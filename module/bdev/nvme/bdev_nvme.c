@@ -1254,20 +1254,40 @@ bdev_nvme_update_io_path_stat(struct nvme_bdev_io *bio)
 	uint32_t blocklen = bdev_io->bdev->blocklen;
 	struct spdk_bdev_io_stat *stat;
 	uint64_t tsc_diff;
+     
+        struct nvme_bdev *nbdev = (struct nvme_bdev *)bdev_io->bdev->ctxt;
+
+	switch (bdev_io->type) {
+	case SPDK_BDEV_IO_TYPE_READ:
+		_cnt[nbdev->_seq][0]--;
+		break;
+	case SPDK_BDEV_IO_TYPE_WRITE:
+                _cnt[nbdev->_seq][1]--;
+		break;
+	case SPDK_BDEV_IO_TYPE_UNMAP:
+		_cnt[nbdev->_seq][2]--;
+		break;
+	default:
+		break;
+	}
+
+       //if((spdk_get_ticks()  - _ptout) > 8000000000)
+	//{	
+         //  _ptout=spdk_get_ticks();
+         //   for (int i=0;i<_seq;i++)
+          //        SPDK_ERRLOG("CNT IN for %d - %I64u %I64u %I64u .\n",i, _cnt[i][0],_cnt[i][1],_cnt[i][2]);
+	//}
 
 	if (bio->io_path->stat == NULL) {
 		return;
 	}
-
-        struct nvme_bdev *nbdev = (struct nvme_bdev *)bdev_io->bdev->ctxt;
 	
 	tsc_diff = spdk_get_ticks() - bio->submit_tsc;
 	stat = bio->io_path->stat;
 
 	switch (bdev_io->type) {
 	case SPDK_BDEV_IO_TYPE_READ:
-		_cnt[nbdev->_seq][0]--;
-                stat->bytes_read += num_blocks * blocklen;
+    stat->bytes_read += num_blocks * blocklen;
 		stat->num_read_ops++;
 		stat->read_latency_ticks += tsc_diff;
 		if (stat->max_read_latency_ticks < tsc_diff) {
@@ -1341,13 +1361,6 @@ bdev_nvme_update_io_path_stat(struct nvme_bdev_io *bio)
 		break;
 	default:
 		break;
-	}
-
-       if(((spdk_get_ticks() / spdk_get_ticks_hz()) - _ptout) > 3000000000)
-	{	
-           _ptout=spdk_get_ticks() / spdk_get_ticks_hz();
-            for (int i=0;i<_seq;i++)
-                  SPDK_ERRLOG("CNT IN for %d - %lld %lld %lld.\n",i, _cnt[i][0],_cnt[i][1],_cnt[i][2]);
 	}
 		
 }
@@ -3014,12 +3027,12 @@ _bdev_nvme_submit_request(struct nvme_bdev_channel *nbdev_ch, struct spdk_bdev_i
 	struct nvme_bdev_io *nbdev_io_to_abort;
 	int rc = 0;
 
-        if(((spdk_get_ticks() / spdk_get_ticks_hz()) - _ptin) > 3000000000)
-	{	
-           _ptin=spdk_get_ticks() / spdk_get_ticks_hz();
-           for (int i=0;i<_seq;i++)
-                  SPDK_ERRLOG("CNT IN for %d - %lld %lld %lld.\n",i, _cnt[i][0],_cnt[i][1],_cnt[i][2]);
-	}
+        //if((spdk_get_ticks()  - _ptin) > 8000000000)
+	//{	
+        //   _ptin=spdk_get_ticks();
+        //   for (int i=0;i<_seq;i++)
+         //         SPDK_ERRLOG("CNT IN for %d - %I64u %I64u %I64u .\n",i, _cnt[i][0],_cnt[i][1],_cnt[i][2]);
+	//}
         
 	switch (bdev_io->type) {
 	case SPDK_BDEV_IO_TYPE_READ:
@@ -4337,9 +4350,9 @@ nvme_bdev_create(struct nvme_ctrlr *nvme_ctrlr, struct nvme_ns *nvme_ns)
 
 	//msi
 	bdev->_seq=_seq;
-        SPDK_ERRLOG("BDEV %s: %l.\n",bdev->disk.name,_seq); 
-        _seq++;
-        //end-msi
+  SPDK_ERRLOG("BDEV %s - %d \n",bdev->disk.name,_seq); 
+  _seq++;
+  //end-msi
 
 	TAILQ_INSERT_TAIL(&bdev->nvme_ns_list, nvme_ns, tailq);
 
