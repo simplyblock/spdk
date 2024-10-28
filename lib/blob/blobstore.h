@@ -159,6 +159,15 @@ struct spdk_blob_store {
 	uint64_t			md_start; /* Offset from beginning of disk, in pages */
 	uint32_t			md_len; /* Count, in pages */
 
+	uint32_t	used_page_mask_start; /* Offset from beginning of disk, in pages */
+	uint32_t	used_page_mask_len; /* Count, in pages */
+
+	uint32_t	used_cluster_mask_start; /* Offset from beginning of disk, in pages */
+	uint32_t	used_cluster_mask_len; /* Count, in pages */
+
+	uint32_t	used_blobid_mask_start; /* Offset from beginning of disk, in pages */
+	uint32_t	used_blobid_mask_len; /* Count, in pages */
+
 	struct spdk_io_channel		*md_channel;
 	uint32_t			max_channel_ops;
 
