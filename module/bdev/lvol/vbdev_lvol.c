@@ -189,6 +189,7 @@ _vbdev_lvs_create_cb(void *cb_arg, struct spdk_lvol_store *lvs, int lvserrno)
 	}
 
 	assert(lvs != NULL);
+	lvs->blobstore->support_storage_tiering = req->support_storage_tiering;
 
 	lvs_bdev = calloc(1, sizeof(*lvs_bdev));
 	if (!lvs_bdev) {
@@ -211,7 +212,7 @@ end:
 
 int
 vbdev_lvs_create(const char *base_bdev_name, const char *name, uint32_t cluster_sz,
-		 enum lvs_clear_method clear_method, uint32_t num_md_pages_per_cluster_ratio,
+		 enum lvs_clear_method clear_method, uint32_t num_md_pages_per_cluster_ratio, bool support_storage_tiering,
 		 spdk_lvs_op_with_handle_complete cb_fn, void *cb_arg)
 {
 	struct spdk_bs_dev *bs_dev;
@@ -270,6 +271,7 @@ vbdev_lvs_create(const char *base_bdev_name, const char *name, uint32_t cluster_
 	lvs_req->base_bdev = bs_dev->get_base_bdev(bs_dev);
 	lvs_req->cb_fn = cb_fn;
 	lvs_req->cb_arg = cb_arg;
+	lvs_req->support_storage_tiering = support_storage_tiering;
 
 	rc = spdk_lvs_init(bs_dev, &opts, _vbdev_lvs_create_cb, lvs_req);
 	if (rc < 0) {
@@ -2125,6 +2127,14 @@ void vbdev_lvol_set_tiering_info(struct spdk_lvol *lvol, uint8_t tiering_bits) {
 
 uint8_t vbdev_lvol_get_tiering_info(struct spdk_lvol *lvol) {
 	return spdk_blob_get_tiering_info(lvol->blob);
+}
+
+void vbdev_lvs_support_storage_tiering(struct spdk_lvol_store *lvs, bool support_storage_tiering) {
+	lvs->blobstore->support_storage_tiering = support_storage_tiering;
+}
+
+bool vbdev_lvs_get_support_storage_tiering(struct spdk_lvol_store *lvs) {
+	return lvs->blobstore->support_storage_tiering;
 }
 
 SPDK_LOG_REGISTER_COMPONENT(vbdev_lvol)

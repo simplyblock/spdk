@@ -206,6 +206,11 @@ class UIRoot(UINode):
         return response
     
     @verbose
+    def lvstore_support_storage_tiering(self, **kwargs):
+        response = rpc.lvol.lvstore_support_storage_tiering(self.client, **kwargs)
+        return response
+    
+    @verbose
     def bdev_lvol_set_priority_class(self, **kwargs):
         response = rpc.lvol.bdev_lvol_set_priority_class(self.client, **kwargs)
         return response

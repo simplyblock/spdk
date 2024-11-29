@@ -9,7 +9,10 @@
 #define FORCE_FLUSH_MASK FORCE_FETCH_MASK // force a flush of an untiered page in case of a client flush (if tiered, must not be completely non-dirty)
 #define UNMAP_MODE_MASK FORCE_FETCH_MASK // tiered unmap mode 1 is full delete, tiered unmap mode 0 is client eviction
 #define METADATA_PAGE_MASK (1UL << 62) // whether the pages accessed are metadata, always set by an lvol metadata channel
-#define LBA_METADATA_BITS_MASK (TIERED_IO_MASK | FORCE_FETCH_MASK | METADATA_PAGE_MASK)
+
+#define TOTAL_TIERING_MASK (TIERED_IO_MASK | FORCE_FETCH_MASK | METADATA_PAGE_MASK)
+#define TIERING_BITS_POS 60
+#define LBA_METADATA_BITS_MASK (PRIORITY_CLASS_MASK | TOTAL_TIERING_MASK)
 
 
 #define TIERED_BIT 1

@@ -5,7 +5,7 @@
 
 
 def bdev_lvol_create_lvstore(client, bdev_name, lvs_name, cluster_sz=None,
-                             clear_method=None, num_md_pages_per_cluster_ratio=None):
+                             clear_method=None, num_md_pages_per_cluster_ratio=None, support_storage_tiering=False):
     """Construct a logical volume store.
 
     Args:
@@ -14,6 +14,7 @@ def bdev_lvol_create_lvstore(client, bdev_name, lvs_name, cluster_sz=None,
         cluster_sz: cluster size of the logical volume store in bytes (optional)
         clear_method: Change clear method for data region. Available: none, unmap, write_zeroes (optional)
         num_md_pages_per_cluster_ratio: metadata pages per cluster (optional)
+        support_storage_tiering: whether to support storage tiering and hence explicitly signal metadata pages as untiered to the underlying bdev (optional)
 
     Returns:
         UUID of created logical volume store.
@@ -25,7 +26,14 @@ def bdev_lvol_create_lvstore(client, bdev_name, lvs_name, cluster_sz=None,
         params['clear_method'] = clear_method
     if num_md_pages_per_cluster_ratio:
         params['num_md_pages_per_cluster_ratio'] = num_md_pages_per_cluster_ratio
+    params['support_storage_tiering'] = support_storage_tiering
     return client.call('bdev_lvol_create_lvstore', params)
+
+def lvstore_support_storage_tiering(client, lvs_name, support_storage_tiering):
+    """Set whether the lvol store should support storage tiering."""
+
+    params = {'lvs_name': lvs_name, 'support_storage_tiering': support_storage_tiering}
+    return client.call('lvstore_support_storage_tiering', params)
 
 
 def bdev_lvol_rename_lvstore(client, old_name, new_name):

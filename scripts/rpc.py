@@ -1997,7 +1997,8 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
                                                      lvs_name=args.lvs_name,
                                                      cluster_sz=args.cluster_sz,
                                                      clear_method=args.clear_method,
-                                                     num_md_pages_per_cluster_ratio=args.md_pages_per_cluster_ratio))
+                                                     num_md_pages_per_cluster_ratio=args.md_pages_per_cluster_ratio,
+                                                     support_storage_tiering=args.support_storage_tiering))
 
     p = subparsers.add_parser('bdev_lvol_create_lvstore', help='Add logical volume store on base bdev')
     p.add_argument('bdev_name', help='base bdev name')
@@ -2006,7 +2007,17 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('--clear-method', help="""Change clear method for data region.
         Available: none, unmap, write_zeroes""")
     p.add_argument('-m', '--md-pages-per-cluster-ratio', help='reserved metadata pages for each cluster', type=int)
+    p.add_argument('support_storage_tiering', help='whether the lvolstore supports storage tiering, hence explicitly signals metadata pages as untiered to the underlying bdev', type=int)
     p.set_defaults(func=bdev_lvol_create_lvstore)
+
+    def lvstore_support_storage_tiering(args):
+        print_json(rpc.lvol.lvstore_support_storage_tiering(args.client,
+                                                            lvs_name=args.lvs_name,
+                                                            support_storage_tiering=args.support_storage_tiering))
+    p = subparsers.add_parser('lvstore_support_storage_tiering', help='Set whether an lvol store should support storage tiering')
+    p.add_argument('lvs_name', help='lvol store name')
+    p.add_argument('support_storage_tiering', help='whether to support storage tiering', type=int)
+    p.set_defaults(func=lvstore_support_storage_tiering)
 
     def bdev_lvol_rename_lvstore(args):
         rpc.lvol.bdev_lvol_rename_lvstore(args.client,
@@ -2091,6 +2102,7 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
                                                       sync_fetch=args.sync_fetch,
                                                       force_flush=args.force_flush,
                                                       full_delete_or_evict=args.full_delete_or_evict))
+    p = subparsers.add_parser('bdev_lvol_set_tiering_info', help="set or keep the tiering info fields of an lvol")
     p.add_argument('is_tiered', help='whether this lvol is tiered, hence sends tiered requests', type=int)
     p.add_argument('force_fetch', help='whether fetch requests (tiered reads) from this lvol are force fetch (fetch even into already unfetched data ranges)', type=int)
     p.add_argument('sync_fetch', help='whether regular client reads from this lvol need to wait synchronously for any of its unfetched ranges to be fetched', type=int)

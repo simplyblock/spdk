@@ -37,6 +37,7 @@ struct rpc_bdev_lvol_create_lvstore {
 	uint32_t cluster_sz;
 	char *clear_method;
 	uint32_t num_md_pages_per_cluster_ratio;
+	bool support_storage_tiering;
 };
 
 static int
@@ -83,6 +84,7 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_create_lvstore_decode
 	{"lvs_name", offsetof(struct rpc_bdev_lvol_create_lvstore, lvs_name), spdk_json_decode_string},
 	{"clear_method", offsetof(struct rpc_bdev_lvol_create_lvstore, clear_method), spdk_json_decode_string, true},
 	{"num_md_pages_per_cluster_ratio", offsetof(struct rpc_bdev_lvol_create_lvstore, num_md_pages_per_cluster_ratio), spdk_json_decode_uint32, true},
+	{"support_storage_tiering", offsetof(struct rpc_bdev_lvol_create_lvstore, support_storage_tiering), spdk_json_decode_bool, true}
 };
 
 static void
@@ -138,7 +140,7 @@ rpc_bdev_lvol_create_lvstore(struct spdk_jsonrpc_request *request,
 	}
 
 	rc = vbdev_lvs_create(req.bdev_name, req.lvs_name, req.cluster_sz, clear_method,
-			      req.num_md_pages_per_cluster_ratio, rpc_lvol_store_construct_cb, request);
+			      req.num_md_pages_per_cluster_ratio, req.support_storage_tiering, rpc_lvol_store_construct_cb, request);
 	if (rc < 0) {
 		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
 		goto cleanup;
@@ -151,6 +153,49 @@ cleanup:
 	free_rpc_bdev_lvol_create_lvstore(&req);
 }
 SPDK_RPC_REGISTER("bdev_lvol_create_lvstore", rpc_bdev_lvol_create_lvstore, SPDK_RPC_RUNTIME)
+
+
+struct rpc_lvstore_support_storage_tiering {
+	char* lvs_name;
+	bool support_storage_tiering;
+};
+
+static void
+rpc_lvstore_support_storage_tiering(struct spdk_jsonrpc_request *request,
+			     const struct spdk_json_val *params) 
+{
+	static const struct spdk_json_object_decoder rpc_lvstore_support_storage_tiering_decoders[] = {
+		{"lvs_name", offsetof(struct rpc_lvstore_support_storage_tiering, lvs_name), spdk_json_decode_string},
+		{"support_storage_tiering", offsetof(struct rpc_lvstore_support_storage_tiering, support_storage_tiering), spdk_json_decode_bool}
+	};
+
+	struct rpc_lvstore_support_storage_tiering req = {};
+	struct spdk_lvol_store *lvs;
+
+	if (spdk_json_decode_object(params, rpc_lvstore_support_storage_tiering_decoders,
+				    SPDK_COUNTOF(rpc_lvstore_support_storage_tiering_decoders),
+				    &req)) {
+		SPDK_INFOLOG(lvol_rpc, "spdk_json_decode_object failed\n");
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "spdk_json_decode_object failed");
+		goto cleanup;
+	}
+
+	lvs = vbdev_get_lvol_store_by_name(req.lvs_name);
+	if (lvs == NULL) {
+		SPDK_INFOLOG(lvol_rpc, "no lvs existing for given name\n");
+		spdk_jsonrpc_send_error_response_fmt(request, -ENOENT, "Lvol store %s not found", req.lvs_name);
+		goto cleanup;
+	}
+
+	vbdev_lvs_support_storage_tiering(lvs, req.support_storage_tiering);
+	spdk_jsonrpc_send_bool_response(request, true);
+
+cleanup:
+	free(req.lvs_name);
+}
+
+SPDK_RPC_REGISTER("lvstore_support_storage_tiering", rpc_lvstore_support_storage_tiering, SPDK_RPC_RUNTIME)
 
 struct rpc_bdev_lvol_rename_lvstore {
 	char *old_name;

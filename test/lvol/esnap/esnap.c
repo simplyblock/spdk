@@ -254,7 +254,7 @@ esnap_clone_io(void)
 	SPDK_CU_ASSERT_FATAL(rc == 0);
 
 	/* Create lvstore */
-	rc = vbdev_lvs_create("bs_malloc", "lvs1", cluster_size, 0, 0,
+	rc = vbdev_lvs_create("bs_malloc", "lvs1", cluster_size, 0, 0, 0,
 			      lvs_op_with_handle_cb, clear_owh(&owh_data));
 	SPDK_CU_ASSERT_FATAL(rc == 0);
 	poll_error_updated(&owh_data.lvserrno);
@@ -379,7 +379,7 @@ esnap_hotplug(void)
 	SPDK_CU_ASSERT_FATAL(rc == 0);
 	poll_threads();
 
-	rc = vbdev_lvs_create("aio1", "lvs1", cluster_size, 0, 0,
+	rc = vbdev_lvs_create("aio1", "lvs1", cluster_size, 0, 0, 0,
 			      lvs_op_with_handle_cb, clear_owh(&owh_data));
 	SPDK_CU_ASSERT_FATAL(rc == 0);
 	poll_error_updated(&owh_data.lvserrno);
@@ -479,7 +479,7 @@ esnap_remove_degraded(void)
 	SPDK_CU_ASSERT_FATAL(rc == 0);
 	poll_threads();
 
-	rc = vbdev_lvs_create("aio1", "lvs1", cluster_size, 0, 0,
+	rc = vbdev_lvs_create("aio1", "lvs1", cluster_size, 0, 0, 0,
 			      lvs_op_with_handle_cb, clear_owh(&owh_data));
 	SPDK_CU_ASSERT_FATAL(rc == 0);
 	poll_error_updated(&owh_data.lvserrno);
@@ -696,7 +696,7 @@ late_delete(void)
 	poll_threads();
 
 	/* Create lvstore */
-	rc = vbdev_lvs_create("aio1", "lvs1", cluster_size, 0, 0,
+	rc = vbdev_lvs_create("aio1", "lvs1", cluster_size, 0, 0, 0,
 			      lvs_op_with_handle_cb, clear_owh(&owh_data));
 	SPDK_CU_ASSERT_FATAL(rc == 0);
 	poll_error_updated(&owh_data.lvserrno);

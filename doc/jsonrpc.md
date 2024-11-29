@@ -500,6 +500,7 @@ Example response:
     "bdev_lvol_delete_lvstore",
     "bdev_lvol_rename_lvstore",
     "bdev_lvol_create_lvstore",
+    "lvstore_support_storage_tiering",
     "bdev_lvol_start_shallow_copy",
     "bdev_lvol_check_shallow_copy",
     "bdev_lvol_set_parent",
@@ -9991,6 +9992,7 @@ lvs_name                      | Required | string      | Name of the logical vol
 cluster_sz                    | Optional | number      | Cluster size of the logical volume store in bytes (Default: 4MiB)
 clear_method                  | Optional | string      | Change clear method for data region. Available: none, unmap (default), write_zeroes
 num_md_pages_per_cluster_ratio| Optional | number      | Reserved metadata pages per cluster (Default: 100)
+support_storage_tiering       | Optional | boolean     | whether to support storage tiering and hence explicitly signal metadata pages as untiered to the underlying bdev
 
 The num_md_pages_per_cluster_ratio defines the amount of metadata to
 allocate when the logical volume store is created. The default value
@@ -10034,6 +10036,47 @@ Example response:
   "jsonrpc": "2.0",
   "id": 1,
   "result": "a9959197-b5e2-4f2d-8095-251ffb6985a5"
+}
+~~~
+
+### lvstore_support_storage_tiering {#rpc_lvstore_support_storage_tiering}
+
+Construct a logical volume store.
+
+#### Parameters
+
+Name                          | Optional | Type        | Description
+----------------------------- | -------- | ----------- | -----------
+lvs_name                      | Required | string      | Name of the logical volume store to create
+support_storage_tiering       | Required | boolean     | whether to support storage tiering and hence explicitly signal metadata pages as untiered to the underlying bdev
+
+#### Response
+
+Whether the request succeeded.
+
+#### Example
+
+Example request:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "lvstore_support_storage_tiering",
+  "params": {
+    "lvs_name": "LVS0",
+    "support_storage_tiering": true
+  }
+}
+~~~
+
+Example response:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
 }
 ~~~
 
