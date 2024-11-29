@@ -211,6 +211,11 @@ class UIRoot(UINode):
         return response
 
     @verbose
+    def bdev_lvol_set_tiering_info(self, **kwargs):
+        response = rpc.lvol.bdev_lvol_set_tiering_info(self.client, **kwargs)
+        return response
+
+    @verbose
     def bdev_lvol_delete_lvstore(self, **kwargs):
         rpc.lvol.bdev_lvol_delete_lvstore(self.client, **kwargs)
 

@@ -36,6 +36,7 @@
 #include "spdk/stdinc.h"
 #include "spdk/assert.h"
 #include "spdk/priority_class.h"
+#include "spdk/tiering_bits.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -488,6 +489,8 @@ uint64_t spdk_bs_total_data_cluster_count(struct spdk_blob_store *bs);
  * \return blob id.
  */
 spdk_blob_id spdk_blob_get_id(struct spdk_blob *blob);
+
+uint8_t spdk_blob_get_tiering_info(struct spdk_blob *blob);
 
 /**
  * Get the number of pages allocated to the blob.
@@ -1267,6 +1270,8 @@ lvol's priority class bits. These bits must be cleared when the I/O reaches the 
 again when it exits the lvolstore so that no internal lvolstore operation sees these bits.
 */
 void spdk_blob_set_io_priority_class(struct spdk_blob *blob, int priority_class);
+
+void spdk_blob_set_tiering_info(struct spdk_blob *blob, uint8_t tiering_bits);
 
 #ifdef __cplusplus
 }

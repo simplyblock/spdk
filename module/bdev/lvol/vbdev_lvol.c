@@ -1194,6 +1194,7 @@ _vbdev_lvol_create_cb(void *cb_arg, struct spdk_lvol *lvol, int lvolerrno)
 
 	lvol->priority_class = req->lvol_priority_class;
 	vbdev_lvol_set_io_priority_class(lvol);
+	vbdev_lvol_set_tiering_info(lvol, req->tiering_info);
 
 	lvolerrno = _create_lvol_disk(lvol, true);
 
@@ -1250,7 +1251,7 @@ vbdev_lvs_dump(struct spdk_lvol_store *lvs, const char *file, spdk_lvol_op_with_
 
 int
 vbdev_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz,
-		  bool thin_provision, enum lvol_clear_method clear_method, int8_t lvol_priority_class,
+		  bool thin_provision, enum lvol_clear_method clear_method, int8_t lvol_priority_class, uint8_t tiering_info,
 		  spdk_lvol_op_with_handle_complete cb_fn,
 		  void *cb_arg)
 {
@@ -1262,6 +1263,7 @@ vbdev_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz,
 		return -ENOMEM;
 	}
 	req->lvol_priority_class = lvol_priority_class;
+	req->tiering_info = tiering_info;
 	req->cb_fn = cb_fn;
 	req->cb_arg = cb_arg;
 
@@ -2115,6 +2117,14 @@ vbdev_lvol_set_external_parent(struct spdk_lvol *lvol, const char *esnap_name,
 
 void vbdev_lvol_set_io_priority_class(struct spdk_lvol *lvol) {
 	spdk_blob_set_io_priority_class(lvol->blob, lvol->priority_class);
+}
+
+void vbdev_lvol_set_tiering_info(struct spdk_lvol *lvol, uint8_t tiering_bits) {
+	spdk_blob_set_tiering_info(lvol->blob, tiering_bits);
+}
+
+uint8_t vbdev_lvol_get_tiering_info(struct spdk_lvol *lvol) {
+	return spdk_blob_get_tiering_info(lvol->blob);
 }
 
 SPDK_LOG_REGISTER_COMPONENT(vbdev_lvol)

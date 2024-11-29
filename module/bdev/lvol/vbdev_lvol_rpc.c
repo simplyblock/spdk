@@ -285,6 +285,14 @@ struct rpc_bdev_lvol_create {
 	char *lvs_name;
 	char *lvol_name;
 	int32_t lvol_priority_class;
+
+	bool is_tiered;
+	bool force_fetch;
+	bool sync_fetch;
+	bool force_flush;
+	bool full_delete_or_evict;
+
+	uint8_t tiering_info;
 	uint64_t size_in_mib;
 	bool thin_provision;
 	char *clear_method;
@@ -304,6 +312,13 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_create_decoders[] = {
 	{"lvs_name", offsetof(struct rpc_bdev_lvol_create, lvs_name), spdk_json_decode_string, true},
 	{"lvol_name", offsetof(struct rpc_bdev_lvol_create, lvol_name), spdk_json_decode_string},
 	{"lvol_priority_class", offsetof(struct rpc_bdev_lvol_create, lvol_priority_class), spdk_json_decode_int32, true},
+
+	{"is_tiered", offsetof(struct rpc_bdev_lvol_create, is_tiered), spdk_json_decode_bool, true},
+	{"force_fetch", offsetof(struct rpc_bdev_lvol_create, force_fetch), spdk_json_decode_bool, true},
+	{"sync_fetch", offsetof(struct rpc_bdev_lvol_create, sync_fetch), spdk_json_decode_bool, true},
+	{"force_flush", offsetof(struct rpc_bdev_lvol_create, force_flush), spdk_json_decode_bool, true},
+	{"full_delete_or_evict", offsetof(struct rpc_bdev_lvol_create, full_delete_or_evict), spdk_json_decode_bool, true},
+
 	{"size_in_mib", offsetof(struct rpc_bdev_lvol_create, size_in_mib), spdk_json_decode_uint64},
 	{"thin_provision", offsetof(struct rpc_bdev_lvol_create, thin_provision), spdk_json_decode_bool, true},
 	{"clear_method", offsetof(struct rpc_bdev_lvol_create, clear_method), spdk_json_decode_string, true},
@@ -376,8 +391,15 @@ rpc_bdev_lvol_create(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
+	req.tiering_info = 0;
+	req.tiering_info |= req.is_tiered ? TIERED_BIT : 0;
+	req.tiering_info |= req.force_fetch ? FORCE_FETCH_BIT : 0;
+	req.tiering_info |= req.sync_fetch ? SYNC_FETCH_BIT : 0;
+	req.tiering_info |= req.force_flush ? FORCE_FLUSH_BIT : 0;
+	req.tiering_info |= req.full_delete_or_evict ? UNMAP_MODE_BIT : 0;
+
 	rc = vbdev_lvol_create(lvs, req.lvol_name, req.size_in_mib * 1024 * 1024,
-			       req.thin_provision, clear_method, req.lvol_priority_class, rpc_bdev_lvol_create_cb, request);
+			       req.thin_provision, clear_method, req.lvol_priority_class, req.tiering_info, rpc_bdev_lvol_create_cb, request);
 	if (rc < 0) {
 		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
 		goto cleanup;
@@ -1263,6 +1285,7 @@ rpc_dump_lvol(struct spdk_json_write_ctx *w, struct spdk_lvol *lvol)
 	spdk_json_write_named_bool(w, "is_esnap_clone", spdk_blob_is_esnap_clone(lvol->blob));
 	spdk_json_write_named_bool(w, "is_degraded", spdk_blob_is_degraded(lvol->blob));
 	spdk_json_write_named_uint8(w, "lvol_priority_class", lvol->priority_class);
+	spdk_json_write_named_uint8(w, "tiering_info", vbdev_lvol_get_tiering_info(lvol->blob));
 
 	spdk_json_write_named_uint64(w, "num_allocated_clusters",
 				     spdk_blob_get_num_allocated_clusters(lvol->blob));
@@ -1824,4 +1847,98 @@ cleanup:
 }
 
 SPDK_RPC_REGISTER("bdev_lvol_set_priority_class", rpc_bdev_lvol_set_priority_class,
+		  SPDK_RPC_RUNTIME)
+
+struct rpc_bdev_lvol_set_tiering_info {
+	char* lvol_name;
+
+	bool is_tiered;
+	bool force_fetch;
+	bool sync_fetch;
+	bool force_flush;
+	bool full_delete_or_evict;
+
+	uint8_t tiering_info;
+};
+
+static void 
+free_rpc_bdev_lvol_set_tiering_info(struct rpc_bdev_lvol_set_tiering_info *req) {
+	free(req->lvol_name);
+}
+
+static const struct spdk_json_object_decoder rpc_bdev_lvol_set_tiering_info_decoders[] = {
+	{"lvol_name", offsetof(struct rpc_bdev_lvol_set_tiering_info, lvol_name), spdk_json_decode_string},
+
+	{"is_tiered", offsetof(struct rpc_bdev_lvol_set_tiering_info, is_tiered), spdk_json_decode_bool},
+	{"force_fetch", offsetof(struct rpc_bdev_lvol_set_tiering_info, force_fetch), spdk_json_decode_bool},
+	{"sync_fetch", offsetof(struct rpc_bdev_lvol_set_tiering_info, sync_fetch), spdk_json_decode_bool},
+	{"force_flush", offsetof(struct rpc_bdev_lvol_set_tiering_info, force_flush), spdk_json_decode_bool},
+	{"full_delete_or_evict", offsetof(struct rpc_bdev_lvol_set_tiering_info, full_delete_or_evict), spdk_json_decode_bool}
+};
+
+static void
+rpc_bdev_lvol_set_tiering_info_cb(void *cb_arg, int lvolerrno)
+{
+	struct spdk_jsonrpc_request *request = cb_arg;
+
+	if (lvolerrno != 0) {
+		goto invalid;
+	}
+
+	spdk_jsonrpc_send_bool_response(request, true);
+	return;
+
+invalid:
+	spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+					 spdk_strerror(-lvolerrno));
+}
+
+static void 
+rpc_bdev_lvol_set_tiering_info(struct spdk_jsonrpc_request *request,
+			      const struct spdk_json_val *params) 
+{
+	struct rpc_bdev_lvol_set_tiering_info req = {};
+	struct spdk_lvol *lvol;
+	struct spdk_bdev *lvol_bdev;
+
+	SPDK_INFOLOG(lvol_rpc, "Set tiering info of lvol\n");
+
+	if (spdk_json_decode_object(params, rpc_bdev_lvol_set_tiering_info_decoders,
+				    SPDK_COUNTOF(rpc_bdev_lvol_set_tiering_info_decoders),
+				    &req)) {
+		SPDK_INFOLOG(lvol_rpc, "spdk_json_decode_object failed\n");
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "spdk_json_decode_object failed");
+		goto cleanup;
+	}
+
+	lvol_bdev = spdk_bdev_get_by_name(req.lvol_name);
+	if (lvol_bdev == NULL) {
+		SPDK_ERRLOG("lvol bdev '%s' does not exist\n", req.lvol_name);
+		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
+		goto cleanup;
+	}
+
+	lvol = vbdev_lvol_get_from_bdev(lvol_bdev);
+	if (lvol == NULL) {
+		SPDK_ERRLOG("lvol does not exist\n");
+		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
+		goto cleanup;
+	}
+
+	req.tiering_info = 0;
+	req.tiering_info |= req.is_tiered ? TIERED_BIT : 0;
+	req.tiering_info |= req.force_fetch ? FORCE_FETCH_BIT : 0;
+	req.tiering_info |= req.sync_fetch ? SYNC_FETCH_BIT : 0;
+	req.tiering_info |= req.force_flush ? FORCE_FLUSH_BIT : 0;
+	req.tiering_info |= req.full_delete_or_evict ? UNMAP_MODE_BIT : 0;
+
+	vbdev_lvol_set_tiering_info(lvol, req.tiering_info);
+	rpc_bdev_lvol_set_tiering_info_cb(request, 0);
+
+cleanup:
+	free_rpc_bdev_lvol_set_tiering_info(&req);
+}
+
+SPDK_RPC_REGISTER("bdev_lvol_set_tiering_info", rpc_bdev_lvol_set_tiering_info,
 		  SPDK_RPC_RUNTIME)

@@ -59,7 +59,12 @@ def bdev_lvol_grow_lvstore(client, uuid=None, lvs_name=None):
     return client.call('bdev_lvol_grow_lvstore', params)
 
 
-def bdev_lvol_create(client, lvol_name, size_in_mib, thin_provision=False, uuid=None, lvs_name=None, clear_method=None, lvol_priority_class=0):
+def bdev_lvol_create(client, lvol_name, size_in_mib, thin_provision=False, uuid=None, lvs_name=None, clear_method=None, lvol_priority_class=0,
+    is_tiered=False,
+    force_fetch=False,
+    sync_fetch=False,
+    force_flush=False,
+    full_delete_or_evict=False):
     """Create a logical volume on a logical volume store.
 
     Args:
@@ -69,6 +74,12 @@ def bdev_lvol_create(client, lvol_name, size_in_mib, thin_provision=False, uuid=
         uuid: UUID of logical volume store to create logical volume on (optional)
         lvs_name: name of logical volume store to create logical volume on (optional)
         lvol_priority_class: integer lvol priority class for priority I/O within the range [0, 15], default 0 (optional)
+
+        is_tiered: whether this lvol is tiered, hence sends tiered requests
+        force_fetch: whether fetch requests (tiered reads) from this lvol are force fetch (fetch even into already unfetched data ranges)
+        sync_fetch: whether regular client reads from this lvol need to wait synchronously for any of its unfetched ranges to be fetched
+        force_flush: whether cache flushes (tiered writes) from this lvol should flush untiered pages (obsolete argument, all pages hit by regular client W/U are immediately tiered now)
+        full_delete_or_evict: whether tiered unmaps from this lvol should be full delete (delete both primary and secondary) or cache evictions (evict from primary to secondary)
 
     Either uuid or lvs_name must be specified, but not both.
 
@@ -94,6 +105,12 @@ def bdev_lvol_create(client, lvol_name, size_in_mib, thin_provision=False, uuid=
     if clear_method:
         params['clear_method'] = clear_method
     params['lvol_priority_class'] = lvol_priority_class
+
+    params['is_tiered'] = is_tiered
+    params['sync_fetch'] = sync_fetch
+    params['force_fetch'] = force_fetch
+    params['force_flush'] = force_flush
+    params['full_delete_or_evict'] = full_delete_or_evict
     return client.call('bdev_lvol_create', params)
 
 def bdev_lvs_dump(client, file, uuid=None, lvs_name=None):
@@ -122,6 +139,20 @@ def bdev_lvol_set_priority_class(client, lvol_name, lvol_priority_class):
         raise ValueError("lvol_priority_class must be in the range [{}, {}]".format(min_priority_class, max_priority_class))
     params = {'lvol_name': lvol_name, 'lvol_priority_class': lvol_priority_class}
     return client.call('bdev_lvol_set_priority_class', params)
+
+def bdev_lvol_set_tiering_info(
+    client, 
+    lvol_name,
+    is_tiered,
+    force_fetch,
+    sync_fetch,
+    force_flush,
+    full_delete_or_evict):
+
+    """ Set the storage tiering info of a logical volume. All fields must be provided even if they stay the same.
+    """
+    params = {'lvol_name': lvol_name, 'is_tiered': is_tiered, 'force_fetch': force_fetch, 'sync_fetch': sync_fetch, 'force_flush': force_flush, 'full_delete_or_evict': full_delete_or_evict}
+    return client.call('bdev_lvol_set_tiering_info', params)
 
 def bdev_lvol_snapshot(client, lvol_name, snapshot_name):
     """Capture a snapshot of the current state of a logical volume.

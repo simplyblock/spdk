@@ -37,7 +37,7 @@ void vbdev_lvs_unload(struct spdk_lvol_store *lvs, spdk_lvs_op_complete cb_fn, v
 
 int vbdev_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz,
 		      bool thin_provisioned, enum lvol_clear_method clear_method,
-			  int8_t lvol_priority_class,
+			  int8_t lvol_priority_class, uint8_t tiering_info,
 		      spdk_lvol_op_with_handle_complete cb_fn,
 		      void *cb_arg);
 
@@ -153,6 +153,10 @@ void vbdev_lvol_set_external_parent(struct spdk_lvol *lvol, const char *esnap_na
 the lvol's priority class bits. These bits must be cleared when the I/O reaches the lvolstore and added
 again when it exits the lvolstore so that no internal lvolstore operation sees these bits.
 */
-void vbdev_lvol_set_io_priority_class(struct spdk_lvol* lvol);
+void vbdev_lvol_set_io_priority_class(struct spdk_lvol *lvol);
+
+void vbdev_lvol_set_tiering_info(struct spdk_lvol *lvol, uint8_t tiering_bits);
+
+uint8_t vbdev_lvol_get_tiering_info(struct spdk_lvol *lvol);
 
 #endif /* SPDK_VBDEV_LVOL_H */

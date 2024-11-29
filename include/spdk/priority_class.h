@@ -1,7 +1,7 @@
 #ifndef SPDK_PRIORITY_CLASS_H
 #define SPDK_PRIORITY_CLASS_H
 
-#define NBITS_PRIORITY_CLASS 4
+#define NBITS_PRIORITY_CLASS 1
 /* shift priority class value left by this to get the OR-mask or shift right by this after applying the priority 
 class mask PRIORITY_CLASS_MASK to get the priority class as an integer
 */

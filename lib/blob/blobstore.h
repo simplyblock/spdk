@@ -105,6 +105,7 @@ struct spdk_blob {
 	struct spdk_blob_store *bs;
 
 	int priority_class; // to save the lvol's priority class across cluster allocations
+	uint8_t tiering_bits; // storage tiering bitmask
 
 	uint32_t	open_ref;
 

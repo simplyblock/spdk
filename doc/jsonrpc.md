@@ -496,6 +496,7 @@ Example response:
     "bdev_lvol_snapshot",
     "bdev_lvol_create",
     "bdev_lvol_set_priority_class",
+    "bdev_lvol_set_tiering_info",
     "bdev_lvol_delete_lvstore",
     "bdev_lvol_rename_lvstore",
     "bdev_lvol_create_lvstore",
@@ -10213,6 +10214,11 @@ uuid                    | Optional | string      | UUID of logical volume store 
 lvs_name                | Optional | string      | Name of logical volume store to create logical volume on
 clear_method            | Optional | string      | Change default data clusters clear method. Available: none, unmap, write_zeroes
 priority_class          | Optional | int         | Value of the I/O priority class for the lvol. Default 0
+is_tiered               | Optional | boolean     | Whether this lvol is tiered, hence sends tiered requests
+sync_fetch              | Optional | boolean     | Whether fetch requests (tiered reads) from this lvol are force fetch (fetch even into  already unfetched data ranges)
+force_fetch             | Optional | boolean     | Whether regular client reads from this lvol need to wait synchronously for any of its unfetched ranges to be fetched
+force_flush             | Optional | boolean     | Whether cache flushes (tiered writes) from this lvol should flush untiered pages (obsolete argument, all pages hit by regular client W/U are immediately tiered now)
+full_delete_or_evict    | Optional | boolean     | Whether tiered unmaps from this lvol should be full delete (delete both primary and secondary) or cache evictions (evict from primary to secondary)
 
 Size will be rounded up to a multiple of cluster size. Either uuid or lvs_name must be specified, but not both.
 lvol_name will be used in the alias of the created logical volume.
@@ -10279,6 +10285,55 @@ Example request:
   "params": {
     "lvol_name": "1b38702c-7f0c-411e-a962-92c6a5a8a602",
     "lvol_priority_class": "15"
+  }
+}
+~~~
+
+Example response:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+~~~
+
+### bdev_lvol_set_tiering_info {#rpc_bdev_lvol_set_tiering_info}
+
+Set the storage tiering info of a logical volume. All fields must be provided even if they stay the same.
+
+#### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+lvol_name               | Required | string      | UUID or alias of the logical volume to create a snapshot from
+is_tiered               | Optional | boolean     | Whether this lvol is tiered, hence sends tiered requests
+sync_fetch              | Optional | boolean     | Whether fetch requests (tiered reads) from this lvol are force fetch (fetch even into  already unfetched data ranges)
+force_fetch             | Optional | boolean     | Whether regular client reads from this lvol need to wait synchronously for any of its unfetched ranges to be fetched
+force_flush             | Optional | boolean     | Whether cache flushes (tiered writes) from this lvol should flush untiered pages (obsolete argument, all pages hit by regular client W/U are immediately tiered now)
+full_delete_or_evict    | Optional | boolean     | Whether tiered unmaps from this lvol should be full delete (delete both primary and secondary) or cache evictions (evict from primary to secondary)
+
+#### Response
+
+Returns whether setting the storage tiering info succeeded.
+
+#### Example
+
+Example request:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "method": "bdev_lvol_set_tiering_info",
+  "id": 1,
+  "params": {
+    "lvol_name": "1b38702c-7f0c-411e-a962-92c6a5a8a602",
+    "is_tiered": true,
+    "sync_fetch": true,
+    "force_fetch": false,
+    "force_flush": false,
+    "full_delete_or_evict": true
   }
 }
 ~~~

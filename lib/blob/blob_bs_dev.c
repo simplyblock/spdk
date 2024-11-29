@@ -116,7 +116,6 @@ blob_bs_dev_read(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void 
 	iov.iov_len = lba_count * b->bs_dev.blocklen;
 	/* The backing blob may be smaller than this blob, so zero any trailing bytes. */
 	zero_trailing_bytes(b, &iov, 1, lba, &lba_count);
-	b->blob->priority_class = dev->priority_class;
 
 	spdk_blob_io_read(b->blob, channel, payload, lba, lba_count,
 			  blob_bs_dev_read_cpl, cb_args);
@@ -131,7 +130,6 @@ blob_bs_dev_readv(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 
 	/* The backing blob may be smaller than this blob, so zero any trailing bytes. */
 	zero_trailing_bytes(b, iov, iovcnt, lba, &lba_count);
-	b->blob->priority_class = dev->priority_class;
 
 	spdk_blob_io_readv(b->blob, channel, iov, iovcnt, lba, lba_count,
 			   blob_bs_dev_read_cpl, cb_args);
@@ -147,7 +145,6 @@ blob_bs_dev_readv_ext(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 
 	/* The backing blob may be smaller than this blob, so zero any trailing bytes. */
 	zero_trailing_bytes(b, iov, iovcnt, lba, &lba_count);
-	b->blob->priority_class = dev->priority_class;
 
 	spdk_blob_io_readv_ext(b->blob, channel, iov, iovcnt, lba, lba_count,
 			       blob_bs_dev_read_cpl, cb_args, ext_opts);

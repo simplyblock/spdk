@@ -1006,7 +1006,7 @@ ut_lvs_destroy(void)
 
 	/* Successfully create lvol, which should be unloaded with lvs later */
 	g_lvolerrno = -1;
-	rc = vbdev_lvol_create(lvs, "lvol", sz, false, LVOL_CLEAR_WITH_DEFAULT, 0, vbdev_lvol_create_complete,
+	rc = vbdev_lvol_create(lvs, "lvol", sz, false, LVOL_CLEAR_WITH_DEFAULT, 0, 0, vbdev_lvol_create_complete,
 			       NULL);
 	CU_ASSERT(rc == 0);
 	CU_ASSERT(g_lvolerrno == 0);
@@ -1043,7 +1043,7 @@ ut_lvol_init(void)
 
 	/* Successful lvol create */
 	g_lvolerrno = -1;
-	rc = vbdev_lvol_create(lvs, "lvol", sz, false, LVOL_CLEAR_WITH_DEFAULT, 0, vbdev_lvol_create_complete,
+	rc = vbdev_lvol_create(lvs, "lvol", sz, false, LVOL_CLEAR_WITH_DEFAULT, 0, 0, vbdev_lvol_create_complete,
 			       NULL);
 	SPDK_CU_ASSERT_FATAL(rc == 0);
 	CU_ASSERT(g_lvol != NULL);
@@ -1080,7 +1080,7 @@ ut_lvol_snapshot(void)
 
 	/* Successful lvol create */
 	g_lvolerrno = -1;
-	rc = vbdev_lvol_create(lvs, "lvol", sz, false, LVOL_CLEAR_WITH_DEFAULT, 0, vbdev_lvol_create_complete,
+	rc = vbdev_lvol_create(lvs, "lvol", sz, false, LVOL_CLEAR_WITH_DEFAULT, 0, 0, vbdev_lvol_create_complete,
 			       NULL);
 	SPDK_CU_ASSERT_FATAL(rc == 0);
 	SPDK_CU_ASSERT_FATAL(g_lvol != NULL);
@@ -1130,7 +1130,7 @@ ut_lvol_clone(void)
 
 	/* Successful lvol create */
 	g_lvolerrno = -1;
-	rc = vbdev_lvol_create(lvs, "lvol", sz, false, LVOL_CLEAR_WITH_DEFAULT, 0, vbdev_lvol_create_complete,
+	rc = vbdev_lvol_create(lvs, "lvol", sz, false, LVOL_CLEAR_WITH_DEFAULT, 0, 0, vbdev_lvol_create_complete,
 			       NULL);
 	SPDK_CU_ASSERT_FATAL(rc == 0);
 	SPDK_CU_ASSERT_FATAL(g_lvol != NULL);
@@ -1333,7 +1333,7 @@ ut_lvol_rename(void)
 
 	/* Successful lvols create */
 	g_lvolerrno = -1;
-	rc = vbdev_lvol_create(lvs, "lvol", sz, false, LVOL_CLEAR_WITH_DEFAULT, 0, vbdev_lvol_create_complete,
+	rc = vbdev_lvol_create(lvs, "lvol", sz, false, LVOL_CLEAR_WITH_DEFAULT, 0, 0, vbdev_lvol_create_complete,
 			       NULL);
 	SPDK_CU_ASSERT_FATAL(rc == 0);
 	CU_ASSERT(g_lvol != NULL);
@@ -1341,7 +1341,7 @@ ut_lvol_rename(void)
 	lvol = g_lvol;
 
 	g_lvolerrno = -1;
-	rc = vbdev_lvol_create(lvs, "lvol2", sz, false, LVOL_CLEAR_WITH_DEFAULT, 0, vbdev_lvol_create_complete,
+	rc = vbdev_lvol_create(lvs, "lvol2", sz, false, LVOL_CLEAR_WITH_DEFAULT, 0, 0, vbdev_lvol_create_complete,
 			       NULL);
 	SPDK_CU_ASSERT_FATAL(rc == 0);
 	CU_ASSERT(g_lvol != NULL);
@@ -1420,14 +1420,14 @@ ut_bdev_finish(void)
 	SPDK_CU_ASSERT_FATAL(g_lvol_store != NULL);
 	lvs = g_lvol_store;
 
-	rc = vbdev_lvol_create(lvs, "lvol", sz, false, LVOL_CLEAR_WITH_DEFAULT, 0,
+	rc = vbdev_lvol_create(lvs, "lvol", sz, false, LVOL_CLEAR_WITH_DEFAULT, 0, 0,
 			       vbdev_lvol_create_complete, NULL);
 	SPDK_CU_ASSERT_FATAL(rc == 0);
 	CU_ASSERT(g_lvol != NULL);
 	CU_ASSERT(g_lvolerrno == 0);
 	lvol = g_lvol;
 
-	rc = vbdev_lvol_create(lvs, "lvol2", sz, false, LVOL_CLEAR_WITH_DEFAULT, 0,
+	rc = vbdev_lvol_create(lvs, "lvol2", sz, false, LVOL_CLEAR_WITH_DEFAULT, 0, 0,
 			       vbdev_lvol_create_complete, NULL);
 	SPDK_CU_ASSERT_FATAL(rc == 0);
 	CU_ASSERT(g_lvol != NULL);
@@ -1471,7 +1471,7 @@ ut_lvol_resize(void)
 
 	/* Successful lvol create */
 	g_lvolerrno = -1;
-	rc = vbdev_lvol_create(lvs, "lvol", sz, false, LVOL_CLEAR_WITH_DEFAULT, 0, vbdev_lvol_create_complete,
+	rc = vbdev_lvol_create(lvs, "lvol", sz, false, LVOL_CLEAR_WITH_DEFAULT, 0, 0, vbdev_lvol_create_complete,
 			       NULL);
 	CU_ASSERT(rc == 0);
 	CU_ASSERT(g_lvolerrno == 0);
@@ -1519,7 +1519,7 @@ ut_lvol_set_read_only(void)
 
 	/* Successful lvol create */
 	g_lvolerrno = -1;
-	rc = vbdev_lvol_create(lvs, "lvol", sz, false, LVOL_CLEAR_WITH_DEFAULT, 0, vbdev_lvol_create_complete,
+	rc = vbdev_lvol_create(lvs, "lvol", sz, false, LVOL_CLEAR_WITH_DEFAULT, 0, 0, vbdev_lvol_create_complete,
 			       NULL);
 	CU_ASSERT(rc == 0);
 	CU_ASSERT(g_lvolerrno == 0);
@@ -1563,7 +1563,7 @@ ut_lvs_unload(void)
 
 	/* Successfully create lvol, which should be destroyed with lvs later */
 	g_lvolerrno = -1;
-	rc = vbdev_lvol_create(lvs, "lvol", sz, false, LVOL_CLEAR_WITH_DEFAULT, 0, vbdev_lvol_create_complete,
+	rc = vbdev_lvol_create(lvs, "lvol", sz, false, LVOL_CLEAR_WITH_DEFAULT, 0, 0, vbdev_lvol_create_complete,
 			       NULL);
 	CU_ASSERT(rc == 0);
 	CU_ASSERT(g_lvolerrno == 0);
@@ -1784,7 +1784,7 @@ ut_lvs_rename(void)
 
 	/* Successfully create lvol, which should be destroyed with lvs later */
 	g_lvolerrno = -1;
-	rc = vbdev_lvol_create(lvs, "lvol", sz, false, LVOL_CLEAR_WITH_DEFAULT, 0, vbdev_lvol_create_complete,
+	rc = vbdev_lvol_create(lvs, "lvol", sz, false, LVOL_CLEAR_WITH_DEFAULT, 0, 0, vbdev_lvol_create_complete,
 			       NULL);
 	CU_ASSERT(rc == 0);
 	CU_ASSERT(g_lvolerrno == 0);
@@ -2009,7 +2009,7 @@ ut_lvol_shallow_copy(void)
 
 	/* Successful lvol create */
 	g_lvolerrno = -1;
-	rc = vbdev_lvol_create(lvs, "lvol_sc", sz, false, LVOL_CLEAR_WITH_DEFAULT, 0,
+	rc = vbdev_lvol_create(lvs, "lvol_sc", sz, false, LVOL_CLEAR_WITH_DEFAULT, 0, 0,
 			       vbdev_lvol_create_complete,
 			       NULL);
 	SPDK_CU_ASSERT_FATAL(rc == 0);

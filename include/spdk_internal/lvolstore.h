@@ -74,6 +74,7 @@ struct spdk_lvol_with_handle_req {
 	void				*cb_arg;
 	FILE *fp;
 	int lvol_priority_class;
+	uint8_t tiering_info;
 	struct spdk_lvol		*lvol;
 	struct spdk_lvol		*origlvol;
 };
