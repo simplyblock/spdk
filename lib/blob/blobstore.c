@@ -10477,5 +10477,15 @@ spdk_blob_set_tiering_info(struct spdk_blob *blob, uint8_t tiering_bits)
 	blob->tiering_bits = tiering_bits;
 }
 
+void
+spdk_bs_support_storage_tiering(struct spdk_blob_store *bs, bool support_storage_tiering) {
+	bs->support_storage_tiering = support_storage_tiering;
+}
+
+bool
+spdk_bs_get_support_storage_tiering(struct spdk_blob_store *bs) {
+	return bs->support_storage_tiering;
+}
+
 SPDK_LOG_REGISTER_COMPONENT(blob)
 SPDK_LOG_REGISTER_COMPONENT(blob_esnap)

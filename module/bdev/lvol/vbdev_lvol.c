@@ -189,7 +189,7 @@ _vbdev_lvs_create_cb(void *cb_arg, struct spdk_lvol_store *lvs, int lvserrno)
 	}
 
 	assert(lvs != NULL);
-	lvs->blobstore->support_storage_tiering = req->support_storage_tiering;
+	vbdev_lvs_support_storage_tiering(lvs, req->support_storage_tiering);
 
 	lvs_bdev = calloc(1, sizeof(*lvs_bdev));
 	if (!lvs_bdev) {
@@ -2130,11 +2130,11 @@ uint8_t vbdev_lvol_get_tiering_info(struct spdk_lvol *lvol) {
 }
 
 void vbdev_lvs_support_storage_tiering(struct spdk_lvol_store *lvs, bool support_storage_tiering) {
-	lvs->blobstore->support_storage_tiering = support_storage_tiering;
+	spdk_bs_support_storage_tiering(lvs->blobstore, support_storage_tiering);
 }
 
 bool vbdev_lvs_get_support_storage_tiering(struct spdk_lvol_store *lvs) {
-	return lvs->blobstore->support_storage_tiering;
+	return spdk_bs_get_support_storage_tiering(lvs->blobstore);
 }
 
 SPDK_LOG_REGISTER_COMPONENT(vbdev_lvol)
