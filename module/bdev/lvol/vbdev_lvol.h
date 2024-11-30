@@ -10,7 +10,7 @@
 #include "spdk/lvol.h"
 #include "spdk/bdev_module.h"
 #include "spdk/blob_bdev.h"
-#include "spdk/priority_class.h"
+#include "spdk/tiering_bits.h"
 
 #include "spdk_internal/lvolstore.h"
 

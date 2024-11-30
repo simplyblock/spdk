@@ -35,7 +35,6 @@
 
 #include "spdk/stdinc.h"
 #include "spdk/assert.h"
-#include "spdk/priority_class.h"
 #include "spdk/tiering_bits.h"
 
 #ifdef __cplusplus

@@ -308,6 +308,8 @@ blob_alloc(struct spdk_blob_store *bs, spdk_blob_id id)
 	blob->id = id;
 	blob->bs = bs;
 
+	atomic_init(&blob->tiering_bits, 0);
+
 	blob->parent_id = SPDK_BLOBID_INVALID;
 
 	blob->state = SPDK_BLOB_STATE_DIRTY;
@@ -6230,7 +6232,7 @@ spdk_blob_get_tiering_info(struct spdk_blob *blob)
 {
 	assert(blob != NULL);
 
-	return blob->tiering_bits;
+	return atomic_load_explicit(&blob->tiering_bits, memory_order_relaxed);
 }
 
 uint64_t
@@ -10474,7 +10476,7 @@ spdk_blob_set_io_priority_class(struct spdk_blob *blob, int priority_class)
 void
 spdk_blob_set_tiering_info(struct spdk_blob *blob, uint8_t tiering_bits) 
 {
-	blob->tiering_bits = tiering_bits;
+	atomic_store_explicit(&blob->tiering_bits, tiering_bits, memory_order_relaxed);
 }
 
 void
