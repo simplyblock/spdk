@@ -334,8 +334,7 @@ struct rpc_bdev_lvol_create {
 	bool is_tiered;
 	bool force_fetch;
 	bool sync_fetch;
-	bool force_flush;
-	bool full_delete_or_evict;
+	bool pure_flush_or_evict;
 
 	uint8_t tiering_info;
 	uint64_t size_in_mib;
@@ -361,8 +360,7 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_create_decoders[] = {
 	{"is_tiered", offsetof(struct rpc_bdev_lvol_create, is_tiered), spdk_json_decode_bool, true},
 	{"force_fetch", offsetof(struct rpc_bdev_lvol_create, force_fetch), spdk_json_decode_bool, true},
 	{"sync_fetch", offsetof(struct rpc_bdev_lvol_create, sync_fetch), spdk_json_decode_bool, true},
-	{"force_flush", offsetof(struct rpc_bdev_lvol_create, force_flush), spdk_json_decode_bool, true},
-	{"full_delete_or_evict", offsetof(struct rpc_bdev_lvol_create, full_delete_or_evict), spdk_json_decode_bool, true},
+	{"pure_flush_or_evict", offsetof(struct rpc_bdev_lvol_create, pure_flush_or_evict), spdk_json_decode_bool, true},
 
 	{"size_in_mib", offsetof(struct rpc_bdev_lvol_create, size_in_mib), spdk_json_decode_uint64},
 	{"thin_provision", offsetof(struct rpc_bdev_lvol_create, thin_provision), spdk_json_decode_bool, true},
@@ -440,8 +438,7 @@ rpc_bdev_lvol_create(struct spdk_jsonrpc_request *request,
 	req.tiering_info |= req.is_tiered ? TIERED_BIT : 0;
 	req.tiering_info |= req.force_fetch ? FORCE_FETCH_BIT : 0;
 	req.tiering_info |= req.sync_fetch ? SYNC_FETCH_BIT : 0;
-	req.tiering_info |= req.force_flush ? FORCE_FLUSH_BIT : 0;
-	req.tiering_info |= req.full_delete_or_evict ? UNMAP_MODE_BIT : 0;
+	req.tiering_info |= req.pure_flush_or_evict ? FLUSH_MODE_BIT : 0;
 
 	rc = vbdev_lvol_create(lvs, req.lvol_name, req.size_in_mib * 1024 * 1024,
 			       req.thin_provision, clear_method, req.lvol_priority_class, req.tiering_info, rpc_bdev_lvol_create_cb, request);
@@ -1901,8 +1898,7 @@ struct rpc_bdev_lvol_set_tiering_info {
 	bool is_tiered;
 	bool force_fetch;
 	bool sync_fetch;
-	bool force_flush;
-	bool full_delete_or_evict;
+	bool pure_flush_or_evict;
 
 	uint8_t tiering_info;
 };
@@ -1918,8 +1914,7 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_set_tiering_info_deco
 	{"is_tiered", offsetof(struct rpc_bdev_lvol_set_tiering_info, is_tiered), spdk_json_decode_bool},
 	{"force_fetch", offsetof(struct rpc_bdev_lvol_set_tiering_info, force_fetch), spdk_json_decode_bool},
 	{"sync_fetch", offsetof(struct rpc_bdev_lvol_set_tiering_info, sync_fetch), spdk_json_decode_bool},
-	{"force_flush", offsetof(struct rpc_bdev_lvol_set_tiering_info, force_flush), spdk_json_decode_bool},
-	{"full_delete_or_evict", offsetof(struct rpc_bdev_lvol_set_tiering_info, full_delete_or_evict), spdk_json_decode_bool}
+	{"pure_flush_or_evict", offsetof(struct rpc_bdev_lvol_set_tiering_info, pure_flush_or_evict), spdk_json_decode_bool}
 };
 
 static void
@@ -1976,8 +1971,7 @@ rpc_bdev_lvol_set_tiering_info(struct spdk_jsonrpc_request *request,
 	req.tiering_info |= req.is_tiered ? TIERED_BIT : 0;
 	req.tiering_info |= req.force_fetch ? FORCE_FETCH_BIT : 0;
 	req.tiering_info |= req.sync_fetch ? SYNC_FETCH_BIT : 0;
-	req.tiering_info |= req.force_flush ? FORCE_FLUSH_BIT : 0;
-	req.tiering_info |= req.full_delete_or_evict ? UNMAP_MODE_BIT : 0;
+	req.tiering_info |= req.pure_flush_or_evict ? FLUSH_MODE_BIT : 0;
 
 	vbdev_lvol_set_tiering_info(lvol, req.tiering_info);
 	rpc_bdev_lvol_set_tiering_info_cb(request, 0);

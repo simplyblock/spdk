@@ -246,7 +246,7 @@ bs_sequence_write_dev(spdk_bs_sequence_t *seq, void *payload,
 	{
 		meta_lba |= TIERED_BIT;
 
-		meta_lba |= tiering_bits & FORCE_FLUSH_BIT ? FORCE_FLUSH_MASK : 0; // tiered write may be a force flush
+		meta_lba |= tiering_bits & FLUSH_MODE_BIT ? FLUSH_MODE_MASK : 0; // tiered write may be a pure flush
 	}
 
 	channel->dev->write(channel->dev, channel->dev_channel, payload, meta_lba, lba_count,
@@ -369,7 +369,7 @@ bs_sequence_writev_dev(spdk_bs_sequence_t *seq, struct iovec *iov, int iovcnt,
 	{
 		meta_lba |= TIERED_BIT;
 
-		meta_lba |= tiering_bits & FORCE_FLUSH_BIT ? FORCE_FLUSH_MASK : 0; // tiered write may be a force flush
+		meta_lba |= tiering_bits & FLUSH_MODE_BIT ? FLUSH_MODE_MASK : 0; // tiered write may be a pure flush
 	}
 
 	if (set->ext_io_opts) {
@@ -467,8 +467,6 @@ bs_batch_completion(struct spdk_io_channel *_channel,
 			} else 
 			{
 				meta_lba |= TIERED_BIT;
-
-				meta_lba |= tiering_bits & UNMAP_MODE_BIT ? UNMAP_MODE_MASK : 0; // tiered unmap is either eviction or full deletion
 			}
 
 			channel->dev->unmap(channel->dev, channel->dev_channel, meta_lba, ctx->lba_count,
@@ -627,7 +625,7 @@ bs_batch_write_dev(spdk_bs_batch_t *batch, void *payload,
 	{
 		meta_lba |= TIERED_BIT;
 
-		meta_lba |= tiering_bits & FORCE_FLUSH_BIT ? FORCE_FLUSH_MASK : 0; // tiered write may be a force flush
+		meta_lba |= tiering_bits & FLUSH_MODE_BIT ? FLUSH_MODE_MASK : 0; // tiered write may be a pure flush
 	}
 
 	channel->dev->write(channel->dev, channel->dev_channel, payload, meta_lba, lba_count,
@@ -675,8 +673,6 @@ out:
 	} else 
 	{
 		meta_lba |= TIERED_BIT;
-
-		meta_lba |= tiering_bits & UNMAP_MODE_BIT ? UNMAP_MODE_MASK : 0; // tiered unmap is either eviction or full deletion
 	}
 
 	channel->dev->unmap(channel->dev, channel->dev_channel, meta_lba, lba_count,

@@ -71,8 +71,7 @@ def bdev_lvol_create(client, lvol_name, size_in_mib, thin_provision=False, uuid=
     is_tiered=False,
     force_fetch=False,
     sync_fetch=False,
-    force_flush=False,
-    full_delete_or_evict=False):
+    pure_flush_or_evict=False):
     """Create a logical volume on a logical volume store.
 
     Args:
@@ -86,8 +85,7 @@ def bdev_lvol_create(client, lvol_name, size_in_mib, thin_provision=False, uuid=
         is_tiered: whether this lvol is tiered, hence sends tiered requests
         force_fetch: whether fetch requests (tiered reads) from this lvol are force fetch (fetch even into already unfetched data ranges)
         sync_fetch: whether regular client reads from this lvol need to wait synchronously for any of its unfetched ranges to be fetched
-        force_flush: whether cache flushes (tiered writes) from this lvol should flush untiered pages (obsolete argument, all pages hit by regular client W/U are immediately tiered now)
-        full_delete_or_evict: whether tiered unmaps from this lvol should be full delete (delete both primary and secondary) or cache evictions (evict from primary to secondary)
+        pure_flush_or_evict: whether a tiered write should be pure flush (mode 1) or eviction (mode 0)
 
     Either uuid or lvs_name must be specified, but not both.
 
@@ -117,8 +115,7 @@ def bdev_lvol_create(client, lvol_name, size_in_mib, thin_provision=False, uuid=
     params['is_tiered'] = is_tiered
     params['sync_fetch'] = sync_fetch
     params['force_fetch'] = force_fetch
-    params['force_flush'] = force_flush
-    params['full_delete_or_evict'] = full_delete_or_evict
+    params['pure_flush_or_evict'] = pure_flush_or_evict
     return client.call('bdev_lvol_create', params)
 
 def bdev_lvs_dump(client, file, uuid=None, lvs_name=None):
@@ -154,12 +151,11 @@ def bdev_lvol_set_tiering_info(
     is_tiered,
     force_fetch,
     sync_fetch,
-    force_flush,
-    full_delete_or_evict):
+    pure_flush_or_evict):
 
     """ Set the storage tiering info of a logical volume. All fields must be provided even if they stay the same.
     """
-    params = {'lvol_name': lvol_name, 'is_tiered': is_tiered, 'force_fetch': force_fetch, 'sync_fetch': sync_fetch, 'force_flush': force_flush, 'full_delete_or_evict': full_delete_or_evict}
+    params = {'lvol_name': lvol_name, 'is_tiered': is_tiered, 'force_fetch': force_fetch, 'sync_fetch': sync_fetch, 'pure_flush_or_evict': pure_flush_or_evict}
     return client.call('bdev_lvol_set_tiering_info', params)
 
 def bdev_lvol_snapshot(client, lvol_name, snapshot_name):
