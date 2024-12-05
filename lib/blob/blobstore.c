@@ -1785,6 +1785,12 @@ blob_load(spdk_bs_sequence_t *seq, struct spdk_blob *blob,
 
 	blob->state = SPDK_BLOB_STATE_LOADING;
 
+	/* tier blob-specific metadata if the blob is configured to do so
+	*/
+	const uint8_t blob_tiering_bits = atomic_load_explicit(&blob->tiering_bits, memory_order_relaxed);
+	// unset the metadata page bit mode if the blob must tier its metadata
+	seq->tiering_bits &= (blob_tiering_bits & TIER_BLOB_MD_BIT) ? ~METADATA_PAGE_BIT : 255;
+
 	bs_sequence_read_dev(seq, &ctx->pages[0], lba,
 			     bs_byte_to_lba(bs, SPDK_BS_PAGE_SIZE),
 			     blob_load_cpl, ctx);
