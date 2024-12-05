@@ -168,7 +168,7 @@ struct spdk_blob_store {
 	struct spdk_thread		*md_thread;
 
 	int priority_class; // max priority_class of all constituent blobs to speed up metadata I/Os
-	bool support_storage_tiering; // whether to support storage tiering, also explicitly signals metadata pages as untiered if true
+	bool untier_lvstore_md_pages; // whether to explicitly signal metadata pages as untiered
 
 	struct spdk_bs_dev		*dev;
 

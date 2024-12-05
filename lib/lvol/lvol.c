@@ -1179,6 +1179,8 @@ spdk_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz,
 		 bool thin_provision, enum lvol_clear_method clear_method, spdk_lvol_op_with_handle_complete cb_fn,
 		 void *cb_arg)
 {
+	const uint8_t tiering_info = ((struct spdk_lvol_with_handle_req*)(cb_arg))->tiering_info;
+	const int lvol_priority_class = ((struct spdk_lvol_with_handle_req*)(cb_arg))->lvol_priority_class;
 	struct spdk_lvol_with_handle_req *req;
 	struct spdk_blob_store *bs;
 	struct spdk_lvol *lvol;
@@ -1205,6 +1207,8 @@ spdk_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz,
 	}
 	req->cb_fn = cb_fn;
 	req->cb_arg = cb_arg;
+	req->tiering_info = tiering_info;
+	req->lvol_priority_class = lvol_priority_class;
 
 	lvol = lvol_alloc(lvs, name, thin_provision, clear_method);
 	if (!lvol) {

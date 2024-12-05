@@ -18,6 +18,7 @@
 #define FORCE_FETCH_BIT 2
 #define SYNC_FETCH_BIT 4
 #define FLUSH_MODE_BIT 8
+#define TIER_BLOB_MD_BIT 16 // whether blob-specific metadata should in fact be tiered
 #define METADATA_PAGE_BIT 32
 
 #endif

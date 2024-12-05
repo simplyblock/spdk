@@ -23,6 +23,8 @@
 
 #include "blobstore.h"
 
+#include "spdk_internal/lvolstore.h"
+
 #define BLOB_CRC32C_INITIAL    0xffffffffUL
 
 static int bs_register_md_thread(struct spdk_blob_store *bs);
@@ -2626,6 +2628,12 @@ blob_persist(spdk_bs_sequence_t *seq, struct spdk_blob *blob,
 		return;
 	}
 	TAILQ_INSERT_HEAD(&blob->persists_to_complete, ctx, link);
+
+	/* tier blob-specific metadata if the blob is configured to do so
+	*/
+	const uint8_t blob_tiering_bits = atomic_load_explicit(&blob->tiering_bits, memory_order_relaxed);
+	// unset the metadata page bit mode if the blob must tier its metadata
+	seq->tiering_bits &= (blob_tiering_bits & TIER_BLOB_MD_BIT) ? ~METADATA_PAGE_BIT : 255;
 
 	bs_mark_dirty(seq, blob->bs, blob_persist_start, ctx);
 }
@@ -6472,6 +6480,16 @@ bs_create_blob(struct spdk_blob_store *bs,
 		rc = -ENOMEM;
 		goto error;
 	}
+
+	const uint8_t tiering_info = ((struct spdk_lvol_with_handle_req*)(cb_arg))->tiering_info;
+	const int lvol_priority_class = ((struct spdk_lvol_with_handle_req*)(cb_arg))->lvol_priority_class;
+	spdk_blob_set_tiering_info(blob, tiering_info);
+	spdk_blob_set_io_priority_class(blob, lvol_priority_class);
+
+	/* tier blob-specific metadata if the blob is configured to do so
+	*/
+	// unset the metadata page bit mode if the blob must tier its metadata
+	seq->tiering_bits &= (tiering_info & TIER_BLOB_MD_BIT) ? ~METADATA_PAGE_BIT : 255;
 
 	blob_persist(seq, blob, bs_create_blob_cpl, blob);
 	return;
@@ -10480,13 +10498,13 @@ spdk_blob_set_tiering_info(struct spdk_blob *blob, uint8_t tiering_bits)
 }
 
 void
-spdk_bs_support_storage_tiering(struct spdk_blob_store *bs, bool support_storage_tiering) {
-	bs->support_storage_tiering = support_storage_tiering;
+spdk_bs_untier_lvstore_md_pages(struct spdk_blob_store *bs, bool untier_lvstore_md_pages) {
+	bs->untier_lvstore_md_pages = untier_lvstore_md_pages;
 }
 
 bool
-spdk_bs_get_support_storage_tiering(struct spdk_blob_store *bs) {
-	return bs->support_storage_tiering;
+spdk_bs_get_untier_lvstore_md_pages(struct spdk_blob_store *bs) {
+	return bs->untier_lvstore_md_pages;
 }
 
 SPDK_LOG_REGISTER_COMPONENT(blob)

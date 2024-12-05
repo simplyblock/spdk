@@ -206,8 +206,8 @@ class UIRoot(UINode):
         return response
     
     @verbose
-    def lvstore_support_storage_tiering(self, **kwargs):
-        response = rpc.lvol.lvstore_support_storage_tiering(self.client, **kwargs)
+    def lvstore_untier_lvstore_md_pages(self, **kwargs):
+        response = rpc.lvol.lvstore_untier_lvstore_md_pages(self.client, **kwargs)
         return response
     
     @verbose

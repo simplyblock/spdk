@@ -95,7 +95,7 @@ bs_sequence_start(struct spdk_io_channel *_channel, struct spdk_bs_cpl *cpl,
 	set->back_channel = back_channel;
 
 	set->priority_class = channel->bs->priority_class;
-	set->tiering_bits = (channel->bs->support_storage_tiering && _channel == channel->bs->md_channel) ? METADATA_PAGE_BIT : 0;
+	set->tiering_bits = (channel->bs->untier_lvstore_md_pages && _channel == channel->bs->md_channel) ? METADATA_PAGE_BIT : 0;
 	set->cb_args.cb_fn = bs_sequence_completion;
 	set->cb_args.cb_arg = set;
 	set->cb_args.channel = channel->dev_channel;
@@ -518,7 +518,7 @@ bs_batch_open(struct spdk_io_channel *_channel, struct spdk_bs_cpl *cpl, struct 
 	set->u.batch.batch_closed = 0;
 
 	set->priority_class = blob->priority_class;
-	set->tiering_bits = (channel->bs->support_storage_tiering && _channel == channel->bs->md_channel) ? METADATA_PAGE_BIT : 0;
+	set->tiering_bits = (channel->bs->untier_lvstore_md_pages && _channel == channel->bs->md_channel) ? METADATA_PAGE_BIT : 0;
 	set->tiering_bits |= atomic_load_explicit(&blob->tiering_bits, memory_order_relaxed);
 	set->cb_args.cb_fn = bs_batch_completion;
 	set->cb_args.cb_arg = set;

@@ -37,7 +37,7 @@ struct rpc_bdev_lvol_create_lvstore {
 	uint32_t cluster_sz;
 	char *clear_method;
 	uint32_t num_md_pages_per_cluster_ratio;
-	bool support_storage_tiering;
+	bool untier_lvstore_md_pages;
 };
 
 static int
@@ -84,7 +84,7 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_create_lvstore_decode
 	{"lvs_name", offsetof(struct rpc_bdev_lvol_create_lvstore, lvs_name), spdk_json_decode_string},
 	{"clear_method", offsetof(struct rpc_bdev_lvol_create_lvstore, clear_method), spdk_json_decode_string, true},
 	{"num_md_pages_per_cluster_ratio", offsetof(struct rpc_bdev_lvol_create_lvstore, num_md_pages_per_cluster_ratio), spdk_json_decode_uint32, true},
-	{"support_storage_tiering", offsetof(struct rpc_bdev_lvol_create_lvstore, support_storage_tiering), spdk_json_decode_bool, true}
+	{"untier_lvstore_md_pages", offsetof(struct rpc_bdev_lvol_create_lvstore, untier_lvstore_md_pages), spdk_json_decode_bool, true}
 };
 
 static void
@@ -140,7 +140,7 @@ rpc_bdev_lvol_create_lvstore(struct spdk_jsonrpc_request *request,
 	}
 
 	rc = vbdev_lvs_create(req.bdev_name, req.lvs_name, req.cluster_sz, clear_method,
-			      req.num_md_pages_per_cluster_ratio, req.support_storage_tiering, rpc_lvol_store_construct_cb, request);
+			      req.num_md_pages_per_cluster_ratio, req.untier_lvstore_md_pages, rpc_lvol_store_construct_cb, request);
 	if (rc < 0) {
 		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
 		goto cleanup;
@@ -155,25 +155,25 @@ cleanup:
 SPDK_RPC_REGISTER("bdev_lvol_create_lvstore", rpc_bdev_lvol_create_lvstore, SPDK_RPC_RUNTIME)
 
 
-struct rpc_lvstore_support_storage_tiering {
+struct rpc_lvstore_untier_lvstore_md_pages {
 	char* lvs_name;
-	bool support_storage_tiering;
+	bool untier_lvstore_md_pages;
 };
 
 static void
-rpc_lvstore_support_storage_tiering(struct spdk_jsonrpc_request *request,
+rpc_lvstore_untier_lvstore_md_pages(struct spdk_jsonrpc_request *request,
 			     const struct spdk_json_val *params) 
 {
-	static const struct spdk_json_object_decoder rpc_lvstore_support_storage_tiering_decoders[] = {
-		{"lvs_name", offsetof(struct rpc_lvstore_support_storage_tiering, lvs_name), spdk_json_decode_string},
-		{"support_storage_tiering", offsetof(struct rpc_lvstore_support_storage_tiering, support_storage_tiering), spdk_json_decode_bool}
+	static const struct spdk_json_object_decoder rpc_lvstore_untier_lvstore_md_pages_decoders[] = {
+		{"lvs_name", offsetof(struct rpc_lvstore_untier_lvstore_md_pages, lvs_name), spdk_json_decode_string},
+		{"untier_lvstore_md_pages", offsetof(struct rpc_lvstore_untier_lvstore_md_pages, untier_lvstore_md_pages), spdk_json_decode_bool}
 	};
 
-	struct rpc_lvstore_support_storage_tiering req = {};
+	struct rpc_lvstore_untier_lvstore_md_pages req = {};
 	struct spdk_lvol_store *lvs;
 
-	if (spdk_json_decode_object(params, rpc_lvstore_support_storage_tiering_decoders,
-				    SPDK_COUNTOF(rpc_lvstore_support_storage_tiering_decoders),
+	if (spdk_json_decode_object(params, rpc_lvstore_untier_lvstore_md_pages_decoders,
+				    SPDK_COUNTOF(rpc_lvstore_untier_lvstore_md_pages_decoders),
 				    &req)) {
 		SPDK_INFOLOG(lvol_rpc, "spdk_json_decode_object failed\n");
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
@@ -188,14 +188,14 @@ rpc_lvstore_support_storage_tiering(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
-	vbdev_lvs_support_storage_tiering(lvs, req.support_storage_tiering);
+	vbdev_lvs_untier_lvstore_md_pages(lvs, req.untier_lvstore_md_pages);
 	spdk_jsonrpc_send_bool_response(request, true);
 
 cleanup:
 	free(req.lvs_name);
 }
 
-SPDK_RPC_REGISTER("lvstore_support_storage_tiering", rpc_lvstore_support_storage_tiering, SPDK_RPC_RUNTIME)
+SPDK_RPC_REGISTER("lvstore_untier_lvstore_md_pages", rpc_lvstore_untier_lvstore_md_pages, SPDK_RPC_RUNTIME)
 
 struct rpc_bdev_lvol_rename_lvstore {
 	char *old_name;
@@ -335,6 +335,7 @@ struct rpc_bdev_lvol_create {
 	bool force_fetch;
 	bool sync_fetch;
 	bool pure_flush_or_evict;
+	bool tier_blob_md;
 
 	uint8_t tiering_info;
 	uint64_t size_in_mib;
@@ -361,6 +362,7 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_create_decoders[] = {
 	{"force_fetch", offsetof(struct rpc_bdev_lvol_create, force_fetch), spdk_json_decode_bool, true},
 	{"sync_fetch", offsetof(struct rpc_bdev_lvol_create, sync_fetch), spdk_json_decode_bool, true},
 	{"pure_flush_or_evict", offsetof(struct rpc_bdev_lvol_create, pure_flush_or_evict), spdk_json_decode_bool, true},
+	{"tier_blob_md", offsetof(struct rpc_bdev_lvol_create, tier_blob_md), spdk_json_decode_bool, true}
 
 	{"size_in_mib", offsetof(struct rpc_bdev_lvol_create, size_in_mib), spdk_json_decode_uint64},
 	{"thin_provision", offsetof(struct rpc_bdev_lvol_create, thin_provision), spdk_json_decode_bool, true},
@@ -439,6 +441,7 @@ rpc_bdev_lvol_create(struct spdk_jsonrpc_request *request,
 	req.tiering_info |= req.force_fetch ? FORCE_FETCH_BIT : 0;
 	req.tiering_info |= req.sync_fetch ? SYNC_FETCH_BIT : 0;
 	req.tiering_info |= req.pure_flush_or_evict ? FLUSH_MODE_BIT : 0;
+	req.tiering_info |= req.tier_blob_md ? TIER_BLOB_MD_BIT : 0;
 
 	rc = vbdev_lvol_create(lvs, req.lvol_name, req.size_in_mib * 1024 * 1024,
 			       req.thin_provision, clear_method, req.lvol_priority_class, req.tiering_info, rpc_bdev_lvol_create_cb, request);
@@ -1235,7 +1238,7 @@ rpc_dump_lvol_store_info(struct spdk_json_write_ctx *w, struct lvol_store_bdev *
 	spdk_json_write_named_uint64(w, "free_clusters", spdk_bs_free_cluster_count(bs));
 	spdk_json_write_named_uint64(w, "block_size", spdk_bs_get_io_unit_size(bs));
 	spdk_json_write_named_uint64(w, "cluster_size", cluster_size);
-	spdk_json_write_named_bool(w, "support_storage_tiering", vbdev_lvs_get_support_storage_tiering(lvs_bdev->lvs));
+	spdk_json_write_named_bool(w, "untier_lvstore_md_pages", vbdev_lvs_get_untier_lvstore_md_pages(lvs_bdev->lvs));
 
 	spdk_json_write_object_end(w);
 }
@@ -1899,6 +1902,7 @@ struct rpc_bdev_lvol_set_tiering_info {
 	bool force_fetch;
 	bool sync_fetch;
 	bool pure_flush_or_evict;
+	bool tier_blob_md;
 
 	uint8_t tiering_info;
 };
@@ -1914,7 +1918,8 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_set_tiering_info_deco
 	{"is_tiered", offsetof(struct rpc_bdev_lvol_set_tiering_info, is_tiered), spdk_json_decode_bool},
 	{"force_fetch", offsetof(struct rpc_bdev_lvol_set_tiering_info, force_fetch), spdk_json_decode_bool},
 	{"sync_fetch", offsetof(struct rpc_bdev_lvol_set_tiering_info, sync_fetch), spdk_json_decode_bool},
-	{"pure_flush_or_evict", offsetof(struct rpc_bdev_lvol_set_tiering_info, pure_flush_or_evict), spdk_json_decode_bool}
+	{"pure_flush_or_evict", offsetof(struct rpc_bdev_lvol_set_tiering_info, pure_flush_or_evict), spdk_json_decode_bool},
+	{"tier_blob_md", offsetof(struct rpc_bdev_lvol_set_tiering_info, tier_blob_md), spdk_json_decode_bool}
 };
 
 static void
@@ -1972,6 +1977,7 @@ rpc_bdev_lvol_set_tiering_info(struct spdk_jsonrpc_request *request,
 	req.tiering_info |= req.force_fetch ? FORCE_FETCH_BIT : 0;
 	req.tiering_info |= req.sync_fetch ? SYNC_FETCH_BIT : 0;
 	req.tiering_info |= req.pure_flush_or_evict ? FLUSH_MODE_BIT : 0;
+	req.tiering_info |= req.tier_blob_md ? TIER_BLOB_MD_BIT : 0;
 
 	vbdev_lvol_set_tiering_info(lvol, req.tiering_info);
 	rpc_bdev_lvol_set_tiering_info_cb(request, 0);
