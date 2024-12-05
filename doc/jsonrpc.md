@@ -10041,7 +10041,7 @@ Example response:
 
 ### lvstore_untier_lvstore_md_pages {#rpc_lvstore_untier_lvstore_md_pages}
 
-Construct a logical volume store.
+Set whether lvolstore md pages should be untiered.
 
 #### Parameters
 
@@ -10261,7 +10261,8 @@ is_tiered               | Optional | boolean     | Whether this lvol is tiered, 
 sync_fetch              | Optional | boolean     | Whether fetch requests (tiered reads) from this lvol are force fetch (fetch even into  already unfetched data ranges)
 force_fetch             | Optional | boolean     | Whether regular client reads from this lvol need to wait synchronously for any of its unfetched ranges to be fetched
 pure_flush_or_evict    | Optional | boolean     | Whether a tiered write should be pure flush (mode 1) or eviction (mode 0)
-tier_blob_md           | Optional | boolean     | Whether blob-specific metadata should in fact be tiered
+untier_blob_md           | Optional | int    | For blob-specific metadata: 1 means this blob's md should in fact be untiered (even if lvolstore md is tiered), 
+2 means this blob's md should be tiered even if lvolstore md is untiered, and 0 (default) means this blob's md has the same tiering status as lvolstore md
 
 Size will be rounded up to a multiple of cluster size. Either uuid or lvs_name must be specified, but not both.
 lvol_name will be used in the alias of the created logical volume.
@@ -10355,7 +10356,8 @@ is_tiered               | Optional | boolean     | Whether this lvol is tiered, 
 sync_fetch              | Optional | boolean     | Whether fetch requests (tiered reads) from this lvol are force fetch (fetch even into  already unfetched data ranges)
 force_fetch             | Optional | boolean     | Whether regular client reads from this lvol need to wait synchronously for any of its unfetched ranges to be fetched
 pure_flush_or_evict    | Optional | boolean     | Whether a tiered write should be pure flush (mode 1) or eviction (mode 0)
-tier_blob_md           | Optional | boolean     | Whether blob-specific metadata should in fact be tiered
+untier_blob_md           | Optional | boolean     | For blob-specific metadata: 1 means this blob's md should in fact be untiered (even if lvolstore md is tiered), 
+2 means this blob's md should be tiered even if lvolstore md is untiered, and 0 (default) means this blob's md has the same tiering status as lvolstore md
 
 #### Response
 
@@ -10376,7 +10378,7 @@ Example request:
     "sync_fetch": true,
     "force_fetch": false,
     "pure_flush_or_evict": true,
-    "tier_blob_md": true
+    "untier_blob_md": 2
   }
 }
 ~~~

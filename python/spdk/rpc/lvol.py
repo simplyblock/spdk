@@ -72,7 +72,7 @@ def bdev_lvol_create(client, lvol_name, size_in_mib, thin_provision=False, uuid=
     force_fetch=False,
     sync_fetch=False,
     pure_flush_or_evict=False,
-    tier_blob_md=False):
+    untier_blob_md=False):
     """Create a logical volume on a logical volume store.
 
     Args:
@@ -87,7 +87,8 @@ def bdev_lvol_create(client, lvol_name, size_in_mib, thin_provision=False, uuid=
         force_fetch: whether fetch requests (tiered reads) from this lvol are force fetch (fetch even into already unfetched data ranges)
         sync_fetch: whether regular client reads from this lvol need to wait synchronously for any of its unfetched ranges to be fetched
         pure_flush_or_evict: whether a tiered write should be pure flush (mode 1) or eviction (mode 0)
-        tier_blob_md: whether blob-specific metadata should in fact be tiered
+        untier_blob_md: For blob-specific metadata: 1 means this blob's md should in fact be untiered (even if lvolstore md is tiered), 
+2 means this blob's md should be tiered even if lvolstore md is untiered, and 0 (default) means this blob's md has the same tiering status as lvolstore md
 
     Either uuid or lvs_name must be specified, but not both.
 
@@ -118,7 +119,7 @@ def bdev_lvol_create(client, lvol_name, size_in_mib, thin_provision=False, uuid=
     params['sync_fetch'] = sync_fetch
     params['force_fetch'] = force_fetch
     params['pure_flush_or_evict'] = pure_flush_or_evict
-    params['tier_blob_md'] = tier_blob_md
+    params['untier_blob_md'] = untier_blob_md
     return client.call('bdev_lvol_create', params)
 
 def bdev_lvs_dump(client, file, uuid=None, lvs_name=None):
@@ -155,11 +156,11 @@ def bdev_lvol_set_tiering_info(
     force_fetch,
     sync_fetch,
     pure_flush_or_evict,
-    tier_blob_md):
+    untier_blob_md):
 
     """ Set the storage tiering info of a logical volume. All fields must be provided even if they stay the same.
     """
-    params = {'lvol_name': lvol_name, 'is_tiered': is_tiered, 'force_fetch': force_fetch, 'sync_fetch': sync_fetch, 'pure_flush_or_evict': pure_flush_or_evict, 'tier_blob_md': tier_blob_md}
+    params = {'lvol_name': lvol_name, 'is_tiered': is_tiered, 'force_fetch': force_fetch, 'sync_fetch': sync_fetch, 'pure_flush_or_evict': pure_flush_or_evict, 'untier_blob_md': untier_blob_md}
     return client.call('bdev_lvol_set_tiering_info', params)
 
 def bdev_lvol_snapshot(client, lvol_name, snapshot_name):

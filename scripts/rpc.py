@@ -2053,7 +2053,7 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
                                              force_fetch=args.force_fetch,
                                              sync_fetch=args.sync_fetch,
                                              pure_flush_or_evict=args.pure_flush_or_evict,
-                                             tier_blob_md=args.tier_blob_md
+                                             untier_blob_md=args.untier_blob_md
                                              ))
 
     p = subparsers.add_parser('bdev_lvol_create', help='Add a bdev with an logical volume backend')
@@ -2069,7 +2069,7 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('force_fetch', help='whether fetch requests (tiered reads) from this lvol are force fetch (fetch even into already unfetched data ranges)', type=int)
     p.add_argument('sync_fetch', help='whether regular client reads from this lvol need to wait synchronously for any of its unfetched ranges to be fetched', type=int)
     p.add_argument('pure_flush_or_evict', help='whether a tiered write should be pure flush (mode 1) or eviction (mode 0)', type=int)
-    p.add_argument('tier_blob_md', help='whether blob-specific metadata should in fact be tiered', type=int)
+    p.add_argument('untier_blob_md', help="For blob-specific metadata: 1 means this blob' md should in fact be untiered (even if lvolstore md is tiered), 2 means this blob's md should be tiered even if lvolstore md is untiered, and 0 (default) means this blob's md has the same tiering status as lvolstore md", type=int)
     p.set_defaults(func=bdev_lvol_create)
     
     def bdev_lvs_dump(args):
@@ -2101,13 +2101,13 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
                                                       force_fetch=args.force_fetch,
                                                       sync_fetch=args.sync_fetch,
                                                       pure_flush_or_evict=args.pure_flush_or_evict,
-                                                      tier_blob_md=args.tier_blob_md))
+                                                      untier_blob_md=args.untier_blob_md))
     p = subparsers.add_parser('bdev_lvol_set_tiering_info', help="set or keep the tiering info fields of an lvol")
     p.add_argument('is_tiered', help='whether this lvol is tiered, hence sends tiered requests', type=int)
     p.add_argument('force_fetch', help='whether fetch requests (tiered reads) from this lvol are force fetch (fetch even into already unfetched data ranges)', type=int)
     p.add_argument('sync_fetch', help='whether regular client reads from this lvol need to wait synchronously for any of its unfetched ranges to be fetched', type=int)
     p.add_argument('pure_flush_or_evict', help='whether a tiered write should be pure flush (mode 1) or eviction (mode 0)', type=int)
-    p.add_argument('tier_blob_md', help='whether blob-specific metadata should in fact be tiered', type=int)
+    p.add_argument('untier_blob_md', help="For blob-specific metadata: 1 means this blob' md should in fact be untiered (even if lvolstore md is tiered), 2 means this blob's md should be tiered even if lvolstore md is untiered, and 0 (default) means this blob's md has the same tiering status as lvolstore md", type=int)
     p.set_defaults(func=bdev_lvol_set_tiering_info)
     
     def bdev_lvol_snapshot(args):

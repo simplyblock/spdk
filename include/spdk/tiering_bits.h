@@ -5,7 +5,7 @@
 
 #define TIERED_IO_MASK (1UL << 60)
 #define FORCE_FETCH_MASK (1UL << 61) // force a fetch write even into already-fetched chunks in case of a client fetch
-#define SYNC_FETCH_MASK FORCE_FETCH_MASK // in case of a regular client read, wait for all its pages to be fetched for any not in hot tier
+#define SYNC_FETCH_MASK FORCE_FETCH_MASK // in case of a regular client read, wait for all its ranges on its pages to be fetched for any not in hot tier
 #define FLUSH_MODE_MASK FORCE_FETCH_MASK // whether a tiered write should be pure flush (mode 1) or eviction (mode 0)
 #define METADATA_PAGE_MASK (1UL << 62) // whether the pages accessed are metadata, always set by an lvol metadata channel
 
@@ -18,7 +18,8 @@
 #define FORCE_FETCH_BIT 2
 #define SYNC_FETCH_BIT 4
 #define FLUSH_MODE_BIT 8
-#define TIER_BLOB_MD_BIT 16 // whether blob-specific metadata should in fact be tiered
-#define METADATA_PAGE_BIT 32
+#define UNTIER_BLOB_MD_BIT 16 // whether blob-specific metadata should in fact be untiered (if lvolstore md is tiered)
+#define DO_TIER_BLOB_MD_BIT 32 // whether blob-specific metadata should in fact be tiered even if lvolstore md is untiered
+#define METADATA_PAGE_BIT 64
 
 #endif
