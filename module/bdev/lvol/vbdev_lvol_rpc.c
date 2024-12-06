@@ -536,6 +536,8 @@ SPDK_RPC_REGISTER("bdev_lvs_dump", rpc_bdev_lvs_dump, SPDK_RPC_RUNTIME)
 struct rpc_bdev_lvol_snapshot {
 	char *lvol_name;
 	char *snapshot_name;
+	
+	int32_t lvol_priority_class;
 
 	bool is_tiered;
 	bool force_fetch;
@@ -617,6 +619,12 @@ rpc_bdev_lvol_snapshot(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
+	if (!(req.lvol_priority_class >= MIN_PRIORITY_CLASS && req.lvol_priority_class <= MAX_PRIORITY_CLASS)) {
+		SPDK_ERRLOG("lvol priority class is not within the allowed range of [%d, %d]", MIN_PRIORITY_CLASS, MAX_PRIORITY_CLASS);
+		spdk_jsonrpc_send_error_response(request, -EINVAL, spdk_strerror(EINVAL));
+		goto cleanup;
+	}
+
 	req.tiering_info = 0;
 	req.tiering_info |= req.is_tiered ? TIERED_BIT : 0;
 	req.tiering_info |= req.force_fetch ? FORCE_FETCH_BIT : 0;
@@ -624,7 +632,7 @@ rpc_bdev_lvol_snapshot(struct spdk_jsonrpc_request *request,
 	req.tiering_info |= req.pure_flush_or_evict ? FLUSH_MODE_BIT : 0;
 	req.tiering_info |= req.untier_blob_md == 1 ? UNTIER_BLOB_MD_BIT : (req.untier_blob_md == 2 ? DO_TIER_BLOB_MD_BIT : 0);
 
-	vbdev_lvol_create_snapshot(lvol, req.snapshot_name, rpc_bdev_lvol_snapshot_cb, request);
+	vbdev_lvol_create_snapshot(lvol, req.snapshot_name, req.lvol_priority_class, req.tiering_info, rpc_bdev_lvol_snapshot_cb, request);
 
 cleanup:
 	free_rpc_bdev_lvol_snapshot(&req);
@@ -635,6 +643,8 @@ SPDK_RPC_REGISTER("bdev_lvol_snapshot", rpc_bdev_lvol_snapshot, SPDK_RPC_RUNTIME
 struct rpc_bdev_lvol_clone {
 	char *snapshot_name;
 	char *clone_name;
+
+	int32_t lvol_priority_class;
 
 	bool is_tiered;
 	bool force_fetch;
@@ -716,6 +726,12 @@ rpc_bdev_lvol_clone(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
+	if (!(req.lvol_priority_class >= MIN_PRIORITY_CLASS && req.lvol_priority_class <= MAX_PRIORITY_CLASS)) {
+		SPDK_ERRLOG("lvol priority class is not within the allowed range of [%d, %d]", MIN_PRIORITY_CLASS, MAX_PRIORITY_CLASS);
+		spdk_jsonrpc_send_error_response(request, -EINVAL, spdk_strerror(EINVAL));
+		goto cleanup;
+	}
+
 	req.tiering_info = 0;
 	req.tiering_info |= req.is_tiered ? TIERED_BIT : 0;
 	req.tiering_info |= req.force_fetch ? FORCE_FETCH_BIT : 0;
@@ -723,7 +739,7 @@ rpc_bdev_lvol_clone(struct spdk_jsonrpc_request *request,
 	req.tiering_info |= req.pure_flush_or_evict ? FLUSH_MODE_BIT : 0;
 	req.tiering_info |= req.untier_blob_md == 1 ? UNTIER_BLOB_MD_BIT : (req.untier_blob_md == 2 ? DO_TIER_BLOB_MD_BIT : 0);
 
-	vbdev_lvol_create_clone(lvol, req.clone_name, rpc_bdev_lvol_clone_cb, request);
+	vbdev_lvol_create_clone(lvol, req.clone_name, req.lvol_priority_class, req.tiering_info, rpc_bdev_lvol_clone_cb, request);
 
 cleanup:
 	free_rpc_bdev_lvol_clone(&req);
