@@ -6402,6 +6402,35 @@ blob_opts_copy(const struct spdk_blob_opts *src, struct spdk_blob_opts *dst)
 #undef SET_FIELD
 }
 
+struct spdk_clone_snapshot_ctx {
+	struct spdk_bs_cpl      cpl;
+	int bserrno;
+	bool frozen;
+
+	struct spdk_io_channel *channel;
+
+	/* Current cluster for inflate operation */
+	uint64_t cluster;
+
+	/* For inflation force allocation of all unallocated clusters and remove
+	 * thin-provisioning. Otherwise only decouple parent and keep clone thin. */
+	bool allocate_all;
+
+	struct {
+		spdk_blob_id id;
+		struct spdk_blob *blob;
+		bool md_ro;
+	} original;
+	struct {
+		spdk_blob_id id;
+		struct spdk_blob *blob;
+	} new;
+
+	/* xattrs specified for snapshot/clones only. They have no impact on
+	 * the original blobs xattrs. */
+	const struct spdk_blob_xattr_opts *xattrs;
+};
+
 static void
 bs_create_blob(struct spdk_blob_store *bs,
 	       const struct spdk_blob_opts *opts,
@@ -6552,35 +6581,6 @@ spdk_bs_create_blob_ext(struct spdk_blob_store *bs, const struct spdk_blob_opts 
 /* END spdk_bs_create_blob */
 
 /* START blob_cleanup */
-
-struct spdk_clone_snapshot_ctx {
-	struct spdk_bs_cpl      cpl;
-	int bserrno;
-	bool frozen;
-
-	struct spdk_io_channel *channel;
-
-	/* Current cluster for inflate operation */
-	uint64_t cluster;
-
-	/* For inflation force allocation of all unallocated clusters and remove
-	 * thin-provisioning. Otherwise only decouple parent and keep clone thin. */
-	bool allocate_all;
-
-	struct {
-		spdk_blob_id id;
-		struct spdk_blob *blob;
-		bool md_ro;
-	} original;
-	struct {
-		spdk_blob_id id;
-		struct spdk_blob *blob;
-	} new;
-
-	/* xattrs specified for snapshot/clones only. They have no impact on
-	 * the original blobs xattrs. */
-	const struct spdk_blob_xattr_opts *xattrs;
-};
 
 static void
 bs_clone_snapshot_cleanup_finish(void *cb_arg, int bserrno)
