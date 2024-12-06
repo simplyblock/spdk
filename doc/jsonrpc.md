@@ -10256,7 +10256,7 @@ thin_provision          | Optional | boolean     | True to enable thin provision
 uuid                    | Optional | string      | UUID of logical volume store to create logical volume on
 lvs_name                | Optional | string      | Name of logical volume store to create logical volume on
 clear_method            | Optional | string      | Change default data clusters clear method. Available: none, unmap, write_zeroes
-priority_class          | Optional | int         | Value of the I/O priority class for the lvol. Default 0
+lvol_priority_class     | Optional | int         | Value of the I/O priority class for the lvol. Default 0
 is_tiered               | Optional | boolean     | Whether this lvol is tiered, hence sends tiered requests
 sync_fetch              | Optional | boolean     | Whether fetch requests (tiered reads) from this lvol are force fetch (fetch even into  already unfetched data ranges)
 force_fetch             | Optional | boolean     | Whether regular client reads from this lvol need to wait synchronously for any of its unfetched ranges to be fetched
@@ -10403,6 +10403,13 @@ Name                    | Optional | Type        | Description
 ----------------------- | -------- | ----------- | -----------
 lvol_name               | Required | string      | UUID or alias of the logical volume to create a snapshot from
 snapshot_name           | Required | string      | Name for the newly created snapshot
+lvol_priority_class     | Optional | int         | Value of the I/O priority class for the lvol. Default 0
+is_tiered               | Optional | boolean     | Whether this lvol is tiered, hence sends tiered requests
+sync_fetch              | Optional | boolean     | Whether fetch requests (tiered reads) from this lvol are force fetch (fetch even into  already unfetched data ranges)
+force_fetch             | Optional | boolean     | Whether regular client reads from this lvol need to wait synchronously for any of its unfetched ranges to be fetched
+pure_flush_or_evict    | Optional | boolean     | Whether a tiered write should be pure flush (mode 1) or eviction (mode 0)
+untier_blob_md           | Optional | int    | For blob-specific metadata: 1 means this blob's md should in fact be untiered (even if lvolstore md is tiered), 
+2 means this blob's md should be tiered even if lvolstore md is untiered, and 0 (default) means this blob's md has the same tiering status as lvolstore md
 
 #### Response
 
@@ -10444,6 +10451,13 @@ Name                    | Optional | Type        | Description
 ----------------------- | -------- | ----------- | -----------
 snapshot_name           | Required | string      | UUID or alias of the snapshot to clone
 clone_name              | Required | string      | Name for the logical volume to create
+lvol_priority_class     | Optional | int         | Value of the I/O priority class for the lvol. Default 0
+is_tiered               | Optional | boolean     | Whether this lvol is tiered, hence sends tiered requests
+sync_fetch              | Optional | boolean     | Whether fetch requests (tiered reads) from this lvol are force fetch (fetch even into  already unfetched data ranges)
+force_fetch             | Optional | boolean     | Whether regular client reads from this lvol need to wait synchronously for any of its unfetched ranges to be fetched
+pure_flush_or_evict    | Optional | boolean     | Whether a tiered write should be pure flush (mode 1) or eviction (mode 0)
+untier_blob_md           | Optional | int    | For blob-specific metadata: 1 means this blob's md should in fact be untiered (even if lvolstore md is tiered), 
+2 means this blob's md should be tiered even if lvolstore md is untiered, and 0 (default) means this blob's md has the same tiering status as lvolstore md
 
 #### Response
 

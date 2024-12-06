@@ -45,10 +45,10 @@ int vbdev_lvs_dump(struct spdk_lvol_store *lvs, const char *file,
 		      spdk_lvol_op_with_handle_complete cb_fn,
 		      void *cb_arg);			  
 
-void vbdev_lvol_create_snapshot(struct spdk_lvol *lvol, const char *snapshot_name,
+void vbdev_lvol_create_snapshot(struct spdk_lvol *lvol, const char *snapshot_name, uint8_t lvol_priority_class, uint8_t tiering_info,
 				spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
 
-void vbdev_lvol_create_clone(struct spdk_lvol *lvol, const char *clone_name,
+void vbdev_lvol_create_clone(struct spdk_lvol *lvol, const char *clone_name, uint8_t lvol_priority_class, uint8_t tiering_info,
 			     spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
 void vbdev_lvol_create_bdev_clone(const char *esnap_uuid,
 				  struct spdk_lvol_store *lvs, const char *clone_name,

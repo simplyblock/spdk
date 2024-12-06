@@ -1089,7 +1089,7 @@ ut_lvol_snapshot(void)
 	lvol = g_lvol;
 
 	/* Successful snap create */
-	vbdev_lvol_create_snapshot(lvol, "snap", vbdev_lvol_create_complete, NULL);
+	vbdev_lvol_create_snapshot(lvol, "snap", 0, 0, vbdev_lvol_create_complete, NULL);
 	SPDK_CU_ASSERT_FATAL(rc == 0);
 	CU_ASSERT(g_lvol != NULL);
 	CU_ASSERT(g_lvolerrno == 0);
@@ -1139,7 +1139,7 @@ ut_lvol_clone(void)
 	lvol = g_lvol;
 
 	/* Successful snap create */
-	vbdev_lvol_create_snapshot(lvol, "snap", vbdev_lvol_create_complete, NULL);
+	vbdev_lvol_create_snapshot(lvol, "snap", 0, 0, vbdev_lvol_create_complete, NULL);
 	SPDK_CU_ASSERT_FATAL(rc == 0);
 	SPDK_CU_ASSERT_FATAL(g_lvol != NULL);
 	CU_ASSERT(g_lvolerrno == 0);
@@ -1147,7 +1147,7 @@ ut_lvol_clone(void)
 	snap = g_lvol;
 
 	/* Successful clone create */
-	vbdev_lvol_create_clone(snap, "clone", vbdev_lvol_create_complete, NULL);
+	vbdev_lvol_create_clone(snap, "clone", 0, 0, vbdev_lvol_create_complete, NULL);
 
 	SPDK_CU_ASSERT_FATAL(rc == 0);
 	SPDK_CU_ASSERT_FATAL(g_lvol != NULL);

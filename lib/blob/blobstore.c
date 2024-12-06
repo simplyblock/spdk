@@ -6450,9 +6450,14 @@ bs_create_blob(struct spdk_blob_store *bs,
 		blob->invalid_flags |= SPDK_BLOB_EXTENT_TABLE;
 	}
 
+	void* bits_cb_arg = cb_arg;
+
 	if (!internal_xattrs) {
 		blob_xattrs_init(&internal_xattrs_default);
 		internal_xattrs = &internal_xattrs_default;
+	} else {
+		// snapshot or clone
+		bits_cb_arg = ((struct spdk_clone_snapshot_ctx*)(cb_arg))->cpl.u.blobid.cb_arg;
 	}
 
 	rc = blob_set_xattrs(blob, &opts_local.xattrs, false);
@@ -6503,8 +6508,8 @@ bs_create_blob(struct spdk_blob_store *bs,
 		goto error;
 	}
 
-	const uint8_t blob_tiering_bits = ((struct spdk_lvol_with_handle_req*)(cb_arg))->tiering_info;
-	const int lvol_priority_class = ((struct spdk_lvol_with_handle_req*)(cb_arg))->lvol_priority_class;
+	const uint8_t blob_tiering_bits = ((struct spdk_lvol_with_handle_req*)(bits_cb_arg))->tiering_info;
+	const int lvol_priority_class = ((struct spdk_lvol_with_handle_req*)(bits_cb_arg))->lvol_priority_class;
 	spdk_blob_set_tiering_info(blob, blob_tiering_bits);
 	spdk_blob_set_io_priority_class(blob, lvol_priority_class);
 

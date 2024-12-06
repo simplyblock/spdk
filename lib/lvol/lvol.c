@@ -1300,7 +1300,9 @@ spdk_lvol_create_esnap_clone(const void *esnap_id, uint32_t id_len, uint64_t siz
 void
 spdk_lvol_create_snapshot(struct spdk_lvol *origlvol, const char *snapshot_name,
 			  spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg)
-{
+{	const uint8_t tiering_info = ((struct spdk_lvol_with_handle_req*)(cb_arg))->tiering_info;
+	const int lvol_priority_class = ((struct spdk_lvol_with_handle_req*)(cb_arg))->lvol_priority_class;
+
 	struct spdk_lvol_store *lvs;
 	struct spdk_lvol *newlvol;
 	struct spdk_blob *origblob;
@@ -1353,6 +1355,8 @@ spdk_lvol_create_snapshot(struct spdk_lvol *origlvol, const char *snapshot_name,
 	req->origlvol = origlvol;
 	req->cb_fn = cb_fn;
 	req->cb_arg = cb_arg;
+	req->lvol_priority_class = lvol_priority_class;
+	req->tiering_info = tiering_info;
 
 	spdk_bs_create_snapshot(lvs->blobstore, spdk_blob_get_id(origblob), &snapshot_xattrs,
 				lvol_create_cb, req);
@@ -1362,6 +1366,9 @@ void
 spdk_lvol_create_clone(struct spdk_lvol *origlvol, const char *clone_name,
 		       spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg)
 {
+	const uint8_t tiering_info = ((struct spdk_lvol_with_handle_req*)(cb_arg))->tiering_info;
+	const int lvol_priority_class = ((struct spdk_lvol_with_handle_req*)(cb_arg))->lvol_priority_class;
+
 	struct spdk_lvol *newlvol;
 	struct spdk_lvol_with_handle_req *req;
 	struct spdk_lvol_store *lvs;
@@ -1412,6 +1419,8 @@ spdk_lvol_create_clone(struct spdk_lvol *origlvol, const char *clone_name,
 	req->lvol = newlvol;
 	req->cb_fn = cb_fn;
 	req->cb_arg = cb_arg;
+	req->tiering_info = tiering_info;
+	req->lvol_priority_class = lvol_priority_class;
 
 	spdk_bs_create_clone(lvs->blobstore, spdk_blob_get_id(origblob), &clone_xattrs,
 			     lvol_create_cb,

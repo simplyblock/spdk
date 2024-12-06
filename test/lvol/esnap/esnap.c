@@ -510,7 +510,7 @@ esnap_remove_degraded(void)
 	 * State:
 	 *   esnap <-- vol2 <-- vol1
 	 */
-	vbdev_lvol_create_snapshot(vol1, "vol2", lvol_op_with_handle_cb, clear_owh(&owh_data));
+	vbdev_lvol_create_snapshot(vol1, "vol2", 0, 0, lvol_op_with_handle_cb, clear_owh(&owh_data));
 	poll_error_updated(&owh_data.lvserrno);
 	SPDK_CU_ASSERT_FATAL(owh_data.lvserrno == 0);
 	SPDK_CU_ASSERT_FATAL(owh_data.u.lvol != NULL);
@@ -521,7 +521,7 @@ esnap_remove_degraded(void)
 	 *   esnap <-- vol2 <-- vol1
 	 *                `---- vol3
 	 */
-	vbdev_lvol_create_clone(vol2, "vol3", lvol_op_with_handle_cb, clear_owh(&owh_data));
+	vbdev_lvol_create_clone(vol2, "vol3", 0, 0, lvol_op_with_handle_cb, clear_owh(&owh_data));
 	poll_error_updated(&owh_data.lvserrno);
 	SPDK_CU_ASSERT_FATAL(owh_data.lvserrno == 0);
 	SPDK_CU_ASSERT_FATAL(owh_data.u.lvol != NULL);

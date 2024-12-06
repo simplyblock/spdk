@@ -72,7 +72,7 @@ def bdev_lvol_create(client, lvol_name, size_in_mib, thin_provision=False, uuid=
     force_fetch=False,
     sync_fetch=False,
     pure_flush_or_evict=False,
-    untier_blob_md=False):
+    untier_blob_md=0):
     """Create a logical volume on a logical volume store.
 
     Args:
@@ -163,36 +163,83 @@ def bdev_lvol_set_tiering_info(
     params = {'lvol_name': lvol_name, 'is_tiered': is_tiered, 'force_fetch': force_fetch, 'sync_fetch': sync_fetch, 'pure_flush_or_evict': pure_flush_or_evict, 'untier_blob_md': untier_blob_md}
     return client.call('bdev_lvol_set_tiering_info', params)
 
-def bdev_lvol_snapshot(client, lvol_name, snapshot_name):
+def bdev_lvol_snapshot(
+    client, 
+    lvol_name, 
+    snapshot_name,  
+    lvol_priority_class=0,   
+    is_tiered=False,
+    force_fetch=False,
+    sync_fetch=False,
+    pure_flush_or_evict=False,
+    untier_blob_md=0):
     """Capture a snapshot of the current state of a logical volume.
 
     Args:
         lvol_name: logical volume to create a snapshot from
         snapshot_name: name for the newly created snapshot
 
+        For this snapshot:
+
+        lvol_priority_class: integer lvol priority class for priority I/O within the range [0, 15], default 0 (optional)
+        is_tiered: whether this lvol is tiered, hence sends tiered requests
+        force_fetch: whether fetch requests (tiered reads) from this lvol are force fetch (fetch even into already unfetched data ranges)
+        sync_fetch: whether regular client reads from this lvol need to wait synchronously for any of its unfetched ranges to be fetched
+        pure_flush_or_evict: whether a tiered write should be pure flush (mode 1) or eviction (mode 0)
+        untier_blob_md: For blob-specific metadata: 1 means this blob's md should in fact be untiered (even if lvolstore md is tiered), 
+2 means this blob's md should be tiered even if lvolstore md is untiered, and 0 (default) means this blob's md has the same tiering status as lvolstore md
+
     Returns:
         Name of created logical volume snapshot.
     """
     params = {
         'lvol_name': lvol_name,
-        'snapshot_name': snapshot_name
+        'snapshot_name': snapshot_name,
+        'lvol_priority_class': lvol_priority_class,
+        'is_tiered': is_tiered,
+        'force_fetch': force_fetch,
+        'pure_flush_or_evict': pure_flush_or_evict,
+        'untier_blob_md': untier_blob_md
     }
     return client.call('bdev_lvol_snapshot', params)
 
 
-def bdev_lvol_clone(client, snapshot_name, clone_name):
+def bdev_lvol_clone(
+    client, 
+    snapshot_name, 
+    clone_name,
+    is_tiered=False,
+    force_fetch=False,
+    sync_fetch=False,
+    pure_flush_or_evict=False,
+    untier_blob_md=0):
     """Create a logical volume based on a snapshot.
 
     Args:
         snapshot_name: snapshot to clone
         clone_name: name of logical volume to create
 
+        For this clone:
+
+        lvol_priority_class: integer lvol priority class for priority I/O within the range [0, 15], default 0 (optional)
+        is_tiered: whether this lvol is tiered, hence sends tiered requests
+        force_fetch: whether fetch requests (tiered reads) from this lvol are force fetch (fetch even into already unfetched data ranges)
+        sync_fetch: whether regular client reads from this lvol need to wait synchronously for any of its unfetched ranges to be fetched
+        pure_flush_or_evict: whether a tiered write should be pure flush (mode 1) or eviction (mode 0)
+        untier_blob_md: For blob-specific metadata: 1 means this blob's md should in fact be untiered (even if lvolstore md is tiered), 
+2 means this blob's md should be tiered even if lvolstore md is untiered, and 0 (default) means this blob's md has the same tiering status as lvolstore md
+
     Returns:
         Name of created logical volume clone.
     """
     params = {
         'snapshot_name': snapshot_name,
-        'clone_name': clone_name
+        'clone_name': clone_name,
+        'lvol_priority_class': lvol_priority_class,
+        'is_tiered': is_tiered,
+        'force_fetch': force_fetch,
+        'pure_flush_or_evict': pure_flush_or_evict,
+        'untier_blob_md': untier_blob_md
     }
     return client.call('bdev_lvol_clone', params)
 

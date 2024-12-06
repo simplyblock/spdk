@@ -536,6 +536,14 @@ SPDK_RPC_REGISTER("bdev_lvs_dump", rpc_bdev_lvs_dump, SPDK_RPC_RUNTIME)
 struct rpc_bdev_lvol_snapshot {
 	char *lvol_name;
 	char *snapshot_name;
+
+	bool is_tiered;
+	bool force_fetch;
+	bool sync_fetch;
+	bool pure_flush_or_evict;
+	bool untier_blob_md;
+
+	uint8_t tiering_info;
 };
 
 static void
@@ -548,6 +556,12 @@ free_rpc_bdev_lvol_snapshot(struct rpc_bdev_lvol_snapshot *req)
 static const struct spdk_json_object_decoder rpc_bdev_lvol_snapshot_decoders[] = {
 	{"lvol_name", offsetof(struct rpc_bdev_lvol_snapshot, lvol_name), spdk_json_decode_string},
 	{"snapshot_name", offsetof(struct rpc_bdev_lvol_snapshot, snapshot_name), spdk_json_decode_string},
+
+	{"is_tiered", offsetof(struct rpc_bdev_lvol_create, is_tiered), spdk_json_decode_bool, true},
+	{"force_fetch", offsetof(struct rpc_bdev_lvol_create, force_fetch), spdk_json_decode_bool, true},
+	{"sync_fetch", offsetof(struct rpc_bdev_lvol_create, sync_fetch), spdk_json_decode_bool, true},
+	{"pure_flush_or_evict", offsetof(struct rpc_bdev_lvol_create, pure_flush_or_evict), spdk_json_decode_bool, true},
+	{"untier_blob_md", offsetof(struct rpc_bdev_lvol_create, untier_blob_md), spdk_json_decode_bool, true},
 };
 
 static void
@@ -603,6 +617,13 @@ rpc_bdev_lvol_snapshot(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
+	req.tiering_info = 0;
+	req.tiering_info |= req.is_tiered ? TIERED_BIT : 0;
+	req.tiering_info |= req.force_fetch ? FORCE_FETCH_BIT : 0;
+	req.tiering_info |= req.sync_fetch ? SYNC_FETCH_BIT : 0;
+	req.tiering_info |= req.pure_flush_or_evict ? FLUSH_MODE_BIT : 0;
+	req.tiering_info |= req.untier_blob_md == 1 ? UNTIER_BLOB_MD_BIT : (req.untier_blob_md == 2 ? DO_TIER_BLOB_MD_BIT : 0);
+
 	vbdev_lvol_create_snapshot(lvol, req.snapshot_name, rpc_bdev_lvol_snapshot_cb, request);
 
 cleanup:
@@ -614,6 +635,14 @@ SPDK_RPC_REGISTER("bdev_lvol_snapshot", rpc_bdev_lvol_snapshot, SPDK_RPC_RUNTIME
 struct rpc_bdev_lvol_clone {
 	char *snapshot_name;
 	char *clone_name;
+
+	bool is_tiered;
+	bool force_fetch;
+	bool sync_fetch;
+	bool pure_flush_or_evict;
+	bool untier_blob_md;
+
+	uint8_t tiering_info;
 };
 
 static void
@@ -626,6 +655,12 @@ free_rpc_bdev_lvol_clone(struct rpc_bdev_lvol_clone *req)
 static const struct spdk_json_object_decoder rpc_bdev_lvol_clone_decoders[] = {
 	{"snapshot_name", offsetof(struct rpc_bdev_lvol_clone, snapshot_name), spdk_json_decode_string},
 	{"clone_name", offsetof(struct rpc_bdev_lvol_clone, clone_name), spdk_json_decode_string, true},
+
+	{"is_tiered", offsetof(struct rpc_bdev_lvol_create, is_tiered), spdk_json_decode_bool, true},
+	{"force_fetch", offsetof(struct rpc_bdev_lvol_create, force_fetch), spdk_json_decode_bool, true},
+	{"sync_fetch", offsetof(struct rpc_bdev_lvol_create, sync_fetch), spdk_json_decode_bool, true},
+	{"pure_flush_or_evict", offsetof(struct rpc_bdev_lvol_create, pure_flush_or_evict), spdk_json_decode_bool, true},
+	{"untier_blob_md", offsetof(struct rpc_bdev_lvol_create, untier_blob_md), spdk_json_decode_bool, true},
 };
 
 static void
@@ -680,6 +715,13 @@ rpc_bdev_lvol_clone(struct spdk_jsonrpc_request *request,
 		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
 		goto cleanup;
 	}
+
+	req.tiering_info = 0;
+	req.tiering_info |= req.is_tiered ? TIERED_BIT : 0;
+	req.tiering_info |= req.force_fetch ? FORCE_FETCH_BIT : 0;
+	req.tiering_info |= req.sync_fetch ? SYNC_FETCH_BIT : 0;
+	req.tiering_info |= req.pure_flush_or_evict ? FLUSH_MODE_BIT : 0;
+	req.tiering_info |= req.untier_blob_md == 1 ? UNTIER_BLOB_MD_BIT : (req.untier_blob_md == 2 ? DO_TIER_BLOB_MD_BIT : 0);
 
 	vbdev_lvol_create_clone(lvol, req.clone_name, rpc_bdev_lvol_clone_cb, request);
 
