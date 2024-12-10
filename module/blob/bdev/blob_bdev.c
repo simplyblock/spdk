@@ -54,10 +54,13 @@ static void
 bdev_blob_io_complete(struct spdk_bdev_io *bdev_io, bool success, void *arg)
 {
 	struct spdk_bs_dev_cb_args *cb_args = arg;
+	int8_t status = spdk_bdev_io_get_status(bdev_io);
 	int bserrno;
 
 	if (success) {
 		bserrno = 0;
+	} else if (status == -7) {
+		bserrno = -ECONNABORTED; // best Linux abort error code there is
 	} else {
 		bserrno = -EIO;
 	}

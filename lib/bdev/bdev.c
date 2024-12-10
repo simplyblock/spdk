@@ -7394,6 +7394,10 @@ spdk_bdev_io_complete(struct spdk_bdev_io *bdev_io, enum spdk_bdev_io_status sta
 	bdev_io_complete(bdev_io);
 }
 
+enum spdk_bdev_io_status spdk_bdev_io_get_status(struct spdk_bdev_io *bdev_io) {
+	return bdev_io->internal.status;
+}
+
 void
 spdk_bdev_io_complete_scsi_status(struct spdk_bdev_io *bdev_io, enum spdk_scsi_status sc,
 				  enum spdk_scsi_sense sk, uint8_t asc, uint8_t ascq)
