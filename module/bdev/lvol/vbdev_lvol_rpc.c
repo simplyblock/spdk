@@ -335,7 +335,7 @@ struct rpc_bdev_lvol_create {
 	bool force_fetch;
 	bool sync_fetch;
 	bool pure_flush_or_evict;
-	bool untier_blob_md;
+	uint8_t untier_blob_md;
 
 	uint8_t tiering_info;
 	uint64_t size_in_mib;
@@ -362,7 +362,7 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_create_decoders[] = {
 	{"force_fetch", offsetof(struct rpc_bdev_lvol_create, force_fetch), spdk_json_decode_bool, true},
 	{"sync_fetch", offsetof(struct rpc_bdev_lvol_create, sync_fetch), spdk_json_decode_bool, true},
 	{"pure_flush_or_evict", offsetof(struct rpc_bdev_lvol_create, pure_flush_or_evict), spdk_json_decode_bool, true},
-	{"untier_blob_md", offsetof(struct rpc_bdev_lvol_create, untier_blob_md), spdk_json_decode_bool, true},
+	{"untier_blob_md", offsetof(struct rpc_bdev_lvol_create, untier_blob_md), spdk_json_decode_uint8, true},
 
 	{"size_in_mib", offsetof(struct rpc_bdev_lvol_create, size_in_mib), spdk_json_decode_uint64},
 	{"thin_provision", offsetof(struct rpc_bdev_lvol_create, thin_provision), spdk_json_decode_bool, true},
@@ -543,7 +543,7 @@ struct rpc_bdev_lvol_snapshot {
 	bool force_fetch;
 	bool sync_fetch;
 	bool pure_flush_or_evict;
-	bool untier_blob_md;
+	uint8_t untier_blob_md;
 
 	uint8_t tiering_info;
 };
@@ -563,7 +563,7 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_snapshot_decoders[] =
 	{"force_fetch", offsetof(struct rpc_bdev_lvol_create, force_fetch), spdk_json_decode_bool, true},
 	{"sync_fetch", offsetof(struct rpc_bdev_lvol_create, sync_fetch), spdk_json_decode_bool, true},
 	{"pure_flush_or_evict", offsetof(struct rpc_bdev_lvol_create, pure_flush_or_evict), spdk_json_decode_bool, true},
-	{"untier_blob_md", offsetof(struct rpc_bdev_lvol_create, untier_blob_md), spdk_json_decode_bool, true},
+	{"untier_blob_md", offsetof(struct rpc_bdev_lvol_create, untier_blob_md), spdk_json_decode_uint8, true},
 };
 
 static void
@@ -650,7 +650,7 @@ struct rpc_bdev_lvol_clone {
 	bool force_fetch;
 	bool sync_fetch;
 	bool pure_flush_or_evict;
-	bool untier_blob_md;
+	uint8_t untier_blob_md;
 
 	uint8_t tiering_info;
 };
@@ -670,7 +670,7 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_clone_decoders[] = {
 	{"force_fetch", offsetof(struct rpc_bdev_lvol_create, force_fetch), spdk_json_decode_bool, true},
 	{"sync_fetch", offsetof(struct rpc_bdev_lvol_create, sync_fetch), spdk_json_decode_bool, true},
 	{"pure_flush_or_evict", offsetof(struct rpc_bdev_lvol_create, pure_flush_or_evict), spdk_json_decode_bool, true},
-	{"untier_blob_md", offsetof(struct rpc_bdev_lvol_create, untier_blob_md), spdk_json_decode_bool, true},
+	{"untier_blob_md", offsetof(struct rpc_bdev_lvol_create, untier_blob_md), spdk_json_decode_uint8, true},
 };
 
 static void
@@ -1960,7 +1960,7 @@ struct rpc_bdev_lvol_set_tiering_info {
 	bool force_fetch;
 	bool sync_fetch;
 	bool pure_flush_or_evict;
-	bool untier_blob_md;
+	uint8_t untier_blob_md;
 
 	uint8_t tiering_info;
 };
@@ -1977,7 +1977,7 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_set_tiering_info_deco
 	{"force_fetch", offsetof(struct rpc_bdev_lvol_set_tiering_info, force_fetch), spdk_json_decode_bool},
 	{"sync_fetch", offsetof(struct rpc_bdev_lvol_set_tiering_info, sync_fetch), spdk_json_decode_bool},
 	{"pure_flush_or_evict", offsetof(struct rpc_bdev_lvol_set_tiering_info, pure_flush_or_evict), spdk_json_decode_bool},
-	{"untier_blob_md", offsetof(struct rpc_bdev_lvol_set_tiering_info, untier_blob_md), spdk_json_decode_bool}
+	{"untier_blob_md", offsetof(struct rpc_bdev_lvol_set_tiering_info, untier_blob_md), spdk_json_decode_uint8}
 };
 
 static void
