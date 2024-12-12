@@ -149,7 +149,7 @@ extern struct spdk_nvme_transport_opts g_spdk_nvme_transport_opts;
  */
 #define NVME_QUIRK_MINIMUM_ADMIN_QUEUE_SIZE 0x20000
 
-#define NVME_MAX_ASYNC_EVENTS	(8)
+#define NVME_MAX_ASYNC_EVENTS	(4)
 
 #define NVME_MAX_ADMIN_TIMEOUT_IN_SECS	(30)
 
