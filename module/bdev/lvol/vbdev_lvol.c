@@ -2139,4 +2139,12 @@ bool vbdev_lvs_get_untier_lvstore_md_pages(struct spdk_lvol_store *lvs) {
 	return spdk_bs_get_untier_lvstore_md_pages(lvs->blobstore);
 }
 
+void vbdev_lvol_backup_snapshot(struct snapshot_backup_ctx *sctx) {
+	spdk_blob_start_snapshot_backup(sctx);
+}
+
+void vbdev_lvol_get_snapshot_backup_status(struct snapshot_backup_ctx *sctx) {
+	spdk_blob_get_snapshot_backup_status(sctx);
+}
+
 SPDK_LOG_REGISTER_COMPONENT(vbdev_lvol)

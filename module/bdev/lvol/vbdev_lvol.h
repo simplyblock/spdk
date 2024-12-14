@@ -163,4 +163,8 @@ void vbdev_lvs_untier_lvstore_md_pages(struct spdk_lvol_store *lvs, bool untier_
 
 bool vbdev_lvs_get_untier_lvstore_md_pages(struct spdk_lvol_store *lvs);
 
+void vbdev_lvol_backup_snapshot(struct snapshot_backup_ctx *sctx);
+
+void vbdev_lvol_get_snapshot_backup_status(struct snapshot_backup_ctx *sctx);
+
 #endif /* SPDK_VBDEV_LVOL_H */

@@ -1274,6 +1274,41 @@ void spdk_bs_untier_lvstore_md_pages(struct spdk_blob_store *bs, bool untier_lvs
 
 bool spdk_bs_get_untier_lvstore_md_pages(struct spdk_blob_store *bs);
 
+enum EFlushStatus {
+	FLUSH_NEVER_STARTED = 0,
+	FLUSH_IS_SUCCEEDED = 1,
+	FLUSH_IS_PENDING = 2,
+	FLUSH_IS_FAILED = -1,
+	FLUSH_IS_ABORTED = -2 // aborted due to confliction with eviction, not a timeout abort (timeout abort is failure)
+};
+
+typedef void (*spdk_snapshot_backup_complete)(void *cb_arg);
+struct snapshot_backup_compl {
+	spdk_snapshot_backup_complete cb_fn;
+	void *cb_arg;
+	void *payload;
+	int rc;
+	int backup_status; // used only for polling the backup status
+};
+
+struct snapshot_backup_ctx {
+	char* lvol_name;
+	struct spdk_blob *blob;
+	uint64_t timeout_us;
+	uint32_t dev_page_size;
+	uint8_t nmax_retries;
+	uint8_t nmax_flush_jobs;
+	struct spdk_thread* caller_th;
+	struct snapshot_backup_compl compl;
+};
+
+/* Start an asynchronous backup of a snapshot represented by the given blob. Returns -EEXIST if the backup is 
+already in progress, otherwise returns the relevant code.
+*/
+void spdk_blob_start_snapshot_backup(struct snapshot_backup_ctx* sctx);
+
+void spdk_blob_get_snapshot_backup_status(struct snapshot_backup_ctx* sctx);
+
 #ifdef __cplusplus
 }
 #endif

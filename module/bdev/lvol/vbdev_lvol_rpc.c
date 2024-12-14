@@ -2046,3 +2046,174 @@ cleanup:
 
 SPDK_RPC_REGISTER("bdev_lvol_set_tiering_info", rpc_bdev_lvol_set_tiering_info,
 		  SPDK_RPC_RUNTIME)
+
+static const struct spdk_json_object_decoder rpc_bdev_lvol_backup_snapshot_decoders[] = {
+	{"lvol_name", offsetof(struct snapshot_backup_ctx, lvol_name), spdk_json_decode_string},
+
+	{"timeout_us", offsetof(struct snapshot_backup_ctx, timeout_us), spdk_json_decode_uint64},
+	{"dev_page_size", offsetof(struct snapshot_backup_ctx, dev_page_size), spdk_json_decode_uint32},
+	{"nmax_retries", offsetof(struct snapshot_backup_ctx, nmax_retries), spdk_json_decode_uint8, true},
+	{"nmax_flush_jobs", offsetof(struct snapshot_backup_ctx, nmax_flush_jobs), spdk_json_decode_uint8, true}
+};
+
+static void
+start_snapshot_backup_cb(void *ctx) {
+	struct snapshot_backup_ctx *sctx = ctx;
+	free(sctx->lvol_name);
+	if (sctx->compl.rc == 0) {
+		spdk_jsonrpc_send_bool_response((struct spdk_jsonrpc_request*)sctx->compl.payload, true);
+	} else {
+		spdk_jsonrpc_send_error_response((struct spdk_jsonrpc_request*)sctx->compl.payload, sctx->compl.rc, spdk_strerror(sctx->compl.rc));
+	}
+	free(sctx);
+}
+
+static void
+rpc_bdev_lvol_backup_snapshot(struct spdk_jsonrpc_request *request,
+			      const struct spdk_json_val *params)
+{
+	struct snapshot_backup_ctx *sctx;
+	struct spdk_lvol *lvol;
+	struct spdk_bdev *lvol_bdev;
+
+	SPDK_INFOLOG(lvol_rpc, "Start backup of snapshot lvol\n");
+
+	sctx = calloc(1, sizeof(struct snapshot_backup_ctx));
+	if (!sctx) {
+		spdk_jsonrpc_send_error_response(request, -ENOMEM,
+						 "nomem");
+		return;
+	}
+
+	sctx->compl.cb_fn = start_snapshot_backup_cb;
+	sctx->compl.cb_arg = sctx;
+	sctx->compl.payload = request;
+	sctx->caller_th = spdk_get_thread();
+
+	if (spdk_json_decode_object(params, rpc_bdev_lvol_backup_snapshot_decoders,
+				    SPDK_COUNTOF(rpc_bdev_lvol_backup_snapshot_decoders),
+				    sctx)) {
+		SPDK_INFOLOG(lvol_rpc, "spdk_json_decode_object failed\n");
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "spdk_json_decode_object failed");
+		goto cleanup;
+	}
+
+	lvol_bdev = spdk_bdev_get_by_name(sctx->lvol_name);
+	if (lvol_bdev == NULL) {
+		SPDK_ERRLOG("lvol bdev '%s' does not exist\n", sctx->lvol_name);
+		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
+		goto cleanup;
+	}
+
+	lvol = vbdev_lvol_get_from_bdev(lvol_bdev);
+	if (lvol == NULL) {
+		SPDK_ERRLOG("lvol does not exist\n");
+		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
+		goto cleanup;
+	}
+
+	sctx->blob = lvol->blob;
+	sctx->nmax_retries = sctx->nmax_retries == 0 ? 4 : sctx->nmax_retries;
+	sctx->nmax_flush_jobs = sctx->nmax_flush_jobs == 0 ? 4 : sctx->nmax_flush_jobs;
+	vbdev_lvol_backup_snapshot(sctx);
+	return;
+
+cleanup:
+	free(sctx->lvol_name);
+	free(sctx);
+}
+SPDK_RPC_REGISTER("bdev_lvol_backup_snapshot", rpc_bdev_lvol_backup_snapshot, SPDK_RPC_RUNTIME)
+
+
+static const struct spdk_json_object_decoder rpc_bdev_lvol_get_snapshot_backup_status_decoders[] = {
+	{"lvol_name", offsetof(struct snapshot_backup_ctx, lvol_name), spdk_json_decode_string}
+};
+
+static const char*
+_get_backup_status_from_code(int8_t backup_status) {
+	if (backup_status == 1) {
+		return "SUCCEEDED";
+	} else if (backup_status == 2) {
+		return "PENDING";
+	}
+	return "FAILED";
+}
+
+static void
+get_snapshot_backup_status_cb(void *ctx) {
+	struct snapshot_backup_ctx *sctx = ctx;
+	free(sctx->lvol_name);
+	if (sctx->compl.rc == 0) {
+		struct spdk_json_write_ctx* w = spdk_jsonrpc_begin_result((struct spdk_jsonrpc_request*)sctx->compl.payload);
+		if (w)
+		{
+			if (spdk_json_write_string(w, _get_backup_status_from_code(sctx->compl.rc))) {
+				spdk_jsonrpc_send_error_response((struct spdk_jsonrpc_request*)sctx->compl.payload, ENOMEM, spdk_strerror(ENOMEM));
+			} else {
+      			spdk_jsonrpc_end_result((struct spdk_jsonrpc_request*)sctx->compl.payload, w);
+			}
+		}
+		else
+			{ spdk_jsonrpc_send_error_response((struct spdk_jsonrpc_request*)sctx->compl.payload, ENOMEM, spdk_strerror(ENOMEM)); }
+	} else {
+		spdk_jsonrpc_send_error_response((struct spdk_jsonrpc_request*)sctx->compl.payload, sctx->compl.rc, spdk_strerror(sctx->compl.rc));
+	}
+	free(sctx);
+}
+
+static void
+rpc_bdev_lvol_get_snapshot_backup_status(struct spdk_jsonrpc_request *request,
+			      const struct spdk_json_val *params)
+{
+	struct snapshot_backup_ctx *sctx;
+	struct spdk_lvol *lvol;
+	struct spdk_bdev *lvol_bdev;
+
+	SPDK_INFOLOG(lvol_rpc, "Get status of backup operation of snapshot lvol\n");
+
+	sctx = calloc(1, sizeof(struct snapshot_backup_ctx));
+	if (!sctx) {
+		spdk_jsonrpc_send_error_response(request, -ENOMEM,
+						 "nomem");
+		return;
+	}
+
+	sctx->compl.cb_fn = get_snapshot_backup_status_cb;
+	sctx->compl.cb_arg = sctx;
+	sctx->compl.payload = request;
+	sctx->caller_th = spdk_get_thread();
+
+	if (spdk_json_decode_object(params, rpc_bdev_lvol_get_snapshot_backup_status_decoders,
+				    SPDK_COUNTOF(rpc_bdev_lvol_get_snapshot_backup_status_decoders),
+				    sctx)) {
+		SPDK_INFOLOG(lvol_rpc, "spdk_json_decode_object failed\n");
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "spdk_json_decode_object failed");
+		goto cleanup;
+	}
+
+	lvol_bdev = spdk_bdev_get_by_name(sctx->lvol_name);
+	if (lvol_bdev == NULL) {
+		SPDK_ERRLOG("lvol bdev '%s' does not exist\n", sctx->lvol_name);
+		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
+		goto cleanup;
+	}
+
+	lvol = vbdev_lvol_get_from_bdev(lvol_bdev);
+	if (lvol == NULL) {
+		SPDK_ERRLOG("lvol does not exist\n");
+		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
+		goto cleanup;
+	}
+
+	sctx->blob = lvol->blob;
+	vbdev_lvol_get_snapshot_backup_status(sctx);
+	return;
+
+cleanup:
+	free(sctx->lvol_name);
+	free(sctx);
+}
+SPDK_RPC_REGISTER("bdev_lvol_get_snapshot_backup_status", rpc_bdev_lvol_get_snapshot_backup_status, SPDK_RPC_RUNTIME)
+

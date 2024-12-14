@@ -27,6 +27,8 @@
 
 #define BLOB_CRC32C_INITIAL    0xffffffffUL
 
+#define SNAPSHOT_BACKUP_POLLER_US 3
+
 static int bs_register_md_thread(struct spdk_blob_store *bs);
 static int bs_unregister_md_thread(struct spdk_blob_store *bs);
 static void blob_close_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno);
@@ -10540,6 +10542,262 @@ spdk_bs_untier_lvstore_md_pages(struct spdk_blob_store *bs, bool untier_lvstore_
 bool
 spdk_bs_get_untier_lvstore_md_pages(struct spdk_blob_store *bs) {
 	return bs->untier_lvstore_md_pages;
+}
+
+static void
+blob_flush_job_compl_cb(void *cb_arg, int bserrno) {
+	struct t_flush_job *job = cb_arg;
+	if (bserrno == -ECONNABORTED) // determine whether the abort was due to a timeout (failure) or conflict due to eviction
+	{
+		const uint64_t end_ticks = spdk_get_ticks();
+		const uint64_t time_elapsed_us = ((end_ticks - job->start_ticks) / spdk_get_ticks_hz()) * 1000000;
+
+		job->status = time_elapsed_us >= job->timeout_us ? FLUSH_IS_FAILED : FLUSH_IS_ABORTED;
+	} else if (bserrno < 0) {
+		job->status = FLUSH_IS_FAILED;
+	} else {
+		job->status = FLUSH_IS_SUCCEEDED;
+	}
+}
+
+static inline int8_t
+blob_do_flush_job(struct spdk_blob *blob, struct t_flush_job *job) {
+	++blob->nflush_jobs_current;
+	if (!job->buf) {
+		job->buf = spdk_malloc(blob->dev_page_size, 0, NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+		if (!job->buf) {
+			job->status = FLUSH_IS_FAILED;
+			return -ENOMEM;
+		}
+	}
+	struct spdk_bs_cpl cpl;
+	cpl.type = SPDK_BS_CPL_TYPE_BLOB_BASIC;
+	cpl.u.blob_basic.cb_fn = blob_flush_job_compl_cb;
+	cpl.u.blob_basic.cb_arg = job;
+	spdk_bs_sequence_t *seq = bs_sequence_start_blob(blob->bs->md_channel, &cpl, blob);
+	if (!seq) {
+		job->status = FLUSH_IS_FAILED;
+		return -ENOMEM;
+	}
+	job->status = FLUSH_IS_PENDING;
+	// flush is a tiered write mode 1
+	seq->tiering_bits = TIERED_IO_MASK | FLUSH_MODE_MASK;
+	job->start_ticks = spdk_get_ticks();
+	bs_sequence_write_dev(seq, job->buf, bs_cluster_to_lba(blob->bs, job->cluster_idx) + bs_dev_page_number_in_cluster_to_lba(blob->bs, blob->dev_page_size, job->dev_page_number), blob->dev_page_size / blob->bs->dev->blocklen, rw_iov_done, NULL);
+	return 0;
+}
+
+static inline int8_t
+blob_start_new_flush_job(struct spdk_blob *blob, struct t_flush_job *job) {
+	if (job->status == FLUSH_IS_SUCCEEDED) {
+		const uint64_t dev_pages_per_cluster = blob->bs->cluster_sz / blob->dev_page_size;
+		if (job->dev_page_number < dev_pages_per_cluster - 1) {
+			++job->dev_page_number;
+			return blob_do_flush_job(blob, job);
+		}
+	}
+	// reset job status
+	job->status = FLUSH_NEVER_STARTED;
+
+	if (blob->nflush_jobs_on_prior_array == 0) {
+		if (blob->current_array_ordinal == 0) {
+			// search for the next allocated data cluster in the snapshot
+			while (blob->next_idx_in_array < blob->active.cluster_array_size && blob->active.clusters[blob->next_idx_in_array] == 0) {
+				++blob->next_idx_in_array;
+			}
+			if (blob->next_idx_in_array < blob->active.cluster_array_size) {
+				job->cluster_idx = bs_lba_to_cluster(blob->bs, blob->active.clusters[blob->next_idx_in_array]);
+				job->dev_page_number = 0;
+
+				// move to the next cluster
+				++blob->next_idx_in_array;
+
+				return blob_do_flush_job(blob, job);
+			} else // move to the next array if there is one
+			{
+				blob->nflush_jobs_on_prior_array = blob->nflush_jobs_current;
+				++blob->current_array_ordinal;
+				blob->next_idx_in_array = 0;
+			}
+		} else if (blob->current_array_ordinal <= 2) {
+			uint32_t* page_idxs_arr = blob->current_array_ordinal == 1 ? blob->active.extent_pages : blob->active.pages;
+			const uint64_t arr_size = blob->current_array_ordinal == 1 ? blob->active.extent_pages_array_size : blob->active.num_pages;
+			// search for the next allocated md page in the snapshot
+			while (blob->next_idx_in_array < arr_size && page_idxs_arr[blob->next_idx_in_array] == 0) {
+				++blob->next_idx_in_array;
+			}
+			if (blob->next_idx_in_array < arr_size) {
+				job->cluster_idx = bs_lba_to_cluster(blob->bs, bs_md_page_to_lba(blob->bs, page_idxs_arr[blob->next_idx_in_array]));
+				job->dev_page_number = 0;
+
+				// search for the next md cluster in the snapshot
+				do {
+					++blob->next_idx_in_array;
+				} while (blob->next_idx_in_array < arr_size && (page_idxs_arr[blob->next_idx_in_array] == 0 
+				|| bs_lba_to_cluster(blob->bs, bs_md_page_to_lba(blob->bs, page_idxs_arr[blob->next_idx_in_array])) == job->cluster_idx));
+
+				return blob_do_flush_job(blob, job);
+			} else // move to the next array if there is one
+			{
+				blob->nflush_jobs_on_prior_array = blob->nflush_jobs_current;
+				++blob->current_array_ordinal;
+				blob->next_idx_in_array = 0;
+			}
+		}
+	}
+	return 0;
+}
+
+static int 
+snapshot_backup_poller(void *ctx) {
+	// event loop
+	struct spdk_blob *blob = ctx;
+
+	/* Optimization: since the max number of jobs is not too large, we can save branch predictions by just changing counters in a first loop 
+	and then trying to start or retry jobs under one branch prediction for overall failure in a second loop
+	*/
+
+	for (int i = 0; i < blob->nmax_flush_jobs; ++i) {
+		struct t_flush_job *job = &blob->flush_jobs[i];
+		if (job->status == FLUSH_IS_SUCCEEDED || job->status == FLUSH_IS_ABORTED) {
+			--blob->nflush_jobs_current;
+			blob->nflush_jobs_on_prior_array -= job->status == FLUSH_IS_SUCCEEDED ? 1 : 0;
+		} else if (job->status == FLUSH_IS_FAILED) {
+			--blob->nflush_jobs_current;
+			++blob->nretries_current;
+		}
+	}
+
+	bool nomem = false;
+	// do not start or retry a job if overall status is failure
+	if (!(blob->nretries_current && blob->nretries_current >= blob->nmax_retries)) {
+		for (int i = 0; i < blob->nmax_flush_jobs && !nomem; ++i) {
+			struct t_flush_job *job = &blob->flush_jobs[i];
+			if (job->status == FLUSH_NEVER_STARTED) // start new job if there is new work to do and overall status is not failure
+			{
+				nomem = blob_start_new_flush_job(blob, job) == -ENOMEM;
+			} else if (job->status == FLUSH_IS_PENDING) {
+
+			} else if (job->status == FLUSH_IS_SUCCEEDED) // start new job if there is new work to do and overall status is not failure
+			{
+				nomem = blob_start_new_flush_job(blob, job) == -ENOMEM;
+			} else // failed or aborted
+			{
+				// retry job if overall status is not failure
+				nomem = blob_do_flush_job(blob, job) == -ENOMEM;
+			}
+		}
+	}
+
+	if (blob->nflush_jobs_current == 0) {
+		// if there are no pending jobs and there are failures and no more retries left, then set the overall status to failed
+		if (blob->nretries_current && blob->nretries_current >= blob->nmax_retries) {
+			blob->backup_status = FLUSH_IS_FAILED;
+		}
+
+		// if there are no pending jobs and there is no more work left to do, then set the overall status to succeeded
+		if (blob->current_array_ordinal == 2 && blob->next_idx_in_array >= blob->active.num_pages) {
+			blob->backup_status = FLUSH_IS_SUCCEEDED;
+		}
+	}
+	return SPDK_POLLER_BUSY;
+}
+
+static void
+blob_start_snapshot_backup(void *ctx) {
+	struct snapshot_backup_ctx *sctx = ctx;
+
+	SPDK_NOTICELOG("md_start=%d\n", sctx->blob->bs->md_start);
+	SPDK_NOTICELOG("clusters array:\n");
+	for (uint64_t i = 0; i < sctx->blob->active.cluster_array_size; ++i) {
+		SPDK_NOTICELOG("%llu\n", sctx->blob->active.clusters[i]);
+	}
+	SPDK_NOTICELOG("extent_pages array\n");
+	for (uint32_t i = 0; i < sctx->blob->active.extent_pages_array_size; ++i) {
+		SPDK_NOTICELOG("%d\n", sctx->blob->active.extent_pages[i]);
+	}
+	SPDK_NOTICELOG("pages array\n");
+	for (uint32_t i = 0; i < sctx->blob->active.num_pages; ++i) {
+		SPDK_NOTICELOG("%d\n", sctx->blob->active.pages[i]);
+	}
+
+	if (sctx->blob->backup_poller) {
+		sctx->compl.rc = -EEXIST;
+	} else if (!spdk_blob_is_snapshot(sctx->blob)) {
+		sctx->compl.rc = -EINVAL;
+	} else {
+		sctx->blob->backup_poller = spdk_poller_register(snapshot_backup_poller, sctx->blob, SNAPSHOT_BACKUP_POLLER_US);
+		if (!sctx->blob->backup_poller) {
+			sctx->compl.rc = -ENOMEM;
+		} else {
+			sctx->blob->flush_jobs = calloc(sctx->nmax_flush_jobs, sizeof(struct t_flush_job));
+			if (!sctx->blob->flush_jobs) {
+				sctx->compl.rc = -ENOMEM;
+			} else {
+				for (int i = 0; i < sctx->nmax_flush_jobs; ++i) {
+					sctx->blob->flush_jobs[i].timeout_us = sctx->timeout_us;
+				}
+				sctx->compl.rc = 0;
+				sctx->blob->timeout_us = sctx->timeout_us;
+				sctx->blob->backup_status = FLUSH_IS_PENDING;
+				sctx->blob->dev_page_size = sctx->dev_page_size;
+				sctx->blob->nmax_retries = sctx->nmax_retries;
+				sctx->blob->nmax_flush_jobs = sctx->nmax_flush_jobs;
+			}
+		}
+	}
+
+	if (sctx->caller_th == sctx->blob->bs->md_thread) {
+		sctx->compl.cb_fn(sctx->compl.cb_arg);
+	} else {
+		spdk_thread_send_msg(sctx->caller_th, sctx->compl.cb_fn, sctx->compl.cb_arg);
+	}
+}
+
+void
+spdk_blob_start_snapshot_backup(struct snapshot_backup_ctx* sctx) {
+	if (sctx->caller_th == sctx->blob->bs->md_thread) {
+		blob_start_snapshot_backup(sctx);
+	} else {
+		spdk_thread_send_msg(sctx->blob->bs->md_thread, blob_start_snapshot_backup, sctx);
+	}
+}
+
+static void
+blob_get_snapshot_backup_status(void *ctx) {
+	struct snapshot_backup_ctx *sctx = ctx;
+
+	if (!sctx->blob->backup_poller) {
+		sctx->compl.rc = -EEXIST;
+	} else {
+		sctx->compl.rc = 0;
+		sctx->compl.backup_status = sctx->blob->backup_status;
+		if (sctx->blob->backup_status != FLUSH_IS_PENDING) // finally end the snapshot backup operation 
+		{
+			spdk_poller_unregister(&sctx->blob->backup_poller);
+
+			for (int i = 0; i < sctx->blob->nmax_flush_jobs; ++i) {
+				if (sctx->blob->flush_jobs[i].buf) {
+					spdk_free(sctx->blob->flush_jobs[i].buf);
+				}
+			}
+			free(sctx->blob->flush_jobs);
+		} 
+	}
+
+	if (sctx->caller_th == sctx->blob->bs->md_thread) {
+		sctx->compl.cb_fn(sctx->compl.cb_arg);
+	} else {
+		spdk_thread_send_msg(sctx->caller_th, sctx->compl.cb_fn, sctx->compl.cb_arg);
+	}
+}
+
+void spdk_blob_get_snapshot_backup_status(struct snapshot_backup_ctx* sctx) {
+	if (sctx->caller_th == sctx->blob->bs->md_thread) {
+		blob_start_snapshot_backup(sctx);
+	} else {
+		spdk_thread_send_msg(sctx->blob->bs->md_thread, blob_get_snapshot_backup_status, sctx);
+	}
 }
 
 SPDK_LOG_REGISTER_COMPONENT(blob)

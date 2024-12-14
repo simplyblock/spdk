@@ -103,6 +103,19 @@ struct spdk_blob_list {
 	TAILQ_ENTRY(spdk_blob_list) link;
 };
 
+// flush job for a snapshot backup operation
+struct t_flush_job {
+	char* buf; // dev page-sized I/O buffer
+	uint64_t timeout_us; // copied from blob parent
+	uint64_t start_ticks; // job start ticks to later use in microsecond computation
+	uint64_t cluster_idx;
+	/* dev page number in the job's cluster (cluster size must be aligned to )
+	dev page size
+	*/
+	uint8_t dev_page_number;
+	enum EFlushStatus status; // I/O status of the job
+};
+
 struct spdk_blob {
 	struct spdk_blob_store *bs;
 
@@ -156,6 +169,34 @@ struct spdk_blob {
 	/* Number of data clusters retrieved from extent table,
 	 * that many have to be read from extent pages. */
 	uint64_t	remaining_clusters_in_et;
+
+	// Snapshot backup fields
+
+	struct spdk_poller *backup_poller;
+	uint64_t timeout_us; // timeout value of a flush request in microseconds
+	enum EFlushStatus backup_status; // overall status for backup operation
+	uint32_t dev_page_size; // page size of backing device (not SPDK_BS_PAGE_SIZE)
+	uint8_t nmax_retries; // max retries in case of failure, default 4
+	uint8_t nretries_current; // current number of retries
+	uint8_t nmax_flush_jobs; // max number of parallel flush jobs, default 4
+	uint8_t nflush_jobs_current; // current number of parallel flush jobs
+	// cannot start a new job on the next array while there is another job on the prior array; this goes down only on a job success
+	uint8_t nflush_jobs_on_prior_array;
+
+	/* ordinal ref to current array in mut data (0 for clusters array, 1 for 
+	extent_pages array, and 2 for pages array)
+	*/
+	uint8_t current_array_ordinal; 
+	/* Next index in the array to start new flush jobs from. This means the 
+	next index is a heretofore completely unprocessed cluster. Each flush job 
+	processes its own cluster completely privately and all concurrent flush jobs
+	are on the same array to safely flush data before metadata and more 
+	sensitive metadata before other metadata.
+	*/
+	uint64_t next_idx_in_array;
+
+	// array of flush jobs
+	struct t_flush_job *flush_jobs;
 };
 
 struct spdk_blob_store {
@@ -700,5 +741,14 @@ bs_io_unit_is_allocated(struct spdk_blob *blob, uint64_t io_unit)
 		return true;
 	}
 }
+
+static inline uint64_t
+bs_dev_page_number_in_cluster_to_lba(struct spdk_blob_store *bs, uint64_t dev_page_size, uint8_t dev_page_number) {
+	return dev_page_number * (dev_page_size / bs->dev->blocklen);
+}
+
+// test
+static inline int
+snapshot_backup_poller(void *ctx);
 
 #endif
