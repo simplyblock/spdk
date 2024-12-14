@@ -10633,7 +10633,7 @@ blob_search_for_new_flush_job(struct spdk_blob *blob, struct t_flush_job *job) {
 			}
 		}
 	}
-	SPDK_NOTICELOG("next array index=%lu\n", blob->next_idx_in_array);
+	SPDK_NOTICELOG("flush jobs on prior array=%d, ordinal=%d, next array index=%lu\n", blob->nflush_jobs_on_prior_array, blob->current_array_ordinal, blob->next_idx_in_array);
 	return 0;
 }
 
