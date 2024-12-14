@@ -2148,7 +2148,7 @@ get_snapshot_backup_status_cb(void *ctx) {
 		struct spdk_json_write_ctx* w = spdk_jsonrpc_begin_result((struct spdk_jsonrpc_request*)sctx->compl.payload);
 		if (w)
 		{
-			if (spdk_json_write_string(w, _get_backup_status_from_code(sctx->compl.rc))) {
+			if (spdk_json_write_string(w, _get_backup_status_from_code(sctx->compl.backup_status))) {
 				spdk_jsonrpc_send_error_response((struct spdk_jsonrpc_request*)sctx->compl.payload, ENOMEM, spdk_strerror(ENOMEM));
 			} else {
       			spdk_jsonrpc_end_result((struct spdk_jsonrpc_request*)sctx->compl.payload, w);
