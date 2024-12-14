@@ -747,8 +747,7 @@ bs_dev_page_number_in_cluster_to_lba(struct spdk_blob_store *bs, uint64_t dev_pa
 	return dev_page_number * (dev_page_size / bs->dev->blocklen);
 }
 
-// test
-static inline int
+int
 snapshot_backup_poller(void *ctx);
 
 #endif
