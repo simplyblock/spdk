@@ -10529,6 +10529,7 @@ spdk_bs_get_untier_lvstore_md_pages(struct spdk_blob_store *bs) {
 static void
 blob_flush_job_compl_cb(void *cb_arg, int bserrno) {
 	struct t_flush_job *job = cb_arg;
+	SPDK_NOTICELOG("Completed flush job, cluster_idx=%lu, dev page number=%d, status=%d\n", job->cluster_idx, job->dev_page_number, job->status);
 	if (bserrno == -ECONNABORTED) // determine whether the abort was due to a timeout (failure) or conflict due to eviction
 	{
 		const uint64_t end_ticks = spdk_get_ticks();
@@ -10546,6 +10547,7 @@ blob_flush_job_compl_cb(void *cb_arg, int bserrno) {
 
 static inline int8_t
 blob_do_flush_job(struct spdk_blob *blob, struct t_flush_job *job) {
+	SPDK_NOTICELOG("Beginning flush job, cluster_idx=%lu, dev page number=%d, status=%d\n", job->cluster_idx, job->dev_page_number, job->status);
 	++blob->nflush_jobs_current;
 	if (!job->buf) {
 		job->buf = spdk_malloc(blob->dev_page_size, 0, NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
@@ -10574,7 +10576,8 @@ blob_do_flush_job(struct spdk_blob *blob, struct t_flush_job *job) {
 }
 
 static inline int8_t
-blob_start_new_flush_job(struct spdk_blob *blob, struct t_flush_job *job) {
+blob_search_for_new_flush_job(struct spdk_blob *blob, struct t_flush_job *job) {
+	SPDK_NOTICELOG("Searching for new flush job\n");
 	if (job->status == FLUSH_IS_SUCCEEDED) {
 		const uint64_t dev_pages_per_cluster = blob->bs->cluster_sz / blob->dev_page_size;
 		if (job->dev_page_number < dev_pages_per_cluster - 1) {
@@ -10654,24 +10657,25 @@ snapshot_backup_poller(void *ctx) {
 		}
 	}
 
-	bool nomem = false;
 	// do not start or retry a job if overall status is failure
 	if (!(blob->nretries_current && blob->nretries_current >= blob->nmax_retries)) {
+		bool nomem = false;
 		for (int i = 0; i < blob->nmax_flush_jobs && !nomem; ++i) {
 			struct t_flush_job *job = &blob->flush_jobs[i];
 			if (job->status == FLUSH_NEVER_STARTED) // start new job if there is new work to do and overall status is not failure
 			{
-				nomem = blob_start_new_flush_job(blob, job) == -ENOMEM;
+				nomem = blob_search_for_new_flush_job(blob, job) == -ENOMEM;
 			} else if (job->status == FLUSH_IS_PENDING) {
 
 			} else if (job->status == FLUSH_IS_SUCCEEDED) // start new job if there is new work to do and overall status is not failure
 			{
-				nomem = blob_start_new_flush_job(blob, job) == -ENOMEM;
+				nomem = blob_search_for_new_flush_job(blob, job) == -ENOMEM;
 			} else // failed or aborted
 			{
 				// retry job if overall status is not failure
 				nomem = blob_do_flush_job(blob, job) == -ENOMEM;
 			}
+			if (nomem) { SPDK_NOTICELOG("Unexpected nomem\n"); }
 		}
 	}
 
