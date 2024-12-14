@@ -2132,9 +2132,9 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_get_snapshot_backup_s
 
 static const char*
 _get_backup_status_from_code(int8_t backup_status) {
-	if (backup_status == 1) {
+	if (backup_status == FLUSH_IS_SUCCEEDED) {
 		return "SUCCEEDED";
-	} else if (backup_status == 2) {
+	} else if (backup_status == FLUSH_IS_PENDING) {
 		return "PENDING";
 	}
 	return "FAILED";

@@ -10535,7 +10535,9 @@ blob_flush_job_compl_cb(void *cb_arg, int bserrno) {
 		const uint64_t time_elapsed_us = ((end_ticks - job->start_ticks) / spdk_get_ticks_hz()) * 1000000;
 
 		job->status = time_elapsed_us >= job->timeout_us ? FLUSH_IS_FAILED : FLUSH_IS_ABORTED;
+		SPDK_NOTICELOG("Aborted job, start=%lu, end=%lu, elapsed=%lu, timeout=%lu\n", job->start_ticks, end_ticks, time_elapsed_us, job->timeout_us);
 	} else if (bserrno < 0) {
+		SPDK_NOTICELOG("Failed job\n");
 		job->status = FLUSH_IS_FAILED;
 	} else {
 		job->status = FLUSH_IS_SUCCEEDED;
@@ -10548,6 +10550,7 @@ blob_do_flush_job(struct spdk_blob *blob, struct t_flush_job *job) {
 	if (!job->buf) {
 		job->buf = spdk_malloc(blob->dev_page_size, 0, NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
 		if (!job->buf) {
+			SPDK_NOTICELOG("Failed buf alloc\n");
 			job->status = FLUSH_IS_FAILED;
 			return -ENOMEM;
 		}
@@ -10558,6 +10561,7 @@ blob_do_flush_job(struct spdk_blob *blob, struct t_flush_job *job) {
 	cpl.u.blob_basic.cb_arg = job;
 	spdk_bs_sequence_t *seq = bs_sequence_start_blob(blob->bs->md_channel, &cpl, blob);
 	if (!seq) {
+		SPDK_NOTICELOG("Failed sequence acquisition\n");
 		job->status = FLUSH_IS_FAILED;
 		return -ENOMEM;
 	}
@@ -10674,6 +10678,7 @@ snapshot_backup_poller(void *ctx) {
 	if (blob->nflush_jobs_current == 0) {
 		// if there are no pending jobs and there are failures and no more retries left, then set the overall status to failed
 		if (blob->nretries_current && blob->nretries_current >= blob->nmax_retries) {
+			SPDK_NOTICELOG("Ran out of retries, current=%d, max=%d\n", blob->nretries_current, blob->nmax_retries);
 			blob->backup_status = FLUSH_IS_FAILED;
 		}
 
@@ -10692,15 +10697,15 @@ blob_start_snapshot_backup(void *ctx) {
 	SPDK_NOTICELOG("md_start=%lu\n", sctx->blob->bs->md_start);
 	SPDK_NOTICELOG("clusters array:\n");
 	for (uint64_t i = 0; i < sctx->blob->active.cluster_array_size; ++i) {
-		SPDK_NOTICELOG("%lu\n", sctx->blob->active.clusters[i]);
+		if (sctx->blob->active.clusters[i] != 0) { SPDK_NOTICELOG("%lu\n", sctx->blob->active.clusters[i]); }
 	}
 	SPDK_NOTICELOG("extent_pages array\n");
 	for (uint32_t i = 0; i < sctx->blob->active.extent_pages_array_size; ++i) {
-		SPDK_NOTICELOG("%d\n", sctx->blob->active.extent_pages[i]);
+		if (sctx->blob->active.extent_pages[i] != 0) { SPDK_NOTICELOG("%d\n", sctx->blob->active.extent_pages[i]); }
 	}
 	SPDK_NOTICELOG("pages array\n");
 	for (uint32_t i = 0; i < sctx->blob->active.num_pages; ++i) {
-		SPDK_NOTICELOG("%d\n", sctx->blob->active.pages[i]);
+		if (sctx->blob->active.pages[i] != 0) { SPDK_NOTICELOG("%d\n", sctx->blob->active.pages[i]); }
 	}
 
 	if (sctx->blob->backup_poller) {
