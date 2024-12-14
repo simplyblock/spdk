@@ -10687,7 +10687,7 @@ snapshot_backup_poller(void *ctx) {
 		}
 
 		// if there are no pending jobs and there is no more work left to do, then set the overall status to succeeded
-		if (blob->current_array_ordinal == 2 && blob->next_idx_in_array >= blob->active.num_pages) {
+		if (blob->current_array_ordinal == 3 && blob->next_idx_in_array >= blob->active.num_pages) {
 			blob->backup_status = FLUSH_IS_SUCCEEDED;
 		}
 	}
