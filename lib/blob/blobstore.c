@@ -10577,7 +10577,6 @@ blob_do_flush_job(struct spdk_blob *blob, struct t_flush_job *job) {
 
 static inline int8_t
 blob_search_for_new_flush_job(struct spdk_blob *blob, struct t_flush_job *job) {
-	SPDK_NOTICELOG("Searching for new flush job\n");
 	if (job->status == FLUSH_IS_SUCCEEDED) {
 		const uint64_t dev_pages_per_cluster = blob->bs->cluster_sz / blob->dev_page_size;
 		if (job->dev_page_number < dev_pages_per_cluster - 1) {
@@ -10587,7 +10586,7 @@ blob_search_for_new_flush_job(struct spdk_blob *blob, struct t_flush_job *job) {
 	}
 	// reset job status
 	job->status = FLUSH_NEVER_STARTED;
-
+	SPDK_NOTICELOG("flush jobs on prior array=%d, ordinal=%d\n", blob->nflush_jobs_on_prior_array, blob->current_array_ordinal);
 	if (blob->nflush_jobs_on_prior_array == 0) {
 		if (blob->current_array_ordinal == 0) {
 			// search for the next allocated data cluster in the snapshot
@@ -10634,6 +10633,7 @@ blob_search_for_new_flush_job(struct spdk_blob *blob, struct t_flush_job *job) {
 			}
 		}
 	}
+	SPDK_NOTICELOG("next array index=%lu\n", blob->next_idx_in_array);
 	return 0;
 }
 
@@ -10650,7 +10650,7 @@ snapshot_backup_poller(void *ctx) {
 		struct t_flush_job *job = &blob->flush_jobs[i];
 		if (job->status == FLUSH_IS_SUCCEEDED || job->status == FLUSH_IS_ABORTED) {
 			--blob->nflush_jobs_current;
-			blob->nflush_jobs_on_prior_array -= job->status == FLUSH_IS_SUCCEEDED ? 1 : 0;
+			blob->nflush_jobs_on_prior_array -= job->status == FLUSH_IS_SUCCEEDED;
 		} else if (job->status == FLUSH_IS_FAILED) {
 			--blob->nflush_jobs_current;
 			++blob->nretries_current;
