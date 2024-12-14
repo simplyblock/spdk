@@ -10603,7 +10603,7 @@ blob_search_for_new_flush_job(struct spdk_blob *blob, struct t_flush_job *job) {
 				blob->next_idx_in_array = 0;
 			}
 		} else if (blob->current_array_ordinal <= 2) {
-			uint32_t* page_idxs_arr = blob->current_array_ordinal == 1 ? blob->active.extent_pages : blob->active.pages;
+			uint32_t *page_idxs_arr = blob->current_array_ordinal == 1 ? blob->active.extent_pages : blob->active.pages;
 			const uint64_t arr_size = blob->current_array_ordinal == 1 ? blob->active.extent_pages_array_size : blob->active.num_pages;
 			// search for the next allocated md page in the snapshot
 			while (blob->next_idx_in_array < arr_size && page_idxs_arr[blob->next_idx_in_array] == 0) {
@@ -10644,7 +10644,9 @@ snapshot_backup_poller(void *ctx) {
 		struct t_flush_job *job = &blob->flush_jobs[i];
 		if (job->status == FLUSH_IS_SUCCEEDED || job->status == FLUSH_IS_ABORTED) {
 			--blob->nflush_jobs_current;
-			blob->nflush_jobs_on_prior_array -= job->status == FLUSH_IS_SUCCEEDED;
+			const uint64_t dev_pages_per_cluster = blob->bs->cluster_sz / blob->dev_page_size;
+			// if this job succeeded and was on the prior array, then this job is fully done if it has no more dev pages to flush in its cluster
+			blob->nflush_jobs_on_prior_array -= (job->status == FLUSH_IS_SUCCEEDED) && (blob->nflush_jobs_on_prior_array > 0) && (job->dev_page_number == dev_pages_per_cluster - 1);
 		} else if (job->status == FLUSH_IS_FAILED) {
 			--blob->nflush_jobs_current;
 			++blob->nretries_current;
@@ -10676,7 +10678,7 @@ snapshot_backup_poller(void *ctx) {
 		// if there are no pending jobs and there are failures and no more retries left, then set the overall status to failed
 		if (blob->nretries_current && blob->nretries_current >= blob->nmax_retries) {
 			blob->backup_status = FLUSH_IS_FAILED;
-		} else if (blob->current_array_ordinal == 3 && blob->next_idx_in_array >= blob->active.num_pages) {
+		} else if (blob->current_array_ordinal == 3) {
 			// else, if there are no pending jobs and there is no more work left to do, then set the overall status to succeeded
 			blob->backup_status = FLUSH_IS_SUCCEEDED;
 		}
@@ -10736,7 +10738,7 @@ blob_start_snapshot_backup(void *ctx) {
 }
 
 void
-spdk_blob_start_snapshot_backup(struct snapshot_backup_ctx* sctx) {
+spdk_blob_start_snapshot_backup(struct snapshot_backup_ctx *sctx) {
 	if (sctx->caller_th == sctx->blob->bs->md_thread) {
 		blob_start_snapshot_backup(sctx);
 	} else {
@@ -10778,7 +10780,7 @@ blob_get_snapshot_backup_status(void *ctx) {
 	}
 }
 
-void spdk_blob_get_snapshot_backup_status(struct snapshot_backup_ctx* sctx) {
+void spdk_blob_get_snapshot_backup_status(struct snapshot_backup_ctx *sctx) {
 	if (sctx->caller_th == sctx->blob->bs->md_thread) {
 		blob_get_snapshot_backup_status(sctx);
 	} else {
