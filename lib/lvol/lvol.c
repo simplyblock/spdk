@@ -751,7 +751,6 @@ spdk_lvs_init(struct spdk_bs_dev *bs_dev, struct spdk_lvs_opts *o,
 	lvs->bs_dev = bs_dev;
 
 	SPDK_INFOLOG(lvol, "Initializing lvol store\n");
-	SPDK_NOTICELOG("About to call spdk_bs_init\n");
 	spdk_bs_init(bs_dev, &opts, lvs_init_cb, lvs_req);
 
 	return 0;
