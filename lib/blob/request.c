@@ -170,7 +170,7 @@ bs_sequence_read_bs_dev(spdk_bs_sequence_t *seq, struct spdk_bs_dev *bs_dev,
 		}
 	} else 
 	{
-		meta_lba |= TIERED_BIT;
+		meta_lba |= TIERED_IO_MASK;
 
 		meta_lba |= tiering_bits & FORCE_FETCH_BIT ? FORCE_FETCH_MASK : 0; // tiered read may be a force fetch
 	}
@@ -207,7 +207,7 @@ bs_sequence_read_dev(spdk_bs_sequence_t *seq, void *payload,
 		}
 	} else 
 	{
-		meta_lba |= TIERED_BIT;
+		meta_lba |= TIERED_IO_MASK;
 
 		meta_lba |= tiering_bits & FORCE_FETCH_BIT ? FORCE_FETCH_MASK : 0; // tiered read may be a force fetch
 	}
@@ -244,7 +244,7 @@ bs_sequence_write_dev(spdk_bs_sequence_t *seq, void *payload,
 		}
 	} else 
 	{
-		meta_lba |= TIERED_BIT;
+		meta_lba |= TIERED_IO_MASK;
 
 		meta_lba |= tiering_bits & FLUSH_MODE_BIT ? FLUSH_MODE_MASK : 0; // tiered write may be a pure flush
 	}
@@ -282,7 +282,7 @@ bs_sequence_readv_bs_dev(spdk_bs_sequence_t *seq, struct spdk_bs_dev *bs_dev,
 		}
 	} else 
 	{
-		meta_lba |= TIERED_BIT;
+		meta_lba |= TIERED_IO_MASK;
 
 		meta_lba |= tiering_bits & FORCE_FETCH_BIT ? FORCE_FETCH_MASK : 0; // tiered read may be a force fetch
 	}
@@ -324,7 +324,7 @@ bs_sequence_readv_dev(spdk_bs_sequence_t *seq, struct iovec *iov, int iovcnt,
 		}
 	} else 
 	{
-		meta_lba |= TIERED_BIT;
+		meta_lba |= TIERED_IO_MASK;
 
 		meta_lba |= tiering_bits & FORCE_FETCH_BIT ? FORCE_FETCH_MASK : 0; // tiered read may be a force fetch
 	}
@@ -367,7 +367,7 @@ bs_sequence_writev_dev(spdk_bs_sequence_t *seq, struct iovec *iov, int iovcnt,
 		}
 	} else 
 	{
-		meta_lba |= TIERED_BIT;
+		meta_lba |= TIERED_IO_MASK;
 
 		meta_lba |= tiering_bits & FLUSH_MODE_BIT ? FLUSH_MODE_MASK : 0; // tiered write may be a pure flush
 	}
@@ -466,7 +466,7 @@ bs_batch_completion(struct spdk_io_channel *_channel,
 				}
 			} else 
 			{
-				meta_lba |= TIERED_BIT;
+				meta_lba |= TIERED_IO_MASK;
 			}
 
 			channel->dev->unmap(channel->dev, channel->dev_channel, meta_lba, ctx->lba_count,
@@ -554,7 +554,7 @@ bs_batch_read_bs_dev(spdk_bs_batch_t *batch, struct spdk_bs_dev *bs_dev,
 		}
 	} else 
 	{
-		meta_lba |= TIERED_BIT;
+		meta_lba |= TIERED_IO_MASK;
 
 		meta_lba |= tiering_bits & FORCE_FETCH_BIT ? FORCE_FETCH_MASK : 0; // tiered read may be a force fetch
 	}
@@ -589,7 +589,7 @@ bs_batch_read_dev(spdk_bs_batch_t *batch, void *payload,
 		}
 	} else 
 	{
-		meta_lba |= TIERED_BIT;
+		meta_lba |= TIERED_IO_MASK;
 
 		meta_lba |= tiering_bits & FORCE_FETCH_BIT ? FORCE_FETCH_MASK : 0; // tiered read may be a force fetch
 	}
@@ -623,7 +623,7 @@ bs_batch_write_dev(spdk_bs_batch_t *batch, void *payload,
 		}
 	} else 
 	{
-		meta_lba |= TIERED_BIT;
+		meta_lba |= TIERED_IO_MASK;
 
 		meta_lba |= tiering_bits & FLUSH_MODE_BIT ? FLUSH_MODE_MASK : 0; // tiered write may be a pure flush
 	}
@@ -672,7 +672,7 @@ out:
 		}
 	} else 
 	{
-		meta_lba |= TIERED_BIT;
+		meta_lba |= TIERED_IO_MASK;
 	}
 
 	channel->dev->unmap(channel->dev, channel->dev_channel, meta_lba, lba_count,
