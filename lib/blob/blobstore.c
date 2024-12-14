@@ -10773,7 +10773,12 @@ blob_get_snapshot_backup_status(void *ctx) {
 				}
 			}
 			free(sctx->blob->flush_jobs);
-		} 
+			sctx->blob->nflush_jobs_current = 0;
+			sctx->blob->nflush_jobs_on_prior_array = 0;
+			sctx->blob->current_array_ordinal = 0;
+			sctx->blob->next_idx_in_array = 0;
+			sctx->blob->flush_jobs = NULL;
+		}
 	}
 
 	if (sctx->caller_th == sctx->blob->bs->md_thread) {
