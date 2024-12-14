@@ -272,7 +272,7 @@ vbdev_lvs_create(const char *base_bdev_name, const char *name, uint32_t cluster_
 	lvs_req->cb_fn = cb_fn;
 	lvs_req->cb_arg = cb_arg;
 	lvs_req->untier_lvstore_md_pages = untier_lvstore_md_pages;
-
+	SPDK_NOTICELOG("About to call spdk_lvs_init\n");
 	rc = spdk_lvs_init(bs_dev, &opts, _vbdev_lvs_create_cb, lvs_req);
 	if (rc < 0) {
 		free(lvs_req);
