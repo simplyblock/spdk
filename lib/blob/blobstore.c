@@ -6549,7 +6549,7 @@ bs_create_blob(struct spdk_blob_store *bs,
 		blob_tiering_bits = ((struct spdk_lvol_with_handle_req*)(bits_cb_arg))->tiering_info;
 		lvol_priority_class = ((struct spdk_lvol_with_handle_req*)(bits_cb_arg))->lvol_priority_class;
 	} else {
-		blob_tiering_bits = ((struct spdk_lvs_with_handle_req*)(bits_cb_arg))->untier_lvstore_md_pages;
+		blob_tiering_bits = ((struct spdk_lvs_with_handle_req*)(bits_cb_arg))->untier_lvstore_md_pages ? METADATA_PAGE_BIT : 0;
 		lvol_priority_class = 0; // add later
 	}
 	spdk_blob_set_tiering_info(blob, blob_tiering_bits);
