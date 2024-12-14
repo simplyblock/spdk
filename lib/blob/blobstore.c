@@ -10750,7 +10750,7 @@ blob_get_snapshot_backup_status(void *ctx) {
 	struct snapshot_backup_ctx *sctx = ctx;
 
 	if (!sctx->blob->backup_poller) {
-		sctx->compl.rc = -EEXIST;
+		sctx->compl.rc = -ENOENT;
 	} else {
 		sctx->compl.rc = 0;
 		sctx->compl.backup_status = sctx->blob->backup_status;
@@ -10776,7 +10776,7 @@ blob_get_snapshot_backup_status(void *ctx) {
 
 void spdk_blob_get_snapshot_backup_status(struct snapshot_backup_ctx* sctx) {
 	if (sctx->caller_th == sctx->blob->bs->md_thread) {
-		blob_start_snapshot_backup(sctx);
+		blob_get_snapshot_backup_status(sctx);
 	} else {
 		spdk_thread_send_msg(sctx->blob->bs->md_thread, blob_get_snapshot_backup_status, sctx);
 	}

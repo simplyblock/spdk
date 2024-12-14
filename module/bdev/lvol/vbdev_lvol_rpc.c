@@ -111,7 +111,6 @@ static void
 rpc_bdev_lvol_create_lvstore(struct spdk_jsonrpc_request *request,
 			     const struct spdk_json_val *params)
 {
-	SPDK_NOTICELOG("Create lvstore RPC\n");
 	struct rpc_bdev_lvol_create_lvstore req = {};
 	int rc = 0;
 	enum lvs_clear_method clear_method;
