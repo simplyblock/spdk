@@ -10684,10 +10684,8 @@ snapshot_backup_poller(void *ctx) {
 		if (blob->nretries_current && blob->nretries_current >= blob->nmax_retries) {
 			SPDK_NOTICELOG("Ran out of retries, current=%d, max=%d\n", blob->nretries_current, blob->nmax_retries);
 			blob->backup_status = FLUSH_IS_FAILED;
-		}
-
-		// if there are no pending jobs and there is no more work left to do, then set the overall status to succeeded
-		if (blob->current_array_ordinal == 3 && blob->next_idx_in_array >= blob->active.num_pages) {
+		} else if (blob->current_array_ordinal == 3 && blob->next_idx_in_array >= blob->active.num_pages) {
+			// if there are no pending jobs and there is no more work left to do, then set the overall status to succeeded
 			blob->backup_status = FLUSH_IS_SUCCEEDED;
 		}
 	}
