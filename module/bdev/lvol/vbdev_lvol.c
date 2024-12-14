@@ -1194,7 +1194,9 @@ _vbdev_lvol_create_cb(void *cb_arg, struct spdk_lvol *lvol, int lvolerrno)
 		goto end;
 	}
 
+	vbdev_lvol_set_tiering_info(lvol, req->tiering_info);
 	lvol->priority_class = req->lvol_priority_class;
+	vbdev_lvol_set_io_priority_class(lvol);
 
 	lvolerrno = _create_lvol_disk(lvol, true);
 

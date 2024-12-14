@@ -607,7 +607,7 @@ lvs_init_cb(void *cb_arg, struct spdk_blob_store *bs, int lvserrno)
 
 	assert(bs != NULL);
 	lvs->blobstore = bs;
-
+	SPDK_NOTICELOG("lvol store initialized\n");
 	SPDK_INFOLOG(lvol, "Lvol store initialized\n");
 
 	/* create super blob */
