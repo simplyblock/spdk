@@ -6465,9 +6465,15 @@ bs_create_blob(struct spdk_blob_store *bs,
 
 	SPDK_DEBUGLOG(blob, "Creating blob with id 0x%" PRIx64 " at page %u\n", id, page_idx);
 
+	void* bits_cb_arg = NULL;
+	bool is_lvs_create = false;
+
 	spdk_blob_opts_init(&opts_local, sizeof(opts_local));
 	if (opts) {
 		blob_opts_copy(opts, &opts_local);
+	} else { 
+		bits_cb_arg = cb_arg; 
+		is_lvs_create = true;
 	}
 
 	blob = blob_alloc(bs, id);
@@ -6481,12 +6487,10 @@ bs_create_blob(struct spdk_blob_store *bs,
 		blob->invalid_flags |= SPDK_BLOB_EXTENT_TABLE;
 	}
 
-	void* bits_cb_arg = cb_arg;
-
 	if (!internal_xattrs) {
 		blob_xattrs_init(&internal_xattrs_default);
 		internal_xattrs = &internal_xattrs_default;
-	} else {
+	} else if (!is_lvs_create) {
 		// snapshot or clone
 		bits_cb_arg = ((struct spdk_clone_snapshot_ctx*)(cb_arg))->cpl.u.blobid.cb_arg;
 	}
@@ -6539,8 +6543,15 @@ bs_create_blob(struct spdk_blob_store *bs,
 		goto error;
 	}
 
-	const uint8_t blob_tiering_bits = ((struct spdk_lvol_with_handle_req*)(bits_cb_arg))->tiering_info;
-	const int lvol_priority_class = ((struct spdk_lvol_with_handle_req*)(bits_cb_arg))->lvol_priority_class;
+	uint8_t blob_tiering_bits;
+	int lvol_priority_class;
+	if (!is_lvs_create) {
+		blob_tiering_bits = ((struct spdk_lvol_with_handle_req*)(bits_cb_arg))->tiering_info;
+		lvol_priority_class = ((struct spdk_lvol_with_handle_req*)(bits_cb_arg))->lvol_priority_class;
+	} else {
+		blob_tiering_bits = ((struct spdk_lvs_with_handle_req*)(bits_cb_arg))->untier_lvstore_md_pages;
+		lvol_priority_class = 0; // add later
+	}
 	spdk_blob_set_tiering_info(blob, blob_tiering_bits);
 	spdk_blob_set_io_priority_class(blob, lvol_priority_class);
 
