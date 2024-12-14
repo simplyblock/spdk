@@ -10581,7 +10581,7 @@ blob_do_flush_job(struct spdk_blob *blob, struct t_flush_job *job) {
 	}
 	job->status = FLUSH_IS_PENDING;
 	// flush is a tiered write mode 1
-	seq->tiering_bits = TIERED_IO_MASK | FLUSH_MODE_MASK;
+	seq->tiering_bits = TIERED_BIT | FLUSH_MODE_BIT;
 	job->start_ticks = spdk_get_ticks();
 	bs_sequence_write_dev(seq, job->buf, bs_cluster_to_lba(blob->bs, job->cluster_idx) + bs_dev_page_number_in_cluster_to_lba(blob->bs, blob->dev_page_size, job->dev_page_number), blob->dev_page_size / blob->bs->dev->blocklen, rw_iov_done, NULL);
 	return 0;
@@ -10648,7 +10648,7 @@ blob_start_new_flush_job(struct spdk_blob *blob, struct t_flush_job *job) {
 	return 0;
 }
 
-static int 
+int 
 snapshot_backup_poller(void *ctx) {
 	// event loop
 	struct spdk_blob *blob = ctx;
@@ -10707,10 +10707,10 @@ static void
 blob_start_snapshot_backup(void *ctx) {
 	struct snapshot_backup_ctx *sctx = ctx;
 
-	SPDK_NOTICELOG("md_start=%d\n", sctx->blob->bs->md_start);
+	SPDK_NOTICELOG("md_start=%lu\n", sctx->blob->bs->md_start);
 	SPDK_NOTICELOG("clusters array:\n");
 	for (uint64_t i = 0; i < sctx->blob->active.cluster_array_size; ++i) {
-		SPDK_NOTICELOG("%llu\n", sctx->blob->active.clusters[i]);
+		SPDK_NOTICELOG("%lu\n", sctx->blob->active.clusters[i]);
 	}
 	SPDK_NOTICELOG("extent_pages array\n");
 	for (uint32_t i = 0; i < sctx->blob->active.extent_pages_array_size; ++i) {
