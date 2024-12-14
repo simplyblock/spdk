@@ -10529,16 +10529,14 @@ spdk_bs_get_untier_lvstore_md_pages(struct spdk_blob_store *bs) {
 static void
 blob_flush_job_compl_cb(void *cb_arg, int bserrno) {
 	struct t_flush_job *job = cb_arg;
-	SPDK_NOTICELOG("Completed flush job, cluster_idx=%lu, dev page number=%d, status=%d\n", job->cluster_idx, job->dev_page_number, job->status);
+	SPDK_NOTICELOG("Completed flush job, cluster_idx=%lu, dev page number=%d, bserrno=%d\n", job->cluster_idx, job->dev_page_number, bserrno);
 	if (bserrno == -ECONNABORTED) // determine whether the abort was due to a timeout (failure) or conflict due to eviction
 	{
 		const uint64_t end_ticks = spdk_get_ticks();
 		const uint64_t time_elapsed_us = ((end_ticks - job->start_ticks) / spdk_get_ticks_hz()) * 1000000;
 
 		job->status = time_elapsed_us >= job->timeout_us ? FLUSH_IS_FAILED : FLUSH_IS_ABORTED;
-		SPDK_NOTICELOG("Aborted job, start=%lu, end=%lu, elapsed=%lu, timeout=%lu\n", job->start_ticks, end_ticks, time_elapsed_us, job->timeout_us);
 	} else if (bserrno < 0) {
-		SPDK_NOTICELOG("Failed job\n");
 		job->status = FLUSH_IS_FAILED;
 	} else {
 		job->status = FLUSH_IS_SUCCEEDED;
@@ -10552,7 +10550,6 @@ blob_do_flush_job(struct spdk_blob *blob, struct t_flush_job *job) {
 	if (!job->buf) {
 		job->buf = spdk_malloc(blob->dev_page_size, 0, NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
 		if (!job->buf) {
-			SPDK_NOTICELOG("Failed buf alloc\n");
 			job->status = FLUSH_IS_FAILED;
 			return -ENOMEM;
 		}
@@ -10563,7 +10560,6 @@ blob_do_flush_job(struct spdk_blob *blob, struct t_flush_job *job) {
 	cpl.u.blob_basic.cb_arg = job;
 	spdk_bs_sequence_t *seq = bs_sequence_start_blob(blob->bs->md_channel, &cpl, blob);
 	if (!seq) {
-		SPDK_NOTICELOG("Failed sequence acquisition\n");
 		job->status = FLUSH_IS_FAILED;
 		return -ENOMEM;
 	}
@@ -10586,7 +10582,6 @@ blob_search_for_new_flush_job(struct spdk_blob *blob, struct t_flush_job *job) {
 	}
 	// reset job status
 	job->status = FLUSH_NEVER_STARTED;
-	SPDK_NOTICELOG("flush jobs on prior array=%d, ordinal=%d\n", blob->nflush_jobs_on_prior_array, blob->current_array_ordinal);
 	if (blob->nflush_jobs_on_prior_array == 0) {
 		if (blob->current_array_ordinal == 0) {
 			// search for the next allocated data cluster in the snapshot
@@ -10633,7 +10628,6 @@ blob_search_for_new_flush_job(struct spdk_blob *blob, struct t_flush_job *job) {
 			}
 		}
 	}
-	SPDK_NOTICELOG("flush jobs on prior array=%d, ordinal=%d, next array index=%lu\n", blob->nflush_jobs_on_prior_array, blob->current_array_ordinal, blob->next_idx_in_array);
 	return 0;
 }
 
@@ -10675,14 +10669,12 @@ snapshot_backup_poller(void *ctx) {
 				// retry job if overall status is not failure
 				nomem = blob_do_flush_job(blob, job) == -ENOMEM;
 			}
-			if (nomem) { SPDK_NOTICELOG("Unexpected nomem\n"); }
 		}
 	}
 
 	if (blob->nflush_jobs_current == 0) {
 		// if there are no pending jobs and there are failures and no more retries left, then set the overall status to failed
 		if (blob->nretries_current && blob->nretries_current >= blob->nmax_retries) {
-			SPDK_NOTICELOG("Ran out of retries, current=%d, max=%d\n", blob->nretries_current, blob->nmax_retries);
 			blob->backup_status = FLUSH_IS_FAILED;
 		} else if (blob->current_array_ordinal == 3 && blob->next_idx_in_array >= blob->active.num_pages) {
 			// else, if there are no pending jobs and there is no more work left to do, then set the overall status to succeeded
