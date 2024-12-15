@@ -109,8 +109,7 @@ struct t_flush_job {
 	uint64_t timeout_us; // copied from blob parent
 	uint64_t start_ticks; // job start ticks to later use in microsecond computation
 	uint64_t cluster_idx;
-	/* dev page number in the job's cluster (cluster size must be aligned to )
-	dev page size
+	/* dev page number in the job's cluster (cluster size must be aligned to dev page size)
 	*/
 	uint8_t dev_page_number;
 	enum EFlushStatus status; // I/O status of the job
