@@ -10690,20 +10690,6 @@ static void
 blob_start_snapshot_backup(void *ctx) {
 	struct snapshot_backup_ctx *sctx = ctx;
 
-	SPDK_NOTICELOG("md_start=%lu\n", sctx->blob->bs->md_start);
-	SPDK_NOTICELOG("clusters array:\n");
-	for (uint64_t i = 0; i < sctx->blob->active.cluster_array_size; ++i) {
-		if (sctx->blob->active.clusters[i] != 0) { SPDK_NOTICELOG("%lu\n", sctx->blob->active.clusters[i]); }
-	}
-	SPDK_NOTICELOG("extent_pages array\n");
-	for (uint32_t i = 0; i < sctx->blob->active.extent_pages_array_size; ++i) {
-		if (sctx->blob->active.extent_pages[i] != 0) { SPDK_NOTICELOG("%d\n", sctx->blob->active.extent_pages[i]); }
-	}
-	SPDK_NOTICELOG("pages array\n");
-	for (uint32_t i = 0; i < sctx->blob->active.num_pages; ++i) {
-		if (sctx->blob->active.pages[i] != 0) { SPDK_NOTICELOG("%d\n", sctx->blob->active.pages[i]); }
-	}
-
 	if (sctx->blob->backup_poller) {
 		sctx->compl.rc = -EEXIST;
 	} else if (!spdk_blob_is_snapshot(sctx->blob)) {
