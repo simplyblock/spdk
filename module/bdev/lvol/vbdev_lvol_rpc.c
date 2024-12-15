@@ -2081,7 +2081,7 @@ rpc_bdev_lvol_backup_snapshot(struct spdk_jsonrpc_request *request,
 	sctx = calloc(1, sizeof(struct snapshot_backup_ctx));
 	if (!sctx) {
 		spdk_jsonrpc_send_error_response(request, -ENOMEM,
-						 "nomem");
+						 spdk_strerror(ENOMEM));
 		return;
 	}
 
@@ -2175,7 +2175,7 @@ rpc_bdev_lvol_get_snapshot_backup_status(struct spdk_jsonrpc_request *request,
 	sctx = calloc(1, sizeof(struct snapshot_backup_ctx));
 	if (!sctx) {
 		spdk_jsonrpc_send_error_response(request, -ENOMEM,
-						 "nomem");
+						 spdk_strerror(ENOMEM));
 		return;
 	}
 
