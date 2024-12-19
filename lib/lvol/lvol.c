@@ -1247,7 +1247,10 @@ spdk_lvol_recover(struct spdk_lvol_store *lvs, spdk_blob_id id_to_recover,
 	req->is_recovery = true;
 	req->cb_fn = cb_fn;
 	req->cb_arg = cb_arg;
+	
 	spdk_bs_start_recover_blob_ext(lvs->blobstore, id_to_recover, lvol_create_cb, req);
+
+	return 0;
 }
 
 int

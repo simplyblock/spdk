@@ -1005,7 +1005,7 @@ blob_parse(const struct spdk_blob_md_page *pages, uint32_t page_count,
 		if (!blob->is_recovery) {
 			assert(spdk_bit_array_get(blob->bs->used_md_pages, pages[i - 1].next));
 		} else {
-			spdk_bit_array_set(blob->bs, pages[i - 1].next);
+			spdk_bit_array_set(blob->bs->used_md_pages, pages[i - 1].next);
 		}
 		blob->active.pages[i] = pages[i - 1].next;
 	}
@@ -6470,12 +6470,7 @@ bs_start_recover_blob(struct spdk_blob_store *bs,
 	       spdk_blob_id id_to_recover,
 	       spdk_blob_op_with_id_complete cb_fn, void *cb_arg)
 {
-	struct spdk_blob	*blob;
 	uint32_t		page_idx;
-	struct spdk_bs_cpl	cpl;
-	struct spdk_blob_opts	opts_local;
-	struct spdk_blob_xattr_opts internal_xattrs_default;
-	spdk_bs_sequence_t	*seq;
 	int rc;
 
 	assert(spdk_get_thread() == bs->md_thread);
