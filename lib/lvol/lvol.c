@@ -1260,13 +1260,19 @@ spdk_blob_id id_to_recover, spdk_lvol_op_with_handle_complete cb_fn, void *cb_ar
 
 	lvol = calloc(1, sizeof(*lvol));
 	if (lvol == NULL) {
+		free(req);
 		return -ENOMEM;
 	}
 
 	lvol->lvol_store = lvs;
 	lvol->clear_method = (enum blob_clear_method)clear_method;
 	snprintf(lvol->name, sizeof(lvol->name), "%s", orig_name);
-	memcpy(&lvol->uuid, orig_uuid, sizeof(lvol->uuid));
+	if (spdk_uuid_parse(&lvol->uuid, orig_uuid) != 0) {
+		SPDK_INFOLOG(lvol, "incorrect UUID '%s'\n", orig_uuid);
+		free(req);
+		lvol_free(lvol);
+		return -EINVAL;
+	}
 	spdk_uuid_fmt_lower(lvol->uuid_str, sizeof(lvol->uuid_str), &lvol->uuid);
 	spdk_uuid_fmt_lower(lvol->unique_id, sizeof(lvol->uuid_str), &lvol->uuid);
 
