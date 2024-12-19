@@ -156,6 +156,10 @@ void spdk_bit_pool_load_mask(struct spdk_bit_pool *pool, const void *mask);
  */
 void spdk_bit_pool_free_all_bits(struct spdk_bit_pool *pool);
 
+// Get the underlying bit array from the bit pool.
+struct spdk_bit_array *
+spdk_bit_pool_get_bit_array(struct spdk_bit_pool *pool);
+
 #ifdef __cplusplus
 }
 #endif
