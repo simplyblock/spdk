@@ -6466,34 +6466,6 @@ struct spdk_clone_snapshot_ctx {
 };
 
 static void
-bs_start_recover_blob(struct spdk_blob_store *bs,
-	       spdk_blob_id id_to_recover,
-	       spdk_blob_op_with_id_complete cb_fn, void *cb_arg)
-{
-	uint32_t		page_idx;
-	int rc;
-
-	assert(spdk_get_thread() == bs->md_thread);
-
-	spdk_spin_lock(&bs->used_lock);
-	page_idx = bs_blobid_to_page(id_to_recover);
-	if (page_idx == UINT32_MAX) {
-		spdk_spin_unlock(&bs->used_lock);
-		cb_fn(cb_arg, 0, -ENOMEM);
-		return;
-	}
-	if (spdk_bit_array_get(bs->used_blobids, page_idx)) {
-		spdk_spin_unlock(&bs->used_lock);
-		cb_fn(cb_arg, 0, -EEXIST);
-		return;
-	}
-	spdk_bit_array_set(bs->used_blobids, page_idx);
-	bs_claim_md_page(bs, page_idx);
-	spdk_spin_unlock(&bs->used_lock);
-	cb_fn(cb_arg, id_to_recover, 0);
-}
-
-static void
 bs_create_blob(struct spdk_blob_store *bs,
 	       const struct spdk_blob_opts *opts,
 	       const struct spdk_blob_xattr_opts *internal_xattrs,
@@ -6609,6 +6581,34 @@ error:
 	spdk_spin_unlock(&bs->used_lock);
 	cb_fn(cb_arg, 0, rc);
 }
+
+static void
+bs_start_recover_blob(struct spdk_blob_store *bs,
+	       spdk_blob_id id_to_recover,
+	       spdk_blob_op_with_id_complete cb_fn, void *cb_arg)
+{
+	uint32_t		page_idx;
+
+	assert(spdk_get_thread() == bs->md_thread);
+
+	spdk_spin_lock(&bs->used_lock);
+	page_idx = bs_blobid_to_page(id_to_recover);
+	if (page_idx == UINT32_MAX) {
+		spdk_spin_unlock(&bs->used_lock);
+		cb_fn(cb_arg, 0, -ENOMEM);
+		return;
+	}
+	if (spdk_bit_array_get(bs->used_blobids, page_idx)) {
+		spdk_spin_unlock(&bs->used_lock);
+		cb_fn(cb_arg, 0, -EEXIST);
+		return;
+	}
+	spdk_bit_array_set(bs->used_blobids, page_idx);
+	bs_claim_md_page(bs, page_idx);
+	spdk_spin_unlock(&bs->used_lock);
+	cb_fn(cb_arg, id_to_recover, 0);
+}
+
 
 void
 spdk_bs_create_blob(struct spdk_blob_store *bs,
