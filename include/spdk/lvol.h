@@ -197,10 +197,10 @@ int spdk_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz,
 
 /**
  * Recover a backed up (via storage tiering) lvol on a given lvolstore, which may not be overall backed up.
- * 
+ * Must pass in the original user lvol name, spdk uuid (the one on disk, not the one transformed to the lvol uuid), and clear method.
  */
-int spdk_lvol_recover(struct spdk_lvol_store *lvs, spdk_blob_id id_to_recover,
-		     spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
+int spdk_lvol_recover(struct spdk_lvol_store *lvs, const char *orig_name, const char *orig_uuid, enum lvol_clear_method clear_method, 
+spdk_blob_id id_to_recover, spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
 
 /**
  * Create snapshot of given lvol.

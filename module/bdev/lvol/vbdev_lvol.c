@@ -1278,8 +1278,8 @@ vbdev_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz,
 }
 
 int
-vbdev_lvol_recover(struct spdk_lvol_store *lvs, spdk_blob_id id_to_recover,
-		     spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg)
+vbdev_lvol_recover(struct spdk_lvol_store *lvs, const char *orig_name, const char *orig_uuid, enum lvol_clear_method clear_method, 
+spdk_blob_id id_to_recover, spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg)
 {	
 	struct spdk_lvol_with_handle_req *req;
 	int rc;
@@ -1291,7 +1291,7 @@ vbdev_lvol_recover(struct spdk_lvol_store *lvs, spdk_blob_id id_to_recover,
 	req->cb_fn = cb_fn;
 	req->cb_arg = cb_arg;
 
-	rc = spdk_lvol_recover(lvs, id_to_recover, _vbdev_lvol_create_cb, req);
+	rc = spdk_lvol_recover(lvs, orig_name, orig_uuid, clear_method, id_to_recover, _vbdev_lvol_create_cb, req);
 	if (rc != 0) {
 		free(req);
 	}

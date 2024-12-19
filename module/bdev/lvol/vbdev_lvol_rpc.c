@@ -1388,6 +1388,7 @@ rpc_dump_lvol(struct spdk_json_write_ctx *w, struct spdk_lvol *lvol)
 	spdk_json_write_named_bool(w, "is_clone", spdk_blob_is_clone(lvol->blob));
 	spdk_json_write_named_bool(w, "is_esnap_clone", spdk_blob_is_esnap_clone(lvol->blob));
 	spdk_json_write_named_bool(w, "is_degraded", spdk_blob_is_degraded(lvol->blob));
+	spdk_json_write_named_uint64(w, "blobid", spdk_blob_get_id(lvol->blob));
 	spdk_json_write_named_uint8(w, "lvol_priority_class", lvol->priority_class);
 	spdk_json_write_named_uint8(w, "tiering_info", vbdev_lvol_get_tiering_info(lvol));
 
@@ -2218,12 +2219,18 @@ cleanup:
 SPDK_RPC_REGISTER("bdev_lvol_get_snapshot_backup_status", rpc_bdev_lvol_get_snapshot_backup_status, SPDK_RPC_RUNTIME)
 
 struct rpc_bdev_lvol_recover {
-	char* lvs_name;
+	char *lvs_name;
+	char *orig_name;
+	char *orig_uuid;
+	char* clear_method;
 	spdk_blob_id id_to_recover;
 };
 
 static const struct spdk_json_object_decoder rpc_bdev_lvol_recover_decoders[] = {
 	{"lvs_name", offsetof(struct rpc_bdev_lvol_recover, lvs_name), spdk_json_decode_string},
+	{"orig_name", offsetof(struct rpc_bdev_lvol_recover, orig_name), spdk_json_decode_string},
+	{"orig_uuid", offsetof(struct rpc_bdev_lvol_recover, orig_uuid), spdk_json_decode_string},
+	{"clear_method", offsetof(struct rpc_bdev_lvol_recover, clear_method), spdk_json_decode_string},
 	{"id_of_blob_to_recover", offsetof(struct rpc_bdev_lvol_recover, id_to_recover), spdk_json_decode_uint64}
 };
 
@@ -2232,13 +2239,8 @@ static void rpc_bdev_lvol_recover(struct spdk_jsonrpc_request *request,
 {
 	SPDK_INFOLOG(lvol_rpc, "Recover an lvol backed on secondary storage via storage tiering\n");
 
-	struct rpc_bdev_lvol_recover *req;
+	struct rpc_bdev_lvol_recover req = {};
 	struct spdk_lvol_store *lvs;
-
-	req = calloc(1, sizeof(struct rpc_bdev_lvol_recover));
-	if (!req) {
-		spdk_jsonrpc_send_error_response(request, -ENOMEM, spdk_strerror(ENOMEM));
-	}
 
 	if (spdk_json_decode_object(params, rpc_bdev_lvol_recover_decoders,
 				    SPDK_COUNTOF(rpc_bdev_lvol_recover_decoders),
@@ -2249,21 +2251,35 @@ static void rpc_bdev_lvol_recover(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
-	lvs = vbdev_get_lvol_store_by_name(req->lvs_name);
+	lvs = vbdev_get_lvol_store_by_name(req.lvs_name);
 	if (lvs == NULL) {
 		SPDK_INFOLOG(lvol_rpc, "no lvs existing for given name\n");
-		spdk_jsonrpc_send_error_response_fmt(request, -ENOENT, "Lvol store %s not found", req->lvs_name);
+		spdk_jsonrpc_send_error_response_fmt(request, -ENOENT, "Lvol store %s not found", req.lvs_name);
 		goto cleanup;
 	}
 
-	int rc = vbdev_lvol_recover(lvs, req->id_to_recover, rpc_bdev_lvol_create_cb, req);
+	enum lvol_clear_method clear_method;
+	if (!strcasecmp(req.clear_method, "none")) {
+		clear_method = LVOL_CLEAR_WITH_NONE;
+	} else if (!strcasecmp(req.clear_method, "unmap")) {
+		clear_method = LVOL_CLEAR_WITH_UNMAP;
+	} else if (!strcasecmp(req.clear_method, "write_zeroes")) {
+		clear_method = LVOL_CLEAR_WITH_WRITE_ZEROES;
+	} else {
+		spdk_jsonrpc_send_error_response(request, -EINVAL, "Invalid clean_method option");
+		goto cleanup;
+	}
+	
+	int rc = vbdev_lvol_recover(lvs, req.orig_name, req.orig_uuid, clear_method, req.id_to_recover, rpc_bdev_lvol_create_cb, request);
 	if (rc < 0) {
 		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
 		goto cleanup;
 	}
 
 cleanup:
-	free(req->lvs_name);
-	free(req);
+	free(req.lvs_name);
+	free(req.orig_name);
+	free(req.orig_uuid);
+	free(req.clear_method);
 }
 SPDK_RPC_REGISTER("bdev_lvol_recover", rpc_bdev_lvol_recover, SPDK_RPC_RUNTIME)

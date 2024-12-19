@@ -1236,9 +1236,17 @@ spdk_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz,
 }
 
 int
-spdk_lvol_recover(struct spdk_lvol_store *lvs, spdk_blob_id id_to_recover,
-		     spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg)
+spdk_lvol_recover(struct spdk_lvol_store *lvs, const char *orig_name, const char *orig_uuid, enum lvol_clear_method clear_method,
+spdk_blob_id id_to_recover, spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg)
 {
+	int rc = lvs_verify_lvol_name(lvs, orig_name);
+	if (rc < 0) {
+		return rc;
+	}
+	if (spdk_bdev_get_by_name(orig_uuid) != NULL) {
+		return -EEXIST;
+	}
+
 	struct spdk_lvol_with_handle_req *req = calloc(1, sizeof(*req));
 	if (!req) {
 		SPDK_ERRLOG("Cannot alloc memory for lvol request pointer\n");
@@ -1247,7 +1255,24 @@ spdk_lvol_recover(struct spdk_lvol_store *lvs, spdk_blob_id id_to_recover,
 	req->is_recovery = true;
 	req->cb_fn = cb_fn;
 	req->cb_arg = cb_arg;
-	
+
+	struct spdk_lvol *lvol;
+
+	lvol = calloc(1, sizeof(*lvol));
+	if (lvol == NULL) {
+		return -ENOMEM;
+	}
+
+	lvol->lvol_store = lvs;
+	lvol->clear_method = (enum blob_clear_method)clear_method;
+	snprintf(lvol->name, sizeof(lvol->name), "%s", orig_name);
+	memcpy(&lvol->uuid, orig_uuid, sizeof(lvol->uuid));
+	spdk_uuid_fmt_lower(lvol->uuid_str, sizeof(lvol->uuid_str), &lvol->uuid);
+	spdk_uuid_fmt_lower(lvol->unique_id, sizeof(lvol->uuid_str), &lvol->uuid);
+
+	TAILQ_INSERT_TAIL(&lvs->pending_lvols, lvol, link);
+
+	req->lvol = lvol;
 	spdk_bs_start_recover_blob_ext(lvs->blobstore, id_to_recover, lvol_create_cb, req);
 
 	return 0;
