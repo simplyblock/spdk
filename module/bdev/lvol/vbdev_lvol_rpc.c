@@ -2252,7 +2252,7 @@ static void rpc_bdev_lvol_recover(struct spdk_jsonrpc_request *request,
 	lvs = vbdev_get_lvol_store_by_name(req->lvs_name);
 	if (lvs == NULL) {
 		SPDK_INFOLOG(lvol_rpc, "no lvs existing for given name\n");
-		spdk_jsonrpc_send_error_response_fmt(request, -ENOENT, "Lvol store %s not found", req.lvs_name);
+		spdk_jsonrpc_send_error_response_fmt(request, -ENOENT, "Lvol store %s not found", req->lvs_name);
 		goto cleanup;
 	}
 
