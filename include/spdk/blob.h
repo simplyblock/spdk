@@ -625,6 +625,12 @@ void spdk_blob_opts_init(struct spdk_blob_opts *opts, size_t opts_size);
 void spdk_bs_create_blob_ext(struct spdk_blob_store *bs, const struct spdk_blob_opts *opts,
 			     spdk_blob_op_with_id_complete cb_fn, void *cb_arg);
 
+/* Start recovering a backed up (via storage tiering) blob on the given blobstore, which may not be 
+overall backed up.
+*/
+void spdk_bs_start_recover_blob_ext(struct spdk_blob_store *bs, spdk_blob_id id_to_recover,
+			     spdk_blob_op_with_id_complete cb_fn, void *cb_arg);	
+
 /**
  * Create a new blob with default option values on the given blobstore.
  * The new blob id will be passed to the callback function.
@@ -916,6 +922,12 @@ void spdk_bs_open_blob(struct spdk_blob_store *bs, spdk_blob_id blobid,
  */
 void spdk_bs_open_blob_ext(struct spdk_blob_store *bs, spdk_blob_id blobid,
 			   struct spdk_blob_open_opts *opts, spdk_blob_op_with_handle_complete cb_fn, void *cb_arg);
+
+/* Open a backed up (via storage tiering) blob from the given blobstore, which may not be overall backed up.
+See spdk_bs_open_blob_ext() for further details.
+*/
+void spdk_bs_open_recover_blob_ext(struct spdk_blob_store *bs, spdk_blob_id blobid,
+		      struct spdk_blob_open_opts *opts, spdk_blob_op_with_handle_complete cb_fn, void *cb_arg);
 
 /**
  * Resize a blob to 'sz' clusters. These changes are not persisted to disk until

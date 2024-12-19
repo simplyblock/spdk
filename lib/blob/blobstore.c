@@ -754,7 +754,14 @@ blob_parse_page(const struct spdk_blob_md_page *page, struct spdk_blob *blob)
 					if (desc_extent_rle->extents[i].cluster_idx != 0) {
 						if (!spdk_bit_pool_is_allocated(blob->bs->used_clusters,
 										desc_extent_rle->extents[i].cluster_idx + j)) {
-							return -EINVAL;
+							if (!blob->is_recovery) {
+								return -EINVAL;
+							} else {
+								int rc = spdk_bit_array_set(spdk_bit_pool_get_bit_array(blob->bs->used_clusters), desc_extent_rle->extents[i].cluster_idx + j);
+								if (rc != 0) {
+									return -ENOMEM;
+								}
+							}
 						}
 					}
 					cluster_count++;
@@ -865,7 +872,14 @@ blob_parse_page(const struct spdk_blob_md_page *page, struct spdk_blob *blob)
 			for (i = 0; i < cluster_idx_length / sizeof(desc_extent->cluster_idx[0]); i++) {
 				if (desc_extent->cluster_idx[i] != 0) {
 					if (!spdk_bit_pool_is_allocated(blob->bs->used_clusters, desc_extent->cluster_idx[i])) {
-						return -EINVAL;
+						if (!blob->is_recovery) {
+							return -EINVAL;
+						} else {
+							int rc = spdk_bit_array_set(spdk_bit_pool_get_bit_array(blob->bs->used_clusters), desc_extent->cluster_idx[i]);
+							if (rc != 0) {
+								return -ENOMEM;
+							}
+						}
 					}
 				}
 				cluster_count++;
@@ -988,7 +1002,11 @@ blob_parse(const struct spdk_blob_md_page *pages, uint32_t page_count,
 	blob->active.pages[0] = pages[0].id;
 
 	for (i = 1; i < page_count; i++) {
-		assert(spdk_bit_array_get(blob->bs->used_md_pages, pages[i - 1].next));
+		if (!blob->is_recovery) {
+			assert(spdk_bit_array_get(blob->bs->used_md_pages, pages[i - 1].next));
+		} else {
+			spdk_bit_array_set(blob->bs, pages[i - 1].next);
+		}
 		blob->active.pages[i] = pages[i - 1].next;
 	}
 	blob->active.num_pages = page_count;
@@ -6448,6 +6466,39 @@ struct spdk_clone_snapshot_ctx {
 };
 
 static void
+bs_start_recover_blob(struct spdk_blob_store *bs,
+	       spdk_blob_id id_to_recover,
+	       spdk_blob_op_with_id_complete cb_fn, void *cb_arg)
+{
+	struct spdk_blob	*blob;
+	uint32_t		page_idx;
+	struct spdk_bs_cpl	cpl;
+	struct spdk_blob_opts	opts_local;
+	struct spdk_blob_xattr_opts internal_xattrs_default;
+	spdk_bs_sequence_t	*seq;
+	int rc;
+
+	assert(spdk_get_thread() == bs->md_thread);
+
+	spdk_spin_lock(&bs->used_lock);
+	page_idx = bs_blobid_to_page(id_to_recover);
+	if (page_idx == UINT32_MAX) {
+		spdk_spin_unlock(&bs->used_lock);
+		cb_fn(cb_arg, 0, -ENOMEM);
+		return;
+	}
+	if (spdk_bit_array_get(bs->used_blobids, page_idx)) {
+		spdk_spin_unlock(&bs->used_lock);
+		cb_fn(cb_arg, 0, -EEXIST);
+		return;
+	}
+	spdk_bit_array_set(bs->used_blobids, page_idx);
+	bs_claim_md_page(bs, page_idx);
+	spdk_spin_unlock(&bs->used_lock);
+	cb_fn(cb_arg, id_to_recover, 0);
+}
+
+static void
 bs_create_blob(struct spdk_blob_store *bs,
 	       const struct spdk_blob_opts *opts,
 	       const struct spdk_blob_xattr_opts *internal_xattrs,
@@ -6576,6 +6627,13 @@ spdk_bs_create_blob_ext(struct spdk_blob_store *bs, const struct spdk_blob_opts 
 			spdk_blob_op_with_id_complete cb_fn, void *cb_arg)
 {
 	bs_create_blob(bs, opts, NULL, cb_fn, cb_arg);
+}
+
+void
+spdk_bs_start_recover_blob_ext(struct spdk_blob_store *bs, spdk_blob_id id_to_recover,
+			     spdk_blob_op_with_id_complete cb_fn, void *cb_arg) 
+{
+	bs_start_recover_blob(bs, id_to_recover, cb_fn, cb_arg);
 }
 
 /* END spdk_bs_create_blob */
@@ -8833,6 +8891,67 @@ bs_open_blob(struct spdk_blob_store *bs,
 	blob_load(seq, blob, bs_open_blob_cpl, blob);
 }
 
+static void
+bs_open_recover_blob(struct spdk_blob_store *bs,
+	     spdk_blob_id blobid,
+	     struct spdk_blob_open_opts *opts,
+	     spdk_blob_op_with_handle_complete cb_fn,
+	     void *cb_arg)
+{
+	struct spdk_blob		*blob;
+	struct spdk_bs_cpl		cpl;
+	struct spdk_blob_open_opts	opts_local;
+	spdk_bs_sequence_t		*seq;
+	uint32_t			page_num;
+
+	SPDK_DEBUGLOG(blob, "Opening blob 0x%" PRIx64 "\n", blobid);
+	SPDK_INFOLOG(blob, "Opening blob 0x%" PRIx64 "\n", blobid);	
+	assert(spdk_get_thread() == bs->md_thread);
+
+	page_num = bs_blobid_to_page(blobid);
+	if (spdk_bit_array_get(bs->used_blobids, page_num) == false) {
+		/* Invalid blobid */
+		cb_fn(cb_arg, NULL, -ENOENT);
+		return;
+	}
+
+	blob = blob_lookup(bs, blobid);
+	if (blob) {
+		blob->open_ref++;
+		cb_fn(cb_arg, blob, 0);
+		return;
+	}
+
+	blob = blob_alloc(bs, blobid);
+	if (!blob) {
+		cb_fn(cb_arg, NULL, -ENOMEM);
+		return;
+	}
+	blob->is_recovery = true;
+
+	spdk_blob_open_opts_init(&opts_local, sizeof(opts_local));
+	if (opts) {
+		blob_open_opts_copy(opts, &opts_local);
+	}
+
+	blob->clear_method = opts_local.clear_method;
+
+	cpl.type = SPDK_BS_CPL_TYPE_BLOB_HANDLE;
+	cpl.u.blob_handle.cb_fn = cb_fn;
+	cpl.u.blob_handle.cb_arg = cb_arg;
+	cpl.u.blob_handle.blob = blob;
+	cpl.u.blob_handle.esnap_ctx = opts_local.esnap_ctx;
+
+	seq = bs_sequence_start_bs(bs->md_channel, &cpl);
+	if (!seq) {
+		blob_free(blob);
+		cb_fn(cb_arg, NULL, -ENOMEM);
+		return;
+	}
+
+	blob_load(seq, blob, bs_open_blob_cpl, blob);
+}
+
 void
 spdk_bs_open_blob(struct spdk_blob_store *bs, spdk_blob_id blobid,
 		  spdk_blob_op_with_handle_complete cb_fn, void *cb_arg)
@@ -8845,6 +8964,13 @@ spdk_bs_open_blob_ext(struct spdk_blob_store *bs, spdk_blob_id blobid,
 		      struct spdk_blob_open_opts *opts, spdk_blob_op_with_handle_complete cb_fn, void *cb_arg)
 {
 	bs_open_blob(bs, blobid, opts, cb_fn, cb_arg);
+}
+
+void
+spdk_bs_open_recover_blob_ext(struct spdk_blob_store *bs, spdk_blob_id blobid,
+		      struct spdk_blob_open_opts *opts, spdk_blob_op_with_handle_complete cb_fn, void *cb_arg)
+{
+	bs_open_recover_blob(bs, blobid, opts, cb_fn, cb_arg);
 }
 
 /* END spdk_bs_open_blob */
@@ -10615,27 +10741,26 @@ blob_search_for_new_flush_job(struct spdk_blob *blob, struct t_flush_job *job) {
 				++blob->next_idx_in_array;
 
 				return blob_do_flush_job(blob, job);
-			} else // move to the next array if there is one
+			} else // move to the next array
 			{
 				blob->nflush_jobs_on_prior_array = blob->nflush_jobs_current;
 				++blob->current_array_ordinal;
-				blob->next_idx_in_array = 0;
+				blob->next_idx_in_array = blob->active.extent_pages_array_size - 1; // next array is extent pages array
 			}
 		} else if (blob->current_array_ordinal <= 2) {
 			uint32_t *page_idxs_arr = blob->current_array_ordinal == 1 ? blob->active.extent_pages : blob->active.pages;
-			const uint64_t arr_size = blob->current_array_ordinal == 1 ? blob->active.extent_pages_array_size : blob->active.num_pages;
 			// search for the next allocated md page in the snapshot
-			while (blob->next_idx_in_array < arr_size && page_idxs_arr[blob->next_idx_in_array] == 0) {
-				++blob->next_idx_in_array;
+			while ((int64_t)blob->next_idx_in_array >= 0 && page_idxs_arr[blob->next_idx_in_array] == 0) {
+				--blob->next_idx_in_array;
 			}
-			if (blob->next_idx_in_array < arr_size) {
+			if ((int64_t)blob->next_idx_in_array >= 0) {
 				job->cluster_idx = bs_lba_to_cluster(blob->bs, bs_md_page_to_lba(blob->bs, page_idxs_arr[blob->next_idx_in_array]));
 				job->dev_page_number = 0;
 
 				// search for the next md cluster in the snapshot
 				do {
-					++blob->next_idx_in_array;
-				} while (blob->next_idx_in_array < arr_size && (page_idxs_arr[blob->next_idx_in_array] == 0 
+					--blob->next_idx_in_array;
+				} while ((int64_t)blob->next_idx_in_array >= 0 && (page_idxs_arr[blob->next_idx_in_array] == 0 
 				|| bs_lba_to_cluster(blob->bs, bs_md_page_to_lba(blob->bs, page_idxs_arr[blob->next_idx_in_array])) == job->cluster_idx));
 
 				return blob_do_flush_job(blob, job);
@@ -10643,7 +10768,7 @@ blob_search_for_new_flush_job(struct spdk_blob *blob, struct t_flush_job *job) {
 			{
 				blob->nflush_jobs_on_prior_array = blob->nflush_jobs_current;
 				++blob->current_array_ordinal;
-				blob->next_idx_in_array = 0;
+				blob->next_idx_in_array = blob->active.num_pages - 1; // next array after extent pages array is pages array
 			}
 		}
 	}

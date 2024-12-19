@@ -118,6 +118,10 @@ struct t_flush_job {
 struct spdk_blob {
 	struct spdk_blob_store *bs;
 
+	/* whether the blob is to be recovered from secondary storage via storage tiering, thus bypassing initial persisting and some later 
+	validation checks
+	*/
+	bool is_recovery;
 	int priority_class; // to save the lvol's priority class across cluster allocations
 	atomic_uchar tiering_bits; // storage tiering bitmask, must be cache-coherent to prevent garbage reads, which will tier/untier when undesired
 
@@ -190,7 +194,10 @@ struct spdk_blob {
 	next index is a heretofore completely unprocessed cluster. Each flush job 
 	processes its own cluster completely privately and all concurrent flush jobs
 	are on the same array to safely flush data before metadata and more 
-	sensitive metadata before other metadata.
+	sensitive metadata before other metadata. 
+
+	However, the very first non-extent page must be the last md page to be flushed. 
+	For convenience sake, we'll just flush both types of md pages in reverse order.
 	*/
 	uint64_t next_idx_in_array;
 

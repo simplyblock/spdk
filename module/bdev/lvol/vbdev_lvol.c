@@ -1277,6 +1277,27 @@ vbdev_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz,
 	return rc;
 }
 
+int
+vbdev_lvol_recover(struct spdk_lvol_store *lvs, spdk_blob_id id_to_recover,
+		     spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg)
+{	
+	struct spdk_lvol_with_handle_req *req;
+	int rc;
+
+	req = calloc(1, sizeof(*req));
+	if (req == NULL) {
+		return -ENOMEM;
+	}
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+
+	rc = spdk_lvol_recover(lvs, id_to_recover, _vbdev_lvol_create_cb, req);
+	if (rc != 0) {
+		free(req);
+	}
+
+	return rc;
+}
 
 void
 vbdev_lvol_create_snapshot(struct spdk_lvol *lvol, const char *snapshot_name, uint8_t lvol_priority_class, uint8_t tiering_info,

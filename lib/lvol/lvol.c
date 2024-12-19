@@ -1118,7 +1118,11 @@ lvol_create_cb(void *cb_arg, spdk_blob_id blobid, int lvolerrno)
 		lvs_degraded_lvol_set_add(degraded_set, req->lvol);
 	}
 
-	spdk_bs_open_blob_ext(bs, blobid, &opts, lvol_create_open_cb, req);
+	if (!req->is_recovery) {
+		spdk_bs_open_blob_ext(bs, blobid, &opts, lvol_create_open_cb, req);
+	} else {
+		spdk_bs_open_recover_blob_ext(bs, blobid, &opts, lvol_create_open_cb, req);
+	}
 }
 
 static void
@@ -1229,6 +1233,21 @@ spdk_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz,
 	spdk_bs_create_blob_ext(lvs->blobstore, &opts, lvol_create_cb, req);
 
 	return 0;
+}
+
+int
+spdk_lvol_recover(struct spdk_lvol_store *lvs, spdk_blob_id id_to_recover,
+		     spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg)
+{
+	struct spdk_lvol_with_handle_req *req = calloc(1, sizeof(*req));
+	if (!req) {
+		SPDK_ERRLOG("Cannot alloc memory for lvol request pointer\n");
+		return -ENOMEM;
+	}
+	req->is_recovery = true;
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+	spdk_bs_start_recover_blob_ext(lvs->blobstore, id_to_recover, lvol_create_cb, req);
 }
 
 int
