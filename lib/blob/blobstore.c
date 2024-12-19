@@ -1629,6 +1629,7 @@ blob_load_cpl_extents_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 			lba = bs_md_page_to_lba(blob->bs, blob->active.extent_pages[i]);
 			ctx->next_extent_page = i + 1;
 
+			seq->tiering_bits |= SYNC_FETCH_BIT;
 			bs_sequence_read_dev(seq, &ctx->pages[0], lba,
 					     bs_byte_to_lba(blob->bs, SPDK_BS_PAGE_SIZE),
 					     blob_load_cpl_extents_cpl, ctx);
@@ -1707,6 +1708,7 @@ blob_load_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		ctx->num_pages++;
 		ctx->pages = tmp_pages;
 
+		seq->tiering_bits |= SYNC_FETCH_BIT;
 		bs_sequence_read_dev(seq, &ctx->pages[ctx->num_pages - 1],
 				     next_lba,
 				     bs_byte_to_lba(blob->bs, sizeof(*page)),
@@ -1792,6 +1794,7 @@ blob_load(spdk_bs_sequence_t *seq, struct spdk_blob *blob,
 	seq->tiering_bits |= (blob_tiering_bits & UNTIER_BLOB_MD_BIT) ? METADATA_PAGE_BIT : 0;
 	seq->tiering_bits &= (blob_tiering_bits & DO_TIER_BLOB_MD_BIT) ? ~METADATA_PAGE_BIT : 255;
 
+	seq->tiering_bits |= SYNC_FETCH_BIT;
 	bs_sequence_read_dev(seq, &ctx->pages[0], lba,
 			     bs_byte_to_lba(bs, SPDK_BS_PAGE_SIZE),
 			     blob_load_cpl, ctx);
@@ -2606,6 +2609,7 @@ bs_mark_dirty(spdk_bs_sequence_t *seq, struct spdk_blob_store *bs,
 		return;
 	}
 
+	seq->tiering_bits |= SYNC_FETCH_BIT;
 	bs_sequence_read_dev(seq, ctx->super, bs_page_to_lba(bs, 0),
 			     bs_byte_to_lba(bs, sizeof(*ctx->super)),
 			     bs_mark_dirty_write, ctx);
@@ -2952,6 +2956,7 @@ bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 			blob_copy(ctx, op, copy_src_lba);
 		} else {
 			/* Read cluster from backing device */
+			// back dev may not support storage tiering
 			bs_sequence_read_bs_dev(ctx->seq, blob->back_bs_dev, ctx->buf,
 						bs_dev_page_to_lba(blob->back_bs_dev, cluster_start_page),
 						bs_dev_byte_to_lba(blob->back_bs_dev, blob->bs->cluster_sz),
@@ -4425,6 +4430,7 @@ bs_load_used_clusters_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	}
 	lba = bs_page_to_lba(ctx->bs, ctx->super->used_blobid_mask_start);
 	lba_count = bs_page_to_lba(ctx->bs, ctx->super->used_blobid_mask_len);
+	seq->tiering_bits |= SYNC_FETCH_BIT;
 	bs_sequence_read_dev(seq, ctx->mask, lba, lba_count,
 			     bs_load_used_blobids_cpl, ctx);
 }
@@ -4474,6 +4480,7 @@ bs_load_used_pages_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	}
 	lba = bs_page_to_lba(ctx->bs, ctx->super->used_cluster_mask_start);
 	lba_count = bs_page_to_lba(ctx->bs, ctx->super->used_cluster_mask_len);
+	seq->tiering_bits |= SYNC_FETCH_BIT;
 	bs_sequence_read_dev(seq, ctx->mask, lba, lba_count,
 			     bs_load_used_clusters_cpl, ctx);
 }
@@ -4494,6 +4501,7 @@ bs_load_read_used_pages(struct spdk_bs_load_ctx *ctx)
 
 	lba = bs_page_to_lba(ctx->bs, ctx->super->used_page_mask_start);
 	lba_count = bs_page_to_lba(ctx->bs, ctx->super->used_page_mask_len);
+	ctx->seq->tiering_bits |= SYNC_FETCH_BIT;
 	bs_sequence_read_dev(ctx->seq, ctx->mask, lba, lba_count,
 			     bs_load_used_pages_cpl, ctx);
 }
@@ -4843,6 +4851,7 @@ bs_load_replay_extent_pages(struct spdk_bs_load_ctx *ctx)
 		page = ctx->extent_page_num[i];
 		assert(page < ctx->super->md_len);
 		lba = bs_md_page_to_lba(ctx->bs, page);
+		batch->tiering_bits |= SYNC_FETCH_BIT;
 		bs_batch_read_dev(batch, &ctx->extent_pages[i], lba,
 				  bs_byte_to_lba(ctx->bs, SPDK_BS_PAGE_SIZE));
 	}
@@ -4901,6 +4910,7 @@ bs_load_replay_cur_md_page(struct spdk_bs_load_ctx *ctx)
 
 	assert(ctx->cur_page < ctx->super->md_len);
 	lba = bs_md_page_to_lba(ctx->bs, ctx->cur_page);
+	ctx->seq->tiering_bits |= SYNC_FETCH_BIT;
 	bs_sequence_read_dev(ctx->seq, ctx->page, lba,
 			     bs_byte_to_lba(ctx->bs, SPDK_BS_PAGE_SIZE),
 			     bs_load_replay_md_cpl, ctx);
@@ -5122,6 +5132,7 @@ spdk_bs_load(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	}
 
 	/* Read the super block */
+	ctx->seq->tiering_bits |= SYNC_FETCH_BIT;
 	bs_sequence_read_dev(ctx->seq, ctx->super, bs_page_to_lba(bs, 0),
 			     bs_byte_to_lba(bs, sizeof(*ctx->super)),
 			     bs_load_super_cpl, ctx);
@@ -5448,6 +5459,7 @@ bs_dump_read_md_page(spdk_bs_sequence_t *seq, void *cb_arg)
 
 	assert(ctx->cur_page < ctx->super->md_len);
 	lba = bs_page_to_lba(ctx->bs, ctx->super->md_start + ctx->cur_page);
+	seq->tiering_bits |= SYNC_FETCH_BIT;
 	bs_sequence_read_dev(seq, ctx->page, lba,
 			     bs_byte_to_lba(ctx->bs, SPDK_BS_PAGE_SIZE),
 			     bs_dump_read_md_page_cpl, ctx);
@@ -5556,6 +5568,7 @@ spdk_bs_dump(struct spdk_bs_dev *dev, FILE *fp, spdk_bs_dump_print_xattr print_x
 	}
 
 	/* Read the super block */
+	ctx->seq->tiering_bits |= SYNC_FETCH_BIT;
 	bs_sequence_read_dev(ctx->seq, ctx->super, bs_page_to_lba(bs, 0),
 			     bs_byte_to_lba(bs, sizeof(*ctx->super)),
 			     bs_dump_super_cpl, ctx);
@@ -5609,6 +5622,7 @@ spdk_bs_dumpv2(struct spdk_blob_store *bs, FILE *fp, spdk_bs_op_complete cb_fn, 
 	}
 
 	/* Read the super block */
+	ctx->seq->tiering_bits |= SYNC_FETCH_BIT;
 	bs_sequence_read_dev(ctx->seq, ctx->super, bs_page_to_lba(bs, 0),
 			     bs_byte_to_lba(bs, sizeof(*ctx->super)),
 			     bs_dump_super_cpl, ctx);
@@ -6084,6 +6098,7 @@ spdk_bs_unload(struct spdk_blob_store *bs, spdk_bs_op_complete cb_fn, void *cb_a
 	}
 
 	/* Read super block */
+	ctx->seq->tiering_bits |= SYNC_FETCH_BIT;
 	bs_sequence_read_dev(ctx->seq, ctx->super, bs_page_to_lba(bs, 0),
 			     bs_byte_to_lba(bs, sizeof(*ctx->super)),
 			     bs_unload_read_super_cpl, ctx);
@@ -6181,6 +6196,7 @@ spdk_bs_set_super(struct spdk_blob_store *bs, spdk_blob_id blobid,
 	bs->super_blob = blobid;
 
 	/* Read super block */
+	seq->tiering_bits |= SYNC_FETCH_BIT;
 	bs_sequence_read_dev(seq, ctx->super, bs_page_to_lba(bs, 0),
 			     bs_byte_to_lba(bs, sizeof(*ctx->super)),
 			     bs_set_super_read_cpl, ctx);
@@ -9945,6 +9961,7 @@ bs_load_try_to_grow(struct spdk_bs_load_ctx *ctx)
 	}
 	lba = bs_page_to_lba(ctx->bs, ctx->super->used_cluster_mask_start);
 	lba_count = bs_page_to_lba(ctx->bs, ctx->super->used_cluster_mask_len);
+	ctx->seq->tiering_bits |= SYNC_FETCH_BIT;
 	bs_sequence_read_dev(ctx->seq, ctx->mask, lba, lba_count,
 			     bs_load_grow_used_clusters_read_cpl, ctx);
 }
@@ -10137,6 +10154,7 @@ spdk_bs_grow_live(struct spdk_blob_store *bs,
 	}
 
 	/* Read the super block */
+	ctx->seq->tiering_bits |= SYNC_FETCH_BIT;
 	bs_sequence_read_dev(ctx->seq, ctx->super, bs_page_to_lba(bs, 0),
 			     bs_byte_to_lba(bs, sizeof(*ctx->super)),
 			     bs_grow_live_load_super_cpl, ctx);
@@ -10196,6 +10214,7 @@ spdk_bs_grow(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	}
 
 	/* Read the super block */
+	ctx->seq->tiering_bits |= SYNC_FETCH_BIT;
 	bs_sequence_read_dev(ctx->seq, ctx->super, bs_page_to_lba(bs, 0),
 			     bs_byte_to_lba(bs, sizeof(*ctx->super)),
 			     bs_grow_load_super_cpl, ctx);
