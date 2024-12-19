@@ -1193,6 +1193,9 @@ _vbdev_lvol_create_cb(void *cb_arg, struct spdk_lvol *lvol, int lvolerrno)
 		goto end;
 	}
 
+ 	// backed up lvol should require synchronous fetches on reads by default
+	req->tiering_info = req->is_recovery ? SYNC_FETCH_BIT : req->tiering_info;
+
 	vbdev_lvol_set_tiering_info(lvol, req->tiering_info);
 	lvol->priority_class = req->lvol_priority_class;
 	vbdev_lvol_set_io_priority_class(lvol);
@@ -1290,6 +1293,7 @@ spdk_blob_id id_to_recover, spdk_lvol_op_with_handle_complete cb_fn, void *cb_ar
 	}
 	req->cb_fn = cb_fn;
 	req->cb_arg = cb_arg;
+	req->is_recovery = true;
 
 	rc = spdk_lvol_recover(lvs, orig_name, orig_uuid, clear_method, id_to_recover, _vbdev_lvol_create_cb, req);
 	if (rc != 0) {
