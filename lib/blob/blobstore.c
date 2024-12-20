@@ -5889,14 +5889,12 @@ spdk_bs_init_persistent(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	struct spdk_blob_store	*bs;
 	struct spdk_bs_cpl	cpl;
 	spdk_bs_sequence_t	*seq;
-	uint64_t		num_md_lba;
 	uint64_t		num_md_pages;
 	uint64_t		num_md_clusters;
 	uint64_t		max_used_cluster_mask_len;
 	uint32_t		i;
 	struct spdk_bs_opts	opts = {};
 	int			rc;
-	uint64_t		lba, lba_count;
 
 	SPDK_DEBUGLOG(blob, "Initializing blobstore on dev %p\n", dev);
 
