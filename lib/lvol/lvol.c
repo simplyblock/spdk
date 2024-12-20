@@ -1327,6 +1327,7 @@ spdk_blob_id id_to_recover, spdk_lvol_op_with_handle_complete cb_fn, void *cb_ar
 		return rc;
 	}
 	if (spdk_bdev_get_by_name(orig_uuid) != NULL) {
+		SPDK_NOTICELOG("Already found lvol to recover\n");
 		return -EEXIST;
 	}
 

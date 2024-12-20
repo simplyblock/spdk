@@ -165,6 +165,7 @@ blob_insert_cluster(struct spdk_blob *blob, uint32_t cluster_num, uint64_t clust
 	blob_verify_md_op(blob);
 
 	if (*cluster_lba != 0) {
+		SPDK_NOTICELOG("Already inserted cluster\n");
 		return -EEXIST;
 	}
 
@@ -6780,6 +6781,7 @@ bs_start_recover_blob(struct spdk_blob_store *bs,
 		return;
 	}
 	if (spdk_bit_array_get(bs->used_blobids, page_idx)) {
+		SPDK_NOTICELOG("Already used blobid=%lu\n", id_to_recover);
 		spdk_spin_unlock(&bs->used_lock);
 		cb_fn(cb_arg, 0, -EEXIST);
 		return;
