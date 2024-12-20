@@ -6022,8 +6022,6 @@ spdk_bs_init_persistent(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	ctx->super->md_len = bs->md_len;
 	num_md_pages += bs->md_len;
 
-	num_md_lba = bs_page_to_lba(bs, num_md_pages);
-
 	ctx->super->size = dev->blockcnt * dev->blocklen;
 
 	ctx->super->crc = blob_md_page_calc_crc(ctx->super);
