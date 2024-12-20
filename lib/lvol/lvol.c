@@ -756,6 +756,89 @@ spdk_lvs_init(struct spdk_bs_dev *bs_dev, struct spdk_lvs_opts *o,
 	return 0;
 }
 
+int
+spdk_lvs_init_persistent(struct spdk_bs_dev *bs_dev, struct spdk_lvs_opts *o,
+		  spdk_lvs_op_with_handle_complete cb_fn, void *cb_arg)
+{
+	struct spdk_lvol_store *lvs;
+	struct spdk_lvs_with_handle_req *lvs_req;
+	struct spdk_bs_opts opts = {};
+	struct spdk_lvs_opts lvs_opts;
+	uint32_t total_clusters;
+	int rc;
+
+	if (bs_dev == NULL) {
+		SPDK_ERRLOG("Blobstore device does not exist\n");
+		return -ENODEV;
+	}
+
+	if (o == NULL) {
+		SPDK_ERRLOG("spdk_lvs_opts not specified\n");
+		return -EINVAL;
+	}
+
+	spdk_lvs_opts_init(&lvs_opts);
+	if (lvs_opts_copy(o, &lvs_opts) != 0) {
+		SPDK_ERRLOG("spdk_lvs_opts invalid\n");
+		return -EINVAL;
+	}
+
+	if (lvs_opts.cluster_sz < bs_dev->blocklen) {
+		SPDK_ERRLOG("Cluster size %" PRIu32 " is smaller than blocklen %" PRIu32 "\n",
+			    lvs_opts.cluster_sz, bs_dev->blocklen);
+		return -EINVAL;
+	}
+	total_clusters = bs_dev->blockcnt / (lvs_opts.cluster_sz / bs_dev->blocklen);
+
+	lvs = lvs_alloc();
+	if (!lvs) {
+		SPDK_ERRLOG("Cannot alloc memory for lvol store base pointer\n");
+		return -ENOMEM;
+	}
+
+	setup_lvs_opts(&opts, o, total_clusters, lvs);
+
+	if (strnlen(lvs_opts.name, SPDK_LVS_NAME_MAX) == SPDK_LVS_NAME_MAX) {
+		SPDK_ERRLOG("Name has no null terminator.\n");
+		lvs_free(lvs);
+		return -EINVAL;
+	}
+
+	if (strnlen(lvs_opts.name, SPDK_LVS_NAME_MAX) == 0) {
+		SPDK_ERRLOG("No name specified.\n");
+		lvs_free(lvs);
+		return -EINVAL;
+	}
+
+	spdk_uuid_generate(&lvs->uuid);
+	snprintf(lvs->name, sizeof(lvs->name), "%s", lvs_opts.name);
+
+	rc = add_lvs_to_list(lvs);
+	if (rc) {
+		SPDK_ERRLOG("lvolstore with name %s already exists\n", lvs->name);
+		lvs_free(lvs);
+		return -EEXIST;
+	}
+
+	lvs_req = calloc(1, sizeof(*lvs_req));
+	if (!lvs_req) {
+		lvs_free(lvs);
+		SPDK_ERRLOG("Cannot alloc memory for lvol store request pointer\n");
+		return -ENOMEM;
+	}
+
+	assert(cb_fn != NULL);
+	lvs_req->cb_fn = cb_fn;
+	lvs_req->cb_arg = cb_arg;
+	lvs_req->lvol_store = lvs;
+	lvs->bs_dev = bs_dev;
+
+	SPDK_INFOLOG(lvol, "Initializing lvol store FOR RECOVERY\n");
+	spdk_bs_init_persistent(bs_dev, &opts, lvs_init_cb, lvs_req);
+
+	return 0;
+}
+
 static void
 lvs_rename_cb(void *cb_arg, int lvolerrno)
 {

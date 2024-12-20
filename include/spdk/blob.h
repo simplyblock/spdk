@@ -371,6 +371,12 @@ void spdk_bs_grow_live(struct spdk_blob_store *bs,
 void spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts,
 		  spdk_bs_op_with_handle_complete cb_fn, void *cb_arg);
 
+/* Same as spdk_bs_init() but meant for recovery via storage tiering: respects storage tiering 
+by not wiping out data via zeroing-out or unmapping, only writes the super block in the I/O part.
+*/
+void spdk_bs_init_persistent(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts,
+		  spdk_bs_op_with_handle_complete cb_fn, void *cb_arg);
+
 typedef void (*spdk_bs_dump_print_xattr)(FILE *fp, const char *bstype, const char *name,
 		const void *value, size_t value_length);
 

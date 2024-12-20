@@ -5881,6 +5881,191 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	bs_batch_close(batch);
 }
 
+void
+spdk_bs_init_persistent(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
+	     spdk_bs_op_with_handle_complete cb_fn, void *cb_arg)
+{
+	struct spdk_bs_load_ctx *ctx;
+	struct spdk_blob_store	*bs;
+	struct spdk_bs_cpl	cpl;
+	spdk_bs_sequence_t	*seq;
+	uint64_t		num_md_lba;
+	uint64_t		num_md_pages;
+	uint64_t		num_md_clusters;
+	uint64_t		max_used_cluster_mask_len;
+	uint32_t		i;
+	struct spdk_bs_opts	opts = {};
+	int			rc;
+	uint64_t		lba, lba_count;
+
+	SPDK_DEBUGLOG(blob, "Initializing blobstore on dev %p\n", dev);
+
+	if ((SPDK_BS_PAGE_SIZE % dev->blocklen) != 0) {
+		SPDK_ERRLOG("unsupported dev block length of %d\n",
+			    dev->blocklen);
+		dev->destroy(dev);
+		cb_fn(cb_arg, NULL, -EINVAL);
+		return;
+	}
+
+	spdk_bs_opts_init(&opts, sizeof(opts));
+	if (o) {
+		if (bs_opts_copy(o, &opts)) {
+			return;
+		}
+	}
+
+	if (bs_opts_verify(&opts) != 0) {
+		dev->destroy(dev);
+		cb_fn(cb_arg, NULL, -EINVAL);
+		return;
+	}
+
+	rc = bs_alloc(dev, &opts, &bs, &ctx);
+	if (rc) {
+		dev->destroy(dev);
+		cb_fn(cb_arg, NULL, rc);
+		return;
+	}
+
+	if (opts.num_md_pages == SPDK_BLOB_OPTS_NUM_MD_PAGES) {
+		/* By default, allocate 1 page per cluster.
+		 * Technically, this over-allocates metadata
+		 * because more metadata will reduce the number
+		 * of usable clusters. This can be addressed with
+		 * more complex math in the future.
+		 */
+		bs->md_len = bs->total_clusters;
+	} else {
+		bs->md_len = opts.num_md_pages;
+	}
+	rc = spdk_bit_array_resize(&bs->used_md_pages, bs->md_len);
+	if (rc < 0) {
+		spdk_free(ctx->super);
+		free(ctx);
+		bs_free(bs);
+		cb_fn(cb_arg, NULL, -ENOMEM);
+		return;
+	}
+
+	rc = spdk_bit_array_resize(&bs->used_blobids, bs->md_len);
+	if (rc < 0) {
+		spdk_free(ctx->super);
+		free(ctx);
+		bs_free(bs);
+		cb_fn(cb_arg, NULL, -ENOMEM);
+		return;
+	}
+
+	rc = spdk_bit_array_resize(&bs->open_blobids, bs->md_len);
+	if (rc < 0) {
+		spdk_free(ctx->super);
+		free(ctx);
+		bs_free(bs);
+		cb_fn(cb_arg, NULL, -ENOMEM);
+		return;
+	}
+
+	memcpy(ctx->super->signature, SPDK_BS_SUPER_BLOCK_SIG,
+	       sizeof(ctx->super->signature));
+	ctx->super->version = SPDK_BS_VERSION;
+	ctx->super->length = sizeof(*ctx->super);
+	ctx->super->super_blob = bs->super_blob;
+	ctx->super->clean = 0;
+	ctx->super->cluster_size = bs->cluster_sz;
+	ctx->super->io_unit_size = bs->io_unit_size;
+	memcpy(&ctx->super->bstype, &bs->bstype, sizeof(bs->bstype));
+
+	/* Calculate how many pages the metadata consumes at the front
+	 * of the disk.
+	 */
+
+	/* The super block uses 1 page */
+	num_md_pages = 1;
+
+	/* The used_md_pages mask requires 1 bit per metadata page, rounded
+	 * up to the nearest page, plus a header.
+	 */
+	ctx->super->used_page_mask_start = num_md_pages;
+	ctx->super->used_page_mask_len = spdk_divide_round_up(sizeof(struct spdk_bs_md_mask) +
+					 spdk_divide_round_up(bs->md_len, 8),
+					 SPDK_BS_PAGE_SIZE);
+	num_md_pages += ctx->super->used_page_mask_len;
+
+	/* The used_clusters mask requires 1 bit per cluster, rounded
+	 * up to the nearest page, plus a header.
+	 */
+	ctx->super->used_cluster_mask_start = num_md_pages;
+	ctx->super->used_cluster_mask_len = spdk_divide_round_up(sizeof(struct spdk_bs_md_mask) +
+					    spdk_divide_round_up(bs->total_clusters, 8),
+					    SPDK_BS_PAGE_SIZE);
+	/* The blobstore might be extended, then the used_cluster bitmap will need more space.
+	 * Here we calculate the max clusters we can support according to the
+	 * num_md_pages (bs->md_len).
+	 */
+	max_used_cluster_mask_len = spdk_divide_round_up(sizeof(struct spdk_bs_md_mask) +
+				    spdk_divide_round_up(bs->md_len, 8),
+				    SPDK_BS_PAGE_SIZE);
+	max_used_cluster_mask_len = spdk_max(max_used_cluster_mask_len,
+					     ctx->super->used_cluster_mask_len);
+	num_md_pages += max_used_cluster_mask_len;
+
+	/* The used_blobids mask requires 1 bit per metadata page, rounded
+	 * up to the nearest page, plus a header.
+	 */
+	ctx->super->used_blobid_mask_start = num_md_pages;
+	ctx->super->used_blobid_mask_len = spdk_divide_round_up(sizeof(struct spdk_bs_md_mask) +
+					   spdk_divide_round_up(bs->md_len, 8),
+					   SPDK_BS_PAGE_SIZE);
+	num_md_pages += ctx->super->used_blobid_mask_len;
+
+	/* The metadata region size was chosen above */
+	ctx->super->md_start = bs->md_start = num_md_pages;
+	ctx->super->md_len = bs->md_len;
+	num_md_pages += bs->md_len;
+
+	num_md_lba = bs_page_to_lba(bs, num_md_pages);
+
+	ctx->super->size = dev->blockcnt * dev->blocklen;
+
+	ctx->super->crc = blob_md_page_calc_crc(ctx->super);
+
+	num_md_clusters = spdk_divide_round_up(num_md_pages, bs->pages_per_cluster);
+	if (num_md_clusters > bs->total_clusters) {
+		SPDK_ERRLOG("Blobstore metadata cannot use more clusters than is available, "
+			    "please decrease number of pages reserved for metadata "
+			    "or increase cluster size.\n");
+		spdk_free(ctx->super);
+		spdk_bit_array_free(&ctx->used_clusters);
+		free(ctx);
+		bs_free(bs);
+		cb_fn(cb_arg, NULL, -ENOMEM);
+		return;
+	}
+	/* Claim all of the clusters used by the metadata */
+	for (i = 0; i < num_md_clusters; i++) {
+		spdk_bit_array_set(ctx->used_clusters, i);
+	}
+
+	bs->num_free_clusters -= num_md_clusters;
+	bs->total_data_clusters = bs->num_free_clusters;
+
+	cpl.type = SPDK_BS_CPL_TYPE_BS_HANDLE;
+	cpl.u.bs_handle.cb_fn = cb_fn;
+	cpl.u.bs_handle.cb_arg = cb_arg;
+	cpl.u.bs_handle.bs = bs;
+
+	seq = bs_sequence_start_bs(bs->md_channel, &cpl);
+	if (!seq) {
+		spdk_free(ctx->super);
+		free(ctx);
+		bs_free(bs);
+		cb_fn(cb_arg, NULL, -ENOMEM);
+		return;
+	}
+	bs_init_trim_cpl(seq, ctx, 0);
+}
+
 /* END spdk_bs_init */
 
 /* START spdk_bs_destroy */

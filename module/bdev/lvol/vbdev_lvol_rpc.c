@@ -154,6 +154,52 @@ cleanup:
 }
 SPDK_RPC_REGISTER("bdev_lvol_create_lvstore", rpc_bdev_lvol_create_lvstore, SPDK_RPC_RUNTIME)
 
+static void
+rpc_bdev_lvol_create_lvstore_persistent(struct spdk_jsonrpc_request *request,
+			     const struct spdk_json_val *params)
+{
+	struct rpc_bdev_lvol_create_lvstore req = {};
+	int rc = 0;
+	enum lvs_clear_method clear_method;
+
+	if (spdk_json_decode_object(params, rpc_bdev_lvol_create_lvstore_decoders,
+				    SPDK_COUNTOF(rpc_bdev_lvol_create_lvstore_decoders),
+				    &req)) {
+		SPDK_INFOLOG(lvol_rpc, "spdk_json_decode_object failed\n");
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "spdk_json_decode_object failed");
+		goto cleanup;
+	}
+
+	if (req.clear_method != NULL) {
+		if (!strcasecmp(req.clear_method, "none")) {
+			clear_method = LVS_CLEAR_WITH_NONE;
+		} else if (!strcasecmp(req.clear_method, "unmap")) {
+			clear_method = LVS_CLEAR_WITH_UNMAP;
+		} else if (!strcasecmp(req.clear_method, "write_zeroes")) {
+			clear_method = LVS_CLEAR_WITH_WRITE_ZEROES;
+		} else {
+			spdk_jsonrpc_send_error_response(request, -EINVAL, "Invalid clear_method parameter");
+			goto cleanup;
+		}
+	} else {
+		clear_method = LVS_CLEAR_WITH_UNMAP;
+	}
+
+	rc = vbdev_lvs_create_persistent(req.bdev_name, req.lvs_name, req.cluster_sz, clear_method,
+			      req.num_md_pages_per_cluster_ratio, req.untier_lvstore_md_pages, rpc_lvol_store_construct_cb, request);
+	if (rc < 0) {
+		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
+		goto cleanup;
+	}
+	free_rpc_bdev_lvol_create_lvstore(&req);
+
+	return;
+
+cleanup:
+	free_rpc_bdev_lvol_create_lvstore(&req);
+}
+SPDK_RPC_REGISTER("bdev_lvol_create_lvstore_persistent", rpc_bdev_lvol_create_lvstore_persistent, SPDK_RPC_RUNTIME)
 
 struct rpc_lvstore_untier_lvstore_md_pages {
 	char* lvs_name;

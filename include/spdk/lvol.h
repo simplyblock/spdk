@@ -139,6 +139,12 @@ typedef int (*spdk_lvol_iter_cb)(void *cb_arg, struct spdk_lvol *lvol);
 int spdk_lvs_init(struct spdk_bs_dev *bs_dev, struct spdk_lvs_opts *o,
 		  spdk_lvs_op_with_handle_complete cb_fn, void *cb_arg);
 
+/* Same as spdk_lvs_init() but meant for recovery via storage tiering: respects storage tiering 
+by not wiping out data via zeroing-out or unmapping, only writes the super block in the I/O part.
+*/
+int spdk_lvs_init_persistent(struct spdk_bs_dev *bs_dev, struct spdk_lvs_opts *o,
+		  spdk_lvs_op_with_handle_complete cb_fn, void *cb_arg);
+
 /**
  * Rename the given lvolstore.
  *
