@@ -1706,6 +1706,7 @@ blob_load_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	page = &ctx->pages[ctx->num_pages - 1];
 	crc = blob_md_page_calc_crc(page);
 	if (crc != page->crc) {
+		SPDK_NOTICELOG("page->crc=%u, crc=%u\n", page->crc, crc);
 		SPDK_ERRLOG("Metadata page %d crc mismatch for blobid 0x%" PRIx64 "\n",
 			    current_page, blob->id);
 		blob_load_final(ctx, -EINVAL);
