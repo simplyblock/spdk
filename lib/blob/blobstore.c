@@ -1709,7 +1709,7 @@ blob_load_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		char tmp[sizeof(*page)];
 		memcpy(tmp, page, sizeof(*page));
 		for (int i = 0; i < sizeof(*page); ++i) {
-			if (tmp[i] != 0) {
+			if (tmp[i] != '0') {
 				SPDK_NOTICELOG("Garbage, i=%d, stuff=%s\n", i, &tmp[i]);
 				break;
 			}
