@@ -118,6 +118,11 @@ struct t_flush_job {
 struct spdk_blob {
 	struct spdk_blob_store *bs;
 
+	/* Whether, upon removal, the blob should be removed only in memory, not interacted with the disk 
+	(hence no wiping); the blob must have been backed up beforehand. An ideal use case for this parameter 
+	is persisting already backed-up snapshots, especially when debugging.
+	*/
+	bool should_persist;
 	/* whether the blob is to be recovered from secondary storage via storage tiering, thus bypassing initial persisting and some later 
 	validation checks
 	*/

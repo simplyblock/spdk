@@ -1706,14 +1706,6 @@ blob_load_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	page = &ctx->pages[ctx->num_pages - 1];
 	crc = blob_md_page_calc_crc(page);
 	if (crc != page->crc) {
-		char tmp[sizeof(*page)];
-		memcpy(tmp, page, sizeof(*page));
-		for (int i = 0; i < sizeof(*page); ++i) {
-			if (tmp[i] != '0') {
-				SPDK_NOTICELOG("Garbage, i=%d, stuff=%s\n", i, &tmp[i]);
-				break;
-			}
-		}
 		SPDK_ERRLOG("Metadata page %d crc mismatch for blobid 0x%" PRIx64 "\n",
 			    current_page, blob->id);
 		blob_load_final(ctx, -EINVAL);
@@ -9619,7 +9611,11 @@ spdk_blob_close(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_ar
 	}
 
 	/* Sync metadata */
-	blob_persist(seq, blob, blob_close_cpl, blob);
+	if (!blob->should_persist) {
+		blob_persist(seq, blob, blob_close_cpl, blob);
+	} else {
+		blob_close_cpl(seq, blob, 0);
+	}
 }
 
 /* END spdk_blob_close */
@@ -11100,6 +11096,10 @@ void spdk_blob_get_snapshot_backup_status(struct snapshot_backup_ctx *sctx) {
 	} else {
 		spdk_thread_send_msg(sctx->blob->bs->md_thread, blob_get_snapshot_backup_status, sctx);
 	}
+}
+
+void spdk_blob_set_persistent(struct spdk_blob *blob, bool should_persist) {
+	blob->should_persist = should_persist;
 }
 
 SPDK_LOG_REGISTER_COMPONENT(blob)
