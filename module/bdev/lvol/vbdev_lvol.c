@@ -2245,8 +2245,4 @@ void vbdev_lvol_get_snapshot_backup_status(struct snapshot_backup_ctx *sctx) {
 	spdk_blob_get_snapshot_backup_status(sctx);
 }
 
-void vbdev_lvol_set_persistent(struct spdk_lvol *lvol, bool should_persist) {
-	spdk_blob_set_persistent(lvol->blob, should_persist);
-}
-
 SPDK_LOG_REGISTER_COMPONENT(vbdev_lvol)

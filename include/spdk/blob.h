@@ -1327,8 +1327,6 @@ void spdk_blob_start_snapshot_backup(struct snapshot_backup_ctx* sctx);
 
 void spdk_blob_get_snapshot_backup_status(struct snapshot_backup_ctx* sctx);
 
-void spdk_blob_set_persistent(struct spdk_blob *blob, bool should_persist);
-
 #ifdef __cplusplus
 }
 #endif

@@ -9611,11 +9611,7 @@ spdk_blob_close(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_ar
 	}
 
 	/* Sync metadata */
-	if (!blob->should_persist) {
-		blob_persist(seq, blob, blob_close_cpl, blob);
-	} else {
-		blob_close_cpl(seq, blob, 0);
-	}
+	blob_persist(seq, blob, blob_close_cpl, blob);
 }
 
 /* END spdk_blob_close */
@@ -11096,10 +11092,6 @@ void spdk_blob_get_snapshot_backup_status(struct snapshot_backup_ctx *sctx) {
 	} else {
 		spdk_thread_send_msg(sctx->blob->bs->md_thread, blob_get_snapshot_backup_status, sctx);
 	}
-}
-
-void spdk_blob_set_persistent(struct spdk_blob *blob, bool should_persist) {
-	blob->should_persist = should_persist;
 }
 
 SPDK_LOG_REGISTER_COMPONENT(blob)
