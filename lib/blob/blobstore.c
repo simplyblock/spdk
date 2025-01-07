@@ -3208,8 +3208,12 @@ blob_request_submit_op_single(struct spdk_io_channel *_ch, struct spdk_blob *blo
 		return;
 	}
 
-	is_allocated = blob_calculate_lba_and_lba_count(blob, offset, length, &lba, &lba_count) || blob->is_recovery;
-
+	is_allocated = blob_calculate_lba_and_lba_count(blob, offset, length, &lba, &lba_count);
+	if (blob->is_recovery) {
+		lba = offset;
+		lba_count = length;
+	}
+	
 	switch (op_type) {
 	case SPDK_BLOB_READ: {
 		spdk_bs_batch_t *batch;
@@ -3532,9 +3536,11 @@ blob_request_submit_rw_iov(struct spdk_blob *blob, struct spdk_io_channel *_chan
 			return;
 		}
 
-		is_allocated = blob_calculate_lba_and_lba_count(blob, offset, length, &lba, &lba_count) || blob->is_recovery;
-
-		if (blob->is_recovery && offset != 0) { SPDK_NOTICELOG("offset=%llu, lba=%llu\n", offset, lba); }
+		is_allocated = blob_calculate_lba_and_lba_count(blob, offset, length, &lba, &lba_count);
+		if (blob->is_recovery) {
+			lba = offset;
+			lba_count = length;
+		}
 
 		if (read) {
 			spdk_bs_sequence_t *seq;
