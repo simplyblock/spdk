@@ -3002,6 +3002,7 @@ blob_calculate_lba_and_lba_count(struct spdk_blob *blob, uint64_t io_unit, uint6
 		*lba = bs_blob_io_unit_to_lba(blob, io_unit);
 		return true;
 	}
+	if (blob->is_recovery) { SPDK_NOTICELOG("is allocated=%d, io_unit=%llu, lba=%llu\n", bs_io_unit_is_allocated(blob, io_unit), io_unit, *lba); }
 }
 
 struct op_split_ctx {
@@ -9699,7 +9700,6 @@ spdk_blob_io_readv_ext(struct spdk_blob *blob, struct spdk_io_channel *channel,
 		       struct iovec *iov, int iovcnt, uint64_t offset, uint64_t length,
 		       spdk_blob_op_complete cb_fn, void *cb_arg, struct spdk_blob_ext_io_opts *io_opts)
 {
-	if (blob->is_recovery && offset != 0) { SPDK_NOTICELOG("Recovery offset=%llu, masked offset=%llu\n", offset, offset & ~LBA_METADATA_BITS_MASK); }
 	offset &= ~LBA_METADATA_BITS_MASK;
 	blob_request_submit_rw_iov(blob, channel, iov, iovcnt, offset, length, cb_fn, cb_arg, true,
 				   io_opts);
