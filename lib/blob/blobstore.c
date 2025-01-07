@@ -3545,8 +3545,6 @@ blob_request_submit_rw_iov(struct spdk_blob *blob, struct spdk_io_channel *_chan
 
 			seq->ext_io_opts = ext_io_opts;
 
-			if (blob->is_recovery && lba != 0) { SPDK_NOTICELOG("Recovery read lba=%llu\n", lba); }
-
 			if (is_allocated) {
 				bs_sequence_readv_dev(seq, iov, iovcnt, lba, lba_count, rw_iov_done, NULL);
 			} else {
@@ -9701,6 +9699,7 @@ spdk_blob_io_readv_ext(struct spdk_blob *blob, struct spdk_io_channel *channel,
 		       struct iovec *iov, int iovcnt, uint64_t offset, uint64_t length,
 		       spdk_blob_op_complete cb_fn, void *cb_arg, struct spdk_blob_ext_io_opts *io_opts)
 {
+	if (blob->is_recovery && offset != 0) { SPDK_NOTICELOG("Recovery offset=%llu, masked offset=%llu\n", offset, offset & ~LBA_METADATA_BITS_MASK); }
 	offset &= ~LBA_METADATA_BITS_MASK;
 	blob_request_submit_rw_iov(blob, channel, iov, iovcnt, offset, length, cb_fn, cb_arg, true,
 				   io_opts);
