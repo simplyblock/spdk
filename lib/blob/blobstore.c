@@ -3545,6 +3545,8 @@ blob_request_submit_rw_iov(struct spdk_blob *blob, struct spdk_io_channel *_chan
 
 			seq->ext_io_opts = ext_io_opts;
 
+			if (blob->is_recovery && lba != 0) { SPDK_NOTICELOG("Recovery read lba=%llu\n", lba); }
+
 			if (is_allocated) {
 				bs_sequence_readv_dev(seq, iov, iovcnt, lba, lba_count, rw_iov_done, NULL);
 			} else {
