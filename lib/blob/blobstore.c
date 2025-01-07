@@ -3002,7 +3002,6 @@ blob_calculate_lba_and_lba_count(struct spdk_blob *blob, uint64_t io_unit, uint6
 		*lba = bs_blob_io_unit_to_lba(blob, io_unit);
 		return true;
 	}
-	if (blob->is_recovery) { SPDK_NOTICELOG("is allocated=%d, io_unit=%llu, lba=%llu\n", bs_io_unit_is_allocated(blob, io_unit), io_unit, *lba); }
 }
 
 struct op_split_ctx {
@@ -3209,7 +3208,7 @@ blob_request_submit_op_single(struct spdk_io_channel *_ch, struct spdk_blob *blo
 		return;
 	}
 
-	is_allocated = blob_calculate_lba_and_lba_count(blob, offset, length, &lba, &lba_count);
+	is_allocated = blob_calculate_lba_and_lba_count(blob, offset, length, &lba, &lba_count) || blob->is_recovery;
 
 	switch (op_type) {
 	case SPDK_BLOB_READ: {
@@ -3533,7 +3532,9 @@ blob_request_submit_rw_iov(struct spdk_blob *blob, struct spdk_io_channel *_chan
 			return;
 		}
 
-		is_allocated = blob_calculate_lba_and_lba_count(blob, offset, length, &lba, &lba_count);
+		is_allocated = blob_calculate_lba_and_lba_count(blob, offset, length, &lba, &lba_count) || blob->is_recovery;
+
+		if (blob->is_recovery && offset != 0) { SPDK_NOTICELOG("offset=%llu, lba=%llu\n", offset, lba); }
 
 		if (read) {
 			spdk_bs_sequence_t *seq;
