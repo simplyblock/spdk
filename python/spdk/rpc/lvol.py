@@ -98,7 +98,7 @@ def bdev_lvol_create(client, lvol_name, size_in_mib, thin_provision=False, uuid=
     if (uuid and lvs_name) or (not uuid and not lvs_name):
         raise ValueError("Either uuid or lvs_name must be specified, but not both")
     
-    nbits_priority_class = 4
+    nbits_priority_class = 3
     min_priority_class = 0
     max_priority_class = 2**(nbits_priority_class) - 1
     if not (lvol_priority_class >= min_priority_class and lvol_priority_class <= max_priority_class):
@@ -141,7 +141,7 @@ def bdev_lvol_set_priority_class(client, lvol_name, lvol_priority_class):
         lvol_name: name of logical volume to create
         lvol_priority_class: integer lvol priority class for priority I/O within the range [0, 15]
     """
-    nbits_priority_class = 4
+    nbits_priority_class = 3
     min_priority_class = 0
     max_priority_class = 2**(nbits_priority_class) - 1
     if not (lvol_priority_class >= min_priority_class and lvol_priority_class <= max_priority_class):
