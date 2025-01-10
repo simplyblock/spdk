@@ -397,6 +397,7 @@ enum spdk_bdev_io_status {
 	 * Hence, this should be updated when adding new error statuses.
 	 */
 	SPDK_MIN_BDEV_IO_STATUS = SPDK_BDEV_IO_STATUS_AIO_ERROR,
+	// In case of storage tiering, the desired object was not found on the secondary storage.
 	SPDK_SECONDARY_OBJECT_NOT_FOUND = SPDK_MIN_BDEV_IO_STATUS
 };
 
