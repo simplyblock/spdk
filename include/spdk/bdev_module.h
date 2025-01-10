@@ -397,6 +397,7 @@ enum spdk_bdev_io_status {
 	 * Hence, this should be updated when adding new error statuses.
 	 */
 	SPDK_MIN_BDEV_IO_STATUS = SPDK_BDEV_IO_STATUS_AIO_ERROR,
+	SPDK_SECONDARY_OBJECT_NOT_FOUND = SPDK_MIN_BDEV_IO_STATUS
 };
 
 struct spdk_bdev_name {
