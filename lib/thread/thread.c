@@ -1851,27 +1851,14 @@ spdk_poller_destroy(struct spdk_poller **ppoller) {
 	if (poller->state == SPDK_POLLER_STATE_PAUSED) {
 		TAILQ_REMOVE(&thread->paused_pollers, poller, tailq);
 		TAILQ_INSERT_TAIL(&thread->active_pollers, poller, tailq);
+		poller->period_ticks = 0;
 	}
 
 	// destroy the poller
-	bool removed = false;
-	struct spdk_poller *cur, *tmp;
-	TAILQ_FOREACH_REVERSE_SAFE(cur, &thread->active_pollers,
-				   active_pollers_head, tailq, tmp) {
-					if (cur == poller) {
-						removed = true;
-						TAILQ_REMOVE(&thread->active_pollers, poller, tailq);
-						break;
-					}
-	}
-	if (!removed) {
-		struct spdk_poller *cur, *tmp;
-		RB_FOREACH_SAFE(cur, timed_pollers_tree, &thread->timed_pollers, tmp) {
-			if (cur == poller) {
-				poller_remove_timer(thread, poller);
-				break;
-			}
-		}
+	if (poller->period_ticks) {
+		poller_remove_timer(thread, poller);
+	} else {
+		TAILQ_REMOVE(&thread->active_pollers, poller, tailq);
 	}
 	free(poller);
 }
