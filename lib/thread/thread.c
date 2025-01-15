@@ -1854,12 +1854,23 @@ spdk_poller_destroy(struct spdk_poller **ppoller) {
 	}
 
 	// destroy the poller
-	TAILQ_REMOVE(&thread->active_pollers, poller, tailq);
+	bool removed = false;
 	struct spdk_poller *cur, *tmp;
-	RB_FOREACH_SAFE(cur, timed_pollers_tree, &thread->timed_pollers, tmp) {
-		if (cur == poller) {
-			poller_remove_timer(thread, poller);
-			break;
+	TAILQ_FOREACH_REVERSE_SAFE(cur, &thread->active_pollers,
+				   active_pollers_head, tailq, tmp) {
+					if (cur == poller) {
+						removed = true;
+						TAILQ_REMOVE(&thread->active_pollers, poller, tailq);
+						break;
+					}
+	}
+	if (!removed) {
+		struct spdk_poller *cur, *tmp;
+		RB_FOREACH_SAFE(cur, timed_pollers_tree, &thread->timed_pollers, tmp) {
+			if (cur == poller) {
+				poller_remove_timer(thread, poller);
+				break;
+			}
 		}
 	}
 	free(poller);
