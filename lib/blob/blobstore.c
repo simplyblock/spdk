@@ -11064,6 +11064,10 @@ blob_get_snapshot_backup_status(void *ctx) {
 		if (sctx->blob->backup_status != FLUSH_IS_PENDING) // finally end the snapshot backup operation 
 		{
 			spdk_poller_unregister(&sctx->blob->backup_poller);
+			
+			// after unregistering the backup poller, destroy it by draining the thread
+			struct spdk_thread* self = sctx->blob->bs->md_thread;
+  			while (spdk_thread_poll(self, 0, 0)) {} // drain
 
 			for (int i = 0; i < sctx->blob->nmax_flush_jobs; ++i) {
 				if (sctx->blob->flush_jobs[i].buf) {
