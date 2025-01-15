@@ -1810,6 +1810,62 @@ spdk_poller_unregister(struct spdk_poller **ppoller)
 }
 
 void
+spdk_poller_destroy(struct spdk_poller **ppoller) {
+	struct spdk_thread *thread;
+	struct spdk_poller *poller;
+
+	poller = *ppoller;
+	if (poller == NULL) {
+		return;
+	}
+
+	*ppoller = NULL;
+
+	thread = spdk_get_thread();
+	if (!thread) {
+		assert(false);
+		return;
+	}
+
+	if (poller->thread != thread) {
+		wrong_thread(__func__, poller->name, poller->thread, thread);
+		return;
+	}
+
+	if (spdk_interrupt_mode_is_enabled()) {
+		/* Release the interrupt resource for period or busy poller */
+		if (poller->intr != NULL) {
+			poller_interrupt_fini(poller);
+		}
+
+		/* If there is not already a pending poller removal, generate
+		 * a message to go process removals. */
+		if (!thread->poller_unregistered) {
+			thread->poller_unregistered = true;
+			spdk_thread_send_msg(thread, _thread_remove_pollers, thread);
+		}
+	}
+
+	/* If the poller was paused, put it on the active_pollers list.
+	 */
+	if (poller->state == SPDK_POLLER_STATE_PAUSED) {
+		TAILQ_REMOVE(&thread->paused_pollers, poller, tailq);
+		TAILQ_INSERT_TAIL(&thread->active_pollers, poller, tailq);
+	}
+
+	// destroy the poller
+	TAILQ_REMOVE(&thread->active_pollers, poller, tailq);
+	struct spdk_poller *cur, *tmp;
+	RB_FOREACH_SAFE(cur, timed_pollers_tree, &thread->timed_pollers, tmp) {
+		if (cur == poller) {
+			RB_REMOVE(timed_pollers_tree, &thread->timed_pollers, poller);
+			break;
+		}
+	}
+	free(poller);
+}
+
+void
 spdk_poller_pause(struct spdk_poller *poller)
 {
 	struct spdk_thread *thread;

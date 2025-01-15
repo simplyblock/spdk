@@ -630,6 +630,9 @@ struct spdk_poller *spdk_poller_register_named(spdk_poller_fn fn,
  */
 void spdk_poller_unregister(struct spdk_poller **ppoller);
 
+// Unregister a poller on the current thread and destroy it without needing to call spdk_thread_poll().
+void spdk_poller_destroy(struct spdk_poller **ppoller);
+
 /**
  * Pause a poller on the current thread.
  *
