@@ -106,7 +106,7 @@ struct spdk_blob_list {
 // flush job for a snapshot backup operation
 struct t_flush_job {
 	char* buf; // dev page-sized I/O buffer
-	uint64_t timeout_us; // copied from blob parent
+	uint64_t timeout_us; // timeout value of a flush request in microseconds
 	uint64_t start_ticks; // job start ticks to later use in microsecond computation
 	uint64_t cluster_idx;
 	/* dev page number in the job's cluster (cluster size must be aligned to dev page size)
@@ -176,7 +176,6 @@ struct spdk_blob {
 	// Snapshot backup fields
 
 	struct spdk_poller *backup_poller;
-	uint64_t timeout_us; // timeout value of a flush request in microseconds
 	enum EFlushStatus backup_status; // overall status for backup operation
 	uint32_t dev_page_size; // page size of backing device (not SPDK_BS_PAGE_SIZE)
 	uint8_t nmax_retries; // max retries in case of failure, default 4
@@ -193,7 +192,7 @@ struct spdk_blob {
 	/* Next index in the array to start new flush jobs from. This means the 
 	next index is a heretofore completely unprocessed cluster. Each flush job 
 	processes its own cluster completely privately and all concurrent flush jobs
-	are on the same array to safely flush data before metadata and more 
+	are on the same array to safely flush data before metadata and less 
 	sensitive metadata before other metadata. 
 
 	However, the very first non-extent page must be the last md page to be flushed. 

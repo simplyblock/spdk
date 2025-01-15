@@ -10854,7 +10854,7 @@ blob_flush_job_compl_cb(void *cb_arg, int bserrno) {
 	if (bserrno == -ECONNABORTED) // determine whether the abort was due to a timeout (failure) or conflict due to eviction
 	{
 		const uint64_t end_ticks = spdk_get_ticks();
-		const uint64_t time_elapsed_us = ((end_ticks - job->start_ticks) / spdk_get_ticks_hz()) * 1000000;
+		const uint64_t time_elapsed_us = ((end_ticks - job->start_ticks) / spdk_get_ticks_hz()) * SPDK_SEC_TO_USEC;
 
 		job->status = time_elapsed_us >= job->timeout_us ? FLUSH_IS_FAILED : FLUSH_IS_ABORTED;
 	} else if (bserrno < 0) {
@@ -11027,7 +11027,6 @@ blob_start_snapshot_backup(void *ctx) {
 					sctx->blob->flush_jobs[i].timeout_us = sctx->timeout_us;
 				}
 				sctx->compl.rc = 0;
-				sctx->blob->timeout_us = sctx->timeout_us;
 				sctx->blob->backup_status = FLUSH_IS_PENDING;
 				sctx->blob->dev_page_size = sctx->dev_page_size;
 				sctx->blob->nmax_retries = sctx->nmax_retries;
