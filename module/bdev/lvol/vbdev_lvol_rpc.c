@@ -2106,13 +2106,13 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_backup_snapshot_decod
 static void
 start_snapshot_backup_cb(void *ctx) {
 	struct snapshot_backup_ctx *sctx = ctx;
-	free(sctx->lvol_name);
+	//free(sctx->lvol_name);
 	if (sctx->compl.rc == 0) {
 		spdk_jsonrpc_send_bool_response((struct spdk_jsonrpc_request*)sctx->compl.payload, true);
 	} else {
 		spdk_jsonrpc_send_error_response((struct spdk_jsonrpc_request*)sctx->compl.payload, sctx->compl.rc, spdk_strerror(sctx->compl.rc));
 	}
-	free(sctx);
+	//free(sctx);
 }
 
 static void
