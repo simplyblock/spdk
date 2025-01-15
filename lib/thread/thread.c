@@ -1858,7 +1858,7 @@ spdk_poller_destroy(struct spdk_poller **ppoller) {
 	struct spdk_poller *cur, *tmp;
 	RB_FOREACH_SAFE(cur, timed_pollers_tree, &thread->timed_pollers, tmp) {
 		if (cur == poller) {
-			RB_REMOVE(timed_pollers_tree, &thread->timed_pollers, poller);
+			poller_remove_timer(thread, poller);
 			break;
 		}
 	}
