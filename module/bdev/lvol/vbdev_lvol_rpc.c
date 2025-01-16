@@ -2166,7 +2166,6 @@ rpc_bdev_lvol_backup_snapshot(struct spdk_jsonrpc_request *request,
 	return;
 
 cleanup:
-	SPDK_NOTICELOG("SCTX FREE!!!\n");
 	free(sctx->lvol_name);
 	free(sctx);
 }
@@ -2258,7 +2257,6 @@ rpc_bdev_lvol_get_snapshot_backup_status(struct spdk_jsonrpc_request *request,
 	return;
 
 cleanup:
-	SPDK_NOTICELOG("SCTX FREE!!!\n");
 	free(sctx->lvol_name);
 	free(sctx);
 }

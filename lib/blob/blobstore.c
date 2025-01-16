@@ -11010,7 +11010,7 @@ static void
 blob_start_snapshot_backup(void *ctx) {
 	struct snapshot_backup_ctx *sctx = ctx;
 
-	if (sctx->blob->backup_poller) {
+	/*if (sctx->blob->backup_poller) {
 		sctx->compl.rc = -EEXIST;
 	} else if (!spdk_blob_is_snapshot(sctx->blob)) {
 		sctx->compl.rc = -EINVAL;
@@ -11034,7 +11034,7 @@ blob_start_snapshot_backup(void *ctx) {
 				sctx->blob->nmax_flush_jobs = sctx->nmax_flush_jobs;
 			}
 		}
-	}
+	}*/
 
 	if (sctx->caller_th == sctx->blob->bs->md_thread) {
 		sctx->compl.cb_fn(sctx->compl.cb_arg);
