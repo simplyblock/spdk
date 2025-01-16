@@ -11085,7 +11085,7 @@ _blob_get_snapshot_backup_status(void *ctx) {
 	if (sctx->blob->backup_status != FLUSH_IS_PENDING) // finally end the snapshot backup operation 
 	{
 		spdk_put_io_channel(sctx->blob->backup_channel);
-		spdk_poller_unregister(sctx->blob->backup_poller);
+		spdk_poller_unregister(&sctx->blob->backup_poller);
 		if (spdk_likely(sctx->blob->flush_jobs)) {
 			for (int i = 0; i < sctx->blob->nmax_flush_jobs; ++i) {
 				if (sctx->blob->flush_jobs[i].buf) {
