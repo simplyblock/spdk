@@ -11029,6 +11029,8 @@ _blob_start_snapshot_backup(void *ctx) {
 		} else {
 			sctx->blob->flush_jobs = calloc(sctx->nmax_flush_jobs, sizeof(struct t_flush_job));
 			if (!sctx->blob->flush_jobs) {
+				spdk_put_io_channel(sctx->blob->backup_channel);
+				spdk_poller_unregister(sctx->blob->backup_poller);
 				sctx->compl.rc = -ENOMEM;
 			} else {
 				for (int i = 0; i < sctx->nmax_flush_jobs; ++i) {
@@ -11084,14 +11086,13 @@ _blob_get_snapshot_backup_status(void *ctx) {
 	{
 		spdk_put_io_channel(sctx->blob->backup_channel);
 		spdk_poller_unregister(&sctx->blob->backup_poller);
-		if (spdk_likely(sctx->blob->flush_jobs)) {
-			for (int i = 0; i < sctx->blob->nmax_flush_jobs; ++i) {
-				if (sctx->blob->flush_jobs[i].buf) {
-					spdk_free(sctx->blob->flush_jobs[i].buf);
-				}
+		for (int i = 0; i < sctx->blob->nmax_flush_jobs; ++i) {
+			if (sctx->blob->flush_jobs[i].buf) {
+				spdk_free(sctx->blob->flush_jobs[i].buf);
 			}
-			free(sctx->blob->flush_jobs);
 		}
+		free(sctx->blob->flush_jobs);
+		
 		sctx->blob->nflush_jobs_current = 0;
 		sctx->blob->nflush_jobs_on_prior_array = 0;
 		sctx->blob->current_array_ordinal = 0;
