@@ -16,8 +16,6 @@
 
 #include "request.h"
 
-#include <stdatomic.h>
-
 /* In Memory Data Structures
  *
  * The following data structures exist only in memory.
@@ -123,7 +121,7 @@ struct spdk_blob {
 	*/
 	bool is_recovery;
 	int priority_class; // to save the lvol's priority class across cluster allocations
-	atomic_uchar tiering_bits; // storage tiering bitmask, must be cache-coherent to prevent garbage reads, which will tier/untier when undesired
+	uint8_t tiering_bits; // storage tiering bitmask
 
 	uint32_t	open_ref;
 

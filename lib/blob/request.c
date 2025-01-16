@@ -136,7 +136,7 @@ bs_sequence_start_blob(struct spdk_io_channel *_channel, struct spdk_bs_cpl *cpl
 	spdk_bs_sequence_t *seq = bs_sequence_start(_channel, cpl, esnap_ch);
 	if (seq) {
 		seq->priority_class = blob->priority_class; // set here if blobstore priority is different from this specific blob's priority
-		seq->tiering_bits |= atomic_load_explicit(&blob->tiering_bits, memory_order_relaxed);
+		seq->tiering_bits |= blob->tiering_bits;
 	}
 	return seq;
 }
@@ -519,7 +519,7 @@ bs_batch_open(struct spdk_io_channel *_channel, struct spdk_bs_cpl *cpl, struct 
 
 	set->priority_class = blob->priority_class;
 	set->tiering_bits = (channel->bs->untier_lvstore_md_pages && _channel == channel->bs->md_channel) ? METADATA_PAGE_BIT : 0;
-	set->tiering_bits |= atomic_load_explicit(&blob->tiering_bits, memory_order_relaxed);
+	set->tiering_bits |= blob->tiering_bits;
 	set->cb_args.cb_fn = bs_batch_completion;
 	set->cb_args.cb_arg = set;
 	set->cb_args.channel = channel->dev_channel;

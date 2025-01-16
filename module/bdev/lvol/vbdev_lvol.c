@@ -1265,7 +1265,7 @@ _vbdev_lvol_create_cb(void *cb_arg, struct spdk_lvol *lvol, int lvolerrno)
 		goto end;
 	}
 
- 	// backed up lvol should require synchronous fetches on reads by default
+ 	// recovered snapshot lvol should require synchronous fetches on reads by default
 	req->tiering_info = req->is_recovery ? SYNC_FETCH_BIT : req->tiering_info;
 
 	vbdev_lvol_set_tiering_info(lvol, req->tiering_info);

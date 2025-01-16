@@ -310,8 +310,6 @@ blob_alloc(struct spdk_blob_store *bs, spdk_blob_id id)
 	blob->id = id;
 	blob->bs = bs;
 
-	atomic_init(&blob->tiering_bits, 0);
-
 	blob->parent_id = SPDK_BLOBID_INVALID;
 
 	blob->state = SPDK_BLOB_STATE_DIRTY;
@@ -1807,7 +1805,7 @@ blob_load(spdk_bs_sequence_t *seq, struct spdk_blob *blob,
 
 	/* tier blob-specific metadata if the blob is configured to do so
 	*/
-	const uint8_t blob_tiering_bits = atomic_load_explicit(&blob->tiering_bits, memory_order_relaxed);
+	const uint8_t blob_tiering_bits = blob->tiering_bits;
 	// set the metadata page bit mode if the blob must untier its metadata, else unset it
 	seq->tiering_bits |= (blob_tiering_bits & UNTIER_BLOB_MD_BIT) ? METADATA_PAGE_BIT : 0;
 	seq->tiering_bits &= (blob_tiering_bits & DO_TIER_BLOB_MD_BIT) ? ~METADATA_PAGE_BIT : 255;
@@ -1837,7 +1835,7 @@ bs_batch_clear_dev(struct spdk_blob *blob, spdk_bs_batch_t *batch, uint64_t lba,
 {
 	/* tier blob-specific metadata if the blob is configured to do so
 	*/
-	const uint8_t blob_tiering_bits = atomic_load_explicit(&blob->tiering_bits, memory_order_relaxed);
+	const uint8_t blob_tiering_bits = blob->tiering_bits;
 	// set the metadata page bit mode if the blob must untier its metadata, else unset it
 	batch->tiering_bits |= (blob_tiering_bits & UNTIER_BLOB_MD_BIT) ? METADATA_PAGE_BIT : 0;
 	batch->tiering_bits &= (blob_tiering_bits & DO_TIER_BLOB_MD_BIT) ? ~METADATA_PAGE_BIT : 255;
@@ -2667,7 +2665,7 @@ blob_persist(spdk_bs_sequence_t *seq, struct spdk_blob *blob,
 
 	/* tier blob-specific metadata if the blob is configured to do so
 	*/
-	const uint8_t blob_tiering_bits = atomic_load_explicit(&blob->tiering_bits, memory_order_relaxed);
+	const uint8_t blob_tiering_bits = blob->tiering_bits;
 	// set the metadata page bit mode if the blob must untier its metadata, else unset it
 	seq->tiering_bits |= (blob_tiering_bits & UNTIER_BLOB_MD_BIT) ? METADATA_PAGE_BIT : 0;
 	seq->tiering_bits &= (blob_tiering_bits & DO_TIER_BLOB_MD_BIT) ? ~METADATA_PAGE_BIT : 255;
@@ -2961,7 +2959,7 @@ bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 
 	/* tier blob-specific metadata if the blob is configured to do so
 	*/
-	const uint8_t blob_tiering_bits = atomic_load_explicit(&blob->tiering_bits, memory_order_relaxed);
+	const uint8_t blob_tiering_bits = blob->tiering_bits;
 	// set the metadata page bit mode if the blob must untier its metadata, else unset it
 	ctx->seq->tiering_bits |= (blob_tiering_bits & UNTIER_BLOB_MD_BIT) ? METADATA_PAGE_BIT : 0;
 	ctx->seq->tiering_bits &= (blob_tiering_bits & DO_TIER_BLOB_MD_BIT) ? ~METADATA_PAGE_BIT : 255;
@@ -6484,7 +6482,7 @@ spdk_blob_get_tiering_info(struct spdk_blob *blob)
 {
 	assert(blob != NULL);
 
-	return atomic_load_explicit(&blob->tiering_bits, memory_order_relaxed);
+	return blob->tiering_bits;
 }
 
 uint64_t
@@ -9371,7 +9369,7 @@ blob_write_extent_page(struct spdk_blob *blob, uint32_t extent, uint64_t cluster
 
 	/* tier blob-specific metadata if the blob is configured to do so
 	*/
-	const uint8_t blob_tiering_bits = atomic_load_explicit(&blob->tiering_bits, memory_order_relaxed);
+	const uint8_t blob_tiering_bits = blob->tiering_bits;
 	// set the metadata page bit mode if the blob must untier its metadata, else unset it
 	seq->tiering_bits |= (blob_tiering_bits & UNTIER_BLOB_MD_BIT) ? METADATA_PAGE_BIT : 0;
 	seq->tiering_bits &= (blob_tiering_bits & DO_TIER_BLOB_MD_BIT) ? ~METADATA_PAGE_BIT : 255;
@@ -10841,7 +10839,7 @@ spdk_blob_set_io_priority_class(struct spdk_blob *blob, int priority_class)
 void
 spdk_blob_set_tiering_info(struct spdk_blob *blob, uint8_t tiering_bits) 
 {
-	atomic_store_explicit(&blob->tiering_bits, tiering_bits, memory_order_relaxed);
+	blob->tiering_bits = tiering_bits;
 }
 
 void
