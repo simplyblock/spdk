@@ -1304,7 +1304,7 @@ typedef void (*spdk_snapshot_backup_complete)(void *cb_arg);
 struct snapshot_backup_compl {
 	spdk_snapshot_backup_complete cb_fn;
 	void *cb_arg;
-	void *payload;
+	struct spdk_jsonrpc_request *payload;
 	int rc;
 	int backup_status; // used only for polling the backup status
 };

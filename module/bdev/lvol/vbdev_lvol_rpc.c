@@ -2108,9 +2108,9 @@ start_snapshot_backup_cb(void *ctx) {
 	struct snapshot_backup_ctx *sctx = ctx;
 	free(sctx->lvol_name);
 	if (sctx->compl.rc == 0) {
-		spdk_jsonrpc_send_bool_response((struct spdk_jsonrpc_request*)sctx->compl.payload, true);
+		spdk_jsonrpc_send_bool_response(sctx->compl.payload, true);
 	} else {
-		spdk_jsonrpc_send_error_response((struct spdk_jsonrpc_request*)sctx->compl.payload, sctx->compl.rc, spdk_strerror(sctx->compl.rc));
+		spdk_jsonrpc_send_error_response(sctx->compl.payload, sctx->compl.rc, spdk_strerror(sctx->compl.rc));
 	}
 	free(sctx);
 }
@@ -2166,6 +2166,7 @@ rpc_bdev_lvol_backup_snapshot(struct spdk_jsonrpc_request *request,
 	return;
 
 cleanup:
+	SPDK_NOTICELOG("SCTX FREE!!!\n");
 	free(sctx->lvol_name);
 	free(sctx);
 }
@@ -2191,19 +2192,19 @@ get_snapshot_backup_status_cb(void *ctx) {
 	struct snapshot_backup_ctx *sctx = ctx;
 	free(sctx->lvol_name);
 	if (sctx->compl.rc == 0) {
-		struct spdk_json_write_ctx* w = spdk_jsonrpc_begin_result((struct spdk_jsonrpc_request*)sctx->compl.payload);
+		struct spdk_json_write_ctx* w = spdk_jsonrpc_begin_result(sctx->compl.payload);
 		if (w)
 		{
 			if (spdk_json_write_string(w, _get_backup_status_from_code(sctx->compl.backup_status))) {
-				spdk_jsonrpc_send_error_response((struct spdk_jsonrpc_request*)sctx->compl.payload, ENOMEM, spdk_strerror(ENOMEM));
+				spdk_jsonrpc_send_error_response(sctx->compl.payload, ENOMEM, spdk_strerror(ENOMEM));
 			} else {
-      			spdk_jsonrpc_end_result((struct spdk_jsonrpc_request*)sctx->compl.payload, w);
+      			spdk_jsonrpc_end_result(sctx->compl.payload, w);
 			}
 		}
 		else
-			{ spdk_jsonrpc_send_error_response((struct spdk_jsonrpc_request*)sctx->compl.payload, ENOMEM, spdk_strerror(ENOMEM)); }
+			{ spdk_jsonrpc_send_error_response(sctx->compl.payload, ENOMEM, spdk_strerror(ENOMEM)); }
 	} else {
-		spdk_jsonrpc_send_error_response((struct spdk_jsonrpc_request*)sctx->compl.payload, sctx->compl.rc, spdk_strerror(sctx->compl.rc));
+		spdk_jsonrpc_send_error_response(sctx->compl.payload, sctx->compl.rc, spdk_strerror(sctx->compl.rc));
 	}
 	free(sctx);
 }
@@ -2257,6 +2258,7 @@ rpc_bdev_lvol_get_snapshot_backup_status(struct spdk_jsonrpc_request *request,
 	return;
 
 cleanup:
+	SPDK_NOTICELOG("SCTX FREE!!!\n");
 	free(sctx->lvol_name);
 	free(sctx);
 }
