@@ -10955,10 +10955,6 @@ int
 snapshot_backup_poller(void *ctx) {
 	// event loop
 	struct spdk_blob *blob = ctx;
-	if (1) {
-		blob->backup_status = FLUSH_IS_SUCCEEDED;
-		return SPDK_POLLER_IDLE;
-	}
 
 	/* Optimization: since the max number of jobs is not too large, we can save branch predictions by just changing counters in a first loop 
 	and then trying to start or retry jobs under one branch prediction for overall failure in a second loop
@@ -11026,6 +11022,7 @@ blob_start_snapshot_backup(void *ctx) {
 			sctx->blob->flush_jobs = calloc(sctx->nmax_flush_jobs, sizeof(struct t_flush_job));
 			if (!sctx->blob->flush_jobs) {
 				sctx->compl.rc = -ENOMEM;
+				spdk_poller_destroy(sctx->blob->backup_poller);
 			} else {
 				for (int i = 0; i < sctx->nmax_flush_jobs; ++i) {
 					sctx->blob->flush_jobs[i].timeout_us = sctx->timeout_us;

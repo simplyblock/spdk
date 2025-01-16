@@ -2132,11 +2132,6 @@ rpc_bdev_lvol_backup_snapshot(struct spdk_jsonrpc_request *request,
 		return;
 	}
 
-	sctx->compl.cb_fn = start_snapshot_backup_cb;
-	sctx->compl.cb_arg = sctx;
-	sctx->compl.payload = request;
-	sctx->caller_th = spdk_get_thread();
-
 	if (spdk_json_decode_object(params, rpc_bdev_lvol_backup_snapshot_decoders,
 				    SPDK_COUNTOF(rpc_bdev_lvol_backup_snapshot_decoders),
 				    sctx)) {
@@ -2160,6 +2155,10 @@ rpc_bdev_lvol_backup_snapshot(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
+	sctx->compl.cb_fn = start_snapshot_backup_cb;
+	sctx->compl.cb_arg = sctx;
+	sctx->compl.payload = request;
+	sctx->caller_th = spdk_get_thread();
 	sctx->blob = lvol->blob;
 	sctx->nmax_retries = sctx->nmax_retries == 0 ? 4 : sctx->nmax_retries;
 	sctx->nmax_flush_jobs = sctx->nmax_flush_jobs == 0 ? 4 : sctx->nmax_flush_jobs;
@@ -2226,11 +2225,6 @@ rpc_bdev_lvol_get_snapshot_backup_status(struct spdk_jsonrpc_request *request,
 		return;
 	}
 
-	sctx->compl.cb_fn = get_snapshot_backup_status_cb;
-	sctx->compl.cb_arg = sctx;
-	sctx->compl.payload = request;
-	sctx->caller_th = spdk_get_thread();
-
 	if (spdk_json_decode_object(params, rpc_bdev_lvol_get_snapshot_backup_status_decoders,
 				    SPDK_COUNTOF(rpc_bdev_lvol_get_snapshot_backup_status_decoders),
 				    sctx)) {
@@ -2254,6 +2248,10 @@ rpc_bdev_lvol_get_snapshot_backup_status(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
+	sctx->compl.cb_fn = get_snapshot_backup_status_cb;
+	sctx->compl.cb_arg = sctx;
+	sctx->compl.payload = request;
+	sctx->caller_th = spdk_get_thread();
 	sctx->blob = lvol->blob;
 	vbdev_lvol_get_snapshot_backup_status(sctx);
 	return;
