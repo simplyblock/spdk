@@ -174,7 +174,8 @@ struct spdk_blob {
 	uint64_t	remaining_clusters_in_et;
 
 	// Snapshot backup fields
-
+	
+	struct spdk_io_channel *backup_channel;
 	struct spdk_poller *backup_poller;
 	enum EFlushStatus backup_status; // overall status for backup operation
 	uint32_t dev_page_size; // page size of backing device (not SPDK_BS_PAGE_SIZE)
@@ -211,6 +212,10 @@ struct spdk_blob_store {
 	struct spdk_io_channel		*md_channel;
 	uint32_t			max_channel_ops;
 
+	/* For snapshot backup operations, we need a separate thread from the md (= app) thread since creating pollers on the app thread 
+	seems to cause segfaults (UB).
+	*/
+	struct spdk_thread 		*backup_thread;
 	struct spdk_thread		*md_thread;
 
 	int priority_class; // max priority_class of all constituent blobs to speed up metadata I/Os

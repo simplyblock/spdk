@@ -3841,6 +3841,13 @@ bs_free(struct spdk_blob_store *bs)
 {
 	bs_blob_list_free(bs);
 
+	if (bs->backup_thread) {
+		struct spdk_thread* th = bs->backup_thread;
+		while (spdk_thread_poll(th, 0, 0)) {} // drain
+		spdk_thread_exit(th);
+		while (!spdk_thread_is_idle(th)) { spdk_thread_poll(th, 0, 0); } // drain
+	}
+
 	bs_unregister_md_thread(bs);
 	spdk_io_device_unregister(bs, bs_dev_destroy);
 }
@@ -10879,7 +10886,7 @@ blob_do_flush_job(struct spdk_blob *blob, struct t_flush_job *job) {
 	cpl.type = SPDK_BS_CPL_TYPE_BLOB_BASIC;
 	cpl.u.blob_basic.cb_fn = blob_flush_job_compl_cb;
 	cpl.u.blob_basic.cb_arg = job;
-	spdk_bs_sequence_t *seq = bs_sequence_start_blob(blob->bs->md_channel, &cpl, blob);
+	spdk_bs_sequence_t *seq = bs_sequence_start_blob(blob->backup_channel, &cpl, blob);
 	if (!seq) {
 		job->status = FLUSH_IS_FAILED;
 		return -ENOMEM;
@@ -11007,22 +11014,24 @@ snapshot_backup_poller(void *ctx) {
 }
 
 static void
-blob_start_snapshot_backup(void *ctx) {
+_blob_start_snapshot_backup(void *ctx) {
 	struct snapshot_backup_ctx *sctx = ctx;
 
-	/*if (sctx->blob->backup_poller) {
-		sctx->compl.rc = -EEXIST;
-	} else if (!spdk_blob_is_snapshot(sctx->blob)) {
-		sctx->compl.rc = -EINVAL;
+	// This is necessary, because spdk_thread_create may have ignored the mask.
+	spdk_thread_set_cpumask(spdk_thread_get_cpumask(sctx->blob->bs->md_thread));
+
+	sctx->blob->backup_channel = spdk_bs_alloc_io_channel(sctx->blob->bs);
+	if (!sctx->blob->backup_channel) {
+		sctx->compl.rc = -ENOMEM;
 	} else {
 		sctx->blob->backup_poller = spdk_poller_register(snapshot_backup_poller, sctx->blob, SNAPSHOT_BACKUP_POLLER_US);
 		if (!sctx->blob->backup_poller) {
+			spdk_put_io_channel(sctx->blob->backup_channel);
 			sctx->compl.rc = -ENOMEM;
 		} else {
 			sctx->blob->flush_jobs = calloc(sctx->nmax_flush_jobs, sizeof(struct t_flush_job));
 			if (!sctx->blob->flush_jobs) {
 				sctx->compl.rc = -ENOMEM;
-				spdk_poller_destroy(sctx->blob->backup_poller);
 			} else {
 				for (int i = 0; i < sctx->nmax_flush_jobs; ++i) {
 					sctx->blob->flush_jobs[i].timeout_us = sctx->timeout_us;
@@ -11034,22 +11043,65 @@ blob_start_snapshot_backup(void *ctx) {
 				sctx->blob->nmax_flush_jobs = sctx->nmax_flush_jobs;
 			}
 		}
-	}*/
+	}
 
-	if (sctx->caller_th == sctx->blob->bs->md_thread) {
+	spdk_thread_send_msg(sctx->caller_th, sctx->compl.cb_fn, sctx->compl.cb_arg);
+}
+
+static void
+blob_start_snapshot_backup(void *ctx) {
+	struct snapshot_backup_ctx *sctx = ctx;
+
+	if (sctx->blob->backup_poller) {
+		sctx->compl.rc = -EEXIST;
+		sctx->compl.cb_fn(sctx->compl.cb_arg);
+	} else if (!spdk_blob_is_snapshot(sctx->blob)) {
+		sctx->compl.rc = -EINVAL;
 		sctx->compl.cb_fn(sctx->compl.cb_arg);
 	} else {
-		spdk_thread_send_msg(sctx->caller_th, sctx->compl.cb_fn, sctx->compl.cb_arg);
+		if (!sctx->blob->bs->backup_thread) {
+			sctx->blob->bs->backup_thread = spdk_thread_create(0, spdk_thread_get_cpumask(sctx->blob->bs->md_thread));
+		}
+		if (!sctx->blob->bs->backup_thread) {
+			sctx->compl.rc = -ENOMEM;
+			sctx->compl.cb_fn(sctx->compl.cb_arg);
+		} else {
+			spdk_thread_send_msg(sctx->blob->bs->backup_thread, _blob_start_snapshot_backup, sctx);
+		}
 	}
 }
 
 void
 spdk_blob_start_snapshot_backup(struct snapshot_backup_ctx *sctx) {
-	if (sctx->caller_th == sctx->blob->bs->md_thread) {
-		blob_start_snapshot_backup(sctx);
-	} else {
-		spdk_thread_send_msg(sctx->blob->bs->md_thread, blob_start_snapshot_backup, sctx);
+	blob_start_snapshot_backup(sctx);
+}
+
+static void
+_blob_get_snapshot_backup_status(void *ctx) {
+	struct snapshot_backup_ctx *sctx = ctx;
+
+	sctx->compl.rc = 0;
+	sctx->compl.backup_status = sctx->blob->backup_status;
+	if (sctx->blob->backup_status != FLUSH_IS_PENDING) // finally end the snapshot backup operation 
+	{
+		spdk_put_io_channel(sctx->blob->backup_channel);
+		spdk_poller_unregister(sctx->blob->backup_poller);
+		if (spdk_likely(sctx->blob->flush_jobs)) {
+			for (int i = 0; i < sctx->blob->nmax_flush_jobs; ++i) {
+				if (sctx->blob->flush_jobs[i].buf) {
+					spdk_free(sctx->blob->flush_jobs[i].buf);
+				}
+			}
+			free(sctx->blob->flush_jobs);
+		}
+		sctx->blob->nflush_jobs_current = 0;
+		sctx->blob->nflush_jobs_on_prior_array = 0;
+		sctx->blob->current_array_ordinal = 0;
+		sctx->blob->next_idx_in_array = 0;
+		sctx->blob->flush_jobs = NULL;
 	}
+
+	spdk_thread_send_msg(sctx->caller_th, sctx->compl.cb_fn, sctx->compl.cb_arg);
 }
 
 static void
@@ -11058,40 +11110,14 @@ blob_get_snapshot_backup_status(void *ctx) {
 
 	if (!sctx->blob->backup_poller) {
 		sctx->compl.rc = -ENOENT;
-	} else {
-		sctx->compl.rc = 0;
-		sctx->compl.backup_status = sctx->blob->backup_status;
-		if (sctx->blob->backup_status != FLUSH_IS_PENDING) // finally end the snapshot backup operation 
-		{
-			spdk_poller_destroy(&sctx->blob->backup_poller);
-
-			for (int i = 0; i < sctx->blob->nmax_flush_jobs; ++i) {
-				if (sctx->blob->flush_jobs[i].buf) {
-					spdk_free(sctx->blob->flush_jobs[i].buf);
-				}
-			}
-			free(sctx->blob->flush_jobs);
-			sctx->blob->nflush_jobs_current = 0;
-			sctx->blob->nflush_jobs_on_prior_array = 0;
-			sctx->blob->current_array_ordinal = 0;
-			sctx->blob->next_idx_in_array = 0;
-			sctx->blob->flush_jobs = NULL;
-		}
-	}
-
-	if (sctx->caller_th == sctx->blob->bs->md_thread) {
 		sctx->compl.cb_fn(sctx->compl.cb_arg);
 	} else {
-		spdk_thread_send_msg(sctx->caller_th, sctx->compl.cb_fn, sctx->compl.cb_arg);
+		spdk_thread_send_msg(sctx->blob->bs->backup_thread, _blob_get_snapshot_backup_status, sctx);
 	}
 }
 
 void spdk_blob_get_snapshot_backup_status(struct snapshot_backup_ctx *sctx) {
-	if (sctx->caller_th == sctx->blob->bs->md_thread) {
-		blob_get_snapshot_backup_status(sctx);
-	} else {
-		spdk_thread_send_msg(sctx->blob->bs->md_thread, blob_get_snapshot_backup_status, sctx);
-	}
+	blob_get_snapshot_backup_status(sctx);
 }
 
 SPDK_LOG_REGISTER_COMPONENT(blob)
