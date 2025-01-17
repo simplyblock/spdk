@@ -1,4 +1,4 @@
-FROM fedora:37
+FROM fedora:41
 
 # push to "simplyblock/spdk-core:$TAG"
 
@@ -9,21 +9,25 @@ WORKDIR /root
 COPY ./ /root/spdk/
 
 RUN dnf install -y git diffutils procps-ng pip kmod hostname wget pkg-config cmake nano systemd-udev
+RUN yum install -y /root/spdk/docker/accel-config-libs-4.1.8.git4405db70-2.el9.aarch64.rpm \
+    /root/spdk/docker/accel-config-4.1.8.git4405db70-2.el9.aarch64.rpm \
+    /root/spdk/docker/accel-config-devel-4.1.8.git4405db70-2.el9.aarch64.rpm
+
+RUN yum install -y dosfstools ntfsprogs e2fsprogs ntfs-* gdb parted fio xfsprogs libasan libubsan
+
+RUN pip install requests
 
 RUN cd spdk && git submodule update --init --depth 1
 
-RUN cd spdk && scripts/pkgdep.sh --rdma --pmem
+RUN cd spdk && scripts/pkgdep.sh --rdma --pmem --idxd
 
 RUN mkdir /tmp/pmem
-
-RUN pip3 install grpcio-tools==1.51.3 protobuf==4.22.1
-
-RUN sed -i "s/^#define SPDK_JSONRPC_RECV_BUF_SIZE.*/#define SPDK_JSONRPC_RECV_BUF_SIZE\t(32 * 1024 * 1024)/" /root/spdk/lib/jsonrpc/jsonrpc_internal.h
 
 RUN sed -i "s/^#define SPDK_BDEV_QOS_MIN_IOS_PER_SEC.*/#define SPDK_BDEV_QOS_MIN_IOS_PER_SEC\t200/" /root/spdk/lib/bdev/bdev.c
 
 RUN sed -i "s/^#define SPDK_BDEV_QOS_TIMESLICE_IN_USEC.*/#define SPDK_BDEV_QOS_TIMESLICE_IN_USEC\t5000/" /root/spdk/lib/bdev/bdev.c
 
-RUN cd spdk && ./configure --with-crypto --with-rdma --disable-tests --disable-unit-tests --disable-examples --with-ocf --with-fuse --with-nvme-cuse
+RUN cd spdk && ./configure --with-crypto --with-rdma --disable-tests --disable-unit-tests --with-ocf --with-fuse\
+     --with-nvme-cuse  --with-idxd
 
 RUN cd spdk && make --no-builtin-rules -j16
