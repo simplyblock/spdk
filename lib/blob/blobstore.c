@@ -10956,7 +10956,7 @@ blob_search_for_new_flush_job(struct spdk_blob *blob, struct t_flush_job *job) {
 	return 0;
 }
 
-int 
+static int 
 snapshot_backup_poller(void *ctx) {
 	// event loop
 	struct spdk_blob *blob = ctx;
