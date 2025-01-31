@@ -335,7 +335,7 @@ void spdk_lvol_set_leader(struct spdk_lvol *lvol);
  *
  * \param leader The lvs's flag to set as leader or non leader.
  */
-void spdk_set_leader_all(struct spdk_lvol_store *t_lvs, bool leader);
+void spdk_set_leader_all(struct spdk_lvol_store *t_lvs, bool lvs_leader, bool bs_leadership);
 
 /**
  * Get the lvol that has the specified name in the specified lvolstore.

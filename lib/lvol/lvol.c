@@ -2846,26 +2846,27 @@ spdk_lvol_set_leader_failed_on_update(struct spdk_lvol *lvol)
 }
 
 void
-spdk_set_leader_all(struct spdk_lvol_store *t_lvs, bool leader)
+spdk_set_leader_all(struct spdk_lvol_store *t_lvs, bool lvs_leader, bool bs_leadership)
 {
 	struct spdk_lvol_store *lvs;
-	struct spdk_lvol *lvol;
-	SPDK_NOTICELOG("Lvolstore leadership state changed via RPC.\n");
+	struct spdk_lvol *lvol;	
+	SPDK_NOTICELOG("Lvs_leader state changed via RPC to %s and bs_leader to %s.\n", 
+                lvs_leader ? "true" : "false",
+                bs_leadership ? "true" : "false");
+
 	pthread_mutex_lock(&g_lvol_stores_mutex);
 
 	TAILQ_FOREACH(lvs, &g_lvol_stores, link) {
 		if (t_lvs == lvs) {			
 			lvs->update_in_progress = false;
 
-			if (leader) {
-				spdk_bs_set_leader(lvs->blobstore, true);
-			}
+			spdk_bs_set_leader(lvs->blobstore, bs_leadership);
 
 			TAILQ_FOREACH(lvol, &lvs->lvols, link) {			
-				lvol->leader = leader;
+				lvol->leader = lvs_leader;
 				lvol->update_in_progress = false;			
 			}
-			lvs->leader = leader;
+			lvs->leader = lvs_leader;
 		}
 	}
 

@@ -2113,13 +2113,15 @@ SPDK_RPC_REGISTER("bdev_lvol_update_lvstore", rpc_bdev_lvol_update_lvstore, SPDK
 struct rpc_bdev_lvol_leadership {
 	char *uuid;
 	char *lvs_name;
-	bool leadership;
+	bool lvs_leadership;
+	bool bs_leadership;
 };
 
 static const struct spdk_json_object_decoder rpc_bdev_lvol_leadership_decoders[] = {
 	{"uuid", offsetof(struct rpc_bdev_lvol_grow_lvstore, uuid), spdk_json_decode_string, true},
 	{"lvs_name", offsetof(struct rpc_bdev_lvol_grow_lvstore, lvs_name), spdk_json_decode_string, true},
-	{"leadership", offsetof(struct rpc_bdev_lvol_leadership, leadership), spdk_json_decode_bool},
+	{"lvs_leadership", offsetof(struct rpc_bdev_lvol_leadership, lvs_leadership), spdk_json_decode_bool},
+	{"bs_leadership", offsetof(struct rpc_bdev_lvol_leadership, bs_leadership), spdk_json_decode_bool},
 };
 
 static void
@@ -2145,7 +2147,7 @@ rpc_bdev_lvol_set_leader_all(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
-	spdk_set_leader_all(lvs, req.leadership);
+	spdk_set_leader_all(lvs, req.lvs_leadership, req.bs_leadership);
 	spdk_jsonrpc_send_bool_response(request, true);
 cleanup:
 	free(req.uuid);
