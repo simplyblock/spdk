@@ -325,7 +325,7 @@ bs_batch_completion(struct spdk_io_channel *_channel,
 	struct spdk_bs_channel		*channel = set->channel;
 	struct limit *ctx;
 	set->u.batch.outstanding_ops--;
-	if (bserrno != 0) {
+	if (bserrno != 0) {		
 		set->bserrno = bserrno;
 	}
 
@@ -339,7 +339,8 @@ bs_batch_completion(struct spdk_io_channel *_channel,
 				channel->dev->unmap(channel->dev, channel->dev_channel, ctx->lba, ctx->lba_count,
 						&set->cb_args);
 			} else {
-				bs_batch_completion(_channel, set->cb_args.cb_arg, 0);
+				SPDK_NOTICELOG("The unmap IO return with EIO error due to leader.\n");
+				bs_batch_completion(_channel, set->cb_args.cb_arg, -EIO);
 			}
 			free(ctx);
 		}
@@ -469,7 +470,8 @@ out:
 		channel->dev->unmap(channel->dev, channel->dev_channel, lba, lba_count,
 					&set->cb_args);
 	} else {
-		bs_batch_completion(set->cb_args.channel, set->cb_args.cb_arg, 0);
+		SPDK_NOTICELOG("The unmap IO return with EIO error due to leader 1.\n");
+		bs_batch_completion(set->cb_args.channel, set->cb_args.cb_arg, -EIO);
 	}
 }
 
@@ -488,7 +490,8 @@ bs_batch_write_zeroes_dev(spdk_bs_batch_t *batch,
 		channel->dev->write_zeroes(channel->dev, channel->dev_channel, lba, lba_count,
 				   	&set->cb_args);
 	} else {
-		bs_batch_completion(set->cb_args.channel, set->cb_args.cb_arg, 0);
+		SPDK_NOTICELOG("The write zero IO return with EIO error due to leader.\n");
+		bs_batch_completion(set->cb_args.channel, set->cb_args.cb_arg, -EIO);
 	}
 }
 

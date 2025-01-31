@@ -511,6 +511,7 @@ blob_execute_queued_io(struct spdk_io_channel_iter *i)
 			if (!ctx->blob->failed_on_update && bs->is_leader) {
 				bs_user_op_execute(op);
 			} else {
+				SPDK_NOTICELOG("The IO return with EIO error due to leader or failed update.\n");
 				bs_user_op_abort(op, -EIO);
 			}		
 		}
@@ -2230,7 +2231,7 @@ blob_persist_clear_clusters_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserr
 	struct spdk_blob_store		*bs = blob->bs;
 	size_t				i;
 
-	if (bserrno != 0) {
+	if (bserrno != 0) {		
 		blob_persist_complete(seq, ctx, bserrno);
 		return;
 	}

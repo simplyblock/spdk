@@ -2846,13 +2846,13 @@ spdk_lvol_set_leader_failed_on_update(struct spdk_lvol *lvol)
 }
 
 void
-spdk_set_leader_all(struct spdk_lvol_store *t_lvs, bool lvs_leader, bool bs_leadership)
+spdk_set_leader_all(struct spdk_lvol_store *t_lvs, bool lvs_leader, bool bs_nonleadership)
 {
 	struct spdk_lvol_store *lvs;
 	struct spdk_lvol *lvol;	
-	SPDK_NOTICELOG("Lvs_leader state changed via RPC to %s and bs_leader to %s.\n", 
+	SPDK_NOTICELOG("Lvs_leader state changed via RPC to %s and bs_nonleader to %s.\n", 
                 lvs_leader ? "true" : "false",
-                bs_leadership ? "true" : "false");
+                bs_nonleadership ? "true" : "false");
 
 	pthread_mutex_lock(&g_lvol_stores_mutex);
 
@@ -2860,11 +2860,11 @@ spdk_set_leader_all(struct spdk_lvol_store *t_lvs, bool lvs_leader, bool bs_lead
 		if (t_lvs == lvs) {			
 			lvs->update_in_progress = false;
 
-			spdk_bs_set_leader(lvs->blobstore, bs_leadership);
+			spdk_bs_set_leader(lvs->blobstore, !bs_nonleadership);
 
-			TAILQ_FOREACH(lvol, &lvs->lvols, link) {			
+			TAILQ_FOREACH(lvol, &lvs->lvols, link) {
 				lvol->leader = lvs_leader;
-				lvol->update_in_progress = false;			
+				lvol->update_in_progress = false;
 			}
 			lvs->leader = lvs_leader;
 		}
