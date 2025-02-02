@@ -11089,34 +11089,46 @@ static void
 blob_insert_cluster_msg(void *arg)
 {
 	struct spdk_blob_cluster_op_ctx *ctx = arg;
+	struct spdk_blob *blob = ctx->blob;
 	uint32_t *extent_page;
 
-	ctx->rc = blob_insert_cluster(ctx->blob, ctx->cluster_num, ctx->cluster);
+	if (blob->frozen_refcnt) {
+		SPDK_NOTICELOG("Frozen refcnt while IO proccess tryagain 1.\n");
+		if (ctx->copy) {
+			SPDK_NOTICELOG("Frozen refcnt while IO proccess 11.\n");
+			ctx->rc = -EEXIST;				
+		} else {
+			SPDK_NOTICELOG("Frozen refcnt while IO proccess tryagain 12.\n");
+			ctx->rc = -EAGAIN;
+		}
+		spdk_thread_send_msg(ctx->thread, blob_op_cluster_msg_cpl, ctx);
+		return;
+	}
+
+	ctx->rc = blob_insert_cluster(blob, ctx->cluster_num, ctx->cluster);
 	if (ctx->rc != 0) {
 		spdk_thread_send_msg(ctx->thread, blob_op_cluster_msg_cpl, ctx);
 		return;
 	}
 
-	if (ctx->blob->use_extent_table == false) {
+	if (blob->use_extent_table == false) {
 		/* Extent table is not used, proceed with sync of md that will only use extents_rle. */
-		ctx->blob->state = SPDK_BLOB_STATE_DIRTY;
-		blob_sync_md(ctx->blob, blob_op_cluster_msg_cb, ctx);
+		blob->state = SPDK_BLOB_STATE_DIRTY;
+		blob_sync_md(blob, blob_op_cluster_msg_cb, ctx);
 		return;
 	}
 
-	if (ctx->blob->frozen_refcnt) {
-		ctx->rc = -EAGAIN;
-		SPDK_NOTICELOG("Frozen refcnt while IO proccess tryagain 1.\n");
-		spdk_thread_send_msg(ctx->thread, blob_op_cluster_msg_cpl, ctx);
-		return;
-	}
-
-	extent_page = bs_cluster_to_extent_page(ctx->blob, ctx->cluster_num);
+	extent_page = bs_cluster_to_extent_page(blob, ctx->cluster_num);
 	if (*extent_page == 0) {
 		/* Extent page requires allocation.
 		 * It was already claimed in the used_md_pages map and placed in ctx. */
 		// assert(ctx->extent_page != 0);
 		if (ctx->extent_page == 0) {
+			blob->active.clusters[ctx->cluster_num] = 0;
+			if (blob->active.num_allocated_clusters > 0) {
+				blob->active.num_allocated_clusters--;
+			}
+			
 			if (ctx->copy) {
 				SPDK_NOTICELOG("Frozen refcnt while IO proccess 2.\n");
 				ctx->rc = -EEXIST;				
@@ -11124,27 +11136,28 @@ blob_insert_cluster_msg(void *arg)
 				SPDK_NOTICELOG("Frozen refcnt while IO proccess tryagain 2.\n");
 				ctx->rc = -EAGAIN;
 			}
+
 			spdk_thread_send_msg(ctx->thread, blob_op_cluster_msg_cpl, ctx);
 			return;
 		}
 
-		assert(spdk_bit_array_get(ctx->blob->bs->used_md_pages, ctx->extent_page) == true);
-		blob_write_extent_page(ctx->blob, ctx->extent_page, ctx->cluster_num, ctx->page,
+		assert(spdk_bit_array_get(blob->bs->used_md_pages, ctx->extent_page) == true);
+		blob_write_extent_page(blob, ctx->extent_page, ctx->cluster_num, ctx->page,
 				       blob_insert_new_ep_cb, ctx);
 	} else {
 		/* It is possible for original thread to allocate extent page for
 		 * different cluster in the same extent page. In such case proceed with
 		 * updating the existing extent page, but release the additional one. */
 		if (ctx->extent_page != 0) {
-			spdk_spin_lock(&ctx->blob->bs->used_lock);
-			assert(spdk_bit_array_get(ctx->blob->bs->used_md_pages, ctx->extent_page) == true);
-			bs_release_md_page(ctx->blob->bs, ctx->extent_page);
-			spdk_spin_unlock(&ctx->blob->bs->used_lock);
+			spdk_spin_lock(&blob->bs->used_lock);
+			assert(spdk_bit_array_get(blob->bs->used_md_pages, ctx->extent_page) == true);
+			bs_release_md_page(blob->bs, ctx->extent_page);
+			spdk_spin_unlock(&blob->bs->used_lock);
 			ctx->extent_page = 0;
 		}
 		/* Extent page already allocated.
 		 * Every cluster allocation, requires just an update of single extent page. */
-		blob_write_extent_page(ctx->blob, *extent_page, ctx->cluster_num, ctx->page,
+		blob_write_extent_page(blob, *extent_page, ctx->cluster_num, ctx->page,
 				       blob_op_cluster_msg_cb, ctx);
 	}
 }
