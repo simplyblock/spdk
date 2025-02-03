@@ -74,7 +74,8 @@ def bdev_lvol_update_lvstore(client, uuid=None, lvs_name=None):
         params['lvs_name'] = lvs_name
     return client.call('bdev_lvol_update_lvstore', params)
 
-def bdev_lvol_set_leader_all(client, uuid=None, lvs_name=None, lvs_leadership=False, bs_nonleadership=False):
+# def bdev_lvol_set_leader_all(client, uuid=None, lvs_name=None, lvs_leadership=False, bs_nonleadership=False):
+def bdev_lvol_set_leader_all(client, uuid=None, lvs_name=None, leadership=False):
     """Change state of the leadership
 
     Args:
@@ -83,7 +84,8 @@ def bdev_lvol_set_leader_all(client, uuid=None, lvs_name=None, lvs_leadership=Fa
         lvs_leadership: Leadership state for lvolstore (default: False)
         bs_leadership: Leadership state for blobstore (default: False)
     """ 
-    params = {'lvs_leadership': lvs_leadership, 'bs_nonleadership': bs_nonleadership}
+    # params = {'lvs_leadership': lvs_leadership, 'bs_nonleadership': bs_nonleadership}
+    params = {'leadership': leadership}
         
     if (uuid and lvs_name):
         raise ValueError("Exactly one of uuid or lvs_name may be specified")
