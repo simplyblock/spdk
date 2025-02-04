@@ -11030,7 +11030,7 @@ _blob_start_snapshot_backup(void *ctx) {
 			sctx->blob->flush_jobs = calloc(sctx->nmax_flush_jobs, sizeof(struct t_flush_job));
 			if (!sctx->blob->flush_jobs) {
 				spdk_put_io_channel(sctx->blob->backup_channel);
-				spdk_poller_unregister(sctx->blob->backup_poller);
+				spdk_poller_unregister(&sctx->blob->backup_poller);
 				sctx->compl.rc = -ENOMEM;
 			} else {
 				for (int i = 0; i < sctx->nmax_flush_jobs; ++i) {
