@@ -13384,7 +13384,7 @@ void
 spdk_blob_set_io_priority_class(struct spdk_blob* blob, int priority_class)
 {
 	blob->priority_class = priority_class;
-	if (priority_class) { blob->bs->priority_class = MAX_PRIORITY_CLASS; } // max priority for metadata I/O if priority is supported
+	if (priority_class) { blob->bs->priority_class = PREMIUM_PRIORITY_CLASS; } // max priority for metadata I/O if priority is supported
 }
 
 SPDK_LOG_REGISTER_COMPONENT(blob)
