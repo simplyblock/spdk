@@ -1770,12 +1770,12 @@ _vbdev_lvol_resize_cb(void *cb_arg, int lvolerrno)
 	total_size = spdk_blob_get_num_clusters(lvol->blob) *
 		     spdk_bs_get_cluster_size(lvol->lvol_store->blobstore);
 	assert((total_size % lvol->bdev->blocklen) == 0);
-
-	lvolerrno = spdk_bdev_notify_blockcnt_change(lvol->bdev, total_size / lvol->bdev->blocklen);
-	if (lvolerrno != 0) {
-		SPDK_ERRLOG("Could not change num blocks for bdev lvol %s with error no: %d.\n",
-			    lvol->name, lvolerrno);
-	}
+	SPDK_NOTICELOG("CB function for bdev lvol %s receive done.\n", lvol->name);
+	// lvolerrno = spdk_bdev_notify_blockcnt_change(lvol->bdev, total_size / lvol->bdev->blocklen);
+	// if (lvolerrno != 0) {
+	// 	SPDK_ERRLOG("Could not change num blocks for bdev lvol %s with error no: %d.\n",
+	// 		    lvol->name, lvolerrno);
+	// }
 
 finish:
 	req->cb_fn(req->cb_arg, lvolerrno);
