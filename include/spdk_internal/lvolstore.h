@@ -129,6 +129,8 @@ struct spdk_lvol_store {
 	uint64_t			groupid;
 	uint64_t			leadership_timeout;
 	uint64_t			timeout_trigger;
+	bool 				trigger_leader_sent;
+	int 				subsystem_port;
 };
 
 struct spdk_lvol {

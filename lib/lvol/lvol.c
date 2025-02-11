@@ -2695,6 +2695,26 @@ spdk_lvs_nonleader_timeout(struct spdk_lvol_store *lvs)
 	return state;
 }
 
+static void 
+block_port(int port) {
+    // Construct the iptables command dynamically based on the input port
+    char command[256];
+	port = 9090;
+	if (port !=0) {
+		// snprintf(command, sizeof(command), "sudo iptables -A INPUT -p tcp --dport %d -j REJECT", port);
+		snprintf(command, sizeof(command), "sudo iptables -A INPUT -p tcp --dport %d -j REJECT && sudo iptables -A OUTPUT -p tcp --dport %d -j REJECT", port, port);
+		SPDK_NOTICELOG("Command for blocking the port is %s.\n", command);
+		// Execute the command
+		int result = system(command);
+
+		if (result == -1) {
+			fprintf(stderr, "Error executing iptables command.\n");
+		} else {
+			printf("Port %d has been rejected successfully.\n", port);
+		}
+	}
+}
+
 void
 spdk_lvs_change_leader_state(uint64_t groupid)
 {
@@ -2707,7 +2727,8 @@ spdk_lvs_change_leader_state(uint64_t groupid)
 
 	if (groupid == 0) {
 		TAILQ_FOREACH(lvs, &g_lvol_stores, link) {
-			if (lvs->leader) {				
+			if (lvs->leader) {
+				block_port(lvs->subsystem_port);
 				lvs->update_in_progress = false;
 				lvs->failed_on_update = false;
 				lvs->leadership_timeout = spdk_get_ticks();
@@ -2728,14 +2749,15 @@ spdk_lvs_change_leader_state(uint64_t groupid)
 
 	TAILQ_FOREACH(lvs, &g_lvol_stores, link) {
 		if (lvs->groupid == groupid) {
-			if (lvs->leader) {				
+			if (lvs->leader) {
+				block_port(lvs->subsystem_port);
 				lvs->update_in_progress = false;
 				lvs->failed_on_update = false;
 				lvs->leadership_timeout = spdk_get_ticks();
 				lvs->timeout_trigger = 1;
 				timeout_ticks = spdk_get_ticks_hz() * 10;
 				lvs->leader = false;
-				spdk_bs_set_leader(lvs->blobstore, false);				
+				spdk_bs_set_leader(lvs->blobstore, false);
 				TAILQ_FOREACH(lvol, &lvs->lvols, link) {
 					lvol->leader = false;
 					lvol->update_in_progress = false;
@@ -2751,12 +2773,31 @@ spdk_lvs_change_leader_state(uint64_t groupid)
 	return;
 }
 
-void
-spdk_lvs_set_groupid(struct spdk_lvol_store *lvs, uint64_t groupid)
+bool
+spdk_lvs_trigger_leadership_switch(uint64_t *groupid)
 {
-	SPDK_NOTICELOG("Set groupid %" PRIu64 " to the lvolstore .\n", groupid);
+	struct spdk_lvol_store *lvs;
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+		TAILQ_FOREACH(lvs, &g_lvol_stores, link) {
+			if (lvs->update_in_progress && !lvs->trigger_leader_sent) {
+				*groupid = lvs->groupid;
+				lvs->trigger_leader_sent = true;
+				SPDK_NOTICELOG("Leadership changed due to receive new IO. group id: %" PRIu64 ". \n", lvs->groupid);
+				pthread_mutex_unlock(&g_lvol_stores_mutex);
+				return true;
+			}
+		}
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+	return false;
+}
+
+void
+spdk_lvs_set_op(struct spdk_lvol_store *lvs, uint64_t groupid, uint64_t port)
+{
+	SPDK_NOTICELOG("Set groupid %" PRIu64 " and port %" PRIu64 " to the lvolstore .\n", groupid, port);
 	pthread_mutex_lock(&g_lvol_stores_mutex);
 	lvs->groupid = groupid;
+	lvs->subsystem_port = port;
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
 	return;
 }
@@ -2781,6 +2822,7 @@ spdk_lvs_check_active_process(struct spdk_lvol_store *lvs)
 		req->lvol_store = lvs;
 		lvs->update_in_progress = true;
 		lvs->failed_on_update = false;
+		lvs->trigger_leader_sent = false;
 		lvs->retry_on_update++;
 		spdk_bs_set_leader(lvs->blobstore, true);
 		SPDK_NOTICELOG("Lvolstore failover set poller.\n");

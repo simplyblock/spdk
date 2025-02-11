@@ -2307,17 +2307,19 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('-l', '--lvs-name', help='lvol store name')
     p.set_defaults(func=bdev_lvol_get_lvstores)
     
-    def bdev_lvol_set_lvs_groupid(args):
-        print_dict(rpc.lvol.bdev_lvol_set_lvs_groupid(args.client,
+    def bdev_lvol_set_lvs_op(args):
+        print_dict(rpc.lvol.bdev_lvol_set_lvs_op(args.client,
                                                    uuid=args.uuid,
                                                    lvs_name=args.lvs_name,
-                                                   groupid=args.groupid))
+                                                   groupid=args.groupid,
+                                                   subsystem_port=args.subsystem_port))
 
-    p = subparsers.add_parser('bdev_lvol_set_lvs_groupid', help='Set group id for lvolstore')
+    p = subparsers.add_parser('bdev_lvol_set_lvs_op', help='Set options for lvolstore')
     p.add_argument('-u', '--uuid', help='lvol store UUID')
     p.add_argument('-l', '--lvs-name', help='lvol store name')
     p.add_argument('-i', '--groupid', help='lvol store group id', type=int)
-    p.set_defaults(func=bdev_lvol_set_lvs_groupid)
+    p.add_argument('-p', '--subsystemm-port', help='lvols subsystem port', type=int)
+    p.set_defaults(func=bdev_lvol_set_lvs_op)
 
     def bdev_lvol_get_lvols(args):
         print_dict(rpc.lvol.bdev_lvol_get_lvols(args.client,

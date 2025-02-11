@@ -309,7 +309,8 @@ void spdk_lvs_update_on_failover(struct spdk_lvol_store *lvs);
 void spdk_lvs_check_active_process(struct spdk_lvol_store *lvs);
 bool spdk_lvs_nonleader_timeout(struct spdk_lvol_store *lvs);
 void spdk_lvs_change_leader_state(uint64_t groupid);
-void spdk_lvs_set_groupid(struct spdk_lvol_store *lvs, uint64_t groupid);
+bool spdk_lvs_trigger_leadership_switch(uint64_t *groupid);
+void spdk_lvs_set_op(struct spdk_lvol_store *lvs, uint64_t groupid, uint64_t port);
 void spdk_lvs_set_failed_on_update(struct spdk_lvol_store *lvs, bool state);
 /**
  * Get the lvol that has a particular UUID.
