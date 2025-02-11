@@ -2699,8 +2699,7 @@ static void
 block_port(int port) {
     // Construct the iptables command dynamically based on the input port
     char command[256];
-	port = 9090;
-	if (port !=0) {
+	if (port != 0) {
 		// snprintf(command, sizeof(command), "sudo iptables -A INPUT -p tcp --dport %d -j REJECT", port);
 		snprintf(command, sizeof(command), "sudo iptables -A INPUT -p tcp --dport %d -j REJECT && sudo iptables -A OUTPUT -p tcp --dport %d -j REJECT", port, port);
 		SPDK_NOTICELOG("Command for blocking the port is %s.\n", command);
@@ -2708,9 +2707,9 @@ block_port(int port) {
 		int result = system(command);
 
 		if (result == -1) {
-			fprintf(stderr, "Error executing iptables command.\n");
+			SPDK_ERRORLOG(stderr, "Error executing iptables command.\n");
 		} else {
-			printf("Port %d has been rejected successfully.\n", port);
+			SPDK_NOTICELOG("Port %d has been rejected successfully.\n", port);
 		}
 	}
 }

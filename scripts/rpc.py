@@ -2318,7 +2318,7 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('-u', '--uuid', help='lvol store UUID')
     p.add_argument('-l', '--lvs-name', help='lvol store name')
     p.add_argument('-i', '--groupid', help='lvol store group id', type=int)
-    p.add_argument('-p', '--subsystemm-port', help='lvols subsystem port', type=int)
+    p.add_argument('-p', '--subsystem-port', help='lvols subsystem port', type=int)
     p.set_defaults(func=bdev_lvol_set_lvs_op)
 
     def bdev_lvol_get_lvols(args):
