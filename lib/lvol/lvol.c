@@ -2707,7 +2707,7 @@ block_port(int port) {
 		int result = system(command);
 
 		if (result == -1) {
-			SPDK_ERRORLOG(stderr, "Error executing iptables command.\n");
+			SPDK_ERRLOG(stderr, "Error executing iptables command.\n");
 		} else {
 			SPDK_NOTICELOG("Port %d has been rejected successfully.\n", port);
 		}
