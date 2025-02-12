@@ -1002,6 +1002,8 @@ void spdk_bs_open_blob_without_reference(struct spdk_blob_store *bs, spdk_blob_i
 void spdk_blob_resize(struct spdk_blob *blob, uint64_t sz, spdk_blob_op_complete cb_fn,
 		      void *cb_arg);
 			  
+void spdk_blob_resize_unfreeze(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
+			  
 int spdk_blob_resize_register(struct spdk_blob *blob, uint64_t sz);
 
 /**

@@ -1771,15 +1771,64 @@ _vbdev_lvol_resize_cb(void *cb_arg, int lvolerrno)
 		     spdk_bs_get_cluster_size(lvol->lvol_store->blobstore);
 	assert((total_size % lvol->bdev->blocklen) == 0);
 	SPDK_NOTICELOG("CB function for bdev lvol %s receive done.\n", lvol->name);
-	// lvolerrno = spdk_bdev_notify_blockcnt_change(lvol->bdev, total_size / lvol->bdev->blocklen);
-	// if (lvolerrno != 0) {
-	// 	SPDK_ERRLOG("Could not change num blocks for bdev lvol %s with error no: %d.\n",
-	// 		    lvol->name, lvolerrno);
-	// }
+	lvolerrno = spdk_bdev_notify_blockcnt_change(lvol->bdev, total_size / lvol->bdev->blocklen);
+	if (lvolerrno != 0) {
+		SPDK_ERRLOG("Could not change num blocks for bdev lvol %s with error no: %d.\n",
+			    lvol->name, lvolerrno);
+	}
 
 finish:
 	req->cb_fn(req->cb_arg, lvolerrno);
 	free(req);
+}
+
+static void
+_vbdev_lvol_resize_unfreeze_cb(void *cb_arg, int lvolerrno)
+{
+	struct spdk_lvol_req *req = cb_arg;
+	struct spdk_lvol *lvol = req->lvol;
+
+	/* change bdev size */
+	if (lvolerrno != 0) {
+		SPDK_ERRLOG("CB function for unfreeze lvol %s receive error no: %d.\n", lvol->name, lvolerrno);
+		goto finish;
+	}
+
+	if (req->rc != 0) {
+		lvolerrno = req->rc;
+	}
+
+finish:
+	req->cb_fn(req->cb_arg, lvolerrno);
+	free(req);
+}
+
+static void
+_vbdev_lvol_resize_leader_cb(void *cb_arg, int lvolerrno)
+{
+	struct spdk_lvol_req *req = cb_arg;
+	struct spdk_lvol *lvol = req->lvol;
+	uint64_t total_size;
+
+	/* change bdev size */
+	if (lvolerrno != 0) {
+		SPDK_ERRLOG("CB function for bdev lvol %s receive error no: %d.\n", lvol->name, lvolerrno);
+		req->rc = lvolerrno;
+		spdk_lvol_resize_unfreeze(lvol, _vbdev_lvol_resize_unfreeze_cb, req);
+		return;
+	}
+
+	total_size = spdk_blob_get_num_clusters(lvol->blob) *
+		     spdk_bs_get_cluster_size(lvol->lvol_store->blobstore);
+	assert((total_size % lvol->bdev->blocklen) == 0);
+	SPDK_NOTICELOG("CB function for bdev lvol %s receive done.\n", lvol->name);
+	lvolerrno = spdk_bdev_notify_blockcnt_change(lvol->bdev, total_size / lvol->bdev->blocklen);
+	if (lvolerrno != 0) {
+		SPDK_ERRLOG("Could not change num blocks for bdev lvol %s with error no: %d.\n",
+			    lvol->name, lvolerrno);
+	}
+	req->rc = lvolerrno;
+	spdk_lvol_resize_unfreeze(lvol, _vbdev_lvol_resize_unfreeze_cb, req);
 }
 
 void
@@ -1805,8 +1854,8 @@ vbdev_lvol_resize(struct spdk_lvol *lvol, uint64_t sz, spdk_lvol_op_complete cb_
 	req->cb_arg = cb_arg;
 	req->sz = sz;
 	req->lvol = lvol;
-
-	spdk_lvol_resize(req->lvol, req->sz, _vbdev_lvol_resize_cb, req);
+	req->rc = 0;
+	spdk_lvol_resize(req->lvol, req->sz, _vbdev_lvol_resize_leader_cb, req);
 }
 
 void

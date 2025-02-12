@@ -49,6 +49,7 @@ DEFINE_STUB_V(spdk_lvol_update_on_failover, (struct spdk_lvol_store *lvs, struct
 DEFINE_STUB_V(spdk_lvs_grow_live, (struct spdk_lvol_store *lvs,
 				   spdk_lvs_op_complete cb_fn, void *cb_arg));
 DEFINE_STUB_V(spdk_lvs_check_active_process, (struct spdk_lvol_store *lvs));
+DEFINE_STUB_V(spdk_lvol_resize_unfreeze, (struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg));
 DEFINE_STUB(spdk_bdev_get_memory_domains, int, (struct spdk_bdev *bdev,
 		struct spdk_memory_domain **domains, int array_size), 0);
 DEFINE_STUB(spdk_blob_get_esnap_id, int,

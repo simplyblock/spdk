@@ -55,6 +55,7 @@ struct spdk_lvol_req {
 	size_t			sz;
 	struct spdk_io_channel	*channel;
 	char			name[SPDK_LVOL_NAME_MAX];
+	int 	rc;
 };
 
 struct spdk_lvol_copy_req {
@@ -163,6 +164,7 @@ struct lvol_store_bdev *vbdev_lvol_store_next(struct lvol_store_bdev *prev);
 
 void spdk_lvol_resize(struct spdk_lvol *lvol, uint64_t sz, spdk_lvol_op_complete cb_fn,
 		      void *cb_arg);
+void spdk_lvol_resize_unfreeze(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg);
 void spdk_lvol_resize_register(struct spdk_lvol *lvol, uint64_t sz,
 		 spdk_lvol_op_complete cb_fn, void *cb_arg);
 

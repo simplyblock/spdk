@@ -9235,7 +9235,46 @@ bs_resize_freeze_cpl(void *cb_arg, int rc)
 
 	ctx->rc = blob_resize(ctx->blob, ctx->sz);
 
-	blob_unfreeze_io(ctx->blob, bs_resize_unfreeze_cpl, ctx);
+	ctx->cb_fn(ctx->cb_arg, rc);
+	free(ctx);
+
+	// blob_unfreeze_io(ctx->blob, bs_resize_unfreeze_cpl, ctx);
+}
+
+void
+spdk_blob_resize_unfreeze(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_bs_resize_ctx *ctx;
+
+	blob_verify_md_op(blob);
+
+	SPDK_DEBUGLOG(blob, "unfreeze on resizing blob 0x%" PRIx64 " to %" PRIu64 " clusters\n", blob->id);
+
+	// if (blob->md_ro) {
+	// 	cb_fn(cb_arg, -EPERM);
+	// 	return;
+	// }
+
+	// if (sz == blob->active.num_clusters) {
+	// 	cb_fn(cb_arg, 0);
+	// 	return;
+	// }
+
+	// if (blob->locked_operation_in_progress) {
+	// 	cb_fn(cb_arg, -EBUSY);
+	// 	return;
+	// }
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+	
+	ctx->cb_fn = cb_fn;
+	ctx->cb_arg = cb_arg;
+	ctx->blob = blob;
+	blob_unfreeze_io(ctx->blob, bs_resize_unfreeze_cpl, ctx);	
 }
 
 void

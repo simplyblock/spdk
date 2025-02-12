@@ -1642,6 +1642,25 @@ lvol_blob_resize_cb(void *cb_arg, int bserrno)
 }
 
 void
+spdk_lvol_resize_unfreeze(struct spdk_lvol *lvol,
+		 spdk_lvol_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_lvol_req *req;
+
+	req = calloc(1, sizeof(*req));
+	if (!req) {
+		SPDK_ERRLOG("Cannot alloc memory for lvol request pointer for unfreeze the lvol\n");
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+	req->lvol = lvol;
+
+	spdk_blob_resize_unfreeze(lvol->blob, lvol_resize_done, req);
+}
+
+void
 spdk_lvol_resize(struct spdk_lvol *lvol, uint64_t sz,
 		 spdk_lvol_op_complete cb_fn, void *cb_arg)
 {
