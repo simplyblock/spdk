@@ -5206,6 +5206,159 @@ bs_load_read_used_pages(struct spdk_bs_load_ctx *ctx)
 			     bs_load_used_pages_cpl, ctx);
 }
 
+static void
+bs_load_used_blobids_cpl_clean_mode(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct spdk_bs_load_ctx *ctx = cb_arg;
+	int rc;
+
+	/* The type must be correct */
+	assert(ctx->mask->type == SPDK_MD_MASK_TYPE_USED_BLOBIDS);
+
+	/* The length of the mask (in bits) must not be greater than
+	 * the length of the buffer (converted to bits) */
+	assert(ctx->mask->length <= (ctx->super->used_blobid_mask_len * SPDK_BS_PAGE_SIZE * 8));
+
+	/* The length of the mask must be exactly equal to the size
+	 * (in pages) of the metadata region */
+	assert(ctx->mask->length == ctx->super->md_len);
+
+	rc = spdk_bit_array_resize(&ctx->bs->used_blobids, ctx->mask->length);
+	if (rc < 0) {
+		spdk_free(ctx->mask);
+		bs_load_ctx_fail(ctx, rc);
+		return;
+	}
+
+	spdk_bit_array_load_mask(ctx->bs->used_blobids, ctx->mask->mask);
+	ctx->bs->used_clusters = spdk_bit_pool_create_from_array(ctx->used_clusters);
+	spdk_bs_iter_first_without_close(ctx->bs, bs_load_iter_without_close, ctx);
+	// bs_load_complete(ctx);
+}
+
+static void
+bs_load_used_clusters_cpl_clean_mode(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct spdk_bs_load_ctx *ctx = cb_arg;
+	uint64_t		lba, lba_count, mask_size;
+	int			rc;
+
+	if (bserrno != 0) {
+		bs_load_ctx_fail(ctx, bserrno);
+		return;
+	}
+
+	/* The type must be correct */
+	assert(ctx->mask->type == SPDK_MD_MASK_TYPE_USED_CLUSTERS);
+	/* The length of the mask (in bits) must not be greater than the length of the buffer (converted to bits) */
+	assert(ctx->mask->length <= (ctx->super->used_cluster_mask_len * sizeof(
+					     struct spdk_blob_md_page) * 8));
+	/*
+	 * The length of the mask must be equal to or larger than the total number of clusters. It may be
+	 * larger than the total number of clusters due to a failure spdk_bs_grow.
+	 */
+	assert(ctx->mask->length >= ctx->bs->total_clusters);
+	if (ctx->mask->length > ctx->bs->total_clusters) {
+		SPDK_WARNLOG("Shrink the used_custers mask length to total_clusters");
+		ctx->mask->length = ctx->bs->total_clusters;
+	}
+
+	rc = spdk_bit_array_resize(&ctx->used_clusters, ctx->mask->length);
+	if (rc < 0) {
+		spdk_free(ctx->mask);
+		bs_load_ctx_fail(ctx, rc);
+		return;
+	}
+
+	spdk_bit_array_load_mask(ctx->used_clusters, ctx->mask->mask);
+	ctx->bs->num_free_clusters = spdk_bit_array_count_clear(ctx->used_clusters);
+	assert(ctx->bs->num_free_clusters <= ctx->bs->total_clusters);
+
+	spdk_free(ctx->mask);
+
+	/* Read the used blobids mask */
+	mask_size = ctx->super->used_blobid_mask_len * SPDK_BS_PAGE_SIZE;
+	ctx->mask = spdk_zmalloc(mask_size, 0x1000, NULL, SPDK_ENV_SOCKET_ID_ANY,
+				 SPDK_MALLOC_DMA);
+	if (!ctx->mask) {
+		bs_load_ctx_fail(ctx, -ENOMEM);
+		return;
+	}
+	lba = bs_page_to_lba(ctx->bs, ctx->super->used_blobid_mask_start);
+	lba_count = bs_page_to_lba(ctx->bs, ctx->super->used_blobid_mask_len);
+	bs_sequence_read_dev(seq, ctx->mask, lba, lba_count,
+			     bs_load_used_blobids_cpl_clean_mode, ctx);
+}
+
+static void
+bs_load_used_pages_cpl_clean_mode(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct spdk_bs_load_ctx *ctx = cb_arg;
+	uint64_t		lba, lba_count, mask_size;
+	int			rc;
+
+	if (bserrno != 0) {
+		bs_load_ctx_fail(ctx, bserrno);
+		return;
+	}
+
+	/* The type must be correct */
+	assert(ctx->mask->type == SPDK_MD_MASK_TYPE_USED_PAGES);
+	/* The length of the mask (in bits) must not be greater than the length of the buffer (converted to bits) */
+	assert(ctx->mask->length <= (ctx->super->used_page_mask_len * SPDK_BS_PAGE_SIZE *
+				     8));
+	/* The length of the mask must be exactly equal to the size (in pages) of the metadata region */
+	if (ctx->mask->length != ctx->super->md_len) {
+		SPDK_ERRLOG("mismatched md_len in used_pages mask: "
+			    "mask->length=%" PRIu32 " super->md_len=%" PRIu32 "\n",
+			    ctx->mask->length, ctx->super->md_len);
+		assert(false);
+	}
+
+	rc = spdk_bit_array_resize(&ctx->bs->used_md_pages, ctx->mask->length);
+	if (rc < 0) {
+		spdk_free(ctx->mask);
+		bs_load_ctx_fail(ctx, rc);
+		return;
+	}
+
+	spdk_bit_array_load_mask(ctx->bs->used_md_pages, ctx->mask->mask);
+	spdk_free(ctx->mask);
+
+	/* Read the used clusters mask */
+	mask_size = ctx->super->used_cluster_mask_len * SPDK_BS_PAGE_SIZE;
+	ctx->mask = spdk_zmalloc(mask_size, 0x1000, NULL, SPDK_ENV_SOCKET_ID_ANY,
+				 SPDK_MALLOC_DMA);
+	if (!ctx->mask) {
+		bs_load_ctx_fail(ctx, -ENOMEM);
+		return;
+	}
+	lba = bs_page_to_lba(ctx->bs, ctx->super->used_cluster_mask_start);
+	lba_count = bs_page_to_lba(ctx->bs, ctx->super->used_cluster_mask_len);
+	bs_sequence_read_dev(seq, ctx->mask, lba, lba_count,
+			     bs_load_used_clusters_cpl_clean_mode, ctx);
+}
+
+static void
+bs_load_read_used_pages_clean_mode(struct spdk_bs_load_ctx *ctx)
+{
+	uint64_t lba, lba_count, mask_size;
+	SPDK_INFOLOG(blob, "Read the used metadata pages bit array to recover the blobstore.\n");
+	/* Read the used pages mask */
+	mask_size = ctx->super->used_page_mask_len * SPDK_BS_PAGE_SIZE;
+	ctx->mask = spdk_zmalloc(mask_size, 0x1000, NULL,
+				 SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+	if (!ctx->mask) {
+		bs_load_ctx_fail(ctx, -ENOMEM);
+		return;
+	}
+
+	lba = bs_page_to_lba(ctx->bs, ctx->super->used_page_mask_start);
+	lba_count = bs_page_to_lba(ctx->bs, ctx->super->used_page_mask_len);
+	bs_sequence_read_dev(ctx->seq, ctx->mask, lba, lba_count,
+			     bs_load_used_pages_cpl_clean_mode, ctx);
+}
+
 static int
 bs_load_replay_md_parse_page(struct spdk_bs_load_ctx *ctx, struct spdk_blob_md_page *page)
 {
@@ -5785,7 +5938,7 @@ bs_load_super_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		bs_load_read_only_used_pages(ctx);
 	} else {
 		SPDK_INFOLOG(blob, "Loading lvols from base dev with gracefully unload start\n");
-		bs_load_read_used_pages(ctx);
+		bs_load_read_used_pages_clean_mode(ctx);
 	}
 }
 
@@ -9248,7 +9401,7 @@ spdk_blob_resize_unfreeze(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, v
 
 	blob_verify_md_op(blob);
 
-	SPDK_DEBUGLOG(blob, "unfreeze on resizing blob 0x%" PRIx64 " to %" PRIu64 " clusters\n", blob->id);
+	SPDK_DEBUGLOG(blob, "unfreeze on resizing blob 0x%" PRIx64 " .\n", blob->id);
 
 	// if (blob->md_ro) {
 	// 	cb_fn(cb_arg, -EPERM);
