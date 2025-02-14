@@ -103,7 +103,7 @@ struct spdk_blob_list {
 
 // flush job for a snapshot backup operation
 struct t_flush_job {
-	char* buf; // dev page-sized I/O buffer
+	char* buf; // dev page-sized I/O buffer if not using internal distrib buffer pool optimization, else a fake, non-null pointer
 	uint64_t timeout_us; // timeout value of a flush request in microseconds
 	uint64_t start_ticks; // job start ticks to later use in microsecond computation
 	uint64_t cluster_idx;

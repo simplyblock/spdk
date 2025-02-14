@@ -10873,13 +10873,14 @@ static inline int8_t
 blob_do_flush_job(struct spdk_blob *blob, struct t_flush_job *job) {
 	SPDK_NOTICELOG("Beginning flush job, cluster_idx=%lu, dev page number=%d, status=%d\n", job->cluster_idx, job->dev_page_number, job->status);
 	++blob->nflush_jobs_current;
-	if (!job->buf) {
+	/*if (!job->buf) {
 		job->buf = spdk_malloc(blob->dev_page_size, 0, NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
 		if (!job->buf) {
 			job->status = FLUSH_IS_FAILED;
 			return -ENOMEM;
 		}
-	}
+	}*/
+	job->buf = (void*)4097;
 	struct spdk_bs_cpl cpl;
 	cpl.type = SPDK_BS_CPL_TYPE_BLOB_BASIC;
 	cpl.u.blob_basic.cb_fn = blob_flush_job_compl_cb;
@@ -11086,11 +11087,11 @@ _blob_get_snapshot_backup_status(void *ctx) {
 	{
 		spdk_put_io_channel(sctx->blob->backup_channel);
 		spdk_poller_unregister(&sctx->blob->backup_poller);
-		for (int i = 0; i < sctx->blob->nmax_flush_jobs; ++i) {
+		/*for (int i = 0; i < sctx->blob->nmax_flush_jobs; ++i) {
 			if (sctx->blob->flush_jobs[i].buf) {
 				spdk_free(sctx->blob->flush_jobs[i].buf);
 			}
-		}
+		}*/
 		free(sctx->blob->flush_jobs);
 		
 		sctx->blob->nflush_jobs_current = 0;
