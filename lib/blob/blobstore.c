@@ -9417,6 +9417,10 @@ spdk_blob_resize_unfreeze(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, v
 	// 	cb_fn(cb_arg, -EBUSY);
 	// 	return;
 	// }
+	if (blob->frozen_refcnt == 0) {
+		cb_fn(cb_arg, 0);
+		return;
+	}
 
 	ctx = calloc(1, sizeof(*ctx));
 	if (!ctx) {

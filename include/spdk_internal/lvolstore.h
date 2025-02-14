@@ -50,6 +50,7 @@ struct spdk_lvol_req {
 	spdk_lvol_op_complete   cb_fn;
 	void                    *cb_arg;
 	struct spdk_lvol	*lvol;
+	struct spdk_poller *poller;
 	/* Only set while lvol is being deleted and has a clone. */
 	struct spdk_lvol	*clone_lvol;
 	size_t			sz;
