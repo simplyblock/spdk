@@ -2750,14 +2750,14 @@ block_port(int port) {
     		port, port, port, port);
 
 
-		SPDK_NOTICELOG("Command for blocking the port is %s.\n", command);
+		// SPDK_NOTICELOG("Command for blocking the port is %s.\n", command);
 		// Execute the command
 		int result = system(command);
 
 		if (result != 0) {
 			SPDK_ERRLOG("Error executing iptables command.\n");
 		} else {			
-			SPDK_NOTICELOG("Port %d has been rejected successfully.\n", port);
+			SPDK_NOTICELOG("Port %d has been droped successfully.\n", port);
 		}
 	}
 }
@@ -2850,7 +2850,7 @@ spdk_lvs_set_op(struct spdk_lvol_store *lvs, uint64_t groupid, uint64_t port)
 }
 
 void
-spdk_lvs_check_active_process(struct spdk_lvol_store *lvs)
+spdk_lvs_check_active_process(struct spdk_lvol_store *lvs, struct spdk_lvol *lvol, uint8_t type)
 {
 	struct spdk_lvs_req *req;
 
@@ -2872,7 +2872,7 @@ spdk_lvs_check_active_process(struct spdk_lvol_store *lvs)
 		lvs->trigger_leader_sent = false;
 		lvs->retry_on_update++;
 		spdk_bs_set_leader(lvs->blobstore, true);
-		SPDK_NOTICELOG("Lvolstore failover set poller.\n");
+		SPDK_NOTICELOG("Lvolstore failover set poller - trigger refresh: %" PRIu64 " t %d \n", lvol->blob_id, type);
 		req->poller = spdk_poller_register(spdk_lvs_update_on_failover_poller, req, 250000); // Delay of 250ms
 	}
 

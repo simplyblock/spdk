@@ -306,7 +306,7 @@ struct spdk_lvol *spdk_lvol_get_by_uuid(const struct spdk_uuid *uuid);
 void spdk_lvol_update_on_failover(struct spdk_lvol_store *lvs, struct spdk_lvol *lvol, bool send_md_thread);
 void lvol_update_on_failover(struct spdk_lvol_store *lvs, struct spdk_lvol *lvol, bool send_msg);
 void spdk_lvs_update_on_failover(struct spdk_lvol_store *lvs);
-void spdk_lvs_check_active_process(struct spdk_lvol_store *lvs);
+void spdk_lvs_check_active_process(struct spdk_lvol_store *lvs, struct spdk_lvol *lvol, uint8_t type);
 bool spdk_lvs_nonleader_timeout(struct spdk_lvol_store *lvs);
 void spdk_lvs_change_leader_state(uint64_t groupid);
 bool spdk_lvs_trigger_leadership_switch(uint64_t *groupid);

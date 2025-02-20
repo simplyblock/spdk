@@ -1074,6 +1074,17 @@ vbdev_lvol_io_type_supported(void *ctx, enum spdk_bdev_io_type io_type)
 	}
 }
 
+static bool 
+check_IO_type(enum spdk_bdev_io_type type) {
+	if (type == SPDK_BDEV_IO_TYPE_READ  || 
+		type == SPDK_BDEV_IO_TYPE_WRITE || 
+		type == SPDK_BDEV_IO_TYPE_UNMAP || 
+		type == SPDK_BDEV_IO_TYPE_WRITE_ZEROES) {
+		return true;
+	}
+	return false;
+}
+
 static void
 lvol_op_comp(void *cb_arg, int bserrno)
 {
@@ -1205,38 +1216,34 @@ vbdev_lvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_
 
 	if (!lvs->leader) {
 		if (spdk_lvs_nonleader_timeout(lvs)) {
-			SPDK_NOTICELOG("FAILED IO-TO change leader - blob: %" PRIu64 "  "
-							"Lba: %" PRIu64 "  Cnt %" PRIu64 "  t %d \n",
-		 					lvol->blob_id, bdev_io->u.bdev.offset_blocks,
-							bdev_io->u.bdev.num_blocks, bdev_io->type);
+			if (check_IO_type(bdev_io->type)) {
+				SPDK_NOTICELOG("FAILED IO-TO change leader - blob: %" PRIu64 "  "
+								"Lba: %" PRIu64 "  Cnt %" PRIu64 "  t %d \n",
+								lvol->blob_id, bdev_io->u.bdev.offset_blocks,
+								bdev_io->u.bdev.num_blocks, bdev_io->type);
+			}
 			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 			return;
 		}
 
-		if (!lvs->update_in_progress) {
-			SPDK_NOTICELOG("Frist IO - trigger refresh: %" PRIu64 "  Lba: %" PRIu64 "  Cnt %" PRIu64 "  t %d \n",
-		 				lvol->blob_id, bdev_io->u.bdev.offset_blocks, bdev_io->u.bdev.num_blocks, bdev_io->type);
-			if (bdev_io->type == SPDK_BDEV_IO_TYPE_READ || 
-				bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE || 
-				bdev_io->type == SPDK_BDEV_IO_TYPE_UNMAP || 
-				bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE_ZEROES) {
-				spdk_lvs_check_active_process(lvs);			
+		if (!lvs->update_in_progress) {			
+			if (check_IO_type(bdev_io->type)) {
+				spdk_lvs_check_active_process(lvs, lvol, (uint8_t)bdev_io->type);
 			}
 		}
 	}
 
 	if (!lvol->leader && !lvol->update_in_progress) {
-		if (bdev_io->type == SPDK_BDEV_IO_TYPE_READ || 
-			bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE || 
-			bdev_io->type == SPDK_BDEV_IO_TYPE_UNMAP || 
-			bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE_ZEROES) {
+		if (check_IO_type(bdev_io->type)) {
 			spdk_lvol_update_on_failover(lvs, lvol, true);
 		}
 	}
 
 	if (lvol->failed_on_update || lvs->failed_on_update) {
-		SPDK_NOTICELOG("FAILED IO - update failed blob: %" PRIu64 "  Lba: %" PRIu64 "  Cnt %" PRIu64 "  t %d \n",
+		if (check_IO_type(bdev_io->type)) {
+			SPDK_NOTICELOG("FAILED IO - update failed blob: %" PRIu64 "  Lba: %" PRIu64 "  Cnt %" PRIu64 "  t %d \n",
 		 				lvol->blob_id, bdev_io->u.bdev.offset_blocks, bdev_io->u.bdev.num_blocks, bdev_io->type);
+		}
 		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 		return;
 	}
@@ -1266,8 +1273,6 @@ vbdev_lvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_
 		break;
 	default:
 		SPDK_INFOLOG(vbdev_lvol, "lvol: unsupported I/O type %d\n", bdev_io->type);
-		SPDK_NOTICELOG("FAILED IO OP in blob: %" PRIu64 "  LBA: %" PRIu64 "  CNT %" PRIu64 "  type is %d \n", 
-				lvol->blob_id, bdev_io->u.bdev.offset_blocks, bdev_io->u.bdev.num_blocks, bdev_io->type);
 		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 		return;
 	}
