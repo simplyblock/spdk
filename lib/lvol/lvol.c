@@ -2740,10 +2740,16 @@ spdk_lvs_nonleader_timeout(struct spdk_lvol_store *lvs)
 
 static void 
 block_port(int port) {
-    // Construct the iptables command dynamically based on the input port
-    char command[256];
+    // Construct the iptables command dynamically based on the input port    
 	if (port != 0) {
-		snprintf(command, sizeof(command), "sudo iptables -A INPUT -p tcp --dport %d -j DROP && sudo iptables -A OUTPUT -p tcp --dport %d -j DROP", port, port);
+		char command[500];
+		// snprintf(command, sizeof(command), "sudo iptables -A INPUT -p tcp --dport %d -j DROP && sudo iptables -A OUTPUT -p tcp --dport %d -j DROP", port, port);
+		snprintf(command, sizeof(command),
+    		"sudo iptables -C INPUT -p tcp --dport %d -j DROP 2>/dev/null || sudo iptables -A INPUT -p tcp --dport %d -j DROP; "
+    		"sudo iptables -C OUTPUT -p tcp --dport %d -j DROP 2>/dev/null || sudo iptables -A OUTPUT -p tcp --dport %d -j DROP",
+    		port, port, port, port);
+
+
 		SPDK_NOTICELOG("Command for blocking the port is %s.\n", command);
 		// Execute the command
 		int result = system(command);

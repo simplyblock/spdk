@@ -1214,12 +1214,24 @@ vbdev_lvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_
 		}
 
 		if (!lvs->update_in_progress) {
-			spdk_lvs_check_active_process(lvs);			
+			SPDK_NOTICELOG("Frist IO - trigger refresh: %" PRIu64 "  Lba: %" PRIu64 "  Cnt %" PRIu64 "  t %d \n",
+		 				lvol->blob_id, bdev_io->u.bdev.offset_blocks, bdev_io->u.bdev.num_blocks, bdev_io->type);
+			if (bdev_io->type == SPDK_BDEV_IO_TYPE_READ || 
+				bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE || 
+				bdev_io->type == SPDK_BDEV_IO_TYPE_UNMAP || 
+				bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE_ZEROES) {
+				spdk_lvs_check_active_process(lvs);			
+			}
 		}
 	}
 
 	if (!lvol->leader && !lvol->update_in_progress) {
-		spdk_lvol_update_on_failover(lvs, lvol, true);
+		if (bdev_io->type == SPDK_BDEV_IO_TYPE_READ || 
+			bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE || 
+			bdev_io->type == SPDK_BDEV_IO_TYPE_UNMAP || 
+			bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE_ZEROES) {
+			spdk_lvol_update_on_failover(lvs, lvol, true);
+		}
 	}
 
 	if (lvol->failed_on_update || lvs->failed_on_update) {
