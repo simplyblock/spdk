@@ -5853,7 +5853,7 @@ bs_parse_super(struct spdk_bs_load_ctx *ctx)
 		ctx->super->io_unit_size = SPDK_BS_PAGE_SIZE;
 	}
 
-	ctx->bs->clean = 1;
+	ctx->bs->clean = 0;
 	ctx->bs->cluster_sz = ctx->super->cluster_size;
 	ctx->bs->total_clusters = ctx->super->size / ctx->super->cluster_size;
 	ctx->bs->pages_per_cluster = ctx->bs->cluster_sz / SPDK_BS_PAGE_SIZE;
@@ -12597,6 +12597,7 @@ bs_update_replay_md_parse_page(struct spdk_bs_update_ctx *ctx, struct spdk_blob_
 
 			if (desc_extent->length <= sizeof(desc_extent->start_cluster_idx) ||
 			    (cluster_idx_length % sizeof(desc_extent->cluster_idx[0]) != 0)) {
+				SPDK_ERRLOG("Extent page has an incorrect length.\n");
 				return -EINVAL;
 			}
 
@@ -12609,10 +12610,12 @@ bs_update_replay_md_parse_page(struct spdk_bs_update_ctx *ctx, struct spdk_blob_
 				if (cluster_idx != 0) {
 					if (cluster_idx < desc_extent->start_cluster_idx &&
 					    cluster_idx >= desc_extent->start_cluster_idx + cluster_count) {
+						SPDK_ERRLOG("The cluster in the extent page is not valid.\n");
 						return -EINVAL;
 					}
 					spdk_bit_array_set(ctx->used_clusters, cluster_idx);
 					if (bs->num_free_clusters == 0) {
+						SPDK_ERRLOG("No free clusters in the bit array.\n");
 						return -ENOSPC;
 					}
 					bs->num_free_clusters--;
@@ -12621,6 +12624,7 @@ bs_update_replay_md_parse_page(struct spdk_bs_update_ctx *ctx, struct spdk_blob_
 			}
 
 			if (cluster_count == 0) {
+				SPDK_ERRLOG("Extent page has no clusters.\n");
 				return -EINVAL;
 			}
 		} else if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_XATTR) {
@@ -12921,13 +12925,15 @@ bs_update_replay_extent_page_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bser
 		/* Extent pages are only read when present within in chain md.
 		 * Integrity of md is not right if that page was not a valid extent page. */
 		if (bs_load_cur_extent_page_valid(&ctx->extent_pages[i]) != true) {
+			SPDK_ERRLOG("Extent page is not valid.\n");
 			bs_update_live_done(ctx, -EILSEQ);
 			return;
 		}
 
 		page_num = ctx->extent_page_num[i];
 		spdk_bit_array_set(ctx->used_md_pages, page_num);
-		if (bs_update_replay_md_parse_page(ctx, &ctx->extent_pages[i])) {		
+		if (bs_update_replay_md_parse_page(ctx, &ctx->extent_pages[i])) {
+			SPDK_ERRLOG("Extent page parsing encountered an error.\n");
 			bs_update_live_done(ctx, -EILSEQ);
 			return;
 		}
@@ -12953,6 +12959,7 @@ bs_update_replay_extent_pages(struct spdk_bs_update_ctx *ctx)
 	ctx->extent_pages = spdk_zmalloc(SPDK_BS_PAGE_SIZE * ctx->num_extent_pages, 0,
 					 NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
 	if (!ctx->extent_pages) {
+		SPDK_ERRLOG("Could not allocate buffer for reading the extent pages.\n");
 		bs_update_live_done(ctx, -ENOMEM);
 		return;
 	}

@@ -2743,15 +2743,14 @@ block_port(int port) {
     // Construct the iptables command dynamically based on the input port
     char command[256];
 	if (port != 0) {
-		// snprintf(command, sizeof(command), "sudo iptables -A INPUT -p tcp --dport %d -j REJECT", port);
-		snprintf(command, sizeof(command), "sudo iptables -A INPUT -p tcp --dport %d -j REJECT && sudo iptables -A OUTPUT -p tcp --dport %d -j REJECT", port, port);
+		snprintf(command, sizeof(command), "sudo iptables -A INPUT -p tcp --dport %d -j DROP && sudo iptables -A OUTPUT -p tcp --dport %d -j DROP", port, port);
 		SPDK_NOTICELOG("Command for blocking the port is %s.\n", command);
 		// Execute the command
 		int result = system(command);
 
-		if (result == -1) {
+		if (result != 0) {
 			SPDK_ERRLOG("Error executing iptables command.\n");
-		} else {
+		} else {			
 			SPDK_NOTICELOG("Port %d has been rejected successfully.\n", port);
 		}
 	}
