@@ -7231,7 +7231,10 @@ spdk_bs_init_persistent(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 		cb_fn(cb_arg, NULL, -ENOMEM);
 		return;
 	}
-	bs_init_trim_cpl(seq, ctx, 0);
+
+	spdk_bs_batch_t *batch = bs_sequence_to_batch(seq, bs_init_trim_cpl, ctx);
+
+	bs_batch_close(batch);
 }
 
 /* END spdk_bs_init */
