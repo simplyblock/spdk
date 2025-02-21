@@ -7061,6 +7061,8 @@ spdk_bs_init_persistent(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	struct spdk_blob_store	*bs;
 	struct spdk_bs_cpl	cpl;
 	spdk_bs_sequence_t	*seq;
+	spdk_bs_batch_t		*batch;
+	uint64_t		num_md_lba;
 	uint64_t		num_md_pages;
 	uint64_t		num_md_clusters;
 	uint64_t		max_used_cluster_mask_len;
@@ -7194,6 +7196,8 @@ spdk_bs_init_persistent(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	ctx->super->md_len = bs->md_len;
 	num_md_pages += bs->md_len;
 
+	num_md_lba = bs_page_to_lba(bs, num_md_pages);
+
 	ctx->super->size = dev->blockcnt * dev->blocklen;
 
 	ctx->super->crc = blob_md_page_calc_crc(ctx->super);
@@ -7218,6 +7222,15 @@ spdk_bs_init_persistent(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	bs->num_free_clusters -= num_md_clusters;
 	bs->total_data_clusters = bs->num_free_clusters;
 
+	bs->used_page_mask_start = ctx->super->used_page_mask_start;
+	bs->used_page_mask_len = ctx->super->used_page_mask_len;
+
+	bs->used_blobid_mask_start = ctx->super->used_blobid_mask_start;
+	bs->used_blobid_mask_len = ctx->super->used_blobid_mask_len;
+
+	bs->used_cluster_mask_start = ctx->super->used_cluster_mask_start;
+	bs->used_cluster_mask_len = ctx->super->used_cluster_mask_len;
+
 	cpl.type = SPDK_BS_CPL_TYPE_BS_HANDLE;
 	cpl.u.bs_handle.cb_fn = cb_fn;
 	cpl.u.bs_handle.cb_arg = cb_arg;
@@ -7232,7 +7245,10 @@ spdk_bs_init_persistent(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 		return;
 	}
 
-	spdk_bs_batch_t *batch = bs_sequence_to_batch(seq, bs_init_trim_cpl, ctx);
+	batch = bs_sequence_to_batch(seq, bs_init_trim_cpl, ctx);
+
+	/* Clear metadata space */
+	bs_batch_write_zeroes_dev(batch, 0, num_md_lba);
 
 	bs_batch_close(batch);
 }
