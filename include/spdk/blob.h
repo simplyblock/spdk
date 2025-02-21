@@ -1043,7 +1043,7 @@ int spdk_blob_set_read_only(struct spdk_blob *blob);
  * \param cb_fn Called when the operation is complete.
  * \param cb_arg Argument passed to function cb_fn.
  */
-int spdk_blob_sync_md(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
+void spdk_blob_sync_md(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
 
 /**
  * Close a blob. This will automatically sync.
