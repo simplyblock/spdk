@@ -441,7 +441,7 @@ bs_batch_completion(struct spdk_io_channel *_channel,
 	struct spdk_bs_channel		*channel = set->channel;
 	struct limit *ctx;
 	set->u.batch.outstanding_ops--;
-	if (bserrno != 0) {
+	if (bserrno != 0) {		
 		set->bserrno = bserrno;
 	}
 
@@ -469,8 +469,13 @@ bs_batch_completion(struct spdk_io_channel *_channel,
 				meta_lba |= TIERED_IO_MASK;
 			}
 
-			channel->dev->unmap(channel->dev, channel->dev_channel, meta_lba, ctx->lba_count,
-					&set->cb_args);
+			if (spdk_likely(channel->bs->is_leader)) {
+				channel->dev->unmap(channel->dev, channel->dev_channel, meta_lba, ctx->lba_count,
+						&set->cb_args);
+			} else {
+				SPDK_NOTICELOG("The unmap IO return with EIO error due to leader.\n");
+				bs_batch_completion(_channel, set->cb_args.cb_arg, -EIO);
+			}
 			free(ctx);
 		}
 	}	
@@ -675,8 +680,13 @@ out:
 		meta_lba |= TIERED_IO_MASK;
 	}
 
-	channel->dev->unmap(channel->dev, channel->dev_channel, meta_lba, lba_count,
-			    &set->cb_args);
+	if (spdk_likely(channel->bs->is_leader)) {
+		channel->dev->unmap(channel->dev, channel->dev_channel, meta_lba, lba_count,
+					&set->cb_args);
+	} else {
+		SPDK_NOTICELOG("The unmap IO return with EIO error due to leader 1.\n");
+		bs_batch_completion(set->cb_args.channel, set->cb_args.cb_arg, -EIO);
+	}
 }
 
 void
@@ -687,10 +697,14 @@ bs_batch_write_zeroes_dev(spdk_bs_batch_t *batch,
 	struct spdk_bs_channel		*channel = set->channel;
 
 	SPDK_DEBUGLOG(blob_rw, "Zeroing %" PRIu64 " blocks at LBA %" PRIu64 "\n", lba_count, lba);
-
 	set->u.batch.outstanding_ops++;
-	channel->dev->write_zeroes(channel->dev, channel->dev_channel, lba, lba_count,
-				   &set->cb_args);
+	if (spdk_likely(channel->bs->is_leader)) {
+		channel->dev->write_zeroes(channel->dev, channel->dev_channel, lba, lba_count,
+				   	&set->cb_args);
+	} else {
+		SPDK_NOTICELOG("The write zero IO return with EIO error due to leader.\n");
+		bs_batch_completion(set->cb_args.channel, set->cb_args.cb_arg, -EIO);
+	}
 }
 
 void
@@ -771,7 +785,7 @@ bs_user_op_execute(spdk_bs_user_op_t *op)
 	set = (struct spdk_bs_request_set *)op;
 	args = &set->u.user_op;
 	ch = spdk_io_channel_from_ctx(set->channel);
-
+	// SPDK_NOTICELOG("IO OP blocks at LBA: %" PRIu64 " blocks CNT %" PRIu64 " and the type is %d \n", args->offset, args->length, args->type);
 	switch (args->type) {
 	case SPDK_BLOB_READ:
 		spdk_blob_io_read(args->blob, ch, args->payload, args->offset, args->length,

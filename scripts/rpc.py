@@ -2040,6 +2040,45 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('-l', '--lvs-name', help='lvol store name')
     p.set_defaults(func=bdev_lvol_grow_lvstore)
 
+    def bdev_lvol_update_lvstore(args):
+        print_dict(rpc.lvol.bdev_lvol_update_lvstore(args.client,
+                                                   uuid=args.uuid,
+                                                   lvs_name=args.lvs_name))
+
+    p = subparsers.add_parser('bdev_lvol_update_lvstore',
+                              help='Update the lvstore on the secondary node')
+    p.add_argument('-u', '--uuid', help='lvol store UUID')
+    p.add_argument('-l', '--lvs-name', help='lvol store name')
+    p.set_defaults(func=bdev_lvol_update_lvstore)
+    
+    # def bdev_lvol_set_leader_all(args):
+    #     print_dict(rpc.lvol.bdev_lvol_set_leader_all(args.client,
+    #                                                uuid=args.uuid,
+    #                                                lvs_name=args.lvs_name,
+    #                                                lvs_leadership=args.lvs_leadership,
+    #                                                bs_nonleadership=args.bs_nonleadership))
+
+    # p = subparsers.add_parser('bdev_lvol_set_leader_all',
+    #                           help='Change leadership state for lvstore and lvols')
+    # p.add_argument('-l', '--lvs-leadership', action='store_true', help='Leadership state for lvolstore level, default False')
+    # p.add_argument('-b', '--bs-nonleadership', action='store_true', help='Leadership state for blobstore level, default False')
+    # p.add_argument('-u', '--uuid', help='lvol store UUID')
+    # p.add_argument('-s', '--lvs-name', help='lvol store name')
+    # p.set_defaults(func=bdev_lvol_set_leader_all)
+    def bdev_lvol_set_leader_all(args):
+        print_dict(rpc.lvol.bdev_lvol_set_leader_all(args.client,
+                                                   uuid=args.uuid,
+                                                   lvs_name=args.lvs_name,
+                                                   leadership=args.leadership))
+
+    p = subparsers.add_parser('bdev_lvol_set_leader_all',
+                              help='Change leadership state for lvstore and lvols')
+    p.add_argument('-l', '--leadership', action='store_true', help='Leadership state for lvolstore level, default False')
+    # p.add_argument('-b', '--bs-nonleadership', action='store_true', help='Leadership state for blobstore level, default False')
+    p.add_argument('-u', '--uuid', help='lvol store UUID')
+    p.add_argument('-s', '--lvs-name', help='lvol store name')
+    p.set_defaults(func=bdev_lvol_set_leader_all)
+
     def bdev_lvol_create(args):
         print_json(rpc.lvol.bdev_lvol_create(args.client,
                                              lvol_name=args.lvol_name,
@@ -2071,6 +2110,29 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('pure_flush_or_evict', help='whether a tiered write should be pure flush (mode 1) or eviction (mode 0)', type=int)
     p.add_argument('untier_blob_md', help="For blob-specific metadata: 1 means this blob' md should in fact be untiered (even if lvolstore md is tiered), 2 means this blob's md should be tiered even if lvolstore md is untiered, and 0 (default) means this blob's md has the same tiering status as lvolstore md", type=int)
     p.set_defaults(func=bdev_lvol_create)
+    
+    def bdev_lvol_register(args):
+        print_json(rpc.lvol.bdev_lvol_register(args.client,
+                                             lvol_name=args.lvol_name,
+                                             registered_uuid=args.registered_uuid,
+                                             blobid=args.blobid,
+                                             thin_provision=args.thin_provision,
+                                             clear_method=args.clear_method,
+                                             uuid=args.uuid,
+                                             lvs_name=args.lvs_name,
+                                             lvol_priority_class=args.priority_class))
+
+    p = subparsers.add_parser('bdev_lvol_register', help='Register bdev with an logical volume backend for secondary node')
+    p.add_argument('-u', '--uuid', help='lvol store UUID')
+    p.add_argument('-l', '--lvs-name', help='lvol store name')
+    p.add_argument('-t', '--thin-provision', action='store_true', help='create lvol bdev as thin provisioned')
+    p.add_argument('-c', '--clear-method', help="""Change default data clusters clear method.
+        Available: none, unmap, write_zeroes""")
+    p.add_argument('lvol_name', help='name for this lvol')
+    p.add_argument('-r', '--registered-uuid', help='registered lvol UUID')
+    p.add_argument('-b', '--blobid', help='blob id page for registered lvol', type=int)    
+    p.add_argument('-p','--priority-class', help='integer I/O priority class for this lvol in the range [0, 15], default 0', type=int, default=0, required=False)
+    p.set_defaults(func=bdev_lvol_register)
     
     def bdev_lvs_dump(args):
         print_json(rpc.lvol.bdev_lvs_dump(args.client,
@@ -2149,6 +2211,34 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('snapshot_name', help='lvol snapshot name')
     p.add_argument('clone_name', help='lvol clone name')
     p.set_defaults(func=bdev_lvol_clone)
+    
+    def bdev_lvol_snapshot_register(args):
+        print_json(rpc.lvol.bdev_lvol_snapshot_register(args.client,
+                                               lvol_name=args.lvol_name,
+                                               snapshot_name=args.snapshot_name,
+                                               registered_uuid=args.registered_uuid,
+                                               blobid=args.blobid))
+
+    p = subparsers.add_parser('bdev_lvol_snapshot_register', help='Register a snapshot of an lvol bdev')
+    p.add_argument('lvol_name', help='lvol bdev name')
+    p.add_argument('snapshot_name', help='lvol snapshot name')
+    p.add_argument('-r', '--registered-uuid', help='registered lvol UUID')
+    p.add_argument('-b', '--blobid', help='blob id page for registered lvol', type=int)    
+    p.set_defaults(func=bdev_lvol_snapshot_register)
+
+    def bdev_lvol_clone_register(args):
+        print_json(rpc.lvol.bdev_lvol_clone_register(args.client,
+                                            snapshot_name=args.snapshot_name,
+                                            clone_name=args.clone_name,
+                                            registered_uuid=args.registered_uuid,
+                                            blobid=args.blobid))
+
+    p = subparsers.add_parser('bdev_lvol_clone_register', help='Register a clone of an lvol snapshot')
+    p.add_argument('snapshot_name', help='lvol snapshot name')
+    p.add_argument('clone_name', help='lvol clone name')
+    p.add_argument('-r', '--registered-uuid', help='registered lvol UUID')
+    p.add_argument('-b', '--blobid', help='blob id page for registered lvol', type=int)    
+    p.set_defaults(func=bdev_lvol_clone_register)
 
     def bdev_lvol_clone_bdev(args):
         print_json(rpc.lvol.bdev_lvol_clone_bdev(args.client,
@@ -2280,6 +2370,20 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('-u', '--uuid', help='lvol store UUID')
     p.add_argument('-l', '--lvs-name', help='lvol store name')
     p.set_defaults(func=bdev_lvol_get_lvstores)
+    
+    def bdev_lvol_set_lvs_op(args):
+        print_dict(rpc.lvol.bdev_lvol_set_lvs_op(args.client,
+                                                   uuid=args.uuid,
+                                                   lvs_name=args.lvs_name,
+                                                   groupid=args.groupid,
+                                                   subsystem_port=args.subsystem_port))
+
+    p = subparsers.add_parser('bdev_lvol_set_lvs_op', help='Set options for lvolstore')
+    p.add_argument('-u', '--uuid', help='lvol store UUID')
+    p.add_argument('-l', '--lvs-name', help='lvol store name')
+    p.add_argument('-i', '--groupid', help='lvol store group id', type=int)
+    p.add_argument('-p', '--subsystem-port', help='lvols subsystem port', type=int)
+    p.set_defaults(func=bdev_lvol_set_lvs_op)
 
     def bdev_lvol_get_lvols(args):
         print_dict(rpc.lvol.bdev_lvol_get_lvols(args.client,

@@ -394,6 +394,9 @@ raid_bdev_free(struct raid_bdev *raid_bdev)
 	raid_bdev_free_superblock(raid_bdev);
 	free(raid_bdev->base_bdev_info);
 	free(raid_bdev->bdev.name);
+	if (raid_bdev->level == RAID0) {
+		spdk_spin_destroy(&raid_bdev->used_lock);
+	}
 	free(raid_bdev);
 }
 
@@ -780,6 +783,10 @@ raid_bdev_io_complete(struct raid_bdev_io *raid_io, enum spdk_bdev_io_status sta
 			if (rc != 0) {
 				status = SPDK_BDEV_IO_STATUS_FAILED;
 			}
+		}
+
+		if (status == SPDK_BDEV_IO_STATUS_FAILED) {
+			SPDK_NOTICELOG("FAILED in proccess IO RAID.\n");	
 		}
 		spdk_bdev_io_complete(bdev_io, status);
 	}

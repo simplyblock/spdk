@@ -43,6 +43,9 @@ int vbdev_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz
 			  int8_t lvol_priority_class, uint8_t tiering_info,
 		      spdk_lvol_op_with_handle_complete cb_fn,
 		      void *cb_arg);
+int vbdev_lvol_register(struct spdk_lvol_store *lvs, const char *name, const char *registered_uuid, 
+			  uint64_t blobid, bool thin_provision, enum lvol_clear_method clear_method, 
+			  int8_t lvol_priority_class, spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
 
 int vbdev_lvol_recover(struct spdk_lvol_store *lvs, const char *orig_name, const char *orig_uuid, enum lvol_clear_method clear_method, 
 spdk_blob_id id_to_recover, spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
@@ -53,6 +56,9 @@ int vbdev_lvs_dump(struct spdk_lvol_store *lvs, const char *file,
 
 void vbdev_lvol_create_snapshot(struct spdk_lvol *lvol, const char *snapshot_name, uint8_t lvol_priority_class, uint8_t tiering_info,
 				spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
+void
+vbdev_lvol_update_snapshot_clone(struct spdk_lvol *lvol, struct spdk_lvol *origlvol,
+			   bool clone, spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
 
 void vbdev_lvol_create_clone(struct spdk_lvol *lvol, const char *clone_name, uint8_t lvol_priority_class, uint8_t tiering_info,
 			     spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
@@ -70,6 +76,8 @@ void vbdev_lvol_create_bdev_clone(const char *esnap_uuid,
  */
 void vbdev_lvol_resize(struct spdk_lvol *lvol, uint64_t sz, spdk_lvol_op_complete cb_fn,
 		       void *cb_arg);
+void vbdev_lvol_resize_register(struct spdk_lvol *lvol, uint64_t sz, spdk_lvol_op_complete cb_fn,
+ 					void *cb_arg);
 
 /**
  * \brief Mark lvol as read only
@@ -88,7 +96,7 @@ void vbdev_lvol_rename(struct spdk_lvol *lvol, const char *new_lvol_name,
  * \param cb_fn Completion callback
  * \param cb_arg Completion callback custom arguments
  */
-void vbdev_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg);
+void vbdev_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg, bool is_async);
 
 /**
  * \brief Renames given lvolstore.

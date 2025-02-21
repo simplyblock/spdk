@@ -92,6 +92,12 @@ enum spdk_blob_state {
 	SPDK_BLOB_STATE_LOADING,
 };
 
+enum spdk_blob_load_status {
+	SPDK_BLOB_UPDATE_NORMAL,
+	SPDK_BLOB_UPDATE_LIVE,
+	SPDK_BLOB_UPDATE_FAILOVER,
+};
+
 TAILQ_HEAD(spdk_xattr_tailq, spdk_xattr);
 
 struct spdk_blob_list {
@@ -122,7 +128,7 @@ struct spdk_blob {
 	bool is_recovery;
 	int priority_class; // to save the lvol's priority class across cluster allocations
 	uint8_t tiering_bits; // storage tiering bitmask
-
+	bool  failed_on_update;
 	uint32_t	open_ref;
 
 	spdk_blob_id	id;
@@ -207,6 +213,15 @@ struct spdk_blob_store {
 	uint64_t			md_start; /* Offset from beginning of disk, in pages */
 	uint32_t			md_len; /* Count, in pages */
 
+	uint32_t	used_page_mask_start; /* Offset from beginning of disk, in pages */
+	uint32_t	used_page_mask_len; /* Count, in pages */
+
+	uint32_t	used_cluster_mask_start; /* Offset from beginning of disk, in pages */
+	uint32_t	used_cluster_mask_len; /* Count, in pages */
+
+	uint32_t	used_blobid_mask_start; /* Offset from beginning of disk, in pages */
+	uint32_t	used_blobid_mask_len; /* Count, in pages */
+
 	struct spdk_io_channel		*md_channel;
 	uint32_t			max_channel_ops;
 
@@ -246,6 +261,10 @@ struct spdk_blob_store {
 	TAILQ_HEAD(, spdk_blob_list)	snapshots;
 
 	bool				clean;
+	/* True if the node is a leader, false otherwise.
+	 * Only when the distrib internal force state changes, it will be set to false.
+	 */
+	bool				is_leader;
 
 	spdk_bs_esnap_dev_create	esnap_bs_dev_create;
 	void				*esnap_ctx;
@@ -443,7 +462,14 @@ struct spdk_blob_md_page {
 	uint32_t	next;
 	uint32_t	crc;
 };
+
+struct spdk_bit_page {	
+	uint8_t		descriptors[4096];
+};
+
 #define SPDK_BS_PAGE_SIZE 0x1000
+#define SPDK_BS_PAGE_SIZE_INBIT  (SPDK_BS_PAGE_SIZE * 8)
+#define SPDK_BS_MD_STRUCT_INBIT  (sizeof(struct spdk_bs_md_mask) * 8)
 SPDK_STATIC_ASSERT(SPDK_BS_PAGE_SIZE == sizeof(struct spdk_blob_md_page), "Invalid md page size");
 
 #define SPDK_BS_MAX_DESC_SIZE SPDK_SIZEOF_MEMBER(struct spdk_blob_md_page, descriptors)

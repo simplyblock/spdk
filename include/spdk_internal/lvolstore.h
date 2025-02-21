@@ -24,6 +24,17 @@ struct spdk_lvs_req {
 	spdk_lvs_op_complete    cb_fn;
 	void                    *cb_arg;
 	struct spdk_lvol_store		*lvol_store;
+	struct spdk_poller *poller;
+	int				lvserrno;
+};
+
+struct spdk_lvol_update_on_failover_req {
+	// spdk_lvs_op_complete    cb_fn_lvs;
+	// void                    *cb_arg_lvs;		
+	spdk_lvol_op_complete   cb_fn;
+	void                    *cb_arg;
+	struct spdk_lvol_store		*lvol_store;
+	struct spdk_lvol		*lvol;
 	int				lvserrno;
 };
 
@@ -39,11 +50,13 @@ struct spdk_lvol_req {
 	spdk_lvol_op_complete   cb_fn;
 	void                    *cb_arg;
 	struct spdk_lvol	*lvol;
+	struct spdk_poller *poller;
 	/* Only set while lvol is being deleted and has a clone. */
 	struct spdk_lvol	*clone_lvol;
 	size_t			sz;
 	struct spdk_io_channel	*channel;
 	char			name[SPDK_LVOL_NAME_MAX];
+	int 	rc;
 };
 
 struct spdk_lvol_copy_req {
@@ -62,6 +75,7 @@ struct spdk_lvs_with_handle_req {
 	struct spdk_bdev		*base_bdev;
 	int				lvserrno;
 	bool untier_lvstore_md_pages;
+	bool 			examine;
 };
 
 struct spdk_lvs_destroy_req {
@@ -77,6 +91,9 @@ struct spdk_lvol_with_handle_req {
 	bool is_recovery;
 	int lvol_priority_class;
 	uint8_t tiering_info;
+	struct spdk_poller *poller;
+	int force_failure;
+	int frozen_refcnt;
 	struct spdk_lvol		*lvol;
 	struct spdk_lvol		*origlvol;
 };
@@ -101,6 +118,7 @@ struct spdk_lvol_store {
 	TAILQ_HEAD(, spdk_lvol)		lvols;
 	TAILQ_HEAD(, spdk_lvol)		pending_lvols;
 	TAILQ_HEAD(, spdk_lvol)		retry_open_lvols;
+	TAILQ_HEAD(, spdk_lvol)		pending_update_lvols;
 	bool				load_esnaps;
 	bool				on_list;
 	TAILQ_ENTRY(spdk_lvol_store)	link;
@@ -109,12 +127,27 @@ struct spdk_lvol_store {
 	spdk_bs_esnap_dev_create	esnap_bs_dev_create;
 	RB_HEAD(degraded_lvol_sets_tree, spdk_lvs_degraded_lvol_set)	degraded_lvol_sets_tree;
 	struct spdk_thread		*thread;
+	bool				leader;
+	bool				update_in_progress;
+	bool				failed_on_update;
+	int  retry_on_update;
+	uint64_t			groupid;
+	uint64_t			leadership_timeout;
+	uint64_t			timeout_trigger;
+	bool 				trigger_leader_sent;
+	int 				subsystem_port;
 };
 
 struct spdk_lvol {
 	struct spdk_lvol_store		*lvol_store;
 	struct spdk_blob		*blob;
+	struct spdk_blob		*tmp_blob;
 	spdk_blob_id			blob_id;
+	bool				leader;
+	bool				update_in_progress;
+	// uint64_t 			timeout_update_bs;
+	// uint64_t 			timeout_change_leadership;
+	bool				failed_on_update;
 	char				unique_id[SPDK_LVOL_UNIQUE_ID_MAX];
 	char				name[SPDK_LVOL_NAME_MAX];
 	struct spdk_uuid		uuid;
@@ -125,6 +158,7 @@ struct spdk_lvol {
 	bool				action_in_progress;
 	enum blob_clear_method		clear_method;
 	TAILQ_ENTRY(spdk_lvol)		link;
+	TAILQ_ENTRY(spdk_lvol)		entry_to_update;
 	struct spdk_lvs_degraded_lvol_set *degraded_set;
 	TAILQ_ENTRY(spdk_lvol)		degraded_link;
 };
@@ -134,6 +168,13 @@ struct lvol_store_bdev *vbdev_lvol_store_next(struct lvol_store_bdev *prev);
 
 void spdk_lvol_resize(struct spdk_lvol *lvol, uint64_t sz, spdk_lvol_op_complete cb_fn,
 		      void *cb_arg);
+void spdk_lvol_resize_unfreeze(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg);
+void spdk_lvol_resize_register(struct spdk_lvol *lvol, uint64_t sz,
+		 spdk_lvol_op_complete cb_fn, void *cb_arg);
+
+int spdk_lvol_register_live(struct spdk_lvol_store *lvs, const char *name, const char *uuid_str, uint64_t blobid,
+		 bool thin_provision, enum lvol_clear_method clear_method, spdk_lvol_op_with_handle_complete cb_fn,
+		 void *cb_arg);
 
 void spdk_lvol_set_read_only(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn,
 			     void *cb_arg);

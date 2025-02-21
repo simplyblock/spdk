@@ -361,6 +361,49 @@ void spdk_bs_grow_live(struct spdk_blob_store *bs,
 		       spdk_bs_op_complete cb_fn, void *cb_arg);
 
 /**
+ * update a blobstore according to bit array synced.
+ * Can be used on loaded blobstore, even with opened blobs.
+ *
+ * \param bs blobstore to update.
+ * \param cb_fn Called when the updating is complete.
+ * \param cb_arg Argument passed to function cb_fn.
+ */
+void spdk_bs_update_live(struct spdk_blob_store *bs, bool failover,
+		       spdk_bs_op_complete cb_fn, void *cb_arg);
+
+void spdk_blob_failover_unfreaze(struct spdk_blob *blob, 
+				spdk_blob_op_complete cb_fn, void *cb_arg);
+
+int blob_freeze(struct spdk_blob *blob);
+int spdk_blob_get_freeze_cnt(struct spdk_blob *blob);
+
+void spdk_blob_unfreeze_cleanup(struct spdk_blob *blob,
+				 spdk_blob_op_with_id_complete cb_fn, void *cb_arg);
+
+void blob_freeze_on_failover(struct spdk_blob *blob);
+
+void spdk_blob_update_failed_cleanup(struct spdk_blob *blob,
+				 spdk_blob_op_complete cb_fn, void *cb_arg);
+
+void spdk_bs_set_leader(struct spdk_blob_store *bs, bool state);
+/**
+ * update a blobstore according to bit array synced.
+ * Can be used on loaded blobstore, even with opened blobs.
+ *
+ * \param bs blobstore to update.
+ * \param cb_fn Called when the updating is complete.
+ * \param cb_arg Argument passed to function cb_fn.
+ */
+void
+spdk_bs_update_on_failover(struct spdk_blob_store *bs,
+		       spdk_bs_op_complete cb_fn, void *cb_arg);
+
+void spdk_blob_update_on_failover(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
+
+void
+spdk_blob_update_on_failover_send_msg(struct spdk_blob *blob,
+				spdk_blob_op_complete cb_fn, void *cb_arg);
+/**
  * Initialize a blobstore on the given device.
  *
  * \param dev Blobstore block device.
@@ -494,6 +537,15 @@ uint64_t spdk_bs_total_data_cluster_count(struct spdk_blob_store *bs);
 spdk_blob_id spdk_blob_get_id(struct spdk_blob *blob);
 
 uint8_t spdk_blob_get_tiering_info(struct spdk_blob *blob);
+
+/**
+ * Get the blob open ref.
+ *
+ * \param blob Blob struct to query.
+ *
+ * \return blob open ref.
+ */
+uint32_t spdk_blob_get_open_ref(struct spdk_blob *blob);
 
 /**
  * Get the number of pages allocated to the blob.
@@ -648,6 +700,11 @@ void spdk_bs_start_recover_blob_ext(struct spdk_blob_store *bs, spdk_blob_id id_
 void spdk_bs_create_blob(struct spdk_blob_store *bs,
 			 spdk_blob_op_with_id_complete cb_fn, void *cb_arg);
 
+struct spdk_blob *
+spdk_bs_copy_blob(struct spdk_blob_store *bs, struct spdk_blob	*blob);
+
+int spdk_bs_delete_blob_non_leader(struct spdk_blob_store *bs, struct spdk_blob	*blob);
+
 /**
  * Create a read-only snapshot of specified blob with provided options.
  * This will automatically sync specified blob.
@@ -666,6 +723,14 @@ void spdk_bs_create_blob(struct spdk_blob_store *bs,
 void spdk_bs_create_snapshot(struct spdk_blob_store *bs, spdk_blob_id blobid,
 			     const struct spdk_blob_xattr_opts *snapshot_xattrs,
 			     spdk_blob_op_with_id_complete cb_fn, void *cb_arg);
+				 
+void spdk_bs_update_snapshot_clone(struct spdk_blob_store *bs, 
+			struct spdk_blob *origblob, struct spdk_blob *newblob,
+			bool leader, bool update_in_progress);
+
+void spdk_bs_update_snapshot_clone_live(struct spdk_blob *origblob, struct spdk_blob *newblob);
+
+void spdk_bs_update_clone(struct spdk_blob *clone);
 
 /**
  * Create a clone of specified read-only blob.
@@ -917,6 +982,9 @@ void spdk_blob_open_opts_init(struct spdk_blob_open_opts *opts, size_t opts_size
 void spdk_bs_open_blob(struct spdk_blob_store *bs, spdk_blob_id blobid,
 		       spdk_blob_op_with_handle_complete cb_fn, void *cb_arg);
 
+void spdk_bs_open_blob_on_failover(struct spdk_blob_store *bs, spdk_blob_id blobid,
+		  spdk_blob_op_with_handle_complete cb_fn, void *cb_arg);
+
 /**
  * Open a blob from the given blobstore with additional options.
  *
@@ -928,6 +996,9 @@ void spdk_bs_open_blob(struct spdk_blob_store *bs, spdk_blob_id blobid,
  */
 void spdk_bs_open_blob_ext(struct spdk_blob_store *bs, spdk_blob_id blobid,
 			   struct spdk_blob_open_opts *opts, spdk_blob_op_with_handle_complete cb_fn, void *cb_arg);
+
+void spdk_bs_open_blob_without_reference(struct spdk_blob_store *bs, spdk_blob_id blobid,
+				struct spdk_blob_open_opts *opts, spdk_blob_op_with_handle_complete cb_fn, void *cb_arg);
 
 /* Open a backed up (via storage tiering) blob from the given blobstore, which may not be overall backed up.
 See spdk_bs_open_blob_ext() for further details.
@@ -948,6 +1019,10 @@ void spdk_bs_open_recover_blob_ext(struct spdk_blob_store *bs, spdk_blob_id blob
  */
 void spdk_blob_resize(struct spdk_blob *blob, uint64_t sz, spdk_blob_op_complete cb_fn,
 		      void *cb_arg);
+			  
+void spdk_blob_resize_unfreeze(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
+			  
+int spdk_blob_resize_register(struct spdk_blob *blob, uint64_t sz);
 
 /**
  * Set blob as read only.
@@ -968,7 +1043,7 @@ int spdk_blob_set_read_only(struct spdk_blob *blob);
  * \param cb_fn Called when the operation is complete.
  * \param cb_arg Argument passed to function cb_fn.
  */
-void spdk_blob_sync_md(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
+int spdk_blob_sync_md(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
 
 /**
  * Close a blob. This will automatically sync.
@@ -1140,6 +1215,12 @@ void spdk_blob_io_write_zeroes(struct spdk_blob *blob, struct spdk_io_channel *c
  */
 void spdk_bs_iter_first(struct spdk_blob_store *bs,
 			spdk_blob_op_with_handle_complete cb_fn, void *cb_arg);
+
+void spdk_bs_iter_first_without_close(struct spdk_blob_store *bs,
+		   spdk_blob_op_with_handle_complete cb_fn, void *cb_arg);
+
+void spdk_bs_iter_next_without_close(struct spdk_blob_store *bs, struct spdk_blob *blob,
+		  spdk_blob_op_with_handle_complete cb_fn, void *cb_arg);
 
 /**
  * Get the next blob by using the current blob. The obtained blob will be passed
