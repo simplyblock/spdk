@@ -7247,9 +7247,6 @@ spdk_bs_init_persistent(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 
 	batch = bs_sequence_to_batch(seq, bs_init_trim_cpl, ctx);
 
-	/* Clear metadata space */
-	bs_batch_write_zeroes_dev(batch, 0, num_md_lba);
-
 	bs_batch_close(batch);
 }
 
