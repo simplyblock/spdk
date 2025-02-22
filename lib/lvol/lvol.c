@@ -2762,60 +2762,116 @@ block_port(int port) {
 	}
 }
 
+static void
+spdk_lvs_unfreeze_on_conflict(struct spdk_lvol_store *lvs)
+{
+	struct spdk_lvol *lvol;
+
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+	block_port(lvs->subsystem_port);
+	lvs->update_in_progress = false;
+	lvs->failed_on_update = false;
+	lvs->leadership_timeout = spdk_get_ticks();
+	lvs->timeout_trigger = 1;
+	lvs->leader = false;
+	spdk_bs_set_leader(lvs->blobstore, false);
+	TAILQ_FOREACH(lvol, &lvs->lvols, link) {
+		lvol->leader = false;
+		lvol->update_in_progress = false;
+	}
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+
+	//TODO create new function to unfreeze all the lvols
+	SPDK_NOTICELOG("Starting unfreeze the lvols.\n");
+	spdk_lvs_unfreeze_on_conflict_msg(lvs->blobstore);
+}
+
+static int
+spdk_lvs_unfreeze_on_conflict_poller(void *cb_arg)
+{
+	struct spdk_lvs_req *req = cb_arg;
+	struct spdk_lvol_store *lvs = req->lvol_store;
+	spdk_poller_unregister(&req->poller);
+	spdk_lvs_unfreeze_on_conflict(lvs);
+	return -1;
+}
+
+static void
+spdk_lvs_conflict_signal(void *arg, int errorno) {
+
+	// SPDK_NOTICELOG("Receive signal to change leadership internally due to conflict.\n");
+	struct spdk_lvol_store *lvs = arg;
+	struct spdk_lvs_req *req;
+	// if (errorno != 0) {
+	// 	spdk_lvs_unfreeze_on_conflict(lvs, false);
+	// 	return;
+	// }
+
+	req = calloc(1, sizeof(*req));
+	if (req == NULL) {
+		SPDK_ERRLOG("Cannot alloc memory for request structure\n");		
+		// in this case we should not wait for the IO inflyight
+		spdk_lvs_unfreeze_on_conflict(lvs);
+		return;
+	}
+	// TODO create a poller so after 50ms and unfreeze all the blobs and set blobstore to false
+	// in case we have snapshots and we need to allocate new cluster and do copy and write
+	req->cb_fn = NULL;
+	req->cb_arg = NULL;
+	req->lvol_store = lvs;
+	SPDK_NOTICELOG("Lvolstore on conflict set poller.\n");
+	req->poller = spdk_poller_register(spdk_lvs_unfreeze_on_conflict_poller, req, 50000); // Delay of 50ms
+}
+
+// void
+// spdk_lvs_send_signal_on_conflict(uint64_t groupid)
+// {
+// 	struct spdk_lvol_store *lvs;
+// 	// struct spdk_lvol *lvol;
+	
+// 	SPDK_NOTICELOG("Receive signal to change leadership internally due to conflict.\n");
+
+// 	pthread_mutex_lock(&g_lvol_stores_mutex);
+// 	TAILQ_FOREACH(lvs, &g_lvol_stores, link) {
+// 	if (lvs->groupid == groupid) {
+// 		if (lvs->leader) {
+// 			SPDK_NOTICELOG("Starting to apply freeze due to conflict. group id: %" PRIu64 ".\n", lvs->groupid);
+// 			we should send msg to md thread
+// 			spdk_blob_freeze_on_conflict_send_msg(lvs->blobstore, spdk_lvs_conflict_signal, lvs);
+// 		}
+// 	}
+// 	}
+// 	pthread_mutex_unlock(&g_lvol_stores_mutex);
+// 	return;
+// }
+
 void
 spdk_lvs_change_leader_state(uint64_t groupid)
 {
 	struct spdk_lvol_store *lvs;
 	struct spdk_lvol *lvol;
-	uint64_t timeout_ticks;
 
-	SPDK_NOTICELOG("Attempting to change leadership state internally.\n");
+	SPDK_NOTICELOG("Attempting to change leadership state internally groupid %" PRIu64 ".\n", groupid);
 	pthread_mutex_lock(&g_lvol_stores_mutex);
-
-	if (groupid == 0) {
-		TAILQ_FOREACH(lvs, &g_lvol_stores, link) {
-			if (lvs->leader) {
-				block_port(lvs->subsystem_port);
-				lvs->update_in_progress = false;
-				lvs->failed_on_update = false;
-				lvs->leadership_timeout = spdk_get_ticks();
-				lvs->timeout_trigger = 1;
-				timeout_ticks = spdk_get_ticks_hz() * 10;
-				lvs->leader = false;
-				spdk_bs_set_leader(lvs->blobstore, false);
-				TAILQ_FOREACH(lvol, &lvs->lvols, link) {
-					lvol->leader = false;
-					lvol->update_in_progress = false;
-				}
-			}
-		}
-		SPDK_NOTICELOG("Leadership state changed internally to false for all lvs. \n");
-		pthread_mutex_unlock(&g_lvol_stores_mutex);
-		return;
-	}
-
 	TAILQ_FOREACH(lvs, &g_lvol_stores, link) {
-		if (lvs->groupid == groupid) {
-			if (lvs->leader) {
+		if ((lvs->groupid == groupid || groupid == 0) && lvs->leader) {			
+			if (spdk_blob_freeze_on_conflict_send_msg(lvs->blobstore,
+					spdk_lvs_conflict_signal, lvs)) {
 				block_port(lvs->subsystem_port);
 				lvs->update_in_progress = false;
 				lvs->failed_on_update = false;
 				lvs->leadership_timeout = spdk_get_ticks();
 				lvs->timeout_trigger = 1;
-				timeout_ticks = spdk_get_ticks_hz() * 10;
 				lvs->leader = false;
 				spdk_bs_set_leader(lvs->blobstore, false);
 				TAILQ_FOREACH(lvol, &lvs->lvols, link) {
 					lvol->leader = false;
 					lvol->update_in_progress = false;
 				}
-				SPDK_NOTICELOG("Leadership state changed internally to false. Timeout set to %" PRIu64 " "
-								"and current time is %" PRIu64 " seconds.\n",
-								timeout_ticks, lvs->leadership_timeout);				
 			}
+			SPDK_NOTICELOG("Leadership state changed internally to false. Timeout is set.\n");				
 		}
 	}
-
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
 	return;
 }
@@ -2873,7 +2929,7 @@ spdk_lvs_check_active_process(struct spdk_lvol_store *lvs, struct spdk_lvol *lvo
 		lvs->retry_on_update++;
 		spdk_bs_set_leader(lvs->blobstore, true);
 		SPDK_NOTICELOG("Lvolstore failover set poller - trigger refresh: %" PRIu64 " t %d \n", lvol->blob_id, type);
-		req->poller = spdk_poller_register(spdk_lvs_update_on_failover_poller, req, 250000); // Delay of 250ms
+		req->poller = spdk_poller_register(spdk_lvs_update_on_failover_poller, req, 500000); // Delay of 500ms
 	}
 
 	pthread_mutex_unlock(&g_lvol_stores_mutex);

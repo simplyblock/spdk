@@ -402,9 +402,13 @@ spdk_bs_update_on_failover(struct spdk_blob_store *bs,
 
 void spdk_blob_update_on_failover(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
 
-void
-spdk_blob_update_on_failover_send_msg(struct spdk_blob *blob,
+void spdk_blob_update_on_failover_send_msg(struct spdk_blob *blob,
 				spdk_blob_op_complete cb_fn, void *cb_arg);
+
+int spdk_blob_freeze_on_conflict_send_msg(struct spdk_blob_store *bs,
+		  spdk_blob_op_complete cb_fn, void *cb_arg);
+
+void spdk_lvs_unfreeze_on_conflict_msg(struct spdk_blob_store *bs);
 /**
  * Initialize a blobstore on the given device.
  *

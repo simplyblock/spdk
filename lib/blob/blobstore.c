@@ -9951,6 +9951,71 @@ spdk_blob_update_on_failover_send_msg(struct spdk_blob *blob,
 	spdk_thread_send_msg(blob->bs->md_thread, blob_update_on_failover_msg, ctx);	
 }
 
+static void 
+spdk_blob_on_conflict_unfreeze_cb(void *cb_arg, int bserrorno)
+{
+	// struct spdk_blob *blob = cb_arg;
+	if (bserrorno != 0) {
+		SPDK_ERRLOG("Unfreeze failed, rc=%d\n", bserrorno);
+	}
+}
+
+void
+spdk_lvs_unfreeze_on_conflict_msg(struct spdk_blob_store *bs) {
+	struct spdk_blob *blob;
+	// spdk_blob_update_on_failover(ctx->blob, ctx->cb_fn, ctx->cb_arg);
+    RB_FOREACH(blob, spdk_blob_tree, &bs->open_blobs) {
+        // Access each blob here
+		if (blob->data_ro || blob->md_ro) {
+			continue;		
+		} else {			
+			blob_unfreeze_io(blob, spdk_blob_on_conflict_unfreeze_cb, blob);
+		}
+    }
+}
+
+struct spdk_bs_freeze_conflict_ctx {
+	spdk_blob_op_complete cb_fn;
+	void			*cb_arg;
+	struct spdk_blob_store		*bs;
+};
+
+static void
+bs_freeze_on_conflict_msg(void *arg) {
+	struct spdk_bs_freeze_conflict_ctx *ctx = arg;
+	struct spdk_blob_store	*bs = ctx->bs;
+	struct spdk_blob *blob;
+    RB_FOREACH(blob, spdk_blob_tree, &bs->open_blobs) {
+        // Access each blob here
+		if (blob->data_ro || blob->md_ro) {
+			continue;		
+		} else {
+			blob->frozen_refcnt++;
+		}
+    }
+
+	ctx->cb_fn(ctx->cb_arg, 0);
+	free(ctx);
+}
+
+int
+spdk_blob_freeze_on_conflict_send_msg(struct spdk_blob_store *bs,
+		  spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_bs_freeze_conflict_ctx *ctx;
+	ctx = calloc(1, sizeof(struct spdk_bs_freeze_conflict_ctx));
+	if (!ctx) {
+		SPDK_ERRLOG("Cannot allocate buf for freeze IO on all blobs.\n");
+		// cb_fn(cb_arg, -ENOMEM);
+		return -ENOMEM;
+	}
+	ctx->bs = bs;
+	ctx->cb_fn = cb_fn;
+	ctx->cb_arg = cb_arg;
+	spdk_thread_send_msg(bs->md_thread, bs_freeze_on_conflict_msg, ctx);
+	return 0;
+}
+
 void
 blob_freeze_on_failover(struct spdk_blob *blob)
 {
