@@ -5349,6 +5349,7 @@ bs_load_used_clusters_cpl_clean_mode(spdk_bs_sequence_t *seq, void *cb_arg, int 
 	}
 	lba = bs_page_to_lba(ctx->bs, ctx->super->used_blobid_mask_start);
 	lba_count = bs_page_to_lba(ctx->bs, ctx->super->used_blobid_mask_len);
+	seq->tiering_bits |= SYNC_FETCH_BIT;
 	bs_sequence_read_dev(seq, ctx->mask, lba, lba_count,
 			     bs_load_used_blobids_cpl_clean_mode, ctx);
 }
@@ -5398,6 +5399,7 @@ bs_load_used_pages_cpl_clean_mode(spdk_bs_sequence_t *seq, void *cb_arg, int bse
 	}
 	lba = bs_page_to_lba(ctx->bs, ctx->super->used_cluster_mask_start);
 	lba_count = bs_page_to_lba(ctx->bs, ctx->super->used_cluster_mask_len);
+	seq->tiering_bits |= SYNC_FETCH_BIT;
 	bs_sequence_read_dev(seq, ctx->mask, lba, lba_count,
 			     bs_load_used_clusters_cpl_clean_mode, ctx);
 }
@@ -5418,6 +5420,7 @@ bs_load_read_used_pages_clean_mode(struct spdk_bs_load_ctx *ctx)
 
 	lba = bs_page_to_lba(ctx->bs, ctx->super->used_page_mask_start);
 	lba_count = bs_page_to_lba(ctx->bs, ctx->super->used_page_mask_len);
+	ctx->seq->tiering_bits |= SYNC_FETCH_BIT;
 	bs_sequence_read_dev(ctx->seq, ctx->mask, lba, lba_count,
 			     bs_load_used_pages_cpl_clean_mode, ctx);
 }
@@ -5901,6 +5904,7 @@ bs_load_read_only_used_pages(struct spdk_bs_load_ctx *ctx)
 
 	lba = bs_page_to_lba(ctx->bs, ctx->super->used_page_mask_start);
 	lba_count = bs_page_to_lba(ctx->bs, ctx->super->used_page_mask_len);
+	ctx->seq->tiering_bits |= SYNC_FETCH_BIT;
 	bs_sequence_read_dev(ctx->seq, ctx->mask, lba, lba_count,
 			     bs_load_only_used_pages_cpl, ctx);
 }
@@ -6611,6 +6615,7 @@ bs_load_used_pages_cpl_dump(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	}
 	lba = bs_page_to_lba(ctx->bs, ctx->super->used_blobid_mask_start);
 	lba_count = bs_page_to_lba(ctx->bs, ctx->super->used_blobid_mask_len);
+	seq->tiering_bits |= SYNC_FETCH_BIT;
 	bs_sequence_read_dev(seq, ctx->mask, lba, lba_count,
 			     bs_load_used_blobids_cpl_dump, ctx);
 }
@@ -6632,6 +6637,7 @@ bs_load_read_used_pages_dump(spdk_bs_sequence_t *seq, struct spdk_bs_load_ctx *c
 
 	lba = bs_page_to_lba(ctx->bs, ctx->super->used_page_mask_start);
 	lba_count = bs_page_to_lba(ctx->bs, ctx->super->used_page_mask_len);
+	ctx->seq->tiering_bits |= SYNC_FETCH_BIT;
 	bs_sequence_read_dev(ctx->seq, ctx->mask, lba, lba_count,
 			     bs_load_used_pages_cpl_dump, ctx);
 }
@@ -13362,6 +13368,7 @@ bs_update_replay_extent_pages(struct spdk_bs_update_ctx *ctx)
 
 	batch = bs_sequence_to_batch(ctx->seq, bs_update_replay_extent_page_cpl, ctx);
 
+	batch->tiering_bits |= SYNC_FETCH_BIT;
 	for (i = 0; i < ctx->num_extent_pages; i++) {
 		page = ctx->extent_page_num[i];
 		assert(page < ctx->super->md_len);
@@ -13421,6 +13428,7 @@ bs_update_replay_cur_md_page(struct spdk_bs_update_ctx *ctx)
 
 	assert(ctx->cur_page < ctx->super->md_len);
 	lba = bs_md_page_to_lba(ctx->bs, ctx->cur_page);
+	ctx->seq->tiering_bits |= SYNC_FETCH_BIT;
 	bs_sequence_read_dev(ctx->seq, ctx->page, lba,
 			     bs_byte_to_lba(ctx->bs, SPDK_BS_PAGE_SIZE),
 			     bs_update_replay_md_cpl, ctx);
@@ -13527,6 +13535,7 @@ bs_update_read_only_used_pages(struct spdk_bs_update_ctx *ctx)
 
 	lba = bs_page_to_lba(ctx->bs, ctx->super->used_page_mask_start);
 	lba_count = bs_page_to_lba(ctx->bs, ctx->super->used_page_mask_len);
+	ctx->seq->tiering_bits |= SYNC_FETCH_BIT;
 	bs_sequence_read_dev(ctx->seq, ctx->mask, lba, lba_count,
 			     bs_update_only_used_pages_cpl, ctx);
 }
@@ -13603,6 +13612,7 @@ spdk_bs_update_live(struct spdk_blob_store *bs, bool failover,
 	}
 
 	/* Read the super block */
+	ctx->seq->tiering_bits |= SYNC_FETCH_BIT;
 	bs_sequence_read_dev(ctx->seq, ctx->super, bs_page_to_lba(bs, 0),
 			     bs_byte_to_lba(bs, sizeof(*ctx->super)),
 			     bs_update_super_cpl, ctx);
