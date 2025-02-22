@@ -2869,7 +2869,7 @@ spdk_lvs_change_leader_state(uint64_t groupid)
 					lvol->update_in_progress = false;
 				}
 			}
-			SPDK_NOTICELOG("Leadership state changed internally to false. Timeout is set.\n");				
+			SPDK_NOTICELOG("Leadership state changed internally to false. Timeout has been set.\n");				
 		}
 	}
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
