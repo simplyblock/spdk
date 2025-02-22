@@ -1369,9 +1369,9 @@ void spdk_blob_set_io_priority_class(struct spdk_blob *blob, int priority_class)
 
 void spdk_blob_set_tiering_info(struct spdk_blob *blob, uint8_t tiering_bits);
 
-void spdk_bs_untier_lvstore_md_pages(struct spdk_blob_store *bs, bool untier_lvstore_md_pages);
+void spdk_bs_not_evict_lvstore_md_pages(struct spdk_blob_store *bs, bool not_evict_lvstore_md_pages);
 
-bool spdk_bs_get_untier_lvstore_md_pages(struct spdk_blob_store *bs);
+bool spdk_bs_get_not_evict_lvstore_md_pages(struct spdk_blob_store *bs);
 
 enum EFlushStatus {
 	FLUSH_NEVER_STARTED = 0,

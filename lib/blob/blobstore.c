@@ -1879,9 +1879,9 @@ blob_load(spdk_bs_sequence_t *seq, struct spdk_blob *blob,
 	/* tier blob-specific metadata if the blob is configured to do so
 	*/
 	const uint8_t blob_tiering_bits = blob->tiering_bits;
-	// set the metadata page bit mode if the blob must untier its metadata, else unset it
-	seq->tiering_bits |= (blob_tiering_bits & UNTIER_BLOB_MD_BIT) ? METADATA_PAGE_BIT : 0;
-	seq->tiering_bits &= (blob_tiering_bits & DO_TIER_BLOB_MD_BIT) ? ~METADATA_PAGE_BIT : 255;
+	// set the metadata page bit mode if the blob must never evict metadata, else unset it
+	seq->tiering_bits |= (blob_tiering_bits & NOT_EVICT_BLOB_MD_BIT) ? METADATA_PAGE_BIT : 0;
+	seq->tiering_bits &= (blob_tiering_bits & DO_EVICT_BLOB_MD_BIT) ? ~METADATA_PAGE_BIT : 255;
 
 	seq->tiering_bits |= SYNC_FETCH_BIT;
 	bs_sequence_read_dev(seq, &ctx->pages[0], lba,
@@ -1915,9 +1915,9 @@ bs_batch_clear_dev(struct spdk_blob *blob, spdk_bs_batch_t *batch, uint64_t lba,
 	/* tier blob-specific metadata if the blob is configured to do so
 	*/
 	const uint8_t blob_tiering_bits = blob->tiering_bits;
-	// set the metadata page bit mode if the blob must untier its metadata, else unset it
-	batch->tiering_bits |= (blob_tiering_bits & UNTIER_BLOB_MD_BIT) ? METADATA_PAGE_BIT : 0;
-	batch->tiering_bits &= (blob_tiering_bits & DO_TIER_BLOB_MD_BIT) ? ~METADATA_PAGE_BIT : 255;
+	// set the metadata page bit mode if the blob must never evict metadata, else unset it
+	batch->tiering_bits |= (blob_tiering_bits & NOT_EVICT_BLOB_MD_BIT) ? METADATA_PAGE_BIT : 0;
+	batch->tiering_bits &= (blob_tiering_bits & DO_EVICT_BLOB_MD_BIT) ? ~METADATA_PAGE_BIT : 255;
 
 	switch (blob->clear_method) {
 	case BLOB_CLEAR_WITH_DEFAULT:
@@ -3165,9 +3165,9 @@ blob_persist(spdk_bs_sequence_t *seq, struct spdk_blob *blob,
 	/* tier blob-specific metadata if the blob is configured to do so
 	*/
 	const uint8_t blob_tiering_bits = blob->tiering_bits;
-	// set the metadata page bit mode if the blob must untier its metadata, else unset it
-	seq->tiering_bits |= (blob_tiering_bits & UNTIER_BLOB_MD_BIT) ? METADATA_PAGE_BIT : 0;
-	seq->tiering_bits &= (blob_tiering_bits & DO_TIER_BLOB_MD_BIT) ? ~METADATA_PAGE_BIT : 255;
+	// set the metadata page bit mode if the blob must never evict metadata, else unset it
+	seq->tiering_bits |= (blob_tiering_bits & NOT_EVICT_BLOB_MD_BIT) ? METADATA_PAGE_BIT : 0;
+	seq->tiering_bits &= (blob_tiering_bits & DO_EVICT_BLOB_MD_BIT) ? ~METADATA_PAGE_BIT : 255;
 
 	bs_mark_dirty(seq, blob->bs, blob_persist_start, ctx);
 }
@@ -3465,9 +3465,9 @@ bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 	/* tier blob-specific metadata if the blob is configured to do so
 	*/
 	const uint8_t blob_tiering_bits = blob->tiering_bits;
-	// set the metadata page bit mode if the blob must untier its metadata, else unset it
-	ctx->seq->tiering_bits |= (blob_tiering_bits & UNTIER_BLOB_MD_BIT) ? METADATA_PAGE_BIT : 0;
-	ctx->seq->tiering_bits &= (blob_tiering_bits & DO_TIER_BLOB_MD_BIT) ? ~METADATA_PAGE_BIT : 255;
+	// set the metadata page bit mode if the blob must never evict metadata, else unset it
+	ctx->seq->tiering_bits |= (blob_tiering_bits & NOT_EVICT_BLOB_MD_BIT) ? METADATA_PAGE_BIT : 0;
+	ctx->seq->tiering_bits &= (blob_tiering_bits & DO_EVICT_BLOB_MD_BIT) ? ~METADATA_PAGE_BIT : 255;
 
 	/* Queue the user op to block other incoming operations */
 	TAILQ_INSERT_TAIL(&ch->need_cluster_alloc, op, link);
@@ -11657,9 +11657,9 @@ blob_write_extent_page(struct spdk_blob *blob, uint32_t extent, uint64_t cluster
 	/* tier blob-specific metadata if the blob is configured to do so
 	*/
 	const uint8_t blob_tiering_bits = blob->tiering_bits;
-	// set the metadata page bit mode if the blob must untier its metadata, else unset it
-	seq->tiering_bits |= (blob_tiering_bits & UNTIER_BLOB_MD_BIT) ? METADATA_PAGE_BIT : 0;
-	seq->tiering_bits &= (blob_tiering_bits & DO_TIER_BLOB_MD_BIT) ? ~METADATA_PAGE_BIT : 255;
+	// set the metadata page bit mode if the blob must never evict metadata, else unset it
+	seq->tiering_bits |= (blob_tiering_bits & NOT_EVICT_BLOB_MD_BIT) ? METADATA_PAGE_BIT : 0;
+	seq->tiering_bits &= (blob_tiering_bits & DO_EVICT_BLOB_MD_BIT) ? ~METADATA_PAGE_BIT : 255;
 
 	blob_serialize_extent_page(blob, cluster_num, page);
 
@@ -14018,13 +14018,13 @@ spdk_blob_set_tiering_info(struct spdk_blob *blob, uint8_t tiering_bits)
 }
 
 void
-spdk_bs_untier_lvstore_md_pages(struct spdk_blob_store *bs, bool untier_lvstore_md_pages) {
-	bs->untier_lvstore_md_pages = untier_lvstore_md_pages;
+spdk_bs_not_evict_lvstore_md_pages(struct spdk_blob_store *bs, bool not_evict_lvstore_md_pages) {
+	bs->not_evict_lvstore_md_pages = not_evict_lvstore_md_pages;
 }
 
 bool
-spdk_bs_get_untier_lvstore_md_pages(struct spdk_blob_store *bs) {
-	return bs->untier_lvstore_md_pages;
+spdk_bs_get_not_evict_lvstore_md_pages(struct spdk_blob_store *bs) {
+	return bs->not_evict_lvstore_md_pages;
 }
 
 static void
@@ -14066,7 +14066,7 @@ blob_do_flush_job(struct spdk_blob *blob, struct t_flush_job *job) {
 	}
 	job->status = FLUSH_IS_PENDING;
 	// flush is a tiered write mode 1
-	seq->tiering_bits = TIERED_BIT | FLUSH_MODE_BIT;
+	seq->tiering_bits = TIERED_BIT | FLUSH_MODE_BIT | ((job->is_md_job && blob->bs->not_evict_lvstore_md_pages) ? METADATA_PAGE_BIT : 0);
 	job->start_ticks = spdk_get_ticks();
 	bs_sequence_write_dev(seq, job->buf, bs_cluster_to_lba(blob->bs, job->cluster_idx) + bs_dev_page_number_in_cluster_to_lba(blob->bs, blob->dev_page_size, job->dev_page_number), blob->dev_page_size / blob->bs->dev->blocklen, rw_iov_done, NULL);
 	return 0;
@@ -14085,6 +14085,8 @@ blob_search_for_new_flush_job(struct spdk_blob *blob, struct t_flush_job *job) {
 	job->status = FLUSH_NEVER_STARTED;
 	if (blob->nflush_jobs_on_prior_array == 0) {
 		if (blob->current_array_ordinal == 0) {
+			job->is_md_job = false;
+
 			// search for the next allocated data cluster in the snapshot
 			while (blob->next_idx_in_array < blob->active.cluster_array_size && blob->active.clusters[blob->next_idx_in_array] == 0) {
 				++blob->next_idx_in_array;
@@ -14104,6 +14106,8 @@ blob_search_for_new_flush_job(struct spdk_blob *blob, struct t_flush_job *job) {
 				blob->next_idx_in_array = blob->active.extent_pages_array_size - 1; // next array is extent pages array
 			}
 		} else if (blob->current_array_ordinal <= 2) {
+			job->is_md_job = true;
+
 			uint32_t *page_idxs_arr = blob->current_array_ordinal == 1 ? blob->active.extent_pages : blob->active.pages;
 			// search for the next allocated md page in the snapshot
 			while ((int64_t)blob->next_idx_in_array >= 0 && page_idxs_arr[blob->next_idx_in_array] == 0) {

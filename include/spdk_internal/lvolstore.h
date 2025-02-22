@@ -74,7 +74,7 @@ struct spdk_lvs_with_handle_req {
 	struct spdk_bs_dev		*bs_dev;
 	struct spdk_bdev		*base_bdev;
 	int				lvserrno;
-	bool untier_lvstore_md_pages;
+	bool not_evict_lvstore_md_pages;
 	bool 			examine;
 };
 

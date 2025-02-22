@@ -500,7 +500,7 @@ Example response:
     "bdev_lvol_delete_lvstore",
     "bdev_lvol_rename_lvstore",
     "bdev_lvol_create_lvstore",
-    "lvstore_untier_lvstore_md_pages",
+    "lvstore_not_evict_lvstore_md_pages",
     "bdev_lvol_start_shallow_copy",
     "bdev_lvol_check_shallow_copy",
     "bdev_lvol_set_parent",
@@ -9992,7 +9992,7 @@ lvs_name                      | Required | string      | Name of the logical vol
 cluster_sz                    | Optional | number      | Cluster size of the logical volume store in bytes (Default: 4MiB)
 clear_method                  | Optional | string      | Change clear method for data region. Available: none, unmap (default), write_zeroes
 num_md_pages_per_cluster_ratio| Optional | number      | Reserved metadata pages per cluster (Default: 100)
-untier_lvstore_md_pages       | Optional | boolean     | whether to explicitly signal lvolstore metadata pages as untiered to the underlying bdev
+not_evict_lvstore_md_pages       | Optional | boolean     | whether to explicitly signal lvolstore metadata pages as unevictable to the underlying bdev
 
 The num_md_pages_per_cluster_ratio defines the amount of metadata to
 allocate when the logical volume store is created. The default value
@@ -10039,16 +10039,16 @@ Example response:
 }
 ~~~
 
-### lvstore_untier_lvstore_md_pages {#rpc_lvstore_untier_lvstore_md_pages}
+### lvstore_not_evict_lvstore_md_pages {#rpc_lvstore_not_evict_lvstore_md_pages}
 
-Set whether lvolstore md pages should be untiered.
+Set whether lvolstore md pages should be unevictable.
 
 #### Parameters
 
 Name                          | Optional | Type        | Description
 ----------------------------- | -------- | ----------- | -----------
 lvs_name                      | Required | string      | Name of the logical volume store to create
-untier_lvstore_md_pages       | Required | boolean     | whether to explicitly signal lvolstore metadata pages as untiered to the underlying bdev
+not_evict_lvstore_md_pages       | Required | boolean     | whether to explicitly signal lvolstore metadata pages as unevictable to the underlying bdev
 
 #### Response
 
@@ -10062,10 +10062,10 @@ Example request:
 {
   "jsonrpc": "2.0",
   "id": 1,
-  "method": "lvstore_untier_lvstore_md_pages",
+  "method": "lvstore_not_evict_lvstore_md_pages",
   "params": {
     "lvs_name": "LVS0",
-    "untier_lvstore_md_pages": true
+    "not_evict_lvstore_md_pages": true
   }
 }
 ~~~
@@ -10261,8 +10261,8 @@ is_tiered               | Optional | boolean     | Whether this lvol is tiered, 
 sync_fetch              | Optional | boolean     | Whether fetch requests (tiered reads) from this lvol are force fetch (fetch even into  already unfetched data ranges)
 force_fetch             | Optional | boolean     | Whether regular client reads from this lvol need to wait synchronously for any of its unfetched ranges to be fetched
 pure_flush_or_evict    | Optional | boolean     | Whether a tiered write should be pure flush (mode 1) or eviction (mode 0)
-untier_blob_md           | Optional | int    | For blob-specific metadata: 1 means this blob's md should in fact be untiered (even if lvolstore md is tiered), 
-2 means this blob's md should be tiered even if lvolstore md is untiered, and 0 (default) means this blob's md has the same tiering status as lvolstore md
+not_evict_blob_md           | Optional | int    | For blob-specific metadata: 1 means this blob's md should in fact be unevictable (even if lvolstore md is evictable), 
+2 means this blob's md should be evictable even if lvolstore md is unevictable, and 0 (default) means this blob's md has the same evictability status as lvolstore md
 
 Size will be rounded up to a multiple of cluster size. Either uuid or lvs_name must be specified, but not both.
 lvol_name will be used in the alias of the created logical volume.
@@ -10356,8 +10356,8 @@ is_tiered               | Optional | boolean     | Whether this lvol is tiered, 
 sync_fetch              | Optional | boolean     | Whether fetch requests (tiered reads) from this lvol are force fetch (fetch even into  already unfetched data ranges)
 force_fetch             | Optional | boolean     | Whether regular client reads from this lvol need to wait synchronously for any of its unfetched ranges to be fetched
 pure_flush_or_evict    | Optional | boolean     | Whether a tiered write should be pure flush (mode 1) or eviction (mode 0)
-untier_blob_md           | Optional | boolean     | For blob-specific metadata: 1 means this blob's md should in fact be untiered (even if lvolstore md is tiered), 
-2 means this blob's md should be tiered even if lvolstore md is untiered, and 0 (default) means this blob's md has the same tiering status as lvolstore md
+not_evict_blob_md           | Optional | boolean     | For blob-specific metadata: 1 means this blob's md should in fact be unevictable (even if lvolstore md is evictable), 
+2 means this blob's md should be evictable even if lvolstore md is unevictable, and 0 (default) means this blob's md has the same tiering status as lvolstore md
 
 #### Response
 
@@ -10378,7 +10378,7 @@ Example request:
     "sync_fetch": true,
     "force_fetch": false,
     "pure_flush_or_evict": true,
-    "untier_blob_md": 2
+    "not_evict_blob_md": 2
   }
 }
 ~~~
@@ -10408,8 +10408,8 @@ is_tiered               | Optional | boolean     | Whether this lvol is tiered, 
 sync_fetch              | Optional | boolean     | Whether fetch requests (tiered reads) from this lvol are force fetch (fetch even into  already unfetched data ranges)
 force_fetch             | Optional | boolean     | Whether regular client reads from this lvol need to wait synchronously for any of its unfetched ranges to be fetched
 pure_flush_or_evict    | Optional | boolean     | Whether a tiered write should be pure flush (mode 1) or eviction (mode 0)
-untier_blob_md           | Optional | int    | For blob-specific metadata: 1 means this blob's md should in fact be untiered (even if lvolstore md is tiered), 
-2 means this blob's md should be tiered even if lvolstore md is untiered, and 0 (default) means this blob's md has the same tiering status as lvolstore md
+not_evict_blob_md           | Optional | int    | For blob-specific metadata: 1 means this blob's md should in fact be unevictable (even if lvolstore md is evictable), 
+2 means this blob's md should be evictable even if lvolstore md is unevictable, and 0 (default) means this blob's md has the same tiering status as lvolstore md
 
 #### Response
 
@@ -10456,8 +10456,8 @@ is_tiered               | Optional | boolean     | Whether this lvol is tiered, 
 sync_fetch              | Optional | boolean     | Whether fetch requests (tiered reads) from this lvol are force fetch (fetch even into  already unfetched data ranges)
 force_fetch             | Optional | boolean     | Whether regular client reads from this lvol need to wait synchronously for any of its unfetched ranges to be fetched
 pure_flush_or_evict    | Optional | boolean     | Whether a tiered write should be pure flush (mode 1) or eviction (mode 0)
-untier_blob_md           | Optional | int    | For blob-specific metadata: 1 means this blob's md should in fact be untiered (even if lvolstore md is tiered), 
-2 means this blob's md should be tiered even if lvolstore md is untiered, and 0 (default) means this blob's md has the same tiering status as lvolstore md
+not_evict_blob_md           | Optional | int    | For blob-specific metadata: 1 means this blob's md should in fact be unevictable (even if lvolstore md is evictable), 
+2 means this blob's md should be evictable even if lvolstore md is unevictable, and 0 (default) means this blob's md has the same evictability status as lvolstore md
 
 #### Response
 

@@ -30,10 +30,10 @@ struct lvol_bdev {
 };
 
 int vbdev_lvs_create(const char *base_bdev_name, const char *name, uint32_t cluster_sz,
-		     enum lvs_clear_method clear_method, uint32_t num_md_pages_per_cluster_ratio, bool untier_lvstore_md_pages,
+		     enum lvs_clear_method clear_method, uint32_t num_md_pages_per_cluster_ratio, bool not_evict_lvstore_md_pages,
 		     spdk_lvs_op_with_handle_complete cb_fn, void *cb_arg);
 int vbdev_lvs_create_persistent(const char *base_bdev_name, const char *name, uint32_t cluster_sz,
-		     enum lvs_clear_method clear_method, uint32_t num_md_pages_per_cluster_ratio, bool untier_lvstore_md_pages,
+		     enum lvs_clear_method clear_method, uint32_t num_md_pages_per_cluster_ratio, bool not_evict_lvstore_md_pages,
 		     spdk_lvs_op_with_handle_complete cb_fn, void *cb_arg);
 void vbdev_lvs_destruct(struct spdk_lvol_store *lvs, spdk_lvs_op_complete cb_fn, void *cb_arg);
 void vbdev_lvs_unload(struct spdk_lvol_store *lvs, spdk_lvs_op_complete cb_fn, void *cb_arg);
@@ -173,9 +173,9 @@ void vbdev_lvol_set_tiering_info(struct spdk_lvol *lvol, uint8_t tiering_bits);
 
 uint8_t vbdev_lvol_get_tiering_info(struct spdk_lvol *lvol);
 
-void vbdev_lvs_untier_lvstore_md_pages(struct spdk_lvol_store *lvs, bool untier_lvstore_md_pages);
+void vbdev_lvs_not_evict_lvstore_md_pages(struct spdk_lvol_store *lvs, bool not_evict_lvstore_md_pages);
 
-bool vbdev_lvs_get_untier_lvstore_md_pages(struct spdk_lvol_store *lvs);
+bool vbdev_lvs_get_not_evict_lvstore_md_pages(struct spdk_lvol_store *lvs);
 
 void vbdev_lvol_backup_snapshot(struct snapshot_backup_ctx *sctx);
 

@@ -18,8 +18,8 @@
 #define FORCE_FETCH_BIT 2
 #define SYNC_FETCH_BIT 4
 #define FLUSH_MODE_BIT 8
-#define UNTIER_BLOB_MD_BIT 16 // whether blob-specific metadata should in fact be untiered (if lvolstore md is tiered)
-#define DO_TIER_BLOB_MD_BIT 32 // whether blob-specific metadata should in fact be tiered even if lvolstore md is untiered
+#define NOT_EVICT_BLOB_MD_BIT 16 // whether blob-specific metadata should in fact be unevictable (if lvolstore md is evictable)
+#define DO_EVICT_BLOB_MD_BIT 32 // whether blob-specific metadata should in fact be evictable even if lvolstore md is unevictable
 #define METADATA_PAGE_BIT 64
 
 #endif

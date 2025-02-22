@@ -116,6 +116,10 @@ struct t_flush_job {
 	/* dev page number in the job's cluster (cluster size must be aligned to dev page size)
 	*/
 	uint8_t dev_page_number;
+	/* flag denoting whether this flush job is flushing data clusters or metadata, needed because snapshot backup poller occurs
+	on a separate thread, not the md thread
+	*/
+	bool is_md_job;
 	enum EFlushStatus status; // I/O status of the job
 };
 
@@ -232,7 +236,7 @@ struct spdk_blob_store {
 	struct spdk_thread		*md_thread;
 
 	int priority_class; // max priority_class of all constituent blobs to speed up metadata I/Os
-	bool untier_lvstore_md_pages; // whether to explicitly signal metadata pages as untiered
+	bool not_evict_lvstore_md_pages; // whether to explicitly signal metadata pages as unevictable
 
 	struct spdk_bs_dev		*dev;
 

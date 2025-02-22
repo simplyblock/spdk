@@ -206,8 +206,8 @@ class UIRoot(UINode):
         return response
     
     @verbose
-    def lvstore_untier_lvstore_md_pages(self, **kwargs):
-        response = rpc.lvol.lvstore_untier_lvstore_md_pages(self.client, **kwargs)
+    def lvstore_not_evict_lvstore_md_pages(self, **kwargs):
+        response = rpc.lvol.lvstore_not_evict_lvstore_md_pages(self.client, **kwargs)
         return response
     
     @verbose

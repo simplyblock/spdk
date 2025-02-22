@@ -5,7 +5,7 @@
 
 
 def bdev_lvol_create_lvstore(client, bdev_name, lvs_name, cluster_sz=None,
-                             clear_method=None, num_md_pages_per_cluster_ratio=None, untier_lvstore_md_pages=False):
+                             clear_method=None, num_md_pages_per_cluster_ratio=None, not_evict_lvstore_md_pages=False):
     """Construct a logical volume store.
 
     Args:
@@ -14,7 +14,7 @@ def bdev_lvol_create_lvstore(client, bdev_name, lvs_name, cluster_sz=None,
         cluster_sz: cluster size of the logical volume store in bytes (optional)
         clear_method: Change clear method for data region. Available: none, unmap, write_zeroes (optional)
         num_md_pages_per_cluster_ratio: metadata pages per cluster (optional)
-        untier_lvstore_md_pages: whether to explicitly signal lvolstore metadata pages as untiered to the underlying bdev (optional)
+        not_evict_lvstore_md_pages: whether to explicitly signal lvolstore metadata pages as unevictable to the underlying bdev (optional)
 
     Returns:
         UUID of created logical volume store.
@@ -26,14 +26,14 @@ def bdev_lvol_create_lvstore(client, bdev_name, lvs_name, cluster_sz=None,
         params['clear_method'] = clear_method
     if num_md_pages_per_cluster_ratio:
         params['num_md_pages_per_cluster_ratio'] = num_md_pages_per_cluster_ratio
-    params['untier_lvstore_md_pages'] = untier_lvstore_md_pages
+    params['not_evict_lvstore_md_pages'] = not_evict_lvstore_md_pages
     return client.call('bdev_lvol_create_lvstore', params)
 
-def lvstore_untier_lvstore_md_pages(client, lvs_name, untier_lvstore_md_pages):
+def lvstore_not_evict_lvstore_md_pages(client, lvs_name, not_evict_lvstore_md_pages):
     """Set whether the lvol store should support storage tiering."""
 
-    params = {'lvs_name': lvs_name, 'untier_lvstore_md_pages': untier_lvstore_md_pages}
-    return client.call('lvstore_untier_lvstore_md_pages', params)
+    params = {'lvs_name': lvs_name, 'not_evict_lvstore_md_pages': not_evict_lvstore_md_pages}
+    return client.call('lvstore_not_evict_lvstore_md_pages', params)
 
 
 def bdev_lvol_rename_lvstore(client, old_name, new_name):
@@ -108,7 +108,7 @@ def bdev_lvol_create(client, lvol_name, size_in_mib, thin_provision=False, uuid=
     force_fetch=False,
     sync_fetch=False,
     pure_flush_or_evict=False,
-    untier_blob_md=0):
+    not_evict_blob_md=0):
     """Create a logical volume on a logical volume store.
 
     Args:
@@ -123,8 +123,8 @@ def bdev_lvol_create(client, lvol_name, size_in_mib, thin_provision=False, uuid=
         force_fetch: whether fetch requests (tiered reads) from this lvol are force fetch (fetch even into already unfetched data ranges)
         sync_fetch: whether regular client reads from this lvol need to wait synchronously for any of its unfetched ranges to be fetched
         pure_flush_or_evict: whether a tiered write should be pure flush (mode 1) or eviction (mode 0)
-        untier_blob_md: For blob-specific metadata: 1 means this blob's md should in fact be untiered (even if lvolstore md is tiered), 
-2 means this blob's md should be tiered even if lvolstore md is untiered, and 0 (default) means this blob's md has the same tiering status as lvolstore md
+        not_evict_blob_md: For blob-specific metadata: 1 means this blob's md should in fact be unevictable (even if lvolstore md is evictable), 
+2 means this blob's md should be evictable even if lvolstore md is unevictable, and 0 (default) means this blob's md has the same evictability status as lvolstore md
 
     Either uuid or lvs_name must be specified, but not both.
 
@@ -155,7 +155,7 @@ def bdev_lvol_create(client, lvol_name, size_in_mib, thin_provision=False, uuid=
     params['sync_fetch'] = sync_fetch
     params['force_fetch'] = force_fetch
     params['pure_flush_or_evict'] = pure_flush_or_evict
-    params['untier_blob_md'] = untier_blob_md
+    params['not_evict_blob_md'] = not_evict_blob_md
     return client.call('bdev_lvol_create', params)
 
 def bdev_lvol_register(client, lvol_name, registered_uuid, blobid, thin_provision=False, uuid=None, lvs_name=None, clear_method=None, lvol_priority_class=0):
@@ -232,11 +232,11 @@ def bdev_lvol_set_tiering_info(
     force_fetch,
     sync_fetch,
     pure_flush_or_evict,
-    untier_blob_md):
+    not_evict_blob_md):
 
     """ Set the storage tiering info of a logical volume. All fields must be provided even if they stay the same.
     """
-    params = {'lvol_name': lvol_name, 'is_tiered': is_tiered, 'force_fetch': force_fetch, 'sync_fetch': sync_fetch, 'pure_flush_or_evict': pure_flush_or_evict, 'untier_blob_md': untier_blob_md}
+    params = {'lvol_name': lvol_name, 'is_tiered': is_tiered, 'force_fetch': force_fetch, 'sync_fetch': sync_fetch, 'pure_flush_or_evict': pure_flush_or_evict, 'not_evict_blob_md': not_evict_blob_md}
     return client.call('bdev_lvol_set_tiering_info', params)
 
 def bdev_lvol_snapshot(
@@ -248,7 +248,7 @@ def bdev_lvol_snapshot(
     force_fetch=False,
     sync_fetch=False,
     pure_flush_or_evict=False,
-    untier_blob_md=0):
+    not_evict_blob_md=0):
     """Capture a snapshot of the current state of a logical volume.
 
     Args:
@@ -262,8 +262,8 @@ def bdev_lvol_snapshot(
         force_fetch: whether fetch requests (tiered reads) from this lvol are force fetch (fetch even into already unfetched data ranges)
         sync_fetch: whether regular client reads from this lvol need to wait synchronously for any of its unfetched ranges to be fetched
         pure_flush_or_evict: whether a tiered write should be pure flush (mode 1) or eviction (mode 0)
-        untier_blob_md: For blob-specific metadata: 1 means this blob's md should in fact be untiered (even if lvolstore md is tiered), 
-2 means this blob's md should be tiered even if lvolstore md is untiered, and 0 (default) means this blob's md has the same tiering status as lvolstore md
+        not_evict_blob_md: For blob-specific metadata: 1 means this blob's md should in fact be unevictable (even if lvolstore md is evictable), 
+2 means this blob's md should be evictable even if lvolstore md is unevictable, and 0 (default) means this blob's md has the same evictability status as lvolstore md
 
     Returns:
         Name of created logical volume snapshot.
@@ -275,7 +275,7 @@ def bdev_lvol_snapshot(
         'is_tiered': is_tiered,
         'force_fetch': force_fetch,
         'pure_flush_or_evict': pure_flush_or_evict,
-        'untier_blob_md': untier_blob_md
+        'not_evict_blob_md': not_evict_blob_md
     }
     return client.call('bdev_lvol_snapshot', params)
 
@@ -288,7 +288,7 @@ def bdev_lvol_clone(
     force_fetch=False,
     sync_fetch=False,
     pure_flush_or_evict=False,
-    untier_blob_md=0):
+    not_evict_blob_md=0):
     """Create a logical volume based on a snapshot.
 
     Args:
@@ -302,8 +302,8 @@ def bdev_lvol_clone(
         force_fetch: whether fetch requests (tiered reads) from this lvol are force fetch (fetch even into already unfetched data ranges)
         sync_fetch: whether regular client reads from this lvol need to wait synchronously for any of its unfetched ranges to be fetched
         pure_flush_or_evict: whether a tiered write should be pure flush (mode 1) or eviction (mode 0)
-        untier_blob_md: For blob-specific metadata: 1 means this blob's md should in fact be untiered (even if lvolstore md is tiered), 
-2 means this blob's md should be tiered even if lvolstore md is untiered, and 0 (default) means this blob's md has the same tiering status as lvolstore md
+        not_evict_blob_md: For blob-specific metadata: 1 means this blob's md should in fact be unevictable (even if lvolstore md is evictable), 
+2 means this blob's md should be tiered even if lvolstore md is unevictable, and 0 (default) means this blob's md has the same evictability status as lvolstore md
 
     Returns:
         Name of created logical volume clone.
@@ -315,7 +315,7 @@ def bdev_lvol_clone(
         'is_tiered': is_tiered,
         'force_fetch': force_fetch,
         'pure_flush_or_evict': pure_flush_or_evict,
-        'untier_blob_md': untier_blob_md
+        'not_evict_blob_md': not_evict_blob_md
     }
     return client.call('bdev_lvol_clone', params)
 
