@@ -162,12 +162,8 @@ bs_sequence_read_bs_dev(spdk_bs_sequence_t *seq, struct spdk_bs_dev *bs_dev,
 	uint64_t meta_lba = priority_lba;
 
 	if (!(tiering_bits & TIERED_BIT)) {
-		if (!(tiering_bits & METADATA_PAGE_BIT)) {
-			meta_lba |= (tiering_bits & SYNC_FETCH_BIT) ? SYNC_FETCH_MASK : 0; // data read may require sync fetch
-		} else 
-		{
-			meta_lba |= METADATA_PAGE_MASK;
-		}
+		meta_lba |= (tiering_bits & SYNC_FETCH_BIT) ? SYNC_FETCH_MASK : 0; // read may require sync fetch
+		meta_lba |= (tiering_bits & METADATA_PAGE_BIT) ? METADATA_PAGE_MASK : 0;
 	} else 
 	{
 		meta_lba |= TIERED_IO_MASK;
@@ -199,12 +195,8 @@ bs_sequence_read_dev(spdk_bs_sequence_t *seq, void *payload,
 	uint64_t meta_lba = priority_lba;
 
 	if (!(tiering_bits & TIERED_BIT)) {
-		if (!(tiering_bits & METADATA_PAGE_BIT)) {
-			meta_lba |= (tiering_bits & SYNC_FETCH_BIT) ? SYNC_FETCH_MASK : 0; // data read may require sync fetch
-		} else 
-		{
-			meta_lba |= METADATA_PAGE_MASK;
-		}
+		meta_lba |= (tiering_bits & SYNC_FETCH_BIT) ? SYNC_FETCH_MASK : 0; // read may require sync fetch
+		meta_lba |= (tiering_bits & METADATA_PAGE_BIT) ? METADATA_PAGE_MASK : 0;
 	} else 
 	{
 		meta_lba |= TIERED_IO_MASK;
@@ -274,12 +266,8 @@ bs_sequence_readv_bs_dev(spdk_bs_sequence_t *seq, struct spdk_bs_dev *bs_dev,
 	uint64_t meta_lba = priority_lba;
 
 	if (!(tiering_bits & TIERED_BIT)) {
-		if (!(tiering_bits & METADATA_PAGE_BIT)) {
-			meta_lba |= (tiering_bits & SYNC_FETCH_BIT) ? SYNC_FETCH_MASK : 0; // data read may require sync fetch
-		} else 
-		{
-			meta_lba |= METADATA_PAGE_MASK;
-		}
+		meta_lba |= (tiering_bits & SYNC_FETCH_BIT) ? SYNC_FETCH_MASK : 0; // read may require sync fetch
+		meta_lba |= (tiering_bits & METADATA_PAGE_BIT) ? METADATA_PAGE_MASK : 0;
 	} else 
 	{
 		meta_lba |= TIERED_IO_MASK;
@@ -316,12 +304,8 @@ bs_sequence_readv_dev(spdk_bs_sequence_t *seq, struct iovec *iov, int iovcnt,
 	uint64_t meta_lba = priority_lba;
 
 	if (!(tiering_bits & TIERED_BIT)) {
-		if (!(tiering_bits & METADATA_PAGE_BIT)) {
-			meta_lba |= (tiering_bits & SYNC_FETCH_BIT) ? SYNC_FETCH_MASK : 0; // data read may require sync fetch
-		} else 
-		{
-			meta_lba |= METADATA_PAGE_MASK;
-		}
+		meta_lba |= (tiering_bits & SYNC_FETCH_BIT) ? SYNC_FETCH_MASK : 0; // read may require sync fetch
+		meta_lba |= (tiering_bits & METADATA_PAGE_BIT) ? METADATA_PAGE_MASK : 0;
 	} else 
 	{
 		meta_lba |= TIERED_IO_MASK;
@@ -551,12 +535,8 @@ bs_batch_read_bs_dev(spdk_bs_batch_t *batch, struct spdk_bs_dev *bs_dev,
 	uint64_t meta_lba = priority_lba;
 
 	if (!(tiering_bits & TIERED_BIT)) {
-		if (!(tiering_bits & METADATA_PAGE_BIT)) {
-			meta_lba |= (tiering_bits & SYNC_FETCH_BIT) ? SYNC_FETCH_MASK : 0; // data read may require sync fetch
-		} else 
-		{
-			meta_lba |= METADATA_PAGE_MASK;
-		}
+		meta_lba |= (tiering_bits & SYNC_FETCH_BIT) ? SYNC_FETCH_MASK : 0; // read may require sync fetch
+		meta_lba |= (tiering_bits & METADATA_PAGE_BIT) ? METADATA_PAGE_MASK : 0;
 	} else 
 	{
 		meta_lba |= TIERED_IO_MASK;
@@ -586,12 +566,8 @@ bs_batch_read_dev(spdk_bs_batch_t *batch, void *payload,
 	uint64_t meta_lba = priority_lba;
 
 	if (!(tiering_bits & TIERED_BIT)) {
-		if (!(tiering_bits & METADATA_PAGE_BIT)) {
-			meta_lba |= (tiering_bits & SYNC_FETCH_BIT) ? SYNC_FETCH_MASK : 0; // data read may require sync fetch
-		} else 
-		{
-			meta_lba |= METADATA_PAGE_MASK;
-		}
+		meta_lba |= (tiering_bits & SYNC_FETCH_BIT) ? SYNC_FETCH_MASK : 0; // read may require sync fetch
+		meta_lba |= (tiering_bits & METADATA_PAGE_BIT) ? METADATA_PAGE_MASK : 0;
 	} else 
 	{
 		meta_lba |= TIERED_IO_MASK;
