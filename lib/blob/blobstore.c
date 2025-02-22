@@ -7068,7 +7068,6 @@ spdk_bs_init_persistent(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	struct spdk_bs_cpl	cpl;
 	spdk_bs_sequence_t	*seq;
 	spdk_bs_batch_t		*batch;
-	uint64_t		num_md_lba;
 	uint64_t		num_md_pages;
 	uint64_t		num_md_clusters;
 	uint64_t		max_used_cluster_mask_len;
@@ -7201,8 +7200,6 @@ spdk_bs_init_persistent(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	ctx->super->md_start = bs->md_start = num_md_pages;
 	ctx->super->md_len = bs->md_len;
 	num_md_pages += bs->md_len;
-
-	num_md_lba = bs_page_to_lba(bs, num_md_pages);
 
 	ctx->super->size = dev->blockcnt * dev->blocklen;
 
