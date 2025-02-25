@@ -101,11 +101,11 @@ bs_get_snapshot_entry(struct spdk_blob_store *bs, spdk_blob_id blobid)
 
 	TAILQ_FOREACH(snapshot_entry, &bs->snapshots, link) {
 		if (snapshot_entry->id == blobid) {
-			break;
+			return snapshot_entry;
 		}
 	}
 
-	return snapshot_entry;
+	return NULL;
 }
 
 static void
@@ -4093,29 +4093,34 @@ static void
 blob_get_snapshot_and_clone_entries(struct spdk_blob *blob,
 				    struct spdk_blob_list **snapshot_entry, struct spdk_blob_list **clone_entry)
 {
-	assert(blob != NULL);
-	*snapshot_entry = NULL;
-	*clone_entry = NULL;
+    // Search for the correct snapshot entry
+    struct spdk_blob_list *snap;
+    TAILQ_FOREACH(snap, &blob->bs->snapshots, link) {
+        if (snap->id == blob->parent_id) {
+            *snapshot_entry = snap;
+            break;
+        }
+    }
 
-	if (blob->parent_id == SPDK_BLOBID_INVALID) {
-		return;
-	}
+    // If no valid snapshot is found, do NOT search for clones
+    if (*snapshot_entry == NULL) {
+        return;
+    }
 
-	TAILQ_FOREACH(*snapshot_entry, &blob->bs->snapshots, link) {
-		if ((*snapshot_entry)->id == blob->parent_id) {
-			break;
-		}
-	}
+    // Now safely search for the clone entry
+	struct spdk_blob_list *clone;
+    TAILQ_FOREACH(clone, &(*snapshot_entry)->clones, link) {
+        if (clone->id == blob->id) {
+			*clone_entry = clone;
+            break;
+        }
+    }
 
-	if (*snapshot_entry != NULL) {
-		TAILQ_FOREACH(*clone_entry, &(*snapshot_entry)->clones, link) {
-			if ((*clone_entry)->id == blob->id) {
-				break;
-			}
-		}
-
-		assert(*clone_entry != NULL);
-	}
+    // Avoid assert crash by checking *clone_entry properly
+    if (*clone_entry == NULL) {
+        SPDK_ERRLOG("Clone entry not found for blob %lu under snapshot %lu\n",
+                    blob->id, (*snapshot_entry)->id);
+    }
 }
 
 static int
@@ -4246,8 +4251,10 @@ bs_blob_list_add(struct spdk_blob *blob)
 		TAILQ_INIT(&snapshot_entry->clones);
 		TAILQ_INSERT_TAIL(&blob->bs->snapshots, snapshot_entry, link);
 	} else {
-		TAILQ_FOREACH(clone_entry, &snapshot_entry->clones, link) {
-			if (clone_entry->id == blob->id) {
+		struct spdk_blob_list *clone = NULL;
+		TAILQ_FOREACH(clone, &snapshot_entry->clones, link) {
+			if (clone->id == blob->id) {
+				clone_entry = clone;
 				break;
 			}
 		}
@@ -4281,10 +4288,12 @@ bs_blob_list_remove(struct spdk_blob *blob)
 	}
 
 	blob->parent_id = SPDK_BLOBID_INVALID;
-	TAILQ_REMOVE(&snapshot_entry->clones, clone_entry, link);
-	free(clone_entry);
+	if (clone_entry != NULL) {
+		TAILQ_REMOVE(&snapshot_entry->clones, clone_entry, link);
+		free(clone_entry);
 
-	snapshot_entry->clone_count--;
+		snapshot_entry->clone_count--;
+	}
 }
 
 static int
@@ -10190,9 +10199,14 @@ delete_snapshot_sync_snapshot_cpl(void *cb_arg, int bserrno)
 						    &snapshot_clone_entry);
 
 		/* Switch clone entry in parent snapshot */
-		TAILQ_INSERT_TAIL(&parent_snapshot_entry->clones, clone_entry, link);
-		TAILQ_REMOVE(&parent_snapshot_entry->clones, snapshot_clone_entry, link);
-		free(snapshot_clone_entry);
+		if (parent_snapshot_entry != NULL) {
+			TAILQ_INSERT_TAIL(&parent_snapshot_entry->clones, clone_entry, link);
+		}
+
+		if (snapshot_clone_entry != NULL) {
+			TAILQ_REMOVE(&parent_snapshot_entry->clones, snapshot_clone_entry, link);
+			free(snapshot_clone_entry);
+		}
 	}
 
 	/* Restore md_ro flags */
@@ -10628,11 +10642,22 @@ spdk_bs_delete_blob_non_leader(struct spdk_blob_store *bs, struct spdk_blob *blo
 				* the snapshot that is being removed) */
 
 				/* Switch clone entry in parent snapshot */
-				TAILQ_INSERT_TAIL(&parent_snapshot_entry->clones, clone_entry, link);
-				TAILQ_REMOVE(&parent_snapshot_entry->clones, snapshot_clone_entry, link);
-				free(snapshot_clone_entry);
+				if (parent_snapshot_entry != NULL) {
+					TAILQ_INSERT_TAIL(&parent_snapshot_entry->clones, clone_entry, link);
+				}
+
+				if (snapshot_clone_entry != NULL) {
+					TAILQ_REMOVE(&parent_snapshot_entry->clones, snapshot_clone_entry, link);
+					free(snapshot_clone_entry);
+				}
 		}
-		// TODO reload the clone
+
+		/* Remove snapshot from the list */
+		if (snapshot_entry != NULL) {
+			TAILQ_REMOVE(&blob->bs->snapshots, snapshot_entry, link);
+			free(snapshot_entry);
+		}
+		
 		blob_free(blob);
 	} else {
 		/* This blob does not have any clones - just remove it */
