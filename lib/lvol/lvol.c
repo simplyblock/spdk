@@ -1157,7 +1157,7 @@ lvol_create_cb(void *cb_arg, spdk_blob_id blobid, int lvolerrno)
 		TAILQ_REMOVE(&req->lvol->lvol_store->pending_lvols, req->lvol, link);
 		lvol_free(req->lvol);
 		assert(req->cb_fn != NULL);
-		req->cb_fn(req->cb_arg, NULL, lvolerrno);
+		req->cb_fn(req->cb_arg, NULL, -EPERM);
 		free(req);
 		return;
 	}

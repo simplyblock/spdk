@@ -1601,7 +1601,7 @@ blob_load_backing_dev(spdk_bs_sequence_t *seq, void *cb_arg)
 			}
 			/* open snapshot blob and continue in the callback function */
 			blob->parent_id = *(spdk_blob_id *)value;
-			
+
 			if (ctx->status == SPDK_BLOB_UPDATE_FAILOVER) {
 				exist = blob_lookup(blob->bs, blob->parent_id);
 				if (exist) {
@@ -7569,7 +7569,8 @@ spdk_bs_copy_blob(struct spdk_blob_store *bs,
 	}
 	SPDK_NOTICELOG( "Copy blob 0x%" PRIx64 " ref: 0x%" PRIx32 " \n", blob->id, blob->open_ref);
 	tmp_blob->open_ref = blob->open_ref;
-	tmp_blob->parent_id = blob->parent_id;
+	tmp_blob->parent_id = blob->parent_id;	
+	tmp_blob->back_bs_dev = blob->back_bs_dev;
 	free(tmp_blob->active.pages);
 
 	// TODO no need for allocate buf for clean pages
@@ -9544,55 +9545,6 @@ bs_swap_blobs(struct spdk_blob *destblob, struct spdk_blob *srcblob)
 	xattrs_free(&srcblob->xattrs);
 	xattrs_free(&srcblob->xattrs_internal);
 
-	// TAILQ_FOREACH(xattr, &srcblob->xattrs, link) {
-	// 	new_xattr = calloc(1, sizeof(*new_xattr));
-	// 	// if (xattr == NULL) {
-	// 	// 	return -ENOMEM;
-	// 	// }
-	// 	new_xattr->name = malloc(strlen(xattr->name) + 1);
-	// 	// if (xattr->name == NULL) {
-	// 	// 	free(xattr);
-	// 	// 	return -ENOMEM;
-	// 	// }
-
-	// 	new_xattr->value = malloc(xattr->value_len);
-	// 	// if (xattr->value == NULL) {
-	// 	// 	free(xattr->name);
-	// 	// 	free(xattr);
-	// 	// 	return -ENOMEM;
-	// 	// }
-	// 	new_xattr->value_len = xattr->value_len;
-	// 	memcpy(new_xattr->name, xattr->name, strlen(xattr->name));
-	// 	new_xattr->name[strlen(xattr->name)] = '\0';
-	// 	memcpy(new_xattr->value, xattr->value, xattr->value_len);
-	// 	TAILQ_INSERT_TAIL(&destblob->xattrs, new_xattr, link);
-	// }
-
-	// TAILQ_FOREACH(xattr, &srcblob->xattrs_internal, link) {
-	// 	new_xattr = calloc(1, sizeof(*new_xattr));
-	// 	// if (xattr == NULL) {
-	// 	// 	return -ENOMEM;
-	// 	// }
-	// 	new_xattr->name = malloc(strlen(xattr->name) + 1);
-	// 	// if (xattr->name == NULL) {
-	// 	// 	free(xattr);
-	// 	// 	return -ENOMEM;
-	// 	// }
-
-	// 	new_xattr->value = malloc(xattr->value_len);
-	// 	// if (xattr->value == NULL) {
-	// 	// 	free(xattr->name);
-	// 	// 	free(xattr);
-	// 	// 	return -ENOMEM;
-	// 	// }
-
-	// 	new_xattr->value_len = xattr->value_len;
-	// 	memcpy(new_xattr->name, xattr->name, strlen(xattr->name));
-	// 	new_xattr->name[strlen(xattr->name)] = '\0';
-	// 	memcpy(new_xattr->value, xattr->value, xattr->value_len);
-	// 	TAILQ_INSERT_TAIL(&destblob->xattrs_internal, new_xattr, link);
-	// }
-
 	destblob->state = srcblob->state;
 
 	//swap active pages
@@ -10563,6 +10515,7 @@ spdk_bs_delete_blob_non_leader(struct spdk_blob_store *bs, struct spdk_blob *blo
 	int bserrno = bs_is_blob_deletable(blob, &update_clone);
 	if (bserrno) {
 		SPDK_ERRLOG("Cannot remove blob in state nonleader.\n");
+		blob->back_bs_dev = NULL;
 		blob_free(blob);
 		// spdk_blob_close(blob, delete_blob_cleanup_finish, ctx);
 		return -1;
@@ -10570,6 +10523,7 @@ spdk_bs_delete_blob_non_leader(struct spdk_blob_store *bs, struct spdk_blob *blo
 
 	if (blob->locked_operation_in_progress) {
 		SPDK_DEBUGLOG(blob, "Cannot remove blob - another operation in progress\n");
+		blob->back_bs_dev = NULL;
 		blob_free(blob);
 		// spdk_blob_close(blob, delete_blob_cleanup_finish, ctx);
 		return -EBUSY;
@@ -10657,7 +10611,7 @@ spdk_bs_delete_blob_non_leader(struct spdk_blob_store *bs, struct spdk_blob *blo
 			TAILQ_REMOVE(&blob->bs->snapshots, snapshot_entry, link);
 			free(snapshot_entry);
 		}
-		
+		blob->back_bs_dev = NULL;
 		blob_free(blob);
 	} else {
 		/* This blob does not have any clones - just remove it */
@@ -10696,6 +10650,7 @@ spdk_bs_delete_blob_non_leader(struct spdk_blob_store *bs, struct spdk_blob *blo
 		}
 
 		spdk_spin_unlock(&bs->used_lock);
+		blob->back_bs_dev = NULL;
 		blob_free(blob);
 	}
 	return 0;
