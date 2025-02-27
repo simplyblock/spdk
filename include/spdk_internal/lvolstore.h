@@ -104,6 +104,12 @@ struct spdk_lvol_bs_dev_req {
 
 struct spdk_lvs_degraded_lvol_set;
 
+struct spdk_pending_iorsp {
+	struct spdk_bdev_io *bdev_io;
+	struct spdk_thread	*thread;
+	TAILQ_ENTRY(spdk_pending_iorsp)	entry;
+};
+
 struct spdk_lvol_store {
 	struct spdk_bs_dev		*bs_dev;
 	struct spdk_blob_store		*blobstore;
@@ -116,6 +122,8 @@ struct spdk_lvol_store {
 	TAILQ_HEAD(, spdk_lvol)		pending_lvols;
 	TAILQ_HEAD(, spdk_lvol)		retry_open_lvols;
 	TAILQ_HEAD(, spdk_lvol)		pending_update_lvols;
+	TAILQ_HEAD(, spdk_pending_iorsp)   pending_iorsp;
+	bool				queue_failed_rsp;
 	bool				load_esnaps;
 	bool				on_list;
 	TAILQ_ENTRY(spdk_lvol_store)	link;

@@ -55,6 +55,7 @@ DEFINE_STUB(spdk_bdev_get_memory_domains, int, (struct spdk_bdev *bdev,
 DEFINE_STUB(spdk_blob_get_esnap_id, int,
 	    (struct spdk_blob *blob, const void **id, size_t *len), -ENOTSUP);
 DEFINE_STUB(spdk_blob_is_esnap_clone, bool, (const struct spdk_blob *blob), false);
+DEFINE_STUB(spdk_lvs_queued_rsp, bool, (struct spdk_lvol_store *lvs, struct spdk_bdev_io *bdev_io), false);
 DEFINE_STUB(spdk_lvol_iter_immediate_clones, int,
 	    (struct spdk_lvol *lvol, spdk_lvol_iter_cb cb_fn, void *cb_arg), -ENOTSUP);
 DEFINE_STUB(spdk_lvs_esnap_missing_add, int,

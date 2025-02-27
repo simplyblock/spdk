@@ -29,6 +29,7 @@ struct spdk_lvs_degraded_lvol_set {
 
 static TAILQ_HEAD(, spdk_lvol_store) g_lvol_stores = TAILQ_HEAD_INITIALIZER(g_lvol_stores);
 static pthread_mutex_t g_lvol_stores_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_lvs_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static inline int lvs_opts_copy(const struct spdk_lvs_opts *src, struct spdk_lvs_opts *dst);
 static int lvs_esnap_bs_dev_create(void *bs_ctx, void *blob_ctx, struct spdk_blob *blob,
@@ -76,6 +77,8 @@ lvs_alloc(void)
 	TAILQ_INIT(&lvs->pending_lvols);
 	TAILQ_INIT(&lvs->retry_open_lvols);
 	TAILQ_INIT(&lvs->pending_update_lvols);
+	TAILQ_INIT(&lvs->pending_iorsp);
+	lvs->queue_failed_rsp = false;
 
 	lvs->load_esnaps = false;
 	lvs->leader = false;
@@ -2762,6 +2765,52 @@ block_port(int port) {
 	}
 }
 
+bool
+spdk_lvs_queued_rsp(struct spdk_lvol_store *lvs, struct spdk_bdev_io *bdev_io)
+{
+	struct spdk_pending_iorsp *qrsp;
+	pthread_mutex_lock(&g_lvs_queue_mutex);
+	if (lvs->queue_failed_rsp) {
+		qrsp = calloc(1, sizeof(*qrsp));
+		if (!qrsp) {
+			SPDK_ERRLOG("Cannot allocate memory for qrsp.\n");
+			pthread_mutex_unlock(&g_lvs_queue_mutex);
+			return false;
+		}
+		qrsp->bdev_io = bdev_io;
+		qrsp->thread = spdk_get_thread();
+		TAILQ_INSERT_TAIL(&lvs->pending_iorsp, qrsp, entry);
+		pthread_mutex_unlock(&g_lvs_queue_mutex);
+		return true;
+	}
+	pthread_mutex_unlock(&g_lvs_queue_mutex);
+	return false;
+}
+
+static void
+lvol_op_comp_dequeue(void *cb_arg)
+{
+	struct spdk_bdev_io *bdev_io = cb_arg;
+	struct spdk_lvol *lvol = bdev_io->bdev->ctxt;
+
+	SPDK_NOTICELOG("Unfreeze failed IO blob: %" PRIu64 " LBA: %" PRIu64 " CNT %" PRIu64 " type %d \n",
+				lvol->blob_id, bdev_io->u.bdev.offset_blocks, bdev_io->u.bdev.num_blocks, bdev_io->type);
+
+	spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+}
+
+static void
+spdk_lvs_dequeu_rsp(struct spdk_lvol_store *lvs)
+{
+	struct spdk_pending_iorsp *qrsp, *tmp;
+	TAILQ_FOREACH_SAFE(qrsp, &lvs->pending_iorsp, entry, tmp) {
+		assert(qrsp != NULL);
+		TAILQ_REMOVE(&lvs->pending_iorsp, qrsp, entry); // Remove it from the queue.
+		spdk_thread_send_msg(qrsp->thread, lvol_op_comp_dequeue, qrsp->bdev_io);
+		free(qrsp);
+	}
+}
+
 static void
 spdk_lvs_unfreeze_on_conflict(struct spdk_lvol_store *lvs)
 {
@@ -2769,19 +2818,27 @@ spdk_lvs_unfreeze_on_conflict(struct spdk_lvol_store *lvs)
 
 	pthread_mutex_lock(&g_lvol_stores_mutex);
 	block_port(lvs->subsystem_port);
+
+	pthread_mutex_lock(&g_lvs_queue_mutex);
+	lvs->queue_failed_rsp = false;
+	pthread_mutex_unlock(&g_lvs_queue_mutex);
+
 	lvs->update_in_progress = false;
 	lvs->failed_on_update = false;
 	lvs->leadership_timeout = spdk_get_ticks();
 	lvs->timeout_trigger = 1;
 	lvs->leader = false;
+
 	spdk_bs_set_leader(lvs->blobstore, false);
+
 	TAILQ_FOREACH(lvol, &lvs->lvols, link) {
 		lvol->leader = false;
 		lvol->update_in_progress = false;
 	}
-	pthread_mutex_unlock(&g_lvol_stores_mutex);
 
-	//TODO create new function to unfreeze all the lvols
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+	spdk_lvs_dequeu_rsp(lvs);
+
 	SPDK_NOTICELOG("Starting unfreeze the lvols.\n");
 	spdk_lvs_unfreeze_on_conflict_msg(lvs->blobstore);
 }
@@ -2854,22 +2911,32 @@ spdk_lvs_change_leader_state(uint64_t groupid)
 	SPDK_NOTICELOG("Attempting to change leadership state internally groupid %" PRIu64 ".\n", groupid);
 	pthread_mutex_lock(&g_lvol_stores_mutex);
 	TAILQ_FOREACH(lvs, &g_lvol_stores, link) {
-		if ((lvs->groupid == groupid || groupid == 0) && lvs->leader) {			
+		if ((lvs->groupid == groupid || groupid == 0) && lvs->leader) {
+			lvs->queue_failed_rsp = true;
 			if (spdk_blob_freeze_on_conflict_send_msg(lvs->blobstore,
 					spdk_lvs_conflict_signal, lvs)) {
 				block_port(lvs->subsystem_port);
+
+				pthread_mutex_lock(&g_lvs_queue_mutex);
+				lvs->queue_failed_rsp = false;
+				pthread_mutex_unlock(&g_lvs_queue_mutex);
+
 				lvs->update_in_progress = false;
 				lvs->failed_on_update = false;
 				lvs->leadership_timeout = spdk_get_ticks();
 				lvs->timeout_trigger = 1;
 				lvs->leader = false;
+
 				spdk_bs_set_leader(lvs->blobstore, false);
+
 				TAILQ_FOREACH(lvol, &lvs->lvols, link) {
 					lvol->leader = false;
 					lvol->update_in_progress = false;
 				}
+
+				spdk_lvs_dequeu_rsp(lvs);
 			}
-			SPDK_NOTICELOG("Leadership state changed internally to false. Timeout has been set.\n");				
+			SPDK_NOTICELOG("Leadership state changed internally to false. Timeout has been set.\n");
 		}
 	}
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
