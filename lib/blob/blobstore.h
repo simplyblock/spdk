@@ -204,8 +204,8 @@ struct spdk_blob {
 	are on the same array to safely flush data before metadata and less 
 	sensitive metadata before other metadata. 
 
-	However, the very first non-extent page must be the last md page to be flushed. 
-	For convenience sake, we'll just flush both types of md pages in reverse order.
+	However, extent pages and md pages are implicitly ordered like a linked list, so 
+	we must flush them one md cluster at a time in reverse order.
 	*/
 	uint64_t next_idx_in_array;
 
