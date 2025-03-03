@@ -14102,8 +14102,7 @@ blob_search_for_new_flush_job(struct spdk_blob *blob, struct t_flush_job *job) {
 				++blob->current_array_ordinal;
 				blob->next_idx_in_array = blob->active.extent_pages_array_size - 1; // next array is extent pages array
 			}
-		} else if (blob->current_array_ordinal <= 2 && blob->nflush_jobs_current == 0) // no parallelism allowed on md
-		{
+		} else if (blob->current_array_ordinal <= 2) {
 			job->is_md_job = true;
 
 			uint32_t *page_idxs_arr = blob->current_array_ordinal == 1 ? blob->active.extent_pages : blob->active.pages;
@@ -14128,10 +14127,6 @@ blob_search_for_new_flush_job(struct spdk_blob *blob, struct t_flush_job *job) {
 				++blob->current_array_ordinal;
 				blob->next_idx_in_array = blob->active.num_pages - 1; // next array after extent pages array is pages array
 			}
-		} else if (job->buf) // job will never be done again, free its buffer to save memory
-		{
-			spdk_free(job->buf);
-			job->buf = NULL;
 		}
 	}
 	return 0;
