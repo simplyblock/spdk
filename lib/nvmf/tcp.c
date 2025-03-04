@@ -240,6 +240,8 @@ struct spdk_nvmf_tcp_req  {
 	 * h2c_offset is used when we receive the h2c_data PDU.
 	 */
 	uint32_t				h2c_offset;
+	uint64_t				time;
+	bool					loged;
 
 	STAILQ_ENTRY(spdk_nvmf_tcp_req)		link;
 	TAILQ_ENTRY(spdk_nvmf_tcp_req)		state_link;
@@ -2859,6 +2861,16 @@ nvmf_tcp_check_fused_ordering(struct spdk_nvmf_tcp_transport *ttransport,
 	}
 }
 
+static void check_time(struct spdk_nvmf_tcp_req *tcp_req) {
+	if (!tcp_req->loged && tcp_req->time) {
+		if (spdk_get_ticks() - tcp_req->time > spdk_get_ticks_hz() * 2){
+			SPDK_NOTICELOG("tcp_req ttag %d, tcp_req \n", tcp_req->ttag);
+			tcp_req->loged = false;
+		}
+	}
+}
+
+
 static bool
 nvmf_tcp_req_process(struct spdk_nvmf_tcp_transport *ttransport,
 		     struct spdk_nvmf_tcp_req *tcp_req)
@@ -2899,6 +2911,7 @@ nvmf_tcp_req_process(struct spdk_nvmf_tcp_transport *ttransport,
 		case TCP_REQUEST_STATE_NEW:
 			spdk_trace_record(TRACE_TCP_REQUEST_STATE_NEW, tqpair->qpair.trace_id, 0, (uintptr_t)tcp_req,
 					  tqpair->qpair.queue_depth);
+			tcp_req->time = spdk_get_ticks();
 
 			/* copy the cmd from the receive pdu */
 			tcp_req->cmd = tqpair->pdu_in_progress->hdr.capsule_cmd.ccsqe;
@@ -2947,6 +2960,7 @@ nvmf_tcp_req_process(struct spdk_nvmf_tcp_transport *ttransport,
 		case TCP_REQUEST_STATE_NEED_BUFFER:
 			spdk_trace_record(TRACE_TCP_REQUEST_STATE_NEED_BUFFER, tqpair->qpair.trace_id, 0,
 					  (uintptr_t)tcp_req);
+			check_time(tcp_req);
 
 			assert(tcp_req->req.xfer != SPDK_NVME_DATA_NONE);
 
@@ -3013,10 +3027,12 @@ nvmf_tcp_req_process(struct spdk_nvmf_tcp_transport *ttransport,
 					  (uintptr_t)tcp_req);
 			/* Some external code must kick a request into  TCP_REQUEST_STATE_ZCOPY_START_COMPLETED
 			 * to escape this state. */
+			check_time(tcp_req);
 			break;
 		case TCP_REQUEST_STATE_ZCOPY_START_COMPLETED:
 			spdk_trace_record(TRACE_TCP_REQUEST_STATE_ZCOPY_START_COMPLETED, tqpair->qpair.trace_id, 0,
 					  (uintptr_t)tcp_req);
+			check_time(tcp_req);
 			if (spdk_unlikely(spdk_nvme_cpl_is_error(&tcp_req->req.rsp->nvme_cpl))) {
 				SPDK_DEBUGLOG(nvmf_tcp, "Zero-copy start failed for tcp_req(%p) on tqpair=%p\n",
 					      tcp_req, tqpair);
@@ -3033,6 +3049,7 @@ nvmf_tcp_req_process(struct spdk_nvmf_tcp_transport *ttransport,
 		case TCP_REQUEST_STATE_AWAITING_R2T_ACK:
 			spdk_trace_record(TRACE_TCP_REQUEST_STATE_AWAIT_R2T_ACK, tqpair->qpair.trace_id, 0,
 					  (uintptr_t)tcp_req);
+			check_time(tcp_req);
 			/* The R2T completion or the h2c data incoming will kick it out of this state. */
 			break;
 		case TCP_REQUEST_STATE_TRANSFERRING_HOST_TO_CONTROLLER:
@@ -3041,10 +3058,12 @@ nvmf_tcp_req_process(struct spdk_nvmf_tcp_transport *ttransport,
 					  0, (uintptr_t)tcp_req);
 			/* Some external code must kick a request into TCP_REQUEST_STATE_READY_TO_EXECUTE
 			 * to escape this state. */
+			check_time(tcp_req);
 			break;
 		case TCP_REQUEST_STATE_READY_TO_EXECUTE:
 			spdk_trace_record(TRACE_TCP_REQUEST_STATE_READY_TO_EXECUTE, tqpair->qpair.trace_id, 0,
 					  (uintptr_t)tcp_req);
+			check_time(tcp_req);
 
 			if (spdk_unlikely(tcp_req->req.dif_enabled)) {
 				assert(tcp_req->req.dif.elba_length >= tcp_req->req.length);
@@ -3112,12 +3131,14 @@ nvmf_tcp_req_process(struct spdk_nvmf_tcp_transport *ttransport,
 			spdk_trace_record(TRACE_TCP_REQUEST_STATE_EXECUTING, tqpair->qpair.trace_id, 0, (uintptr_t)tcp_req);
 			/* Some external code must kick a request into TCP_REQUEST_STATE_EXECUTED
 			 * to escape this state. */
+			check_time(tcp_req);
 			break;
 		case TCP_REQUEST_STATE_AWAITING_ZCOPY_COMMIT:
 			spdk_trace_record(TRACE_TCP_REQUEST_STATE_AWAIT_ZCOPY_COMMIT, tqpair->qpair.trace_id, 0,
 					  (uintptr_t)tcp_req);
 			/* Some external code must kick a request into TCP_REQUEST_STATE_EXECUTED
 			 * to escape this state. */
+			check_time(tcp_req);
 			break;
 		case TCP_REQUEST_STATE_EXECUTED:
 			spdk_trace_record(TRACE_TCP_REQUEST_STATE_EXECUTED, tqpair->qpair.trace_id, 0, (uintptr_t)tcp_req);
@@ -3125,12 +3146,14 @@ nvmf_tcp_req_process(struct spdk_nvmf_tcp_transport *ttransport,
 			if (spdk_unlikely(tcp_req->req.dif_enabled)) {
 				tcp_req->req.length = tcp_req->req.dif.orig_length;
 			}
-
+			check_time(tcp_req);
 			nvmf_tcp_req_set_state(tcp_req, TCP_REQUEST_STATE_READY_TO_COMPLETE);
 			break;
 		case TCP_REQUEST_STATE_READY_TO_COMPLETE:
 			spdk_trace_record(TRACE_TCP_REQUEST_STATE_READY_TO_COMPLETE, tqpair->qpair.trace_id, 0,
 					  (uintptr_t)tcp_req);
+			check_time(tcp_req);
+			tcp_req->time = 0;
 			if (request_transfer_out(&tcp_req->req) != 0) {
 				assert(0); /* No good way to handle this currently */
 			}
@@ -3140,12 +3163,14 @@ nvmf_tcp_req_process(struct spdk_nvmf_tcp_transport *ttransport,
 					  0, (uintptr_t)tcp_req);
 			/* Some external code must kick a request into TCP_REQUEST_STATE_COMPLETED
 			 * to escape this state. */
+			check_time(tcp_req);
 			break;
 		case TCP_REQUEST_STATE_AWAITING_ZCOPY_RELEASE:
 			spdk_trace_record(TRACE_TCP_REQUEST_STATE_AWAIT_ZCOPY_RELEASE, tqpair->qpair.trace_id, 0,
 					  (uintptr_t)tcp_req);
 			/* Some external code must kick a request into TCP_REQUEST_STATE_COMPLETED
 			 * to escape this state. */
+			check_time(tcp_req);
 			break;
 		case TCP_REQUEST_STATE_COMPLETED:
 			spdk_trace_record(TRACE_TCP_REQUEST_STATE_COMPLETED, tqpair->qpair.trace_id, 0, (uintptr_t)tcp_req,
@@ -3153,6 +3178,7 @@ nvmf_tcp_req_process(struct spdk_nvmf_tcp_transport *ttransport,
 			/* If there's an outstanding PDU sent to the host, the request is completed
 			 * due to the qpair being disconnected.  We must delay the completion until
 			 * that write is done to avoid freeing the request twice. */
+			check_time(tcp_req);
 			if (spdk_unlikely(tcp_req->pdu_in_use)) {
 				SPDK_DEBUGLOG(nvmf_tcp, "Delaying completion due to outstanding "
 					      "write on req=%p\n", tcp_req);

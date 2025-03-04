@@ -1664,14 +1664,35 @@ nvmf_subsystem_update_ns(struct spdk_nvmf_subsystem *subsystem,
 	return 0;
 }
 
+struct subsystem_ns_change_ctx_v2 {
+	// struct spdk_nvmf_subsystem		*subsystem;
+	uint32_t nsid;
+	struct spdk_nvmf_ctrlr *ctrlr;
+	// spdk_nvmf_subsystem_state_change_done	cb_fn;
+	// uint32_t				nsid;
+};
+
+
+static void
+nvmf_subsystem_ns_changed_v2(void *cb_arg)
+{
+	struct subsystem_ns_change_ctx_v2 *ctx = cb_arg;		
+	nvmf_ctrlr_ns_changed(ctx->ctrlr, ctx->nsid);
+	free(ctx);
+}
+
 static void
 nvmf_subsystem_ns_changed(struct spdk_nvmf_subsystem *subsystem, uint32_t nsid)
 {
 	struct spdk_nvmf_ctrlr *ctrlr;
-
+	struct subsystem_ns_change_ctx_v2 *ctx;
+	ctx = calloc(1, sizeof(struct subsystem_ns_change_ctx_v2));
 	TAILQ_FOREACH(ctrlr, &subsystem->ctrlrs, link) {
 		if (nvmf_ctrlr_ns_is_visible(ctrlr, nsid)) {
-			nvmf_ctrlr_ns_changed(ctrlr, nsid);
+			ctx->nsid = nsid;
+			ctx->ctrlr = ctrlr;
+			spdk_thread_send_msg(ctrlr->thread, nvmf_subsystem_ns_changed_v2, ctx);
+			// nvmf_ctrlr_ns_changed(ctrlr, nsid);
 		}
 	}
 }
@@ -1822,8 +1843,9 @@ static void
 _nvmf_ns_resize(struct spdk_nvmf_subsystem *subsystem, void *cb_arg, int status)
 {
 	struct subsystem_ns_change_ctx *ctx = cb_arg;
-
+	SPDK_NOTICELOG("starting to change the ns list.\n");
 	nvmf_subsystem_ns_changed(subsystem, ctx->nsid);
+	SPDK_NOTICELOG("ns list changed and resume the subsystem.\n");
 	if (spdk_nvmf_subsystem_resume(subsystem, NULL, NULL) != 0) {
 		SPDK_ERRLOG("Failed to resume NVME-oF subsystem with id: %u\n", subsystem->id);
 	}
