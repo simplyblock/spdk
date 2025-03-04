@@ -25,7 +25,7 @@
 
 #define BLOB_CRC32C_INITIAL    0xffffffffUL
 
-#define SNAPSHOT_BACKUP_POLLER_US 3
+#define SNAPSHOT_BACKUP_POLLER_US 50
 
 static int bs_register_md_thread(struct spdk_blob_store *bs);
 static int bs_unregister_md_thread(struct spdk_blob_store *bs);
