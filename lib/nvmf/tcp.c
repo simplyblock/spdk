@@ -531,12 +531,12 @@ nvmf_tcp_dump_qpair_req_contents(struct spdk_nvmf_tcp_qpair *tqpair)
 	SPDK_ERRLOG("Dumping contents of queue pair (QID %d)\n", tqpair->qpair.qid);
 	for (i = 1; i < TCP_REQUEST_NUM_STATES; i++) {
 		SPDK_ERRLOG("\tNum of requests in state[%d] = %u\n", i, tqpair->state_cntr[i]);
-		TAILQ_FOREACH(tcp_req, &tqpair->tcp_req_working_queue, state_link) {
-			if ((int)tcp_req->state == i) {
-				SPDK_ERRLOG("\t\tRequest Data From Pool: %d\n", tcp_req->req.data_from_pool);
-				SPDK_ERRLOG("\t\tRequest opcode: %d\n", tcp_req->req.cmd->nvmf_cmd.opcode);
-			}
-		}
+		// TAILQ_FOREACH(tcp_req, &tqpair->tcp_req_working_queue, state_link) {
+		// 	if ((int)tcp_req->state == i) {
+		// 		SPDK_ERRLOG("\t\tRequest Data From Pool: %d\n", tcp_req->req.data_from_pool);
+		// 		SPDK_ERRLOG("\t\tRequest opcode: %d\n", tcp_req->req.cmd->nvmf_cmd.opcode);
+		// 	}
+		// }
 	}
 }
 
