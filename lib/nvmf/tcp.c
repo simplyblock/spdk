@@ -526,18 +526,31 @@ static void
 nvmf_tcp_dump_qpair_req_contents(struct spdk_nvmf_tcp_qpair *tqpair)
 {
 	int i;
-	struct spdk_nvmf_tcp_req *tcp_req;
+	// struct spdk_nvmf_tcp_req *tcp_req;
 
-	SPDK_ERRLOG("Dumping contents of queue pair (QID %d)\n", tqpair->qpair.qid);
-	for (i = 1; i < TCP_REQUEST_NUM_STATES; i++) {
-		SPDK_ERRLOG("\tNum of requests in state[%d] = %u\n", i, tqpair->state_cntr[i]);
+	// SPDK_ERRLOG("Dumping contents of queue pair (QID %d)\n", tqpair->qpair.qid);
+	// for (i = 1; i < TCP_REQUEST_NUM_STATES; i++) {
+	// 	SPDK_ERRLOG("\tNum of requests in state[%d] = %u\n", i, tqpair->state_cntr[i]);
 		// TAILQ_FOREACH(tcp_req, &tqpair->tcp_req_working_queue, state_link) {
 		// 	if ((int)tcp_req->state == i) {
 		// 		SPDK_ERRLOG("\t\tRequest Data From Pool: %d\n", tcp_req->req.data_from_pool);
 		// 		SPDK_ERRLOG("\t\tRequest opcode: %d\n", tcp_req->req.cmd->nvmf_cmd.opcode);
 		// 	}
 		// }
+	// }
+
+	char buf[1024]; // Adjust the size as necessary
+	int offset = 0;
+
+	// Build the string with all states
+	offset += snprintf(buf + offset, sizeof(buf) - offset, "Dumping (QID %d): ", tqpair->qpair.qid);
+	for (i = 1; i < TCP_REQUEST_NUM_STATES; i++) {
+		offset += snprintf(buf + offset, sizeof(buf) - offset, "[%d]=%u ", i, tqpair->state_cntr[i]);
 	}
+
+	// Print the entire string in one line
+	SPDK_ERRLOG("%s \n", buf);
+
 }
 
 static void
@@ -2863,14 +2876,51 @@ nvmf_tcp_check_fused_ordering(struct spdk_nvmf_tcp_transport *ttransport,
 	}
 }
 
+static const char *
+nvme_command_string(uint16_t value)
+{
+	switch (value) {
+	case SPDK_NVME_OPC_WRITE:
+		return "WRITE";
+	case SPDK_NVME_OPC_READ:
+		return "READ";
+	case SPDK_NVME_OPC_WRITE_ZEROES:
+		return "WRITE ZEROES";
+	case SPDK_NVME_OPC_COMPARE:
+		return "COMPARE";
+	case SPDK_NVME_OPC_FLUSH:
+		return "FLUSH";
+	case SPDK_NVME_OPC_WRITE_UNCORRECTABLE:
+		return "WRITE UNCORRECTABLE";
+	case SPDK_NVME_OPC_DATASET_MANAGEMENT:
+		return "DATASET MANAGEMENT";
+	case SPDK_NVME_OPC_RESERVATION_REGISTER:
+		return "RESERVATION REGISTER";
+	case SPDK_NVME_OPC_RESERVATION_REPORT:
+		return "RESERVATION REPORT";
+	case SPDK_NVME_OPC_RESERVATION_RELEASE:
+		return "RESERVATION RELEASE";
+	case SPDK_NVME_OPC_RESERVATION_ACQUIRE:
+		return "RESERVATION ACQUIRE";
+	default:
+		return "IO COMMAND";
+	}
+}
+
 static void 
 check_time(struct spdk_nvmf_tcp_req *tcp_req, struct spdk_nvmf_tcp_qpair *tqpair) {
 	if (!tcp_req->loged && tcp_req->time && (tqpair->target_port <= 9099 && tqpair->target_port >= 9090)) {
-		if (((spdk_get_ticks() - tcp_req->time) > spdk_get_ticks_hz() * 2) && tqpair->qpair.qid) {		
-			SPDK_NOTICELOG("tcp_req ttag %d (QID %d) cport %d sport %d\n", tcp_req->ttag, tqpair->qpair.qid, tqpair->initiator_port, tqpair->target_port);
-			spdk_nvmf_request_nqn(&tcp_req->req);
-			spdk_nvme_print_command_s(tqpair->qpair.qid, &tcp_req->cmd);
-			if (tqpair->qpair.qid && ((spdk_get_ticks() - tqpair->time) > spdk_get_ticks_hz() * 15)) {
+		if (((spdk_get_ticks() - tcp_req->time) > spdk_get_ticks_hz() * 2) && tqpair->qpair.qid) {
+			char *uuid = spdk_nvmf_request_nqn(&tcp_req->req);
+			if (!uuid) {
+				uuid = "";
+			}
+			SPDK_NOTICELOG("ttag %d (QID %d) cp %d sp %d, cmd %s, nqn %s\n", 
+				tcp_req->ttag, tqpair->qpair.qid, tqpair->initiator_port,
+				tqpair->target_port, nvme_command_string(tcp_req->cmd.opc), uuid);
+			// spdk_nvmf_request_nqn(&tcp_req->req);
+			// spdk_nvme_print_command_s(tqpair->qpair.qid, &tcp_req->cmd);
+			if (tqpair->qpair.qid && ((spdk_get_ticks() - tqpair->time) > spdk_get_ticks_hz() * 15)) {	
 				nvmf_tcp_dump_qpair_req_contents(tqpair);
 				tqpair->time = spdk_get_ticks();
 			}
@@ -2878,7 +2928,6 @@ check_time(struct spdk_nvmf_tcp_req *tcp_req, struct spdk_nvmf_tcp_qpair *tqpair
 		}
 	}
 }
-
 
 static bool
 nvmf_tcp_req_process(struct spdk_nvmf_tcp_transport *ttransport,

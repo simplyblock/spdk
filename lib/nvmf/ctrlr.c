@@ -4713,7 +4713,7 @@ nvmf_check_qpair_active(struct spdk_nvmf_request *req)
 	return false;
 }
 
-void
+char *
 spdk_nvmf_request_nqn(struct spdk_nvmf_request *req)
 {
 	struct spdk_nvmf_qpair *qpair = req->qpair;
@@ -4721,9 +4721,10 @@ spdk_nvmf_request_nqn(struct spdk_nvmf_request *req)
 	if (qpair->ctrlr && qpair->qid != 0) {
 		ctrlr = qpair->ctrlr;
 		if (ctrlr->subsys) {
-			SPDK_NOTICELOG(" subnqn: \"%s\"\n", ctrlr->subsys->subnqn);
+			return &ctrlr->subsys->subnqn[67];
 		}
 	}
+	return NULL;
 }
 
 
