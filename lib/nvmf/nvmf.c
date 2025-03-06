@@ -1575,6 +1575,13 @@ poll_group_update_subsystem(struct spdk_nvmf_poll_group *group,
 				      group,
 				      ns_info->num_blocks,
 				      spdk_bdev_get_num_blocks(ns->bdev));
+			SPDK_NOTICELOG("Namespace resized: subsystem_id %u,"
+				      " nsid %u, pg %p, old %" PRIu64 ", new %" PRIu64 "\n",
+				      subsystem->id,
+				      ns->nsid,
+				      group,
+				      ns_info->num_blocks,
+				      spdk_bdev_get_num_blocks(ns->bdev));
 			ns_changed = true;
 		}
 
@@ -1613,6 +1620,7 @@ poll_group_update_subsystem(struct spdk_nvmf_poll_group *group,
 				continue;
 			}
 			if (ctrlr->admin_qpair->group == group) {
+				SPDK_NOTICELOG("Namespace resized: send aer request.\n");
 				nvmf_ctrlr_async_event_ns_notice(ctrlr);
 				nvmf_ctrlr_async_event_ana_change_notice(ctrlr);
 			}

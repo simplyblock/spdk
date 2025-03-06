@@ -3733,18 +3733,25 @@ nvmf_ctrlr_process_admin_cmd(struct spdk_nvmf_request *req)
 
 	switch (cmd->opc) {
 	case SPDK_NVME_OPC_GET_LOG_PAGE:
+		SPDK_NOTICELOG("admin qpair - 2 \n");
 		return nvmf_ctrlr_get_log_page(req);
 	case SPDK_NVME_OPC_IDENTIFY:
+		SPDK_NOTICELOG("admin qpair - 3 \n");
 		return nvmf_ctrlr_identify(req);
 	case SPDK_NVME_OPC_ABORT:
+		SPDK_NOTICELOG("admin qpair - 4 \n");
 		return nvmf_ctrlr_abort(req);
 	case SPDK_NVME_OPC_GET_FEATURES:
+		SPDK_NOTICELOG("admin qpair - 5 \n");
 		return nvmf_ctrlr_get_features(req);
 	case SPDK_NVME_OPC_SET_FEATURES:
+		SPDK_NOTICELOG("admin qpair - 6 \n");
 		return nvmf_ctrlr_set_features(req);
 	case SPDK_NVME_OPC_ASYNC_EVENT_REQUEST:
+		SPDK_NOTICELOG("admin qpair - 7 \n");
 		return nvmf_ctrlr_async_event_request(req);
 	case SPDK_NVME_OPC_KEEP_ALIVE:
+		SPDK_NOTICELOG("admin qpair - 8 \n");
 		return nvmf_ctrlr_keep_alive(req);
 
 	case SPDK_NVME_OPC_CREATE_IO_SQ:
@@ -3776,6 +3783,7 @@ nvmf_ctrlr_process_fabrics_cmd(struct spdk_nvmf_request *req)
 	if (qpair->ctrlr == NULL) {
 		/* No ctrlr established yet; the only valid command is Connect */
 		assert(cap_hdr->fctype == SPDK_NVMF_FABRIC_COMMAND_CONNECT);
+		SPDK_NOTICELOG("SPDK_NVME_OPC_FABRIC 2 \n");
 		return nvmf_ctrlr_cmd_connect(req);
 	} else if (nvmf_qpair_is_admin_queue(qpair)) {
 		/*
@@ -3784,8 +3792,10 @@ nvmf_ctrlr_process_fabrics_cmd(struct spdk_nvmf_request *req)
 		 */
 		switch (cap_hdr->fctype) {
 		case SPDK_NVMF_FABRIC_COMMAND_PROPERTY_SET:
+		SPDK_NOTICELOG("SPDK_NVME_OPC_FABRIC 3 \n");
 			return nvmf_property_set(req);
 		case SPDK_NVMF_FABRIC_COMMAND_PROPERTY_GET:
+			SPDK_NOTICELOG("SPDK_NVME_OPC_FABRIC 4 \n");
 			return nvmf_property_get(req);
 		case SPDK_NVMF_FABRIC_COMMAND_AUTHENTICATION_SEND:
 		case SPDK_NVMF_FABRIC_COMMAND_AUTHENTICATION_RECV:
@@ -4734,8 +4744,12 @@ spdk_nvmf_request_exec(struct spdk_nvmf_request *req)
 	TAILQ_INSERT_TAIL(&qpair->outstanding, req, link);
 
 	if (spdk_unlikely(req->cmd->nvmf_cmd.opcode == SPDK_NVME_OPC_FABRIC)) {
+		SPDK_NOTICELOG("SPDK_NVME_OPC_FABRIC 1 \n");
+		spdk_nvme_print_command_s(qpair->qid, &req->cmd->nvme_cmd);
 		status = nvmf_ctrlr_process_fabrics_cmd(req);
 	} else if (spdk_unlikely(nvmf_qpair_is_admin_queue(qpair))) {
+		SPDK_NOTICELOG("admin qpair - 1 \n");
+		spdk_nvme_print_command_s(qpair->qid, &req->cmd->nvme_cmd);
 		status = nvmf_ctrlr_process_admin_cmd(req);
 	} else {
 		status = nvmf_ctrlr_process_io_cmd(req);
