@@ -308,6 +308,8 @@ struct spdk_nvmf_tcp_qpair {
 
 	spdk_nvmf_transport_qpair_fini_cb	fini_cb_fn;
 	void					*fini_cb_arg;
+	bool					dump;
+	uint64_t				time;
 
 	TAILQ_ENTRY(spdk_nvmf_tcp_qpair)	link;
 };
@@ -2864,14 +2866,15 @@ nvmf_tcp_check_fused_ordering(struct spdk_nvmf_tcp_transport *ttransport,
 static void 
 check_time(struct spdk_nvmf_tcp_req *tcp_req, struct spdk_nvmf_tcp_qpair *tqpair) {
 	if (!tcp_req->loged && tcp_req->time && (tqpair->target_port <= 9099 && tqpair->target_port >= 9090)) {
-		// if (spdk_get_ticks() - tcp_req->time > spdk_get_ticks_hz() && tqpair->qpair.qid) {
-		if (spdk_get_ticks() - tcp_req->time > spdk_get_ticks_hz()) {
+		if (((spdk_get_ticks() - tcp_req->time) > spdk_get_ticks_hz() * 2) && tqpair->qpair.qid) {		
 			SPDK_NOTICELOG("tcp_req ttag %d (QID %d) cport %d sport %d\n", tcp_req->ttag, tqpair->qpair.qid, tqpair->initiator_port, tqpair->target_port);
+			spdk_nvmf_request_nqn(&tcp_req->req);
 			spdk_nvme_print_command_s(tqpair->qpair.qid, &tcp_req->cmd);
-			if (tqpair->qpair.qid) {				
+			if (tqpair->qpair.qid && ((spdk_get_ticks() - tqpair->time) > spdk_get_ticks_hz() * 15)) {
 				nvmf_tcp_dump_qpair_req_contents(tqpair);
+				tqpair->time = spdk_get_ticks();
 			}
-			tcp_req->loged = false;
+			tcp_req->loged = true;
 		}
 	}
 }
@@ -2918,6 +2921,7 @@ nvmf_tcp_req_process(struct spdk_nvmf_tcp_transport *ttransport,
 			spdk_trace_record(TRACE_TCP_REQUEST_STATE_NEW, tqpair->qpair.trace_id, 0, (uintptr_t)tcp_req,
 					  tqpair->qpair.queue_depth);
 			tcp_req->time = spdk_get_ticks();
+			tcp_req->loged = false;
 
 			/* copy the cmd from the receive pdu */
 			tcp_req->cmd = tqpair->pdu_in_progress->hdr.capsule_cmd.ccsqe;
