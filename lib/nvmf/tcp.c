@@ -310,7 +310,7 @@ struct spdk_nvmf_tcp_qpair {
 	void					*fini_cb_arg;
 	bool					dump;
 	uint64_t				time;
-
+	uint64_t				ticks_hz;
 	TAILQ_ENTRY(spdk_nvmf_tcp_qpair)	link;
 };
 
@@ -539,7 +539,7 @@ nvmf_tcp_dump_qpair_req_contents(struct spdk_nvmf_tcp_qpair *tqpair)
 		// }
 	// }
 
-	char buf[1024]; // Adjust the size as necessary
+	char buf[255]; // Adjust the size as necessary
 	int offset = 0;
 
 	// Build the string with all states
@@ -1362,6 +1362,7 @@ nvmf_tcp_handle_connect(struct spdk_nvmf_transport *transport,
 	tqpair->state_cntr[TCP_REQUEST_STATE_FREE] = 0;
 	tqpair->port = port;
 	tqpair->qpair.transport = transport;
+	tqpair->ticks_hz = spdk_get_ticks_hz();
 
 	rc = spdk_sock_getaddr(tqpair->sock, tqpair->target_addr,
 			       sizeof(tqpair->target_addr), &tqpair->target_port,
@@ -2909,21 +2910,28 @@ nvme_command_string(uint16_t value)
 
 static void 
 check_time(struct spdk_nvmf_tcp_req *tcp_req, struct spdk_nvmf_tcp_qpair *tqpair) {
-	if (!tcp_req->loged && tcp_req->time && (tqpair->target_port <= 9099 && tqpair->target_port >= 9090)) {
-		if (((spdk_get_ticks() - tcp_req->time) > spdk_get_ticks_hz() * 2) && tqpair->qpair.qid) {
-			char *uuid = spdk_nvmf_request_nqn(&tcp_req->req);
-			if (!uuid) {
-				uuid = "";
-			}
-			SPDK_NOTICELOG("ttag %d (QID %d) cp %d sp %d, cmd %s, nqn %s\n", 
+	if (!tcp_req->loged && tcp_req->time && tqpair->qpair.qid) {
+		uint64_t current = spdk_get_ticks();
+		uint8_t idx = (tqpair->target_port == 4420) ? 32 : 67;
+		// Check if more than 28 ticks have passed since tcp_req->time
+		if ((current - tcp_req->time) > tqpair->ticks_hz * 28) {
+			char *uuid = spdk_nvmf_request_nqn(&tcp_req->req, idx);
+			uuid = (uuid) ? uuid : ""; // Handle NULL UUID
+
+			// Log relevant information
+			SPDK_NOTICELOG("ttag %d (QID %d) cp %d sp %d, cmd %s, nqn %s\n",
 				tcp_req->ttag, tqpair->qpair.qid, tqpair->initiator_port,
 				tqpair->target_port, nvme_command_string(tcp_req->cmd.opc), uuid);
 			// spdk_nvmf_request_nqn(&tcp_req->req);
 			// spdk_nvme_print_command_s(tqpair->qpair.qid, &tcp_req->cmd);
-			if (tqpair->qpair.qid && ((spdk_get_ticks() - tqpair->time) > spdk_get_ticks_hz() * 15)) {	
+
+			// If more than 30 ticks have passed for the qpair, dump its contents
+			if ((current - tqpair->time) > tqpair->ticks_hz * 30) {
 				nvmf_tcp_dump_qpair_req_contents(tqpair);
-				tqpair->time = spdk_get_ticks();
+				tqpair->time = current;
 			}
+
+			// Mark the request as logged
 			tcp_req->loged = true;
 		}
 	}
