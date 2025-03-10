@@ -3811,6 +3811,12 @@ blob_request_submit_op(struct spdk_blob *blob, struct spdk_io_channel *_channel,
 		return;
 	}
 
+	if (blob->bs->read_only && 
+		(op_type == SPDK_BLOB_WRITE || op_type == SPDK_BLOB_WRITE_ZEROES)) {
+		// SPDK_NOTICELOG("FAILED IO on update filed condition.\n");
+		cb_fn(cb_arg, -EIO);
+	}
+
 	if (blob->failed_on_update) {
 		SPDK_NOTICELOG("FAILED IO on update filed condition.\n");
 		cb_fn(cb_arg, -EIO);
@@ -3950,6 +3956,11 @@ blob_request_submit_rw_iov(struct spdk_blob *blob, struct spdk_io_channel *_chan
 	if (length == 0) {
 		cb_fn(cb_arg, 0);
 		return;
+	}
+
+	if (blob->bs->read_only && !read) {
+		// SPDK_NOTICELOG("FAILED IO on update filed condition.\n");
+		cb_fn(cb_arg, -EIO);
 	}
 
 	if (blob->failed_on_update) {
@@ -4472,6 +4483,7 @@ bs_alloc(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts, struct spdk_blob_st
 
 	bs->priority_class = 0;
 	bs->is_leader = true;
+	bs->read_only = false;
 	/*
 	 * Do not use bs_lba_to_cluster() here since blockcnt may not be an
 	 *  even multiple of the cluster size.
@@ -7349,6 +7361,12 @@ void
 spdk_bs_set_leader(struct spdk_blob_store *bs, bool state)
 {
 	bs->is_leader = state;	
+}
+
+void
+spdk_bs_set_read_only(struct spdk_blob_store *bs, bool state)
+{
+	bs->read_only = state;
 }
 
 uint64_t

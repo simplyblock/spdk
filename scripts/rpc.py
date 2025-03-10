@@ -2067,6 +2067,19 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('-u', '--uuid', help='lvol store UUID')
     p.add_argument('-s', '--lvs-name', help='lvol store name')
     p.set_defaults(func=bdev_lvol_set_leader_all)
+    
+    def bdev_lvol_set_lvs_read_only(args):
+        print_dict(rpc.lvol.bdev_lvol_set_lvs_read_only(args.client,
+                                                   uuid=args.uuid,
+                                                   lvs_name=args.lvs_name,
+                                                   read_only=args.read_only))
+
+    p = subparsers.add_parser('bdev_lvol_set_lvs_read_only',
+                              help='Change read only state for lvstore')
+    p.add_argument('-r', '--read-only', action='store_true', help='read only state for lvolstore level, default False')
+    p.add_argument('-u', '--uuid', help='lvol store UUID')
+    p.add_argument('-s', '--lvs-name', help='lvol store name')
+    p.set_defaults(func=bdev_lvol_set_lvs_read_only)
 
     def bdev_lvol_create(args):
         print_json(rpc.lvol.bdev_lvol_create(args.client,

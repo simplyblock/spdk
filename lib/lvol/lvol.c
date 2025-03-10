@@ -82,6 +82,7 @@ lvs_alloc(void)
 
 	lvs->load_esnaps = false;
 	lvs->leader = false;
+	lvs->read_only = false;
 	RB_INIT(&lvs->degraded_lvol_sets_tree);
 	lvs->thread = spdk_get_thread();
 
@@ -2968,6 +2969,17 @@ spdk_lvs_set_op(struct spdk_lvol_store *lvs, uint64_t groupid, uint64_t port)
 	pthread_mutex_lock(&g_lvol_stores_mutex);
 	lvs->groupid = groupid;
 	lvs->subsystem_port = port;
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+	return;
+}
+
+void
+spdk_lvs_set_read_only(struct spdk_lvol_store *lvs, bool status)
+{
+	SPDK_NOTICELOG("Set lvostore read_only %s.\n", status ? "true" : "false");
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+	lvs->read_only = status;
+	spdk_bs_set_read_only(lvs->blobstore, status);
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
 	return;
 }

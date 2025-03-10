@@ -95,6 +95,24 @@ def bdev_lvol_set_leader_all(client, uuid=None, lvs_name=None, leadership=False)
         params['lvs_name'] = lvs_name
     return client.call('bdev_lvol_set_leader_all', params)
 
+def bdev_lvol_set_lvs_read_only(client, uuid=None, lvs_name=None, read_only=False):
+    """Change state of the read only
+
+    Args:
+        uuid: UUID of the lvolstore
+        lvs_name: lvolstore name
+        read_only: Read only state for lvolstore (default: False)        
+    """ 
+    params = {'read_only': read_only}
+        
+    if (uuid and lvs_name):
+        raise ValueError("Exactly one of uuid or lvs_name may be specified")
+    if uuid:
+        params['uuid'] = uuid
+    if lvs_name:
+        params['lvs_name'] = lvs_name
+    return client.call('bdev_lvol_set_lvs_read_only', params)
+
 def bdev_lvol_create(client, lvol_name, size_in_mib, thin_provision=False, uuid=None, lvs_name=None, clear_method=None, lvol_priority_class=0):
     """Create a logical volume on a logical volume store.
 

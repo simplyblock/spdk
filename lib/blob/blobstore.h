@@ -212,6 +212,7 @@ struct spdk_blob_store {
 	 * Only when the distrib internal force state changes, it will be set to false.
 	 */
 	bool				is_leader;
+	bool				read_only;
 
 	spdk_bs_esnap_dev_create	esnap_bs_dev_create;
 	void				*esnap_ctx;

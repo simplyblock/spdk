@@ -1575,6 +1575,59 @@ cleanup:
 
 SPDK_RPC_REGISTER("bdev_lvol_set_read_only", rpc_bdev_lvol_set_read_only, SPDK_RPC_RUNTIME)
 
+struct rpc_set_ro_lvs_bdev {
+	char *lvs_name;
+	char *uuid;
+	bool read_only;
+
+};
+
+static void
+free_rpc_set_ro_lvs_bdev(struct rpc_set_ro_lvs_bdev *req)
+{
+	free(req->lvs_name);
+	free(req->uuid);
+}
+
+static const struct spdk_json_object_decoder rpc_set_ro_lvs_bdev_decoders[] = {
+	{"lvs_name", offsetof(struct rpc_set_ro_lvs_bdev, lvs_name), spdk_json_decode_string, true},
+	{"uuid", offsetof(struct rpc_set_ro_lvs_bdev, uuid), spdk_json_decode_string, true},
+	{"read_only", offsetof(struct rpc_set_ro_lvs_bdev, read_only), spdk_json_decode_bool},
+};
+
+static void
+rpc_bdev_lvol_set_lvs_read_only(struct spdk_jsonrpc_request *request,
+			    const struct spdk_json_val *params)
+{
+	struct rpc_set_ro_lvs_bdev req = {};
+	struct spdk_lvol_store *lvs = NULL;
+	int rc;
+
+	SPDK_INFOLOG(lvol_rpc, "Setting lvol as read only\n");
+
+	if (spdk_json_decode_object(params, rpc_set_ro_lvs_bdev_decoders,
+				    SPDK_COUNTOF(rpc_set_ro_lvs_bdev_decoders),
+				    &req)) {
+		SPDK_INFOLOG(lvol_rpc, "spdk_json_decode_object failed\n");
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "spdk_json_decode_object failed");
+		goto cleanup;
+	}
+
+	rc = vbdev_get_lvol_store_by_uuid_xor_name(req.uuid, req.lvs_name, &lvs);
+	if (rc != 0) {
+		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
+		goto cleanup;
+	}
+	
+	spdk_lvs_set_read_only(lvs, req.read_only);
+	spdk_jsonrpc_send_bool_response(request, true);
+cleanup:
+	free_rpc_set_ro_lvs_bdev(&req);
+}
+
+SPDK_RPC_REGISTER("bdev_lvol_set_lvs_read_only", rpc_bdev_lvol_set_lvs_read_only, SPDK_RPC_RUNTIME)
+
 struct rpc_bdev_lvol_delete {
 	char *name;
 	bool sync;
@@ -1699,6 +1752,7 @@ rpc_dump_lvol_store_info(struct spdk_json_write_ctx *w, struct lvol_store_bdev *
 	spdk_json_write_named_uuid(w, "uuid", &lvs_bdev->lvs->uuid);
 	spdk_json_write_named_string(w, "name", lvs_bdev->lvs->name);
 	spdk_json_write_named_bool(w, "lvs leadership", lvs_bdev->lvs->leader);
+	spdk_json_write_named_bool(w, "lvs_read_only", lvs_bdev->lvs->read_only);
 	spdk_json_write_named_string(w, "base_bdev", spdk_bdev_get_name(lvs_bdev->bdev));
 	spdk_json_write_named_uint64(w, "total_data_clusters", spdk_bs_total_data_cluster_count(bs));
 	spdk_json_write_named_uint64(w, "free_clusters", spdk_bs_free_cluster_count(bs));

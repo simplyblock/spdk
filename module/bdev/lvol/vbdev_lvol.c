@@ -1260,6 +1260,10 @@ vbdev_lvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_
 				     bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen);
 		break;
 	case SPDK_BDEV_IO_TYPE_WRITE:
+		if (lvs->read_only) {
+			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+			return;
+		}
 		lvol_write(lvol, ch, bdev_io);
 		break;
 	case SPDK_BDEV_IO_TYPE_RESET:
@@ -1269,6 +1273,10 @@ vbdev_lvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_
 		lvol_unmap(lvol, ch, bdev_io);
 		break;
 	case SPDK_BDEV_IO_TYPE_WRITE_ZEROES:
+		if (lvs->read_only) {
+			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+			return;
+		}
 		lvol_write_zeroes(lvol, ch, bdev_io);
 		break;
 	case SPDK_BDEV_IO_TYPE_SEEK_DATA:

@@ -140,6 +140,7 @@ struct spdk_lvol_store {
 	uint64_t			leadership_timeout;
 	uint64_t			timeout_trigger;
 	bool 				trigger_leader_sent;
+	bool 				read_only;
 	int 				subsystem_port;
 };
 

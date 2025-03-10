@@ -388,6 +388,7 @@ void spdk_blob_update_failed_cleanup(struct spdk_blob *blob,
 				 spdk_blob_op_complete cb_fn, void *cb_arg);
 
 void spdk_bs_set_leader(struct spdk_blob_store *bs, bool state);
+void spdk_bs_set_read_only(struct spdk_blob_store *bs, bool state);
 /**
  * update a blobstore according to bit array synced.
  * Can be used on loaded blobstore, even with opened blobs.
