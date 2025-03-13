@@ -1348,7 +1348,9 @@ nvmf_tcp_handle_connect(struct spdk_nvmf_transport *transport,
 	struct spdk_nvmf_tcp_qpair *tqpair;
 	int rc;
 
-	SPDK_DEBUGLOG(nvmf_tcp, "New connection accepted on %s port %s\n",
+	// SPDK_DEBUGLOG(nvmf_tcp, "New connection accepted on %s port %s\n",
+	// 	      port->trid->traddr, port->trid->trsvcid);
+	SPDK_NOTICELOG("New connection accepted on %s port %s\n",
 		      port->trid->traddr, port->trid->trsvcid);
 
 	tqpair = calloc(1, sizeof(struct spdk_nvmf_tcp_qpair));
@@ -2908,25 +2910,54 @@ nvme_command_string(uint16_t value)
 	}
 }
 
+// static void 
+// check_time(struct spdk_nvmf_tcp_req *tcp_req, struct spdk_nvmf_tcp_qpair *tqpair) {
+// 	if (!tcp_req->loged && tcp_req->time && tqpair->qpair.qid) {
+// 		uint64_t current = spdk_get_ticks();
+// 		uint8_t idx = (tqpair->target_port == 4420) ? 32 : 67;
+// 		// Check if more than 28 ticks have passed since tcp_req->time
+// 		if ((current - tcp_req->time) > tqpair->ticks_hz * 28) {
+// 			char *uuid = spdk_nvmf_request_nqn(&tcp_req->req, idx);
+// 			uuid = (uuid) ? uuid : ""; // Handle NULL UUID
+
+// 			// Log relevant information
+// 			SPDK_NOTICELOG("ttag %d (QID %d) cp %d sp %d, cmd %s, nqn %s\n",
+// 				tcp_req->ttag, tqpair->qpair.qid, tqpair->initiator_port,
+// 				tqpair->target_port, nvme_command_string(tcp_req->cmd.opc), uuid);
+// 			// spdk_nvmf_request_nqn(&tcp_req->req);
+// 			// spdk_nvme_print_command_s(tqpair->qpair.qid, &tcp_req->cmd);
+
+// 			// If more than 30 ticks have passed for the qpair, dump its contents
+// 			if ((current - tqpair->time) > tqpair->ticks_hz * 30) {
+// 				nvmf_tcp_dump_qpair_req_contents(tqpair);
+// 				tqpair->time = current;
+// 			}
+
+// 			// Mark the request as logged
+// 			tcp_req->loged = true;
+// 		}
+// 	}
+// }
+
 static void 
 check_time(struct spdk_nvmf_tcp_req *tcp_req, struct spdk_nvmf_tcp_qpair *tqpair) {
-	if (!tcp_req->loged && tcp_req->time && tqpair->qpair.qid) {
+	if (!tcp_req->loged && tcp_req->time && !tqpair->qpair.qid) {
 		uint64_t current = spdk_get_ticks();
 		uint8_t idx = (tqpair->target_port == 4420) ? 32 : 67;
 		// Check if more than 28 ticks have passed since tcp_req->time
-		if ((current - tcp_req->time) > tqpair->ticks_hz * 28) {
+		if ((current - tcp_req->time) > tqpair->ticks_hz * 2 && (tcp_req->cmd.opc != SPDK_NVME_OPC_ASYNC_EVENT_REQUEST)) {
 			char *uuid = spdk_nvmf_request_nqn(&tcp_req->req, idx);
 			uuid = (uuid) ? uuid : ""; // Handle NULL UUID
 
 			// Log relevant information
-			SPDK_NOTICELOG("ttag %d (QID %d) cp %d sp %d, cmd %s, nqn %s\n",
+			SPDK_NOTICELOG("ttag %d (QID %d) cp %d sp %d, nqn %s\n",
 				tcp_req->ttag, tqpair->qpair.qid, tqpair->initiator_port,
-				tqpair->target_port, nvme_command_string(tcp_req->cmd.opc), uuid);
-			// spdk_nvmf_request_nqn(&tcp_req->req);
-			// spdk_nvme_print_command_s(tqpair->qpair.qid, &tcp_req->cmd);
+				tqpair->target_port, uuid);
+			// spdk_nvmf_request_nqn(&tcp_req->req);			
+			spdk_nvme_print_command_s(tqpair->qpair.qid, &tcp_req->cmd);
 
 			// If more than 30 ticks have passed for the qpair, dump its contents
-			if ((current - tqpair->time) > tqpair->ticks_hz * 30) {
+			if ((current - tqpair->time) > tqpair->ticks_hz * 10) {
 				nvmf_tcp_dump_qpair_req_contents(tqpair);
 				tqpair->time = current;
 			}

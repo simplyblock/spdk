@@ -213,6 +213,14 @@ struct spdk_blob_store {
 	 */
 	bool				is_leader;
 	bool				read_only;
+	bool 				stop;
+	uint64_t			total;
+	uint64_t			total_r;
+	uint64_t			total_w;
+	uint64_t			r_io;
+	uint64_t			w_io;
+	struct spdk_poller		*poller;
+
 
 	spdk_bs_esnap_dev_create	esnap_bs_dev_create;
 	void				*esnap_ctx;

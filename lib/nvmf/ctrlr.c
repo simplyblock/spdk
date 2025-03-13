@@ -248,6 +248,7 @@ nvmf_ctrlr_send_connect_rsp(void *ctx)
 		if (nvmf_subsystem_host_auth_required(ctrlr->subsys, ctrlr->hostnqn)) {
 			rc = nvmf_qpair_auth_init(qpair);
 			if (rc != 0) {
+				SPDK_ERRLOG("Unable to init qpair auth.\n");
 				rsp->status.sct = SPDK_NVME_SCT_GENERIC;
 				rsp->status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 				spdk_nvmf_request_complete(req);
@@ -914,6 +915,7 @@ _nvmf_ctrlr_connect(struct spdk_nvmf_request *req)
 
 	if (cmd->qid == 0) {
 		SPDK_DEBUGLOG(nvmf, "Connect Admin Queue for controller ID 0x%x\n", data->cntlid);
+		SPDK_NOTICELOG("Connect Admin Queue for controller ID 0x%x\n", data->cntlid);
 
 		if (spdk_nvme_trtype_is_fabrics(transport->ops->type) && data->cntlid != 0xFFFF) {
 			/* This NVMf target only supports dynamic mode. */
@@ -1013,7 +1015,7 @@ nvmf_ctrlr_cmd_connect(struct spdk_nvmf_request *req)
 		rsp->status.sc = SPDK_NVME_SC_INVALID_FIELD;
 		return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
 	}
-
+	SPDK_NOTICELOG("Connect request for %s from %s.\n", data->subnqn, data->hostnqn);
 	subsystem = spdk_nvmf_tgt_find_subsystem(transport->tgt, data->subnqn);
 	if (!subsystem) {
 		SPDK_NVMF_INVALID_CONNECT_DATA(rsp, subnqn);
@@ -4750,11 +4752,11 @@ spdk_nvmf_request_exec(struct spdk_nvmf_request *req)
 
 	if (spdk_unlikely(req->cmd->nvmf_cmd.opcode == SPDK_NVME_OPC_FABRIC)) {
 		// SPDK_NOTICELOG("SPDK_NVME_OPC_FABRIC 1 \n");
-		// spdk_nvme_print_command_s(qpair->qid, &req->cmd->nvme_cmd);
+		spdk_nvme_print_command_s(qpair->qid, &req->cmd->nvme_cmd);
 		status = nvmf_ctrlr_process_fabrics_cmd(req);
 	} else if (spdk_unlikely(nvmf_qpair_is_admin_queue(qpair))) {
 		// SPDK_NOTICELOG("admin qpair - 1 \n");
-		// spdk_nvme_print_command_s(qpair->qid, &req->cmd->nvme_cmd);
+		spdk_nvme_print_command_s(qpair->qid, &req->cmd->nvme_cmd);
 		status = nvmf_ctrlr_process_admin_cmd(req);
 	} else {
 		status = nvmf_ctrlr_process_io_cmd(req);
