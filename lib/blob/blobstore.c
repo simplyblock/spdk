@@ -14194,7 +14194,7 @@ _blob_start_snapshot_backup(void *ctx) {
 	// This is necessary, because spdk_thread_create may have ignored the mask.
 	spdk_thread_set_cpumask(spdk_thread_get_cpumask(sctx->blob->bs->md_thread));
 
-	sctx->blob->backup_channel = spdk_get_io_channel(sctx->blob->bs);
+	if (sctx->blob->backup_channel) { sctx->blob->backup_channel = spdk_get_io_channel(sctx->blob->bs); }
 	if (!sctx->blob->backup_channel) {
 		sctx->compl.rc = -ENOMEM;
 	} else {
