@@ -4752,11 +4752,11 @@ spdk_nvmf_request_exec(struct spdk_nvmf_request *req)
 
 	if (spdk_unlikely(req->cmd->nvmf_cmd.opcode == SPDK_NVME_OPC_FABRIC)) {
 		// SPDK_NOTICELOG("SPDK_NVME_OPC_FABRIC 1 \n");
-		spdk_nvme_print_command_s(qpair->qid, &req->cmd->nvme_cmd);
+		// spdk_nvme_print_command_s(qpair->qid, &req->cmd->nvme_cmd);
 		status = nvmf_ctrlr_process_fabrics_cmd(req);
 	} else if (spdk_unlikely(nvmf_qpair_is_admin_queue(qpair))) {
 		// SPDK_NOTICELOG("admin qpair - 1 \n");
-		spdk_nvme_print_command_s(qpair->qid, &req->cmd->nvme_cmd);
+		// spdk_nvme_print_command_s(qpair->qid, &req->cmd->nvme_cmd);
 		status = nvmf_ctrlr_process_admin_cmd(req);
 	} else {
 		status = nvmf_ctrlr_process_io_cmd(req);
