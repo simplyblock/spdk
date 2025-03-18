@@ -1060,6 +1060,7 @@ _nvme_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request *r
 			 * but set the parent request to failure.
 			 */
 			if (req->num_children) {
+				SPDK_ERRLOG("Unable to process nvme qpair 2 .\n");
 				req->cpl.status.sct = SPDK_NVME_SCT_GENERIC;
 				req->cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 				return 0;
@@ -1145,6 +1146,7 @@ error:
 							   SPDK_NVME_SC_ABORTED_SQ_DELETION,
 							   qpair->abort_dnr, true);
 		} else {
+			SPDK_ERRLOG("Unable to process nvme qpair 1 .\n");
 			nvme_qpair_manual_complete_request(qpair, req, SPDK_NVME_SCT_GENERIC,
 							   SPDK_NVME_SC_INTERNAL_DEVICE_ERROR,
 							   true, true);

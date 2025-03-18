@@ -367,6 +367,7 @@ fixup_identify_ctrlr(struct spdk_nvmf_request *req)
 	/* Get the NVMF identify data */
 	rc = spdk_nvmf_ctrlr_identify_ctrlr(ctrlr, &nvmf_cdata);
 	if (rc != SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE) {
+		SPDK_ERRLOG("Unable to get the nvmf identify 1.\n");
 		rsp->status.sct = SPDK_NVME_SCT_GENERIC;
 		rsp->status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 		return;

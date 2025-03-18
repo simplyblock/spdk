@@ -7531,6 +7531,7 @@ spdk_bdev_io_get_nvme_status(const struct spdk_bdev_io *bdev_io, uint32_t *cdw0,
 		*sct = SPDK_NVME_SCT_GENERIC;
 		*sc = SPDK_NVME_SC_ABORTED_BY_REQUEST;
 	} else {
+		SPDK_ERRLOG("Unable to check the nvme status 1 .\n");
 		*sct = SPDK_NVME_SCT_GENERIC;
 		*sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 	}
@@ -7572,6 +7573,7 @@ spdk_bdev_io_get_nvme_fused_status(const struct spdk_bdev_io *bdev_io, uint32_t 
 		*second_sct = SPDK_NVME_SCT_GENERIC;
 		*second_sc = SPDK_NVME_SC_SUCCESS;
 	} else if (bdev_io->internal.status == SPDK_BDEV_IO_STATUS_FIRST_FUSED_FAILED) {
+		SPDK_ERRLOG("Unable to process request fused 1 .\n");
 		*first_sct = SPDK_NVME_SCT_GENERIC;
 		*first_sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 		*second_sct = SPDK_NVME_SCT_GENERIC;
@@ -7582,6 +7584,7 @@ spdk_bdev_io_get_nvme_fused_status(const struct spdk_bdev_io *bdev_io, uint32_t 
 		*second_sct = SPDK_NVME_SCT_GENERIC;
 		*second_sc = SPDK_NVME_SC_ABORTED_FAILED_FUSED;
 	} else {
+		SPDK_ERRLOG("Unable to process request fused 2 .\n");
 		*first_sct = SPDK_NVME_SCT_GENERIC;
 		*first_sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 		*second_sct = SPDK_NVME_SCT_GENERIC;

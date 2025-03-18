@@ -2029,6 +2029,7 @@ handle_create_io_sq(struct nvmf_vfio_user_ctrlr *ctrlr,
 	if (ctrlr->sqs[qid] == NULL) {
 		err = init_sq(ctrlr, ctrlr->sqs[0]->qpair.transport, qid);
 		if (err != 0) {
+			SPDK_ERRLOG("Unable to get handle create io 3.\n");
 			*sct = SPDK_NVME_SCT_GENERIC;
 			return SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 		}
@@ -2143,6 +2144,7 @@ handle_create_io_cq(struct nvmf_vfio_user_ctrlr *ctrlr,
 	if (ctrlr->cqs[qid] == NULL) {
 		err = init_cq(ctrlr, qid);
 		if (err != 0) {
+			SPDK_ERRLOG("Unable to get handle create io 1.\n");
 			*sct = SPDK_NVME_SCT_GENERIC;
 			return SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 		}
@@ -2331,6 +2333,7 @@ handle_del_io_q(struct nvmf_vfio_user_ctrlr *ctrlr,
 		sq = ctrlr->sqs[cmd->cdw10_bits.delete_io_q.qid];
 		sq->delete_ctx = calloc(1, sizeof(*sq->delete_ctx));
 		if (!sq->delete_ctx) {
+			SPDK_ERRLOG("Unable to get handle create io 2.\n");
 			sct = SPDK_NVME_SCT_GENERIC;
 			sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 			goto out;
