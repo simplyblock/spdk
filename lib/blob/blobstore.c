@@ -14073,7 +14073,7 @@ static inline int8_t
 blob_search_for_new_flush_job(struct spdk_blob *blob, struct t_flush_job *job) {
 	if (job->status == FLUSH_IS_SUCCEEDED) {
 		const uint64_t dev_pages_per_cluster = blob->bs->cluster_sz / blob->dev_page_size;
-		const bool is_root_page_cluster = (blob->current_array_ordinal == 3 && blob->next_idx_in_array == 0);
+		const bool is_root_page_cluster = blob->current_array_ordinal == 3;
 		if ((!is_root_page_cluster && job->dev_page_number < dev_pages_per_cluster - 1) || (is_root_page_cluster && job->dev_page_number > 0)) {
 			// must go right to left for the root page cluster
 			job->dev_page_number += !is_root_page_cluster ? 1 : -1;
@@ -14196,7 +14196,7 @@ snapshot_backup_poller(void *ctx) {
 			--blob->nflush_jobs_current;
 			const uint64_t dev_pages_per_cluster = blob->bs->cluster_sz / blob->dev_page_size;
 			// if this job succeeded and was on the prior array, then this job is fully done if it has no more dev pages to flush in its cluster
-			blob->nflush_jobs_on_prior_array -= (job->status == FLUSH_IS_SUCCEEDED) && (blob->nflush_jobs_on_prior_array > 0) && (job->dev_page_number == (!(blob->current_array_ordinal == 3 && blob->next_idx_in_array == 0) ? dev_pages_per_cluster - 1 : 0));
+			blob->nflush_jobs_on_prior_array -= (job->status == FLUSH_IS_SUCCEEDED) && (blob->nflush_jobs_on_prior_array > 0) && (job->dev_page_number == (blob->current_array_ordinal != 3 ? dev_pages_per_cluster - 1 : 0));
 		} else if (job->status == FLUSH_IS_FAILED) {
 			--blob->nflush_jobs_current;
 			++blob->nretries_current;
