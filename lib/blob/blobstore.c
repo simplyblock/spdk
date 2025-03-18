@@ -14073,8 +14073,10 @@ static inline int8_t
 blob_search_for_new_flush_job(struct spdk_blob *blob, struct t_flush_job *job) {
 	if (job->status == FLUSH_IS_SUCCEEDED) {
 		const uint64_t dev_pages_per_cluster = blob->bs->cluster_sz / blob->dev_page_size;
-		if (job->dev_page_number < dev_pages_per_cluster - 1) {
-			++job->dev_page_number;
+		const bool is_root_page_cluster = (blob->current_array_ordinal == 3 && blob->next_idx_in_array == 0);
+		if ((!is_root_page_cluster && job->dev_page_number < dev_pages_per_cluster - 1) || (is_root_page_cluster && job->dev_page_number > 0)) {
+			// must go right to left for the root page cluster
+			job->dev_page_number += !is_root_page_cluster ? 1 : -1;
 			return blob_do_flush_job(blob, job);
 		}
 	}
@@ -14099,33 +14101,80 @@ blob_search_for_new_flush_job(struct spdk_blob *blob, struct t_flush_job *job) {
 			} else // move to the next array
 			{
 				blob->nflush_jobs_on_prior_array = blob->nflush_jobs_current;
-				++blob->current_array_ordinal;
-				blob->next_idx_in_array = blob->active.extent_pages_array_size - 1; // next array is extent pages array
+				blob->current_array_ordinal = 1;
+				blob->next_idx_in_array = 0; // next array is extent pages array
 			}
 		} else if (blob->current_array_ordinal <= 2) {
 			job->is_md_job = true;
+			const bool is_extents = blob->current_array_ordinal == 1;
+			uint32_t *page_idxs_arr = is_extents ? blob->active.extent_pages : blob->active.pages;
 
-			uint32_t *page_idxs_arr = blob->current_array_ordinal == 1 ? blob->active.extent_pages : blob->active.pages;
-			// search for the next allocated md page in the snapshot
-			while ((int64_t)blob->next_idx_in_array >= 0 && page_idxs_arr[blob->next_idx_in_array] == 0) {
-				--blob->next_idx_in_array;
-			}
-			if ((int64_t)blob->next_idx_in_array >= 0) {
-				job->cluster_idx = bs_lba_to_cluster(blob->bs, bs_md_page_to_lba(blob->bs, page_idxs_arr[blob->next_idx_in_array]));
-				job->dev_page_number = 0;
+			if (!(is_extents && blob->nflush_jobs_current > 0)) // no parallel jobs on extents allowed
+			{ 
+				// search for the next allocated md page in the snapshot
+				if (is_extents) {
+					while (blob->next_idx_in_array < blob->active.extent_pages_array_size && page_idxs_arr[blob->next_idx_in_array] == 0) {
+						++blob->next_idx_in_array;
+					}
+					if (blob->next_idx_in_array < blob->active.extent_pages_array_size) {
+						job->cluster_idx = bs_lba_to_cluster(blob->bs, bs_md_page_to_lba(blob->bs, page_idxs_arr[blob->next_idx_in_array]));
+						job->dev_page_number = 0;
 
-				// search for the next md cluster in the snapshot
-				do {
-					--blob->next_idx_in_array;
-				} while ((int64_t)blob->next_idx_in_array >= 0 && (page_idxs_arr[blob->next_idx_in_array] == 0 
-				|| bs_lba_to_cluster(blob->bs, bs_md_page_to_lba(blob->bs, page_idxs_arr[blob->next_idx_in_array])) == job->cluster_idx));
+						// search for the next md cluster in the snapshot
+						do {
+							++blob->next_idx_in_array;
+						} while (blob->next_idx_in_array < blob->active.extent_pages_array_size && (page_idxs_arr[blob->next_idx_in_array] == 0 
+						|| bs_lba_to_cluster(blob->bs, bs_md_page_to_lba(blob->bs, page_idxs_arr[blob->next_idx_in_array])) == job->cluster_idx));
 
-				return blob_do_flush_job(blob, job);
-			} else // move to the next array if there is one
-			{
-				blob->nflush_jobs_on_prior_array = blob->nflush_jobs_current;
-				++blob->current_array_ordinal;
-				blob->next_idx_in_array = blob->active.num_pages - 1; // next array after extent pages array is pages array
+						return blob_do_flush_job(blob, job);
+					} else {
+						blob->nflush_jobs_on_prior_array = blob->nflush_jobs_current;
+						blob->current_array_ordinal = 2;
+
+						// leave root page cluster for last
+						page_idxs_arr = blob->active.pages;
+						const uint32_t root_page_cluster = bs_lba_to_cluster(blob->bs, bs_md_page_to_lba(blob->bs, page_idxs_arr[0]));
+						blob->next_idx_in_array = 0;
+						do {
+							++blob->next_idx_in_array;
+						} while (blob->next_idx_in_array < blob->active.num_pages && (page_idxs_arr[blob->next_idx_in_array] == 0 
+						|| bs_lba_to_cluster(blob->bs, bs_md_page_to_lba(blob->bs, page_idxs_arr[blob->next_idx_in_array])) == root_page_cluster));
+					}
+				} else {
+					if (blob->next_idx_in_array == 0) // this means only the root page is left
+					{
+						// need to wait until all later md pages have been flushed
+						if (blob->nflush_jobs_current == 0) {
+							blob->current_array_ordinal = 3; // no more jobs after this one finally finishes
+							job->cluster_idx = bs_lba_to_cluster(blob->bs, bs_md_page_to_lba(blob->bs, page_idxs_arr[0]));
+							const uint64_t dev_pages_per_cluster = blob->bs->cluster_sz / blob->dev_page_size;
+							// must go right to left for the root page cluster
+							job->dev_page_number = dev_pages_per_cluster - 1;
+	
+							return blob_do_flush_job(blob, job);
+						}
+					} else {
+						while (blob->next_idx_in_array < blob->active.num_pages && page_idxs_arr[blob->next_idx_in_array] == 0) {
+							++blob->next_idx_in_array;
+						}
+
+						if (blob->next_idx_in_array < blob->active.num_pages) {
+							job->cluster_idx = bs_lba_to_cluster(blob->bs, bs_md_page_to_lba(blob->bs, page_idxs_arr[blob->next_idx_in_array]));
+							job->dev_page_number = 0;
+
+							// search for the next md cluster in the snapshot
+							do {
+								++blob->next_idx_in_array;
+							} while (blob->next_idx_in_array < blob->active.num_pages && (page_idxs_arr[blob->next_idx_in_array] == 0 
+							|| bs_lba_to_cluster(blob->bs, bs_md_page_to_lba(blob->bs, page_idxs_arr[blob->next_idx_in_array])) == job->cluster_idx));
+							
+							return blob_do_flush_job(blob, job);
+						} else // remaining page to flush is page root
+						{
+							blob->next_idx_in_array = 0;
+						}
+					}
+				}
 			}
 		}
 	}
@@ -14147,7 +14196,7 @@ snapshot_backup_poller(void *ctx) {
 			--blob->nflush_jobs_current;
 			const uint64_t dev_pages_per_cluster = blob->bs->cluster_sz / blob->dev_page_size;
 			// if this job succeeded and was on the prior array, then this job is fully done if it has no more dev pages to flush in its cluster
-			blob->nflush_jobs_on_prior_array -= (job->status == FLUSH_IS_SUCCEEDED) && (blob->nflush_jobs_on_prior_array > 0) && (job->dev_page_number == dev_pages_per_cluster - 1);
+			blob->nflush_jobs_on_prior_array -= (job->status == FLUSH_IS_SUCCEEDED) && (blob->nflush_jobs_on_prior_array > 0) && (job->dev_page_number == (!(blob->current_array_ordinal == 3 && blob->next_idx_in_array == 0) ? dev_pages_per_cluster - 1 : 0));
 		} else if (job->status == FLUSH_IS_FAILED) {
 			--blob->nflush_jobs_current;
 			++blob->nretries_current;
