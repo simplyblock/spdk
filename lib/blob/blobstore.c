@@ -13022,11 +13022,13 @@ bs_update_replay_md_chain_cpl(struct spdk_bs_update_ctx *ctx)
 		ctx->bs->used_md_pages = ctx->used_md_pages;
 		ctx->bs->used_blobids = ctx->used_blobids;
 		spdk_spin_unlock(&ctx->bs->used_lock);
-
+		ctx->used_blobids = NULL;
+		ctx->used_md_pages = NULL;
+		ctx->used_clusters = NULL;
 		spdk_bit_array_free(&used_md_pages_tmp);
-		spdk_bit_array_free(&used_blobids_tmp);
+		spdk_bit_array_free(&used_blobids_tmp);	
 		spdk_bit_pool_free(&used_clusters_tmp);
-
+		
 		if (ctx->failover) {
 			bs_update_write_used_md(ctx);
 		} else {
