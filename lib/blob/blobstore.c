@@ -14098,11 +14098,11 @@ blob_search_for_new_flush_job(struct spdk_blob *blob, struct t_flush_job *job) {
 				++blob->next_idx_in_array;
 
 				return blob_do_flush_job(blob, job);
-			} else // move to the next array
+			} else // move to the extent pages array
 			{
 				blob->nflush_jobs_on_prior_array = blob->nflush_jobs_current;
 				blob->current_array_ordinal = 1;
-				blob->next_idx_in_array = 0; // next array is extent pages array
+				blob->next_idx_in_array = 0;
 			}
 		} else if (blob->current_array_ordinal <= 2) {
 			job->is_md_job = true;
@@ -14127,7 +14127,8 @@ blob_search_for_new_flush_job(struct spdk_blob *blob, struct t_flush_job *job) {
 						|| bs_lba_to_cluster(blob->bs, bs_md_page_to_lba(blob->bs, page_idxs_arr[blob->next_idx_in_array])) == job->cluster_idx));
 
 						return blob_do_flush_job(blob, job);
-					} else {
+					} else // move to the non-extent md pages array
+					{
 						blob->nflush_jobs_on_prior_array = blob->nflush_jobs_current;
 						blob->current_array_ordinal = 2;
 
