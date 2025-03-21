@@ -1382,14 +1382,6 @@ enum EFlushStatus {
 };
 
 typedef void (*spdk_snapshot_backup_complete)(void *cb_arg);
-struct snapshot_backup_compl {
-	spdk_snapshot_backup_complete cb_fn;
-	void *cb_arg;
-	struct spdk_jsonrpc_request *payload;
-	int rc;
-	int backup_status; // used only for polling the backup status
-};
-
 struct snapshot_backup_ctx {
 	char* lvol_name;
 	struct spdk_blob *blob;
@@ -1398,7 +1390,13 @@ struct snapshot_backup_ctx {
 	uint8_t nmax_retries;
 	uint8_t nmax_flush_jobs;
 	struct spdk_thread* caller_th;
-	struct snapshot_backup_compl compl;
+	struct {
+		spdk_snapshot_backup_complete cb_fn;
+		void *cb_arg;
+		struct spdk_jsonrpc_request *payload;
+		int rc;
+		int backup_status; // used only for polling the backup status
+	} compl;
 };
 
 /* Start an asynchronous backup of a snapshot represented by the given blob. Returns -EEXIST if the backup is 
