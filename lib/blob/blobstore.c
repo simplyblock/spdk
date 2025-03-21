@@ -14246,23 +14246,23 @@ _blob_start_snapshot_backup(void *ctx) {
 
 	sctx->blob->backup_channel = spdk_get_io_channel(sctx->blob->bs);
 	if (!sctx->blob->backup_channel) {
-		sctx->compl.rc = -ENOMEM;
+		sctx->rc = -ENOMEM;
 	} else {
 		sctx->blob->backup_poller = spdk_poller_register(snapshot_backup_poller, sctx->blob, SNAPSHOT_BACKUP_POLLER_US);
 		if (!sctx->blob->backup_poller) {
 			spdk_put_io_channel(sctx->blob->backup_channel);
-			sctx->compl.rc = -ENOMEM;
+			sctx->rc = -ENOMEM;
 		} else {
 			sctx->blob->flush_jobs = calloc(sctx->nmax_flush_jobs, sizeof(struct t_flush_job));
 			if (!sctx->blob->flush_jobs) {
 				spdk_put_io_channel(sctx->blob->backup_channel);
 				spdk_poller_unregister(&sctx->blob->backup_poller);
-				sctx->compl.rc = -ENOMEM;
+				sctx->rc = -ENOMEM;
 			} else {
 				for (int i = 0; i < sctx->nmax_flush_jobs; ++i) {
 					sctx->blob->flush_jobs[i].timeout_us = sctx->timeout_us;
 				}
-				sctx->compl.rc = 0;
+				sctx->rc = 0;
 				sctx->blob->backup_status = FLUSH_IS_PENDING;
 				sctx->blob->dev_page_size = sctx->dev_page_size;
 				sctx->blob->nmax_retries = sctx->nmax_retries;
@@ -14271,7 +14271,7 @@ _blob_start_snapshot_backup(void *ctx) {
 		}
 	}
 
-	spdk_thread_send_msg(sctx->caller_th, sctx->compl.cb_fn, sctx->compl.cb_arg);
+	spdk_thread_send_msg(sctx->caller_th, sctx->cb_fn, sctx->cb_arg);
 }
 
 static void
@@ -14279,18 +14279,18 @@ blob_start_snapshot_backup(void *ctx) {
 	struct snapshot_backup_ctx *sctx = ctx;
 
 	if (sctx->blob->backup_poller) {
-		sctx->compl.rc = -EEXIST;
-		sctx->compl.cb_fn(sctx->compl.cb_arg);
+		sctx->rc = -EEXIST;
+		sctx->cb_fn(sctx->cb_arg);
 	} else if (!spdk_blob_is_snapshot(sctx->blob)) {
-		sctx->compl.rc = -EINVAL;
-		sctx->compl.cb_fn(sctx->compl.cb_arg);
+		sctx->rc = -EINVAL;
+		sctx->cb_fn(sctx->cb_arg);
 	} else {
 		if (!sctx->blob->bs->backup_thread) {
 			sctx->blob->bs->backup_thread = spdk_thread_create(0, spdk_thread_get_cpumask(sctx->blob->bs->md_thread));
 		}
 		if (!sctx->blob->bs->backup_thread) {
-			sctx->compl.rc = -ENOMEM;
-			sctx->compl.cb_fn(sctx->compl.cb_arg);
+			sctx->rc = -ENOMEM;
+			sctx->cb_fn(sctx->cb_arg);
 		} else {
 			spdk_thread_send_msg(sctx->blob->bs->backup_thread, _blob_start_snapshot_backup, sctx);
 		}
@@ -14306,8 +14306,8 @@ static void
 _blob_get_snapshot_backup_status(void *ctx) {
 	struct snapshot_backup_ctx *sctx = ctx;
 
-	sctx->compl.rc = 0;
-	sctx->compl.backup_status = sctx->blob->backup_status;
+	sctx->rc = 0;
+	sctx->backup_status = sctx->blob->backup_status;
 	if (sctx->blob->backup_status != FLUSH_IS_PENDING) // finally end the snapshot backup operation 
 	{
 		spdk_put_io_channel(sctx->blob->backup_channel);
@@ -14326,7 +14326,7 @@ _blob_get_snapshot_backup_status(void *ctx) {
 		sctx->blob->flush_jobs = NULL;
 	}
 
-	spdk_thread_send_msg(sctx->caller_th, sctx->compl.cb_fn, sctx->compl.cb_arg);
+	spdk_thread_send_msg(sctx->caller_th, sctx->cb_fn, sctx->cb_arg);
 }
 
 static void
@@ -14334,8 +14334,8 @@ blob_get_snapshot_backup_status(void *ctx) {
 	struct snapshot_backup_ctx *sctx = ctx;
 
 	if (!sctx->blob->backup_poller) {
-		sctx->compl.rc = -ENOENT;
-		sctx->compl.cb_fn(sctx->compl.cb_arg);
+		sctx->rc = -ENOENT;
+		sctx->cb_fn(sctx->cb_arg);
 	} else {
 		spdk_thread_send_msg(sctx->blob->bs->backup_thread, _blob_get_snapshot_backup_status, sctx);
 	}

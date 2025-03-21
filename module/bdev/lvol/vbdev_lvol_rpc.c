@@ -2862,10 +2862,10 @@ static void
 start_snapshot_backup_cb(void *ctx) {
 	struct snapshot_backup_ctx *sctx = ctx;
 	free(sctx->lvol_name);
-	if (sctx->compl.rc == 0) {
-		spdk_jsonrpc_send_bool_response(sctx->compl.payload, true);
+	if (sctx->rc == 0) {
+		spdk_jsonrpc_send_bool_response(sctx->payload, true);
 	} else {
-		spdk_jsonrpc_send_error_response(sctx->compl.payload, sctx->compl.rc, spdk_strerror(sctx->compl.rc));
+		spdk_jsonrpc_send_error_response(sctx->payload, sctx->rc, spdk_strerror(sctx->rc));
 	}
 	free(sctx);
 }
@@ -2910,9 +2910,9 @@ rpc_bdev_lvol_backup_snapshot(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
-	sctx->compl.cb_fn = start_snapshot_backup_cb;
-	sctx->compl.cb_arg = sctx;
-	sctx->compl.payload = request;
+	sctx->cb_fn = start_snapshot_backup_cb;
+	sctx->cb_arg = sctx;
+	sctx->payload = request;
 	sctx->caller_th = spdk_get_thread();
 	sctx->blob = lvol->blob;
 	sctx->nmax_retries = sctx->nmax_retries == 0 ? 4 : sctx->nmax_retries;
@@ -2945,20 +2945,20 @@ static void
 get_snapshot_backup_status_cb(void *ctx) {
 	struct snapshot_backup_ctx *sctx = ctx;
 	free(sctx->lvol_name);
-	if (sctx->compl.rc == 0) {
-		struct spdk_json_write_ctx* w = spdk_jsonrpc_begin_result(sctx->compl.payload);
+	if (sctx->rc == 0) {
+		struct spdk_json_write_ctx* w = spdk_jsonrpc_begin_result(sctx->payload);
 		if (w)
 		{
-			if (spdk_json_write_string(w, _get_backup_status_from_code(sctx->compl.backup_status))) {
-				spdk_jsonrpc_send_error_response(sctx->compl.payload, ENOMEM, spdk_strerror(ENOMEM));
+			if (spdk_json_write_string(w, _get_backup_status_from_code(sctx->backup_status))) {
+				spdk_jsonrpc_send_error_response(sctx->payload, ENOMEM, spdk_strerror(ENOMEM));
 			} else {
-      			spdk_jsonrpc_end_result(sctx->compl.payload, w);
+      			spdk_jsonrpc_end_result(sctx->payload, w);
 			}
 		}
 		else
-			{ spdk_jsonrpc_send_error_response(sctx->compl.payload, ENOMEM, spdk_strerror(ENOMEM)); }
+			{ spdk_jsonrpc_send_error_response(sctx->payload, ENOMEM, spdk_strerror(ENOMEM)); }
 	} else {
-		spdk_jsonrpc_send_error_response(sctx->compl.payload, sctx->compl.rc, spdk_strerror(sctx->compl.rc));
+		spdk_jsonrpc_send_error_response(sctx->payload, sctx->rc, spdk_strerror(sctx->rc));
 	}
 	free(sctx);
 }
@@ -3003,9 +3003,9 @@ rpc_bdev_lvol_get_snapshot_backup_status(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
-	sctx->compl.cb_fn = get_snapshot_backup_status_cb;
-	sctx->compl.cb_arg = sctx;
-	sctx->compl.payload = request;
+	sctx->cb_fn = get_snapshot_backup_status_cb;
+	sctx->cb_arg = sctx;
+	sctx->payload = request;
 	sctx->caller_th = spdk_get_thread();
 	sctx->blob = lvol->blob;
 	vbdev_lvol_get_snapshot_backup_status(sctx);
