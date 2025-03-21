@@ -545,10 +545,10 @@ spdk_nvme_print_completion(uint16_t qid, struct spdk_nvme_cpl *cpl)
 		SPDK_ERRLOG("sqid %u doesn't match qid\n", cpl->sqid);
 	}
 
-	// SPDK_NOTICELOG("%s (%02x/%02x) qid:%d cid:%d cdw0:%x sqhd:%04x p:%x m:%x dnr:%x\n",
-	// 	       spdk_nvme_cpl_get_status_string(&cpl->status),
-	// 	       cpl->status.sct, cpl->status.sc, qid, cpl->cid, cpl->cdw0,
-	// 	       cpl->sqhd, cpl->status.p, cpl->status.m, cpl->status.dnr);
+	SPDK_NOTICELOG("%s (%02x/%02x) qid:%d cid:%d cdw0:%x sqhd:%04x p:%x m:%x dnr:%x\n",
+		       spdk_nvme_cpl_get_status_string(&cpl->status),
+		       cpl->status.sct, cpl->status.sc, qid, cpl->cid, cpl->cdw0,
+		       cpl->sqhd, cpl->status.p, cpl->status.m, cpl->status.dnr);
 }
 
 void

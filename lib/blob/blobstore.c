@@ -10653,6 +10653,7 @@ spdk_bs_delete_blob_non_leader(struct spdk_blob_store *bs, struct spdk_blob *blo
 			clone->back_bs_dev = bs_create_zeroes_dev();
 			blob_remove_xattr(clone, BLOB_SNAPSHOT, true);
 		}
+		clone->state = SPDK_BLOB_STATE_CLEAN;
 
 		TAILQ_REMOVE(&snapshot_entry->clones, clone_entry, link);
 		snapshot_entry->clone_count--;
