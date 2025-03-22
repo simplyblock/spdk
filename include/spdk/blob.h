@@ -1378,7 +1378,8 @@ enum EFlushStatus {
 	FLUSH_IS_SUCCEEDED = 1,
 	FLUSH_IS_PENDING = 2,
 	FLUSH_IS_FAILED = -1,
-	FLUSH_IS_ABORTED = -2 // aborted due to confliction with eviction, not a timeout abort (timeout abort is failure)
+	// aborted due to conflict with another I/O (possible only with shared md clusters), not a timeout abort (timeout abort is failure)
+	FLUSH_IS_ABORTED = -2
 };
 
 typedef void (*spdk_snapshot_backup_complete)(void *cb_arg);

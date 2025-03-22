@@ -14028,7 +14028,7 @@ static void
 blob_flush_job_compl_cb(void *cb_arg, int bserrno) {
 	struct t_flush_job *job = cb_arg;
 	SPDK_NOTICELOG("Completed flush job, cluster_idx=%lu, dev page number=%d, bserrno=%d\n", job->cluster_idx, job->dev_page_number, bserrno);
-	if (bserrno == -ECONNABORTED) // determine whether the abort was due to a timeout (failure) or conflict due to eviction
+	if (bserrno == -ECONNABORTED) // determine whether the abort was due to a timeout (failure) or conflict
 	{
 		const uint64_t end_ticks = spdk_get_ticks();
 		const uint64_t time_elapsed_us = ((end_ticks - job->start_ticks) / spdk_get_ticks_hz()) * SPDK_SEC_TO_USEC;
