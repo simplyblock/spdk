@@ -51,6 +51,7 @@ DEFINE_STUB(spdk_nvme_transport_id_adrfam_str, const char *, (enum spdk_nvmf_adr
 DEFINE_STUB(ibv_dereg_mr, int, (struct ibv_mr *mr), 0);
 DEFINE_STUB(ibv_resize_cq, int, (struct ibv_cq *cq, int cqe), 0);
 DEFINE_STUB(spdk_mempool_lookup, struct spdk_mempool *, (const char *name), NULL);
+DEFINE_STUB(spdk_rdma_cm_id_get_numa_id, int32_t, (struct rdma_cm_id *cm_id), 0);
 
 /* ibv_reg_mr can be a macro, need to undefine it */
 #ifdef ibv_reg_mr
@@ -1248,7 +1249,7 @@ test_nvmf_rdma_request_free_data(void)
 				  SPDK_NVMF_MAX_SGL_ENTRIES,
 				  sizeof(struct spdk_nvmf_rdma_request_data),
 				  SPDK_MEMPOOL_DEFAULT_CACHE_SIZE,
-				  SPDK_ENV_SOCKET_ID_ANY);
+				  SPDK_ENV_NUMA_ID_ANY);
 	next_request_data = spdk_mempool_get(rtransport.data_wr_pool);
 	SPDK_CU_ASSERT_FATAL(((struct test_mempool *)rtransport.data_wr_pool)->count ==
 			     SPDK_NVMF_MAX_SGL_ENTRIES - 1);
@@ -1430,7 +1431,7 @@ test_nvmf_rdma_resize_cq(void)
 
 	rc = nvmf_rdma_resize_cq(&rqpair, &rdevice);
 	CU_ASSERT(rc == 0);
-	CU_ASSERT(rpoller.num_cqe = 30);
+	CU_ASSERT(rpoller.num_cqe == 30);
 	CU_ASSERT(rpoller.required_num_wr == 18 + MAX_WR_PER_QP(rqpair.max_queue_depth));
 	CU_ASSERT(rpoller.required_num_wr > tnum_wr);
 	CU_ASSERT(rpoller.num_cqe > tnum_cqe);

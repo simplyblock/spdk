@@ -35,6 +35,7 @@ struct rpc_bdev_lvol_create_lvstore {
 	uint32_t cluster_sz;
 	char *clear_method;
 	uint32_t num_md_pages_per_cluster_ratio;
+	uint32_t md_page_size;
 };
 
 static int
@@ -81,6 +82,7 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_create_lvstore_decode
 	{"lvs_name", offsetof(struct rpc_bdev_lvol_create_lvstore, lvs_name), spdk_json_decode_string},
 	{"clear_method", offsetof(struct rpc_bdev_lvol_create_lvstore, clear_method), spdk_json_decode_string, true},
 	{"num_md_pages_per_cluster_ratio", offsetof(struct rpc_bdev_lvol_create_lvstore, num_md_pages_per_cluster_ratio), spdk_json_decode_uint32, true},
+	{"md_page_size", offsetof(struct rpc_bdev_lvol_create_lvstore, md_page_size), spdk_json_decode_uint32, true},
 };
 
 static void
@@ -135,8 +137,9 @@ rpc_bdev_lvol_create_lvstore(struct spdk_jsonrpc_request *request,
 		clear_method = LVS_CLEAR_WITH_UNMAP;
 	}
 
-	rc = vbdev_lvs_create(req.bdev_name, req.lvs_name, req.cluster_sz, clear_method,
-			      req.num_md_pages_per_cluster_ratio, rpc_lvol_store_construct_cb, request);
+	rc = vbdev_lvs_create_ext(req.bdev_name, req.lvs_name, req.cluster_sz, clear_method,
+				  req.num_md_pages_per_cluster_ratio, req.md_page_size,
+				  rpc_lvol_store_construct_cb, request);
 	if (rc < 0) {
 		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
 		goto cleanup;
@@ -1175,6 +1178,8 @@ rpc_dump_lvol(struct spdk_json_write_ctx *w, struct spdk_lvol *lvol)
 	spdk_json_write_named_bool(w, "is_clone", spdk_blob_is_clone(lvol->blob));
 	spdk_json_write_named_bool(w, "is_esnap_clone", spdk_blob_is_esnap_clone(lvol->blob));
 	spdk_json_write_named_bool(w, "is_degraded", spdk_blob_is_degraded(lvol->blob));
+	spdk_json_write_named_uint64(w, "num_allocated_clusters",
+				     spdk_blob_get_num_allocated_clusters(lvol->blob));
 
 	spdk_json_write_named_object_begin(w, "lvs");
 	spdk_json_write_named_string(w, "name", lvs->name);
@@ -1191,6 +1196,9 @@ rpc_dump_lvols(struct spdk_json_write_ctx *w, struct lvol_store_bdev *lvs_bdev)
 	struct spdk_lvol *lvol;
 
 	TAILQ_FOREACH(lvol, &lvs->lvols, link) {
+		if (lvol->ref_count == 0) {
+			continue;
+		}
 		rpc_dump_lvol(w, lvol);
 	}
 }

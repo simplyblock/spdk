@@ -89,6 +89,7 @@
 	spdk_dif_get_length_with_md;
 	spdk_dif_remap_ref_tag;
 	spdk_dix_remap_ref_tag;
+	spdk_dif_pi_format_get_size;
 
 	# public functions in fd.h
 	spdk_fd_get_size;
@@ -184,11 +185,14 @@
 	spdk_fd_group_wait;
 	spdk_fd_group_add;
 	spdk_fd_group_add_for_events;
+	spdk_fd_group_add_ext;
+	spdk_fd_group_get_default_event_handler_opts;
 	spdk_fd_group_remove;
 	spdk_fd_group_event_modify;
 	spdk_fd_group_get_fd;
 	spdk_fd_group_nest;
 	spdk_fd_group_unnest;
+	spdk_fd_group_set_wrapper;
 
 	# public functions in xor.h
 	spdk_xor_gen;
@@ -198,6 +202,11 @@
 	spdk_zipf_create;
 	spdk_zipf_free;
 	spdk_zipf_generate;
+
+	# public functions in md5.h
+	spdk_md5init;
+	spdk_md5final;
+	spdk_md5update;
 
 	local: *;
 };

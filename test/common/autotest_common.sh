@@ -174,6 +174,8 @@ export SPDK_TEST_NVMF_MDNS
 export SPDK_JSONRPC_GO_CLIENT
 : ${SPDK_TEST_SETUP=0}
 export SPDK_TEST_SETUP
+: ${SPDK_TEST_NVME_INTERRUPT=0}
+export SPDK_TEST_NVME_INTERRUPT
 
 # always test with SPDK shared objects.
 export SPDK_LIB_DIR="$rootdir/build/lib"
@@ -262,6 +264,16 @@ export AR_TOOL=$rootdir/scripts/ar-xnvme-fixer
 # For testing nvmes which are attached to some sort of a fanout switch in the CI pool
 export UNBIND_ENTIRE_IOMMU_GROUP=${UNBIND_ENTIRE_IOMMU_GROUP:-no}
 
+_LCOV_MAIN=0
+_LCOV_LLVM=1
+_LCOV=$LCOV_MAIN
+[[ $CC == *clang* || $SPDK_TEST_FUZZER -eq 1 ]] && _LCOV=$_LCOV_LLVM
+
+_lcov_opt[_LCOV_LLVM]="--gcov-tool $rootdir/test/fuzz/llvm/llvm-gcov.sh"
+_lcov_opt[_LCOV_MAIN]=""
+
+lcov_opt=${_lcov_opt[_LCOV]}
+
 # pass our valgrind desire on to unittest.sh
 if [ $SPDK_RUN_VALGRIND -eq 0 ]; then
 	export valgrind=''
@@ -303,11 +315,11 @@ for i in "$@"; do
 		--transport=*)
 			TEST_TRANSPORT="${i#*=}"
 			;;
-		--sock=*)
-			TEST_SOCK="${i#*=}"
-			;;
 		--no-hugepages)
 			NO_HUGE=(--no-huge -s 1024)
+			;;
+		--interrupt-mode)
+			TEST_INTERRUPT_MODE=1
 			;;
 	esac
 done
@@ -403,18 +415,11 @@ function get_config_params() {
 		config_params+=" --with-usdt"
 	fi
 
-	if [ $(uname -s) == "FreeBSD" ]; then
-		intel="hw.model: Intel"
-		cpu_vendor=$(sysctl -a | grep hw.model | cut -c 1-15)
-	else
-		intel="GenuineIntel"
-		cpu_vendor=$(grep -i 'vendor' /proc/cpuinfo --max-count=1)
-	fi
-	if [[ "$cpu_vendor" != *"$intel"* ]]; then
-		config_params+=" --without-idxd"
-	else
-		config_params+=" --with-idxd"
-	fi
+	case "$(uname -s)" in
+		FreeBSD) [[ $(sysctl -n hw.model) == Intel* ]] ;;
+		Linux) [[ $(< /proc/cpuinfo) == *GenuineIntel* ]] ;;
+		*) false ;;
+	esac && config_params+=" --with-idxd" || config_params+=" --without-idxd"
 
 	if [[ -d $CONFIG_FIO_SOURCE_DIR ]]; then
 		config_params+=" --with-fio=$CONFIG_FIO_SOURCE_DIR"
@@ -464,9 +469,7 @@ function get_config_params() {
 		config_params+=' --enable-asan'
 	fi
 
-	if [ "$(uname -s)" = "Linux" ]; then
-		config_params+=' --enable-coverage'
-	fi
+	config_params+=' --enable-coverage'
 
 	if [ $SPDK_TEST_BLOBFS -eq 1 ]; then
 		if [[ -d /usr/include/fuse3 ]] || [[ -d /usr/local/include/fuse3 ]]; then
@@ -729,15 +732,17 @@ function timing_exit() {
 }
 
 function timing_finish() {
+	[[ -e $output_dir/timing.txt ]] || return 0
+
 	flamegraph='/usr/local/FlameGraph/flamegraph.pl'
-	if [ -x "$flamegraph" ]; then
-		"$flamegraph" \
-			--title 'Build Timing' \
-			--nametype 'Step:' \
-			--countname seconds \
-			$output_dir/timing.txt \
-			> $output_dir/timing.svg
-	fi
+	[[ -x "$flamegraph" ]] || return 1
+
+	"$flamegraph" \
+		--title 'Build Timing' \
+		--nametype 'Step:' \
+		--countname seconds \
+		"$output_dir/timing.txt" \
+		> "$output_dir/timing.svg"
 }
 
 function create_test_list() {
@@ -1433,8 +1438,6 @@ function autotest_cleanup() {
 			echo l > /proc/sysrq-trigger
 			# Show mem usage
 			echo m > /proc/sysrq-trigger
-			# show task states
-			echo t > /proc/sysrq-trigger
 			# show blocked tasks
 			echo w > /proc/sysrq-trigger
 
@@ -1510,7 +1513,8 @@ function nvme_namespace_revert() {
 	$rootdir/scripts/setup.sh
 	sleep 1
 	local bdfs=()
-	bdfs=($(get_nvme_bdfs))
+	# If there are no nvme bdfs, just return immediately
+	bdfs=($(get_nvme_bdfs)) || return 0
 
 	$rootdir/scripts/setup.sh reset
 
@@ -1553,15 +1557,16 @@ function nvme_namespace_revert() {
 
 # Get BDFs based on device ID, such as 0x0a54
 function get_nvme_bdfs_by_id() {
-	local bdfs=()
-
-	for bdf in $(get_nvme_bdfs); do
+	local bdfs=() _bdfs=()
+	_bdfs=($(get_nvme_bdfs)) || return 0
+	for bdf in "${_bdfs[@]}"; do
 		device=$(cat /sys/bus/pci/devices/$bdf/device) || true
 		if [[ "$device" == "$1" ]]; then
 			bdfs+=($bdf)
 		fi
 	done
 
+	((${#bdfs[@]} > 0)) || return 0
 	printf '%s\n' "${bdfs[@]}"
 }
 
@@ -1618,11 +1623,12 @@ function reap_spdk_processes() {
 	local bins test_bins procs
 	local spdk_procs spdk_pids
 
-	mapfile -t test_bins < <(find "$rootdir"/test/{app,env,event} -type f)
+	mapfile -t test_bins < <(find "$rootdir"/test/{app,env,event,nvme} -type f)
 	mapfile -t bins < <(
 		exec_files "${test_bins[@]}"
 		readlink -f "$SPDK_BIN_DIR/"* "$SPDK_EXAMPLE_DIR/"*
 	)
+	((${#bins[@]} > 0)) || return 0
 
 	mapfile -t spdk_procs < <(get_proc_paths | grep -E "$(
 		IFS="|"
@@ -1646,13 +1652,41 @@ function is_block_zoned() {
 
 function get_zoned_devs() {
 	local -gA zoned_devs=()
-	local nvme bdf
+	local -A zoned_ctrls=()
+	local nvme bdf ns
 
-	for nvme in /sys/block/nvme*; do
-		if is_block_zoned "${nvme##*/}"; then
-			zoned_devs["${nvme##*/}"]=$(< "$nvme/device/address")
-		fi
+	# When given ctrl has > 1 namespaces attached, we need to make
+	# sure we pick up ALL of them, even if only one of them is zoned.
+	# This is because the zoned_devs[] is mainly used for PCI_BLOCKED
+	# which passed to setup.sh will skip entire ctrl, not a single
+	# ns. FIXME: this should not be necessary. We need to find a way
+	# to handle zoned devices more gracefully instead of hiding them
+	# like that from all the other non-zns test suites.
+	for nvme in /sys/class/nvme/nvme*; do
+		bdf=$(< "$nvme/address")
+		for ns in "$nvme/"nvme*n*; do
+			if is_block_zoned "${ns##*/}"; then
+				zoned_ctrls["$nvme"]=$bdf
+				continue 2
+			fi
+		done
 	done
+
+	for nvme in "${!zoned_ctrls[@]}"; do
+		for ns in "$nvme/"nvme*n*; do
+			zoned_devs["${ns##*/}"]=${zoned_ctrls["$nvme"]}
+		done
+	done
+}
+
+function is_pid_child() {
+	local pid=$1 _pid
+
+	while read -r _pid; do
+		((pid == _pid)) && return 0
+	done < <(jobs -pr)
+
+	return 1
 }
 
 # Define temp storage for all the tests. Look for 2GB at minimum
@@ -1668,4 +1702,22 @@ if $SPDK_AUTOTEST_X; then
 	xtrace_fd
 else
 	xtrace_disable
+fi
+
+if [[ $CONFIG_COVERAGE == y ]]; then
+	if lt "$(lcov --version | awk '{print $NF}')" 2; then
+		lcov_rc_opt="--rc lcov_branch_coverage=1 --rc lcov_function_coverage=1"
+	else
+		lcov_rc_opt="--rc branch_coverage=1 --rc function_coverage=1"
+	fi
+	export LCOV_OPTS="
+		$lcov_rc_opt
+		--rc genhtml_branch_coverage=1
+		--rc genhtml_function_coverage=1
+		--rc genhtml_legend=1
+		--rc geninfo_all_blocks=1
+		--rc geninfo_unexecuted_blocks=1
+		$lcov_opt
+		"
+	export LCOV="lcov $LCOV_OPTS"
 fi

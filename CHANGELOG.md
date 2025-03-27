@@ -1,28 +1,197 @@
 # Changelog
 
-## v24.09: (Upcoming Release)
+## v25.01: (Upcoming Release)
+
+### bdev_nvme
+
+Added controller configuration consistency check, so all controllers created with the same name will
+be forced to have consistent setting, either multipath or failover. No mixing of different '-x'
+options will be allowed.
+
+Changed default mode: if no '-x' option is specified in bdev_nvme_attach_controller RPC call,
+the multipath mode will be assigned as a default.
+
+Changed `spdk_bdev_nvme_create` API function, the `multipath` parameter was removed as it is redundant
+to `multipath` field in spdk_bdev_nvme_ctrlr_opts structure passed as a parameter to this function.
+If multipathing shall be enabled for nvme bdev, `bdev_opts.multipath` shall be set to `true`. When
+`bdev_opts.multipath` is set to `false`, failover mode is enabled.
+
+Added public APIs `spdk_bdev_nvme_get_opts` and `spdk_bdev_nvme_set_opts` to get default bdev nvme
+options and set them respectively.
+
+### env
+
+Added 3 APIs to handle multiple interrupts for PCI device `spdk_pci_device_enable_interrupts()`,
+`spdk_pci_device_disable_interrupts()`, and `spdk_pci_device_get_interrupt_efd_by_index()`.
+
+### nvme
+
+Added `enable_interrupts` option to `spdk_nvme_ctrlr_opts`. If set to true then interrupts may be
+enabled during initialization. Make sure to check the resulting value after the attach step to
+check for success. This mode is currently only supported for PCIe transport. This is only
+supported within a primary SPDK process, and if enabled SPDK will not support secondary processes.
+
+Added APIs `spdk_nvme_qpair_get_fd()` and `spdk_nvme_ctrlr_get_admin_qp_fd()` to retrieve the file
+descriptor for an I/O and the admin queue pair of a given NVMe controller respectively.
+These APIs accept `spdk_event_handler_opts` structure, and if specified the transport layer will
+fill it out which can be used by the application to register interrupts on the queue pairs.
+
+Added `opts_size` in `spdk_nvme_io_qpair_opts` structure to align it with other opts structures.
+
+`spdk_nvme_poll_group_create()` now creates a fd group to manage interrupt events.
+
+Two new APIs have been added to manage interrupt events in poll group.
+
+`spdk_nvme_poll_group_get_fd()` retrieves the internal epoll file descriptor of the poll group.
+
+`spdk_nvme_poll_group_wait()` waits for interrupt events on all the I/O queue pair file descriptors
+in a poll group. When an interrupt event gets generated, it processes any outstanding completions
+on the I/O queue pair with interrupts. These interrupt events are registered at the the time of I/O
+queue pair creation.
 
 ### nvmf
 
+Added public API `spdk_nvmf_send_discovery_log_notice` to send discovery log page
+change notice to client.
+
+### reduce
+
+Add `spdk_reduce_vol_get_info()` to get the information for the compressed volume.
+
+### thread
+
+Added `spdk_interrupt_register_ext()` API which can receive `spdk_event_handler_opts` structure.
+This is to prevent any further expansion of `spdk_interrupt_register()` API.
+
+### util
+
+Added `spdk_fd_group_add_ext()` API which can receive `spdk_event_handler_opts` structure. This is
+to prevent any further expansion of `spdk_fd_group_add()` API.
+
+## v24.09
+
+### accel
+
+Added `spdk_accel_submit_compress_ext()` and `spdk_accel_submit_decompress_ext()` API.  They differ
+from the non-ext variants in that these functions allow users to specify a compression algorithm and
+compression level.
+
+Added `spdk_accel_get_compress_level_range()` to get the valid level range of a given compression
+algorithm.
+
+Added API to generate and verify DIX.
+
+Added append version of `dif_verify`, `dif_verify_copy`, `dif_generate`, and `dif_generate_copy`.
+
+Added support for lz4 compression.
+
+### bdev
+
+`spdk_bdev_io_get_aux_buf` and `spdk_bdev_io_put_aux_buf` are deprecated and
+will be removed in the 25.01 release. We do not believe these are in use currently.
+
+### bdev_compress
+
+Added support for specifying compression algorithm and level.
+
+### bdev_nvme
+
+Introduced new header file /module/bdev/nvme.h and added public APIs `spdk_bdev_nvme_create`,
+`spdk_bdev_nvme_set_multipath_policy` and `spdk_bdev_nvme_get_default_ctrlr_opts`
+to get connectivity and multipathing capabilities of `bdev_nvme`.
+
+Added `bdev_nvme_set_keys` RPC to change DH-HMAC-CHAP keys and force reauthentication of all qpairs
+of a controller.
+
+### dif
+
+Each element in `enum spdk_dif_pi_format` was subtracted by 1 to match the definition
+of the Protection Information Format in the NVMe specification. This is necessary change
+but breaks ABI compatibility. Please recompile your application if you added code using
+this enum of older SPDK.
+
+### dma
+
+Added `spdk_memory_domain_transfer_data()` function to transfer data between two memory domains.
+
+### env
+
+Added `spdk_env_core_get_smt_cpuset()` API to get the list of SMT sibling
+cores for a given core ID.
+
+Added `spdk_pci_device_get_numa_id()`, `spdk_env_get_numa_id()`, and `SPDK_ENV_NUMA_ID_ANY` to
+replace `socket_id` with `numa_id` when referring to a NUMA node.
+
+Added `spdk_env_get_first_numa_id()`, `spdk_env_get_last_numa_id()`, `spdk_env_get_next_numa_id()`,
+and `SPDK_ENV_FOREACH_NUMA_ID()` API to iterate over available NUMA nodes in a system.
+
+Added `enforce_numa` option to `spdk_env_opts`.  This option forces all hugepage memory
+allocations to allocate memory only from the specified NUMA node without trying to fallback to other
+NUMA nodes if it fails.
+
+### env_dpdk
+
+`spdk_get_tid` is added to get the tid of the current thread.
+
+### event
+
+The `framework_get_reactors` RPC method supports getting pid and tid.
+
+### fsdev
+
+Added the fsdev library providing a filesystem abstraction.
+
+### fuse_dispatcher
+
+Added the `fuse_dispatcher` library that manages fsdevs and implements FUSE <-> fsdev API
+translation.
+
+### idxd
+
+Added `spdk_idxd_submit_dix_generate()` function to generate DIX using DSA.
+
+### nvme
+
+Added `spdk_nvme_ctrlr_set_keys()`, `spdk_nvme_ctrlr_authenticate()`, and
+`spdk_nvme_qpair_authenticate()` API to change the DH-HMAC-CHAP keys of a given controller and force
+reauthentication on its qpairs.
+
+### nvmf
+
+Added support for interrupt mode in the NVMe-of TCP transport.
+
 Enable iobuf based queuing for nvmf requests when there is not enough free buffers available.
-Perspective from the user of the spdk_nvmf_request_get_buffers() API is that whenever all iovecs
+Perspective from the user of the `spdk_nvmf_request_get_buffers()` API is that whenever all iovecs
 are allocated immediately then nothing changes compared to the previous implementation.
 If iobuf does not have enough buffers then there are two flows now:
 
-- if req_get_buffers_done is not set in the spdk_nvmf_transport_ops then again, nothing changes. All
-  (if there were any) ioves are released and caller must try again later.
+- if `req_get_buffers_done` is not set in the `spdk_nvmf_transport_ops` then again, nothing
+  changes. All (if there were any) ioves are released and caller must try again later.
 - if callback was set then caller will be notified once all iovecs are allocated.
 
 As requests waiting for the buffer might get aborted, another API to remove such request from
 the iobuf queue is also added.
 
+Added public API `spdk_nvmf_subsystem_set_cntlid_range()` to set controller ID range for a
+subsystem.
+
+Added `nvmf_subsystem_set_keys` RPC to change DH-HMAC-CHAP keys for a given subsystem/host pair
+without having to remove and readd a host.
+
+Added `spdk_nvmf_subsystem_set_ns_ana_group()` function to change ANA group ID of an active
+namespace of a subsystem.
+
+### scheduler
+
+Added `framework_get_governor` RPC to retrieve the power governor name,
+power env and the frequencies available, frequency set to the cpu cores.
+
 ### sock
 
 New functions that allows to register interrupt for given socket group:
-`spdk_sock_group_register_interrupt()`
-`spdk_sock_group_unregister_interrupt()`
-Both uses API exposed by the thread.h, see below for details.
-Support implemented only for the POSIX and SSL sockets.
+`spdk_sock_group_register_interrupt()` and `spdk_sock_group_unregister_interrupt()`. Both uses API
+exposed by the thread.h, see below for details.  Support implemented only for the POSIX and SSL
+sockets.
 
 ### thread
 
@@ -33,43 +202,9 @@ See below for details.
 
 New function `spdk_fd_group_add_for_events()` was added alongside the existing `spdk_fd_group_add()`.
 Difference is that new API allows for specifying a set of events to be monitored instead of default
-SPDK_INTERRUPT_EVENT_IN.
+`SPDK_INTERRUPT_EVENT_IN`.
 
-### env
-
-Added `spdk_env_core_get_smt_cpuset()` API to get the list of SMT sibling
-cores for a given core ID.
-
-### nvmf
-
-Added public API 'spdk_nvmf_subsystem_set_cntlid_range' to set controller ID
-range for a subsystem.
-
-### event
-
-The `framework_get_reactors` RPC method supports getting pid and tid.
-
-### env_dpdk
-
-`spdk_get_tid` is added to get the tid of the current thread.
-
-### scheduler
-
-Added `framework_get_governor` RPC to retrieve the power governor name,
-power env and the frequencies available, frequency set to the cpu cores.
-
-### bdev_nvme
-
-Introduced new header file /module/bdev/nvme.h and added public APIs `spdk_bdev_nvme_create`,
-`spdk_bdev_nvme_set_multipath_policy` and `spdk_bdev_nvme_get_default_ctrlr_opts`
-to get connectivity and multipathing capabilities of bdev_nvme.
-
-### dif
-
-Each element in `enum spdk_dif_pi_format` was subtracted by 1 to match the definition
-of the Protection Information Format in the NVMe specification. This is necessary change
-but breaks ABI compatibility. Please recompile your application if you added code using
-this enum of older SPDK.
+Added API to calculate md5 hash.
 
 ## v24.05
 

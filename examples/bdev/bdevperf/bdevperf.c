@@ -25,6 +25,7 @@
 #define BDEVPERF_CONFIG_UNDEFINED -1
 #define BDEVPERF_CONFIG_ERROR -2
 #define PATTERN_TYPES_STR "(read, write, randread, randwrite, rw, randrw, verify, reset, unmap, flush, write_zeroes)"
+#define BDEVPERF_MAX_COREMASK_STRING 64
 
 struct bdevperf_task {
 	struct iovec			iov;
@@ -33,6 +34,7 @@ struct bdevperf_task {
 	void				*buf;
 	void				*verify_buf;
 	void				*md_buf;
+	void				*verify_md_buf;
 	uint64_t			offset_blocks;
 	struct bdevperf_task		*task_to_abort;
 	enum spdk_bdev_io_type		io_type;
@@ -73,6 +75,7 @@ static const char *g_bdevperf_conf_file = NULL;
 static double g_zipf_theta;
 static bool g_random_map = false;
 static bool g_unique_writes = false;
+static bool g_hide_metadata = false;
 
 static struct spdk_cpuset g_all_cpuset;
 static struct spdk_poller *g_perf_timer = NULL;
@@ -166,6 +169,7 @@ struct bdevperf_job {
 	uint64_t			buf_size;
 	uint32_t			dif_check_flags;
 	bool				is_draining;
+	bool				md_check;
 	struct spdk_poller		*run_timer;
 	struct spdk_poller		*reset_timer;
 	struct spdk_bit_array		*outstanding;
@@ -211,21 +215,25 @@ TAILQ_HEAD(, job_config) job_config_list
 
 static bool g_performance_dump_active = false;
 
-struct bdevperf_aggregate_stats {
-	struct bdevperf_job		*current_job;
+struct bdevperf_stats {
 	uint64_t			io_time_in_usec;
-	uint64_t			ema_period;
 	double				total_io_per_second;
 	double				total_mb_per_second;
 	double				total_failed_per_second;
 	double				total_timeout_per_second;
 	double				min_latency;
 	double				max_latency;
+	double				average_latency;
 	uint64_t			total_io_completed;
 	uint64_t			total_tsc;
 };
 
-static struct bdevperf_aggregate_stats g_stats = {.min_latency = (double)UINT64_MAX};
+struct bdevperf_aggregate_stats {
+	struct bdevperf_job		*current_job;
+	struct bdevperf_stats		total;
+};
+
+static struct bdevperf_aggregate_stats g_stats = {.total.min_latency = (double)UINT64_MAX};
 
 struct lcore_thread {
 	struct spdk_thread		*thread;
@@ -320,33 +328,41 @@ get_avg_latency(void *ctx, uint64_t start, uint64_t end, uint64_t count,
 }
 
 static void
-performance_dump_job(struct bdevperf_aggregate_stats *stats, struct bdevperf_job *job,
-		     bool print_job_info)
+bdevperf_job_stats_accumulate(struct bdevperf_stats *aggr_stats,
+			      struct bdevperf_stats *job_stats)
+{
+	aggr_stats->total_io_per_second += job_stats->total_io_per_second;
+	aggr_stats->total_mb_per_second += job_stats->total_mb_per_second;
+	aggr_stats->total_failed_per_second += job_stats->total_failed_per_second;
+	aggr_stats->total_timeout_per_second += job_stats->total_timeout_per_second;
+	aggr_stats->total_io_completed += job_stats->total_io_completed;
+	aggr_stats->total_tsc += job_stats->total_tsc;
+
+	if (job_stats->min_latency < aggr_stats->min_latency) {
+		aggr_stats->min_latency = job_stats->min_latency;
+	}
+	if (job_stats->max_latency > aggr_stats->max_latency) {
+		aggr_stats->max_latency = job_stats->max_latency;
+	}
+}
+
+static void
+bdevperf_job_get_stats(struct bdevperf_job *job,
+		       struct bdevperf_stats *job_stats,
+		       uint64_t time_in_usec,
+		       uint64_t ema_period)
 {
 	double io_per_second, mb_per_second, failed_per_second, timeout_per_second;
 	double average_latency = 0.0, min_latency, max_latency;
-	uint64_t time_in_usec;
 	uint64_t tsc_rate;
 	uint64_t total_io;
 	struct latency_info latency_info = {};
 
-	if (g_performance_dump_active == true) {
-		/* Use job's actual run time as Job has ended */
-		if (job->io_failed > 0 && !job->continue_on_failure) {
-			time_in_usec = job->run_time_in_usec;
-		} else {
-			time_in_usec = stats->io_time_in_usec;
-		}
-	} else {
-		time_in_usec = job->run_time_in_usec;
-	}
-
-	if (stats->ema_period == 0) {
+	if (ema_period == 0) {
 		io_per_second = get_cma_io_per_second(job, time_in_usec);
 	} else {
-		io_per_second = get_ema_io_per_second(job, stats->ema_period);
+		io_per_second = get_ema_io_per_second(job, ema_period);
 	}
-
 	tsc_rate = spdk_get_ticks_hz();
 	mb_per_second = io_per_second * job->io_size / (1024 * 1024);
 
@@ -362,48 +378,99 @@ performance_dump_job(struct bdevperf_aggregate_stats *stats, struct bdevperf_job
 	failed_per_second = (double)job->io_failed * SPDK_SEC_TO_USEC / time_in_usec;
 	timeout_per_second = (double)job->io_timeout * SPDK_SEC_TO_USEC / time_in_usec;
 
-	if (print_job_info) {
-		if (job->workload_type == JOB_CONFIG_RW_RW || job->workload_type == JOB_CONFIG_RW_RANDRW) {
-			printf("Job: %s (Core Mask 0x%s, workload: %s, percentage: %d, depth: %d, IO size: %d)\n",
-			       job->name, spdk_cpuset_fmt(spdk_thread_get_cpumask(job->thread)),
-			       parse_workload_type(job->workload_type), job->rw_percentage,
-			       job->queue_depth, job->io_size);
-		} else {
-			printf("Job: %s (Core Mask 0x%s, workload: %s, depth: %d, IO size: %d)\n",
-			       job->name, spdk_cpuset_fmt(spdk_thread_get_cpumask(job->thread)),
-			       parse_workload_type(job->workload_type), job->queue_depth, job->io_size);
-		}
+	job_stats->total_io_per_second = io_per_second;
+	job_stats->total_mb_per_second = mb_per_second;
+	job_stats->total_failed_per_second = failed_per_second;
+	job_stats->total_timeout_per_second = timeout_per_second;
+	job_stats->total_io_completed = total_io;
+	job_stats->total_tsc = latency_info.total;
+	job_stats->average_latency = average_latency;
+	job_stats->min_latency = min_latency;
+	job_stats->max_latency = max_latency;
+	job_stats->io_time_in_usec = time_in_usec;
+}
 
-
-		if (job->io_failed > 0 && !job->reset && !job->continue_on_failure) {
-			printf("Job: %s ended in about %.2f seconds with error\n",
-			       job->name, (double)job->run_time_in_usec / SPDK_SEC_TO_USEC);
-		}
-		if (job->verify) {
-			printf("\t Verification LBA range: start 0x%" PRIx64 " length 0x%" PRIx64 "\n",
-			       job->ios_base, job->size_in_ios);
-		}
-
-		printf("\t %-20s: %10.2f %10.2f %10.2f",
-		       job->name, (float)time_in_usec / SPDK_SEC_TO_USEC, io_per_second, mb_per_second);
-		printf(" %10.2f %8.2f",
-		       failed_per_second, timeout_per_second);
-		printf(" %10.2f %10.2f %10.2f\n",
-		       average_latency, min_latency, max_latency);
+static void
+performance_dump_job_stdout(struct bdevperf_job *job,
+			    struct bdevperf_stats *job_stats)
+{
+	if (job->workload_type == JOB_CONFIG_RW_RW || job->workload_type == JOB_CONFIG_RW_RANDRW) {
+		printf("Job: %s (Core Mask 0x%s, workload: %s, percentage: %d, depth: %d, IO size: %d)\n",
+		       job->name, spdk_cpuset_fmt(spdk_thread_get_cpumask(job->thread)),
+		       parse_workload_type(job->workload_type), job->rw_percentage,
+		       job->queue_depth, job->io_size);
+	} else {
+		printf("Job: %s (Core Mask 0x%s, workload: %s, depth: %d, IO size: %d)\n",
+		       job->name, spdk_cpuset_fmt(spdk_thread_get_cpumask(job->thread)),
+		       parse_workload_type(job->workload_type), job->queue_depth, job->io_size);
 	}
 
-	stats->total_io_per_second += io_per_second;
-	stats->total_mb_per_second += mb_per_second;
-	stats->total_failed_per_second += failed_per_second;
-	stats->total_timeout_per_second += timeout_per_second;
-	stats->total_io_completed += job->io_completed + job->io_failed;
-	stats->total_tsc += latency_info.total;
-	if (min_latency < stats->min_latency) {
-		stats->min_latency = min_latency;
+
+	if (job->io_failed > 0 && !job->reset && !job->continue_on_failure) {
+		printf("Job: %s ended in about %.2f seconds with error\n",
+		       job->name, (double)job->run_time_in_usec / SPDK_SEC_TO_USEC);
 	}
-	if (max_latency > stats->max_latency) {
-		stats->max_latency = max_latency;
+	if (job->verify) {
+		printf("\t Verification LBA range: start 0x%" PRIx64 " length 0x%" PRIx64 "\n",
+		       job->ios_base, job->size_in_ios);
 	}
+
+	printf("\t %-20s: %10.2f %10.2f %10.2f",
+	       job->name,
+	       (float)job_stats->io_time_in_usec / SPDK_SEC_TO_USEC,
+	       job_stats->total_io_per_second,
+	       job_stats->total_mb_per_second);
+	printf(" %10.2f %8.2f",
+	       job_stats->total_failed_per_second,
+	       job_stats->total_timeout_per_second);
+	printf(" %10.2f %10.2f %10.2f\n",
+	       job_stats->average_latency,
+	       job_stats->min_latency,
+	       job_stats->max_latency);
+}
+
+static void
+performance_dump_job_json(struct bdevperf_job *job,
+			  struct spdk_json_write_ctx *w,
+			  struct bdevperf_stats *job_stats)
+{
+	char core_mask_string[BDEVPERF_MAX_COREMASK_STRING] = {0};
+
+	spdk_json_write_named_string(w, "job", job->name);
+	snprintf(core_mask_string, BDEVPERF_MAX_COREMASK_STRING,
+		 "0x%s", spdk_cpuset_fmt(spdk_thread_get_cpumask(job->thread)));
+	spdk_json_write_named_string(w, "core_mask", core_mask_string);
+	spdk_json_write_named_string(w, "workload", parse_workload_type(job->workload_type));
+
+	if (job->workload_type == JOB_CONFIG_RW_RW || job->workload_type == JOB_CONFIG_RW_RANDRW) {
+		spdk_json_write_named_uint32(w, "percentage", job->rw_percentage);
+	}
+
+	if (g_shutdown) {
+		spdk_json_write_named_string(w, "status", "terminated");
+	} else if (job->io_failed > 0 && !job->reset && !job->continue_on_failure) {
+		spdk_json_write_named_string(w, "status", "failed");
+	} else {
+		spdk_json_write_named_string(w, "status", "finished");
+	}
+
+	if (job->verify) {
+		spdk_json_write_named_object_begin(w, "verify_range");
+		spdk_json_write_named_uint64(w, "start", job->ios_base);
+		spdk_json_write_named_uint64(w, "length", job->size_in_ios);
+		spdk_json_write_object_end(w);
+	}
+
+	spdk_json_write_named_uint32(w, "queue_depth", job->queue_depth);
+	spdk_json_write_named_uint32(w, "io_size", job->io_size);
+	spdk_json_write_named_double(w, "runtime", (double)job_stats->io_time_in_usec / SPDK_SEC_TO_USEC);
+	spdk_json_write_named_double(w, "iops", job_stats->total_io_per_second);
+	spdk_json_write_named_double(w, "mibps", job_stats->total_mb_per_second);
+	spdk_json_write_named_uint64(w, "io_failed", job->io_failed);
+	spdk_json_write_named_uint64(w, "io_timeout", job->io_timeout);
+	spdk_json_write_named_double(w, "avg_latency_us", job_stats->average_latency);
+	spdk_json_write_named_double(w, "min_latency_us", job_stats->min_latency);
+	spdk_json_write_named_double(w, "max_latency_us", job_stats->max_latency);
 }
 
 static void
@@ -411,8 +478,8 @@ generate_data(struct bdevperf_job *job, void *buf, void *md_buf, bool unique)
 {
 	int offset_blocks = 0, md_offset, data_block_size, inner_offset;
 	int buf_len = job->buf_size;
-	int block_size = spdk_bdev_get_block_size(job->bdev);
-	int md_size = spdk_bdev_get_md_size(job->bdev);
+	int block_size = spdk_bdev_desc_get_block_size(job->bdev_desc);
+	int md_size = spdk_bdev_desc_get_md_size(job->bdev_desc);
 	int num_blocks = job->io_size_blocks;
 
 	if (buf_len < num_blocks * block_size) {
@@ -551,6 +618,10 @@ free_job_config(void)
 static void
 bdevperf_job_free(struct bdevperf_job *job)
 {
+	if (job->bdev_desc != NULL) {
+		spdk_bdev_close(job->bdev_desc);
+	}
+
 	spdk_histogram_data_free(job->histogram);
 	spdk_bit_array_free(&job->outstanding);
 	spdk_bit_array_free(&job->random_map);
@@ -613,9 +684,12 @@ bdevperf_test_done(void *ctx)
 	double average_latency = 0.0;
 	uint64_t time_in_usec;
 	int rc;
+	struct spdk_json_write_ctx *w = NULL;
+	struct bdevperf_stats job_stats = {0};
+	struct spdk_cpuset cpu_mask;
 
 	if (g_time_in_usec) {
-		g_stats.io_time_in_usec = g_time_in_usec;
+		g_stats.total.io_time_in_usec = g_time_in_usec;
 
 		if (!g_run_rc && g_performance_dump_active) {
 			spdk_thread_send_msg(spdk_get_thread(), bdevperf_test_done, NULL);
@@ -632,29 +706,56 @@ bdevperf_test_done(void *ctx)
 		printf("Received shutdown signal, test time was about %.6f seconds\n",
 		       (double)g_time_in_usec / SPDK_SEC_TO_USEC);
 	}
+	/* Send RPC response if g_run_rc indicate success, or shutdown request was sent to bdevperf.
+	 * rpc_perform_tests_cb will send error response in case of error.
+	 */
+	if ((g_run_rc == 0 || g_shutdown) && g_request) {
+		w = spdk_jsonrpc_begin_result(g_request);
+		spdk_json_write_object_begin(w);
+		spdk_json_write_named_array_begin(w, "results");
+	}
 
 	printf("\n%*s\n", 107, "Latency(us)");
 	printf("\r %-*s: %10s %10s %10s %10s %8s %10s %10s %10s\n",
 	       28, "Device Information", "runtime(s)", "IOPS", "MiB/s", "Fail/s", "TO/s", "Average", "min", "max");
 
+
+	spdk_cpuset_zero(&cpu_mask);
 	TAILQ_FOREACH_SAFE(job, &g_bdevperf.jobs, link, jtmp) {
-		performance_dump_job(&g_stats, job, true);
+		spdk_cpuset_or(&cpu_mask, spdk_thread_get_cpumask(job->thread));
+		memset(&job_stats, 0, sizeof(job_stats));
+		bdevperf_job_get_stats(job, &job_stats, job->run_time_in_usec, 0);
+		bdevperf_job_stats_accumulate(&g_stats.total, &job_stats);
+		performance_dump_job_stdout(job, &job_stats);
+		if (w) {
+			spdk_json_write_object_begin(w);
+			performance_dump_job_json(job, w, &job_stats);
+			spdk_json_write_object_end(w);
+		}
 	}
 
+	if (w) {
+		spdk_json_write_array_end(w);
+		spdk_json_write_named_uint32(w, "core_count", spdk_cpuset_count(&cpu_mask));
+		spdk_json_write_object_end(w);
+		spdk_jsonrpc_end_result(g_request, w);
+	}
 	printf("\r =================================================================================="
 	       "=================================\n");
 	printf("\r %-28s: %10s %10.2f %10.2f",
-	       "Total", "", g_stats.total_io_per_second, g_stats.total_mb_per_second);
+	       "Total", "", g_stats.total.total_io_per_second, g_stats.total.total_mb_per_second);
 	printf(" %10.2f %8.2f",
-	       g_stats.total_failed_per_second, g_stats.total_timeout_per_second);
+	       g_stats.total.total_failed_per_second, g_stats.total.total_timeout_per_second);
 
-	if (g_stats.total_io_completed != 0) {
-		average_latency = ((double)g_stats.total_tsc / g_stats.total_io_completed) * SPDK_SEC_TO_USEC /
+	if (g_stats.total.total_io_completed != 0) {
+		average_latency = ((double)g_stats.total.total_tsc / g_stats.total.total_io_completed) *
+				  SPDK_SEC_TO_USEC /
 				  spdk_get_ticks_hz();
 	}
-	printf(" %10.2f %10.2f %10.2f\n", average_latency, g_stats.min_latency, g_stats.max_latency);
+	printf(" %10.2f %10.2f %10.2f\n", average_latency, g_stats.total.min_latency,
+	       g_stats.total.max_latency);
 
-	if (g_latency_display_level == 0 || g_stats.total_io_completed == 0) {
+	if (g_latency_display_level == 0 || g_stats.total.total_io_completed == 0) {
 		goto clean;
 	}
 
@@ -700,6 +801,7 @@ clean:
 			spdk_free(task->buf);
 			spdk_free(task->verify_buf);
 			spdk_free(task->md_buf);
+			spdk_free(task->verify_md_buf);
 			free(task);
 		}
 
@@ -732,7 +834,14 @@ clean:
 static void
 bdevperf_job_end(void *ctx)
 {
+	struct bdevperf_job *job = ctx;
+
 	assert(g_main_thread == spdk_get_thread());
+
+	if (job->bdev_desc != NULL) {
+		spdk_bdev_close(job->bdev_desc);
+		job->bdev_desc = NULL;
+	}
 
 	if (--g_bdevperf.running_jobs == 0) {
 		bdevperf_test_done(NULL);
@@ -760,8 +869,7 @@ bdevperf_job_empty(struct bdevperf_job *job)
 	spdk_bdev_channel_get_histogram(job->ch, bdevperf_channel_get_histogram_cb,
 					job->histogram);
 	spdk_put_io_channel(job->ch);
-	spdk_bdev_close(job->bdev_desc);
-	spdk_thread_send_msg(g_main_thread, bdevperf_job_end, NULL);
+	spdk_thread_send_msg(g_main_thread, bdevperf_job_end, job);
 }
 
 static void
@@ -887,12 +995,10 @@ bdevperf_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
 	struct bdevperf_job	*job;
 	struct bdevperf_task	*task = cb_arg;
-	bool			md_check;
 	uint64_t		offset_in_ios;
 	int			rc;
 
 	job = task->job;
-	md_check = spdk_bdev_get_dif_type(job->bdev) == SPDK_DIF_DISABLE;
 
 	if (g_error_to_exit == true) {
 		bdevperf_job_drain(job);
@@ -907,16 +1013,16 @@ bdevperf_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	} else if (job->verify || job->reset) {
 		if (!verify_data(task->buf, job->buf_size,
 				 task->iov.iov_base, job->buf_size,
-				 spdk_bdev_get_block_size(job->bdev),
+				 spdk_bdev_desc_get_block_size(job->bdev_desc),
 				 task->md_buf, spdk_bdev_io_get_md_buf(bdev_io),
-				 spdk_bdev_get_md_size(job->bdev),
-				 job->io_size_blocks, md_check)) {
+				 spdk_bdev_desc_get_md_size(job->bdev_desc),
+				 job->io_size_blocks, job->md_check)) {
 			printf("Buffer mismatch! Target: %s Disk Offset: %" PRIu64 "\n", job->name, task->offset_blocks);
 			bdevperf_job_drain(job);
 			g_run_rc = -1;
 		}
 	} else if (job->dif_check_flags != 0) {
-		if (task->io_type == SPDK_BDEV_IO_TYPE_READ && spdk_bdev_get_md_size(job->bdev) != 0) {
+		if (task->io_type == SPDK_BDEV_IO_TYPE_READ && spdk_bdev_desc_get_md_size(job->bdev_desc) != 0) {
 			rc = bdevperf_verify_dif(task);
 			if (rc != 0) {
 				printf("DIF error detected. task offset: %" PRIu64 " on job bdev=%s\n",
@@ -976,7 +1082,7 @@ bdevperf_verify_submit_read(void *cb_arg)
 	task->iov.iov_len = job->buf_size;
 
 	/* Read the data back in */
-	rc = spdk_bdev_readv_blocks_with_md(job->bdev_desc, job->ch, &task->iov, 1, NULL,
+	rc = spdk_bdev_readv_blocks_with_md(job->bdev_desc, job->ch, &task->iov, 1, task->verify_md_buf,
 					    task->offset_blocks, job->io_size_blocks,
 					    bdevperf_complete, task);
 
@@ -1016,19 +1122,19 @@ static int
 bdevperf_generate_dif(struct bdevperf_task *task)
 {
 	struct bdevperf_job	*job = task->job;
-	struct spdk_bdev	*bdev = job->bdev;
+	struct spdk_bdev_desc	*desc = job->bdev_desc;
 	struct spdk_dif_ctx	dif_ctx;
 	int			rc;
 	struct spdk_dif_ctx_init_ext_opts dif_opts;
 
 	dif_opts.size = SPDK_SIZEOF(&dif_opts, dif_pi_format);
-	dif_opts.dif_pi_format = spdk_bdev_get_dif_pi_format(bdev);
+	dif_opts.dif_pi_format = spdk_bdev_desc_get_dif_pi_format(desc);
 	rc = spdk_dif_ctx_init(&dif_ctx,
-			       spdk_bdev_get_block_size(bdev),
-			       spdk_bdev_get_md_size(bdev),
-			       spdk_bdev_is_md_interleaved(bdev),
-			       spdk_bdev_is_dif_head_of_md(bdev),
-			       spdk_bdev_get_dif_type(bdev),
+			       spdk_bdev_desc_get_block_size(desc),
+			       spdk_bdev_desc_get_md_size(desc),
+			       spdk_bdev_desc_is_md_interleaved(desc),
+			       spdk_bdev_desc_is_dif_head_of_md(desc),
+			       spdk_bdev_desc_get_dif_type(desc),
 			       job->dif_check_flags,
 			       task->offset_blocks, 0, 0, 0, 0, &dif_opts);
 	if (rc != 0) {
@@ -1036,12 +1142,12 @@ bdevperf_generate_dif(struct bdevperf_task *task)
 		return rc;
 	}
 
-	if (spdk_bdev_is_md_interleaved(bdev)) {
+	if (spdk_bdev_desc_is_md_interleaved(desc)) {
 		rc = spdk_dif_generate(&task->iov, 1, job->io_size_blocks, &dif_ctx);
 	} else {
 		struct iovec md_iov = {
 			.iov_base	= task->md_buf,
-			.iov_len	= spdk_bdev_get_md_size(bdev) * job->io_size_blocks,
+			.iov_len	= spdk_bdev_desc_get_md_size(desc) * job->io_size_blocks,
 		};
 
 		rc = spdk_dix_generate(&task->iov, 1, &md_iov, job->io_size_blocks, &dif_ctx);
@@ -1070,7 +1176,7 @@ bdevperf_submit_task(void *arg)
 
 	switch (task->io_type) {
 	case SPDK_BDEV_IO_TYPE_WRITE:
-		if (spdk_bdev_get_md_size(job->bdev) != 0 && job->dif_check_flags != 0) {
+		if (spdk_bdev_desc_get_md_size(desc) != 0 && job->dif_check_flags != 0) {
 			rc = bdevperf_generate_dif(task);
 		}
 		if (rc == 0) {
@@ -1170,9 +1276,9 @@ bdevperf_zcopy_get_buf_complete(struct spdk_bdev_io *bdev_io, bool success, void
 		assert(iovs != NULL);
 
 		copy_data(iovs[0].iov_base, iovs[0].iov_len, task->buf, job->buf_size,
-			  spdk_bdev_get_block_size(job->bdev),
+			  spdk_bdev_desc_get_block_size(job->bdev_desc),
 			  spdk_bdev_io_get_md_buf(bdev_io), task->md_buf,
-			  spdk_bdev_get_md_size(job->bdev), job->io_size_blocks);
+			  spdk_bdev_desc_get_md_size(job->bdev_desc), job->io_size_blocks);
 	}
 
 	bdevperf_submit_task(task);
@@ -1397,8 +1503,6 @@ bdevperf_job_run(void *ctx)
 							10 * SPDK_SEC_TO_USEC);
 	}
 
-	spdk_bdev_set_timeout(job->bdev_desc, g_timeout_in_sec, bdevperf_timeout_cb, job);
-
 	for (i = 0; i < job->queue_depth; i++) {
 		task = bdevperf_job_get_task(job);
 		bdevperf_submit_single(job, task);
@@ -1408,7 +1512,8 @@ bdevperf_job_run(void *ctx)
 static void
 _performance_dump_done(void *ctx)
 {
-	struct bdevperf_aggregate_stats *stats = ctx;
+	struct bdevperf_aggregate_stats *aggregate = ctx;
+	struct bdevperf_stats *stats = &aggregate->total;
 	double average_latency;
 
 	if (g_summarize_performance) {
@@ -1432,15 +1537,28 @@ _performance_dump_done(void *ctx)
 
 	g_performance_dump_active = false;
 
-	free(stats);
+	free(aggregate);
 }
 
 static void
 _performance_dump(void *ctx)
 {
 	struct bdevperf_aggregate_stats *stats = ctx;
+	struct bdevperf_stats job_stats = {0};
+	struct bdevperf_job *job = stats->current_job;
+	uint64_t time_in_usec;
 
-	performance_dump_job(stats, stats->current_job, !g_summarize_performance);
+	if (job->io_failed > 0 && !job->continue_on_failure) {
+		time_in_usec = job->run_time_in_usec;
+	} else {
+		time_in_usec = stats->total.io_time_in_usec;
+	}
+
+	bdevperf_job_get_stats(job, &job_stats, time_in_usec, g_show_performance_ema_period);
+	bdevperf_job_stats_accumulate(&stats->total, &job_stats);
+	if (!g_summarize_performance) {
+		performance_dump_job_stdout(stats->current_job, &job_stats);
+	}
 
 	/* This assumes the jobs list is static after start up time.
 	 * That's true right now, but if that ever changed this would need a lock. */
@@ -1455,7 +1573,9 @@ _performance_dump(void *ctx)
 static int
 performance_statistics_thread(void *arg)
 {
-	struct bdevperf_aggregate_stats *stats;
+	struct bdevperf_aggregate_stats *aggregate;
+	struct bdevperf_stats *stats;
+
 
 	if (g_performance_dump_active) {
 		return -1;
@@ -1463,27 +1583,26 @@ performance_statistics_thread(void *arg)
 
 	g_performance_dump_active = true;
 
-	stats = calloc(1, sizeof(*stats));
-	if (stats == NULL) {
+	aggregate = calloc(1, sizeof(*aggregate));
+	if (aggregate == NULL) {
 		return -1;
 	}
-
+	stats = &aggregate->total;
 	stats->min_latency = (double)UINT64_MAX;
 
 	g_show_performance_period_num++;
 
 	stats->io_time_in_usec = g_show_performance_period_num * g_show_performance_period_in_usec;
-	stats->ema_period = g_show_performance_ema_period;
 
 	/* Iterate all of the jobs to gather stats
 	 * These jobs will not get removed here until a final performance dump is run,
 	 * so this should be safe without locking.
 	 */
-	stats->current_job = TAILQ_FIRST(&g_bdevperf.jobs);
-	if (stats->current_job == NULL) {
-		spdk_thread_send_msg(g_main_thread, _performance_dump_done, stats);
+	aggregate->current_job = TAILQ_FIRST(&g_bdevperf.jobs);
+	if (aggregate->current_job == NULL) {
+		spdk_thread_send_msg(g_main_thread, _performance_dump_done, aggregate);
 	} else {
-		spdk_thread_send_msg(stats->current_job->thread, _performance_dump, stats);
+		spdk_thread_send_msg(aggregate->current_job->thread, _performance_dump, aggregate);
 	}
 
 	return -1;
@@ -1493,6 +1612,15 @@ static void
 bdevperf_test(void)
 {
 	struct bdevperf_job *job;
+
+	if (TAILQ_EMPTY(&g_bdevperf.jobs)) {
+		if (g_request) {
+			spdk_jsonrpc_send_error_response_fmt(g_request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+							     "No jobs defined or bdevs created");
+			g_request = NULL;
+		}
+		return;
+	}
 
 	printf("Running I/O for %" PRIu64 " seconds...\n", g_time_in_usec / (uint64_t)SPDK_SEC_TO_USEC);
 	fflush(stdout);
@@ -1511,9 +1639,17 @@ bdevperf_test(void)
 
 	/* Iterate jobs to start all I/O */
 	TAILQ_FOREACH(job, &g_bdevperf.jobs, link) {
+		spdk_bdev_set_timeout(job->bdev_desc, g_timeout_in_sec, bdevperf_timeout_cb, job);
+
 		g_bdevperf.running_jobs++;
 		spdk_thread_send_msg(job->thread, bdevperf_job_run, job);
 	}
+}
+
+static void
+_bdevperf_job_drain(void *ctx)
+{
+	bdevperf_job_drain(ctx);
 }
 
 static void
@@ -1522,7 +1658,7 @@ bdevperf_bdev_removed(enum spdk_bdev_event_type type, struct spdk_bdev *bdev, vo
 	struct bdevperf_job *job = event_ctx;
 
 	if (SPDK_BDEV_EVENT_REMOVE == type) {
-		bdevperf_job_drain(job);
+		spdk_thread_send_msg(job->thread, _bdevperf_job_drain, job);
 	}
 }
 
@@ -1654,15 +1790,6 @@ static void
 _bdevperf_construct_job(void *ctx)
 {
 	struct bdevperf_job *job = ctx;
-	int rc;
-
-	rc = spdk_bdev_open_ext(spdk_bdev_get_name(job->bdev), true, bdevperf_bdev_removed, job,
-				&job->bdev_desc);
-	if (rc != 0) {
-		SPDK_ERRLOG("Could not open leaf bdev %s, error=%d\n", spdk_bdev_get_name(job->bdev), rc);
-		g_run_rc = -EINVAL;
-		goto end;
-	}
 
 	if (g_zcopy) {
 		if (!spdk_bdev_io_type_supported(job->bdev, SPDK_BDEV_IO_TYPE_ZCOPY)) {
@@ -1674,10 +1801,7 @@ _bdevperf_construct_job(void *ctx)
 
 	job->ch = spdk_bdev_get_io_channel(job->bdev_desc);
 	if (!job->ch) {
-		SPDK_ERRLOG("Could not get io_channel for device %s, error=%d\n", spdk_bdev_get_name(job->bdev),
-			    rc);
-		spdk_bdev_close(job->bdev_desc);
-		TAILQ_REMOVE(&g_bdevperf.jobs, job, link);
+		SPDK_ERRLOG("Could not get io_channel for device %s\n", spdk_bdev_get_name(job->bdev));
 		g_run_rc = -ENOMEM;
 		goto end;
 	}
@@ -1740,13 +1864,12 @@ bdevperf_construct_job(struct spdk_bdev *bdev, struct job_config *config,
 		       struct spdk_thread *thread)
 {
 	struct bdevperf_job *job;
+	struct spdk_bdev_open_opts opts = {};
 	struct bdevperf_task *task;
 	int block_size, data_block_size;
 	int rc;
 	int task_num, n;
-
-	block_size = spdk_bdev_get_block_size(bdev);
-	data_block_size = spdk_bdev_get_data_block_size(bdev);
+	int32_t numa_id;
 
 	job = calloc(1, sizeof(struct bdevperf_job));
 	if (!job) {
@@ -1754,12 +1877,28 @@ bdevperf_construct_job(struct spdk_bdev *bdev, struct job_config *config,
 		return -ENOMEM;
 	}
 
+	job->thread = thread;
+
 	job->name = strdup(spdk_bdev_get_name(bdev));
 	if (!job->name) {
 		fprintf(stderr, "Unable to allocate memory for job name.\n");
 		bdevperf_job_free(job);
 		return -ENOMEM;
 	}
+
+	spdk_bdev_open_opts_init(&opts, sizeof(opts));
+	opts.hide_metadata = g_hide_metadata;
+
+	rc = spdk_bdev_open_ext_v2(job->name, true, bdevperf_bdev_removed, job, &opts,
+				   &job->bdev_desc);
+	if (rc != 0) {
+		fprintf(stderr, "Could not open leaf bdev %s, error=%d\n", job->name, rc);
+		bdevperf_job_free(job);
+		return rc;
+	}
+
+	block_size = spdk_bdev_desc_get_block_size(job->bdev_desc);
+	data_block_size = spdk_bdev_get_data_block_size(bdev);
 
 	job->workload_type = config->rw;
 	job->io_size = config->bs;
@@ -1771,6 +1910,7 @@ bdevperf_construct_job(struct spdk_bdev *bdev, struct job_config *config,
 	job->buf_size = job->io_size_blocks * block_size;
 	job->abort = g_abort;
 	job_init_rw(job, config->rw);
+	job->md_check = spdk_bdev_get_dif_type(job->bdev) == SPDK_DIF_DISABLE;
 
 	if ((job->io_size % data_block_size) != 0) {
 		SPDK_ERRLOG("IO size (%d) is not multiples of data block size of bdev %s (%"PRIu32")\n",
@@ -1785,10 +1925,10 @@ bdevperf_construct_job(struct spdk_bdev *bdev, struct job_config *config,
 		return -ENOTSUP;
 	}
 
-	if (spdk_bdev_is_dif_check_enabled(bdev, SPDK_DIF_CHECK_TYPE_REFTAG)) {
+	if (spdk_bdev_desc_is_dif_check_enabled(job->bdev_desc, SPDK_DIF_CHECK_TYPE_REFTAG)) {
 		job->dif_check_flags |= SPDK_DIF_FLAGS_REFTAG_CHECK;
 	}
-	if (spdk_bdev_is_dif_check_enabled(bdev, SPDK_DIF_CHECK_TYPE_GUARD)) {
+	if (spdk_bdev_desc_is_dif_check_enabled(job->bdev_desc, SPDK_DIF_CHECK_TYPE_GUARD)) {
 		job->dif_check_flags |= SPDK_DIF_FLAGS_GUARD_CHECK;
 	}
 
@@ -1864,6 +2004,8 @@ bdevperf_construct_job(struct spdk_bdev *bdev, struct job_config *config,
 
 	TAILQ_INSERT_TAIL(&g_bdevperf.jobs, job, link);
 
+	numa_id = spdk_bdev_get_numa_id(job->bdev);
+
 	for (n = 0; n < task_num; n++) {
 		task = calloc(1, sizeof(struct bdevperf_task));
 		if (!task) {
@@ -1873,7 +2015,7 @@ bdevperf_construct_job(struct spdk_bdev *bdev, struct job_config *config,
 		}
 
 		task->buf = spdk_zmalloc(job->buf_size, spdk_bdev_get_buf_align(job->bdev), NULL,
-					 SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
+					 numa_id, SPDK_MALLOC_DMA);
 		if (!task->buf) {
 			fprintf(stderr, "Cannot allocate buf for task=%p\n", task);
 			spdk_zipf_free(&job->zipf);
@@ -1883,7 +2025,7 @@ bdevperf_construct_job(struct spdk_bdev *bdev, struct job_config *config,
 
 		if (job->verify && job->buf_size > SPDK_BDEV_LARGE_BUF_MAX_SIZE) {
 			task->verify_buf = spdk_zmalloc(job->buf_size, spdk_bdev_get_buf_align(job->bdev), NULL,
-							SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
+							numa_id, SPDK_MALLOC_DMA);
 			if (!task->verify_buf) {
 				fprintf(stderr, "Cannot allocate buf_verify for task=%p\n", task);
 				spdk_free(task->buf);
@@ -1892,16 +2034,29 @@ bdevperf_construct_job(struct spdk_bdev *bdev, struct job_config *config,
 				return -ENOMEM;
 			}
 
+			if (spdk_bdev_is_md_separate(job->bdev)) {
+				task->verify_md_buf = spdk_zmalloc(spdk_bdev_get_md_size(bdev) * job->io_size_blocks,
+								   spdk_bdev_get_buf_align(job->bdev), NULL, numa_id, SPDK_MALLOC_DMA);
+				if (!task->verify_md_buf) {
+					fprintf(stderr, "Cannot allocate verify_md_buf for task=%p\n", task);
+					spdk_free(task->buf);
+					spdk_free(task->verify_buf);
+					spdk_zipf_free(&job->zipf);
+					free(task);
+					return -ENOMEM;
+				}
+			}
 		}
 
-		if (spdk_bdev_is_md_separate(job->bdev)) {
+		if (spdk_bdev_desc_is_md_separate(job->bdev_desc)) {
 			task->md_buf = spdk_zmalloc(job->io_size_blocks *
-						    spdk_bdev_get_md_size(job->bdev), 0, NULL,
-						    SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
+						    spdk_bdev_desc_get_md_size(job->bdev_desc), 0, NULL,
+						    numa_id, SPDK_MALLOC_DMA);
 			if (!task->md_buf) {
 				fprintf(stderr, "Cannot allocate md buf for task=%p\n", task);
 				spdk_zipf_free(&job->zipf);
 				spdk_free(task->verify_buf);
+				spdk_free(task->verify_md_buf);
 				spdk_free(task->buf);
 				free(task);
 				return -ENOMEM;
@@ -1911,8 +2066,6 @@ bdevperf_construct_job(struct spdk_bdev *bdev, struct job_config *config,
 		task->job = job;
 		TAILQ_INSERT_TAIL(&job->task_list, task, link);
 	}
-
-	job->thread = thread;
 
 	g_construct_job_count++;
 
@@ -2480,16 +2633,11 @@ rpc_perform_tests_reset(void)
 static void
 rpc_perform_tests_cb(void)
 {
-	struct spdk_json_write_ctx *w;
 	struct spdk_jsonrpc_request *request = g_request;
 
 	g_request = NULL;
 
-	if (g_run_rc == 0) {
-		w = spdk_jsonrpc_begin_result(request);
-		spdk_json_write_uint32(w, g_run_rc);
-		spdk_jsonrpc_end_result(request, w);
-	} else {
+	if (g_run_rc) {
 		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
 						     "bdevperf failed with error %s", spdk_strerror(-g_run_rc));
 	}
@@ -2603,12 +2751,6 @@ rpc_error:
 SPDK_RPC_REGISTER("perform_tests", rpc_perform_tests, SPDK_RPC_RUNTIME)
 
 static void
-_bdevperf_job_drain(void *ctx)
-{
-	bdevperf_job_drain(ctx);
-}
-
-static void
 spdk_bdevperf_shutdown_cb(void)
 {
 	g_shutdown = true;
@@ -2673,6 +2815,8 @@ bdevperf_parse_arg(int ch, char *arg)
 		g_io_size = (int)size;
 	} else if (ch == 'U') {
 		g_unique_writes = true;
+	} else if (ch == 'N') {
+		g_hide_metadata = true;
 	} else {
 		tmp = spdk_strtoll(arg, 10);
 		if (tmp < 0) {
@@ -2739,6 +2883,7 @@ bdevperf_usage(void)
 	printf(" -E                        share per lcore thread among jobs. Available only if -j is not used.\n");
 	printf(" -J                        File name to open with append mode and log JSON RPC calls.\n");
 	printf(" -U                        generate unique data for each write I/O, has no effect on non-write I/O\n");
+	printf(" -N                        Enable hide_metadata option to each bdev\n");
 }
 
 static void
@@ -2862,7 +3007,7 @@ main(int argc, char **argv)
 	opts.rpc_addr = NULL;
 	opts.shutdown_cb = spdk_bdevperf_shutdown_cb;
 
-	if ((rc = spdk_app_parse_args(argc, argv, &opts, "Zzfq:o:t:w:k:CEF:J:M:P:S:T:Xlj:DU", NULL,
+	if ((rc = spdk_app_parse_args(argc, argv, &opts, "Zzfq:o:t:w:k:CEF:J:M:P:S:T:Xlj:DUN", NULL,
 				      bdevperf_parse_arg, bdevperf_usage)) !=
 	    SPDK_APP_PARSE_ARGS_SUCCESS) {
 		return rc;

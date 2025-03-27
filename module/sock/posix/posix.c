@@ -10,7 +10,6 @@
 #include <sys/event.h>
 #define SPDK_KEVENT
 #else
-#include <sys/epoll.h>
 #define SPDK_EPOLL
 #endif
 
@@ -257,23 +256,23 @@ posix_sock_get_interface_name(struct spdk_sock *_sock)
 }
 
 static int32_t
-posix_sock_get_numa_socket_id(struct spdk_sock *sock)
+posix_sock_get_numa_id(struct spdk_sock *sock)
 {
 	const char *interface_name;
-	uint32_t numa_socket_id;
+	uint32_t numa_id;
 	int rc;
 
 	interface_name = posix_sock_get_interface_name(sock);
 	if (interface_name == NULL) {
-		return SPDK_ENV_SOCKET_ID_ANY;
+		return SPDK_ENV_NUMA_ID_ANY;
 	}
 
-	rc = spdk_read_sysfs_attribute_uint32(&numa_socket_id,
+	rc = spdk_read_sysfs_attribute_uint32(&numa_id,
 					      "/sys/class/net/%s/device/numa_node", interface_name);
-	if (rc == 0 && numa_socket_id <= INT32_MAX) {
-		return (int32_t)numa_socket_id;
+	if (rc == 0 && numa_id <= INT32_MAX) {
+		return (int32_t)numa_id;
 	} else {
-		return SPDK_ENV_SOCKET_ID_ANY;
+		return SPDK_ENV_NUMA_ID_ANY;
 	}
 }
 
@@ -1921,10 +1920,6 @@ posix_sock_group_impl_add_sock(struct spdk_sock_group_impl *_group, struct spdk_
 	memset(&event, 0, sizeof(event));
 	/* EPOLLERR is always on even if we don't set it, but be explicit for clarity */
 	event.events = EPOLLIN | EPOLLERR;
-	if (spdk_interrupt_mode_is_enabled()) {
-		event.events |= EPOLLOUT;
-	}
-
 	event.data.ptr = sock;
 
 	rc = epoll_ctl(group->fd, EPOLL_CTL_ADD, sock->fd, &event);
@@ -2242,7 +2237,7 @@ static struct spdk_net_impl g_posix_net_impl = {
 	.name		= "posix",
 	.getaddr	= posix_sock_getaddr,
 	.get_interface_name = posix_sock_get_interface_name,
-	.get_numa_socket_id = posix_sock_get_numa_socket_id,
+	.get_numa_id	= posix_sock_get_numa_id,
 	.connect	= posix_sock_connect,
 	.listen		= posix_sock_listen,
 	.accept		= posix_sock_accept,
@@ -2295,7 +2290,7 @@ static struct spdk_net_impl g_ssl_net_impl = {
 	.name		= "ssl",
 	.getaddr	= posix_sock_getaddr,
 	.get_interface_name = posix_sock_get_interface_name,
-	.get_numa_socket_id = posix_sock_get_numa_socket_id,
+	.get_numa_id	= posix_sock_get_numa_id,
 	.connect	= ssl_sock_connect,
 	.listen		= ssl_sock_listen,
 	.accept		= ssl_sock_accept,

@@ -243,12 +243,12 @@ spdk_sock_get_interface_name(struct spdk_sock *sock)
 }
 
 int32_t
-spdk_sock_get_numa_socket_id(struct spdk_sock *sock)
+spdk_sock_get_numa_id(struct spdk_sock *sock)
 {
-	if (sock->net_impl->get_numa_socket_id) {
-		return sock->net_impl->get_numa_socket_id(sock);
+	if (sock->net_impl->get_numa_id) {
+		return sock->net_impl->get_numa_id(sock);
 	} else {
-		return SPDK_ENV_SOCKET_ID_ANY;
+		return SPDK_ENV_NUMA_ID_ANY;
 	}
 }
 
@@ -1029,7 +1029,8 @@ spdk_sock_group_unregister_interrupt(struct spdk_sock_group *group)
 
 SPDK_LOG_REGISTER_COMPONENT(sock)
 
-SPDK_TRACE_REGISTER_FN(sock_trace, "sock", TRACE_GROUP_SOCK)
+static void
+sock_trace(void)
 {
 	struct spdk_trace_tpoint_opts opts[] = {
 		{
@@ -1059,3 +1060,4 @@ SPDK_TRACE_REGISTER_FN(sock_trace, "sock", TRACE_GROUP_SOCK)
 	spdk_trace_register_object(OBJECT_SOCK_REQ, 's');
 	spdk_trace_register_description_ext(opts, SPDK_COUNTOF(opts));
 }
+SPDK_TRACE_REGISTER_FN(sock_trace, "sock", TRACE_GROUP_SOCK)

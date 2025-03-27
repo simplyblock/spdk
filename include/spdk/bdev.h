@@ -312,6 +312,15 @@ int spdk_bdev_set_opts(struct spdk_bdev_opts *opts);
 
 typedef void (*spdk_bdev_wait_for_examine_cb)(void *arg);
 
+enum spdk_bdev_reset_stat_mode {
+	/** Reset all stats */
+	SPDK_BDEV_RESET_STAT_ALL,
+	/** Reset only max and min stats */
+	SPDK_BDEV_RESET_STAT_MAXMIN,
+	/** Do not reset stats at all */
+	SPDK_BDEV_RESET_STAT_NONE,
+};
+
 /**
  * Report when all bdevs finished the examine process.
  * The registered cb_fn will be called just once.
@@ -436,6 +445,28 @@ struct spdk_bdev *spdk_bdev_first_leaf(void);
 struct spdk_bdev *spdk_bdev_next_leaf(struct spdk_bdev *prev);
 
 /**
+ * Structure with optional synchronous bdev open parameters.
+ */
+struct spdk_bdev_open_opts {
+	/* Size of this structure in bytes. */
+	size_t size;
+
+	/* To indicate that the upper layer do not want to use metadata
+	 * with this bdev.
+	 */
+	bool hide_metadata;
+};
+SPDK_STATIC_ASSERT(sizeof(struct spdk_bdev_open_opts) == 16, "Incorrect size");
+
+/**
+ * Initialize bdev open options.
+ *
+ * \param opts Bdev open options.
+ * \param opts_size Must be set to sizeof(struct spdk_bdev_open_opts).
+ */
+void spdk_bdev_open_opts_init(struct spdk_bdev_open_opts *opts, size_t opts_size);
+
+/**
  * Open a block device for I/O operations.
  *
  * \param bdev_name Block device name to open.
@@ -451,6 +482,25 @@ struct spdk_bdev *spdk_bdev_next_leaf(struct spdk_bdev *prev);
  */
 int spdk_bdev_open_ext(const char *bdev_name, bool write, spdk_bdev_event_cb_t event_cb,
 		       void *event_ctx, struct spdk_bdev_desc **desc);
+
+/**
+ * Open a block device for I/O operations with options.
+ *
+ * \param bdev_name Block device name to open.
+ * \param write true is read/write access requested, false if read-only
+ * \param event_cb notification callback to be called when the bdev triggers
+ * asynchronous event such as bdev removal. This will always be called on the
+ * same thread that spdk_bdev_open_ext() was called on. In case of removal event
+ * the descriptor will have to be manually closed to make the bdev unregister
+ * proceed.
+ * \param event_ctx param for event_cb.
+ * \param opts Option for block device open. If NULL, default values are used.
+ * \param desc output parameter for the descriptor when operation is successful
+ * \return 0 if operation is successful, suitable errno value otherwise
+ */
+int spdk_bdev_open_ext_v2(const char *bdev_name, bool write, spdk_bdev_event_cb_t event_cb,
+			  void *event_ctx, struct spdk_bdev_open_opts *opts,
+			  struct spdk_bdev_desc **desc);
 
 /**
  * Block device asynchronous open callback.
@@ -510,6 +560,16 @@ int spdk_bdev_open_async(const char *bdev_name, bool write, spdk_bdev_event_cb_t
 void spdk_bdev_close(struct spdk_bdev_desc *desc);
 
 /**
+ * Get the NUMA node ID for the specified bdev.
+ *
+ * \param bdev Block device to get the NUMA node ID for
+ *
+ * \returns NUMA node ID for the bdev, SPDK_ENV_NODE_ID_ANY if the ID
+ *	    ID is unknown.
+ */
+int32_t spdk_bdev_get_numa_id(struct spdk_bdev *bdev);
+
+/**
  * Callback function for spdk_for_each_bdev() and spdk_for_each_bdev_leaf().
  *
  * \param ctx Context passed to the callback.
@@ -554,6 +614,87 @@ int spdk_for_each_bdev_leaf(void *ctx, spdk_for_each_bdev_fn fn);
  * \return bdev associated with the descriptor
  */
 struct spdk_bdev *spdk_bdev_desc_get_bdev(struct spdk_bdev_desc *desc);
+
+/**
+ * Get logical block size, specific to a bdev descriptor.
+ *
+ * \param desc Open block device descriptor.
+ * \return Size of logical block for this bdev in bytes.
+ */
+uint32_t spdk_bdev_desc_get_block_size(struct spdk_bdev_desc *desc);
+
+/**
+ * Get metadata size, specific to a bdev descriptor.
+ *
+ * \param desc Open block device descriptor
+ * \return Size of metadata for this bdev in bytes.
+ */
+uint32_t spdk_bdev_desc_get_md_size(struct spdk_bdev_desc *desc);
+
+/**
+ * Query whether metadata is interleaved with block data or separated
+ * with block data, specific to a bdev descriptor.
+ *
+ * Note this function is valid only if there is metadata.
+ *
+ * \param desc Open block device descriptor.
+ * \return true if metadata is interleaved with block data or false
+ * if metadata is separated with block data.
+ */
+bool spdk_bdev_desc_is_md_interleaved(struct spdk_bdev_desc *desc);
+
+/**
+ * Query whether metadata is interleaved with block data or separated
+ * from block data, specific to a bdev descriptor
+ *
+ * Note this function is valid only if there is metadata.
+ *
+ * \param desc Open block device descriptor.
+ * \return true if metadata is separated from block data, false
+ * otherwise.
+ */
+bool spdk_bdev_desc_is_md_separate(struct spdk_bdev_desc *desc);
+
+/**
+ * Get DIF type, specific to a bdev descriptor.
+ *
+ * \param desc Open block device descriptor.
+ * \return DIF type of the block device.
+ */
+enum spdk_dif_type spdk_bdev_desc_get_dif_type(struct spdk_bdev_desc *desc);
+
+/**
+ * Get DIF protection information format of the block device, specific to
+ * a bdev descriptor.
+ *
+ * Note that this function is valid only if DIF type is not SPDK_DIF_DISABLE.
+ *
+ * \param desc Open block device descriptor.
+ * \return DIF protection information format of the block device.
+ */
+enum spdk_dif_pi_format spdk_bdev_desc_get_dif_pi_format(struct spdk_bdev_desc *desc);
+
+/**
+ * Check whether DIF is set in the first 8/16 bytes or the last 8/16 bytes of metadata,
+ * specific to a bdev descriptor.
+ *
+ * Note that this function is valid only if DIF type is not SPDK_DIF_DISABLE.
+ *
+ * \param desc Open block device descriptor..
+ * \return true if DIF is set in the first 8/16 bytes of metadata, or false
+ * if DIF is set in the last 8/16 bytes of metadata.
+ */
+bool spdk_bdev_desc_is_dif_head_of_md(struct spdk_bdev_desc *desc);
+
+/**
+ * Check whether the DIF check type is enabled, specific to a bdev descriptor.
+ *
+ * \param desc Open block device descriptor.
+ * \param check_type The specific DIF check type.
+ * \return true if enabled, false otherwise.
+ */
+bool spdk_bdev_desc_is_dif_check_enabled(struct spdk_bdev_desc *desc,
+		enum spdk_dif_check_type check_type);
 
 /**
  * Set a time limit for the timeout IO of the bdev and timeout callback.
@@ -754,11 +895,11 @@ uint32_t spdk_bdev_get_md_size(const struct spdk_bdev *bdev);
  * Query whether metadata is interleaved with block data or separated
  * with block data.
  *
+ * Note this function is valid only if there is metadata.
+ *
  * \param bdev Block device to query.
  * \return true if metadata is interleaved with block data or false
  * if metadata is separated with block data.
- *
- * Note this function is valid only if there is metadata.
  */
 bool spdk_bdev_is_md_interleaved(const struct spdk_bdev *bdev);
 
@@ -766,11 +907,11 @@ bool spdk_bdev_is_md_interleaved(const struct spdk_bdev *bdev);
  * Query whether metadata is interleaved with block data or separated
  * from block data.
  *
+ * Note this function is valid only if there is metadata.
+ *
  * \param bdev Block device to query.
  * \return true if metadata is separated from block data, false
  * otherwise.
- *
- * Note this function is valid only if there is metadata.
  */
 bool spdk_bdev_is_md_separate(const struct spdk_bdev *bdev);
 
@@ -824,11 +965,11 @@ enum spdk_dif_pi_format spdk_bdev_get_dif_pi_format(const struct spdk_bdev *bdev
 /**
  * Check whether DIF is set in the first 8/16 bytes or the last 8/16 bytes of metadata.
  *
+ * Note that this function is valid only if DIF type is not SPDK_DIF_DISABLE.
+ *
  * \param bdev Block device to query.
  * \return true if DIF is set in the first 8/16 bytes of metadata, or false
  * if DIF is set in the last 8/16 bytes of metadata.
- *
- * Note that this function is valid only if DIF type is not SPDK_DIF_DISABLE.
  */
 bool spdk_bdev_is_dif_head_of_md(const struct spdk_bdev *bdev);
 
@@ -2009,10 +2150,11 @@ int spdk_bdev_queue_io_wait(struct spdk_bdev *bdev, struct spdk_io_channel *ch,
  * \param bdev Block device.
  * \param ch I/O channel. Obtained by calling spdk_bdev_get_io_channel().
  * \param stat The per-channel statistics.
+ * \param reset_mode Mode to determine how I/O stat should be reset after obtaining it.
  *
  */
 void spdk_bdev_get_io_stat(struct spdk_bdev *bdev, struct spdk_io_channel *ch,
-			   struct spdk_bdev_io_stat *stat);
+			   struct spdk_bdev_io_stat *stat, enum spdk_bdev_reset_stat_mode reset_mode);
 
 
 /**
@@ -2021,11 +2163,12 @@ void spdk_bdev_get_io_stat(struct spdk_bdev *bdev, struct spdk_io_channel *ch,
  *
  * \param bdev Block device to query.
  * \param stat Structure for aggregating collected statistics.  Passed as argument to cb.
+ * \param reset_mode Mode to determine how I/O stat should be reset after obtaining it.
  * \param cb Called when this operation completes.
  * \param cb_arg Argument passed to callback function.
  */
 void spdk_bdev_get_device_stat(struct spdk_bdev *bdev, struct spdk_bdev_io_stat *stat,
-			       spdk_bdev_get_device_stat_cb cb, void *cb_arg);
+			       enum spdk_bdev_reset_stat_mode reset_mode, spdk_bdev_get_device_stat_cb cb, void *cb_arg);
 
 /**
  * Get the status of bdev_io as an NVMe status code and command specific
@@ -2269,6 +2412,15 @@ void spdk_bdev_for_each_channel(struct spdk_bdev *bdev, spdk_bdev_for_each_chann
  * \return controller attributes for the bdev.
  */
 union spdk_bdev_nvme_ctratt spdk_bdev_get_nvme_ctratt(struct spdk_bdev *bdev);
+
+/**
+ * Get NVMe namespace ID for a given bdev (only for NVMe bdevs).
+ *
+ * \param bdev Block device to query.
+ *
+ * \return Namespace ID or 0 if it's not available.
+ */
+uint32_t spdk_bdev_get_nvme_nsid(struct spdk_bdev *bdev);
 
 #ifdef __cplusplus
 }

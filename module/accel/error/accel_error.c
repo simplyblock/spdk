@@ -17,15 +17,24 @@ struct accel_error_inject_info {
 	uint64_t			interval;
 };
 
+struct accel_error_task;
+
 struct accel_error_channel {
 	struct spdk_io_channel		*swch;
+	struct spdk_poller		*poller;
 	struct accel_error_inject_info	injects[SPDK_ACCEL_OPC_LAST];
+	STAILQ_HEAD(, accel_error_task)	tasks;
 };
 
 struct accel_error_task {
-	struct accel_error_channel	*ch;
-	spdk_accel_completion_cb	cb_fn;
-	void				*cb_arg;
+	struct accel_error_channel		*ch;
+	union {
+		spdk_accel_completion_cb	cpl;
+		spdk_accel_step_cb		step;
+	} cb_fn;
+	void					*cb_arg;
+	int					status;
+	STAILQ_ENTRY(accel_error_task)		link;
 };
 
 static struct spdk_accel_module_if *g_sw_module;
@@ -36,6 +45,12 @@ static struct accel_error_task *
 accel_error_get_task_ctx(struct spdk_accel_task *task)
 {
 	return (void *)((uint8_t *)task + g_task_offset);
+}
+
+static struct spdk_accel_task *
+accel_error_get_task_from_ctx(struct accel_error_task *errtask)
+{
+	return (void *)((uint8_t *)errtask - g_task_offset);
 }
 
 static void
@@ -51,14 +66,39 @@ accel_error_corrupt_task(struct spdk_accel_task *task)
 }
 
 static void
-accel_error_task_complete_cb(void *arg, int status)
+accel_error_corrupt_cb(void *arg, int status)
 {
 	struct spdk_accel_task *task = arg;
 	struct accel_error_task *errtask = accel_error_get_task_ctx(task);
-	struct accel_error_channel *ch = errtask->ch;
-	struct accel_error_inject_info *info = &ch->injects[task->op_code];
-	spdk_accel_completion_cb cb_fn = errtask->cb_fn;
+	spdk_accel_completion_cb cb_fn = errtask->cb_fn.cpl;
 	void *cb_arg = errtask->cb_arg;
+
+	accel_error_corrupt_task(task);
+	cb_fn(cb_arg, status);
+}
+
+static void
+accel_error_corrupt_step_cb(void *arg)
+{
+	struct spdk_accel_task *task = arg;
+	struct accel_error_task *errtask = accel_error_get_task_ctx(task);
+	spdk_accel_step_cb cb_fn = errtask->cb_fn.step;
+	void *cb_arg = errtask->cb_arg;
+
+	accel_error_corrupt_task(task);
+
+	cb_fn(cb_arg);
+}
+
+static bool
+accel_error_should_inject(struct spdk_io_channel *ch, struct spdk_accel_task *task)
+{
+	struct accel_error_channel *errch = spdk_io_channel_get_ctx(ch);
+	struct accel_error_inject_info *info = &errch->injects[task->op_code];
+
+	if (info->opts.type == ACCEL_ERROR_INJECT_DISABLE) {
+		return false;
+	}
 
 	info->interval++;
 	if (info->interval >= info->opts.interval) {
@@ -66,22 +106,15 @@ accel_error_task_complete_cb(void *arg, int status)
 		info->count++;
 
 		if (info->count <= info->opts.count) {
-			switch (info->opts.type) {
-			case ACCEL_ERROR_INJECT_CORRUPT:
-				accel_error_corrupt_task(task);
-				break;
-			case ACCEL_ERROR_INJECT_FAILURE:
-				status = info->opts.errcode;
-				break;
-			default:
-				break;
-			}
+			return true;
 		} else {
 			info->opts.type = ACCEL_ERROR_INJECT_DISABLE;
+			info->interval = 0;
+			info->count = 0;
 		}
 	}
 
-	cb_fn(cb_arg, status);
+	return false;
 }
 
 static int
@@ -89,14 +122,60 @@ accel_error_submit_tasks(struct spdk_io_channel *ch, struct spdk_accel_task *tas
 {
 	struct accel_error_channel *errch = spdk_io_channel_get_ctx(ch);
 	struct accel_error_task *errtask = accel_error_get_task_ctx(task);
+	struct accel_error_inject_info *info = &errch->injects[task->op_code];
 
-	errtask->ch = errch;
-	errtask->cb_fn = task->cb_fn;
-	errtask->cb_arg = task->cb_arg;
-	task->cb_fn = accel_error_task_complete_cb;
-	task->cb_arg = task;
+	if (!accel_error_should_inject(ch, task)) {
+		goto submit;
+	}
 
+	switch (info->opts.type) {
+	case ACCEL_ERROR_INJECT_CORRUPT:
+		errtask->ch = errch;
+		errtask->cb_arg = task->cb_arg;
+		task->cb_arg = task;
+		if (task->seq != NULL) {
+			errtask->cb_fn.step = task->step_cb_fn;
+			task->step_cb_fn = accel_error_corrupt_step_cb;
+		} else {
+			errtask->cb_fn.cpl = task->cb_fn;
+			task->cb_fn = accel_error_corrupt_cb;
+		}
+		break;
+	case ACCEL_ERROR_INJECT_FAILURE:
+		errtask->status = info->opts.errcode;
+		STAILQ_INSERT_TAIL(&errch->tasks, errtask, link);
+		return 0;
+	default:
+		break;
+	}
+submit:
 	return g_sw_module->submit_tasks(errch->swch, task);
+}
+
+static int
+accel_error_poller(void *arg)
+{
+	struct accel_error_channel *errch = arg;
+	struct accel_error_task *errtask;
+	STAILQ_HEAD(, accel_error_task) tasks;
+	struct spdk_accel_task *task;
+
+	if (STAILQ_EMPTY(&errch->tasks)) {
+		return SPDK_POLLER_IDLE;
+	}
+
+	STAILQ_INIT(&tasks);
+	STAILQ_SWAP(&tasks, &errch->tasks, accel_error_task);
+
+	while (!STAILQ_EMPTY(&tasks)) {
+		errtask = STAILQ_FIRST(&tasks);
+		STAILQ_REMOVE_HEAD(&tasks, link);
+
+		task = accel_error_get_task_from_ctx(errtask);
+		spdk_accel_task_complete(task, errtask->status);
+	}
+
+	return SPDK_POLLER_BUSY;
 }
 
 static void
@@ -143,8 +222,15 @@ accel_error_channel_create_cb(void *io_device, void *ctx)
 	struct accel_error_channel *errch = ctx;
 	size_t i;
 
+	STAILQ_INIT(&errch->tasks);
+	errch->poller = SPDK_POLLER_REGISTER(accel_error_poller, errch, 0);
+	if (errch->poller == NULL) {
+		return -ENOMEM;
+	}
+
 	errch->swch = g_sw_module->get_io_channel();
 	if (errch->swch == NULL) {
+		spdk_poller_unregister(&errch->poller);
 		return -ENOMEM;
 	}
 
@@ -161,6 +247,8 @@ accel_error_channel_destroy_cb(void *io_device, void *ctx)
 {
 	struct accel_error_channel *errch = ctx;
 
+	assert(STAILQ_EMPTY(&errch->tasks));
+	spdk_poller_unregister(&errch->poller);
 	spdk_put_io_channel(errch->swch);
 }
 

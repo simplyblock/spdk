@@ -616,8 +616,7 @@ nvme_qpair_abort_queued_reqs_with_cbarg(struct spdk_nvme_qpair *qpair, void *cmd
 	uint32_t		aborting = 0;
 
 	STAILQ_FOREACH_SAFE(req, &qpair->queued_req, stailq, tmp) {
-		if ((req->cb_arg != cmd_cb_arg) &&
-		    (req->parent == NULL || req->parent->cb_arg != cmd_cb_arg)) {
+		if (!nvme_request_abort_match(req, cmd_cb_arg)) {
 			continue;
 		}
 
@@ -752,6 +751,14 @@ nvme_complete_register_operations(struct spdk_nvme_qpair *qpair)
 	}
 }
 
+int
+spdk_nvme_qpair_get_fd(struct spdk_nvme_qpair *qpair, struct spdk_event_handler_opts *opts)
+{
+	struct spdk_nvme_ctrlr *ctrlr = qpair->ctrlr;
+
+	return nvme_transport_qpair_get_fd(ctrlr, qpair, opts);
+}
+
 int32_t
 spdk_nvme_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_completions)
 {
@@ -786,7 +793,8 @@ spdk_nvme_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_
 	/* error injection for those queued error requests */
 	if (spdk_unlikely(!STAILQ_EMPTY(&qpair->err_req_head))) {
 		STAILQ_FOREACH_SAFE(req, &qpair->err_req_head, stailq, tmp) {
-			if (spdk_get_ticks() - req->submit_tick > req->timeout_tsc) {
+			if (req->pid == getpid() &&
+			    spdk_get_ticks() - req->submit_tick > req->timeout_tsc) {
 				STAILQ_REMOVE(&qpair->err_req_head, req, nvme_request, stailq);
 				nvme_qpair_manual_complete_request(qpair, req,
 								   req->cpl.status.sct,
@@ -801,8 +809,8 @@ spdk_nvme_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_
 		if (ret == -ENXIO && nvme_qpair_get_state(qpair) == NVME_QPAIR_DISCONNECTING) {
 			ret = 0;
 		} else {
-			SPDK_ERRLOG("CQ transport error %d (%s) on qpair id %hu\n",
-				    ret, spdk_strerror(-ret), qpair->id);
+			NVME_CTRLR_ERRLOG(qpair->ctrlr, "CQ transport error %d (%s) on qpair id %hu\n",
+					  ret, spdk_strerror(-ret), qpair->id);
 			if (nvme_qpair_is_admin_queue(qpair)) {
 				nvme_ctrlr_fail(qpair->ctrlr, false);
 			}
@@ -886,7 +894,7 @@ nvme_qpair_init(struct spdk_nvme_qpair *qpair, uint16_t id,
 	num_requests++;
 
 	qpair->req_buf = spdk_zmalloc(req_size_padded * num_requests, 64, NULL,
-				      SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_SHARE);
+				      SPDK_ENV_NUMA_ID_ANY, SPDK_MALLOC_SHARE);
 	if (qpair->req_buf == NULL) {
 		SPDK_ERRLOG("no memory to allocate qpair(cntlid:0x%x sqid:%d) req_buf with %d request\n",
 			    ctrlr->cntlid, qpair->id, num_requests);
@@ -914,6 +922,7 @@ nvme_qpair_complete_error_reqs(struct spdk_nvme_qpair *qpair)
 
 	while (!STAILQ_EMPTY(&qpair->err_req_head)) {
 		req = STAILQ_FIRST(&qpair->err_req_head);
+		assert(req->pid == getpid());
 		STAILQ_REMOVE_HEAD(&qpair->err_req_head, stailq);
 		nvme_qpair_manual_complete_request(qpair, req,
 						   req->cpl.status.sct,

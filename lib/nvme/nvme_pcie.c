@@ -840,6 +840,11 @@ pcie_nvme_enum_cb(void *ctx, struct spdk_pci_device *pci_dev)
 			return -1;
 		}
 
+		if (ctrlr->opts.enable_interrupts) {
+			SPDK_ERRLOG("Secondary processes are not supported in interrupt mode.\n");
+			return -1;
+		}
+
 		return nvme_ctrlr_add_process(ctrlr, pci_dev);
 	}
 
@@ -913,7 +918,7 @@ static struct spdk_nvme_ctrlr *
 	}
 
 	pctrlr = spdk_zmalloc(sizeof(struct nvme_pcie_ctrlr), 64, NULL,
-			      SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_SHARE);
+			      SPDK_ENV_NUMA_ID_ANY, SPDK_MALLOC_SHARE);
 	if (pctrlr == NULL) {
 		spdk_pci_device_unclaim(pci_dev);
 		SPDK_ERRLOG("could not allocate ctrlr\n");
@@ -929,6 +934,10 @@ static struct spdk_nvme_ctrlr *
 					      NVME_PCIE_MIN_ADMIN_QUEUE_SIZE);
 	pci_id = spdk_pci_device_get_id(pci_dev);
 	pctrlr->ctrlr.quirks = nvme_get_quirks(&pci_id);
+	if (pci_dev->numa_id != SPDK_ENV_NUMA_ID_ANY) {
+		pctrlr->ctrlr.numa.id_valid = 1;
+		pctrlr->ctrlr.numa.id = pci_dev->numa_id;
+	}
 
 	rc = nvme_ctrlr_construct(&pctrlr->ctrlr);
 	if (rc != 0) {
@@ -1027,11 +1036,30 @@ nvme_pcie_ctrlr_destruct(struct spdk_nvme_ctrlr *ctrlr)
 	nvme_pcie_ctrlr_free_bars(pctrlr);
 
 	if (devhandle) {
+		if (ctrlr->opts.enable_interrupts) {
+			spdk_pci_device_disable_interrupts(devhandle);
+		}
 		spdk_pci_device_unclaim(devhandle);
 		spdk_pci_device_detach(devhandle);
 	}
 
 	spdk_free(pctrlr);
+
+	return 0;
+}
+
+static int
+nvme_pcie_ctrlr_enable_interrupts(struct spdk_nvme_ctrlr *ctrlr)
+{
+	struct spdk_pci_device *devhandle = nvme_ctrlr_proc_get_devhandle(ctrlr);
+	int rc;
+
+	assert(devhandle != NULL);
+	rc = spdk_pci_device_enable_interrupts(devhandle, ctrlr->opts.num_io_queues);
+	if (rc) {
+		SPDK_ERRLOG("enable_interrupts() failed\n");
+		return -EIO;
+	}
 
 	return 0;
 }
@@ -1087,6 +1115,7 @@ const struct spdk_nvme_transport_ops pcie_ops = {
 	.ctrlr_scan_attached = nvme_pci_ctrlr_scan_attached,
 	.ctrlr_destruct = nvme_pcie_ctrlr_destruct,
 	.ctrlr_enable = nvme_pcie_ctrlr_enable,
+	.ctrlr_enable_interrupts = nvme_pcie_ctrlr_enable_interrupts,
 
 	.ctrlr_get_registers = nvme_pcie_ctrlr_get_registers,
 	.ctrlr_set_reg_4 = nvme_pcie_ctrlr_set_reg_4,
@@ -1116,6 +1145,7 @@ const struct spdk_nvme_transport_ops pcie_ops = {
 	.qpair_submit_request = nvme_pcie_qpair_submit_request,
 	.qpair_process_completions = nvme_pcie_qpair_process_completions,
 	.qpair_iterate_requests = nvme_pcie_qpair_iterate_requests,
+	.qpair_get_fd = nvme_pcie_qpair_get_fd,
 	.admin_qpair_abort_aers = nvme_pcie_admin_qpair_abort_aers,
 
 	.poll_group_create = nvme_pcie_poll_group_create,
@@ -1124,6 +1154,7 @@ const struct spdk_nvme_transport_ops pcie_ops = {
 	.poll_group_add = nvme_pcie_poll_group_add,
 	.poll_group_remove = nvme_pcie_poll_group_remove,
 	.poll_group_process_completions = nvme_pcie_poll_group_process_completions,
+	.poll_group_check_disconnected_qpairs = nvme_pcie_poll_group_check_disconnected_qpairs,
 	.poll_group_destroy = nvme_pcie_poll_group_destroy,
 	.poll_group_get_stats = nvme_pcie_poll_group_get_stats,
 	.poll_group_free_stats = nvme_pcie_poll_group_free_stats

@@ -262,7 +262,7 @@ spdk_nvmf_subsystem_create(struct spdk_nvmf_tgt *tgt,
 	subsystem->id = sid;
 	subsystem->subtype = type;
 	subsystem->max_nsid = num_ns;
-	subsystem->next_cntlid = 0;
+	subsystem->next_cntlid = 1;
 	subsystem->min_cntlid = NVMF_MIN_CNTLID;
 	subsystem->max_cntlid = NVMF_MAX_CNTLID;
 	snprintf(subsystem->subnqn, sizeof(subsystem->subnqn), "%s", nqn);
@@ -354,7 +354,7 @@ _nvmf_subsystem_remove_listener(struct spdk_nvmf_subsystem *subsystem,
 	if (spdk_nvmf_subsystem_is_discovery(listener->subsystem)) {
 		nvmf_tgt_update_mdns_prr(listener->subsystem->tgt);
 	}
-	nvmf_update_discovery_log(listener->subsystem->tgt, NULL);
+	spdk_nvmf_send_discovery_log_notice(listener->subsystem->tgt, NULL);
 	free(listener->ana_state);
 	spdk_bit_array_clear(subsystem->used_listener_ids, listener->id);
 	free(listener->opts.sock_impl);
@@ -921,14 +921,10 @@ nvmf_ns_visible(struct spdk_nvmf_subsystem *subsystem,
 	/* Also apply to existing controllers. */
 	TAILQ_FOREACH(ctrlr, &subsystem->ctrlrs, link) {
 		if (strcmp(hostnqn, ctrlr->hostnqn) ||
-		    spdk_bit_array_get(ctrlr->visible_ns, nsid - 1) == visible) {
+		    nvmf_ctrlr_ns_is_visible(ctrlr, nsid) == visible) {
 			continue;
 		}
-		if (visible) {
-			spdk_bit_array_set(ctrlr->visible_ns, nsid - 1);
-		} else {
-			spdk_bit_array_clear(ctrlr->visible_ns, nsid - 1);
-		}
+		nvmf_ctrlr_ns_set_visible(ctrlr, nsid, visible);
 		send_async_event_ns_notice(ctrlr);
 		nvmf_ctrlr_ns_changed(ctrlr, nsid);
 	}
@@ -1043,7 +1039,7 @@ spdk_nvmf_subsystem_add_host_ext(struct spdk_nvmf_subsystem *subsystem,
 	TAILQ_INSERT_HEAD(&subsystem->hosts, host, link);
 
 	if (!TAILQ_EMPTY(&subsystem->listeners)) {
-		nvmf_update_discovery_log(subsystem->tgt, hostnqn);
+		spdk_nvmf_send_discovery_log_notice(subsystem->tgt, hostnqn);
 	}
 
 	for (transport = spdk_nvmf_transport_get_first(subsystem->tgt); transport;
@@ -1097,7 +1093,7 @@ spdk_nvmf_subsystem_remove_host(struct spdk_nvmf_subsystem *subsystem, const cha
 	nvmf_subsystem_remove_host(subsystem, host);
 
 	if (!TAILQ_EMPTY(&subsystem->listeners)) {
-		nvmf_update_discovery_log(subsystem->tgt, hostnqn);
+		spdk_nvmf_send_discovery_log_notice(subsystem->tgt, hostnqn);
 	}
 
 	for (transport = spdk_nvmf_transport_get_first(subsystem->tgt); transport;
@@ -1107,6 +1103,61 @@ spdk_nvmf_subsystem_remove_host(struct spdk_nvmf_subsystem *subsystem, const cha
 		}
 	}
 
+	pthread_mutex_unlock(&subsystem->mutex);
+
+	return 0;
+}
+
+int
+spdk_nvmf_subsystem_set_keys(struct spdk_nvmf_subsystem *subsystem, const char *hostnqn,
+			     struct spdk_nvmf_subsystem_key_opts *opts)
+{
+	struct spdk_nvmf_host *host;
+	struct spdk_key *key, *ckey;
+
+	if (!nvmf_auth_is_supported()) {
+		SPDK_ERRLOG("NVMe in-band authentication is unsupported\n");
+		return -EINVAL;
+	}
+
+	pthread_mutex_lock(&subsystem->mutex);
+	host = nvmf_subsystem_find_host(subsystem, hostnqn);
+	if (host == NULL) {
+		pthread_mutex_unlock(&subsystem->mutex);
+		return -EINVAL;
+	}
+
+	if (SPDK_GET_FIELD(opts, dhchap_key, host->dhchap_key) == NULL &&
+	    SPDK_GET_FIELD(opts, dhchap_ctrlr_key, host->dhchap_ctrlr_key) != NULL) {
+		SPDK_ERRLOG("DH-HMAC-CHAP controller key requires host key to be set\n");
+		pthread_mutex_unlock(&subsystem->mutex);
+		return -EINVAL;
+	}
+	key = SPDK_GET_FIELD(opts, dhchap_key, NULL);
+	if (key != NULL) {
+		key = spdk_key_dup(key);
+		if (key == NULL) {
+			pthread_mutex_unlock(&subsystem->mutex);
+			return -EINVAL;
+		}
+	}
+	ckey = SPDK_GET_FIELD(opts, dhchap_ctrlr_key, NULL);
+	if (ckey != NULL) {
+		ckey = spdk_key_dup(ckey);
+		if (ckey == NULL) {
+			pthread_mutex_unlock(&subsystem->mutex);
+			spdk_keyring_put_key(key);
+			return -EINVAL;
+		}
+	}
+	if (SPDK_FIELD_VALID(opts, dhchap_key)) {
+		spdk_keyring_put_key(host->dhchap_key);
+		host->dhchap_key = key;
+	}
+	if (SPDK_FIELD_VALID(opts, dhchap_ctrlr_key)) {
+		spdk_keyring_put_key(host->dhchap_ctrlr_key);
+		host->dhchap_ctrlr_key = ckey;
+	}
 	pthread_mutex_unlock(&subsystem->mutex);
 
 	return 0;
@@ -1193,10 +1244,14 @@ spdk_nvmf_subsystem_disconnect_host(struct spdk_nvmf_subsystem *subsystem,
 int
 spdk_nvmf_subsystem_set_allow_any_host(struct spdk_nvmf_subsystem *subsystem, bool allow_any_host)
 {
+	if (subsystem->allow_any_host == allow_any_host) {
+		return 0;
+	}
+
 	pthread_mutex_lock(&subsystem->mutex);
 	subsystem->allow_any_host = allow_any_host;
 	if (!TAILQ_EMPTY(&subsystem->listeners)) {
-		nvmf_update_discovery_log(subsystem->tgt, NULL);
+		spdk_nvmf_send_discovery_log_notice(subsystem->tgt, NULL);
 	}
 	pthread_mutex_unlock(&subsystem->mutex);
 
@@ -1348,7 +1403,7 @@ _nvmf_subsystem_add_listener_done(void *ctx, int status)
 		}
 	}
 
-	nvmf_update_discovery_log(listener->subsystem->tgt, NULL);
+	spdk_nvmf_send_discovery_log_notice(listener->subsystem->tgt, NULL);
 	listener->cb_fn(listener->cb_arg, status);
 }
 
@@ -1752,7 +1807,7 @@ spdk_nvmf_subsystem_remove_ns(struct spdk_nvmf_subsystem *subsystem, uint32_t ns
 	nvmf_subsystem_ns_changed(subsystem, nsid);
 
 	TAILQ_FOREACH(ctrlr, &subsystem->ctrlrs, link) {
-		spdk_bit_array_clear(ctrlr->visible_ns, nsid - 1);
+		nvmf_ctrlr_ns_set_visible(ctrlr, nsid, false);
 	}
 
 	return 0;
@@ -1945,6 +2000,7 @@ spdk_nvmf_ns_opts_get_defaults(struct spdk_nvmf_ns_opts *opts, size_t opts_size)
 	}
 	SET_FIELD(anagrpid, 0);
 	SET_FIELD(transport_specific, NULL);
+	SET_FIELD(hide_metadata, false);
 
 #undef FIELD_OK
 #undef SET_FIELD
@@ -1976,13 +2032,14 @@ nvmf_ns_opts_copy(struct spdk_nvmf_ns_opts *opts,
 	SET_FIELD(anagrpid);
 	SET_FIELD(no_auto_visible);
 	SET_FIELD(transport_specific);
+	SET_FIELD(hide_metadata);
 
 	opts->opts_size = user_opts->opts_size;
 
 	/* We should not remove this statement, but need to update the assert statement
 	 * if we add a new field, and also add a corresponding SET_FIELD statement.
 	 */
-	SPDK_STATIC_ASSERT(sizeof(struct spdk_nvmf_ns_opts) == 72, "Incorrect size");
+	SPDK_STATIC_ASSERT(sizeof(struct spdk_nvmf_ns_opts) == 73, "Incorrect size");
 
 #undef FIELD_OK
 #undef SET_FIELD
@@ -2024,10 +2081,10 @@ spdk_nvmf_subsystem_add_ns_ext(struct spdk_nvmf_subsystem *subsystem, const char
 {
 	struct spdk_nvmf_transport *transport;
 	struct spdk_nvmf_ns_opts opts;
+	struct spdk_bdev_open_opts open_opts = {};
 	struct spdk_nvmf_ns *ns, *first_ns;
 	struct spdk_nvmf_ctrlr *ctrlr;
 	struct spdk_nvmf_reservation_info info = {0};
-	struct spdk_nvme_ns *nvme_ns;
 	int rc;
 	bool zone_append_supported;
 	uint64_t max_zone_append_size_kib;
@@ -2091,13 +2148,14 @@ spdk_nvmf_subsystem_add_ns_ext(struct spdk_nvmf_subsystem *subsystem, const char
 
 	TAILQ_INIT(&ns->hosts);
 	ns->always_visible = !opts.no_auto_visible;
-	if (ns->always_visible) {
-		TAILQ_FOREACH(ctrlr, &subsystem->ctrlrs, link) {
-			spdk_bit_array_set(ctrlr->visible_ns, opts.nsid - 1);
-		}
+	TAILQ_FOREACH(ctrlr, &subsystem->ctrlrs, link) {
+		nvmf_ctrlr_ns_set_visible(ctrlr, opts.nsid, ns->always_visible);
 	}
 
-	rc = spdk_bdev_open_ext(bdev_name, true, nvmf_ns_event, ns, &ns->desc);
+	spdk_bdev_open_opts_init(&open_opts, sizeof(open_opts));
+	open_opts.hide_metadata = opts.hide_metadata;
+
+	rc = spdk_bdev_open_ext_v2(bdev_name, true, nvmf_ns_event, ns, &open_opts, &ns->desc);
 	if (rc != 0) {
 		SPDK_ERRLOG("Subsystem %s: bdev %s cannot be opened, error=%d\n",
 			    subsystem->subnqn, bdev_name, rc);
@@ -2107,17 +2165,18 @@ spdk_nvmf_subsystem_add_ns_ext(struct spdk_nvmf_subsystem *subsystem, const char
 
 	ns->bdev = spdk_bdev_desc_get_bdev(ns->desc);
 
-	if (spdk_bdev_get_md_size(ns->bdev) != 0) {
-		if (!spdk_bdev_is_md_interleaved(ns->bdev)) {
+	if (spdk_bdev_desc_get_md_size(ns->desc) != 0) {
+		if (!spdk_bdev_desc_is_md_interleaved(ns->desc)) {
 			SPDK_ERRLOG("Can't attach bdev with separate metadata.\n");
 			spdk_bdev_close(ns->desc);
 			free(ns);
 			return 0;
 		}
 
-		if (spdk_bdev_get_md_size(ns->bdev) > SPDK_BDEV_MAX_INTERLEAVED_MD_SIZE) {
+		if (spdk_bdev_desc_get_md_size(ns->desc) > SPDK_BDEV_MAX_INTERLEAVED_MD_SIZE) {
 			SPDK_ERRLOG("Maximum supported interleaved md size %u, current md size %u\n",
-				    SPDK_BDEV_MAX_INTERLEAVED_MD_SIZE, spdk_bdev_get_md_size(ns->bdev));
+				    SPDK_BDEV_MAX_INTERLEAVED_MD_SIZE,
+				    spdk_bdev_desc_get_md_size(ns->desc));
 			spdk_bdev_close(ns->desc);
 			free(ns);
 			return 0;
@@ -2131,11 +2190,8 @@ spdk_nvmf_subsystem_add_ns_ext(struct spdk_nvmf_subsystem *subsystem, const char
 		return 0;
 	}
 
-	if (!strncmp(spdk_bdev_get_module_name(ns->bdev), "nvme",
-		     strlen(spdk_bdev_get_module_name(ns->bdev)))) {
-		nvme_ns = (struct spdk_nvme_ns *) spdk_bdev_get_module_ctx(ns->desc);
-		ns->passthrough_nsid = spdk_nvme_ns_get_id(nvme_ns);
-	} else if (subsystem->passthrough) {
+	ns->passthru_nsid = spdk_bdev_get_nvme_nsid(ns->bdev);
+	if (subsystem->passthrough && ns->passthru_nsid == 0) {
 		SPDK_ERRLOG("Only bdev_nvme namespaces can be added to a passthrough subsystem.\n");
 		goto err;
 	}
@@ -2159,8 +2215,8 @@ spdk_nvmf_subsystem_add_ns_ext(struct spdk_nvmf_subsystem *subsystem, const char
 
 		zone_append_supported = spdk_bdev_io_type_supported(ns->bdev,
 					SPDK_BDEV_IO_TYPE_ZONE_APPEND);
-		max_zone_append_size_kib = spdk_bdev_get_max_zone_append_size(
-						   ns->bdev) * spdk_bdev_get_block_size(ns->bdev);
+		max_zone_append_size_kib = spdk_bdev_get_max_zone_append_size(ns->bdev) *
+					   spdk_bdev_desc_get_block_size(ns->desc);
 
 		if (_nvmf_subsystem_get_first_zoned_ns(subsystem) != NULL &&
 		    (nvmf_subsystem_zone_append_supported(subsystem) != zone_append_supported ||
@@ -2248,6 +2304,47 @@ err:
 	spdk_bdev_close(ns->desc);
 	free(ns->ptpl_file);
 	free(ns);
+
+	return 0;
+}
+
+int
+spdk_nvmf_subsystem_set_ns_ana_group(struct spdk_nvmf_subsystem *subsystem,
+				     uint32_t nsid, uint32_t anagrpid)
+{
+	struct spdk_nvmf_ns *ns;
+
+	if (anagrpid > subsystem->max_nsid) {
+		SPDK_ERRLOG("ANAGRPID greater than maximum NSID not allowed\n");
+		return -1;
+	}
+
+	if (anagrpid == 0) {
+		SPDK_ERRLOG("Zero is not allowed to ANAGRPID\n");
+		return -1;
+	}
+
+	if (nsid == 0 || nsid > subsystem->max_nsid) {
+		return -1;
+	}
+
+	ns = subsystem->ns[nsid - 1];
+	if (!ns) {
+		return -1;
+	}
+
+	assert(ns->anagrpid - 1 < subsystem->max_nsid);
+
+	assert(subsystem->ana_group[ns->anagrpid - 1] > 0);
+
+	subsystem->ana_group[ns->anagrpid - 1]--;
+
+	subsystem->ana_group[anagrpid - 1]++;
+
+	ns->anagrpid = anagrpid;
+	ns->opts.anagrpid = anagrpid;
+
+	nvmf_subsystem_ns_changed(subsystem, nsid);
 
 	return 0;
 }
@@ -2418,8 +2515,8 @@ spdk_nvmf_subsystem_set_cntlid_range(struct spdk_nvmf_subsystem *subsystem,
 	}
 	subsystem->min_cntlid = min_cntlid;
 	subsystem->max_cntlid = max_cntlid;
-	if (subsystem->next_cntlid < min_cntlid || subsystem->next_cntlid > max_cntlid - 1) {
-		subsystem->next_cntlid = min_cntlid - 1;
+	if (subsystem->next_cntlid < min_cntlid || subsystem->next_cntlid > max_cntlid) {
+		subsystem->next_cntlid = min_cntlid;
 	}
 
 	return 0;
@@ -2429,21 +2526,24 @@ uint16_t
 nvmf_subsystem_gen_cntlid(struct spdk_nvmf_subsystem *subsystem)
 {
 	int count;
+	uint16_t cntlid;
 
 	/*
 	 * In the worst case, we might have to try all CNTLID values between min_cntlid and max_cntlid
 	 * before we find one that is unused (or find that all values are in use).
 	 */
 	for (count = 0; count < subsystem->max_cntlid - subsystem->min_cntlid + 1; count++) {
+		cntlid = subsystem->next_cntlid;
 		subsystem->next_cntlid++;
+
 		if (subsystem->next_cntlid > subsystem->max_cntlid) {
 			subsystem->next_cntlid = subsystem->min_cntlid;
 		}
 
 		/* Check if a controller with this cntlid currently exists. */
-		if (nvmf_subsystem_get_ctrlr(subsystem, subsystem->next_cntlid) == NULL) {
+		if (nvmf_subsystem_get_ctrlr(subsystem, cntlid) == NULL) {
 			/* Found unused cntlid */
-			return subsystem->next_cntlid;
+			return cntlid;
 		}
 	}
 

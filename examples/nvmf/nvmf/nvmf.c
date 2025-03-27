@@ -183,8 +183,7 @@ nvmf_reactor_run(void *arg)
 
 			spdk_thread_poll(thread, 0, 0);
 
-			if (spdk_unlikely(spdk_thread_is_exited(thread) &&
-					  spdk_thread_is_idle(thread))) {
+			if (spdk_unlikely(spdk_thread_is_exited(thread))) {
 				spdk_thread_destroy(thread);
 			} else if (spdk_unlikely(lw_thread->resched)) {
 				lw_thread->resched = false;
@@ -338,7 +337,7 @@ nvmf_init_threads(void)
 
 		nvmf_reactor->core = i;
 
-		nvmf_reactor->threads = spdk_ring_create(SPDK_RING_TYPE_MP_SC, 1024, SPDK_ENV_SOCKET_ID_ANY);
+		nvmf_reactor->threads = spdk_ring_create(SPDK_RING_TYPE_MP_SC, 1024, SPDK_ENV_NUMA_ID_ANY);
 		if (!nvmf_reactor->threads) {
 			fprintf(stderr, "failed to alloc ring\n");
 			free(nvmf_reactor);

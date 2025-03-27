@@ -29,9 +29,13 @@ SPDK_STATIC_ASSERT(sizeof(struct spdk_iobuf_buffer) <= IOBUF_MIN_SMALL_BUFSIZE,
 
 static bool g_iobuf_is_initialized = false;
 
-struct iobuf_channel {
+struct iobuf_channel_node {
 	spdk_iobuf_entry_stailq_t	small_queue;
 	spdk_iobuf_entry_stailq_t	large_queue;
+};
+
+struct iobuf_channel {
+	struct iobuf_channel_node	node[SPDK_CONFIG_MAX_NUMA_NODES];
 	struct spdk_iobuf_channel	*channels[IOBUF_MAX_CHANNELS];
 };
 
@@ -40,23 +44,29 @@ struct iobuf_module {
 	TAILQ_ENTRY(iobuf_module)	tailq;
 };
 
-struct iobuf {
+struct iobuf_node {
 	struct spdk_ring		*small_pool;
 	struct spdk_ring		*large_pool;
 	void				*small_pool_base;
 	void				*large_pool_base;
+};
+
+struct iobuf {
 	struct spdk_iobuf_opts		opts;
 	TAILQ_HEAD(, iobuf_module)	modules;
 	spdk_iobuf_finish_cb		finish_cb;
 	void				*finish_arg;
+	struct iobuf_node		node[SPDK_CONFIG_MAX_NUMA_NODES];
 };
+
+#define IOBUF_FOREACH_NUMA_ID(i)						\
+	for (i = g_iobuf.opts.enable_numa ? spdk_env_get_first_numa_id() : 0;	\
+	     i < INT32_MAX;							\
+	     i = g_iobuf.opts.enable_numa ? spdk_env_get_next_numa_id(i) : INT32_MAX)
 
 static struct iobuf g_iobuf = {
 	.modules = TAILQ_HEAD_INITIALIZER(g_iobuf.modules),
-	.small_pool = NULL,
-	.large_pool = NULL,
-	.small_pool_base = NULL,
-	.large_pool_base = NULL,
+	.node = {},
 	.opts = {
 		.small_pool_count = IOBUF_DEFAULT_SMALL_POOL_SIZE,
 		.large_pool_count = IOBUF_DEFAULT_LARGE_POOL_SIZE,
@@ -76,9 +86,14 @@ static int
 iobuf_channel_create_cb(void *io_device, void *ctx)
 {
 	struct iobuf_channel *ch = ctx;
+	struct iobuf_channel_node *node;
+	int32_t i;
 
-	STAILQ_INIT(&ch->small_queue);
-	STAILQ_INIT(&ch->large_queue);
+	IOBUF_FOREACH_NUMA_ID(i) {
+		node = &ch->node[i];
+		STAILQ_INIT(&node->small_queue);
+		STAILQ_INIT(&node->large_queue);
+	}
 
 	return 0;
 }
@@ -86,64 +101,130 @@ iobuf_channel_create_cb(void *io_device, void *ctx)
 static void
 iobuf_channel_destroy_cb(void *io_device, void *ctx)
 {
-	struct iobuf_channel *ch __attribute__((unused)) = ctx;
+	struct iobuf_channel *ch = ctx;
+	struct iobuf_channel_node *node __attribute__((unused));
+	int32_t i;
 
-	assert(STAILQ_EMPTY(&ch->small_queue));
-	assert(STAILQ_EMPTY(&ch->large_queue));
+	IOBUF_FOREACH_NUMA_ID(i) {
+		node = &ch->node[i];
+		assert(STAILQ_EMPTY(&node->small_queue));
+		assert(STAILQ_EMPTY(&node->large_queue));
+	}
 }
 
-int
-spdk_iobuf_initialize(void)
+static int
+iobuf_node_initialize(struct iobuf_node *node, uint32_t numa_id)
 {
 	struct spdk_iobuf_opts *opts = &g_iobuf.opts;
-	int rc = 0;
-	uint64_t i;
 	struct spdk_iobuf_buffer *buf;
+	uint64_t i;
+	int rc;
 
-	g_iobuf.small_pool = spdk_ring_create(SPDK_RING_TYPE_MP_MC, opts->small_pool_count,
-					      SPDK_ENV_SOCKET_ID_ANY);
-	if (!g_iobuf.small_pool) {
+	if (!g_iobuf.opts.enable_numa) {
+		numa_id = SPDK_ENV_NUMA_ID_ANY;
+	}
+
+	node->small_pool = spdk_ring_create(SPDK_RING_TYPE_MP_MC, opts->small_pool_count,
+					    numa_id);
+	if (!node->small_pool) {
 		SPDK_ERRLOG("Failed to create small iobuf pool\n");
 		rc = -ENOMEM;
 		goto error;
 	}
 
-	/* Round up to the nearest alignment so that each element remains aligned */
-	opts->small_bufsize = SPDK_ALIGN_CEIL(opts->small_bufsize, IOBUF_ALIGNMENT);
-	g_iobuf.small_pool_base = spdk_malloc(opts->small_bufsize * opts->small_pool_count, IOBUF_ALIGNMENT,
-					      NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
-	if (g_iobuf.small_pool_base == NULL) {
+	node->small_pool_base = spdk_malloc(opts->small_bufsize * opts->small_pool_count, IOBUF_ALIGNMENT,
+					    NULL, numa_id, SPDK_MALLOC_DMA);
+	if (node->small_pool_base == NULL) {
 		SPDK_ERRLOG("Unable to allocate requested small iobuf pool size\n");
 		rc = -ENOMEM;
 		goto error;
 	}
 
-	g_iobuf.large_pool = spdk_ring_create(SPDK_RING_TYPE_MP_MC, opts->large_pool_count,
-					      SPDK_ENV_SOCKET_ID_ANY);
-	if (!g_iobuf.large_pool) {
+	node->large_pool = spdk_ring_create(SPDK_RING_TYPE_MP_MC, opts->large_pool_count,
+					    numa_id);
+	if (!node->large_pool) {
 		SPDK_ERRLOG("Failed to create large iobuf pool\n");
 		rc = -ENOMEM;
 		goto error;
 	}
 
-	/* Round up to the nearest alignment so that each element remains aligned */
-	opts->large_bufsize = SPDK_ALIGN_CEIL(opts->large_bufsize, IOBUF_ALIGNMENT);
-	g_iobuf.large_pool_base = spdk_malloc(opts->large_bufsize * opts->large_pool_count, IOBUF_ALIGNMENT,
-					      NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
-	if (g_iobuf.large_pool_base == NULL) {
+	node->large_pool_base = spdk_malloc(opts->large_bufsize * opts->large_pool_count, IOBUF_ALIGNMENT,
+					    NULL, numa_id, SPDK_MALLOC_DMA);
+	if (node->large_pool_base == NULL) {
 		SPDK_ERRLOG("Unable to allocate requested large iobuf pool size\n");
 		rc = -ENOMEM;
 		goto error;
 	}
 
 	for (i = 0; i < opts->small_pool_count; i++) {
-		buf = g_iobuf.small_pool_base + i * opts->small_bufsize;
-		spdk_ring_enqueue(g_iobuf.small_pool, (void **)&buf, 1, NULL);
+		buf = node->small_pool_base + i * opts->small_bufsize;
+		spdk_ring_enqueue(node->small_pool, (void **)&buf, 1, NULL);
 	}
 
 	for (i = 0; i < opts->large_pool_count; i++) {
-		buf = g_iobuf.large_pool_base + i * opts->large_bufsize;
-		spdk_ring_enqueue(g_iobuf.large_pool, (void **)&buf, 1, NULL);
+		buf = node->large_pool_base + i * opts->large_bufsize;
+		spdk_ring_enqueue(node->large_pool, (void **)&buf, 1, NULL);
+	}
+
+	return 0;
+
+error:
+	spdk_free(node->small_pool_base);
+	spdk_ring_free(node->small_pool);
+	spdk_free(node->large_pool_base);
+	spdk_ring_free(node->large_pool);
+	memset(node, 0, sizeof(*node));
+
+	return rc;
+}
+
+static void
+iobuf_node_free(struct iobuf_node *node)
+{
+	if (node->small_pool == NULL) {
+		/* This node didn't get allocated, so just return immediately. */
+		return;
+	}
+
+	if (spdk_ring_count(node->small_pool) != g_iobuf.opts.small_pool_count) {
+		SPDK_ERRLOG("small iobuf pool count is %zu, expected %"PRIu64"\n",
+			    spdk_ring_count(node->small_pool), g_iobuf.opts.small_pool_count);
+	}
+
+	if (spdk_ring_count(node->large_pool) != g_iobuf.opts.large_pool_count) {
+		SPDK_ERRLOG("large iobuf pool count is %zu, expected %"PRIu64"\n",
+			    spdk_ring_count(node->large_pool), g_iobuf.opts.large_pool_count);
+	}
+
+	spdk_free(node->small_pool_base);
+	node->small_pool_base = NULL;
+	spdk_ring_free(node->small_pool);
+	node->small_pool = NULL;
+
+	spdk_free(node->large_pool_base);
+	node->large_pool_base = NULL;
+	spdk_ring_free(node->large_pool);
+	node->large_pool = NULL;
+}
+
+int
+spdk_iobuf_initialize(void)
+{
+	struct spdk_iobuf_opts *opts = &g_iobuf.opts;
+	struct iobuf_node *node;
+	int32_t i;
+	int rc = 0;
+
+	/* Round up to the nearest alignment so that each element remains aligned */
+	opts->small_bufsize = SPDK_ALIGN_CEIL(opts->small_bufsize, IOBUF_ALIGNMENT);
+	opts->large_bufsize = SPDK_ALIGN_CEIL(opts->large_bufsize, IOBUF_ALIGNMENT);
+
+	IOBUF_FOREACH_NUMA_ID(i) {
+		node = &g_iobuf.node[i];
+		rc = iobuf_node_initialize(node, i);
+		if (rc) {
+			goto err;
+		}
 	}
 
 	spdk_io_device_register(&g_iobuf, iobuf_channel_create_cb, iobuf_channel_destroy_cb,
@@ -151,12 +232,12 @@ spdk_iobuf_initialize(void)
 	g_iobuf_is_initialized = true;
 
 	return 0;
-error:
-	spdk_free(g_iobuf.small_pool_base);
-	spdk_ring_free(g_iobuf.small_pool);
-	spdk_free(g_iobuf.large_pool_base);
-	spdk_ring_free(g_iobuf.large_pool);
 
+err:
+	IOBUF_FOREACH_NUMA_ID(i) {
+		node = &g_iobuf.node[i];
+		iobuf_node_free(node);
+	}
 	return rc;
 }
 
@@ -164,6 +245,8 @@ static void
 iobuf_unregister_cb(void *io_device)
 {
 	struct iobuf_module *module;
+	struct iobuf_node *node;
+	int32_t i;
 
 	while (!TAILQ_EMPTY(&g_iobuf.modules)) {
 		module = TAILQ_FIRST(&g_iobuf.modules);
@@ -172,25 +255,10 @@ iobuf_unregister_cb(void *io_device)
 		free(module);
 	}
 
-	if (spdk_ring_count(g_iobuf.small_pool) != g_iobuf.opts.small_pool_count) {
-		SPDK_ERRLOG("small iobuf pool count is %zu, expected %"PRIu64"\n",
-			    spdk_ring_count(g_iobuf.small_pool), g_iobuf.opts.small_pool_count);
+	IOBUF_FOREACH_NUMA_ID(i) {
+		node = &g_iobuf.node[i];
+		iobuf_node_free(node);
 	}
-
-	if (spdk_ring_count(g_iobuf.large_pool) != g_iobuf.opts.large_pool_count) {
-		SPDK_ERRLOG("large iobuf pool count is %zu, expected %"PRIu64"\n",
-			    spdk_ring_count(g_iobuf.large_pool), g_iobuf.opts.large_pool_count);
-	}
-
-	spdk_free(g_iobuf.small_pool_base);
-	g_iobuf.small_pool_base = NULL;
-	spdk_ring_free(g_iobuf.small_pool);
-	g_iobuf.small_pool = NULL;
-
-	spdk_free(g_iobuf.large_pool_base);
-	g_iobuf.large_pool_base = NULL;
-	spdk_ring_free(g_iobuf.large_pool);
-	g_iobuf.large_pool = NULL;
 
 	if (g_iobuf.finish_cb != NULL) {
 		g_iobuf.finish_cb(g_iobuf.finish_arg);
@@ -248,6 +316,16 @@ spdk_iobuf_set_opts(const struct spdk_iobuf_opts *opts)
 		return -EINVAL;
 	}
 
+	if (opts->enable_numa &&
+	    spdk_env_get_last_numa_id() >= SPDK_CONFIG_MAX_NUMA_NODES) {
+		SPDK_ERRLOG("max NUMA ID %" PRIu32 " cannot be supported with "
+			    "SPDK_CONFIG_MAX_NUMA_NODES %" PRIu32 "\n",
+			    spdk_env_get_last_numa_id(), SPDK_CONFIG_MAX_NUMA_NODES);
+		SPDK_ERRLOG("Re-configure with --max-numa-nodes=%" PRIu32 "\n",
+			    spdk_env_get_last_numa_id() + 1);
+		return -EINVAL;
+	}
+
 #define SET_FIELD(field) \
         if (offsetof(struct spdk_iobuf_opts, field) + sizeof(opts->field) <= opts->opts_size) { \
                 g_iobuf.opts.field = opts->field; \
@@ -257,6 +335,7 @@ spdk_iobuf_set_opts(const struct spdk_iobuf_opts *opts)
 	SET_FIELD(large_pool_count);
 	SET_FIELD(small_bufsize);
 	SET_FIELD(large_bufsize);
+	SET_FIELD(enable_numa);
 
 	g_iobuf.opts.opts_size = opts->opts_size;
 
@@ -289,14 +368,75 @@ spdk_iobuf_get_opts(struct spdk_iobuf_opts *opts, size_t opts_size)
 	SET_FIELD(large_pool_count);
 	SET_FIELD(small_bufsize);
 	SET_FIELD(large_bufsize);
+	SET_FIELD(enable_numa);
 
 #undef SET_FIELD
 
 	/* Do not remove this statement, you should always update this statement when you adding a new field,
 	 * and do not forget to add the SET_FIELD statement for your added field. */
-	SPDK_STATIC_ASSERT(sizeof(struct spdk_iobuf_opts) == 32, "Incorrect size");
+	SPDK_STATIC_ASSERT(sizeof(struct spdk_iobuf_opts) == 40, "Incorrect size");
 }
 
+static void
+iobuf_channel_node_init(struct spdk_iobuf_channel *ch, struct iobuf_channel *iobuf_ch,
+			int32_t numa_id, uint32_t small_cache_size, uint32_t large_cache_size)
+{
+	struct iobuf_node *node = &g_iobuf.node[numa_id];
+	struct spdk_iobuf_node_cache *cache = &ch->cache[numa_id];
+	struct iobuf_channel_node *ch_node = &iobuf_ch->node[numa_id];
+
+	cache->small.queue = &ch_node->small_queue;
+	cache->large.queue = &ch_node->large_queue;
+	cache->small.pool = node->small_pool;
+	cache->large.pool = node->large_pool;
+	cache->small.bufsize = g_iobuf.opts.small_bufsize;
+	cache->large.bufsize = g_iobuf.opts.large_bufsize;
+	cache->small.cache_size = small_cache_size;
+	cache->large.cache_size = large_cache_size;
+	cache->small.cache_count = 0;
+	cache->large.cache_count = 0;
+
+	STAILQ_INIT(&cache->small.cache);
+	STAILQ_INIT(&cache->large.cache);
+}
+
+static int
+iobuf_channel_node_populate(struct spdk_iobuf_channel *ch, const char *name, int32_t numa_id)
+{
+	struct iobuf_node *node = &g_iobuf.node[numa_id];
+	struct spdk_iobuf_node_cache *cache = &ch->cache[numa_id];
+	uint32_t small_cache_size = cache->small.cache_size;
+	uint32_t large_cache_size = cache->large.cache_size;
+	struct spdk_iobuf_buffer *buf;
+	uint32_t i;
+
+	for (i = 0; i < small_cache_size; ++i) {
+		if (spdk_ring_dequeue(node->small_pool, (void **)&buf, 1) == 0) {
+			SPDK_ERRLOG("Failed to populate '%s' iobuf small buffer cache at %d/%d entries. "
+				    "You may need to increase spdk_iobuf_opts.small_pool_count (%"PRIu64")\n",
+				    name, i, small_cache_size, g_iobuf.opts.small_pool_count);
+			SPDK_ERRLOG("See scripts/calc-iobuf.py for guidance on how to calculate "
+				    "this value.\n");
+			return -ENOMEM;
+		}
+		STAILQ_INSERT_TAIL(&cache->small.cache, buf, stailq);
+		cache->small.cache_count++;
+	}
+	for (i = 0; i < large_cache_size; ++i) {
+		if (spdk_ring_dequeue(node->large_pool, (void **)&buf, 1) == 0) {
+			SPDK_ERRLOG("Failed to populate '%s' iobuf large buffer cache at %d/%d entries. "
+				    "You may need to increase spdk_iobuf_opts.large_pool_count (%"PRIu64")\n",
+				    name, i, large_cache_size, g_iobuf.opts.large_pool_count);
+			SPDK_ERRLOG("See scripts/calc-iobuf.py for guidance on how to calculate "
+				    "this value.\n");
+			return -ENOMEM;
+		}
+		STAILQ_INSERT_TAIL(&cache->large.cache, buf, stailq);
+		cache->large.cache_count++;
+	}
+
+	return 0;
+}
 
 int
 spdk_iobuf_channel_init(struct spdk_iobuf_channel *ch, const char *name,
@@ -305,8 +445,9 @@ spdk_iobuf_channel_init(struct spdk_iobuf_channel *ch, const char *name,
 	struct spdk_io_channel *ioch;
 	struct iobuf_channel *iobuf_ch;
 	struct iobuf_module *module;
-	struct spdk_iobuf_buffer *buf;
 	uint32_t i;
+	int32_t numa_id;
+	int rc;
 
 	TAILQ_FOREACH(module, &g_iobuf.modules, tailq) {
 		if (strcmp(name, module->name) == 0) {
@@ -336,89 +477,75 @@ spdk_iobuf_channel_init(struct spdk_iobuf_channel *ch, const char *name,
 
 	if (i == IOBUF_MAX_CHANNELS) {
 		SPDK_ERRLOG("Max number of iobuf channels (%" PRIu32 ") exceeded.\n", i);
+		rc = -ENOMEM;
 		goto error;
 	}
 
-	ch->small.queue = &iobuf_ch->small_queue;
-	ch->large.queue = &iobuf_ch->large_queue;
-	ch->small.pool = g_iobuf.small_pool;
-	ch->large.pool = g_iobuf.large_pool;
-	ch->small.bufsize = g_iobuf.opts.small_bufsize;
-	ch->large.bufsize = g_iobuf.opts.large_bufsize;
 	ch->parent = ioch;
 	ch->module = module;
-	ch->small.cache_size = small_cache_size;
-	ch->large.cache_size = large_cache_size;
-	ch->small.cache_count = 0;
-	ch->large.cache_count = 0;
 
-	STAILQ_INIT(&ch->small.cache);
-	STAILQ_INIT(&ch->large.cache);
-
-	for (i = 0; i < small_cache_size; ++i) {
-		if (spdk_ring_dequeue(g_iobuf.small_pool, (void **)&buf, 1) == 0) {
-			SPDK_ERRLOG("Failed to populate '%s' iobuf small buffer cache at %d/%d entries. "
-				    "You may need to increase spdk_iobuf_opts.small_pool_count (%"PRIu64")\n",
-				    name, i, small_cache_size, g_iobuf.opts.small_pool_count);
-			SPDK_ERRLOG("See scripts/calc-iobuf.py for guidance on how to calculate "
-				    "this value.\n");
-			goto error;
-		}
-		STAILQ_INSERT_TAIL(&ch->small.cache, buf, stailq);
-		ch->small.cache_count++;
+	IOBUF_FOREACH_NUMA_ID(numa_id) {
+		iobuf_channel_node_init(ch, iobuf_ch, numa_id,
+					small_cache_size, large_cache_size);
 	}
-	for (i = 0; i < large_cache_size; ++i) {
-		if (spdk_ring_dequeue(g_iobuf.large_pool, (void **)&buf, 1) == 0) {
-			SPDK_ERRLOG("Failed to populate '%s' iobuf large buffer cache at %d/%d entries. "
-				    "You may need to increase spdk_iobuf_opts.large_pool_count (%"PRIu64")\n",
-				    name, i, large_cache_size, g_iobuf.opts.large_pool_count);
-			SPDK_ERRLOG("See scripts/calc-iobuf.py for guidance on how to calculate "
-				    "this value.\n");
+
+	IOBUF_FOREACH_NUMA_ID(numa_id) {
+		rc = iobuf_channel_node_populate(ch, name, numa_id);
+		if (rc) {
 			goto error;
 		}
-		STAILQ_INSERT_TAIL(&ch->large.cache, buf, stailq);
-		ch->large.cache_count++;
 	}
 
 	return 0;
 error:
 	spdk_iobuf_channel_fini(ch);
 
-	return -ENOMEM;
+	return rc;
+}
+
+static void
+iobuf_channel_node_fini(struct spdk_iobuf_channel *ch, int32_t numa_id)
+{
+	struct spdk_iobuf_node_cache *cache = &ch->cache[numa_id];
+	struct iobuf_node *node = &g_iobuf.node[numa_id];
+	struct spdk_iobuf_entry *entry __attribute__((unused));
+	struct spdk_iobuf_buffer *buf;
+
+	/* Make sure none of the wait queue entries are coming from this module */
+	STAILQ_FOREACH(entry, cache->small.queue, stailq) {
+		assert(entry->module != ch->module);
+	}
+	STAILQ_FOREACH(entry, cache->large.queue, stailq) {
+		assert(entry->module != ch->module);
+	}
+
+	/* Release cached buffers back to the pool */
+	while (!STAILQ_EMPTY(&cache->small.cache)) {
+		buf = STAILQ_FIRST(&cache->small.cache);
+		STAILQ_REMOVE_HEAD(&cache->small.cache, stailq);
+		spdk_ring_enqueue(node->small_pool, (void **)&buf, 1, NULL);
+		cache->small.cache_count--;
+	}
+	while (!STAILQ_EMPTY(&cache->large.cache)) {
+		buf = STAILQ_FIRST(&cache->large.cache);
+		STAILQ_REMOVE_HEAD(&cache->large.cache, stailq);
+		spdk_ring_enqueue(node->large_pool, (void **)&buf, 1, NULL);
+		cache->large.cache_count--;
+	}
+
+	assert(cache->small.cache_count == 0);
+	assert(cache->large.cache_count == 0);
 }
 
 void
 spdk_iobuf_channel_fini(struct spdk_iobuf_channel *ch)
 {
-	struct spdk_iobuf_entry *entry __attribute__((unused));
-	struct spdk_iobuf_buffer *buf;
 	struct iobuf_channel *iobuf_ch;
 	uint32_t i;
 
-	/* Make sure none of the wait queue entries are coming from this module */
-	STAILQ_FOREACH(entry, ch->small.queue, stailq) {
-		assert(entry->module != ch->module);
+	IOBUF_FOREACH_NUMA_ID(i) {
+		iobuf_channel_node_fini(ch, i);
 	}
-	STAILQ_FOREACH(entry, ch->large.queue, stailq) {
-		assert(entry->module != ch->module);
-	}
-
-	/* Release cached buffers back to the pool */
-	while (!STAILQ_EMPTY(&ch->small.cache)) {
-		buf = STAILQ_FIRST(&ch->small.cache);
-		STAILQ_REMOVE_HEAD(&ch->small.cache, stailq);
-		spdk_ring_enqueue(g_iobuf.small_pool, (void **)&buf, 1, NULL);
-		ch->small.cache_count--;
-	}
-	while (!STAILQ_EMPTY(&ch->large.cache)) {
-		buf = STAILQ_FIRST(&ch->large.cache);
-		STAILQ_REMOVE_HEAD(&ch->large.cache, stailq);
-		spdk_ring_enqueue(g_iobuf.large_pool, (void **)&buf, 1, NULL);
-		ch->large.cache_count--;
-	}
-
-	assert(ch->small.cache_count == 0);
-	assert(ch->large.cache_count == 0);
 
 	iobuf_ch = spdk_io_channel_get_ctx(ch->parent);
 	for (i = 0; i < IOBUF_MAX_CHANNELS; ++i) {
@@ -476,8 +603,8 @@ spdk_iobuf_unregister_module(const char *name)
 	return -ENOENT;
 }
 
-int
-spdk_iobuf_for_each_entry(struct spdk_iobuf_channel *ch, struct spdk_iobuf_pool *pool,
+static int
+iobuf_pool_for_each_entry(struct spdk_iobuf_channel *ch, struct spdk_iobuf_pool_cache *pool,
 			  spdk_iobuf_for_each_entry_fn cb_fn, void *cb_ctx)
 {
 	struct spdk_iobuf_entry *entry, *tmp;
@@ -498,20 +625,66 @@ spdk_iobuf_for_each_entry(struct spdk_iobuf_channel *ch, struct spdk_iobuf_pool 
 	return 0;
 }
 
+int
+spdk_iobuf_for_each_entry(struct spdk_iobuf_channel *ch,
+			  spdk_iobuf_for_each_entry_fn cb_fn, void *cb_ctx)
+{
+	struct spdk_iobuf_node_cache *cache;
+	uint32_t i;
+	int rc;
+
+	IOBUF_FOREACH_NUMA_ID(i) {
+		cache = &ch->cache[i];
+
+		rc = iobuf_pool_for_each_entry(ch, &cache->small, cb_fn, cb_ctx);
+		if (rc != 0) {
+			return rc;
+		}
+		rc = iobuf_pool_for_each_entry(ch, &cache->large, cb_fn, cb_ctx);
+		if (rc != 0) {
+			return rc;
+		}
+	}
+
+	return 0;
+}
+
+static bool
+iobuf_entry_abort_node(struct spdk_iobuf_channel *ch, int32_t numa_id,
+		       struct spdk_iobuf_entry *entry, uint64_t len)
+{
+	struct spdk_iobuf_node_cache *cache;
+	struct spdk_iobuf_pool_cache *pool;
+	struct spdk_iobuf_entry *e;
+
+	cache = &ch->cache[numa_id];
+
+	if (len <= cache->small.bufsize) {
+		pool = &cache->small;
+	} else {
+		assert(len <= cache->large.bufsize);
+		pool = &cache->large;
+	}
+
+	STAILQ_FOREACH(e, pool->queue, stailq) {
+		if (e == entry) {
+			STAILQ_REMOVE(pool->queue, entry, spdk_iobuf_entry, stailq);
+			return true;
+		}
+	}
+
+	return false;
+}
+
 void
 spdk_iobuf_entry_abort(struct spdk_iobuf_channel *ch, struct spdk_iobuf_entry *entry,
 		       uint64_t len)
 {
-	struct spdk_iobuf_pool *pool;
+	uint32_t i;
 
-	if (len <= ch->small.bufsize) {
-		pool = &ch->small;
-	} else {
-		assert(len <= ch->large.bufsize);
-		pool = &ch->large;
+	IOBUF_FOREACH_NUMA_ID(i) {
+		iobuf_entry_abort_node(ch, i, entry, len);
 	}
-
-	STAILQ_REMOVE(pool->queue, entry, spdk_iobuf_entry, stailq);
 }
 
 #define IOBUF_BATCH_SIZE 32
@@ -520,15 +693,18 @@ void *
 spdk_iobuf_get(struct spdk_iobuf_channel *ch, uint64_t len,
 	       struct spdk_iobuf_entry *entry, spdk_iobuf_get_cb cb_fn)
 {
-	struct spdk_iobuf_pool *pool;
+	struct spdk_iobuf_node_cache *cache;
+	struct spdk_iobuf_pool_cache *pool;
 	void *buf;
 
+	cache = &ch->cache[0];
+
 	assert(spdk_io_channel_get_thread(ch->parent) == spdk_get_thread());
-	if (len <= ch->small.bufsize) {
-		pool = &ch->small;
+	if (len <= cache->small.bufsize) {
+		pool = &cache->small;
 	} else {
-		assert(len <= ch->large.bufsize);
-		pool = &ch->large;
+		assert(len <= cache->large.bufsize);
+		pool = &cache->large;
 	}
 
 	buf = (void *)STAILQ_FIRST(&pool->cache);
@@ -573,14 +749,24 @@ spdk_iobuf_put(struct spdk_iobuf_channel *ch, void *buf, uint64_t len)
 {
 	struct spdk_iobuf_entry *entry;
 	struct spdk_iobuf_buffer *iobuf_buf;
-	struct spdk_iobuf_pool *pool;
+	struct spdk_iobuf_node_cache *cache;
+	struct spdk_iobuf_pool_cache *pool;
+	uint32_t numa_id;
 	size_t sz;
 
-	assert(spdk_io_channel_get_thread(ch->parent) == spdk_get_thread());
-	if (len <= ch->small.bufsize) {
-		pool = &ch->small;
+	if (g_iobuf.opts.enable_numa) {
+		numa_id = spdk_mem_get_numa_id(buf, NULL);
 	} else {
-		pool = &ch->large;
+		numa_id = 0;
+	}
+
+	cache = &ch->cache[numa_id];
+
+	assert(spdk_io_channel_get_thread(ch->parent) == spdk_get_thread());
+	if (len <= cache->small.bufsize) {
+		pool = &cache->small;
+	} else {
+		pool = &cache->large;
 	}
 
 	if (STAILQ_EMPTY(pool->queue)) {
@@ -653,12 +839,20 @@ iobuf_get_channel_stats(struct spdk_io_channel_iter *iter)
 			it = &ctx->modules[i];
 			module = (struct iobuf_module *)channel->module;
 			if (strcmp(it->module, module->name) == 0) {
-				it->small_pool.cache += channel->small.stats.cache;
-				it->small_pool.main += channel->small.stats.main;
-				it->small_pool.retry += channel->small.stats.retry;
-				it->large_pool.cache += channel->large.stats.cache;
-				it->large_pool.main += channel->large.stats.main;
-				it->large_pool.retry += channel->large.stats.retry;
+				struct spdk_iobuf_pool_cache *cache;
+				uint32_t i;
+
+				IOBUF_FOREACH_NUMA_ID(i) {
+					cache = &channel->cache[i].small;
+					it->small_pool.cache += cache->stats.cache;
+					it->small_pool.main += cache->stats.main;
+					it->small_pool.retry += cache->stats.retry;
+
+					cache = &channel->cache[i].large;
+					it->large_pool.cache += cache->stats.cache;
+					it->large_pool.main += cache->stats.main;
+					it->large_pool.retry += cache->stats.retry;
+				}
 				break;
 			}
 		}

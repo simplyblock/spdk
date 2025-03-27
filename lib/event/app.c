@@ -63,7 +63,6 @@ static bool g_delay_subsystem_init = false;
 static bool g_shutdown_sig_received = false;
 static char *g_executable_name;
 static struct spdk_app_opts g_default_opts;
-
 static int g_core_locks[SPDK_CONFIG_MAX_LCORES];
 
 static struct {
@@ -148,6 +147,8 @@ static const struct option g_cmdline_options[] = {
 	{"no-huge",			no_argument,		NULL, NO_HUGE_OPT_IDX},
 #define NO_RPC_SERVER_OPT_IDX	273
 	{"no-rpc-server",		no_argument,		NULL, NO_RPC_SERVER_OPT_IDX},
+#define ENFORCE_NUMA_OPT_IDX 274
+	{"enforce-numa",		no_argument,		NULL, ENFORCE_NUMA_OPT_IDX},
 };
 
 static int
@@ -320,6 +321,7 @@ spdk_app_opts_init(struct spdk_app_opts *opts, size_t opts_size)
 	SET_FIELD(delay_subsystem_init, false);
 	SET_FIELD(disable_signal_handlers, false);
 	SET_FIELD(interrupt_mode, false);
+	SET_FIELD(enforce_numa, false);
 	/* Don't set msg_mempool_size here, it is set or calculated later */
 	SET_FIELD(rpc_allowlist, NULL);
 	SET_FIELD(rpc_log_file, NULL);
@@ -404,6 +406,8 @@ app_subsystem_init_done(int rc, void *arg1)
 		spdk_subsystem_load_config(g_spdk_app.json_data, g_spdk_app.json_data_size,
 					   app_start_application, NULL,
 					   !g_spdk_app.json_config_ignore_errors);
+		free(g_spdk_app.json_data);
+		g_spdk_app.json_data = NULL;
 	} else {
 		app_start_application(0, NULL);
 	}
@@ -498,6 +502,7 @@ app_setup_env(struct spdk_app_opts *opts)
 	env_opts.iova_mode = opts->iova_mode;
 	env_opts.vf_token = opts->vf_token;
 	env_opts.no_huge = opts->no_huge;
+	env_opts.enforce_numa = opts->enforce_numa;
 
 	rc = spdk_env_init(&env_opts);
 	free(env_opts.pci_blocked);
@@ -505,6 +510,9 @@ app_setup_env(struct spdk_app_opts *opts)
 
 	if (rc < 0) {
 		SPDK_ERRLOG("Unable to initialize SPDK env\n");
+		if (getuid() != 0) {
+			SPDK_ERRLOG("You may need to run as root\n");
+		}
 	}
 
 	return rc;
@@ -674,6 +682,7 @@ app_copy_opts(struct spdk_app_opts *opts, struct spdk_app_opts *opts_user, size_
 	SET_FIELD(base_virtaddr);
 	SET_FIELD(disable_signal_handlers);
 	SET_FIELD(interrupt_mode);
+	SET_FIELD(enforce_numa);
 	SET_FIELD(msg_mempool_size);
 	SET_FIELD(rpc_allowlist);
 	SET_FIELD(vf_token);
@@ -698,7 +707,7 @@ unclaim_cpu_cores(uint32_t *failed_core)
 	int rc;
 
 	for (i = 0; i < SPDK_CONFIG_MAX_LCORES; i++) {
-		if (g_core_locks[i] != -1) {
+		if (g_core_locks[i] != -1 && g_core_locks[i] != 0) {
 			snprintf(core_name, sizeof(core_name), "/var/tmp/spdk_cpu_lock_%03d", i);
 			rc = close(g_core_locks[i]);
 			if (rc) {
@@ -916,19 +925,6 @@ spdk_app_start(struct spdk_app_opts *opts_user, spdk_msg_fn start_fn,
 
 	spdk_cpuset_set_cpu(&tmp_cpumask, spdk_env_get_current_core(), true);
 
-	/* Now that the reactors have been initialized, we can create the app thread. */
-	spdk_thread_create("app_thread", &tmp_cpumask);
-	if (!spdk_thread_get_app_thread()) {
-		SPDK_ERRLOG("Unable to create an spdk_thread for initialization\n");
-		return 1;
-	}
-
-	SPDK_ENV_FOREACH_CORE(core) {
-		rc = init_proc_stat(core);
-		if (rc) {
-			SPDK_NOTICELOG("Unable to parse /proc/stat [core: %d].\n", core);
-		}
-	}
 	/*
 	 * Disable and ignore trace setup if setting num_entries
 	 * to be 0.
@@ -941,6 +937,20 @@ spdk_app_start(struct spdk_app_opts *opts_user, spdk_msg_fn start_fn,
 	 */
 	if (opts->num_entries != 0 && app_setup_trace(opts) != 0) {
 		return 1;
+	}
+
+	/* Now that the reactors have been initialized, we can create the app thread. */
+	spdk_thread_create("app_thread", &tmp_cpumask);
+	if (!spdk_thread_get_app_thread()) {
+		SPDK_ERRLOG("Unable to create an spdk_thread for initialization\n");
+		return 1;
+	}
+
+	SPDK_ENV_FOREACH_CORE(core) {
+		rc = init_proc_stat(core);
+		if (rc) {
+			SPDK_NOTICELOG("Unable to parse /proc/stat [core: %d].\n", core);
+		}
 	}
 
 	if (!opts->disable_signal_handlers && app_setup_signal_handlers(opts) != 0) {
@@ -1031,8 +1041,6 @@ log_deprecation_hits(void *ctx, struct spdk_deprecation *dep)
 static void
 app_stop(void *arg1)
 {
-	free(g_spdk_app.json_data);
-
 	if (g_spdk_app.rc == 0) {
 		g_spdk_app.rc = (int)(intptr_t)arg1;
 	}
@@ -1041,6 +1049,8 @@ app_stop(void *arg1)
 		SPDK_NOTICELOG("spdk_app_stop called twice\n");
 		return;
 	}
+
+	free(g_spdk_app.json_data);
 
 	g_spdk_app.stopped = true;
 	spdk_log_for_each_deprecation(NULL, log_deprecation_hits);
@@ -1113,6 +1123,7 @@ usage(void (*app_usage)(void))
 	printf("     --msg-mempool-size <size>  global message memory pool size in count (default: %d)\n",
 	       SPDK_DEFAULT_MSG_MEMPOOL_SIZE);
 	printf("     --no-huge             run without using hugepages\n");
+	printf("     --enforce-numa        enforce NUMA allocations from the specified NUMA node\n");
 	printf(" -i, --shm-id <id>         shared memory ID (optional)\n");
 	printf(" -g, --single-file-segments   force creating just one hugetlbfs file\n");
 
@@ -1288,6 +1299,9 @@ spdk_app_parse_args(int argc, char **argv, struct spdk_app_opts *opts,
 			break;
 		case NO_RPC_SERVER_OPT_IDX:
 			opts->rpc_addr = NULL;
+			break;
+		case ENFORCE_NUMA_OPT_IDX:
+			opts->enforce_numa = true;
 			break;
 		case MEM_SIZE_OPT_IDX: {
 			uint64_t mem_size_mb;

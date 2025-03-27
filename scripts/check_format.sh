@@ -131,11 +131,8 @@ function check_c_style() {
 	if hash astyle; then
 		echo -n "Checking coding style..."
 		version=$(astyle --version | awk '{print $NF}')
-		if lt "$version" 3.0.1; then
-			echo " Your astyle version is too old so skipping coding style checks. Please update astyle to at least 3.0.1 version..."
-			rc=1
-		elif ge "$version" 3.4; then
-			echo " Your astyle version is too new so skipping coding style checks. Please use astyle version < 3.4"
+		if lt "$version" 3.0.1 || gt "$version" 3.1; then
+			echo " Your astyle version is not compatible so skipping coding style checks. Please use astyle version between 3.0.1 and 3.1"
 			rc=1
 		else
 			rm -f astyle.log
@@ -230,7 +227,7 @@ function check_forbidden_functions() {
 
 	echo -n "Checking for use of forbidden library functions..."
 
-	git grep --line-number -w '\(atoi\|atol\|atoll\|strncpy\|strcpy\|strcat\|sprintf\|vsprintf\)' -- './*.c' ':!lib/rte_vhost*/**' > badfunc.log || true
+	git grep --line-number -w '\(atoi\|atol\|atoll\|strncpy\|strcpy\|strcat\|sprintf\|vsprintf\|strtok\)' -- './*.c' ':!lib/rte_vhost*/**' > badfunc.log || true
 	if [ -s badfunc.log ]; then
 		echo " Forbidden library functions detected"
 		cat badfunc.log

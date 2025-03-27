@@ -41,6 +41,16 @@
  */
 #define NVME_TCP_CTRLR_MAX_TRANSPORT_ACK_TIMEOUT	31
 
+enum nvme_tcp_qpair_state {
+	NVME_TCP_QPAIR_STATE_INVALID = 0,
+	NVME_TCP_QPAIR_STATE_INITIALIZING = 1,
+	NVME_TCP_QPAIR_STATE_FABRIC_CONNECT_SEND = 2,
+	NVME_TCP_QPAIR_STATE_FABRIC_CONNECT_POLL = 3,
+	NVME_TCP_QPAIR_STATE_AUTHENTICATING = 4,
+	NVME_TCP_QPAIR_STATE_RUNNING = 5,
+	NVME_TCP_QPAIR_STATE_EXITING = 6,
+	NVME_TCP_QPAIR_STATE_EXITED = 7,
+};
 
 /* NVMe TCP transport extensions for spdk_nvme_ctrlr */
 struct nvme_tcp_ctrlr {
@@ -225,17 +235,6 @@ nvme_tcp_req_put(struct nvme_tcp_qpair *tqpair, struct nvme_tcp_req *tcp_req)
 }
 
 static inline void
-nvme_tcp_accel_submit_crc32c(struct nvme_tcp_poll_group *tgroup, struct nvme_tcp_req *treq,
-			     uint32_t *dst, struct iovec *iovs, uint32_t iovcnt, uint32_t seed,
-			     spdk_nvme_accel_completion_cb cb_fn, void *cb_arg)
-{
-	struct spdk_nvme_poll_group *pg = tgroup->group.group;
-
-	treq->ordering.bits.in_progress_accel = 1;
-	pg->accel_fn_table.submit_accel_crc32c(pg->ctx, dst, iovs, iovcnt, seed, cb_fn, cb_arg);
-}
-
-static inline void
 nvme_tcp_accel_finish_sequence(struct nvme_tcp_poll_group *tgroup, struct nvme_tcp_req *treq,
 			       void *seq, spdk_nvme_accel_completion_cb cb_fn, void *cb_arg)
 {
@@ -290,7 +289,7 @@ nvme_tcp_alloc_reqs(struct nvme_tcp_qpair *tqpair)
 	/* Add additional 2 member for the send_pdu, recv_pdu owned by the tqpair */
 	tqpair->send_pdus = spdk_zmalloc((tqpair->num_entries + 2) * sizeof(struct nvme_tcp_pdu),
 					 0x1000, NULL,
-					 SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+					 SPDK_ENV_NUMA_ID_ANY, SPDK_MALLOC_DMA);
 
 	if (tqpair->send_pdus == NULL) {
 		SPDK_ERRLOG("Failed to allocate send_pdus on tqpair=%p\n", tqpair);
@@ -369,7 +368,7 @@ nvme_tcp_ctrlr_disconnect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_
 		TAILQ_REMOVE(&tqpair->send_queue, pdu, tailq);
 	}
 
-	nvme_tcp_qpair_abort_reqs(qpair, 0);
+	nvme_tcp_qpair_abort_reqs(qpair, qpair->abort_dnr);
 
 	/* If the qpair is marked as asynchronous, let it go through the process_completions() to
 	 * let any outstanding requests (e.g. those with outstanding accel operations) complete.
@@ -390,7 +389,7 @@ nvme_tcp_ctrlr_delete_io_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_q
 	struct nvme_tcp_qpair *tqpair = nvme_tcp_qpair(qpair);
 
 	assert(qpair != NULL);
-	nvme_tcp_qpair_abort_reqs(qpair, 0);
+	nvme_tcp_qpair_abort_reqs(qpair, qpair->abort_dnr);
 	assert(TAILQ_EMPTY(&tqpair->outstanding_reqs));
 
 	nvme_qpair_deinit(qpair);
@@ -561,50 +560,6 @@ tcp_write_pdu(struct nvme_tcp_pdu *pdu)
 }
 
 static void
-pdu_accel_compute_crc32_done(void *cb_arg, int status)
-{
-	struct nvme_tcp_pdu *pdu = cb_arg;
-	struct nvme_tcp_req *req = pdu->req;
-
-	assert(req->ordering.bits.in_progress_accel);
-	req->ordering.bits.in_progress_accel = 0;
-
-	if (spdk_unlikely(status)) {
-		SPDK_ERRLOG("Failed to compute the data digest for pdu =%p\n", pdu);
-		pdu_write_fail(pdu, status);
-		return;
-	}
-
-	pdu->data_digest_crc32 ^= SPDK_CRC32C_XOR;
-	MAKE_DIGEST_WORD(pdu->data_digest, pdu->data_digest_crc32);
-
-	_tcp_write_pdu(pdu);
-}
-
-static void
-pdu_accel_compute_crc32_seq_cb(void *cb_arg, int status)
-{
-	struct nvme_tcp_pdu *pdu = cb_arg;
-	struct nvme_tcp_qpair *tqpair = pdu->qpair;
-	struct nvme_tcp_poll_group *tgroup = nvme_tcp_poll_group(tqpair->qpair.poll_group);
-	struct nvme_tcp_req *treq = pdu->req;
-	struct nvme_request *req = treq->req;
-
-	assert(treq->ordering.bits.in_progress_accel);
-	treq->ordering.bits.in_progress_accel = 0;
-
-	req->accel_sequence = NULL;
-	if (spdk_unlikely(status != 0)) {
-		pdu_seq_fail(pdu, status);
-		return;
-	}
-
-	nvme_tcp_accel_submit_crc32c(tgroup, pdu->req, &pdu->data_digest_crc32,
-				     pdu->data_iov, pdu->data_iovcnt, 0,
-				     pdu_accel_compute_crc32_done, pdu);
-}
-
-static void
 pdu_accel_seq_compute_crc32_done(void *cb_arg)
 {
 	struct nvme_tcp_pdu *pdu = cb_arg;
@@ -628,42 +583,29 @@ pdu_accel_compute_crc32(struct nvme_tcp_pdu *pdu)
 		return false;
 	}
 
-	if (tqpair->qpair.poll_group == NULL) {
+	if (tqpair->qpair.poll_group == NULL ||
+	    tgroup->group.group->accel_fn_table.append_crc32c == NULL) {
 		return false;
 	}
 
-	if (tgroup->group.group->accel_fn_table.append_crc32c != NULL) {
-		rc = nvme_tcp_accel_append_crc32c(tgroup, &req->accel_sequence,
-						  &pdu->data_digest_crc32,
-						  pdu->data_iov, pdu->data_iovcnt, 0,
-						  pdu_accel_seq_compute_crc32_done, pdu);
-		if (spdk_unlikely(rc != 0)) {
-			/* If accel is out of resources, fall back to non-accelerated crc32 */
-			if (rc == -ENOMEM) {
-				return false;
-			}
-
-			SPDK_ERRLOG("Failed to append crc32c operation: %d\n", rc);
-			pdu_write_fail(pdu, rc);
-			return true;
+	rc = nvme_tcp_accel_append_crc32c(tgroup, &req->accel_sequence,
+					  &pdu->data_digest_crc32,
+					  pdu->data_iov, pdu->data_iovcnt, 0,
+					  pdu_accel_seq_compute_crc32_done, pdu);
+	if (spdk_unlikely(rc != 0)) {
+		/* If accel is out of resources, fall back to non-accelerated crc32 */
+		if (rc == -ENOMEM) {
+			return false;
 		}
 
-		tcp_write_pdu(pdu);
-		return true;
-	} else if (tgroup->group.group->accel_fn_table.submit_accel_crc32c != NULL) {
-		if (req->accel_sequence != NULL) {
-			nvme_tcp_accel_finish_sequence(tgroup, pdu->req, req->accel_sequence,
-						       pdu_accel_compute_crc32_seq_cb, pdu);
-		} else {
-			nvme_tcp_accel_submit_crc32c(tgroup, pdu->req, &pdu->data_digest_crc32,
-						     pdu->data_iov, pdu->data_iovcnt, 0,
-						     pdu_accel_compute_crc32_done, pdu);
-		}
-
+		SPDK_ERRLOG("Failed to append crc32c operation: %d\n", rc);
+		pdu_write_fail(pdu, rc);
 		return true;
 	}
 
-	return false;
+	tcp_write_pdu(pdu);
+
+	return true;
 }
 
 static void
@@ -1166,6 +1108,7 @@ nvme_tcp_qpair_recv_state_valid(struct nvme_tcp_qpair *tqpair)
 	switch (tqpair->state) {
 	case NVME_TCP_QPAIR_STATE_FABRIC_CONNECT_SEND:
 	case NVME_TCP_QPAIR_STATE_FABRIC_CONNECT_POLL:
+	case NVME_TCP_QPAIR_STATE_AUTHENTICATING:
 	case NVME_TCP_QPAIR_STATE_RUNNING:
 		return true;
 	default:
@@ -1398,43 +1341,6 @@ _nvme_tcp_pdu_payload_handle(struct nvme_tcp_qpair *tqpair, uint32_t *reaped)
 }
 
 static void
-nvme_tcp_accel_recv_compute_crc32_done(void *cb_arg, int status)
-{
-	struct nvme_tcp_req *tcp_req = cb_arg;
-	struct nvme_tcp_pdu *pdu;
-	struct nvme_tcp_qpair *tqpair;
-	int rc;
-	int dummy_reaped = 0;
-
-	pdu = tcp_req->pdu;
-	assert(pdu != NULL);
-
-	tqpair = tcp_req->tqpair;
-	assert(tqpair != NULL);
-
-	assert(tcp_req->ordering.bits.in_progress_accel);
-	tcp_req->ordering.bits.in_progress_accel = 0;
-
-	nvme_tcp_cond_schedule_qpair_polling(tqpair);
-
-	if (spdk_unlikely(status)) {
-		SPDK_ERRLOG("Failed to compute the data digest for pdu =%p\n", pdu);
-		tcp_req->rsp.status.sc = SPDK_NVME_SC_COMMAND_TRANSIENT_TRANSPORT_ERROR;
-		goto end;
-	}
-
-	pdu->data_digest_crc32 ^= SPDK_CRC32C_XOR;
-	rc = MATCH_DIGEST_WORD(pdu->data_digest, pdu->data_digest_crc32);
-	if (rc == 0) {
-		SPDK_ERRLOG("data digest error on tqpair=(%p) with pdu=%p\n", tqpair, pdu);
-		tcp_req->rsp.status.sc = SPDK_NVME_SC_COMMAND_TRANSIENT_TRANSPORT_ERROR;
-	}
-
-end:
-	nvme_tcp_c2h_data_payload_handle(tqpair, tcp_req->pdu, &dummy_reaped);
-}
-
-static void
 nvme_tcp_req_copy_pdu(struct nvme_tcp_req *treq, struct nvme_tcp_pdu *pdu)
 {
 	treq->pdu->hdr = pdu->hdr;
@@ -1477,35 +1383,29 @@ nvme_tcp_accel_recv_compute_crc32(struct nvme_tcp_req *treq, struct nvme_tcp_pdu
 		return false;
 	}
 
-	if (tgroup->group.group->accel_fn_table.append_crc32c != NULL) {
-		nvme_tcp_req_copy_pdu(treq, pdu);
-		rc = nvme_tcp_accel_append_crc32c(tgroup, &req->accel_sequence,
-						  &treq->pdu->data_digest_crc32,
-						  treq->pdu->data_iov, treq->pdu->data_iovcnt, 0,
-						  nvme_tcp_accel_seq_recv_compute_crc32_done, treq);
-		if (spdk_unlikely(rc != 0)) {
-			/* If accel is out of resources, fall back to non-accelerated crc32 */
-			if (rc == -ENOMEM) {
-				return false;
-			}
-
-			SPDK_ERRLOG("Failed to append crc32c operation: %d\n", rc);
-			treq->rsp.status.sc = SPDK_NVME_SC_COMMAND_TRANSIENT_TRANSPORT_ERROR;
-		}
-
-		nvme_tcp_qpair_set_recv_state(tqpair, NVME_TCP_PDU_RECV_STATE_AWAIT_PDU_READY);
-		nvme_tcp_c2h_data_payload_handle(tqpair, treq->pdu, &dummy);
-		return true;
-	} else if (tgroup->group.group->accel_fn_table.submit_accel_crc32c != NULL) {
-		nvme_tcp_req_copy_pdu(treq, pdu);
-		nvme_tcp_qpair_set_recv_state(tqpair, NVME_TCP_PDU_RECV_STATE_AWAIT_PDU_READY);
-		nvme_tcp_accel_submit_crc32c(tgroup, treq, &treq->pdu->data_digest_crc32,
-					     treq->pdu->data_iov, treq->pdu->data_iovcnt, 0,
-					     nvme_tcp_accel_recv_compute_crc32_done, treq);
-		return true;
+	if (tgroup->group.group->accel_fn_table.append_crc32c == NULL) {
+		return false;
 	}
 
-	return false;
+	nvme_tcp_req_copy_pdu(treq, pdu);
+	rc = nvme_tcp_accel_append_crc32c(tgroup, &req->accel_sequence,
+					  &treq->pdu->data_digest_crc32,
+					  treq->pdu->data_iov, treq->pdu->data_iovcnt, 0,
+					  nvme_tcp_accel_seq_recv_compute_crc32_done, treq);
+	if (spdk_unlikely(rc != 0)) {
+		/* If accel is out of resources, fall back to non-accelerated crc32 */
+		if (rc == -ENOMEM) {
+			return false;
+		}
+
+		SPDK_ERRLOG("Failed to append crc32c operation: %d\n", rc);
+		treq->rsp.status.sc = SPDK_NVME_SC_COMMAND_TRANSIENT_TRANSPORT_ERROR;
+	}
+
+	nvme_tcp_qpair_set_recv_state(tqpair, NVME_TCP_PDU_RECV_STATE_AWAIT_PDU_READY);
+	nvme_tcp_c2h_data_payload_handle(tqpair, treq->pdu, &dummy);
+
+	return true;
 }
 
 static void
@@ -2434,10 +2334,25 @@ nvme_tcp_ctrlr_connect_qpair_poll(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvm
 	case NVME_TCP_QPAIR_STATE_FABRIC_CONNECT_POLL:
 		rc = nvme_fabric_qpair_connect_poll(&tqpair->qpair);
 		if (rc == 0) {
-			tqpair->state = NVME_TCP_QPAIR_STATE_RUNNING;
-			nvme_qpair_set_state(qpair, NVME_QPAIR_CONNECTED);
+			if (nvme_fabric_qpair_auth_required(qpair)) {
+				rc = nvme_fabric_qpair_authenticate_async(qpair);
+				if (rc == 0) {
+					tqpair->state = NVME_TCP_QPAIR_STATE_AUTHENTICATING;
+					rc = -EAGAIN;
+				}
+			} else {
+				tqpair->state = NVME_TCP_QPAIR_STATE_RUNNING;
+				nvme_qpair_set_state(qpair, NVME_QPAIR_CONNECTED);
+			}
 		} else if (rc != -EAGAIN) {
 			SPDK_ERRLOG("Failed to poll NVMe-oF Fabric CONNECT command\n");
+		}
+		break;
+	case NVME_TCP_QPAIR_STATE_AUTHENTICATING:
+		rc = nvme_fabric_qpair_authenticate_poll(qpair);
+		if (rc == 0) {
+			tqpair->state = NVME_TCP_QPAIR_STATE_RUNNING;
+			nvme_qpair_set_state(qpair, NVME_QPAIR_CONNECTED);
 		}
 		break;
 	case NVME_TCP_QPAIR_STATE_RUNNING:
@@ -2566,8 +2481,6 @@ nvme_tcp_ctrlr_create_io_qpair(struct spdk_nvme_ctrlr *ctrlr, uint16_t qid,
 					   opts->io_queue_requests, opts->async_mode);
 }
 
-SPDK_LOG_DEPRECATION_REGISTER(nvme_ctrlr_psk, "spdk_nvme_ctrlr_opts.psk", "v24.09", 0);
-
 static int
 nvme_tcp_generate_tls_credentials(struct nvme_tcp_ctrlr *tctrlr)
 {
@@ -2579,23 +2492,15 @@ nvme_tcp_generate_tls_credentials(struct nvme_tcp_ctrlr *tctrlr)
 	uint8_t tls_cipher_suite;
 	uint8_t psk_retained_hash;
 	uint64_t psk_configured_size;
-	uint8_t *psk;
 
-	if (ctrlr->opts.tls_psk != NULL) {
-		rc = spdk_key_get_key(ctrlr->opts.tls_psk, pskbuf, SPDK_TLS_PSK_MAX_LEN);
-		if (rc < 0) {
-			SPDK_ERRLOG("Failed to obtain key '%s': %s\n",
-				    spdk_key_get_name(ctrlr->opts.tls_psk), spdk_strerror(-rc));
-			goto finish;
-		}
-
-		psk = pskbuf;
-	} else {
-		SPDK_LOG_DEPRECATED(nvme_ctrlr_psk);
-		psk = ctrlr->opts.psk;
+	rc = spdk_key_get_key(ctrlr->opts.tls_psk, pskbuf, SPDK_TLS_PSK_MAX_LEN);
+	if (rc < 0) {
+		SPDK_ERRLOG("Failed to obtain key '%s': %s\n",
+			    spdk_key_get_name(ctrlr->opts.tls_psk), spdk_strerror(-rc));
+		goto finish;
 	}
 
-	rc = nvme_tcp_parse_interchange_psk(psk, psk_configured, sizeof(psk_configured),
+	rc = nvme_tcp_parse_interchange_psk(pskbuf, psk_configured, sizeof(psk_configured),
 					    &psk_configured_size, &psk_retained_hash);
 	if (rc < 0) {
 		SPDK_ERRLOG("Failed to parse PSK interchange!\n");
@@ -2665,6 +2570,7 @@ nvme_tcp_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
 			 void *devhandle)
 {
 	struct nvme_tcp_ctrlr *tctrlr;
+	struct nvme_tcp_qpair *tqpair;
 	int rc;
 
 	tctrlr = calloc(1, sizeof(*tctrlr));
@@ -2676,18 +2582,8 @@ nvme_tcp_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
 	tctrlr->ctrlr.opts = *opts;
 	tctrlr->ctrlr.trid = *trid;
 
-	if (opts->psk[0] != '\0' || opts->tls_psk != NULL) {
-		/* Only allow either one at a time */
-		if (opts->tls_psk != NULL && opts->psk[0] != '\0') {
-			SPDK_ERRLOG("Either spdk_nvme_ctrlr_opts.tls_psk or .psk can be set at "
-				    "the same time\n");
-			free(tctrlr);
-			return NULL;
-		}
+	if (opts->tls_psk != NULL) {
 		rc = nvme_tcp_generate_tls_credentials(tctrlr);
-		spdk_memset_s(&tctrlr->ctrlr.opts.psk, sizeof(tctrlr->ctrlr.opts.psk), 0,
-			      sizeof(tctrlr->ctrlr.opts.psk));
-
 		if (rc != 0) {
 			free(tctrlr);
 			return NULL;
@@ -2717,6 +2613,10 @@ nvme_tcp_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
 		nvme_tcp_ctrlr_destruct(&tctrlr->ctrlr);
 		return NULL;
 	}
+
+	tqpair = nvme_tcp_qpair(tctrlr->ctrlr.adminq);
+	tctrlr->ctrlr.numa.id_valid = 1;
+	tctrlr->ctrlr.numa.id = spdk_sock_get_numa_id(tqpair->sock);
 
 	if (nvme_ctrlr_add_process(&tctrlr->ctrlr, 0) != 0) {
 		SPDK_ERRLOG("nvme_ctrlr_add_process() failed\n");
@@ -2761,6 +2661,28 @@ nvme_tcp_qpair_iterate_requests(struct spdk_nvme_qpair *qpair,
 	}
 
 	return 0;
+}
+
+static int
+nvme_tcp_qpair_authenticate(struct spdk_nvme_qpair *qpair)
+{
+	struct nvme_tcp_qpair *tqpair = nvme_tcp_qpair(qpair);
+	int rc;
+
+	/* If the qpair is still connecting, it'll be forced to authenticate later on */
+	if (tqpair->state < NVME_TCP_QPAIR_STATE_RUNNING) {
+		return 0;
+	} else if (tqpair->state != NVME_TCP_QPAIR_STATE_RUNNING) {
+		return -ENOTCONN;
+	}
+
+	rc = nvme_fabric_qpair_authenticate_async(qpair);
+	if (rc == 0) {
+		nvme_qpair_set_state(qpair, NVME_QPAIR_CONNECTING);
+		tqpair->state = NVME_TCP_QPAIR_STATE_AUTHENTICATING;
+	}
+
+	return rc;
 }
 
 static void
@@ -2937,6 +2859,15 @@ nvme_tcp_poll_group_process_completions(struct spdk_nvme_transport_poll_group *t
 	return group->num_completions;
 }
 
+/*
+ * Handle disconnected qpairs when interrupt support gets added.
+ */
+static void
+nvme_tcp_poll_group_check_disconnected_qpairs(struct spdk_nvme_transport_poll_group *tgroup,
+		spdk_nvme_disconnected_qpair_cb disconnected_qpair_cb)
+{
+}
+
 static int
 nvme_tcp_poll_group_destroy(struct spdk_nvme_transport_poll_group *tgroup)
 {
@@ -3035,6 +2966,7 @@ const struct spdk_nvme_transport_ops tcp_ops = {
 	.qpair_submit_request = nvme_tcp_qpair_submit_request,
 	.qpair_process_completions = nvme_tcp_qpair_process_completions,
 	.qpair_iterate_requests = nvme_tcp_qpair_iterate_requests,
+	.qpair_authenticate = nvme_tcp_qpair_authenticate,
 	.admin_qpair_abort_aers = nvme_tcp_admin_qpair_abort_aers,
 
 	.poll_group_create = nvme_tcp_poll_group_create,
@@ -3044,6 +2976,7 @@ const struct spdk_nvme_transport_ops tcp_ops = {
 	.poll_group_add = nvme_tcp_poll_group_add,
 	.poll_group_remove = nvme_tcp_poll_group_remove,
 	.poll_group_process_completions = nvme_tcp_poll_group_process_completions,
+	.poll_group_check_disconnected_qpairs = nvme_tcp_poll_group_check_disconnected_qpairs,
 	.poll_group_destroy = nvme_tcp_poll_group_destroy,
 	.poll_group_get_stats = nvme_tcp_poll_group_get_stats,
 	.poll_group_free_stats = nvme_tcp_poll_group_free_stats,
@@ -3051,7 +2984,8 @@ const struct spdk_nvme_transport_ops tcp_ops = {
 
 SPDK_NVME_TRANSPORT_REGISTER(tcp, &tcp_ops);
 
-SPDK_TRACE_REGISTER_FN(nvme_tcp, "nvme_tcp", TRACE_GROUP_NVME_TCP)
+static void
+nvme_tcp_trace(void)
 {
 	struct spdk_trace_tpoint_opts opts[] = {
 		{
@@ -3085,3 +3019,4 @@ SPDK_TRACE_REGISTER_FN(nvme_tcp, "nvme_tcp", TRACE_GROUP_NVME_TCP)
 	spdk_trace_tpoint_register_relation(TRACE_SOCK_REQ_PEND, OBJECT_NVME_TCP_REQ, 0);
 	spdk_trace_tpoint_register_relation(TRACE_SOCK_REQ_COMPLETE, OBJECT_NVME_TCP_REQ, 0);
 }
+SPDK_TRACE_REGISTER_FN(nvme_tcp_trace, "nvme_tcp", TRACE_GROUP_NVME_TCP)

@@ -236,6 +236,9 @@ CONFIG_AVAHI=n
 # Setup DPDK's RTE_MAX_LCORES
 CONFIG_MAX_LCORES=128
 
+# Maximum number of iobuf NUMA nodes supported
+CONFIG_MAX_NUMA_NODES=1
+
 # Build all Go components
 CONFIG_GOLANG=n
 
@@ -253,3 +256,6 @@ CONFIG_HAVE_STRUCT_STAT_ST_ATIMESPEC=n
 
 # libc contains the copy_file_range
 CONFIG_COPY_FILE_RANGE=n
+
+# liblz4 is available
+CONFIG_HAVE_LZ4=n

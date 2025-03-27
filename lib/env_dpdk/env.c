@@ -21,29 +21,42 @@
 #include <rte_eal.h>
 
 static __thread bool g_is_thread_unaffinitized;
+static bool g_enforce_numa;
 
-SPDK_STATIC_ASSERT(SOCKET_ID_ANY == SPDK_ENV_SOCKET_ID_ANY, "SOCKET_ID_ANY mismatch");
+SPDK_STATIC_ASSERT(SOCKET_ID_ANY == SPDK_ENV_NUMA_ID_ANY, "SOCKET_ID_ANY mismatch");
 
 void *
-spdk_malloc(size_t size, size_t align, uint64_t *unused, int socket_id, uint32_t flags)
+spdk_malloc(size_t size, size_t align, uint64_t *unused, int numa_id, uint32_t flags)
 {
+	void *buf;
+
 	if (flags == 0 || unused != NULL) {
 		return NULL;
 	}
 
 	align = spdk_max(align, RTE_CACHE_LINE_SIZE);
-	return rte_malloc_socket(NULL, size, align, socket_id);
+	buf = rte_malloc_socket(NULL, size, align, numa_id);
+	if (buf == NULL && !g_enforce_numa && numa_id != SOCKET_ID_ANY) {
+		buf = rte_malloc_socket(NULL, size, align, SOCKET_ID_ANY);
+	}
+	return buf;
 }
 
 void *
-spdk_zmalloc(size_t size, size_t align, uint64_t *unused, int socket_id, uint32_t flags)
+spdk_zmalloc(size_t size, size_t align, uint64_t *unused, int numa_id, uint32_t flags)
 {
+	void *buf;
+
 	if (flags == 0 || unused != NULL) {
 		return NULL;
 	}
 
 	align = spdk_max(align, RTE_CACHE_LINE_SIZE);
-	return rte_zmalloc_socket(NULL, size, align, socket_id);
+	buf = rte_zmalloc_socket(NULL, size, align, numa_id);
+	if (buf == NULL && !g_enforce_numa && numa_id != SOCKET_ID_ANY) {
+		buf = rte_zmalloc_socket(NULL, size, align, SOCKET_ID_ANY);
+	}
+	return buf;
 }
 
 void *
@@ -60,27 +73,27 @@ spdk_free(void *buf)
 }
 
 void *
-spdk_dma_malloc_socket(size_t size, size_t align, uint64_t *unused, int socket_id)
+spdk_dma_malloc_socket(size_t size, size_t align, uint64_t *unused, int numa_id)
 {
-	return spdk_malloc(size, align, unused, socket_id, (SPDK_MALLOC_DMA | SPDK_MALLOC_SHARE));
+	return spdk_malloc(size, align, unused, numa_id, (SPDK_MALLOC_DMA | SPDK_MALLOC_SHARE));
 }
 
 void *
-spdk_dma_zmalloc_socket(size_t size, size_t align, uint64_t *unused, int socket_id)
+spdk_dma_zmalloc_socket(size_t size, size_t align, uint64_t *unused, int numa_id)
 {
-	return spdk_zmalloc(size, align, unused, socket_id, (SPDK_MALLOC_DMA | SPDK_MALLOC_SHARE));
+	return spdk_zmalloc(size, align, unused, numa_id, (SPDK_MALLOC_DMA | SPDK_MALLOC_SHARE));
 }
 
 void *
 spdk_dma_malloc(size_t size, size_t align, uint64_t *unused)
 {
-	return spdk_dma_malloc_socket(size, align, unused, SPDK_ENV_SOCKET_ID_ANY);
+	return spdk_dma_malloc_socket(size, align, unused, SPDK_ENV_NUMA_ID_ANY);
 }
 
 void *
 spdk_dma_zmalloc(size_t size, size_t align, uint64_t *unused)
 {
-	return spdk_dma_zmalloc_socket(size, align, unused, SPDK_ENV_SOCKET_ID_ANY);
+	return spdk_dma_zmalloc_socket(size, align, unused, SPDK_ENV_NUMA_ID_ANY);
 }
 
 void *
@@ -100,7 +113,7 @@ spdk_dma_free(void *buf)
 }
 
 void *
-spdk_memzone_reserve_aligned(const char *name, size_t len, int socket_id,
+spdk_memzone_reserve_aligned(const char *name, size_t len, int numa_id,
 			     unsigned flags, unsigned align)
 {
 	const struct rte_memzone *mz;
@@ -110,11 +123,14 @@ spdk_memzone_reserve_aligned(const char *name, size_t len, int socket_id,
 		dpdk_flags |= RTE_MEMZONE_IOVA_CONTIG;
 	}
 
-	if (socket_id == SPDK_ENV_SOCKET_ID_ANY) {
-		socket_id = SOCKET_ID_ANY;
+	if (numa_id == SPDK_ENV_NUMA_ID_ANY) {
+		numa_id = SOCKET_ID_ANY;
 	}
 
-	mz = rte_memzone_reserve_aligned(name, len, socket_id, dpdk_flags, align);
+	mz = rte_memzone_reserve_aligned(name, len, numa_id, dpdk_flags, align);
+	if (mz == NULL && !g_enforce_numa && numa_id != SOCKET_ID_ANY) {
+		mz = rte_memzone_reserve_aligned(name, len, SOCKET_ID_ANY, dpdk_flags, align);
+	}
 
 	if (mz != NULL) {
 		memset(mz->addr, 0, len);
@@ -125,9 +141,9 @@ spdk_memzone_reserve_aligned(const char *name, size_t len, int socket_id,
 }
 
 void *
-spdk_memzone_reserve(const char *name, size_t len, int socket_id, unsigned flags)
+spdk_memzone_reserve(const char *name, size_t len, int numa_id, unsigned flags)
 {
-	return spdk_memzone_reserve_aligned(name, len, socket_id, flags,
+	return spdk_memzone_reserve_aligned(name, len, numa_id, flags,
 					    RTE_CACHE_LINE_SIZE);
 }
 
@@ -163,14 +179,14 @@ spdk_memzone_dump(FILE *f)
 
 struct spdk_mempool *
 spdk_mempool_create_ctor(const char *name, size_t count,
-			 size_t ele_size, size_t cache_size, int socket_id,
+			 size_t ele_size, size_t cache_size, int numa_id,
 			 spdk_mempool_obj_cb_t *obj_init, void *obj_init_arg)
 {
 	struct rte_mempool *mp;
 	size_t tmp;
 
-	if (socket_id == SPDK_ENV_SOCKET_ID_ANY) {
-		socket_id = SOCKET_ID_ANY;
+	if (numa_id == SPDK_ENV_NUMA_ID_ANY) {
+		numa_id = SOCKET_ID_ANY;
 	}
 
 	/* No more than half of all elements can be in cache */
@@ -185,7 +201,12 @@ spdk_mempool_create_ctor(const char *name, size_t count,
 
 	mp = rte_mempool_create(name, count, ele_size, cache_size,
 				0, NULL, NULL, (rte_mempool_obj_cb_t *)obj_init, obj_init_arg,
-				socket_id, 0);
+				numa_id, 0);
+	if (mp == NULL && !g_enforce_numa && numa_id != SOCKET_ID_ANY) {
+		mp = rte_mempool_create(name, count, ele_size, cache_size,
+					0, NULL, NULL, (rte_mempool_obj_cb_t *)obj_init, obj_init_arg,
+					SOCKET_ID_ANY, 0);
+	}
 
 	return (struct spdk_mempool *)mp;
 }
@@ -193,9 +214,9 @@ spdk_mempool_create_ctor(const char *name, size_t count,
 
 struct spdk_mempool *
 spdk_mempool_create(const char *name, size_t count,
-		    size_t ele_size, size_t cache_size, int socket_id)
+		    size_t ele_size, size_t cache_size, int numa_id)
 {
-	return spdk_mempool_create_ctor(name, count, ele_size, cache_size, socket_id,
+	return spdk_mempool_create_ctor(name, count, ele_size, cache_size, numa_id,
 					NULL, NULL);
 }
 
@@ -368,11 +389,12 @@ spdk_call_unaffinitized(void *cb(void *arg), void *arg)
 }
 
 struct spdk_ring *
-spdk_ring_create(enum spdk_ring_type type, size_t count, int socket_id)
+spdk_ring_create(enum spdk_ring_type type, size_t count, int numa_id)
 {
 	char ring_name[64];
 	static uint32_t ring_num = 0;
 	unsigned flags = RING_F_EXACT_SZ;
+	struct rte_ring *ring;
 
 	switch (type) {
 	case SPDK_RING_TYPE_SP_SC:
@@ -391,7 +413,11 @@ spdk_ring_create(enum spdk_ring_type type, size_t count, int socket_id)
 	snprintf(ring_name, sizeof(ring_name), "ring_%u_%d",
 		 __atomic_fetch_add(&ring_num, 1, __ATOMIC_RELAXED), getpid());
 
-	return (struct spdk_ring *)rte_ring_create(ring_name, count, socket_id, flags);
+	ring = rte_ring_create(ring_name, count, numa_id, flags);
+	if (ring == NULL && !g_enforce_numa && numa_id != SOCKET_ID_ANY) {
+		ring = rte_ring_create(ring_name, count, SOCKET_ID_ANY, flags);
+	}
+	return (struct spdk_ring *)ring;
 }
 
 void
@@ -440,4 +466,10 @@ int
 spdk_get_tid(void)
 {
 	return rte_sys_gettid();
+}
+
+void
+mem_enforce_numa(void)
+{
+	g_enforce_numa = true;
 }

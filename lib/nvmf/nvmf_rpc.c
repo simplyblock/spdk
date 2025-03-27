@@ -19,8 +19,6 @@
 
 #include "nvmf_internal.h"
 
-static bool g_logged_deprecated_decode_rpc_listen_address = false;
-
 static int rpc_ana_state_parse(const char *str, enum spdk_nvme_ana_state *ana_state);
 
 static int
@@ -583,7 +581,6 @@ invalid_custom_response:
 SPDK_RPC_REGISTER("nvmf_delete_subsystem", rpc_nvmf_delete_subsystem, SPDK_RPC_RUNTIME)
 
 struct rpc_listen_address {
-	char *transport;
 	char *trtype;
 	char *adrfam;
 	char *traddr;
@@ -591,51 +588,24 @@ struct rpc_listen_address {
 };
 
 static const struct spdk_json_object_decoder rpc_listen_address_decoders[] = {
-	/* NOTE: "transport" is kept for compatibility; new code should use "trtype" */
-	{"transport", offsetof(struct rpc_listen_address, transport), spdk_json_decode_string, true},
 	{"trtype", offsetof(struct rpc_listen_address, trtype), spdk_json_decode_string, true},
 	{"adrfam", offsetof(struct rpc_listen_address, adrfam), spdk_json_decode_string, true},
 	{"traddr", offsetof(struct rpc_listen_address, traddr), spdk_json_decode_string},
 	{"trsvcid", offsetof(struct rpc_listen_address, trsvcid), spdk_json_decode_string, true},
 };
 
-SPDK_LOG_DEPRECATION_REGISTER(decode_rpc_listen_address,
-			      "[listen_]address.transport is deprecated in favor of trtype",
-			      "v24.09", 0);
-
 static int
 decode_rpc_listen_address(const struct spdk_json_val *val, void *out)
 {
 	struct rpc_listen_address *req = (struct rpc_listen_address *)out;
 
-	if (spdk_json_decode_object(val, rpc_listen_address_decoders,
-				    SPDK_COUNTOF(rpc_listen_address_decoders),
-				    req)) {
-		SPDK_ERRLOG("spdk_json_decode_object failed\n");
-		return -1;
-	}
-
-	if (req->transport && req->trtype) {
-		SPDK_ERRLOG("It is invalid to specify both 'transport' and 'trtype'.\n");
-		return -1;
-	}
-
-	/* Log only once */
-	if (req->transport && !g_logged_deprecated_decode_rpc_listen_address) {
-		SPDK_LOG_DEPRECATED(decode_rpc_listen_address);
-		g_logged_deprecated_decode_rpc_listen_address = true;
-		/* Move ->transport to ->trtype since that's one we use now. */
-		req->trtype = req->transport;
-		req->transport = NULL;
-	}
-
-	return 0;
+	return spdk_json_decode_object(val, rpc_listen_address_decoders,
+				       SPDK_COUNTOF(rpc_listen_address_decoders), req);
 }
 
 static void
 free_rpc_listen_address(struct rpc_listen_address *r)
 {
-	free(r->transport);
 	free(r->trtype);
 	free(r->adrfam);
 	free(r->traddr);
@@ -968,12 +938,7 @@ rpc_nvmf_subsystem_add_listener(struct spdk_jsonrpc_request *request,
 
 	rc = spdk_nvmf_subsystem_pause(subsystem, 0, nvmf_rpc_listen_paused, ctx);
 	if (rc != 0) {
-		if (rc == -EBUSY) {
-			spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
-							 "subsystem busy, retry later.");
-		} else {
-			spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR, "Internal error");
-		}
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR, "Internal error");
 		nvmf_rpc_listener_ctx_free(ctx);
 	}
 }
@@ -1047,12 +1012,7 @@ rpc_nvmf_subsystem_remove_listener(struct spdk_jsonrpc_request *request,
 
 	rc = spdk_nvmf_subsystem_pause(subsystem, 0, nvmf_rpc_listen_paused, ctx);
 	if (rc != 0) {
-		if (rc == -EBUSY) {
-			spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
-							 "subsystem busy, retry later.");
-		} else {
-			spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR, "Internal error");
-		}
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR, "Internal error");
 		nvmf_rpc_listener_ctx_free(ctx);
 	}
 }
@@ -1417,6 +1377,7 @@ struct nvmf_rpc_ns_params {
 	struct spdk_uuid uuid;
 	uint32_t anagrpid;
 	bool no_auto_visible;
+	bool hide_metadata;
 };
 
 static const struct spdk_json_object_decoder rpc_ns_params_decoders[] = {
@@ -1428,6 +1389,7 @@ static const struct spdk_json_object_decoder rpc_ns_params_decoders[] = {
 	{"uuid", offsetof(struct nvmf_rpc_ns_params, uuid), spdk_json_decode_uuid, true},
 	{"anagrpid", offsetof(struct nvmf_rpc_ns_params, anagrpid), spdk_json_decode_uint32, true},
 	{"no_auto_visible", offsetof(struct nvmf_rpc_ns_params, no_auto_visible), spdk_json_decode_bool, true},
+	{"hide_metadata", offsetof(struct nvmf_rpc_ns_params, hide_metadata), spdk_json_decode_bool, true},
 };
 
 static int
@@ -1549,6 +1511,7 @@ nvmf_rpc_ns_paused(struct spdk_nvmf_subsystem *subsystem,
 
 	ns_opts.anagrpid = ctx->ns_params.anagrpid;
 	ns_opts.no_auto_visible = ctx->ns_params.no_auto_visible;
+	ns_opts.hide_metadata = ctx->ns_params.hide_metadata;
 
 	ctx->ns_params.nsid = spdk_nvmf_subsystem_add_ns_ext(subsystem, ctx->ns_params.bdev_name,
 			      &ns_opts, sizeof(ns_opts),
@@ -1614,16 +1577,129 @@ rpc_nvmf_subsystem_add_ns(struct spdk_jsonrpc_request *request,
 
 	rc = spdk_nvmf_subsystem_pause(subsystem, ctx->ns_params.nsid, nvmf_rpc_ns_paused, ctx);
 	if (rc != 0) {
-		if (rc == -EBUSY) {
-			spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
-							 "subsystem busy, retry later.");
-		} else {
-			spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR, "Internal error");
-		}
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR, "Internal error");
 		nvmf_rpc_ns_ctx_free(ctx);
 	}
 }
 SPDK_RPC_REGISTER("nvmf_subsystem_add_ns", rpc_nvmf_subsystem_add_ns, SPDK_RPC_RUNTIME)
+
+struct nvmf_rpc_ana_group_ctx {
+	char *nqn;
+	char *tgt_name;
+	uint32_t nsid;
+	uint32_t anagrpid;
+
+	struct spdk_jsonrpc_request *request;
+	bool response_sent;
+};
+
+static const struct spdk_json_object_decoder nvmf_rpc_subsystem_ana_group_decoder[] = {
+	{"nqn", offsetof(struct nvmf_rpc_ana_group_ctx, nqn), spdk_json_decode_string},
+	{"nsid", offsetof(struct nvmf_rpc_ana_group_ctx, nsid), spdk_json_decode_uint32},
+	{"anagrpid", offsetof(struct nvmf_rpc_ana_group_ctx, anagrpid), spdk_json_decode_uint32},
+	{"tgt_name", offsetof(struct nvmf_rpc_ana_group_ctx, tgt_name), spdk_json_decode_string, true},
+};
+
+static void
+nvmf_rpc_ana_group_ctx_free(struct nvmf_rpc_ana_group_ctx *ctx)
+{
+	free(ctx->nqn);
+	free(ctx->tgt_name);
+	free(ctx);
+}
+
+static void
+nvmf_rpc_anagrpid_resumed(struct spdk_nvmf_subsystem *subsystem,
+			  void *cb_arg, int status)
+{
+	struct nvmf_rpc_ana_group_ctx *ctx = cb_arg;
+	struct spdk_jsonrpc_request *request = ctx->request;
+	bool response_sent = ctx->response_sent;
+
+	nvmf_rpc_ana_group_ctx_free(ctx);
+
+	if (response_sent) {
+		return;
+	}
+
+	spdk_jsonrpc_send_bool_response(request, true);
+}
+
+static void
+nvmf_rpc_ana_group(struct spdk_nvmf_subsystem *subsystem,
+		   void *cb_arg, int status)
+{
+	struct nvmf_rpc_ana_group_ctx *ctx = cb_arg;
+	int rc;
+
+	rc = spdk_nvmf_subsystem_set_ns_ana_group(subsystem, ctx->nsid, ctx->anagrpid);
+	if (rc != 0) {
+		SPDK_ERRLOG("Unable to change ANA group ID\n");
+		spdk_jsonrpc_send_error_response(ctx->request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "Invalid parameters");
+		ctx->response_sent = true;
+	}
+
+	if (spdk_nvmf_subsystem_resume(subsystem, nvmf_rpc_anagrpid_resumed, ctx)) {
+		if (!ctx->response_sent) {
+			spdk_jsonrpc_send_error_response(ctx->request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+							 "Internal error");
+		}
+		nvmf_rpc_ana_group_ctx_free(ctx);
+	}
+}
+
+static void
+rpc_nvmf_subsystem_set_ns_ana_group(struct spdk_jsonrpc_request *request,
+				    const struct spdk_json_val *params)
+{
+	struct nvmf_rpc_ana_group_ctx *ctx;
+	struct spdk_nvmf_subsystem *subsystem;
+	struct spdk_nvmf_tgt *tgt;
+	int rc;
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR, "Out of memory");
+		return;
+	}
+
+	if (spdk_json_decode_object(params, nvmf_rpc_subsystem_ana_group_decoder,
+				    SPDK_COUNTOF(nvmf_rpc_subsystem_ana_group_decoder), ctx)) {
+		SPDK_ERRLOG("spdk_json_decode_object failed\n");
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS, "Invalid parameters");
+		nvmf_rpc_ana_group_ctx_free(ctx);
+		return;
+	}
+
+	ctx->request = request;
+	ctx->response_sent = false;
+
+	tgt = spdk_nvmf_get_tgt(ctx->tgt_name);
+	if (!tgt) {
+		SPDK_ERRLOG("Unable to find a target object.\n");
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "Unable to find a target.");
+		nvmf_rpc_ana_group_ctx_free(ctx);
+		return;
+	}
+
+	subsystem = spdk_nvmf_tgt_find_subsystem(tgt, ctx->nqn);
+	if (!subsystem) {
+		SPDK_ERRLOG("Unable to find subsystem with NQN %s\n", ctx->nqn);
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS, "Invalid parameters");
+		nvmf_rpc_ana_group_ctx_free(ctx);
+		return;
+	}
+
+	rc = spdk_nvmf_subsystem_pause(subsystem, ctx->nsid, nvmf_rpc_ana_group, ctx);
+	if (rc != 0) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR, "Internal error");
+		nvmf_rpc_ana_group_ctx_free(ctx);
+	}
+}
+SPDK_RPC_REGISTER("nvmf_subsystem_set_ns_ana_group", rpc_nvmf_subsystem_set_ns_ana_group,
+		  SPDK_RPC_RUNTIME)
 
 struct nvmf_rpc_remove_ns_ctx {
 	char *nqn;
@@ -1734,12 +1810,7 @@ rpc_nvmf_subsystem_remove_ns(struct spdk_jsonrpc_request *request,
 
 	rc = spdk_nvmf_subsystem_pause(subsystem, ctx->nsid, nvmf_rpc_remove_ns_paused, ctx);
 	if (rc != 0) {
-		if (rc == -EBUSY) {
-			spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
-							 "subsystem busy, retry later.");
-		} else {
-			spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR, "Internal error");
-		}
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR, "Internal error");
 		nvmf_rpc_remove_ns_ctx_free(ctx);
 	}
 }
@@ -1859,12 +1930,7 @@ nvmf_rpc_ns_visible(struct spdk_jsonrpc_request *request,
 
 	rc = spdk_nvmf_subsystem_pause(subsystem, ctx->nsid, nvmf_rpc_ns_visible_paused, ctx);
 	if (rc != 0) {
-		if (rc == -EBUSY) {
-			spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
-							 "subsystem busy, retry later.");
-		} else {
-			spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR, "Internal error");
-		}
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR, "Internal error");
 		nvmf_rpc_ns_visible_ctx_free(ctx);
 	}
 }
@@ -2064,6 +2130,73 @@ rpc_nvmf_subsystem_remove_host(struct spdk_jsonrpc_request *request,
 SPDK_RPC_REGISTER("nvmf_subsystem_remove_host", rpc_nvmf_subsystem_remove_host,
 		  SPDK_RPC_RUNTIME)
 
+static void
+rpc_nvmf_subsystem_set_keys(struct spdk_jsonrpc_request *request,
+			    const struct spdk_json_val *params)
+{
+	struct nvmf_rpc_host_ctx ctx = {};
+	struct spdk_nvmf_subsystem *subsystem;
+	struct spdk_nvmf_subsystem_key_opts opts = {};
+	struct spdk_nvmf_tgt *tgt;
+	struct spdk_key *key = NULL, *ckey = NULL;
+	int rc;
+
+	if (spdk_json_decode_object(params, nvmf_rpc_subsystem_host_decoder,
+				    SPDK_COUNTOF(nvmf_rpc_subsystem_host_decoder), &ctx)) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "Invalid parameters");
+		goto out;
+	}
+
+	tgt = spdk_nvmf_get_tgt(ctx.tgt_name);
+	if (!tgt) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "Invalid parameters");
+		goto out;
+	}
+	subsystem = spdk_nvmf_tgt_find_subsystem(tgt, ctx.nqn);
+	if (!subsystem) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "Invalid parameters");
+		goto out;
+	}
+
+	if (ctx.dhchap_key != NULL) {
+		key = spdk_keyring_get_key(ctx.dhchap_key);
+		if (key == NULL) {
+			SPDK_ERRLOG("Unable to find DH-HMAC-CHAP key: %s\n", ctx.dhchap_key);
+			spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+							 "Invalid parameters");
+			goto out;
+		}
+	}
+	if (ctx.dhchap_ctrlr_key != NULL) {
+		ckey = spdk_keyring_get_key(ctx.dhchap_ctrlr_key);
+		if (ckey == NULL) {
+			SPDK_ERRLOG("Unable to find DH-HMAC-CHAP ctrlr key: %s\n",
+				    ctx.dhchap_ctrlr_key);
+			spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+							 "Invalid parameters");
+			goto out;
+		}
+	}
+
+	opts.size = SPDK_SIZEOF(&opts, dhchap_ctrlr_key);
+	opts.dhchap_key = key;
+	opts.dhchap_ctrlr_key = ckey;
+	rc = spdk_nvmf_subsystem_set_keys(subsystem, ctx.host, &opts);
+	if (rc != 0) {
+		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
+		goto out;
+	}
+
+	spdk_jsonrpc_send_bool_response(request, true);
+out:
+	spdk_keyring_put_key(ckey);
+	spdk_keyring_put_key(key);
+	nvmf_rpc_host_ctx_free(&ctx);
+}
+SPDK_RPC_REGISTER("nvmf_subsystem_set_keys", rpc_nvmf_subsystem_set_keys, SPDK_RPC_RUNTIME)
 
 static const struct spdk_json_object_decoder nvmf_rpc_subsystem_any_host_decoder[] = {
 	{"nqn", offsetof(struct nvmf_rpc_host_ctx, nqn), spdk_json_decode_string},
@@ -2132,6 +2265,7 @@ decode_discovery_filter(const struct spdk_json_val *val, void *out)
 	uint32_t filter = SPDK_NVMF_TGT_DISCOVERY_MATCH_ANY;
 	char *tokens = spdk_json_strdup(val);
 	char *tok;
+	char *sp = NULL;
 	int rc = -EINVAL;
 	bool all_specified = false;
 
@@ -2139,7 +2273,7 @@ decode_discovery_filter(const struct spdk_json_val *val, void *out)
 		return -ENOMEM;
 	}
 
-	tok = strtok(tokens, ",");
+	tok = strtok_r(tokens, ",", &sp);
 	while (tok) {
 		if (strncmp(tok, "match_any", 9) == 0) {
 			if (filter != SPDK_NVMF_TGT_DISCOVERY_MATCH_ANY) {
@@ -2163,7 +2297,7 @@ decode_discovery_filter(const struct spdk_json_val *val, void *out)
 			}
 		}
 
-		tok = strtok(NULL, ",");
+		tok = strtok_r(NULL, ",", &sp);
 	}
 
 	rc = 0;
@@ -2736,6 +2870,7 @@ dump_nvmf_qpair(struct spdk_json_write_ctx *w, struct spdk_nvmf_qpair *qpair)
 	spdk_json_write_named_uint32(w, "qid", qpair->qid);
 	spdk_json_write_named_string(w, "state", nvmf_qpair_state_str(qpair->state));
 	spdk_json_write_named_string(w, "thread", spdk_thread_get_name(spdk_get_thread()));
+	spdk_json_write_named_string(w, "hostnqn", qpair->ctrlr->hostnqn);
 
 	if (spdk_nvmf_qpair_get_listen_trid(qpair, &trid) == 0) {
 		spdk_json_write_named_object_begin(w, "listen_address");

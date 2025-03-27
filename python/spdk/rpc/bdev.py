@@ -47,12 +47,14 @@ def bdev_wait_for_examine(client):
     return client.call('bdev_wait_for_examine')
 
 
-def bdev_compress_create(client, base_bdev_name, pm_path, lb_size=None):
+def bdev_compress_create(client, base_bdev_name, pm_path, lb_size=None, comp_algo=None, comp_level=None):
     """Construct a compress virtual block device.
     Args:
         base_bdev_name: name of the underlying base bdev
         pm_path: path to persistent memory
         lb_size: logical block size for the compressed vol in bytes.  Must be 4K or 512.
+        comp_algo: compression algorithm for the compressed vol. Default is deflate.
+        comp_level: compression algorithm level for the compressed vol. Default is 1.
     Returns:
         Name of created virtual block device.
     """
@@ -61,6 +63,10 @@ def bdev_compress_create(client, base_bdev_name, pm_path, lb_size=None):
     params['pm_path'] = pm_path
     if lb_size is not None:
         params['lb_size'] = lb_size
+    if comp_algo is not None:
+        params['comp_algo'] = comp_algo
+    if comp_level is not None:
+        params['comp_level'] = comp_level
     return client.call('bdev_compress_create', params)
 
 
@@ -449,7 +455,7 @@ def bdev_raid_remove_base_bdev(client, name):
     return client.call('bdev_raid_remove_base_bdev', params)
 
 
-def bdev_aio_create(client, filename, name, block_size=None, readonly=None, fallocate=None):
+def bdev_aio_create(client, filename, name, block_size=None, readonly=None, fallocate=None, uuid=None):
     """Construct a Linux AIO block device.
     Args:
         filename: path to device or file (ex: /dev/sda)
@@ -457,6 +463,7 @@ def bdev_aio_create(client, filename, name, block_size=None, readonly=None, fall
         block_size: block size of device (optional; autodetected if omitted)
         readonly: set aio bdev as read-only
         fallocate: enable fallocate for UNMAP/WRITEZEROS support (note that fallocate syscall would block reactor)
+        uuid: UUID of the bdev (optional)
     Returns:
         Name of created block device.
     """
@@ -469,6 +476,8 @@ def bdev_aio_create(client, filename, name, block_size=None, readonly=None, fall
         params['readonly'] = readonly
     if fallocate is not None:
         params['fallocate'] = fallocate
+    if uuid is not None:
+        params['uuid'] = uuid
     return client.call('bdev_aio_create', params)
 
 
@@ -532,7 +541,7 @@ def bdev_uring_delete(client, name):
     return client.call('bdev_uring_delete', params)
 
 
-def bdev_xnvme_create(client, filename, name, io_mechanism, conserve_cpu=None):
+def bdev_xnvme_create(client, filename, name, io_mechanism, conserve_cpu):
     """Create a bdev with xNVMe backend.
     Args:
         filename: path to device or file (ex: /dev/nvme0n1)
@@ -546,8 +555,7 @@ def bdev_xnvme_create(client, filename, name, io_mechanism, conserve_cpu=None):
     params['filename'] = filename
     params['name'] = name
     params['io_mechanism'] = io_mechanism
-    if conserve_cpu is not None:
-        params['conserve_cpu'] = conserve_cpu
+    params['conserve_cpu'] = conserve_cpu
     return client.call('bdev_xnvme_create', params)
 
 
@@ -570,7 +578,7 @@ def bdev_nvme_set_options(client, action_on_timeout=None, timeout_us=None, timeo
                           fast_io_fail_timeout_sec=None, disable_auto_failback=None, generate_uuids=None,
                           transport_tos=None, nvme_error_stat=None, rdma_srq_size=None, io_path_stat=None,
                           allow_accel_sequence=None, rdma_max_cq_size=None, rdma_cm_event_timeout_ms=None,
-                          dhchap_digests=None, dhchap_dhgroups=None):
+                          dhchap_digests=None, dhchap_dhgroups=None, rdma_umr_per_io=None):
     """Set options for the bdev nvme. This is startup command.
     Args:
         action_on_timeout:  action to take on command time out. Valid values are: none, reset, abort (optional)
@@ -619,6 +627,7 @@ def bdev_nvme_set_options(client, action_on_timeout=None, timeout_us=None, timeo
         rdma_cm_event_timeout_ms: Time to wait for RDMA CM event. Only applicable for RDMA transports.
         dhchap_digests: List of allowed DH-HMAC-CHAP digests. (optional)
         dhchap_dhgroups: List of allowed DH-HMAC-CHAP DH groups. (optional)
+        rdma_umr_per_io: Enable/disable scatter-gather UMR per IO in RDMA transport if supported by system (optional).
     """
     params = dict()
     if action_on_timeout is not None:
@@ -679,6 +688,8 @@ def bdev_nvme_set_options(client, action_on_timeout=None, timeout_us=None, timeo
         params['dhchap_digests'] = dhchap_digests
     if dhchap_dhgroups is not None:
         params['dhchap_dhgroups'] = dhchap_dhgroups
+    if rdma_umr_per_io is not None:
+        params['rdma_umr_per_io'] = rdma_umr_per_io
     return client.call('bdev_nvme_set_options', params)
 
 
@@ -1013,6 +1024,21 @@ def bdev_nvme_cuse_unregister(client, name):
     params = dict()
     params['name'] = name
     return client.call('bdev_nvme_cuse_unregister', params)
+
+
+def bdev_nvme_set_keys(client, name, dhchap_key=None, dhchap_ctrlr_key=None):
+    """Set DH-HMAC-CHAP keys and force (re)authentication on all connected qpairs.
+    Args:
+        name: name of the NVMe controller
+        dhchap_key: DH-HMAC-CHAP key name
+        dhchap_ctrlr_key: DH-HMAC-CHAP controller key name
+    """
+    params = {'name': name}
+    if dhchap_key is not None:
+        params['dhchap_key'] = dhchap_key
+    if dhchap_ctrlr_key is not None:
+        params['dhchap_ctrlr_key'] = dhchap_ctrlr_key
+    return client.call('bdev_nvme_set_keys', params)
 
 
 def bdev_zone_block_create(client, name, base_bdev, zone_capacity, optimal_open_zones):
@@ -1520,11 +1546,12 @@ def bdev_get_bdevs(client, name=None, timeout=None):
     return client.call('bdev_get_bdevs', params)
 
 
-def bdev_get_iostat(client, name=None, per_channel=None):
+def bdev_get_iostat(client, name=None, per_channel=None, reset_mode=None):
     """Get I/O statistics for block devices.
     Args:
         name: bdev name to query (optional; if omitted, query all bdevs)
         per_channel: display per channel IO stats for specified bdev
+        reset_mode: mode to reset stats after getting: all, maxmin, none (optional: if omitted, no reset will happen)
     Returns:
         I/O statistics for the requested block devices.
     """
@@ -1533,6 +1560,8 @@ def bdev_get_iostat(client, name=None, per_channel=None):
         params['name'] = name
     if per_channel is not None:
         params['per_channel'] = per_channel
+    if reset_mode is not None:
+        params['reset_mode'] = reset_mode
     return client.call('bdev_get_iostat', params)
 
 

@@ -122,7 +122,7 @@ struct spdk_app_opts {
 	/**
 	 * for passing user-provided log call
 	 */
-	logfunc         *log;
+	spdk_log_cb		*log;
 
 	uint64_t		base_virtaddr;
 
@@ -149,8 +149,10 @@ struct spdk_app_opts {
 
 	bool interrupt_mode;
 
-	/* Hole at bytes 186-191. */
-	uint8_t reserved186[6];
+	bool enforce_numa;
+
+	/* Hole at bytes 187-191. */
+	uint8_t reserved187[5];
 
 	/**
 	 * The allocated size for the message pool used by the threading library.

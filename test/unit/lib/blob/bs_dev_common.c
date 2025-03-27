@@ -11,6 +11,10 @@
 #define DEV_BUFFER_SIZE (64 * 1024 * 1024)
 #define DEV_BUFFER_BLOCKLEN (4096)
 #define DEV_BUFFER_BLOCKCNT (DEV_BUFFER_SIZE / DEV_BUFFER_BLOCKLEN)
+#define DEV_MAX_PHYS_BLOCKLEN (16384)
+#define FIRST_DATA_CLUSTER(bs) \
+	((DEV_BUFFER_SIZE / spdk_bs_get_cluster_size(bs)) - spdk_bs_total_data_cluster_count(bs))
+
 uint8_t *g_dev_buffer;
 uint64_t g_dev_write_bytes;
 uint64_t g_dev_read_bytes;
@@ -19,6 +23,7 @@ bool g_dev_writev_ext_called;
 bool g_dev_readv_ext_called;
 bool g_dev_copy_enabled;
 struct spdk_blob_ext_io_opts g_blob_ext_io_opts;
+uint32_t g_phys_blocklen;
 
 struct spdk_power_failure_counters {
 	uint64_t general_counter;
@@ -419,6 +424,7 @@ init_dev(void)
 	dev->copy = g_dev_copy_enabled ? dev_copy : NULL;
 	dev->blockcnt = DEV_BUFFER_BLOCKCNT;
 	dev->blocklen = DEV_BUFFER_BLOCKLEN;
+	dev->phys_blocklen = g_phys_blocklen;
 
 	return dev;
 }

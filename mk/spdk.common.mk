@@ -97,8 +97,11 @@ COMMON_CFLAGS += -Werror
 endif
 
 ifeq ($(CONFIG_LTO),y)
-COMMON_CFLAGS += -flto=auto
-LDFLAGS += -flto=auto
+COMMON_CFLAGS += -flto=jobserver
+LDFLAGS += -flto=jobserver
+else
+COMMON_CFLAGS += -fno-lto
+LDFLAGS += -fno-lto
 endif
 
 ifeq ($(CONFIG_PGO_CAPTURE),y)
@@ -107,7 +110,7 @@ LDFLAGS += -fprofile-generate=$(CONFIG_PGO_DIR)
 endif
 
 ifeq ($(CONFIG_PGO_USE),y)
-COMMON_CFLAGS += -fprofile-use=$(CONFIG_PGO_DIR)
+COMMON_CFLAGS += -fprofile-use=$(CONFIG_PGO_DIR) -Wno-missing-profile
 LDFLAGS += -fprofile-use=$(CONFIG_PGO_DIR)
 endif
 
@@ -343,8 +346,12 @@ SYS_LIBS += -lssl
 SYS_LIBS += -lcrypto
 SYS_LIBS += -lm
 
+ifeq ($(CONFIG_HAVE_LZ4),y)
+SYS_LIBS += -llz4
+endif
+
 ifeq ($(CONFIG_DPDK_UADK),y)
-SYS_LIBS += -lwd -lwd_crypto
+SYS_LIBS += -lwd -lwd_crypto -lwd_comp
 endif
 
 PKGCONF ?= pkg-config
@@ -406,11 +413,11 @@ endif
 
 # Link $(OBJS) and $(LIBS) into $@ (app)
 LINK_C=\
-	$(Q)echo "  LINK $(notdir $@)"; \
+	$(Q)+echo "  LINK $(notdir $@)"; \
 	$(CC) -o $@ $(CFLAGS) $(LDFLAGS) $(OBJS) $(LIBS) $(ENV_LDFLAGS) $(SYS_LIBS)
 
 LINK_CXX=\
-	$(Q)echo "  LINK $(notdir $@)"; \
+	$(Q)+echo "  LINK $(notdir $@)"; \
 	$(CXX) -o $@ $(CXXFLAGS) $(LDFLAGS) $(OBJS) $(LIBS) $(ENV_LDFLAGS) $(SYS_LIBS)
 
 # Provide function to ease build of a shared lib
@@ -572,6 +579,11 @@ endef
 define cc_version_eq
 $(shell [ "$(call cc_version)" = "$(1)" ] && echo 1 || echo 0)
 endef
+
+version_major := $(shell IFS='-.' read -r v _ _ _ < $(SPDK_ROOT_DIR)/VERSION; echo $$v)
+version_minor := $(shell IFS='-.' read -r _ v _ _ < $(SPDK_ROOT_DIR)/VERSION; echo $$v | sed -e 's/^0//g')
+version_patch := $(shell IFS='-.' read -r _ _ v _ < $(SPDK_ROOT_DIR)/VERSION; echo $$v)
+version_suffix := $(shell IFS='-.' read -r _ _ _ v < $(SPDK_ROOT_DIR)/VERSION; echo $${v:+-$$v})
 
 # _uniq returns the unique elements from the list specified. It does
 # not change the order of the elements. If the same element occurs

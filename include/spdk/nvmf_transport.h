@@ -127,8 +127,9 @@ struct spdk_nvmf_request {
 
 	/* Timeout tracked for connect and abort flows. */
 	uint64_t timeout_tsc;
+	uint32_t			orig_nsid;
 };
-SPDK_STATIC_ASSERT(sizeof(struct spdk_nvmf_request) == 808, "Incorrect size");
+SPDK_STATIC_ASSERT(sizeof(struct spdk_nvmf_request) == 816, "Incorrect size");
 
 enum spdk_nvmf_qpair_state {
 	SPDK_NVMF_QPAIR_UNINITIALIZED = 0,
@@ -174,7 +175,19 @@ struct spdk_nvmf_qpair {
 	uint16_t				queue_depth;
 
 	struct spdk_nvmf_qpair_auth		*auth;
+
+	struct {
+		/* Indicates whether numa.id is valid, needed for numa.id == 0 case */
+		uint32_t			id_valid : 1;
+		int32_t				id : 31;
+	} numa;
 };
+
+static inline int32_t
+spdk_nvmf_qpair_get_numa_id(struct spdk_nvmf_qpair *qpair)
+{
+	return qpair->numa.id_valid ? qpair->numa.id : SPDK_ENV_NUMA_ID_ANY;
+}
 
 struct spdk_nvmf_transport_poll_group {
 	struct spdk_nvmf_transport					*transport;
@@ -182,12 +195,12 @@ struct spdk_nvmf_transport_poll_group {
 	STAILQ_HEAD(, spdk_nvmf_request)				pending_buf_queue;
 	struct spdk_iobuf_channel					*buf_cache;
 	struct spdk_nvmf_poll_group					*group;
+	struct spdk_poller						*poller;
 	TAILQ_ENTRY(spdk_nvmf_transport_poll_group)			link;
 };
 
 struct spdk_nvmf_poll_group {
 	struct spdk_thread				*thread;
-	struct spdk_poller				*poller;
 
 	TAILQ_HEAD(, spdk_nvmf_transport_poll_group)	tgroups;
 
@@ -537,7 +550,6 @@ int spdk_nvmf_request_get_buffers(struct spdk_nvmf_request *req,
 bool spdk_nvmf_request_get_dif_ctx(struct spdk_nvmf_request *req, struct spdk_dif_ctx *dif_ctx);
 
 void spdk_nvmf_request_exec(struct spdk_nvmf_request *req);
-void spdk_nvmf_request_exec_fabrics(struct spdk_nvmf_request *req);
 int spdk_nvmf_request_free(struct spdk_nvmf_request *req);
 int spdk_nvmf_request_complete(struct spdk_nvmf_request *req);
 void spdk_nvmf_request_zcopy_start(struct spdk_nvmf_request *req);

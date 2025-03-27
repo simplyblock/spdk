@@ -456,6 +456,7 @@ Example response:
     "dpdk_cryptodev_set_driver",
     "dpdk_cryptodev_get_driver",
     "mlx5_scan_accel_module",
+    "accel_mlx5_dump_stats",
     "bdev_virtio_attach_controller",
     "bdev_virtio_scsi_get_devices",
     "bdev_virtio_detach_controller",
@@ -1156,7 +1157,7 @@ Enable tracepoint mask on a specific tpoint group. For example "bdev" for bdev t
 and 0x1 to enable the first tracepoint inside the group (BDEV_IO_START). This command will not
 disable already active tracepoints or those not specified in the mask. For a full description
 of all available trace groups, see
-[tracepoint documentation](https://spdk.io/doc/nvmf_tgt_tracepoints.html).
+[tracepoint documentation](https://spdk.io/doc/tracepoints.html).
 
 #### Parameters
 
@@ -1196,7 +1197,7 @@ Example response:
 Disable tracepoint mask on a specific tpoint group. For example "bdev" for bdev trace group,
 and 0x1 to disable the first tracepoint inside the group (BDEV_IO_START). For a full description
 of all available trace groups, see
-[tracepoint documentation](https://spdk.io/doc/nvmf_tgt_tracepoints.html).
+[tracepoint documentation](https://spdk.io/doc/tracepoints.html).
 
 #### Parameters
 
@@ -2187,7 +2188,7 @@ Example response:
 
 Set config and enable compressdev accel module offload.
 Select the DPDK polled mode driver (pmd) for the accel compress module,
-0 = auto-select, 1= QAT only, 2 = mlx5_pci only.
+0 = auto-select, 1= QAT only, 2 = mlx5_pci only, 3 = uadk only.
 
 #### Parameters
 
@@ -2449,6 +2450,69 @@ Example response:
 }
 ~~~
 
+### accel_mlx5_dump_stats {#rpc_accel_mlx5_dump_stats}
+
+Dump mlx5 accel module statistics
+
+#### Parameters
+
+Name                    | Optional | Type    | Description
+----------------------- | -------- |---------| -----------
+level                   | Optional | string  | Verbose level, one of \"total\", \"channel\" or \"device\"
+
+#### Example
+
+Example request:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "method": "accel_mlx5_dump_stats",
+  "id": 1,
+  "params": {
+    "level": "total"
+  }
+}
+~~~
+
+Example response:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "total": {
+      "umrs": {
+        "crypto_umrs": 1234,
+        "sig_umrs": 2345,
+        "total": 3579
+      },
+      "rdma": {
+        "read": 0,
+        "write": 7035,
+        "total": 7035
+      },
+      "polling": {
+        "polls": 1096,
+        "idle_polls": 300,
+        "completions": 7035,
+        "idle_polls_percentage": 36.5,
+        "cpls_per_poll": 6.418,
+        "nomem_qdepth": 0,
+        "nomem_mkey": 0
+      },
+      "tasks": {
+        "copy": 0,
+        "crypto": 1234,
+        "crc32c": 2345,
+        "total": 3579
+      }
+    }
+  }
+}
+~~~
+
 ## Block Device Abstraction Layer {#jsonrpc_components_bdev}
 
 ### bdev_set_options {#rpc_bdev_set_options}
@@ -2646,6 +2710,7 @@ Name                    | Optional | Type        | Description
 ----------------------- | -------- | ----------- | -----------
 name                    | Optional | string      | Block device name
 per_channel             | Optional | bool        | Display per channel data for specified block device.
+reset_mode              | Optional | string      | Mode to reset I/O statistics after obtaining it: all, maxmin, none (default: none)
 
 #### Response
 
@@ -2710,7 +2775,7 @@ a block device may be specified by name.
 Name                    | Optional | Type        | Description
 ----------------------- | -------- | ----------- | -----------
 name                    | Optional | string      | Block device name
-mode                    | Optional | string      | Mode to reset I/O statistics: all, maxmin (default: all)
+mode                    | Optional | string      | Mode to reset I/O statistics: all, maxmin, none (default: all)
 
 #### Example
 
@@ -2915,6 +2980,8 @@ Name                    | Optional | Type        | Description
 base_bdev_name          | Required | string      | Name of the base bdev
 pm_path                 | Required | string      | Path to persistent memory
 lb_size                 | Optional | int         | Compressed vol logical block size (512 or 4096)
+comp_algo               | Optional | string      | Compression algorithm for the compressed vol. Default is deflate
+comp_level              | Optional | int         | Compression algorithm level for the compressed vol. Default is 1
 
 #### Result
 
@@ -2929,7 +2996,9 @@ Example request:
   "params": {
     "base_bdev_name": "Nvme0n1",
     "pm_path": "/pm_files",
-    "lb_size": 4096
+    "lb_size": 4096,
+    "comp_algo": "deflate",
+    "comp_level": 1
   },
   "jsonrpc": "2.0",
   "method": "bdev_compress_create",
@@ -3884,6 +3953,7 @@ filename                | Required | number      | Path to device or file
 block_size              | Optional | number      | Block size in bytes
 readonly                | Optional | boolean     | set aio bdev as read-only
 fallocate               | Optional | boolean     | Enable UNMAP and WRITE ZEROES support. Intended only for testing purposes due to synchronous syscall.
+uuid                    | Optional | string      | UUID of new bdev
 
 #### Result
 
@@ -4027,6 +4097,7 @@ rdma_max_cq_size           | Optional | number      | Set the maximum size of a 
 rdma_cm_event_timeout_ms   | Optional | number      | Time to wait for RDMA CM events. Default: 0 (0 means using default value of driver).
 dhchap_digests             | Optional | list        | List of allowed DH-HMAC-CHAP digests.
 dhchap_dhgroups            | Optional | list        | List of allowed DH-HMAC-CHAP DH groups.
+rdma_umr_per_io            | Optional | boolean     | Enable/disable scatter-gather UMR per IO in RDMA transport if supported by system
 
 #### Example
 
@@ -4055,7 +4126,8 @@ request:
     "dhchap_dhgroups": [
       "ffdhe6144",
       "ffdhe8192"
-    ]
+    ],
+    "rdma_umr_per_io": false
   },
   "jsonrpc": "2.0",
   "method": "bdev_nvme_set_options",
@@ -4146,7 +4218,7 @@ prchk_reftag               | Optional | bool        | Enable checking of PI refe
 prchk_guard                | Optional | bool        | Enable checking of PI guard for I/O processing
 hdgst                      | Optional | bool        | Enable TCP header digest
 ddgst                      | Optional | bool        | Enable TCP data digest
-fabrics_connect_timeout_us | Optional | bool        | Timeout for fabrics connect (in microseconds)
+fabrics_connect_timeout_us | Optional | number      | Timeout for fabrics connect (in microseconds)
 multipath                  | Optional | string      | Multipathing behavior: disable, failover, multipath. Default is failover.
 num_io_queues              | Optional | number      | The number of IO queues to request during initialization. Range: (0, UINT16_MAX + 1], Default is 1024.
 ctrlr_loss_timeout_sec     | Optional | number      | Time to wait until ctrlr is reconnected before deleting ctrlr.  -1 means infinite reconnects. 0 means no reconnect.
@@ -4154,7 +4226,7 @@ reconnect_delay_sec        | Optional | number      | Time to delay a reconnect 
 fast_io_fail_timeout_sec   | Optional | number      | Time to wait until ctrlr is reconnected before failing I/O to ctrlr. 0 means no such timeout.
 psk                        | Optional | string      | Name of the pre-shared key to be used for TLS (Enables SSL socket implementation for TCP)
 max_bdevs                  | Optional | number      | The size of the name array for newly created bdevs. Default is 128.
-dhchap_key                 | Optional | string      | DH-HMAC-CHAP key name.
+dhchap_key                 | Optional | string      | DH-HMAC-CHAP key name (required if controller key is specified)
 dhchap_ctrlr_key           | Optional | string      | DH-HMAC-CHAP controller key name.
 allow_unrecognized_csi     | Optional | bool        | Allow attaching namespaces with unrecognized command set identifiers. These will only support NVMe passthrough.
 
@@ -4840,6 +4912,47 @@ Example request:
   "jsonrpc": "2.0",
   "method": "bdev_nvme_cuse_unregister",
   "id": 1
+}
+~~~
+
+Example response:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+~~~
+
+### bdev_nvme_set_keys {#rpc_bdev_nvme_set_keys}
+
+Set DH-HMAC-CHAP keys and force (re)authentication on all connected qpairs across all multipath
+controllers.  If none of the keys are provided, the keys will be cleared, meaning that any new
+qpairs won't be authenticated.
+
+If successful, existing qpairs won't be disconnected/reconnected.
+
+#### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+name                    | Required | string      | Name of the NVMe controller
+dhchap_key              | Optional | string      | DH-HMAC-CHAP key name (required if controller key is specified)
+dhchap_ctrlr_key        | Optional | string      | DH-HMAC-CHAP controller key name
+
+#### Example
+
+Example request:
+
+~~~json
+{
+  "method": "bdev_nvme_set_keys",
+  "params": {
+    "name": "nvme0",
+    "dhchap_key": "key0",
+    "dhchap_ctrlr_key": "key1"
+  }
 }
 ~~~
 
@@ -8555,6 +8668,7 @@ eui64                   | Optional | string      | 8-byte namespace EUI-64 in he
 uuid                    | Optional | string      | RFC 4122 UUID (e.g. "ceccf520-691e-4b46-9546-34af789907c5")
 ptpl_file               | Optional | string      | File path to save/restore persistent reservation information
 anagrpid                | Optional | number      | ANA group ID. Default: Namespace ID.
+hide_metadata           | Optional | bool        | Enable hide_metadata option to the bdev. Default: false
 
 #### Example
 
@@ -8624,6 +8738,46 @@ Example response:
 }
 ~~~
 
+### nvmf_subsystem_set_ns_ana_group method {#rpc_nvmf_subsystem_set_ns_ana_group}
+
+Change ANA group ID of a namespace in a subsystem.
+
+#### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+nqn                     | Required | string      | Subsystem NQN
+nsid                    | Required | number      | Namespace ID
+anagrpid                | Required | number      | ANA group ID
+tgt_name                | Optional | string      | Parent NVMe-oF target name.
+
+#### Example
+
+Example request:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "nvmf_subsystem_set_ns_ana_group",
+  "params": {
+    "nqn": "nqn.2016-06.io.spdk:cnode1",
+    "nsid": 1,
+    "anagrpid": 2
+  }
+}
+~~~
+
+Example response:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+~~~
+
 ### nvmf_subsystem_add_host method {#rpc_nvmf_subsystem_add_host}
 
 Add a host NQN to the list of allowed hosts.  Adding an already allowed host will result in an
@@ -8637,7 +8791,7 @@ nqn                     | Required | string      | Subsystem NQN
 host                    | Required | string      | Host NQN to add to the list of allowed host NQNs
 tgt_name                | Optional | string      | Parent NVMe-oF target name.
 psk                     | Optional | string      | Path to a file containing PSK for TLS connection
-dhchap_key              | Optional | string      | DH-HMAC-CHAP key name.
+dhchap_key              | Optional | string      | DH-HMAC-CHAP key name (required if controller key is specified)
 dhchap_ctrlr_key        | Optional | string      | DH-HMAC-CHAP controller key name.
 
 #### Example
@@ -8729,6 +8883,50 @@ Example request:
   "params": {
     "nqn": "nqn.2016-06.io.spdk:cnode1",
     "allow_any_host": true
+  }
+}
+~~~
+
+Example response:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+~~~
+
+### nvmf_subsystem_set_keys {#rpc_nvmf_subsystem_set_keys}
+
+Set keys required for a host to connect to a given subsystem.  This will overwrite the keys set by
+`nvmf_subsystem_add_host`.  If none of the keys are provided, host's keys will be cleared, allowing
+it to connect without authentication.
+
+#### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+nqn                     | Required | string      | Subsystem NQN
+host                    | Required | string      | Host NQN
+tgt_name                | Optional | string      | NVMe-oF target name
+dhchap_key              | Optional | string      | DH-HMAC-CHAP key name (required if controller key is specified)
+dhchap_ctrlr_key        | Optional | string      | DH-HMAC-CHAP controller key name
+
+#### Example
+
+Example request:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "nvmf_subsystem_set_keys",
+  "params": {
+    "nqn": "nqn.2024-06.io.spdk:cnode1",
+    "host": "nqn.2024-06.io.spdk:host1",
+    "dhchap_key": "key0",
+    "dchap_ctrlr_key": "key1"
   }
 }
 ~~~
@@ -10144,6 +10342,7 @@ lvs_name                      | Required | string      | Name of the logical vol
 cluster_sz                    | Optional | number      | Cluster size of the logical volume store in bytes (Default: 4MiB)
 clear_method                  | Optional | string      | Change clear method for data region. Available: none, unmap (default), write_zeroes
 num_md_pages_per_cluster_ratio| Optional | number      | Reserved metadata pages per cluster (Default: 100)
+md_page_size                  | Optional | number      | Metadata page size of the logical volume store in bytes (Default: max(4KB, bdev phys blocklen)
 
 The num_md_pages_per_cluster_ratio defines the amount of metadata to
 allocate when the logical volume store is created. The default value
@@ -10176,6 +10375,7 @@ Example request:
     "lvs_name": "LVS0",
     "bdev_name": "Malloc0",
     "clear_method": "write_zeroes"
+    "md_page_size": "4096"
   }
 }
 ~~~
@@ -10517,7 +10717,7 @@ Example request:
   "method": "bdev_lvol_clone_bdev",
   "id": 1,
   "params": {
-    "bdev_uuid": "e4b40d8b-f623-416d-8234-baf5a4c83cbd",
+    "bdev": "e4b40d8b-f623-416d-8234-baf5a4c83cbd",
     "lvs_name": "lvs1",
     "clone_name": "clone2"
   }
@@ -10815,7 +11015,7 @@ Lvol and parent snapshot must have the same size and must belong to the same lvo
 Name                    | Optional | Type        | Description
 ----------------------- | -------- | ----------- | -----------
 lvol_name               | Required | string      | UUID or alias of the lvol to set parent of
-snapshot_name           | Required | string      | UUID or alias of the snapshot to become parent of lvol
+parent_name             | Required | string      | UUID or alias of the snapshot to become parent of lvol
 
 #### Example
 
@@ -10828,7 +11028,7 @@ Example request:
   "id": 1,
   "params": {
     "lvol_name": "LVS1/LVOL0",
-    "snapshot_name": "LVS1/SNAP0"
+    "parent_name": "LVS1/SNAP0"
   }
 }
 ~~~
@@ -10856,7 +11056,7 @@ The size of the external snapshot device must be an integer multiple of cluster 
 Name                    | Optional | Type        | Description
 ----------------------- | -------- | ----------- | -----------
 lvol_name               | Required | string      | UUID or alias of the lvol to set external parent of
-esnap_name              | Required | string      | UUID or name of the external snapshot to become parent of lvol
+parent_name             | Required | string      | UUID or name of the external snapshot to become parent of lvol
 
 #### Example
 
@@ -10869,7 +11069,7 @@ Example request:
   "id": 1,
   "params": {
     "lvol_name": "LVS1/LVOL0",
-    "esnap_name": "e465527b-f412-4f70-a03e-c4a5d608f65e"
+    "parent_name": "e465527b-f412-4f70-a03e-c4a5d608f65e"
   }
 }
 ~~~
@@ -13074,6 +13274,7 @@ small_pool_count        | Optional | number      | Number of small buffers in th
 large_pool_count        | Optional | number      | Number of large buffers in the global pool
 small_bufsize           | Optional | number      | Size of a small buffer
 large_bufsize           | Optional | number      | Size of a small buffer
+enable_numa             | Optional | boolean     | Enable per-NUMA node buffer pools. Each node will allocate a full pool based on small_pool_count and large_pool_count.
 
 #### Example
 
@@ -13612,6 +13813,7 @@ root_path               | Required | string      | Path on the system directory 
 enable_xattr            | Optional | bool        | true to enable the extended attributes, false otherwise
 enable_writeback_cache  | Optional | bool        | true to enable the writeback cache, false otherwise
 max_write               | Optional | int         | Max write size in bytes
+skip_rw                 | Optional | bool        | Skip processing read and write requests and complete them successfully immediately. This is useful for benchmarking.
 
 #### Example
 
@@ -13626,7 +13828,8 @@ Example request:
     "root_path": "/tmp/vfio-test",
     "enable_xattr": false,
     "enable_writeback_cache": true,
-    "max_write": 65535
+    "max_write": 65535,
+    "skip_rw": true
   }
 }
 ~~~

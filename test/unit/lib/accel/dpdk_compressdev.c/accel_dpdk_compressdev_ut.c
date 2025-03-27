@@ -213,7 +213,7 @@ rte_pktmbuf_pool_create(const char *name, unsigned n, unsigned cache_size,
 
 	tmp = spdk_mempool_create("mbuf_mp", 1024, sizeof(struct rte_mbuf),
 				  SPDK_MEMPOOL_DEFAULT_CACHE_SIZE,
-				  SPDK_ENV_SOCKET_ID_ANY);
+				  SPDK_ENV_NUMA_ID_ANY);
 
 	return (struct rte_mempool *)tmp;
 }
@@ -250,6 +250,9 @@ DEFINE_STUB(rte_mbuf_dynfield_register, int, (const struct rte_mbuf_dynfield *pa
 	    DPDK_DYNFIELD_OFFSET);
 DEFINE_STUB(rte_socket_id, unsigned, (void), 0);
 DEFINE_STUB(rte_vdev_init, int, (const char *name, const char *args), 0);
+DEFINE_STUB(rte_vdev_uninit, int, (const char *name), 0);
+DEFINE_STUB_V(rte_compressdev_stop, (uint8_t dev_id));
+DEFINE_STUB(rte_compressdev_close, int, (uint8_t dev_id), 0);
 DEFINE_STUB_V(rte_comp_op_free, (struct rte_comp_op *op));
 DEFINE_STUB(rte_comp_op_alloc, struct rte_comp_op *, (struct rte_mempool *mempool), NULL);
 
@@ -806,7 +809,7 @@ test_setup_compress_mbuf(void)
 	rc = _setup_compress_mbuf(exp_src_mbuf, &src_mbuf_added, &total_length,
 				  &src_iovs, src_iovcnt, &task);
 	CU_ASSERT(rc == 0);
-	CU_ASSERT(total_length = src_iovs.iov_len);
+	CU_ASSERT(total_length == src_iovs.iov_len);
 	CU_ASSERT(src_mbuf_added == 0);
 	CU_ASSERT(ut_total_rte_pktmbuf_attach_extbuf == 1);
 
@@ -824,7 +827,7 @@ test_setup_compress_mbuf(void)
 	rc = _setup_compress_mbuf(exp_src_mbuf, &src_mbuf_added, &total_length,
 				  &src_iovs, src_iovcnt, &task);
 	CU_ASSERT(rc == 0);
-	CU_ASSERT(total_length = src_iovs.iov_len);
+	CU_ASSERT(total_length == src_iovs.iov_len);
 	CU_ASSERT(src_mbuf_added == 0);
 	CU_ASSERT(ut_total_rte_pktmbuf_attach_extbuf == 2);
 
@@ -841,7 +844,7 @@ test_setup_compress_mbuf(void)
 	rc = _setup_compress_mbuf(exp_src_mbuf, &src_mbuf_added, &total_length,
 				  &src_iovs, src_iovcnt, &task);
 	CU_ASSERT(rc == 0);
-	CU_ASSERT(total_length = src_iovs.iov_len);
+	CU_ASSERT(total_length == src_iovs.iov_len);
 	CU_ASSERT(src_mbuf_added == 0);
 	CU_ASSERT(ut_total_rte_pktmbuf_attach_extbuf == 3);
 
@@ -886,7 +889,7 @@ test_poller(void)
 	/* Error from dequeue, nothing needing to be resubmitted.
 	 */
 	ut_rte_compressdev_dequeue_burst = 1;
-	ut_expected_task_status = RTE_COMP_OP_STATUS_NOT_PROCESSED;
+	ut_expected_task_status = -EIO;
 	/* setup what we want dequeue to return for the op */
 	*RTE_MBUF_DYNFIELD(g_comp_op[0].m_src, g_mbuf_offset, uint64_t *) = (uint64_t)&task[0];
 	g_comp_op[0].produced = 1;
@@ -896,7 +899,7 @@ test_poller(void)
 	rc = comp_dev_poller((void *)g_comp_ch);
 	CU_ASSERT(STAILQ_EMPTY(&g_comp_ch->queued_tasks) == true);
 	CU_ASSERT(rc == SPDK_POLLER_BUSY);
-	ut_expected_task_status = RTE_COMP_OP_STATUS_SUCCESS;
+	ut_expected_task_status = 0;
 
 	/* Success from dequeue, 2 ops. nothing needing to be resubmitted.
 	 */

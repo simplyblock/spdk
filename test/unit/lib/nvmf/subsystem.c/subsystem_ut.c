@@ -24,20 +24,20 @@ DEFINE_STUB(spdk_bdev_module_claim_bdev,
 DEFINE_STUB_V(spdk_bdev_module_release_bdev,
 	      (struct spdk_bdev *bdev));
 
-DEFINE_STUB(spdk_bdev_get_block_size, uint32_t,
-	    (const struct spdk_bdev *bdev), 512);
+DEFINE_STUB(spdk_bdev_desc_get_block_size, uint32_t,
+	    (struct spdk_bdev_desc *desc), 512);
 
-DEFINE_STUB(spdk_bdev_get_md_size, uint32_t,
-	    (const struct spdk_bdev *bdev), 0);
+DEFINE_STUB(spdk_bdev_desc_get_md_size, uint32_t,
+	    (struct spdk_bdev_desc *desc), 0);
 
-DEFINE_STUB(spdk_bdev_is_md_interleaved, bool,
-	    (const struct spdk_bdev *bdev), false);
+DEFINE_STUB(spdk_bdev_desc_is_md_interleaved, bool,
+	    (struct spdk_bdev_desc *desc), false);
 
 DEFINE_STUB(spdk_bdev_io_type_supported, bool,
 	    (struct spdk_bdev *bdev,
 	     enum spdk_bdev_io_type io_type), false);
 
-DEFINE_STUB_V(nvmf_update_discovery_log,
+DEFINE_STUB_V(spdk_nvmf_send_discovery_log_notice,
 	      (struct spdk_nvmf_tgt *tgt, const char *hostnqn));
 DEFINE_STUB(spdk_nvmf_qpair_disconnect, int, (struct spdk_nvmf_qpair *qpair), 0);
 
@@ -76,7 +76,7 @@ DEFINE_STUB(nvmf_tgt_update_mdns_prr, int, (struct spdk_nvmf_tgt *tgt), 0);
 
 DEFINE_STUB(spdk_bdev_get_module_name, const char *, (const struct spdk_bdev *bdev), "nvme");
 DEFINE_STUB(spdk_bdev_get_module_ctx, void *, (struct spdk_bdev_desc *desc), NULL);
-DEFINE_STUB(spdk_nvme_ns_get_id, uint32_t, (struct spdk_nvme_ns *ns), 0);
+DEFINE_STUB(spdk_bdev_get_nvme_nsid, uint32_t, (struct spdk_bdev *bdev), 0);
 
 static struct spdk_nvmf_transport g_transport = {};
 
@@ -209,8 +209,9 @@ struct spdk_bdev_desc {
 };
 
 int
-spdk_bdev_open_ext(const char *bdev_name, bool write, spdk_bdev_event_cb_t event_cb,
-		   void *event_ctx, struct spdk_bdev_desc **_desc)
+spdk_bdev_open_ext_v2(const char *bdev_name, bool write, spdk_bdev_event_cb_t event_cb,
+		      void *event_ctx, struct spdk_bdev_open_opts *opts,
+		      struct spdk_bdev_desc **_desc)
 {
 	struct spdk_bdev_desc *desc;
 	size_t i;
@@ -228,6 +229,12 @@ spdk_bdev_open_ext(const char *bdev_name, bool write, spdk_bdev_event_cb_t event
 	}
 
 	return -EINVAL;
+}
+
+void
+spdk_bdev_open_opts_init(struct spdk_bdev_open_opts *opts, size_t opts_size)
+{
+	memset(opts, 0, opts_size);
 }
 
 void
@@ -616,10 +623,10 @@ test_spdk_nvmf_ns_visible(void)
 	CU_ASSERT(nvmf_ns_find_host(&ns1, ctrlrB.hostnqn) == NULL);
 	CU_ASSERT(nvmf_ns_find_host(&ns2, ctrlrA.hostnqn) == NULL);
 	CU_ASSERT(nvmf_ns_find_host(&ns2, ctrlrB.hostnqn) == NULL);
-	CU_ASSERT(spdk_bit_array_get(ctrlrA.visible_ns, nsid - 1));
-	CU_ASSERT(!spdk_bit_array_get(ctrlrB.visible_ns, nsid - 1));
-	CU_ASSERT(!spdk_bit_array_get(ctrlrA.visible_ns, nsid));
-	CU_ASSERT(!spdk_bit_array_get(ctrlrB.visible_ns, nsid));
+	CU_ASSERT(nvmf_ctrlr_ns_is_visible(&ctrlrA, nsid));
+	CU_ASSERT(!nvmf_ctrlr_ns_is_visible(&ctrlrB, nsid));
+	CU_ASSERT(!nvmf_ctrlr_ns_is_visible(&ctrlrA, nsid + 1));
+	CU_ASSERT(!nvmf_ctrlr_ns_is_visible(&ctrlrB, nsid + 1));
 	/* check last ns_changed */
 	CU_ASSERT(g_ns_changed_ctrlr == &ctrlrA);
 	CU_ASSERT(g_ns_changed_nsid == nsid);
@@ -637,10 +644,10 @@ test_spdk_nvmf_ns_visible(void)
 	CU_ASSERT(nvmf_ns_find_host(&ns1, ctrlrB.hostnqn) == NULL);
 	CU_ASSERT(nvmf_ns_find_host(&ns2, ctrlrA.hostnqn) == NULL);
 	CU_ASSERT(nvmf_ns_find_host(&ns2, ctrlrB.hostnqn) == NULL);
-	CU_ASSERT(spdk_bit_array_get(ctrlrA.visible_ns, nsid - 1));
-	CU_ASSERT(!spdk_bit_array_get(ctrlrB.visible_ns, nsid - 1));
-	CU_ASSERT(!spdk_bit_array_get(ctrlrA.visible_ns, nsid));
-	CU_ASSERT(!spdk_bit_array_get(ctrlrB.visible_ns, nsid));
+	CU_ASSERT(nvmf_ctrlr_ns_is_visible(&ctrlrA, nsid));
+	CU_ASSERT(!nvmf_ctrlr_ns_is_visible(&ctrlrB, nsid));
+	CU_ASSERT(!nvmf_ctrlr_ns_is_visible(&ctrlrA, nsid + 1));
+	CU_ASSERT(!nvmf_ctrlr_ns_is_visible(&ctrlrB, nsid + 1));
 	/* check last ns_changed */
 	CU_ASSERT(g_ns_changed_ctrlr == NULL);
 	CU_ASSERT(g_ns_changed_nsid == 0);
@@ -658,10 +665,10 @@ test_spdk_nvmf_ns_visible(void)
 	CU_ASSERT(nvmf_ns_find_host(&ns1, ctrlrB.hostnqn) == NULL);
 	CU_ASSERT(nvmf_ns_find_host(&ns2, ctrlrA.hostnqn) == NULL);
 	CU_ASSERT(nvmf_ns_find_host(&ns2, ctrlrB.hostnqn) == NULL);
-	CU_ASSERT(!spdk_bit_array_get(ctrlrA.visible_ns, nsid - 1));
-	CU_ASSERT(!spdk_bit_array_get(ctrlrB.visible_ns, nsid - 1));
-	CU_ASSERT(!spdk_bit_array_get(ctrlrA.visible_ns, nsid));
-	CU_ASSERT(!spdk_bit_array_get(ctrlrB.visible_ns, nsid));
+	CU_ASSERT(!nvmf_ctrlr_ns_is_visible(&ctrlrA, nsid));
+	CU_ASSERT(!nvmf_ctrlr_ns_is_visible(&ctrlrB, nsid));
+	CU_ASSERT(!nvmf_ctrlr_ns_is_visible(&ctrlrA, nsid + 1));
+	CU_ASSERT(!nvmf_ctrlr_ns_is_visible(&ctrlrB, nsid + 1));
 	/* check last ns_changed */
 	CU_ASSERT(g_ns_changed_ctrlr == &ctrlrA);
 	CU_ASSERT(g_ns_changed_nsid == nsid);
@@ -679,10 +686,10 @@ test_spdk_nvmf_ns_visible(void)
 	CU_ASSERT(nvmf_ns_find_host(&ns1, ctrlrB.hostnqn) == NULL);
 	CU_ASSERT(nvmf_ns_find_host(&ns2, ctrlrA.hostnqn) == NULL);
 	CU_ASSERT(nvmf_ns_find_host(&ns2, ctrlrB.hostnqn) == NULL);
-	CU_ASSERT(!spdk_bit_array_get(ctrlrA.visible_ns, nsid - 1));
-	CU_ASSERT(!spdk_bit_array_get(ctrlrB.visible_ns, nsid - 1));
-	CU_ASSERT(!spdk_bit_array_get(ctrlrA.visible_ns, nsid));
-	CU_ASSERT(!spdk_bit_array_get(ctrlrB.visible_ns, nsid));
+	CU_ASSERT(!nvmf_ctrlr_ns_is_visible(&ctrlrA, nsid));
+	CU_ASSERT(!nvmf_ctrlr_ns_is_visible(&ctrlrB, nsid));
+	CU_ASSERT(!nvmf_ctrlr_ns_is_visible(&ctrlrA, nsid + 1));
+	CU_ASSERT(!nvmf_ctrlr_ns_is_visible(&ctrlrB, nsid + 1));
 	/* check last ns_changed */
 	CU_ASSERT(g_ns_changed_ctrlr == NULL);
 	CU_ASSERT(g_ns_changed_nsid == 0);
@@ -699,8 +706,8 @@ test_spdk_nvmf_ns_visible(void)
 	CU_ASSERT(rc == 0);
 	CU_ASSERT(nvmf_ns_find_host(ns3, ctrlrA.hostnqn) != NULL);
 	CU_ASSERT(nvmf_ns_find_host(ns3, ctrlrB.hostnqn) == NULL);
-	CU_ASSERT(spdk_bit_array_get(ctrlrA.visible_ns, nsid - 1));
-	CU_ASSERT(!spdk_bit_array_get(ctrlrB.visible_ns, nsid - 1));
+	CU_ASSERT(nvmf_ctrlr_ns_is_visible(&ctrlrA, nsid));
+	CU_ASSERT(!nvmf_ctrlr_ns_is_visible(&ctrlrB, nsid));
 	/* check last ns_changed */
 	CU_ASSERT(g_ns_changed_ctrlr == &ctrlrA);
 	CU_ASSERT(g_ns_changed_nsid == nsid);
@@ -713,8 +720,8 @@ test_spdk_nvmf_ns_visible(void)
 	g_ns_changed_nsid = 0;
 	rc = spdk_nvmf_subsystem_remove_ns(&subsystem, nsid);
 	CU_ASSERT(rc == 0);
-	CU_ASSERT(!spdk_bit_array_get(ctrlrA.visible_ns, nsid - 1));
-	CU_ASSERT(!spdk_bit_array_get(ctrlrB.visible_ns, nsid - 1));
+	CU_ASSERT(!nvmf_ctrlr_ns_is_visible(&ctrlrA, nsid));
+	CU_ASSERT(!nvmf_ctrlr_ns_is_visible(&ctrlrB, nsid));
 	/* check last ns_changed */
 	CU_ASSERT(g_ns_changed_ctrlr == &ctrlrA);
 	CU_ASSERT(g_ns_changed_nsid == nsid);
@@ -1999,8 +2006,8 @@ test_nvmf_ns_reservation_restore(void)
 	reg0 = TAILQ_FIRST(&ns.registrants);
 	reg1 = TAILQ_NEXT(reg0, link);
 	CU_ASSERT(ns.holder == reg0);
-	CU_ASSERT(reg0->rkey = 0xb);
-	CU_ASSERT(reg1->rkey = 0xc);
+	CU_ASSERT(reg0->rkey == 0xb);
+	CU_ASSERT(reg1->rkey == 0xc);
 
 	rc = nvmf_ns_reservation_clear_all_registrants(&ns);
 	CU_ASSERT(rc == 2);
@@ -2030,8 +2037,8 @@ test_nvmf_ns_reservation_restore(void)
 	CU_ASSERT(ns.holder == NULL);
 	reg0 = TAILQ_FIRST(&ns.registrants);
 	reg1 = TAILQ_NEXT(reg0, link);
-	CU_ASSERT(reg0->rkey = 0xb);
-	CU_ASSERT(reg1->rkey = 0xc);
+	CU_ASSERT(reg0->rkey == 0xb);
+	CU_ASSERT(reg1->rkey == 0xc);
 
 	rc = nvmf_ns_reservation_clear_all_registrants(&ns);
 	CU_ASSERT(rc == 2);

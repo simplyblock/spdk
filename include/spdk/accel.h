@@ -22,6 +22,11 @@ extern "C" {
 #define SPDK_ACCEL_AES_XTS_128_KEY_SIZE 16
 #define SPDK_ACCEL_AES_XTS_256_KEY_SIZE 32
 
+enum spdk_accel_comp_algo {
+	SPDK_ACCEL_COMP_ALGO_DEFLATE = 0,
+	SPDK_ACCEL_COMP_ALGO_LZ4
+};
+
 /** Data Encryption Key identifier */
 struct spdk_accel_crypto_key;
 
@@ -49,7 +54,9 @@ enum spdk_accel_opcode {
 	SPDK_ACCEL_OPC_DIF_VERIFY_COPY		= 12,
 	SPDK_ACCEL_OPC_DIF_GENERATE		= 13,
 	SPDK_ACCEL_OPC_DIF_GENERATE_COPY	= 14,
-	SPDK_ACCEL_OPC_LAST			= 15,
+	SPDK_ACCEL_OPC_DIX_GENERATE		= 15,
+	SPDK_ACCEL_OPC_DIX_VERIFY		= 16,
+	SPDK_ACCEL_OPC_LAST			= 17,
 };
 
 enum spdk_accel_cipher {
@@ -260,7 +267,7 @@ int spdk_accel_submit_copy_crc32cv(struct spdk_io_channel *ch, void *dst, struct
 				   spdk_accel_completion_cb cb_fn, void *cb_arg);
 
 /**
- * Build and submit a memory compress request.
+ * Build and submit a memory compress request using the deflate algorithm.
  *
  * This function will build the compress descriptor and submit it.
  *
@@ -282,7 +289,7 @@ int spdk_accel_submit_compress(struct spdk_io_channel *ch, void *dst,
 			       spdk_accel_completion_cb cb_fn, void *cb_arg);
 
 /**
- * Build and submit a memory decompress request.
+ * Build and submit a memory decompress request using the deflate algorithm.
  *
  * This function will build the decompress descriptor and submit it.
  *
@@ -302,6 +309,65 @@ int spdk_accel_submit_decompress(struct spdk_io_channel *ch, struct iovec *dst_i
 				 size_t dst_iovcnt, struct iovec *src_iovs,
 				 size_t src_iovcnt, uint32_t *output_size,
 				 spdk_accel_completion_cb cb_fn, void *cb_arg);
+
+/**
+ * Build and submit a memory compress request using the specified algorithm.
+ *
+ * This function will build the compress descriptor and submit it.
+ *
+ * \param ch I/O channel associated with this call
+ * \param dst Destination to write the data to.
+ * \param nbytes Length in bytes.
+ * \param src_iovs The io vector array which stores the src data and len.
+ * \param src_iovcnt The size of the src io vectors.
+ * \param comp_algo The compression algorithm, enum spdk_accel_comp_algo value.
+ * \param comp_level The compression algorithm level.
+ * \param output_size The size of the compressed data (may be NULL if not desired)
+ * \param cb_fn Callback function which will be called when the request is complete.
+ * \param cb_arg Opaque value which will be passed back as the arg parameter in
+ * the completion callback.
+ *
+ * \return 0 on success, negative errno on failure.
+ */
+int spdk_accel_submit_compress_ext(struct spdk_io_channel *ch, void *dst, uint64_t nbytes,
+				   struct iovec *src_iovs, size_t src_iovcnt,
+				   enum spdk_accel_comp_algo comp_algo, uint32_t comp_level,
+				   uint32_t *output_size, spdk_accel_completion_cb cb_fn, void *cb_arg);
+
+/**
+ * Build and submit a memory decompress request using the specified algorithm.
+ *
+ * This function will build the decompress descriptor and submit it.
+ *
+ * \param ch I/O channel associated with this call
+ * \param dst_iovs The io vector array which stores the dst data and len.
+ * \param dst_iovcnt The size of the dst io vectors.
+ * \param src_iovs The io vector array which stores the src data and len.
+ * \param src_iovcnt The size of the src io vectors.
+ * \param decomp_algo The decompression algorithm, enum spdk_accel_comp_algo value.
+ * \param output_size The size of the compressed data (may be NULL if not desired)
+ * \param cb_fn Callback function which will be called when the request is complete.
+ * \param cb_arg Opaque value which will be passed back as the arg parameter in
+ * the completion callback.
+ *
+ * \return 0 on success, negative errno on failure.
+ */
+int spdk_accel_submit_decompress_ext(struct spdk_io_channel *ch, struct iovec *dst_iovs,
+				     size_t dst_iovcnt, struct iovec *src_iovs, size_t src_iovcnt,
+				     enum spdk_accel_comp_algo decomp_algo, uint32_t *output_size,
+				     spdk_accel_completion_cb cb_fn, void *cb_arg);
+
+/**
+ * Gets the level range of the specified algorithm.
+ *
+ * \param comp_algo The compression algorithm.
+ * \param min_level The lowest level supported by the compression algorithm.
+ * \param max_level The highest level supported by the compression algorithm.
+ *
+ * \return 0 on success, negative errno on failure.
+ */
+int spdk_accel_get_compress_level_range(enum spdk_accel_comp_algo comp_algo,
+					uint32_t *min_level, uint32_t *max_level);
 
 /**
  * Submit an xor request.
@@ -416,10 +482,10 @@ int spdk_accel_submit_dif_verify(struct spdk_io_channel *ch,
  *
  * \param ch I/O channel associated with this call.
  * \param dst_iovs The destination I/O vector array. The total allocated memory size needs
- *		  to be at least: num_blocks * block_size (provided to spdk_dif_ctx_init())
+ *		  to be at least: num_blocks * data_block_size.
  * \param dst_iovcnt The size of the destination I/O vectors array.
  * \param src_iovs The source I/O vector array. The total allocated memory size needs
- *		  to be at least: num_blocks * data_block_size.
+ *		  to be at least: num_blocks * block_size (including metadata)
  * \param src_iovcnt The size of the source I/O vectors array.
  * \param num_blocks Number of data blocks to process.
  * \param ctx DIF context. Contains the DIF configuration values, including the reference
@@ -488,6 +554,60 @@ int spdk_accel_submit_dif_generate_copy(struct spdk_io_channel *ch, struct iovec
 					uint32_t num_blocks, const struct spdk_dif_ctx *ctx,
 					spdk_accel_completion_cb cb_fn, void *cb_arg);
 
+/**
+ * Submit a Data Integrity Extension (DIX) generate operation.
+ *
+ * This operation computes Protection Information (DIX) and inserts it into metadata buffer.
+ *
+ * \param ch I/O channel associated with this call.
+ * \param iovs The source io vector array. The total allocated memory size needs to be at least:
+ *	       num_blocks * block_size_no_md
+ * \param iovcnt The size of the source io vectors array.
+ * \param md_iov The metadata vector array. The total allocated memory size needs to be at least:
+ *		  num_blocks * md_size (8B or 16B, depending on the PI format)
+ * \param num_blocks Number of data blocks to process.
+ * \param ctx DIX context. Contains the DIX configuration values, including the reference
+ *	      Application Tag value and initial value of the Reference Tag to insert
+ * \param cb_fn Called when this operation completes.
+ * \param cb_arg Callback argument.
+ *
+ * \return 0 on success, negative errno on failure.
+ */
+int spdk_accel_submit_dix_generate(struct spdk_io_channel *ch, struct iovec *iovs,
+				   size_t iovcnt, struct iovec *md_iov, uint32_t num_blocks,
+				   const struct spdk_dif_ctx *ctx, spdk_accel_completion_cb cb_fn,
+				   void *cb_arg);
+
+/**
+ * Submit a Data Integrity Extension (DIX) verify request.
+ *
+ * This operation computes the Protection Information (DIX) on the data and compares it against
+ * the DIX contained in the metadata.
+ *
+ * \param ch I/O channel associated with this call.
+ * \param iovs The io vector array. The total allocated memory size needs to be at least:
+ *             num_blocks * block_size
+ * \param iovcnt The size of the io vectors array.
+ * \param md_iov The metadata vector array. The total allocated memory size needs to be at least:
+ *		 num_blocks * md_size (8B or 16B, depending on the PI format)
+ * \param num_blocks Number of data blocks to check.
+ * \param ctx DIX context. Contains the DIF configuration values, including the reference
+ *            Application Tag value and initial value of the Reference Tag to check
+ *            Note: the user must ensure the validity of this pointer throughout the entire
+ *	      operation because it is not validated along the processing path.
+ * \param err DIX error detailed information.
+ *            Note: the user must ensure the validity of this pointer throughout the entire
+ *	      operation because it is not validated along the processing path.
+ * \param cb_fn Called when this operation completes.
+ * \param cb_arg Callback argument.
+ *
+ * \return 0 on success, negative errno on failure.
+ */
+int spdk_accel_submit_dix_verify(struct spdk_io_channel *ch, struct iovec *iovs,
+				 size_t iovcnt,  struct iovec *md_iov, uint32_t num_blocks,
+				 const struct spdk_dif_ctx *ctx, struct spdk_dif_error *err,
+				 spdk_accel_completion_cb cb_fn, void *cb_arg);
+
 /** Object grouping multiple accel operations to be executed at the same point in time */
 struct spdk_accel_sequence;
 
@@ -545,7 +665,34 @@ int spdk_accel_append_fill(struct spdk_accel_sequence **seq, struct spdk_io_chan
 			   spdk_accel_step_cb cb_fn, void *cb_arg);
 
 /**
- * Append a decompress operation to a sequence.
+ * Append a decompression operation using the specified algorithm to a sequence.
+ *
+ * \param pseq Sequence object.  If NULL, a new sequence object will be created.
+ * \param ch I/O channel.
+ * \param dst_iovs Destination I/O vector array.
+ * \param dst_iovcnt Size of the `dst_iovs` array.
+ * \param dst_domain Memory domain to which the destination buffers belong.
+ * \param dst_domain_ctx Destination buffer domain context.
+ * \param src_iovs Source I/O vector array.
+ * \param src_iovcnt Size of the `src_iovs` array.
+ * \param src_domain Memory domain to which the source buffers belong.
+ * \param src_domain_ctx Source buffer domain context.
+ * \param decomp_algo The decompression algorithm, enum spdk_accel_comp_algo value.
+ * \param cb_fn Callback to be executed once this operation is completed.
+ * \param cb_arg Argument to be passed to `cb_fn`.
+ *
+ * \return 0 if operation was successfully added to the sequence, negative errno otherwise.
+ */
+int spdk_accel_append_decompress_ext(struct spdk_accel_sequence **pseq, struct spdk_io_channel *ch,
+				     struct iovec *dst_iovs, size_t dst_iovcnt,
+				     struct spdk_memory_domain *dst_domain, void *dst_domain_ctx,
+				     struct iovec *src_iovs, size_t src_iovcnt,
+				     struct spdk_memory_domain *src_domain, void *src_domain_ctx,
+				     enum spdk_accel_comp_algo decomp_algo,
+				     spdk_accel_step_cb cb_fn, void *cb_arg);
+
+/**
+ * Append a decompression operation using the deflate algorithm to a sequence.
  *
  * \param seq Sequence object.  If NULL, a new sequence object will be created.
  * \param ch I/O channel.
@@ -664,6 +811,203 @@ int spdk_accel_append_crc32c(struct spdk_accel_sequence **seq, struct spdk_io_ch
 			     uint32_t seed, spdk_accel_step_cb cb_fn, void *cb_arg);
 
 /**
+ * Append a Data Integrity Field (DIF) verify operation to a sequence.
+ *
+ * This operation computes the DIF on the data and compares it against the DIF contained
+ * in the metadata.
+ *
+ * \param seq Sequence object.  If NULL, a new sequence object will be created.
+ * \param ch I/O channel.
+ * \param iovs The io vector array. The total allocated memory size needs to be at least:
+ *             num_blocks * block_size (including metadata)
+ * \param iovcnt The size of the io vectors array.
+ * \param domain Memory domain to which the data buffers belong.
+ * \param domain_ctx Data buffer domain context.
+ * \param num_blocks Number of data blocks to check.
+ * \param ctx DIF context. Contains the DIF configuration values, including the reference
+ *            Application Tag value and initial value of the Reference Tag to check
+ *            Note: the user must ensure the validity of this pointer throughout the entire operation
+ *            because it is not validated along the processing path.
+ * \param err DIF error detailed information.
+ *            Note: the user must ensure the validity of this pointer throughout the entire operation
+ *            because it is not validated along the processing path.
+ * \param cb_fn Callback to be executed once this operation is completed.
+ * \param cb_arg Argument to be passed to `cb_fn`.
+ *
+ * \return 0 if operation was successfully added to the sequence, negative errno on failure.
+ */
+int spdk_accel_append_dif_verify(struct spdk_accel_sequence **seq, struct spdk_io_channel *ch,
+				 struct iovec *iovs, size_t iovcnt,
+				 struct spdk_memory_domain *domain, void *domain_ctx,
+				 uint32_t num_blocks,
+				 const struct spdk_dif_ctx *ctx, struct spdk_dif_error *err,
+				 spdk_accel_step_cb cb_fn, void *cb_arg);
+
+/**
+ * Append a Data Integrity Field (DIF) copy and verify operation to a sequence.
+ *
+ * This operation copies memory from the source to the destination address and removes
+ * the DIF data with its verification according to the flags provided in the context.
+ *
+ * \param seq Sequence object.  If NULL, a new sequence object will be created.
+ * \param ch I/O channel.
+ * \param dst_iovs The destination I/O vector array. The total allocated memory size needs
+ *                to be at least: num_blocks * data_block_size
+ * \param dst_iovcnt The size of the destination I/O vectors array.
+ * \param dst_domain Memory domain to which the destination buffers belong.
+ * \param dst_domain_ctx Destination buffer domain context.
+ * \param src_iovs The source I/O vector array. The total allocated memory size needs
+ *                to be at least: num_blocks * block_size (including metadata)
+ * \param src_iovcnt The size of the source I/O vectors array.
+ * \param src_domain Memory domain to which the source buffers belong.
+ * \param src_domain_ctx Source buffer domain context.
+ * \param num_blocks Number of data blocks to process.
+ * \param ctx DIF context. Contains the DIF configuration values, including the reference
+ *            Application Tag value and initial value of the Reference Tag to insert.
+ * \param err DIF error detailed information.
+ *            Note: the user must ensure the validity of this pointer throughout the entire operation
+ *            because it is not validated along the processing path.
+ * \param cb_fn Called when this operation completes.
+ * \param cb_arg Callback argument.
+ *
+ * \return 0 on success, negative errno on failure.
+ */
+int spdk_accel_append_dif_verify_copy(struct spdk_accel_sequence **seq, struct spdk_io_channel *ch,
+				      struct iovec *dst_iovs, size_t dst_iovcnt,
+				      struct spdk_memory_domain *dst_domain, void *dst_domain_ctx,
+				      struct iovec *src_iovs, size_t src_iovcnt,
+				      struct spdk_memory_domain *src_domain, void *src_domain_ctx,
+				      uint32_t num_blocks,
+				      const struct spdk_dif_ctx *ctx, struct spdk_dif_error *err,
+				      spdk_accel_step_cb cb_fn, void *cb_arg);
+
+/**
+ * Append a Data Integrity Field (DIF) generate operation to a sequence.
+ *
+ * This operation compute the DIF on the source data and inserting the DIF in place into
+ * the source data.
+ *
+ * \param seq Sequence object.  If NULL, a new sequence object will be created.
+ * \param ch I/O channel associated with this call.
+ * \param iovs The io vector array. The total allocated memory size needs to be at least:
+ *             num_blocks * block_size (including metadata)
+ * \param iovcnt The size of the io vectors array.
+ * \param domain Memory domain to which the data buffers belong.
+ * \param domain_ctx Data buffer domain context.
+ * \param num_blocks Number of data blocks.
+ * \param ctx DIF context. Contains the DIF configuration values, including the reference
+ *            Application Tag value and initial value of the Reference Tag to insert
+ * \param cb_fn Called when this operation completes.
+ * \param cb_arg Callback argument.
+ *
+ * \return 0 on success, negative errno on failure.
+ */
+int spdk_accel_append_dif_generate(struct spdk_accel_sequence **seq, struct spdk_io_channel *ch,
+				   struct iovec *iovs, size_t iovcnt,
+				   struct spdk_memory_domain *domain, void *domain_ctx,
+				   uint32_t num_blocks, const struct spdk_dif_ctx *ctx,
+				   spdk_accel_step_cb cb_fn, void *cb_arg);
+
+/**
+ * Submit a Data Integrity Field (DIF) copy and generate request.
+ *
+ * This operation copies memory from the source to the destination address,
+ * while computing the DIF on the source data and inserting the DIF into
+ * the output data.
+ *
+ * \param seq Sequence object.  If NULL, a new sequence object will be created.
+ * \param ch I/O channel associated with this call.
+ * \param dst_iovs The destination io vector array. The total allocated memory size needs
+ *                to be at least: num_blocks * block_size (provided to spdk_dif_ctx_init())
+ * \param dst_iovcnt The size of the destination io vectors array.
+ * \param dst_domain Memory domain to which the destination buffers belong.
+ * \param dst_domain_ctx Destination buffer domain context.
+ * \param src_iovs The source io vector array. The total allocated memory size needs
+ *                to be at least: num_blocks * data_block_size.
+ * \param src_iovcnt The size of the source io vectors array.
+ * \param src_domain Memory domain to which the source buffers belong.
+ * \param src_domain_ctx Source buffer domain context.
+ * \param num_blocks Number of data blocks to process.
+ * \param ctx DIF context. Contains the DIF configuration values, including the reference
+ *            Application Tag value and initial value of the Reference Tag to insert
+ * \param cb_fn Called when this operation completes.
+ * \param cb_arg Callback argument.
+ *
+ * \return 0 on success, negative errno on failure.
+ */
+int spdk_accel_append_dif_generate_copy(struct spdk_accel_sequence **seq,
+					struct spdk_io_channel *ch,
+					struct iovec *dst_iovs, size_t dst_iovcnt,
+					struct spdk_memory_domain *dst_domain, void *dst_domain_ctx,
+					struct iovec *src_iovs, size_t src_iovcnt,
+					struct spdk_memory_domain *src_domain, void *src_domain_ctx,
+					uint32_t num_blocks, const struct spdk_dif_ctx *ctx,
+					spdk_accel_step_cb cb_fn, void *cb_arg);
+
+/**
+ * Append DIX generate operation to a sequence.
+ *
+ * \param seq Sequence object. If NULL, a new sequence object will be created.
+ * \param ch I/O channel.
+ * \param iovs Source I/O vector array. The total allocated memory size needs to be at least:
+ *	num_blocks * block_size_no_md.
+ * \param iovcnt Size of the source I/O vectors' array.
+ * \param domain Memory domain to which the source buffers belong.
+ * \param domain_ctx Source buffer domain context.
+ * \param md_iov Metadata iovec. The total allocated memory size needs to be at least:
+ *	num_blocks * md_size (8B or 16B, depending on the PI format).
+ * \param md_domain Memory domain to which the metadata buffers belongs.
+ * \param md_domain_ctx Metadata buffer domain context.
+ * \param num_blocks Number of data blocks to process.
+ * \param ctx DIX context. Contains the DIX configuration values, including the reference
+ *	Application Tag value and initial value of the Reference Tag to insert.
+ * \param cb_fn Called when this operation completes.
+ * \param cb_arg Callback argument.
+ *
+ * \returns 0 on success, negative errno on failure.
+ */
+int spdk_accel_append_dix_generate(struct spdk_accel_sequence **seq, struct spdk_io_channel *ch,
+				   struct iovec *iovs, size_t iovcnt,
+				   struct spdk_memory_domain *domain, void *domain_ctx,
+				   struct iovec *md_iov, struct spdk_memory_domain *md_domain,
+				   void *md_domain_ctx, uint32_t num_blocks,
+				   const struct spdk_dif_ctx *ctx,
+				   spdk_accel_step_cb cb_fn, void *cb_arg);
+
+/**
+ * Append DIX verify operation to a sequence.
+ *
+ * \param seq Sequence object. If NULL, a new sequence object will be created.
+ * \param ch I/O channel.
+ * \param iovs Source I/O vector array. The total allocated memory size needs to be at least:
+ *	num_blocks * block_size_no_md.
+ * \param iovcnt Size of the source I/O vectors' array.
+ * \param domain Memory domain to which the source buffers belong.
+ * \param domain_ctx Source buffer domain context.
+ * \param md_iov Metadata iovec. The total allocated memory size needs to be at least:
+ *	num_blocks * md_size (8B or 16B, depending on the PI format).
+ * \param md_domain Memory domain to which the metadata buffers belongs.
+ * \param md_domain_ctx Metadata buffer domain context.
+ * \param num_blocks Number of data blocks to process.
+ * \param ctx DIX context. Contains the DIX configuration values, including the reference
+ *	Application Tag value and initial value of the Reference Tag to insert.
+ * \param err DIX error detailed information.
+ *	Note: the user must ensure the validity of this pointer throughout the entire
+ *	operation because it is not validated along the processing path.
+ * \param cb_fn Called when this operation completes.
+ * \param cb_arg Callback argument.
+ *
+ * \returns 0 on success, negative errno on failure.
+ */
+int spdk_accel_append_dix_verify(struct spdk_accel_sequence **seq, struct spdk_io_channel *ch,
+				 struct iovec *iovs, size_t iovcnt,
+				 struct spdk_memory_domain *domain, void *domain_ctx,
+				 struct iovec *md_iov, struct spdk_memory_domain *md_domain,
+				 void *md_domain_ctx, uint32_t num_blocks,
+				 const struct spdk_dif_ctx *ctx, struct spdk_dif_error *err,
+				 spdk_accel_step_cb cb_fn, void *cb_arg);
+
+/**
  * Finish a sequence and execute all its operations. After the completion callback is executed, the
  * sequence object is automatically freed.
  *
@@ -758,7 +1102,8 @@ void spdk_accel_write_config_json(struct spdk_json_write_ctx *w);
 /**
  * Select platform driver to execute operation chains.
  *
- * \param name Name of the driver.
+ * \param name Name of the driver.  If NULL or empty string, this function will clear the driver
+ * that was previously assigned.
  *
  * \return 0 on success, negetive errno otherwise.
  */

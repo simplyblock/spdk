@@ -19,40 +19,6 @@ The tags can be matched with the level 4 headers below.
 
 ## Deprecation Notices
 
-### nvme
-
-#### `spdk_nvme_ctrlr_opts.psk`
-
-Passing NVMe/TLS pre-shared keys via `spdk_nvme_ctrlr_opts.psk` is deprecated and this field will be
-removed in the v24.09 release.  Instead, a key obtained from the keyring library should be passed
-in `spdk_nvme_ctrlr_opts.tls_psk`.
-
-### init
-
-#### `spdk_subsystem_init_from_json_config`
-
-The function is deprecated and will be removed in 24.09 release. Please use
-`spdk_subsystem_load_config` instead.
-
-### nvmf
-
-#### `decode_rpc_listen_address`
-
-`transport` field in `listen_addresses` decoders is deprecated. `trtype` field should be used
-instead. `transport` field will be removed in 24.09 release.
-
-#### `spdk_nvmf_request_exec_fabrics`
-
-This function is deprecated and will be removed in the 24.09 release.  Instead, users should use
-`spdk_nvmf_request_exec()`, which now allows all transports (both fabrics and non-fabrics) to
-execute fabrics commands.
-
-#### `nvmf_subsystem_add_host`
-
-The ability to specifying path to a PSK file via the `psk` parameter in `nvmf_subsystem_add_host` is
-deprecated and will be removed in the v24.09 release.  Instead, the name of a key attached to the
-keyring should be used.
-
 ### gpt
 
 #### `old_gpt_guid`
@@ -74,3 +40,10 @@ a bdev of the correct size.
 
 These functions are deprecated and will be removed in 24.09 release. Please use
 `spdk_rpc_server_listen`, `spdk_rpc_server_accept` and `spdk_rpc_server_close` instead.
+
+### env
+
+#### `spdk_env_get_socket_id`, `spdk_pci_device_get_socket_id`
+
+These functions are deprecated and will be removed in 25.05 release. Please use
+`spdk_env_get_numa_id` and `spdk_pci_device_get_numa_id` instead.

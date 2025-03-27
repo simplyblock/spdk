@@ -1,7 +1,7 @@
 /*   SPDX-License-Identifier: BSD-3-Clause
  *   Copyright (C) 2016 Intel Corporation.
  *   All rights reserved.
- *   Copyright (c) 2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ *   Copyright (c) 2022, 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  */
 
 #include "spdk/stdinc.h"
@@ -41,6 +41,7 @@ static struct spdk_thread *g_app_thread;
 
 struct spdk_interrupt {
 	int			efd;
+	struct spdk_fd_group	*fgrp;
 	struct spdk_thread	*thread;
 	spdk_interrupt_fn	fn;
 	void			*arg;
@@ -103,6 +104,13 @@ enum spdk_thread_state {
 	SPDK_THREAD_STATE_EXITED,
 };
 
+struct spdk_thread_post_poller_handler {
+	spdk_post_poller_fn fn;
+	void *fn_arg;
+};
+
+#define SPDK_THREAD_MAX_POST_POLLER_HANDLERS (4)
+
 struct spdk_thread {
 	uint64_t			tsc_last;
 	struct spdk_thread_stats	stats;
@@ -124,7 +132,9 @@ struct spdk_thread {
 	 * queues) or unregistered.
 	 */
 	TAILQ_HEAD(paused_pollers_head, spdk_poller)	paused_pollers;
+	struct spdk_thread_post_poller_handler		pp_handlers[SPDK_THREAD_MAX_POST_POLLER_HANDLERS];
 	struct spdk_ring		*messages;
+	uint8_t				num_pp_handlers;
 	int				msg_fd;
 	SLIST_HEAD(, spdk_msg)		msg_cache;
 	size_t				msg_cache_count;
@@ -152,9 +162,19 @@ struct spdk_thread {
 	bool				poller_unregistered;
 	struct spdk_fd_group		*fgrp;
 
+	uint16_t			trace_id;
+
+	uint8_t				reserved[6];
+
 	/* User context allocated at the end */
 	uint8_t				ctx[0];
 };
+
+/*
+ * Assert that spdk_thread struct is 8 byte aligned to ensure
+ * the user ctx is also 8-byte aligned.
+ */
+SPDK_STATIC_ASSERT((sizeof(struct spdk_thread)) % 8 == 0, "Incorrect size");
 
 static pthread_mutex_t g_devlist_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -286,7 +306,8 @@ static uint32_t g_thread_count = 0;
 
 static __thread struct spdk_thread *tls_thread = NULL;
 
-SPDK_TRACE_REGISTER_FN(thread_trace, "thread", TRACE_GROUP_THREAD)
+static void
+thread_trace(void)
 {
 	struct spdk_trace_tpoint_opts opts[] = {
 		{
@@ -301,8 +322,10 @@ SPDK_TRACE_REGISTER_FN(thread_trace, "thread", TRACE_GROUP_THREAD)
 		}
 	};
 
+	spdk_trace_register_owner_type(OWNER_TYPE_THREAD, 't');
 	spdk_trace_register_description_ext(opts, SPDK_COUNTOF(opts));
 }
+SPDK_TRACE_REGISTER_FN(thread_trace, "thread", TRACE_GROUP_THREAD)
 
 /*
  * If this compare function returns zero when two next_run_ticks are equal,
@@ -344,7 +367,7 @@ _thread_lib_init(size_t ctx_sz, size_t msg_mempool_sz)
 	g_spdk_msg_mempool = spdk_mempool_create(mempool_name, msg_mempool_sz,
 			     sizeof(struct spdk_msg),
 			     0, /* No cache. We do our own. */
-			     SPDK_ENV_SOCKET_ID_ANY);
+			     SPDK_ENV_NUMA_ID_ANY);
 
 	SPDK_DEBUGLOG(thread, "spdk_msg_mempool was created with size: %zu\n",
 		      msg_mempool_sz);
@@ -523,7 +546,7 @@ spdk_thread_create(const char *name, const struct spdk_cpuset *cpumask)
 	 */
 	thread->next_poller_id = 1;
 
-	thread->messages = spdk_ring_create(SPDK_RING_TYPE_MP_SC, 65536, SPDK_ENV_SOCKET_ID_ANY);
+	thread->messages = spdk_ring_create(SPDK_RING_TYPE_MP_SC, 65536, SPDK_ENV_NUMA_ID_ANY);
 	if (!thread->messages) {
 		SPDK_ERRLOG("Unable to allocate memory for message ring\n");
 		free(thread);
@@ -546,6 +569,8 @@ spdk_thread_create(const char *name, const struct spdk_cpuset *cpumask)
 	} else {
 		snprintf(thread->name, sizeof(thread->name), "%p", thread);
 	}
+
+	thread->trace_id = spdk_trace_register_owner(OWNER_TYPE_THREAD, thread->name);
 
 	pthread_mutex_lock(&g_devlist_mutex);
 	if (g_thread_id == 0) {
@@ -1060,6 +1085,22 @@ thread_execute_timed_poller(struct spdk_thread *thread, struct spdk_poller *poll
 	return rc;
 }
 
+static inline void
+thread_run_pp_handlers(struct spdk_thread *thread)
+{
+	uint8_t i, count = thread->num_pp_handlers;
+
+	/* Set to max value to prevent new handlers registration within the callback */
+	thread->num_pp_handlers = SPDK_THREAD_MAX_POST_POLLER_HANDLERS;
+
+	for (i = 0; i < count; i++) {
+		thread->pp_handlers[i].fn(thread->pp_handlers[i].fn_arg);
+		thread->pp_handlers[i].fn = NULL;
+	}
+
+	thread->num_pp_handlers = 0;
+}
+
 static int
 thread_poll(struct spdk_thread *thread, uint32_t max_msgs, uint64_t now)
 {
@@ -1089,6 +1130,9 @@ thread_poll(struct spdk_thread *thread, uint32_t max_msgs, uint64_t now)
 		poller_rc = thread_execute_poller(thread, poller);
 		if (poller_rc > rc) {
 			rc = poller_rc;
+		}
+		if (thread->num_pp_handlers) {
+			thread_run_pp_handlers(thread);
 		}
 	}
 
@@ -1607,7 +1651,6 @@ spdk_poller_register_interrupt(struct spdk_poller *poller,
 			       void *cb_arg)
 {
 	assert(poller != NULL);
-	assert(cb_fn != NULL);
 	assert(spdk_get_thread() == poller->thread);
 
 	if (!spdk_interrupt_mode_is_enabled()) {
@@ -1623,7 +1666,7 @@ spdk_poller_register_interrupt(struct spdk_poller *poller,
 	poller->set_intr_cb_arg = cb_arg;
 
 	/* Set poller into interrupt mode if thread is in interrupt. */
-	if (poller->thread->in_interrupt) {
+	if (poller->thread->in_interrupt && poller->set_intr_cb_fn) {
 		poller->set_intr_cb_fn(poller, poller->set_intr_cb_arg, true);
 	}
 }
@@ -1980,6 +2023,12 @@ spdk_thread_get_next_io_channel(struct spdk_io_channel *prev)
 	return RB_NEXT(io_channel_tree, &thread->io_channels, prev);
 }
 
+uint16_t
+spdk_thread_get_trace_id(struct spdk_thread *thread)
+{
+	return thread->trace_id;
+}
+
 struct call_thread {
 	struct spdk_thread *cur_thread;
 	spdk_msg_fn fn;
@@ -2078,13 +2127,9 @@ poller_set_interrupt_mode(struct spdk_poller *poller, bool interrupt_mode)
 		return;
 	}
 
-	if (!poller->set_intr_cb_fn) {
-		SPDK_ERRLOG("Poller(%s) doesn't support set interrupt mode.\n", poller->name);
-		assert(false);
-		return;
+	if (poller->set_intr_cb_fn) {
+		poller->set_intr_cb_fn(poller, poller->set_intr_cb_arg, interrupt_mode);
 	}
-
-	poller->set_intr_cb_fn(poller, poller->set_intr_cb_arg, interrupt_mode);
 }
 
 void
@@ -2724,15 +2769,6 @@ thread_interrupt_msg_process(void *arg)
 	orig_thread = spdk_get_thread();
 	spdk_set_thread(thread);
 
-	/* There may be race between msg_acknowledge and another producer's msg_notify,
-	 * so msg_acknowledge should be applied ahead. And then check for self's msg_notify.
-	 * This can avoid msg notification missing.
-	 */
-	rc = read(thread->msg_fd, &notify, sizeof(notify));
-	if (rc < 0 && errno != EAGAIN) {
-		SPDK_ERRLOG("failed to acknowledge msg event: %s.\n", spdk_strerror(errno));
-	}
-
 	critical_msg = thread->critical_msg;
 	if (spdk_unlikely(critical_msg != NULL)) {
 		critical_msg(NULL);
@@ -2763,12 +2799,14 @@ thread_interrupt_msg_process(void *arg)
 static int
 thread_interrupt_create(struct spdk_thread *thread)
 {
+	struct spdk_event_handler_opts opts = {};
 	int rc;
 
 	SPDK_INFOLOG(thread, "Create fgrp for thread (%s)\n", thread->name);
 
 	rc = spdk_fd_group_create(&thread->fgrp);
 	if (rc) {
+		thread->msg_fd = -1;
 		return rc;
 	}
 
@@ -2781,8 +2819,11 @@ thread_interrupt_create(struct spdk_thread *thread)
 		return rc;
 	}
 
-	return SPDK_FD_GROUP_ADD(thread->fgrp, thread->msg_fd,
-				 thread_interrupt_msg_process, thread);
+	spdk_fd_group_get_default_event_handler_opts(&opts, sizeof(opts));
+	opts.fd_type = SPDK_FD_TYPE_EVENTFD;
+
+	return SPDK_FD_GROUP_ADD_EXT(thread->fgrp, thread->msg_fd,
+				     thread_interrupt_msg_process, thread, &opts);
 }
 #else
 static int
@@ -2827,9 +2868,21 @@ struct spdk_interrupt *
 spdk_interrupt_register_for_events(int efd, uint32_t events, spdk_interrupt_fn fn, void *arg,
 				   const char *name)
 {
+	struct spdk_event_handler_opts opts = {};
+
+	spdk_fd_group_get_default_event_handler_opts(&opts, sizeof(opts));
+	opts.events = events;
+	opts.fd_type = SPDK_FD_TYPE_DEFAULT;
+
+	return spdk_interrupt_register_ext(efd, fn, arg, name, &opts);
+}
+
+static struct spdk_interrupt *
+alloc_interrupt(int efd, struct spdk_fd_group *fgrp, spdk_interrupt_fn fn, void *arg,
+		const char *name)
+{
 	struct spdk_thread *thread;
 	struct spdk_interrupt *intr;
-	int ret;
 
 	thread = spdk_get_thread();
 	if (!thread) {
@@ -2854,16 +2907,82 @@ spdk_interrupt_register_for_events(int efd, uint32_t events, spdk_interrupt_fn f
 		snprintf(intr->name, sizeof(intr->name), "%p", fn);
 	}
 
+	assert(efd < 0 || fgrp == NULL);
 	intr->efd = efd;
+	intr->fgrp = fgrp;
 	intr->thread = thread;
 	intr->fn = fn;
 	intr->arg = arg;
 
-	ret = spdk_fd_group_add_for_events(thread->fgrp, efd, events, _interrupt_wrapper, intr, intr->name);
+	return intr;
+}
 
+struct spdk_interrupt *
+spdk_interrupt_register_ext(int efd, spdk_interrupt_fn fn, void *arg, const char *name,
+			    struct spdk_event_handler_opts *opts)
+{
+	struct spdk_interrupt *intr;
+	int ret;
+
+	intr = alloc_interrupt(efd, NULL, fn, arg, name);
+	if (intr == NULL) {
+		return NULL;
+	}
+
+	ret = spdk_fd_group_add_ext(intr->thread->fgrp, efd,
+				    _interrupt_wrapper, intr, intr->name, opts);
 	if (ret != 0) {
 		SPDK_ERRLOG("thread %s: failed to add fd %d: %s\n",
-			    thread->name, efd, spdk_strerror(-ret));
+			    intr->thread->name, efd, spdk_strerror(-ret));
+		free(intr);
+		return NULL;
+	}
+
+	return intr;
+}
+
+static int
+interrupt_fd_group_wrapper(void *wrap_ctx, spdk_fd_fn cb_fn, void *cb_ctx)
+{
+	struct spdk_interrupt *intr = wrap_ctx;
+	struct spdk_thread *orig_thread, *thread;
+	int rc;
+
+	orig_thread = spdk_get_thread();
+	thread = intr->thread;
+
+	spdk_set_thread(thread);
+	rc = cb_fn(cb_ctx);
+	SPIN_ASSERT(thread->lock_count == 0, SPIN_ERR_HOLD_DURING_SWITCH);
+	spdk_set_thread(orig_thread);
+
+	return rc;
+}
+
+struct spdk_interrupt *
+spdk_interrupt_register_fd_group(struct spdk_fd_group *fgrp, const char *name)
+{
+	struct spdk_interrupt *intr;
+	int rc;
+
+	intr = alloc_interrupt(-1, fgrp, NULL, NULL, name);
+	if (intr == NULL) {
+		return NULL;
+	}
+
+	rc = spdk_fd_group_set_wrapper(fgrp, interrupt_fd_group_wrapper, intr);
+	if (rc != 0) {
+		SPDK_ERRLOG("thread %s: failed to set wrapper for fd_group %d: %s\n",
+			    intr->thread->name, spdk_fd_group_get_fd(fgrp), spdk_strerror(-rc));
+		free(intr);
+		return NULL;
+	}
+
+	rc = spdk_fd_group_nest(intr->thread->fgrp, fgrp);
+	if (rc != 0) {
+		SPDK_ERRLOG("thread %s: failed to nest fd_group %d: %s\n",
+			    intr->thread->name, spdk_fd_group_get_fd(fgrp), spdk_strerror(-rc));
+		spdk_fd_group_set_wrapper(fgrp, NULL, NULL);
 		free(intr);
 		return NULL;
 	}
@@ -2895,7 +3014,14 @@ spdk_interrupt_unregister(struct spdk_interrupt **pintr)
 		return;
 	}
 
-	spdk_fd_group_remove(thread->fgrp, intr->efd);
+	if (intr->fgrp != NULL) {
+		assert(intr->efd < 0);
+		spdk_fd_group_unnest(thread->fgrp, intr->fgrp);
+		spdk_fd_group_set_wrapper(thread->fgrp, NULL, NULL);
+	} else {
+		spdk_fd_group_remove(thread->fgrp, intr->efd);
+	}
+
 	free(intr);
 }
 
@@ -2913,6 +3039,11 @@ spdk_interrupt_set_event_types(struct spdk_interrupt *intr,
 
 	if (intr->thread != thread) {
 		wrong_thread(__func__, intr->name, intr->thread, thread);
+		return -EINVAL;
+	}
+
+	if (intr->efd < 0) {
+		assert(false);
 		return -EINVAL;
 	}
 
@@ -3120,6 +3251,23 @@ spdk_spin_held(struct spdk_spinlock *sspin)
 	SPIN_ASSERT_RETURN(thread != NULL, SPIN_ERR_NOT_SPDK_THREAD, false);
 
 	return sspin->thread == thread;
+}
+
+void
+spdk_thread_register_post_poller_handler(spdk_post_poller_fn fn, void *fn_arg)
+{
+	struct spdk_thread *thr;
+
+	thr = _get_thread();
+	assert(thr);
+	if (spdk_unlikely(thr->num_pp_handlers == SPDK_THREAD_MAX_POST_POLLER_HANDLERS)) {
+		SPDK_ERRLOG("Too many handlers registered");
+		return;
+	}
+
+	thr->pp_handlers[thr->num_pp_handlers].fn = fn;
+	thr->pp_handlers[thr->num_pp_handlers].fn_arg = fn_arg;
+	thr->num_pp_handlers++;
 }
 
 SPDK_LOG_REGISTER_COMPONENT(thread)

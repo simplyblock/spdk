@@ -36,6 +36,7 @@ DEFINE_STUB(spdk_sock_group_get_ctx,
 	    void *,
 	    (struct spdk_sock_group *group),
 	    NULL);
+DEFINE_STUB(spdk_sock_get_numa_id, int32_t, (struct spdk_sock *sock), SPDK_ENV_NUMA_ID_ANY);
 
 DEFINE_STUB(spdk_nvme_poll_group_process_completions, int64_t, (struct spdk_nvme_poll_group *group,
 		uint32_t completions_per_qpair, spdk_nvme_disconnected_qpair_cb disconnected_qpair_cb), 0);
@@ -1627,7 +1628,6 @@ test_nvme_tcp_ctrlr_create_io_qpair(void)
 
 	ctrlr->trid.priority = 1;
 	ctrlr->trid.adrfam = SPDK_NVMF_ADRFAM_IPV4;
-	memset(ctrlr->opts.psk, 0, sizeof(ctrlr->opts.psk));
 	memcpy(ctrlr->trid.traddr, "192.168.1.78", sizeof("192.168.1.78"));
 	memcpy(ctrlr->trid.trsvcid, "23", sizeof("23"));
 	memcpy(ctrlr->opts.src_addr, "192.168.1.77", sizeof("192.168.1.77"));

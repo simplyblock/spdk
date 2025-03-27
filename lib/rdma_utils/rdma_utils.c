@@ -8,6 +8,8 @@
 #include "spdk/log.h"
 #include "spdk/string.h"
 #include "spdk/likely.h"
+#include "spdk/net.h"
+#include "spdk/file.h"
 
 #include "spdk_internal/assert.h"
 
@@ -144,7 +146,7 @@ spdk_rdma_utils_create_mem_map(struct ibv_pd *pd, struct spdk_nvme_rdma_hooks *h
 	}
 
 	if (hooks) {
-		map = spdk_zmalloc(sizeof(*map), 0, NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+		map = spdk_zmalloc(sizeof(*map), 0, NULL, SPDK_ENV_NUMA_ID_ANY, SPDK_MALLOC_DMA);
 	} else {
 		map = calloc(1, sizeof(*map));
 	}
@@ -441,7 +443,7 @@ struct spdk_memory_domain *
 spdk_rdma_utils_get_memory_domain(struct ibv_pd *pd)
 {
 	struct rdma_utils_memory_domain *domain = NULL;
-	struct spdk_memory_domain_ctx ctx;
+	struct spdk_memory_domain_ctx ctx = {};
 	int rc;
 
 	pthread_mutex_lock(&g_memory_domains_lock);
@@ -465,6 +467,7 @@ spdk_rdma_utils_get_memory_domain(struct ibv_pd *pd)
 	domain->rdma_ctx.ibv_pd = pd;
 	ctx.size = sizeof(ctx);
 	ctx.user_ctx = &domain->rdma_ctx;
+	ctx.user_ctx_size = domain->rdma_ctx.size;
 
 	rc = spdk_memory_domain_create(&domain->domain, SPDK_DMA_DEVICE_TYPE_RDMA, &ctx,
 				       SPDK_RDMA_DMA_DEVICE);
@@ -518,4 +521,33 @@ spdk_rdma_utils_put_memory_domain(struct spdk_memory_domain *_domain)
 	pthread_mutex_unlock(&g_memory_domains_lock);
 
 	return 0;
+}
+
+int32_t
+spdk_rdma_cm_id_get_numa_id(struct rdma_cm_id *cm_id)
+{
+	struct sockaddr	*sa;
+	char		addr[64];
+	char		ifc[64];
+	uint32_t	numa_id;
+	int		rc;
+
+	sa = rdma_get_local_addr(cm_id);
+	if (sa == NULL) {
+		return SPDK_ENV_NUMA_ID_ANY;
+	}
+	rc = spdk_net_get_address_string(sa, addr, sizeof(addr));
+	if (rc) {
+		return SPDK_ENV_NUMA_ID_ANY;
+	}
+	rc = spdk_net_get_interface_name(addr, ifc, sizeof(ifc));
+	if (rc) {
+		return SPDK_ENV_NUMA_ID_ANY;
+	}
+	rc = spdk_read_sysfs_attribute_uint32(&numa_id,
+					      "/sys/class/net/%s/device/numa_node", ifc);
+	if (rc || numa_id > INT32_MAX) {
+		return SPDK_ENV_NUMA_ID_ANY;
+	}
+	return (int32_t)numa_id;
 }

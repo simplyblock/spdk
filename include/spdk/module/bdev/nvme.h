@@ -1,5 +1,6 @@
 /*   SPDX-License-Identifier: BSD-3-Clause
  *   Copyright (C) 2024 Nutanix Inc. All rights reserved.
+ *   Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  */
 
 /** \file
@@ -34,8 +35,7 @@ struct spdk_bdev_nvme_ctrlr_opts {
 	uint32_t reconnect_delay_sec;
 	uint32_t fast_io_fail_timeout_sec;
 	bool from_discovery_service;
-	/* Name of the PSK or path to the file containing PSK. */
-	char psk[PATH_MAX];
+	const char *psk;
 	const char *dhchap_key;
 	const char *dhchap_ctrlr_key;
 
@@ -44,7 +44,66 @@ struct spdk_bdev_nvme_ctrlr_opts {
 	 * These will only support NVMe passthrough.
 	 */
 	bool allow_unrecognized_csi;
+
+	/* Set to true if multipath enabled */
+	bool multipath;
 };
+
+enum spdk_bdev_timeout_action {
+	SPDK_BDEV_NVME_TIMEOUT_ACTION_NONE = 0,
+	SPDK_BDEV_NVME_TIMEOUT_ACTION_RESET,
+	SPDK_BDEV_NVME_TIMEOUT_ACTION_ABORT,
+};
+
+struct spdk_bdev_nvme_opts {
+	/**
+	 * The size of spdk_bdev_nvme_opts according to the caller of this library is used for ABI
+	 * compatibility.  The library uses this field to know how many fields in this
+	 * structure are valid. And the library will populate any remaining fields with default values.
+	 * New added fields should be put at the end of the struct.
+	 */
+	size_t opts_size;
+	enum spdk_bdev_timeout_action action_on_timeout;
+	uint32_t keep_alive_timeout_ms;
+	uint64_t timeout_us;
+	uint64_t timeout_admin_us;
+	/* The number of attempts per I/O in the transport layer before an I/O fails. */
+	uint32_t transport_retry_count;
+	uint32_t arbitration_burst;
+	uint32_t low_priority_weight;
+	uint32_t medium_priority_weight;
+	uint32_t high_priority_weight;
+	uint32_t io_queue_requests;
+	uint64_t nvme_adminq_poll_period_us;
+	uint64_t nvme_ioq_poll_period_us;
+	bool delay_cmd_submit;
+	/* Hole at bytes 73-75. */
+	uint8_t reserved73[3];
+	/* The number of attempts per I/O in the bdev layer before an I/O fails. */
+	int32_t bdev_retry_count;
+	int32_t ctrlr_loss_timeout_sec;
+	uint32_t reconnect_delay_sec;
+	uint32_t fast_io_fail_timeout_sec;
+	uint8_t transport_ack_timeout;
+	bool disable_auto_failback;
+	bool generate_uuids;
+	/* Type of Service - RDMA only */
+	uint8_t transport_tos;
+	bool nvme_error_stat;
+	bool io_path_stat;
+	bool allow_accel_sequence;
+	/* Hole at byte 99. */
+	uint8_t reserved99[1];
+	uint32_t rdma_srq_size;
+	uint32_t rdma_max_cq_size;
+	uint16_t rdma_cm_event_timeout_ms;
+	/* Hole at byte 110-111. */
+	uint8_t reserved110[2];
+	uint32_t dhchap_digests;
+	uint32_t dhchap_dhgroups;
+	bool rdma_umr_per_io;
+};
+SPDK_STATIC_ASSERT(sizeof(struct spdk_bdev_nvme_opts) == 128, "Incorrect size");
 
 /**
  * Connect to the NVMe controller and populate namespaces as bdevs.
@@ -59,7 +118,6 @@ struct spdk_bdev_nvme_ctrlr_opts {
  * \param cb_ctx Context to pass to cb_fn.
  * \param drv_opts NVMe driver options.
  * \param bdev_opts NVMe bdev options.
- * \param multipath Whether to enable multipathing (if true) else failover mode.
  * \return 0 on success, negative errno on failure.
  */
 int spdk_bdev_nvme_create(struct spdk_nvme_transport_id *trid,
@@ -69,8 +127,7 @@ int spdk_bdev_nvme_create(struct spdk_nvme_transport_id *trid,
 			  spdk_bdev_nvme_create_cb cb_fn,
 			  void *cb_ctx,
 			  struct spdk_nvme_ctrlr_opts *drv_opts,
-			  struct spdk_bdev_nvme_ctrlr_opts *bdev_opts,
-			  bool multipath);
+			  struct spdk_bdev_nvme_ctrlr_opts *bdev_opts);
 
 /**
  * Set multipath policy of the NVMe bdev.
@@ -94,6 +151,22 @@ void spdk_bdev_nvme_set_multipath_policy(const char *name,
  * \param opts Ctrlr opts object to be loaded with default values.
  */
 void spdk_bdev_nvme_get_default_ctrlr_opts(struct spdk_bdev_nvme_ctrlr_opts *opts);
+
+/**
+ * Get the default value for bdev nvme options.
+ *
+ * \param[out] opts Bdev nvme options object to be filled with default values.
+ * \param opts_size Must be set to sizeof(struct spdk_bdev_nvme_opts).
+ */
+void spdk_bdev_nvme_get_opts(struct spdk_bdev_nvme_opts *opts, size_t opts_size);
+
+/**
+ * Set the bdev nvme options.
+ *
+ * \param opts New value of bdev nvme options to be set.
+ * \return 0 on success, negative errno on failure.
+ */
+int spdk_bdev_nvme_set_opts(const struct spdk_bdev_nvme_opts *opts);
 
 #ifdef __cplusplus
 }

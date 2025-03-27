@@ -35,12 +35,14 @@
 	spdk_thread_send_critical_msg;
 	spdk_for_each_thread;
 	spdk_thread_set_interrupt_mode;
+	spdk_thread_get_trace_id;
 	spdk_poller_register;
 	spdk_poller_register_named;
 	spdk_poller_unregister;
 	spdk_poller_pause;
 	spdk_poller_resume;
 	spdk_poller_register_interrupt;
+	spdk_thread_register_post_poller_handler;
 	spdk_io_device_register;
 	spdk_io_device_unregister;
 	spdk_get_io_channel;
@@ -56,8 +58,10 @@
 	spdk_for_each_channel_continue;
 	spdk_interrupt_register;
 	spdk_interrupt_register_for_events;
+	spdk_interrupt_register_ext;
 	spdk_interrupt_unregister;
 	spdk_interrupt_set_event_types;
+	spdk_interrupt_register_fd_group;
 	spdk_thread_get_interrupt_fd;
 	spdk_thread_get_interrupt_fd_group;
 	spdk_interrupt_mode_enable;

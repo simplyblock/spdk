@@ -104,7 +104,7 @@ spdk_nvmf_tgt_add_referral(struct spdk_nvmf_tgt *tgt,
 	spdk_strcpy_pad(referral->entry.traddr, trid->traddr, sizeof(referral->entry.traddr), ' ');
 
 	TAILQ_INSERT_HEAD(&tgt->referrals, referral, link);
-	nvmf_update_discovery_log(tgt, NULL);
+	spdk_nvmf_send_discovery_log_notice(tgt, NULL);
 
 	return 0;
 }
@@ -128,7 +128,7 @@ spdk_nvmf_tgt_remove_referral(struct spdk_nvmf_tgt *tgt,
 	}
 
 	TAILQ_REMOVE(&tgt->referrals, referral, link);
-	nvmf_update_discovery_log(tgt, NULL);
+	spdk_nvmf_send_discovery_log_notice(tgt, NULL);
 
 	free(referral);
 
@@ -143,25 +143,6 @@ nvmf_qpair_set_state(struct spdk_nvmf_qpair *qpair,
 	assert(qpair->group->thread == spdk_get_thread());
 
 	qpair->state = state;
-}
-
-static int
-nvmf_poll_group_poll(void *ctx)
-{
-	struct spdk_nvmf_poll_group *group = ctx;
-	int rc;
-	int count = 0;
-	struct spdk_nvmf_transport_poll_group *tgroup;
-
-	TAILQ_FOREACH(tgroup, &group->tgroups, link) {
-		rc = nvmf_transport_poll_group_poll(tgroup);
-		if (rc < 0) {
-			return SPDK_POLLER_BUSY;
-		}
-		count += rc;
-	}
-
-	return count > 0 ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
 }
 
 /*
@@ -196,8 +177,6 @@ nvmf_tgt_cleanup_poll_group(struct spdk_nvmf_poll_group *group)
 	}
 
 	free(group->sgroups);
-
-	spdk_poller_unregister(&group->poller);
 
 	if (group->destroy_cb_fn) {
 		group->destroy_cb_fn(group->destroy_cb_arg, 0);
@@ -249,11 +228,6 @@ nvmf_poll_group_add_transport(struct spdk_nvmf_poll_group *group,
 	return 0;
 }
 
-static void
-nvmf_tgt_poller_set_interrupt_mode(struct spdk_poller *poller, void *cb_arg, bool interrupt_mode)
-{
-}
-
 static int
 nvmf_tgt_create_poll_group(void *io_device, void *ctx_buf)
 {
@@ -270,9 +244,6 @@ nvmf_tgt_create_poll_group(void *io_device, void *ctx_buf)
 	TAILQ_INIT(&group->qpairs);
 	group->thread = thread;
 	pthread_mutex_init(&group->mutex, NULL);
-
-	group->poller = SPDK_POLLER_REGISTER(nvmf_poll_group_poll, group, 0);
-	spdk_poller_register_interrupt(group->poller, nvmf_tgt_poller_set_interrupt_mode, NULL);
 
 	SPDK_DTRACE_PROBE1_TICKS(nvmf_create_poll_group, spdk_thread_get_id(thread));
 
@@ -1001,8 +972,11 @@ _nvmf_tgt_pause_polling(struct spdk_io_channel_iter *i)
 {
 	struct spdk_io_channel *ch = spdk_io_channel_iter_get_channel(i);
 	struct spdk_nvmf_poll_group *group = spdk_io_channel_get_ctx(ch);
+	struct spdk_nvmf_transport_poll_group *tgroup;
 
-	spdk_poller_unregister(&group->poller);
+	TAILQ_FOREACH(tgroup, &group->tgroups, link) {
+		nvmf_transport_poll_group_pause(tgroup);
+	}
 
 	spdk_for_each_channel_continue(i, 0);
 }
@@ -1060,9 +1034,11 @@ _nvmf_tgt_resume_polling(struct spdk_io_channel_iter *i)
 {
 	struct spdk_io_channel *ch = spdk_io_channel_iter_get_channel(i);
 	struct spdk_nvmf_poll_group *group = spdk_io_channel_get_ctx(ch);
+	struct spdk_nvmf_transport_poll_group *tgroup;
 
-	assert(group->poller == NULL);
-	group->poller = SPDK_POLLER_REGISTER(nvmf_poll_group_poll, group, 0);
+	TAILQ_FOREACH(tgroup, &group->tgroups, link) {
+		nvmf_transport_poll_group_resume(tgroup);
+	}
 
 	spdk_for_each_channel_continue(i, 0);
 }
@@ -1151,6 +1127,13 @@ _nvmf_poll_group_add(void *_ctx)
 
 	if (spdk_nvmf_poll_group_add(group, qpair) != 0) {
 		SPDK_ERRLOG("Unable to add the qpair to a poll group.\n");
+
+		assert(qpair->state == SPDK_NVMF_QPAIR_UNINITIALIZED);
+		pthread_mutex_lock(&group->mutex);
+		assert(group->current_unassociated_qpairs > 0);
+		group->current_unassociated_qpairs--;
+		pthread_mutex_unlock(&group->mutex);
+
 		spdk_nvmf_qpair_disconnect(qpair);
 	}
 }
@@ -1364,6 +1347,7 @@ _nvmf_qpair_destroy(void *ctx, int status)
 		}
 	} else {
 		pthread_mutex_lock(&qpair->group->mutex);
+		assert(qpair->group->current_unassociated_qpairs > 0);
 		qpair->group->current_unassociated_qpairs--;
 		pthread_mutex_unlock(&qpair->group->mutex);
 	}
@@ -1551,6 +1535,16 @@ poll_group_update_subsystem(struct spdk_nvmf_poll_group *group,
 				      ns_info->num_blocks,
 				      spdk_bdev_get_num_blocks(ns->bdev));
 			ns_changed = true;
+		} else if (ns_info->anagrpid != ns->anagrpid) {
+			/* Namespace is still there but ANA group ID has changed */
+			SPDK_DEBUGLOG(nvmf, "ANA group ID changed: subsystem_id %u,"
+				      "nsid %u, pg %p, old %u, new %u\n",
+				      subsystem->id,
+				      ns->nsid,
+				      group,
+				      ns_info->anagrpid,
+				      ns->anagrpid);
+			ns_changed = true;
 		}
 
 		if (ns == NULL) {
@@ -1558,6 +1552,7 @@ poll_group_update_subsystem(struct spdk_nvmf_poll_group *group,
 		} else {
 			ns_info->uuid = *spdk_bdev_get_uuid(ns->bdev);
 			ns_info->num_blocks = spdk_bdev_get_num_blocks(ns->bdev);
+			ns_info->anagrpid = ns->anagrpid;
 			ns_info->crkey = ns->crkey;
 			ns_info->rtype = ns->rtype;
 			if (ns->holder) {
@@ -1622,7 +1617,6 @@ nvmf_poll_group_add_subsystem(struct spdk_nvmf_poll_group *group,
 				SPDK_ERRLOG("Transport request free error!\n");
 			}
 		}
-		assert(false);
 	}
 
 	rc = poll_group_update_subsystem(group, subsystem);

@@ -65,24 +65,11 @@ cd $src
 freebsd_update_contigmem_mod
 freebsd_set_maxsock_buf
 
-# lcov takes considerable time to process clang coverage.
-# Disabling lcov allow us to do this.
-# More information: https://github.com/spdk/spdk/issues/1693
-CC_TYPE=$(grep CC_TYPE mk/cc.mk)
-if hash lcov && ! [[ "$CC_TYPE" == *"clang"* ]]; then
-	export LCOV_OPTS="
-		--rc lcov_branch_coverage=1
-		--rc lcov_function_coverage=1
-		--rc genhtml_branch_coverage=1
-		--rc genhtml_function_coverage=1
-		--rc genhtml_legend=1
-		--rc geninfo_all_blocks=1
-		"
-	export LCOV="lcov $LCOV_OPTS --no-external"
+if [[ $CONFIG_COVERAGE == y ]]; then
 	# Print lcov version to log
-	$LCOV -v
+	$LCOV --version
 	# zero out coverage data
-	$LCOV -q -c -i -t "Baseline" -d $src -o $out/cov_base.info
+	$LCOV -q -c --no-external -i -t "Baseline" -d $src -o $out/cov_base.info
 fi
 
 # Make sure the disks are clean (no leftover partition tables)
@@ -260,6 +247,10 @@ if [ $SPDK_RUN_FUNCTIONAL_TEST -eq 1 ]; then
 			run_test "ublk" $rootdir/test/ublk/ublk.sh
 			run_test "ublk_recovery" $rootdir/test/ublk/ublk_recovery.sh
 		fi
+
+		if [[ $SPDK_TEST_NVME_INTERRUPT -eq 1 ]]; then
+			run_test "nvme_interrupt" "$rootdir/test/nvme/interrupt.sh"
+		fi
 	fi
 
 	if [ $SPDK_TEST_IOAT -eq 1 ]; then
@@ -300,7 +291,8 @@ if [ $SPDK_RUN_FUNCTIONAL_TEST -eq 1 ]; then
 			# The keyring tests utilize NVMe/TLS
 			run_test "keyring_file" "$rootdir/test/keyring/file.sh"
 			if [[ "$CONFIG_HAVE_KEYUTILS" == y ]]; then
-				run_test "keyring_linux" "$rootdir/test/keyring/linux.sh"
+				run_test "keyring_linux" "$rootdir/scripts/keyctl-session-wrapper" \
+					"$rootdir/test/keyring/linux.sh"
 			fi
 		elif [ "$SPDK_TEST_NVMF_TRANSPORT" = "fc" ]; then
 			run_test "nvmf_fc" $rootdir/test/nvmf/nvmf.sh --transport=$SPDK_TEST_NVMF_TRANSPORT
@@ -385,6 +377,8 @@ if [ $SPDK_RUN_FUNCTIONAL_TEST -eq 1 ]; then
 
 	if [[ $SPDK_TEST_ACCEL_MLX5 -eq 1 ]]; then
 		run_test "accel_mlx5_crypto" $rootdir/test/accel/mlx5/accel_mlx5_crypto.sh
+		run_test "accel_mlx5_copy" $rootdir/test/accel/mlx5/accel_mlx5_copy.sh
+		run_test "accel_mlx5_crc32c" $rootdir/test/accel/mlx5/accel_mlx5_crc32c.sh
 	fi
 fi
 
@@ -399,12 +393,15 @@ chmod a+r $output_dir/timing.txt
 
 [[ -f "$output_dir/udev.log" ]] && rm -f "$output_dir/udev.log"
 
-if hash lcov && ! [[ "$CC_TYPE" == *"clang"* ]]; then
+if [[ $CONFIG_COVERAGE == y ]]; then
 	# generate coverage data and combine with baseline
-	$LCOV -q -c -d $src -t "$(hostname)" -o $out/cov_test.info
+	$LCOV -q -c --no-external -d $src -t "$(hostname)" -o $out/cov_test.info
 	$LCOV -q -a $out/cov_base.info -a $out/cov_test.info -o $out/cov_total.info
 	$LCOV -q -r $out/cov_total.info '*/dpdk/*' -o $out/cov_total.info
-	$LCOV -q -r $out/cov_total.info '/usr/*' -o $out/cov_total.info
+	# C++ headers in /usr can sometimes generate data even when specifying
+	# --no-external, so remove them. But we need to add an ignore-errors
+	# flag to squash warnings on systems where they don't generate data.
+	$LCOV -q -r $out/cov_total.info --ignore-errors unused,unused '/usr/*' -o $out/cov_total.info
 	$LCOV -q -r $out/cov_total.info '*/examples/vmd/*' -o $out/cov_total.info
 	$LCOV -q -r $out/cov_total.info '*/app/spdk_lspci/*' -o $out/cov_total.info
 	$LCOV -q -r $out/cov_total.info '*/app/spdk_top/*' -o $out/cov_total.info

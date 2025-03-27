@@ -94,12 +94,14 @@ if __name__ == "__main__":
     def save_config(args):
         rpc.save_config(args.client,
                         sys.stdout,
-                        indent=args.indent)
+                        indent=args.indent,
+                        subsystems=args.subsystems)
 
     p = subparsers.add_parser('save_config', help="""Write current (live) configuration of SPDK subsystems and targets to stdout.
     """)
     p.add_argument('-i', '--indent', help="""Indent level. Value less than 0 mean compact mode. Default indent level is 2.
     """, type=int, default=2)
+    p.add_argument('-s', '--subsystems', help="""Comma-separated list of subsystems (and their dependencies) to save""")
     p.set_defaults(func=save_config)
 
     def load_config(args):
@@ -169,7 +171,8 @@ if __name__ == "__main__":
                                         period=args.period,
                                         load_limit=args.load_limit,
                                         core_limit=args.core_limit,
-                                        core_busy=args.core_busy)
+                                        core_busy=args.core_busy,
+                                        mappings=args.mappings)
 
     p = subparsers.add_parser(
         'framework_set_scheduler', help='Select thread scheduler that will be activated and its period (experimental)')
@@ -178,6 +181,7 @@ if __name__ == "__main__":
     p.add_argument('--load-limit', help="Scheduler load limit. Reserved for dynamic scheduler", type=int)
     p.add_argument('--core-limit', help="Scheduler core limit. Reserved for dynamic scheduler", type=int)
     p.add_argument('--core-busy', help="Scheduler core busy limit. Reserved for dynamic scheduler", type=int)
+    p.add_argument('--mappings', help="Comma-separated list of thread:core mappings. Reserved for static scheduler")
     p.set_defaults(func=framework_set_scheduler)
 
     def framework_get_scheduler(args):
@@ -259,12 +263,20 @@ if __name__ == "__main__":
         print_json(rpc.bdev.bdev_compress_create(args.client,
                                                  base_bdev_name=args.base_bdev_name,
                                                  pm_path=args.pm_path,
-                                                 lb_size=args.lb_size))
+                                                 lb_size=args.lb_size,
+                                                 comp_algo=args.comp_algo,
+                                                 comp_level=args.comp_level))
 
     p = subparsers.add_parser('bdev_compress_create', help='Add a compress vbdev')
     p.add_argument('-b', '--base-bdev-name', help="Name of the base bdev", required=True)
     p.add_argument('-p', '--pm-path', help="Path to persistent memory", required=True)
     p.add_argument('-l', '--lb-size', help="Compressed vol logical block size (optional, if used must be 512 or 4096)", type=int)
+    p.add_argument('-c', '--comp-algo', help='Compression algorithm, (deflate, lz4). Default is deflate')
+    p.add_argument('-L', '--comp-level',
+                   help="""Compression algorithm level.
+                   if algo == deflate, level ranges from 0 to 3.
+                   if algo == lz4, level ranges from 1 to 65537""",
+                   default=1, type=int)
     p.set_defaults(func=bdev_compress_create)
 
     def bdev_compress_delete(args):
@@ -416,7 +428,7 @@ if __name__ == "__main__":
                                                dif_pi_format=args.dif_pi_format))
     p = subparsers.add_parser('bdev_malloc_create', help='Create a bdev with malloc backend')
     p.add_argument('-b', '--name', help="Name of the bdev")
-    p.add_argument('-u', '--uuid', help="UUID of the bdev")
+    p.add_argument('-u', '--uuid', help="UUID of the bdev (optional)")
     p.add_argument(
         'total_size', help='Size of malloc bdev in MB (float > 0)', type=float)
     p.add_argument('block_size', help='Data block size for this bdev', type=int)
@@ -463,7 +475,7 @@ if __name__ == "__main__":
 
     p = subparsers.add_parser('bdev_null_create', help='Add a bdev with null backend')
     p.add_argument('name', help='Block device name')
-    p.add_argument('-u', '--uuid', help='UUID of the bdev')
+    p.add_argument('-u', '--uuid', help='UUID of the bdev (optional)')
     p.add_argument('total_size', help='Size of null bdev in MB (int > 0). Includes only data blocks.', type=int)
     p.add_argument('block_size', help='Data block size for this bdev.', type=int)
     p.add_argument('-p', '--physical-block-size', help='Physical block size for this bdev.', type=int)
@@ -504,7 +516,8 @@ if __name__ == "__main__":
                                             name=args.name,
                                             block_size=args.block_size,
                                             readonly=args.readonly,
-                                            fallocate=args.fallocate))
+                                            fallocate=args.fallocate,
+                                            uuid=args.uuid))
 
     p = subparsers.add_parser('bdev_aio_create', help='Add a bdev with aio backend')
     p.add_argument('filename', help='Path to device or file (ex: /dev/sda)')
@@ -512,6 +525,7 @@ if __name__ == "__main__":
     p.add_argument('block_size', help='Block size for this bdev', type=int, nargs='?')
     p.add_argument("-r", "--readonly", action='store_true', help='Set this bdev as read-only')
     p.add_argument("--fallocate", action='store_true', help='Support unmap/writezeros by fallocate')
+    p.add_argument('-u', '--uuid', help="UUID of the bdev (optional)")
     p.set_defaults(func=bdev_aio_create)
 
     def bdev_aio_rescan(args):
@@ -564,13 +578,14 @@ if __name__ == "__main__":
         print_json(rpc.bdev.bdev_xnvme_create(args.client,
                                               filename=args.filename,
                                               name=args.name,
-                                              io_mechanism=args.io_mechanism))
+                                              io_mechanism=args.io_mechanism,
+                                              conserve_cpu=args.conserve_cpu))
 
     p = subparsers.add_parser('bdev_xnvme_create', help='Create a bdev with xNVMe backend')
     p.add_argument('filename', help='Path to device or file (ex: /dev/nvme0n1)')
     p.add_argument('name', help='name of xNVMe bdev to create')
     p.add_argument('io_mechanism', help='IO mechanism to use (ex: libaio, io_uring, io_uring_cmd, etc.)')
-    p.add_argument('conserve_cpu', action='store_true', help='Whether or not to conserve CPU when polling')
+    p.add_argument('-c', '--conserve-cpu', action='store_true', help='Whether or not to conserve CPU when polling')
     p.set_defaults(func=bdev_xnvme_create)
 
     def bdev_xnvme_delete(args):
@@ -611,7 +626,8 @@ if __name__ == "__main__":
                                        rdma_max_cq_size=args.rdma_max_cq_size,
                                        rdma_cm_event_timeout_ms=args.rdma_cm_event_timeout_ms,
                                        dhchap_digests=args.dhchap_digests,
-                                       dhchap_dhgroups=args.dhchap_dhgroups)
+                                       dhchap_dhgroups=args.dhchap_dhgroups,
+                                       rdma_umr_per_io=args.rdma_umr_per_io)
 
     p = subparsers.add_parser('bdev_nvme_set_options',
                               help='Set options for the bdev nvme type. This is startup command.')
@@ -698,6 +714,12 @@ if __name__ == "__main__":
                    type=lambda d: d.split(','))
     p.add_argument('--dhchap-dhgroups', help='Comma-separated list of allowed DH-HMAC-CHAP DH groups',
                    type=lambda d: d.split(','))
+    p.add_argument('--enable-rdma-umr-per-io',
+                   help='''Enable scatter-gather RDMA Memory Region per IO if supported by the system.''',
+                   action='store_true', dest='rdma_umr_per_io')
+    p.add_argument('--disable-rdma-umr-per-io',
+                   help='''Disable scatter-gather RDMA Memory Region per IO.''',
+                   action='store_false', dest='rdma_umr_per_io')
 
     p.set_defaults(func=bdev_nvme_set_options)
 
@@ -1004,6 +1026,17 @@ if __name__ == "__main__":
                    help='Name of the NVMe controller. Example: Nvme0', required=True)
     p.set_defaults(func=bdev_nvme_cuse_unregister)
 
+    def bdev_nvme_set_keys(args):
+        rpc.bdev.bdev_nvme_set_keys(args.client, args.name, args.dhchap_key, args.dhchap_ctrlr_key)
+
+    p = subparsers.add_parser('bdev_nvme_set_keys',
+                              help='Set DH-HMAC-CHAP keys and force (re)authentication on all '
+                              'connected qpairs')
+    p.add_argument('name', help='Name of the NVMe controller')
+    p.add_argument('--dhchap-key', help='DH-HMAC-CHAP key name')
+    p.add_argument('--dhchap-ctrlr-key', help='DH-HMAC-CHAP controller key name')
+    p.set_defaults(func=bdev_nvme_set_keys)
+
     def bdev_zone_block_create(args):
         print_json(rpc.bdev.bdev_zone_block_create(args.client,
                                                    name=args.name,
@@ -1249,13 +1282,15 @@ if __name__ == "__main__":
     def bdev_get_iostat(args):
         print_dict(rpc.bdev.bdev_get_iostat(args.client,
                                             name=args.name,
-                                            per_channel=args.per_channel))
+                                            per_channel=args.per_channel,
+                                            reset_mode=args.reset_mode))
 
     p = subparsers.add_parser('bdev_get_iostat',
                               help='Display current I/O statistics of all the blockdevs or specified blockdev.')
     p.add_argument('-b', '--name', help="Name of the Blockdev. Example: Nvme0n1")
     p.add_argument('-c', '--per-channel', default=False, dest='per_channel', help='Display per channel IO stats for specified device',
                    action='store_true')
+    p.add_argument('--reset-mode', help="Mode to reset I/O statistics after getting", choices=['all', 'maxmin', 'none'])
     p.set_defaults(func=bdev_get_iostat)
 
     def bdev_reset_iostat(args):
@@ -1264,7 +1299,7 @@ if __name__ == "__main__":
     p = subparsers.add_parser('bdev_reset_iostat',
                               help='Reset I/O statistics of all the blockdevs or specified blockdev.')
     p.add_argument('-b', '--name', help="Name of the Blockdev. Example: Nvme0n1")
-    p.add_argument('-m', '--mode', help="Mode to reset I/O statistics", choices=['all', 'maxmin'])
+    p.add_argument('-m', '--mode', help="Mode to reset I/O statistics", choices=['all', 'maxmin', 'none'])
     p.set_defaults(func=bdev_reset_iostat)
 
     def bdev_enable_histogram(args):
@@ -2025,7 +2060,8 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
                                                      lvs_name=args.lvs_name,
                                                      cluster_sz=args.cluster_sz,
                                                      clear_method=args.clear_method,
-                                                     num_md_pages_per_cluster_ratio=args.md_pages_per_cluster_ratio))
+                                                     num_md_pages_per_cluster_ratio=args.md_pages_per_cluster_ratio,
+                                                     md_page_size=args.md_page_size))
 
     p = subparsers.add_parser('bdev_lvol_create_lvstore', help='Add logical volume store on base bdev')
     p.add_argument('bdev_name', help='base bdev name')
@@ -2034,6 +2070,7 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('--clear-method', help="""Change clear method for data region.
         Available: none, unmap, write_zeroes""")
     p.add_argument('-m', '--md-pages-per-cluster-ratio', help='reserved metadata pages for each cluster', type=int)
+    p.add_argument('-s', '--md-page-size', help='size of metadata page (in bytes)', type=int)
     p.set_defaults(func=bdev_lvol_create_lvstore)
 
     def bdev_lvol_rename_lvstore(args):
@@ -2184,21 +2221,21 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     def bdev_lvol_set_parent(args):
         rpc.lvol.bdev_lvol_set_parent(args.client,
                                       lvol_name=args.lvol_name,
-                                      snapshot_name=args.snapshot_name)
+                                      parent_name=args.parent_name)
 
     p = subparsers.add_parser('bdev_lvol_set_parent', help='Set the parent snapshot of a lvol')
     p.add_argument('lvol_name', help='lvol name')
-    p.add_argument('snapshot_name', help='snapshot name')
+    p.add_argument('parent_name', help='parent snapshot name')
     p.set_defaults(func=bdev_lvol_set_parent)
 
     def bdev_lvol_set_parent_bdev(args):
         rpc.lvol.bdev_lvol_set_parent_bdev(args.client,
                                            lvol_name=args.lvol_name,
-                                           esnap_name=args.esnap_name)
+                                           parent_name=args.parent_name)
 
     p = subparsers.add_parser('bdev_lvol_set_parent_bdev', help='Set the parent external snapshot of a lvol')
     p.add_argument('lvol_name', help='lvol name')
-    p.add_argument('esnap_name', help='external snapshot name')
+    p.add_argument('parent_name', help='parent external snapshot name')
     p.set_defaults(func=bdev_lvol_set_parent_bdev)
 
     def bdev_lvol_delete_lvstore(args):
@@ -2791,7 +2828,23 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('-a', '--anagrpid', help='ANA group ID (optional)', type=int)
     p.add_argument('-i', '--no-auto-visible', action='store_true',
                    help='Do not auto make namespace visible to controllers (optional)')
+    p.add_argument('-N', '--hide-metadata', action='store_true',
+                   help='Enable hide_metadata option to the bdev (optional)')
     p.set_defaults(func=nvmf_subsystem_add_ns)
+
+    def nvmf_subsystem_set_ns_ana_group(args):
+        rpc.nvmf.nvmf_subsystem_set_ns_ana_group(args.client,
+                                                 nqn=args.nqn,
+                                                 nsid=args.nsid,
+                                                 anagrpid=args.anagrpid,
+                                                 tgt_name=args.tgt_name)
+
+    p = subparsers.add_parser('nvmf_subsystem_set_ns_ana_group', help='Change ANA group ID of a namespace')
+    p.add_argument('nqn', help='NVMe-oF subsystem NQN')
+    p.add_argument('nsid', help='The requested NSID', type=int)
+    p.add_argument('anagrpid', help='ANA group ID', type=int)
+    p.add_argument('-t', '--tgt-name', help='The name of the parent NVMe-oF target (optional)', type=str)
+    p.set_defaults(func=nvmf_subsystem_set_ns_ana_group)
 
     def nvmf_subsystem_remove_ns(args):
         rpc.nvmf.nvmf_subsystem_remove_ns(args.client,
@@ -2864,6 +2917,22 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('host', help='Host NQN to remove')
     p.add_argument('-t', '--tgt-name', help='The name of the parent NVMe-oF target (optional)', type=str)
     p.set_defaults(func=nvmf_subsystem_remove_host)
+
+    def nvmf_subsystem_set_keys(args):
+        rpc.nvmf.nvmf_subsystem_set_keys(args.client,
+                                         nqn=args.nqn,
+                                         host=args.host,
+                                         tgt_name=args.tgt_name,
+                                         dhchap_key=args.dhchap_key,
+                                         dhchap_ctrlr_key=args.dhchap_ctrlr_key)
+
+    p = subparsers.add_parser('nvmf_subsystem_set_keys', help='Set keys required for a host to connect to a given subsystem')
+    p.add_argument('nqn', help='Subsystem NQN')
+    p.add_argument('host', help='Host NQN')
+    p.add_argument('-t', '--tgt-name', help='Name of the NVMe-oF target')
+    p.add_argument('--dhchap-key', help='DH-HMAC-CHAP key name')
+    p.add_argument('--dhchap-ctrlr-key', help='DH-HMAC-CHAP controller key name')
+    p.set_defaults(func=nvmf_subsystem_set_keys)
 
     def nvmf_subsystem_allow_any_host(args):
         rpc.nvmf.nvmf_subsystem_allow_any_host(args.client,
@@ -3295,7 +3364,7 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
         rpc.compressdev.compressdev_scan_accel_module(args.client, pmd=args.pmd)
 
     p = subparsers.add_parser('compressdev_scan_accel_module', help='Scan and enable compressdev module and set pmd option.')
-    p.add_argument('-p', '--pmd', type=int, help='0 = auto-select, 1= QAT only, 2 = mlx5_pci only')
+    p.add_argument('-p', '--pmd', type=int, help='0 = auto-select, 1= QAT only, 2 = mlx5_pci only, 3 = uadk only')
     p.set_defaults(func=compressdev_scan_accel_module)
 
     # dsa
@@ -3344,7 +3413,8 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
                                         qp_size=args.qp_size,
                                         num_requests=args.num_requests,
                                         allowed_devs=args.allowed_devs,
-                                        crypto_split_blocks=args.crypto_split_blocks)
+                                        crypto_split_blocks=args.crypto_split_blocks,
+                                        enable_driver=args.enable_driver)
 
     p = subparsers.add_parser('mlx5_scan_accel_module', help='Enable mlx5 accel module.')
     p.add_argument('-q', '--qp-size', type=int, help='QP size')
@@ -3352,7 +3422,16 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('-d', '--allowed-devs', help="Comma separated list of allowed device names, e.g. mlx5_0,mlx5_1")
     p.add_argument('-s', '--crypto-split-blocks', type=int,
                    help="Number of data blocks to be processed in 1 crypto UMR. [0-65535], 0 means no limit")
+    p.add_argument('-e', '--enable-driver', dest='enable_driver', action='store_true', default=None,
+                   help="Enable mlx5 platform driver. Note: the driver supports reduced scope of operations, enable with care")
     p.set_defaults(func=mlx5_scan_accel_module)
+
+    def accel_mlx5_dump_stats(args):
+        print_dict(rpc.mlx5.accel_mlx5_dump_stats(args.client, level=args.level))
+
+    p = subparsers.add_parser('accel_mlx5_dump_stats', help='Dump accel mlx5 module statistics.')
+    p.add_argument('-l', '--level', type=str, help='Verbose level, one of \"total\", \"channel\" or \"device\"')
+    p.set_defaults(func=accel_mlx5_dump_stats)
 
     # accel_error
     def accel_error_inject_error(args):
@@ -3607,7 +3686,7 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     def fsdev_aio_create(args):
         print(rpc.fsdev.fsdev_aio_create(args.client, name=args.name, root_path=args.root_path,
                                          enable_xattr=args.enable_xattr, enable_writeback_cache=args.enable_writeback_cache,
-                                         max_write=args.max_write))
+                                         max_write=args.max_write, skip_rw=args.skip_rw))
 
     p = subparsers.add_parser('fsdev_aio_create', help='Create a aio filesystem')
     p.add_argument('name', help='Filesystem name. Example: aio0.')
@@ -3623,6 +3702,10 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
                        default=None)
 
     p.add_argument('-w', '--max-write', help='Max write size in bytes', type=int)
+
+    p.add_argument('--skip-rw', dest='skip_rw', help="Do not process read or write commands. This is used for testing.",
+                   action='store_true', default=None)
+
     p.set_defaults(func=fsdev_aio_create)
 
     def fsdev_aio_delete(args):
@@ -3804,12 +3887,14 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
                                     small_pool_count=args.small_pool_count,
                                     large_pool_count=args.large_pool_count,
                                     small_bufsize=args.small_bufsize,
-                                    large_bufsize=args.large_bufsize)
+                                    large_bufsize=args.large_bufsize,
+                                    enable_numa=args.enable_numa)
     p = subparsers.add_parser('iobuf_set_options', help='Set iobuf pool options')
     p.add_argument('--small-pool-count', help='number of small buffers in the global pool', type=int)
     p.add_argument('--large-pool-count', help='number of large buffers in the global pool', type=int)
     p.add_argument('--small-bufsize', help='size of a small buffer', type=int)
     p.add_argument('--large-bufsize', help='size of a large buffer', type=int)
+    p.add_argument('--enable-numa', help='enable per-NUMA node buffer pools', action='store_true')
     p.set_defaults(func=iobuf_set_options)
 
     def iobuf_get_stats(args):

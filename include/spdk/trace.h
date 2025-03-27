@@ -62,7 +62,7 @@ struct spdk_trace_object {
 };
 
 #define	SPDK_TRACE_THREAD_NAME_LEN 16
-#define SPDK_TRACE_MAX_GROUP_ID  16
+#define SPDK_TRACE_MAX_GROUP_ID  20
 #define SPDK_TRACE_MAX_TPOINT_ID (SPDK_TRACE_MAX_GROUP_ID * 64)
 #define SPDK_TPOINT_ID(group, tpoint)	((group * 64) + tpoint)
 
@@ -497,8 +497,7 @@ void spdk_trace_add_register_fn(struct spdk_trace_register_fn *reg_fn);
 	__attribute__((constructor)) static void _ ## fn(void)	\
 	{							\
 		spdk_trace_add_register_fn(&reg_ ## fn);	\
-	}							\
-	static void fn(void)
+	}
 
 #ifdef __cplusplus
 }

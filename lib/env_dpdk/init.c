@@ -112,6 +112,8 @@ spdk_env_opts_init(struct spdk_env_opts *opts)
 		opts->field = value; \
 	}
 
+	SET_FIELD(enforce_numa, false);
+
 #undef SET_FIELD
 }
 
@@ -303,6 +305,10 @@ build_eal_cmdline(const struct spdk_env_opts *opts)
 	/* set no huge pages */
 	if (opts->no_huge) {
 		mem_disable_huge_pages();
+	}
+
+	if (opts->enforce_numa) {
+		mem_enforce_numa();
 	}
 
 	/* set the main core */
@@ -541,8 +547,9 @@ build_eal_cmdline(const struct spdk_env_opts *opts)
 #endif
 
 	if (opts->env_context) {
+		char *sp = NULL;
 		char *ptr = strdup(opts->env_context);
-		char *tok = strtok(ptr, " \t");
+		char *tok = strtok_r(ptr, " \t", &sp);
 
 		/* DPDK expects each argument as a separate string in the argv
 		 * array, so we need to tokenize here in case the caller
@@ -550,7 +557,7 @@ build_eal_cmdline(const struct spdk_env_opts *opts)
 		 */
 		while (tok != NULL) {
 			args = push_arg(args, &argcount, strdup(tok));
-			tok = strtok(NULL, " \t");
+			tok = strtok_r(NULL, " \t", &sp);
 		}
 
 		free(ptr);
@@ -609,6 +616,8 @@ env_copy_opts(struct spdk_env_opts *opts, const struct spdk_env_opts *opts_user,
 	if (offsetof(struct spdk_env_opts, field) + sizeof(opts->field) <= user_opts_size) { \
 		opts->field = opts_user->field; \
 	}
+
+	SET_FIELD(enforce_numa);
 
 #undef SET_FIELD
 }

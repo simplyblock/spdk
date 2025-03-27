@@ -28,8 +28,9 @@ setup_nvmf_tgt_conf() {
 		-a $NVMF_FIRST_TARGET_IP -s $NVMF_PORT -k
 		bdev_malloc_create 32 4096 -b malloc0
 		nvmf_subsystem_add_ns nqn.2016-06.io.spdk:cnode1 malloc0 -n 1
+		keyring_file_add_key key0 "$key"
 		nvmf_subsystem_add_host nqn.2016-06.io.spdk:cnode1 nqn.2016-06.io.spdk:host1 \
-		--psk $key
+			--psk key0
 	EOF
 }
 
@@ -134,7 +135,7 @@ trap 'cleanup' EXIT
 
 # Key taken from NVM Express TCP Transport Specification 1.0c.
 key="NVMeTLSkey-1:01:VRLbtnN9AQb2WXW3c9+wEf/DRLz0QuLdbYvEhwtdWwNf9LrZ:"
-key_path="$testdir/key.txt"
+key_path="$(mktemp -t "spdk-psk.XXX")"
 echo -n "$key" > $key_path
 chmod 0600 $key_path
 
@@ -147,8 +148,9 @@ bdevperf_rpc_sock="/var/tmp/bdevperf.sock"
 bdevperf_pid=$!
 waitforlisten $bdevperf_pid $bdevperf_rpc_sock
 
+$rpc_py -s $bdevperf_rpc_sock keyring_file_add_key key0 "$key_path"
 $rpc_py -s $bdevperf_rpc_sock bdev_nvme_attach_controller -b TLSTEST -t $TEST_TRANSPORT \
 	-a $NVMF_FIRST_TARGET_IP -s $NVMF_PORT -f ipv4 -n nqn.2016-06.io.spdk:cnode1 \
-	-q nqn.2016-06.io.spdk:host1 --psk "$key_path"
+	-q nqn.2016-06.io.spdk:host1 --psk key0
 
 "$rootdir/examples/bdev/bdevperf/bdevperf.py" -s $bdevperf_rpc_sock perform_tests

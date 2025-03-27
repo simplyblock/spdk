@@ -29,7 +29,7 @@ typedef void (*spdk_bdev_nvme_stop_discovery_fn)(void *ctx);
 
 struct nvme_async_probe_ctx {
 	struct spdk_nvme_probe_ctx *probe_ctx;
-	const char *base_name;
+	char *base_name;
 	const char **names;
 	uint32_t max_bdevs;
 	uint32_t reported_bdevs;
@@ -54,6 +54,7 @@ struct nvme_ns {
 	enum spdk_nvme_ana_state	ana_state;
 	bool				ana_state_updating;
 	bool				ana_transition_timedout;
+	bool				depopulating;
 	struct spdk_poller		*anatt_timer;
 	struct nvme_async_probe_ctx	*probe_ctx;
 	TAILQ_ENTRY(nvme_ns)		tailq;
@@ -71,6 +72,8 @@ struct nvme_bdev_io;
 struct nvme_bdev_ctrlr;
 struct nvme_bdev;
 struct nvme_io_path;
+struct nvme_ctrlr_channel_iter;
+struct nvme_bdev_channel_iter;
 
 struct nvme_path_id {
 	struct spdk_nvme_transport_id		trid;
@@ -111,6 +114,7 @@ struct nvme_ctrlr {
 
 	struct spdk_poller			*adminq_timer_poller;
 	struct spdk_thread			*thread;
+	struct spdk_interrupt			*intr;
 
 	bdev_nvme_ctrlr_op_cb			ctrlr_op_cb_fn;
 	void					*ctrlr_op_cb_arg;
@@ -122,6 +126,8 @@ struct nvme_ctrlr {
 	struct spdk_poller			*reconnect_delay_timer;
 
 	nvme_ctrlr_disconnected_cb		disconnected_cb;
+
+	TAILQ_HEAD(, nvme_bdev_io)		pending_resets;
 
 	/** linked list pointer for device list */
 	TAILQ_ENTRY(nvme_ctrlr)			tailq;
@@ -182,9 +188,8 @@ struct nvme_qpair {
 
 struct nvme_ctrlr_channel {
 	struct nvme_qpair		*qpair;
-	TAILQ_HEAD(, nvme_bdev_io)	pending_resets;
 
-	struct spdk_io_channel_iter	*reset_iter;
+	struct nvme_ctrlr_channel_iter	*reset_iter;
 	struct spdk_poller		*connect_poller;
 };
 
@@ -210,6 +215,7 @@ struct nvme_bdev_channel {
 	STAILQ_HEAD(, nvme_io_path)		io_path_list;
 	TAILQ_HEAD(retry_io_head, nvme_bdev_io)	retry_io_list;
 	struct spdk_poller			*retry_io_poller;
+	bool					resetting;
 };
 
 struct nvme_poll_group {
@@ -221,11 +227,43 @@ struct nvme_poll_group {
 	uint64_t				start_ticks;
 	uint64_t				end_ticks;
 	TAILQ_HEAD(, nvme_qpair)		qpair_list;
+	struct spdk_interrupt			*intr;
 };
 
 void nvme_io_path_info_json(struct spdk_json_write_ctx *w, struct nvme_io_path *io_path);
 
 struct nvme_ctrlr *nvme_ctrlr_get_by_name(const char *name);
+
+typedef void (*nvme_ctrlr_for_each_channel_msg)(struct nvme_ctrlr_channel_iter *iter,
+		struct nvme_ctrlr *nvme_ctrlr,
+		struct nvme_ctrlr_channel *ctrlr_ch,
+		void *ctx);
+
+typedef void (*nvme_ctrlr_for_each_channel_done)(struct nvme_ctrlr *nvme_ctrlr,
+		void *ctx, int status);
+
+void nvme_ctrlr_for_each_channel(struct nvme_ctrlr *nvme_ctrlr,
+				 nvme_ctrlr_for_each_channel_msg fn, void *ctx,
+				 nvme_ctrlr_for_each_channel_done cpl);
+
+void nvme_ctrlr_for_each_channel_continue(struct nvme_ctrlr_channel_iter *iter,
+		int status);
+
+
+typedef void (*nvme_bdev_for_each_channel_msg)(struct nvme_bdev_channel_iter *iter,
+		struct nvme_bdev *nbdev,
+		struct nvme_bdev_channel *nbdev_ch,
+		void *ctx);
+
+typedef void (*nvme_bdev_for_each_channel_done)(struct nvme_bdev *nbdev,
+		void *ctx, int status);
+
+void nvme_bdev_for_each_channel(struct nvme_bdev *nbdev,
+				nvme_bdev_for_each_channel_msg fn, void *ctx,
+				nvme_bdev_for_each_channel_done cpl);
+
+void nvme_bdev_for_each_channel_continue(struct nvme_bdev_channel_iter *iter,
+		int status);
 
 struct nvme_ctrlr *nvme_bdev_ctrlr_get_ctrlr_by_id(struct nvme_bdev_ctrlr *nbdev_ctrlr,
 		uint16_t cntlid);
@@ -245,50 +283,7 @@ struct nvme_ns *nvme_ctrlr_get_ns(struct nvme_ctrlr *nvme_ctrlr, uint32_t nsid);
 struct nvme_ns *nvme_ctrlr_get_first_active_ns(struct nvme_ctrlr *nvme_ctrlr);
 struct nvme_ns *nvme_ctrlr_get_next_active_ns(struct nvme_ctrlr *nvme_ctrlr, struct nvme_ns *ns);
 
-enum spdk_bdev_timeout_action {
-	SPDK_BDEV_NVME_TIMEOUT_ACTION_NONE = 0,
-	SPDK_BDEV_NVME_TIMEOUT_ACTION_RESET,
-	SPDK_BDEV_NVME_TIMEOUT_ACTION_ABORT,
-};
-
-struct spdk_bdev_nvme_opts {
-	enum spdk_bdev_timeout_action action_on_timeout;
-	uint64_t timeout_us;
-	uint64_t timeout_admin_us;
-	uint32_t keep_alive_timeout_ms;
-	/* The number of attempts per I/O in the transport layer before an I/O fails. */
-	uint32_t transport_retry_count;
-	uint32_t arbitration_burst;
-	uint32_t low_priority_weight;
-	uint32_t medium_priority_weight;
-	uint32_t high_priority_weight;
-	uint64_t nvme_adminq_poll_period_us;
-	uint64_t nvme_ioq_poll_period_us;
-	uint32_t io_queue_requests;
-	bool delay_cmd_submit;
-	/* The number of attempts per I/O in the bdev layer before an I/O fails. */
-	int32_t bdev_retry_count;
-	uint8_t transport_ack_timeout;
-	int32_t ctrlr_loss_timeout_sec;
-	uint32_t reconnect_delay_sec;
-	uint32_t fast_io_fail_timeout_sec;
-	bool disable_auto_failback;
-	bool generate_uuids;
-	/* Type of Service - RDMA only */
-	uint8_t transport_tos;
-	bool nvme_error_stat;
-	uint32_t rdma_srq_size;
-	bool io_path_stat;
-	bool allow_accel_sequence;
-	uint32_t rdma_max_cq_size;
-	uint16_t rdma_cm_event_timeout_ms;
-	uint32_t dhchap_digests;
-	uint32_t dhchap_dhgroups;
-};
-
 struct spdk_nvme_qpair *bdev_nvme_get_io_qpair(struct spdk_io_channel *ctrlr_io_ch);
-void bdev_nvme_get_opts(struct spdk_bdev_nvme_opts *opts);
-int bdev_nvme_set_opts(const struct spdk_bdev_nvme_opts *opts);
 int bdev_nvme_set_hotplug(bool enabled, uint64_t period_us, spdk_msg_fn cb, void *cb_ctx);
 
 int bdev_nvme_start_discovery(struct spdk_nvme_transport_id *trid, const char *base_name,
@@ -306,6 +301,11 @@ int bdev_nvme_start_mdns_discovery(const char *base_name,
 int bdev_nvme_stop_mdns_discovery(const char *name);
 void bdev_nvme_get_mdns_discovery_info(struct spdk_jsonrpc_request *request);
 void bdev_nvme_mdns_discovery_config_json(struct spdk_json_write_ctx *w);
+
+typedef void (*bdev_nvme_set_keys_cb)(void *ctx, int status);
+
+int bdev_nvme_set_keys(const char *name, const char *dhchap_key, const char *dhchap_ctrlr_key,
+		       bdev_nvme_set_keys_cb cb_fn, void *cb_ctx);
 
 struct spdk_nvme_ctrlr *bdev_nvme_get_ctrlr(struct spdk_bdev *bdev);
 

@@ -143,6 +143,10 @@ struct spdk_accel_task {
 			struct spdk_dif_error		*err;
 			uint32_t	num_blocks;
 		} dif;
+		struct {
+			enum spdk_accel_comp_algo       algo; /* compresssion/decompression algorithm */
+			uint32_t                        level; /* compression alogrithm level */
+		} comp;
 	};
 	union {
 		uint32_t		*crc_dst;
@@ -230,6 +234,17 @@ struct spdk_accel_module_if {
 	 * Returns true if given pair (cipher, key size) is supported.
 	 */
 	bool (*crypto_supports_cipher)(enum spdk_accel_cipher cipher, size_t key_size);
+
+	/**
+	 * Return true if compresssion algo is supported, false otherwise.
+	 */
+	bool (*compress_supports_algo)(enum spdk_accel_comp_algo algo);
+
+	/**
+	 * Returns the lowest and highest levels of the specified algorithm.
+	 */
+	int (*get_compress_level_range)(enum spdk_accel_comp_algo algo,
+					uint32_t *min_level, uint32_t *max_level);
 
 	/**
 	 * Returns memory domains supported by the module.  If NULL, the module does not support

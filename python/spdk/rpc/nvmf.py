@@ -473,7 +473,8 @@ def nvmf_subsystem_add_ns(client, **params):
         eui64: 8-byte namespace EUI-64 in hexadecimal (e.g. "ABCDEF0123456789") (optional).
         uuid: Namespace UUID (optional).
         anagrpid: ANA group ID (optional).
-        no_auto_visible: Do not automatically make namespace visible to controllers
+        no_auto_visible: Do not automatically make namespace visible to controllers (optional)
+        hide_metadata: Enable hide_metadata option to the bdev (optional)
 
     Returns:
         The namespace ID
@@ -482,10 +483,33 @@ def nvmf_subsystem_add_ns(client, **params):
     strip_globals(params)
     apply_defaults(params, tgt_name=None)
     group_as(params, 'namespace', ['bdev_name', 'ptpl_file', 'nsid',
-                                   'nguid', 'eui64', 'uuid', 'anagrpid', 'no_auto_visible'])
+                                   'nguid', 'eui64', 'uuid', 'anagrpid', 'no_auto_visible',
+                                   'hide_metadata'])
     remove_null(params)
 
     return client.call('nvmf_subsystem_add_ns', params)
+
+
+def nvmf_subsystem_set_ns_ana_group(client, nqn, nsid, anagrpid, tgt_name=None):
+    """Change ANA group ID of a namespace.
+
+    Args:
+        nqn: Subsystem NQN.
+        nsid: Namespace ID.
+        anagrpid: ANA group ID.
+        tgt_name: name of the parent NVMe-oF target (optional).
+
+    Returns:
+        True or False
+    """
+    params = {'nqn': nqn,
+              'nsid': nsid,
+              'anagrpid': anagrpid}
+
+    if tgt_name:
+        params['tgt_name'] = tgt_name
+
+    return client.call('nvmf_subsystem_set_ns_ana_group', params)
 
 
 def nvmf_subsystem_remove_ns(client, nqn, nsid, tgt_name=None):
@@ -581,6 +605,31 @@ def nvmf_subsystem_remove_host(client, nqn, host, tgt_name=None):
         params['tgt_name'] = tgt_name
 
     return client.call('nvmf_subsystem_remove_host', params)
+
+
+def nvmf_subsystem_set_keys(client, nqn, host, tgt_name=None,
+                            dhchap_key=None, dhchap_ctrlr_key=None):
+    """Set keys required for a host to connect to a given subsystem.
+
+    Args:
+        nqn: Subsystem NQN.
+        host: Host NQN.
+        tgt_name: Name of the NVMe-oF target (optional).
+        dhchap_key: DH-HMAC-CHAP key name (optional)
+        dhchap_ctrlr_key: DH-HMAC-CHAP controller key name (optional)
+    """
+
+    params = {'nqn': nqn,
+              'host': host}
+
+    if tgt_name is not None:
+        params['tgt_name'] = tgt_name
+    if dhchap_key is not None:
+        params['dhchap_key'] = dhchap_key
+    if dhchap_ctrlr_key is not None:
+        params['dhchap_ctrlr_key'] = dhchap_ctrlr_key
+
+    return client.call('nvmf_subsystem_set_keys', params)
 
 
 def nvmf_subsystem_allow_any_host(client, nqn, disable, tgt_name=None):

@@ -321,7 +321,7 @@ spdk_fsdev_initialize(spdk_fsdev_init_cb cb_fn, void *cb_arg)
 				    sizeof(struct spdk_fsdev_io) +
 				    fsdev_module_get_max_ctx_size(),
 				    0,
-				    SPDK_ENV_SOCKET_ID_ANY);
+				    SPDK_ENV_NUMA_ID_ANY);
 
 	if (g_fsdev_mgr.fsdev_io_pool == NULL) {
 		SPDK_ERRLOG("Could not allocate spdk_fsdev_io pool\n");
@@ -697,45 +697,6 @@ spdk_fsdev_get_opts(struct spdk_fsdev_opts *opts, size_t opts_size)
 	return 0;
 }
 
-static int
-fsdev_set_open_opts(struct spdk_fsdev *fsdev, struct spdk_fsdev_open_opts *opts)
-{
-	int res;
-
-	assert(opts);
-
-	if (!opts->opts_size) {
-		SPDK_ERRLOG("opts_size should not be zero value\n");
-		return -EINVAL;
-	}
-
-	if (!fsdev->fn_table->negotiate_opts) {
-		SPDK_ERRLOG("negotiate_opts is NULL for %s\n", spdk_fsdev_get_name(fsdev));
-		return -ENOTSUP;
-	}
-
-	res = fsdev->fn_table->negotiate_opts(fsdev->ctxt, opts);
-	if (res) {
-		SPDK_ERRLOG("negotiate_opts failed with %d for %s\n", res, spdk_fsdev_get_name(fsdev));
-		return res;
-	}
-
-#define SET_FIELD(field) \
-	if (offsetof(struct spdk_fsdev_open_opts, field) + sizeof(opts->field) <= opts->opts_size) { \
-		fsdev->opts.field = opts->field; \
-	}
-
-	SET_FIELD(writeback_cache_enabled);
-	SET_FIELD(max_write);
-
-	/* Do not remove this statement, you should always update this statement when you adding a new field,
-		* and do not forget to add the SET_FIELD statement for your added field. */
-	SPDK_STATIC_ASSERT(sizeof(struct spdk_fsdev_open_opts) == 9, "Incorrect size");
-#undef SET_FIELD
-
-	return 0;
-}
-
 int
 spdk_fsdev_get_memory_domains(struct spdk_fsdev *fsdev, struct spdk_memory_domain **domains,
 			      int array_size)
@@ -1027,7 +988,7 @@ spdk_fsdev_unregister_by_name(const char *fsdev_name, struct spdk_fsdev_module *
 	struct spdk_fsdev *fsdev;
 	int rc;
 
-	rc = spdk_fsdev_open(fsdev_name, _tmp_fsdev_event_cb, NULL, NULL, &desc);
+	rc = spdk_fsdev_open(fsdev_name, _tmp_fsdev_event_cb, NULL, &desc);
 	if (rc != 0) {
 		SPDK_ERRLOG("Failed to open fsdev with name: %s\n", fsdev_name);
 		return rc;
@@ -1097,8 +1058,8 @@ fsdev_desc_alloc(struct spdk_fsdev *fsdev, spdk_fsdev_event_cb_t event_cb, void 
 }
 
 int
-spdk_fsdev_open(const char *fsdev_name, spdk_fsdev_event_cb_t event_cb,
-		void *event_ctx, struct spdk_fsdev_open_opts *opts, struct spdk_fsdev_desc **_desc)
+spdk_fsdev_open(const char *fsdev_name, spdk_fsdev_event_cb_t event_cb, void *event_ctx,
+		struct spdk_fsdev_desc **_desc)
 {
 	struct spdk_fsdev_desc *desc;
 	struct spdk_fsdev *fsdev;
@@ -1122,17 +1083,6 @@ spdk_fsdev_open(const char *fsdev_name, spdk_fsdev_event_cb_t event_cb,
 	if (rc != 0) {
 		spdk_spin_unlock(&g_fsdev_mgr.spinlock);
 		return rc;
-	}
-
-	if (opts) {
-		rc = fsdev_set_open_opts(fsdev, opts);
-		if (rc != 0) {
-			SPDK_NOTICELOG("%s: fsdev_set_open_opts failed with %d\n", fsdev_name, rc);
-			fsdev_desc_free(desc);
-			*_desc = NULL;
-			spdk_spin_unlock(&g_fsdev_mgr.spinlock);
-			return rc;
-		}
 	}
 
 	rc = fsdev_open(fsdev, desc);

@@ -88,9 +88,18 @@ function check_header_filenames() {
 }
 
 function get_release() {
-	local tag
+	local tag version major minor patch suffix
 
-	tag=$(git describe --tags --abbrev=0 --exclude=LTS --exclude="*-pre" $1)
+	if [[ -n "$1" ]]; then
+		version="$1"
+	else
+		IFS='.-' read -r major minor patch suffix < "$rootdir/VERSION"
+		version="v$major.$minor"
+		((patch > 0)) && version+=".$patch"
+		version+=${suffix:+-$suffix}
+	fi
+
+	tag=$(git describe --tags --abbrev=0 --exclude=LTS --exclude="*-pre" "$version")
 	echo "${tag:0:6}"
 }
 
@@ -140,21 +149,11 @@ function confirm_abi_deps() {
 	#	soname_regexp = ^libspdk_event\\.so\\.12\\.*$
 	cat <<- EOF > ${suppression_file}
 		[suppress_type]
-			label = Added disable_command_passthru field
-			name = spdk_nvmf_transport_opts
-			soname_regexp = ^libspdk_nvmf\\.so\\.18\\.*$
-			has_data_member_regexp = ^reserved29$
-			has_data_member_inserted_between = {232, 256}
-		[suppress_type]
-			label = Added opts.disable_command_passthru field
-			name = spdk_nvmf_transport
-			soname_regexp = ^libspdk_nvmf\\.so\\.18\\.*$
-		[suppress_type]
-			label = Added disable_pcie_sgl_merge field
-			name = spdk_nvme_io_qpair_opts
-			soname_regexp = ^libspdk_nvme\\.so\\.13\\.*$
-			has_data_member_regexp = ^reserved66$
-			has_data_member_inserted_between = {528, end}
+			label = Removed spdk_nvme_accel_fn_table.submit_accel_crc32c field
+			name = spdk_nvme_accel_fn_table
+			soname_regexp = ^libspdk_nvme\\.so\\.14\\.*$
+			has_data_member_regexp = ^submit_accel_crc32c$
+			has_data_member_inserted_between = {64, 128}
 	EOF
 
 	for object in "$libdir"/libspdk_*.so; do
@@ -355,7 +354,7 @@ function confirm_makefile_deps() {
 	rm -f $fail_file
 
 	declare -A IGNORED_LIBS=()
-	if grep -q 'CONFIG_RDMA?=n' $rootdir/mk/config.mk; then
+	if [[ $CONFIG_RDMA == n ]]; then
 		IGNORED_LIBS["rdma"]=1
 	fi
 

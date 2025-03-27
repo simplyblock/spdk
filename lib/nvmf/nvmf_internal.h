@@ -125,6 +125,7 @@ struct spdk_nvmf_subsystem_pg_ns_info {
 	/* Host ID for the registrants with the namespace */
 	struct spdk_uuid		reg_hostid[SPDK_NVMF_MAX_NUM_REGISTRANTS];
 	uint64_t			num_blocks;
+	uint32_t			anagrpid;
 
 	/* I/O outstanding to this namespace */
 	uint64_t			io_outstanding;
@@ -186,7 +187,7 @@ struct spdk_nvmf_ns {
 	/* Namespace is always visible to all controllers */
 	bool always_visible;
 	/* Namespace id of the underlying device, used for passthrough commands */
-	uint32_t passthrough_nsid;
+	uint32_t passthru_nsid;
 };
 
 /*
@@ -375,7 +376,6 @@ void nvmf_poll_group_pause_subsystem(struct spdk_nvmf_poll_group *group,
 void nvmf_poll_group_resume_subsystem(struct spdk_nvmf_poll_group *group,
 				      struct spdk_nvmf_subsystem *subsystem, spdk_nvmf_poll_group_mod_done cb_fn, void *cb_arg);
 
-void nvmf_update_discovery_log(struct spdk_nvmf_tgt *tgt, const char *hostnqn);
 void nvmf_get_discovery_log_page(struct spdk_nvmf_tgt *tgt, const char *hostnqn, struct iovec *iov,
 				 uint32_t iovcnt, uint64_t offset, uint32_t length,
 				 struct spdk_nvme_transport_id *cmd_source_trid);
@@ -391,6 +391,8 @@ bool nvmf_ctrlr_use_zcopy(struct spdk_nvmf_request *req);
 
 void nvmf_bdev_ctrlr_identify_ns(struct spdk_nvmf_ns *ns, struct spdk_nvme_ns_data *nsdata,
 				 bool dif_insert_or_strip);
+void nvmf_bdev_ctrlr_identify_iocs_nvm(struct spdk_nvmf_ns *ns,
+				       struct spdk_nvme_nvm_ns_data *nsdata_nvm);
 int nvmf_bdev_ctrlr_read_cmd(struct spdk_bdev *bdev, struct spdk_bdev_desc *desc,
 			     struct spdk_io_channel *ch, struct spdk_nvmf_request *req);
 int nvmf_bdev_ctrlr_write_cmd(struct spdk_bdev *bdev, struct spdk_bdev_desc *desc,
@@ -409,7 +411,7 @@ int nvmf_bdev_ctrlr_copy_cmd(struct spdk_bdev *bdev, struct spdk_bdev_desc *desc
 			     struct spdk_io_channel *ch, struct spdk_nvmf_request *req);
 int nvmf_bdev_ctrlr_nvme_passthru_io(struct spdk_bdev *bdev, struct spdk_bdev_desc *desc,
 				     struct spdk_io_channel *ch, struct spdk_nvmf_request *req);
-bool nvmf_bdev_ctrlr_get_dif_ctx(struct spdk_bdev *bdev, struct spdk_nvme_cmd *cmd,
+bool nvmf_bdev_ctrlr_get_dif_ctx(struct spdk_bdev_desc *desc, struct spdk_nvme_cmd *cmd,
 				 struct spdk_dif_ctx *dif_ctx);
 bool nvmf_bdev_zcopy_enabled(struct spdk_bdev *bdev);
 
@@ -489,7 +491,19 @@ void nvmf_ctrlr_set_fatal_status(struct spdk_nvmf_ctrlr *ctrlr);
 static inline bool
 nvmf_ctrlr_ns_is_visible(struct spdk_nvmf_ctrlr *ctrlr, uint32_t nsid)
 {
+	assert(nsid > 0 && nsid <= ctrlr->subsys->max_nsid);
 	return spdk_bit_array_get(ctrlr->visible_ns, nsid - 1);
+}
+
+static inline void
+nvmf_ctrlr_ns_set_visible(struct spdk_nvmf_ctrlr *ctrlr, uint32_t nsid, bool visible)
+{
+	assert(nsid > 0 && nsid <= ctrlr->subsys->max_nsid);
+	if (visible) {
+		spdk_bit_array_set(ctrlr->visible_ns, nsid - 1);
+	} else {
+		spdk_bit_array_clear(ctrlr->visible_ns, nsid - 1);
+	}
 }
 
 static inline struct spdk_nvmf_ns *

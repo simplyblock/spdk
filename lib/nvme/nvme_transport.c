@@ -28,7 +28,8 @@ static int g_current_transport_index = 0;
 struct spdk_nvme_transport_opts g_spdk_nvme_transport_opts = {
 	.rdma_srq_size = 0,
 	.rdma_max_cq_size = 0,
-	.rdma_cm_event_timeout_ms = 1000
+	.rdma_cm_event_timeout_ms = 1000,
+	.rdma_umr_per_io = false,
 };
 
 const struct spdk_nvme_transport *
@@ -166,6 +167,19 @@ nvme_transport_ctrlr_enable(struct spdk_nvme_ctrlr *ctrlr)
 }
 
 int
+nvme_transport_ctrlr_enable_interrupts(struct spdk_nvme_ctrlr *ctrlr)
+{
+	const struct spdk_nvme_transport *transport = nvme_get_transport(ctrlr->trid.trstring);
+
+	assert(transport != NULL);
+	if (transport->ops.ctrlr_enable_interrupts != NULL) {
+		return transport->ops.ctrlr_enable_interrupts(ctrlr);
+	}
+
+	return -ENOTSUP;
+}
+
+int
 nvme_transport_ctrlr_ready(struct spdk_nvme_ctrlr *ctrlr)
 {
 	const struct spdk_nvme_transport *transport = nvme_get_transport(ctrlr->trid.trstring);
@@ -220,7 +234,7 @@ nvme_queue_register_operation_completion(struct spdk_nvme_ctrlr *ctrlr, uint64_t
 {
 	struct nvme_register_completion *ctx;
 
-	ctx = spdk_zmalloc(sizeof(*ctx), 0, NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_SHARE);
+	ctx = spdk_zmalloc(sizeof(*ctx), 0, NULL, SPDK_ENV_NUMA_ID_ANY, SPDK_MALLOC_SHARE);
 	if (ctx == NULL) {
 		return -ENOMEM;
 	}
@@ -554,6 +568,20 @@ nvme_transport_ctrlr_disconnect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk
 	transport->ops.ctrlr_disconnect_qpair(ctrlr, qpair);
 }
 
+int
+nvme_transport_qpair_get_fd(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair,
+			    struct spdk_event_handler_opts *opts)
+{
+	const struct spdk_nvme_transport *transport = nvme_get_transport(ctrlr->trid.trstring);
+
+	assert(transport != NULL);
+	if (transport->ops.qpair_get_fd != NULL) {
+		return transport->ops.qpair_get_fd(qpair, opts);
+	}
+
+	return -ENOTSUP;
+}
+
 void
 nvme_transport_ctrlr_disconnect_qpair_done(struct spdk_nvme_qpair *qpair)
 {
@@ -562,6 +590,13 @@ nvme_transport_ctrlr_disconnect_qpair_done(struct spdk_nvme_qpair *qpair)
 		nvme_qpair_abort_all_queued_reqs(qpair);
 	}
 	nvme_qpair_set_state(qpair, NVME_QPAIR_DISCONNECTED);
+
+	/* In interrupt mode qpairs that are added to poll group need an event for the
+	 * disconnected qpairs handling to kick in.
+	 */
+	if (qpair->poll_group) {
+		nvme_poll_group_write_disconnect_qpair_fd(qpair->poll_group->group);
+	}
 }
 
 int
@@ -650,6 +685,19 @@ nvme_transport_qpair_iterate_requests(struct spdk_nvme_qpair *qpair,
 	return transport->ops.qpair_iterate_requests(qpair, iter_fn, arg);
 }
 
+int
+nvme_transport_qpair_authenticate(struct spdk_nvme_qpair *qpair)
+{
+	const struct spdk_nvme_transport *transport;
+
+	transport = nvme_get_transport(qpair->ctrlr->trid.trstring);
+	if (transport->ops.qpair_authenticate == NULL) {
+		return -ENOTSUP;
+	}
+
+	return transport->ops.qpair_authenticate(qpair);
+}
+
 void
 nvme_transport_admin_qpair_abort_aers(struct spdk_nvme_qpair *qpair)
 {
@@ -731,6 +779,14 @@ nvme_transport_poll_group_process_completions(struct spdk_nvme_transport_poll_gr
 		uint32_t completions_per_qpair, spdk_nvme_disconnected_qpair_cb disconnected_qpair_cb)
 {
 	return tgroup->transport->ops.poll_group_process_completions(tgroup, completions_per_qpair,
+			disconnected_qpair_cb);
+}
+
+void
+nvme_transport_poll_group_check_disconnected_qpairs(struct spdk_nvme_transport_poll_group *tgroup,
+		spdk_nvme_disconnected_qpair_cb disconnected_qpair_cb)
+{
+	return tgroup->transport->ops.poll_group_check_disconnected_qpairs(tgroup,
 			disconnected_qpair_cb);
 }
 
@@ -844,6 +900,7 @@ spdk_nvme_transport_get_opts(struct spdk_nvme_transport_opts *opts, size_t opts_
 	SET_FIELD(rdma_srq_size);
 	SET_FIELD(rdma_max_cq_size);
 	SET_FIELD(rdma_cm_event_timeout_ms);
+	SET_FIELD(rdma_umr_per_io);
 
 	/* Do not remove this statement, you should always update this statement when you adding a new field,
 	 * and do not forget to add the SET_FIELD statement for your added field. */
@@ -873,6 +930,7 @@ spdk_nvme_transport_set_opts(const struct spdk_nvme_transport_opts *opts, size_t
 	SET_FIELD(rdma_srq_size);
 	SET_FIELD(rdma_max_cq_size);
 	SET_FIELD(rdma_cm_event_timeout_ms);
+	SET_FIELD(rdma_umr_per_io);
 
 	g_spdk_nvme_transport_opts.opts_size = opts->opts_size;
 

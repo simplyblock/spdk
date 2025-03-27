@@ -20,6 +20,7 @@ packages=(
 	clang-analyzer
 	elfutils
 	elfutils-libelf-devel
+	ethtool
 	fio
 	flex
 	gdb
@@ -59,6 +60,7 @@ packages=(
 	valgrind
 	wget
 	xfsprogs
+	xxd
 )
 
 if [[ $OSID != centos && $OSID != rocky && $OSID != rhel ]]; then

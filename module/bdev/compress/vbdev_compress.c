@@ -21,7 +21,6 @@
 
 #include "spdk/accel_module.h"
 
-
 #define CHUNK_SIZE (1024 * 16)
 #define COMP_BDEV_NAME "compress"
 #define BACKING_IO_SZ (4 * 1024)
@@ -58,6 +57,9 @@ struct vbdev_compress {
 	TAILQ_HEAD(, vbdev_comp_op)	queued_comp_ops;
 	TAILQ_ENTRY(vbdev_compress)	link;
 	struct spdk_thread		*thread;	/* thread where base device is opened */
+	enum spdk_accel_comp_algo       comp_algo;      /* compression algorithm for compress bdev */
+	uint32_t                        comp_level;     /* compression algorithm level */
+	bool				init_failed;	/* compress bdev initialization failed */
 };
 static TAILQ_HEAD(, vbdev_compress) g_vbdev_comp = TAILQ_HEAD_INITIALIZER(g_vbdev_comp);
 
@@ -73,17 +75,17 @@ struct comp_bdev_io {
 	struct vbdev_compress		*comp_bdev;		/* vbdev associated with this IO */
 	struct spdk_bdev_io_wait_entry	bdev_io_wait;		/* for bdev_io_wait */
 	struct spdk_bdev_io		*orig_io;		/* the original IO */
-	struct spdk_io_channel		*ch;			/* for resubmission */
 	int				status;			/* save for completion on orig thread */
 };
 
 static void vbdev_compress_examine(struct spdk_bdev *bdev);
 static int vbdev_compress_claim(struct vbdev_compress *comp_bdev);
-static void vbdev_compress_queue_io(struct spdk_bdev_io *bdev_io);
-struct vbdev_compress *_prepare_for_load_init(struct spdk_bdev_desc *bdev_desc, uint32_t lb_size);
+struct vbdev_compress *_prepare_for_load_init(struct spdk_bdev_desc *bdev_desc, uint32_t lb_size,
+		uint8_t comp_algo, uint32_t comp_level);
 static void vbdev_compress_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io);
 static void comp_bdev_ch_destroy_cb(void *io_device, void *ctx_buf);
 static void vbdev_compress_delete_done(void *cb_arg, int bdeverrno);
+static void _comp_reduce_resubmit_backing_io(void *_backing_io);
 
 /* for completing rw requests on the orig IO thread. */
 static void
@@ -94,7 +96,7 @@ _reduce_rw_blocks_cb(void *arg)
 	if (spdk_likely(io_ctx->status == 0)) {
 		spdk_bdev_io_complete(io_ctx->orig_io, SPDK_BDEV_IO_STATUS_SUCCESS);
 	} else if (io_ctx->status == -ENOMEM) {
-		vbdev_compress_queue_io(spdk_bdev_io_from_ctx(io_ctx));
+		spdk_bdev_io_complete(io_ctx->orig_io, SPDK_BDEV_IO_STATUS_NOMEM);
 	} else {
 		SPDK_ERRLOG("Failed to execute reduce api. %s\n", spdk_strerror(-io_ctx->status));
 		spdk_bdev_io_complete(io_ctx->orig_io, SPDK_BDEV_IO_STATUS_FAILED);
@@ -133,13 +135,16 @@ _compress_operation(struct spdk_reduce_backing_dev *backing_dev, struct iovec *s
 
 	if (compress) {
 		assert(dst_iovcnt == 1);
-		rc = spdk_accel_submit_compress(comp_bdev->accel_channel, dst_iovs[0].iov_base, dst_iovs[0].iov_len,
-						src_iovs, src_iovcnt, &reduce_cb_arg->output_size,
-						reduce_cb_arg->cb_fn, reduce_cb_arg->cb_arg);
+		rc = spdk_accel_submit_compress_ext(comp_bdev->accel_channel, dst_iovs[0].iov_base,
+						    dst_iovs[0].iov_len, src_iovs, src_iovcnt,
+						    comp_bdev->comp_algo, comp_bdev->comp_level,
+						    &reduce_cb_arg->output_size, reduce_cb_arg->cb_fn,
+						    reduce_cb_arg->cb_arg);
 	} else {
-		rc = spdk_accel_submit_decompress(comp_bdev->accel_channel, dst_iovs, dst_iovcnt,
-						  src_iovs, src_iovcnt, &reduce_cb_arg->output_size,
-						  reduce_cb_arg->cb_fn, reduce_cb_arg->cb_arg);
+		rc = spdk_accel_submit_decompress_ext(comp_bdev->accel_channel, dst_iovs, dst_iovcnt,
+						      src_iovs, src_iovcnt, comp_bdev->comp_algo,
+						      &reduce_cb_arg->output_size, reduce_cb_arg->cb_fn,
+						      reduce_cb_arg->cb_arg);
 	}
 
 	return rc;
@@ -221,6 +226,189 @@ comp_read_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io, b
 	spdk_thread_exec_msg(comp_bdev->reduce_thread, _comp_submit_read, bdev_io);
 }
 
+struct partial_chunk_info {
+	uint64_t chunk_idx;
+	uint64_t block_offset;
+	uint64_t block_length;
+};
+
+/*
+ * It's a structure used to hold information needed during the execution of an unmap operation.
+ */
+struct compress_unmap_split_ctx {
+	struct spdk_bdev_io *bdev_io;
+	int32_t status;
+	uint32_t logical_blocks_per_chunk;
+	/* The first chunk that can be fully covered by the unmap bdevio interval */
+	uint64_t full_chunk_idx_b;
+	/* The last chunk that can be fully covered by the unmap bdevio interval */
+	uint64_t full_chunk_idx_e;
+	uint64_t num_full_chunks;
+	uint64_t num_full_chunks_consumed;
+	uint32_t num_partial_chunks;
+	uint32_t num_partial_chunks_consumed;
+	/* Used to hold the partial chunk information. There will only be less than or equal to two,
+	because chunks that cannot be fully covered will only appear at the beginning or end or both two. */
+	struct partial_chunk_info partial_chunk_info[2];
+};
+
+static void _comp_unmap_subcmd_done_cb(void *ctx, int error);
+
+/*
+ * This function processes the unmap operation for both full and partial chunks in a
+ * compressed block device. It iteratively submits unmap requests until all the chunks
+ * have been unmapped or an error occurs.
+ */
+static void
+_comp_submit_unmap_split(void *ctx)
+{
+	struct compress_unmap_split_ctx *split_ctx = ctx;
+	struct spdk_bdev_io *bdev_io = split_ctx->bdev_io;
+	struct vbdev_compress *comp_bdev = SPDK_CONTAINEROF(bdev_io->bdev, struct vbdev_compress,
+					   comp_bdev);
+	struct partial_chunk_info *partial_chunk = NULL;
+	uint64_t chunk_idx = 0;
+	uint64_t block_offset = 0;
+	uint64_t block_length = 0;
+
+	if (split_ctx->status != 0 ||
+	    (split_ctx->num_full_chunks_consumed == split_ctx->num_full_chunks &&
+	     split_ctx->num_partial_chunks_consumed == split_ctx->num_partial_chunks)) {
+		reduce_rw_blocks_cb(bdev_io, split_ctx->status);
+		free(split_ctx);
+		return;
+	}
+
+	if (split_ctx->num_full_chunks_consumed < split_ctx->num_full_chunks) {
+		chunk_idx = split_ctx->full_chunk_idx_b + split_ctx->num_full_chunks_consumed;
+		block_offset = chunk_idx * split_ctx->logical_blocks_per_chunk;
+		block_length = split_ctx->logical_blocks_per_chunk;
+
+		split_ctx->num_full_chunks_consumed++;
+		spdk_reduce_vol_unmap(comp_bdev->vol,
+				      block_offset, block_length,
+				      _comp_unmap_subcmd_done_cb, split_ctx);
+	} else if (split_ctx->num_partial_chunks_consumed < split_ctx->num_partial_chunks) {
+		partial_chunk = &split_ctx->partial_chunk_info[split_ctx->num_partial_chunks_consumed];
+		block_offset = partial_chunk->chunk_idx * split_ctx->logical_blocks_per_chunk +
+			       partial_chunk->block_offset;
+		block_length = partial_chunk->block_length;
+
+		split_ctx->num_partial_chunks_consumed++;
+		spdk_reduce_vol_unmap(comp_bdev->vol,
+				      block_offset, block_length,
+				      _comp_unmap_subcmd_done_cb, split_ctx);
+	} else {
+		assert(false);
+	}
+}
+
+/*
+ * When mkfs or fstrim, large unmap requests may be generated.
+ * Large request will be split into multiple subcmds and processed recursively.
+ * Run too many subcmds recursively may cause stack overflow or monopolize the thread,
+ * delaying other tasks. To avoid this, next subcmd need to be processed asynchronously
+ * by 'spdk_thread_send_msg'.
+ */
+static void
+_comp_unmap_subcmd_done_cb(void *ctx, int error)
+{
+	struct compress_unmap_split_ctx *split_ctx = ctx;
+
+	split_ctx->status = error;
+	spdk_thread_send_msg(spdk_get_thread(), _comp_submit_unmap_split, split_ctx);
+}
+
+/*
+ * This function splits the unmap operation into full and partial chunks based on the
+ * block range specified in the 'spdk_bdev_io' structure. It calculates the start and end
+ * chunks, as well as any partial chunks at the beginning or end of the range, and prepares
+ * a context (compress_unmap_split_ctx) to handle these chunks. The unmap operation is
+ * then submitted for processing through '_comp_submit_unmap_split'.
+ * some cases to handle:
+ * 1. start and end chunks are different
+ * 1.1 start and end chunks are full
+ * 1.2 start and end chunks are partial
+ * 1.3 start or  end chunk  is full and the other is partial
+ * 2. start and end chunks are the same
+ * 2.1 full
+ * 2.2 partial
+ */
+static void
+_comp_submit_unmap(void *ctx)
+{
+	struct spdk_bdev_io *bdev_io = ctx;
+	struct vbdev_compress *comp_bdev = SPDK_CONTAINEROF(bdev_io->bdev, struct vbdev_compress,
+					   comp_bdev);
+	const struct spdk_reduce_vol_params *vol_params = spdk_reduce_vol_get_params(comp_bdev->vol);
+	struct compress_unmap_split_ctx *split_ctx;
+	struct partial_chunk_info *partial_chunk;
+	uint32_t logical_blocks_per_chunk;
+	uint64_t start_chunk, end_chunk, start_offset, end_tail;
+
+	logical_blocks_per_chunk = vol_params->chunk_size / vol_params->logical_block_size;
+	start_chunk = bdev_io->u.bdev.offset_blocks / logical_blocks_per_chunk;
+	end_chunk = (bdev_io->u.bdev.offset_blocks + bdev_io->u.bdev.num_blocks - 1) /
+		    logical_blocks_per_chunk;
+	start_offset = bdev_io->u.bdev.offset_blocks % logical_blocks_per_chunk;
+	end_tail = (bdev_io->u.bdev.offset_blocks + bdev_io->u.bdev.num_blocks) %
+		   logical_blocks_per_chunk;
+
+	split_ctx = calloc(1, sizeof(struct compress_unmap_split_ctx));
+	if (split_ctx == NULL) {
+		reduce_rw_blocks_cb(bdev_io, -ENOMEM);
+		return;
+	}
+	partial_chunk = split_ctx->partial_chunk_info;
+	split_ctx->bdev_io = bdev_io;
+	split_ctx->logical_blocks_per_chunk = logical_blocks_per_chunk;
+
+	if (start_chunk < end_chunk) {
+		if (start_offset != 0) {
+			partial_chunk[split_ctx->num_partial_chunks].chunk_idx = start_chunk;
+			partial_chunk[split_ctx->num_partial_chunks].block_offset = start_offset;
+			partial_chunk[split_ctx->num_partial_chunks].block_length = logical_blocks_per_chunk
+					- start_offset;
+			split_ctx->num_partial_chunks++;
+			split_ctx->full_chunk_idx_b = start_chunk + 1;
+		} else {
+			split_ctx->full_chunk_idx_b = start_chunk;
+		}
+
+		if (end_tail != 0) {
+			partial_chunk[split_ctx->num_partial_chunks].chunk_idx = end_chunk;
+			partial_chunk[split_ctx->num_partial_chunks].block_offset = 0;
+			partial_chunk[split_ctx->num_partial_chunks].block_length = end_tail;
+			split_ctx->num_partial_chunks++;
+			split_ctx->full_chunk_idx_e = end_chunk - 1;
+		} else {
+			split_ctx->full_chunk_idx_e = end_chunk;
+		}
+
+		split_ctx->num_full_chunks = end_chunk - start_chunk + 1 - split_ctx->num_partial_chunks;
+
+		if (split_ctx->num_full_chunks) {
+			assert(split_ctx->full_chunk_idx_b != UINT64_MAX && split_ctx->full_chunk_idx_e != UINT64_MAX);
+			assert(split_ctx->full_chunk_idx_e - split_ctx->full_chunk_idx_b + 1 == split_ctx->num_full_chunks);
+		} else {
+			assert(split_ctx->full_chunk_idx_b - split_ctx->full_chunk_idx_e == 1);
+		}
+	} else if (start_offset != 0 || end_tail != 0) {
+		partial_chunk[0].chunk_idx = start_chunk;
+		partial_chunk[0].block_offset = start_offset;
+		partial_chunk[0].block_length =
+			bdev_io->u.bdev.num_blocks;
+		split_ctx->num_partial_chunks = 1;
+	} else {
+		split_ctx->full_chunk_idx_b = start_chunk;
+		split_ctx->full_chunk_idx_e = end_chunk;
+		split_ctx->num_full_chunks = 1;
+	}
+	assert(split_ctx->num_partial_chunks <= SPDK_COUNTOF(split_ctx->partial_chunk_info));
+
+	_comp_submit_unmap_split(split_ctx);
+}
+
 /* Called when someone above submits IO to this vbdev. */
 static void
 vbdev_compress_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
@@ -243,10 +431,12 @@ vbdev_compress_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *b
 	case SPDK_BDEV_IO_TYPE_WRITE:
 		spdk_thread_exec_msg(comp_bdev->reduce_thread, _comp_submit_write, bdev_io);
 		return;
+	case SPDK_BDEV_IO_TYPE_UNMAP:
+		spdk_thread_exec_msg(comp_bdev->reduce_thread, _comp_submit_unmap, bdev_io);
+		return;
 	/* TODO support RESET in future patch in the series */
 	case SPDK_BDEV_IO_TYPE_RESET:
 	case SPDK_BDEV_IO_TYPE_WRITE_ZEROES:
-	case SPDK_BDEV_IO_TYPE_UNMAP:
 	case SPDK_BDEV_IO_TYPE_FLUSH:
 	default:
 		SPDK_ERRLOG("Unknown I/O type %d\n", bdev_io->type);
@@ -265,42 +455,12 @@ vbdev_compress_io_type_supported(void *ctx, enum spdk_bdev_io_type io_type)
 	case SPDK_BDEV_IO_TYPE_WRITE:
 		return spdk_bdev_io_type_supported(comp_bdev->base_bdev, io_type);
 	case SPDK_BDEV_IO_TYPE_UNMAP:
+		return true;
 	case SPDK_BDEV_IO_TYPE_RESET:
 	case SPDK_BDEV_IO_TYPE_FLUSH:
 	case SPDK_BDEV_IO_TYPE_WRITE_ZEROES:
 	default:
 		return false;
-	}
-}
-
-/* Resubmission function used by the bdev layer when a queued IO is ready to be
- * submitted.
- */
-static void
-vbdev_compress_resubmit_io(void *arg)
-{
-	struct spdk_bdev_io *bdev_io = (struct spdk_bdev_io *)arg;
-	struct comp_bdev_io *io_ctx = (struct comp_bdev_io *)bdev_io->driver_ctx;
-
-	vbdev_compress_submit_request(io_ctx->ch, bdev_io);
-}
-
-/* Used to queue an IO in the event of resource issues. */
-static void
-vbdev_compress_queue_io(struct spdk_bdev_io *bdev_io)
-{
-	struct comp_bdev_io *io_ctx = (struct comp_bdev_io *)bdev_io->driver_ctx;
-	int rc;
-
-	io_ctx->bdev_io_wait.bdev = bdev_io->bdev;
-	io_ctx->bdev_io_wait.cb_fn = vbdev_compress_resubmit_io;
-	io_ctx->bdev_io_wait.cb_arg = bdev_io;
-
-	rc = spdk_bdev_queue_io_wait(bdev_io->bdev, io_ctx->comp_bdev->base_ch, &io_ctx->bdev_io_wait);
-	if (rc) {
-		SPDK_ERRLOG("Queue io failed in vbdev_compress_queue_io, rc=%d.\n", rc);
-		assert(false);
-		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 	}
 }
 
@@ -321,11 +481,17 @@ _vbdev_compress_destruct_cb(void *ctx)
 {
 	struct vbdev_compress *comp_bdev = ctx;
 
-	TAILQ_REMOVE(&g_vbdev_comp, comp_bdev, link);
-	spdk_bdev_module_release_bdev(comp_bdev->base_bdev);
 	/* Close the underlying bdev on its same opened thread. */
 	spdk_bdev_close(comp_bdev->base_desc);
 	comp_bdev->vol = NULL;
+	if (comp_bdev->init_failed) {
+		free(comp_bdev);
+		return;
+	}
+
+	TAILQ_REMOVE(&g_vbdev_comp, comp_bdev, link);
+	spdk_bdev_module_release_bdev(comp_bdev->base_bdev);
+
 	if (comp_bdev->orphaned == false) {
 		spdk_io_device_unregister(comp_bdev, _device_unregister_cb);
 	} else {
@@ -362,11 +528,11 @@ _reduce_destroy_cb(void *ctx, int reduce_errno)
 
 	comp_bdev->vol = NULL;
 	spdk_put_io_channel(comp_bdev->base_ch);
-	if (comp_bdev->orphaned == false) {
+	if (comp_bdev->init_failed || comp_bdev->orphaned) {
+		vbdev_compress_destruct_cb((void *)comp_bdev, 0);
+	} else {
 		spdk_bdev_unregister(&comp_bdev->comp_bdev, vbdev_compress_delete_done,
 				     comp_bdev->delete_ctx);
-	} else {
-		vbdev_compress_destruct_cb((void *)comp_bdev, 0);
 	}
 
 }
@@ -394,8 +560,8 @@ delete_vol_unload_cb(void *cb_arg, int reduce_errno)
 	struct vbdev_compress *comp_bdev = (struct vbdev_compress *)cb_arg;
 
 	if (reduce_errno) {
-		SPDK_ERRLOG("number %d\n", reduce_errno);
-		/* FIXME: callback should be executed. */
+		SPDK_ERRLOG("Failed to unload vol, error %s\n", spdk_strerror(-reduce_errno));
+		vbdev_compress_delete_done(comp_bdev->delete_ctx, reduce_errno);
 		return;
 	}
 
@@ -490,12 +656,28 @@ static int
 vbdev_compress_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 {
 	struct vbdev_compress *comp_bdev = (struct vbdev_compress *)ctx;
+	const struct spdk_reduce_vol_info *vol_info;
+	char *comp_algo = NULL;
+
+	if (comp_bdev->params.comp_algo == SPDK_ACCEL_COMP_ALGO_LZ4) {
+		comp_algo = "lz4";
+	} else if (comp_bdev->params.comp_algo == SPDK_ACCEL_COMP_ALGO_DEFLATE) {
+		comp_algo = "deflate";
+	} else {
+		assert(false);
+	}
 
 	spdk_json_write_name(w, "compress");
 	spdk_json_write_object_begin(w);
 	spdk_json_write_named_string(w, "name", spdk_bdev_get_name(&comp_bdev->comp_bdev));
 	spdk_json_write_named_string(w, "base_bdev_name", spdk_bdev_get_name(comp_bdev->base_bdev));
 	spdk_json_write_named_string(w, "pm_path", spdk_reduce_vol_get_pm_path(comp_bdev->vol));
+	spdk_json_write_named_string(w, "comp_algo", comp_algo);
+	spdk_json_write_named_uint32(w, "comp_level", comp_bdev->params.comp_level);
+	spdk_json_write_named_uint32(w, "chunk_size", comp_bdev->params.chunk_size);
+	spdk_json_write_named_uint32(w, "backing_io_unit_size", comp_bdev->params.backing_io_unit_size);
+	vol_info = spdk_reduce_vol_get_info(comp_bdev->vol);
+	spdk_json_write_named_uint64(w, "allocated_io_units", vol_info->allocated_io_units);
 	spdk_json_write_object_end(w);
 
 	return 0;
@@ -516,8 +698,37 @@ struct vbdev_init_reduce_ctx {
 };
 
 static void
-_vbdev_reduce_init_unload_cb(void *ctx, int reduce_errno)
+_cleanup_vol_unload_cb(void *ctx)
 {
+	struct vbdev_compress *comp_bdev = ctx;
+
+	assert(!comp_bdev->reduce_thread ||
+	       comp_bdev->reduce_thread == spdk_get_thread());
+
+	comp_bdev->base_ch = spdk_bdev_get_io_channel(comp_bdev->base_desc);
+
+	spdk_reduce_vol_destroy(&comp_bdev->backing_dev, _reduce_destroy_cb, comp_bdev);
+}
+
+static void
+init_vol_unload_cb(void *ctx, int reduce_errno)
+{
+	struct vbdev_compress *comp_bdev = (struct vbdev_compress *)ctx;
+
+	if (reduce_errno) {
+		SPDK_ERRLOG("Failed to unload vol, error %s\n", spdk_strerror(-reduce_errno));
+	}
+
+	pthread_mutex_lock(&comp_bdev->reduce_lock);
+	if (comp_bdev->reduce_thread && comp_bdev->reduce_thread != spdk_get_thread()) {
+		spdk_thread_send_msg(comp_bdev->reduce_thread,
+				     _cleanup_vol_unload_cb, comp_bdev);
+		pthread_mutex_unlock(&comp_bdev->reduce_lock);
+	} else {
+		pthread_mutex_unlock(&comp_bdev->reduce_lock);
+
+		_cleanup_vol_unload_cb(comp_bdev);
+	}
 }
 
 static void
@@ -525,25 +736,31 @@ _vbdev_reduce_init_cb(void *ctx)
 {
 	struct vbdev_init_reduce_ctx *init_ctx = ctx;
 	struct vbdev_compress *comp_bdev = init_ctx->comp_bdev;
-	int rc;
+	int rc = init_ctx->status;
 
 	assert(comp_bdev->base_desc != NULL);
 
 	/* We're done with metadata operations */
 	spdk_put_io_channel(comp_bdev->base_ch);
 
-	if (comp_bdev->vol) {
-		rc = vbdev_compress_claim(comp_bdev);
-		if (rc == 0) {
-			init_ctx->cb_fn(init_ctx->cb_ctx, rc);
-			free(init_ctx);
-			return;
-		} else {
-			spdk_reduce_vol_unload(comp_bdev->vol, _vbdev_reduce_init_unload_cb, NULL);
-		}
-		init_ctx->cb_fn(init_ctx->cb_ctx, rc);
+	if (rc != 0) {
+		goto err;
 	}
 
+	assert(comp_bdev->vol != NULL);
+
+	rc = vbdev_compress_claim(comp_bdev);
+	if (rc != 0) {
+		comp_bdev->init_failed = true;
+		spdk_reduce_vol_unload(comp_bdev->vol, init_vol_unload_cb, comp_bdev);
+	}
+
+	init_ctx->cb_fn(init_ctx->cb_ctx, rc);
+	free(init_ctx);
+	return;
+
+err:
+	init_ctx->cb_fn(init_ctx->cb_ctx, rc);
 	/* Close the underlying bdev on its same opened thread. */
 	spdk_bdev_close(comp_bdev->base_desc);
 	free(comp_bdev);
@@ -563,9 +780,8 @@ vbdev_reduce_init_cb(void *cb_arg, struct spdk_reduce_vol *vol, int reduce_errno
 	if (reduce_errno == 0) {
 		comp_bdev->vol = vol;
 	} else {
-		SPDK_ERRLOG("for vol %s, error %u\n",
-			    spdk_bdev_get_name(comp_bdev->base_bdev), reduce_errno);
-		init_ctx->cb_fn(init_ctx->cb_ctx, reduce_errno);
+		SPDK_ERRLOG("for vol %s, error %s\n",
+			    spdk_bdev_get_name(comp_bdev->base_bdev), spdk_strerror(-reduce_errno));
 	}
 
 	init_ctx->status = reduce_errno;
@@ -596,83 +812,129 @@ comp_reduce_io_cb(struct spdk_bdev_io *bdev_io, bool success, void *arg)
 	cb_args->cb_fn(cb_args->cb_arg, reduce_errno);
 }
 
-/* This is the function provided to the reduceLib for sending reads directly to
- * the backing device.
- */
 static void
-_comp_reduce_readv(struct spdk_reduce_backing_dev *dev, struct iovec *iov, int iovcnt,
-		   uint64_t lba, uint32_t lba_count, struct spdk_reduce_vol_cb_args *args)
+_comp_backing_bdev_queue_io_wait(struct vbdev_compress *comp_bdev,
+				 struct spdk_reduce_backing_io *backing_io)
 {
-	struct vbdev_compress *comp_bdev = SPDK_CONTAINEROF(dev, struct vbdev_compress,
+	struct spdk_bdev_io_wait_entry *waitq_entry;
+	int rc;
+
+	waitq_entry = (struct spdk_bdev_io_wait_entry *) &backing_io->user_ctx;
+	waitq_entry->bdev = spdk_bdev_desc_get_bdev(comp_bdev->base_desc);
+	waitq_entry->cb_fn = _comp_reduce_resubmit_backing_io;
+	waitq_entry->cb_arg = backing_io;
+
+	rc = spdk_bdev_queue_io_wait(waitq_entry->bdev, comp_bdev->base_ch, waitq_entry);
+	if (rc) {
+		SPDK_ERRLOG("Queue io failed in _comp_backing_bdev_queue_io_wait, rc=%d.\n", rc);
+		assert(false);
+		backing_io->backing_cb_args->cb_fn(backing_io->backing_cb_args->cb_arg, rc);
+	}
+}
+
+static void
+_comp_backing_bdev_read(struct spdk_reduce_backing_io *backing_io)
+{
+	struct spdk_reduce_vol_cb_args *backing_cb_args = backing_io->backing_cb_args;
+	struct vbdev_compress *comp_bdev = SPDK_CONTAINEROF(backing_io->dev, struct vbdev_compress,
 					   backing_dev);
 	int rc;
 
 	rc = spdk_bdev_readv_blocks(comp_bdev->base_desc, comp_bdev->base_ch,
-				    iov, iovcnt, lba, lba_count,
+				    backing_io->iov, backing_io->iovcnt,
+				    backing_io->lba, backing_io->lba_count,
 				    comp_reduce_io_cb,
-				    args);
+				    backing_cb_args);
+
 	if (rc) {
 		if (rc == -ENOMEM) {
-			SPDK_ERRLOG("No memory, start to queue io.\n");
-			/* TODO: there's no bdev_io to queue */
+			_comp_backing_bdev_queue_io_wait(comp_bdev, backing_io);
+			return;
 		} else {
-			SPDK_ERRLOG("submitting readv request\n");
+			SPDK_ERRLOG("submitting readv request, rc=%d\n", rc);
 		}
-		args->cb_fn(args->cb_arg, rc);
+		backing_cb_args->cb_fn(backing_cb_args->cb_arg, rc);
 	}
 }
 
-/* This is the function provided to the reduceLib for sending writes directly to
- * the backing device.
- */
 static void
-_comp_reduce_writev(struct spdk_reduce_backing_dev *dev, struct iovec *iov, int iovcnt,
-		    uint64_t lba, uint32_t lba_count, struct spdk_reduce_vol_cb_args *args)
+_comp_backing_bdev_write(struct spdk_reduce_backing_io  *backing_io)
 {
-	struct vbdev_compress *comp_bdev = SPDK_CONTAINEROF(dev, struct vbdev_compress,
+	struct spdk_reduce_vol_cb_args *backing_cb_args = backing_io->backing_cb_args;
+	struct vbdev_compress *comp_bdev = SPDK_CONTAINEROF(backing_io->dev, struct vbdev_compress,
 					   backing_dev);
 	int rc;
 
 	rc = spdk_bdev_writev_blocks(comp_bdev->base_desc, comp_bdev->base_ch,
-				     iov, iovcnt, lba, lba_count,
+				     backing_io->iov, backing_io->iovcnt,
+				     backing_io->lba, backing_io->lba_count,
 				     comp_reduce_io_cb,
-				     args);
+				     backing_cb_args);
+
 	if (rc) {
 		if (rc == -ENOMEM) {
-			SPDK_ERRLOG("No memory, start to queue io.\n");
-			/* TODO: there's no bdev_io to queue */
+			_comp_backing_bdev_queue_io_wait(comp_bdev, backing_io);
+			return;
 		} else {
-			SPDK_ERRLOG("error submitting writev request\n");
+			SPDK_ERRLOG("error submitting writev request, rc=%d\n", rc);
 		}
-		args->cb_fn(args->cb_arg, rc);
+		backing_cb_args->cb_fn(backing_cb_args->cb_arg, rc);
 	}
 }
 
-/* This is the function provided to the reduceLib for sending unmaps directly to
- * the backing device.
- */
 static void
-_comp_reduce_unmap(struct spdk_reduce_backing_dev *dev,
-		   uint64_t lba, uint32_t lba_count, struct spdk_reduce_vol_cb_args *args)
+_comp_backing_bdev_unmap(struct spdk_reduce_backing_io *backing_io)
 {
-	struct vbdev_compress *comp_bdev = SPDK_CONTAINEROF(dev, struct vbdev_compress,
+	struct spdk_reduce_vol_cb_args *backing_cb_args = backing_io->backing_cb_args;
+	struct vbdev_compress *comp_bdev = SPDK_CONTAINEROF(backing_io->dev, struct vbdev_compress,
 					   backing_dev);
 	int rc;
 
 	rc = spdk_bdev_unmap_blocks(comp_bdev->base_desc, comp_bdev->base_ch,
-				    lba, lba_count,
+				    backing_io->lba, backing_io->lba_count,
 				    comp_reduce_io_cb,
-				    args);
+				    backing_cb_args);
 
 	if (rc) {
 		if (rc == -ENOMEM) {
-			SPDK_ERRLOG("No memory, start to queue io.\n");
-			/* TODO: there's no bdev_io to queue */
+			_comp_backing_bdev_queue_io_wait(comp_bdev, backing_io);
+			return;
 		} else {
-			SPDK_ERRLOG("submitting unmap request\n");
+			SPDK_ERRLOG("submitting unmap request, rc=%d\n", rc);
 		}
-		args->cb_fn(args->cb_arg, rc);
+		backing_cb_args->cb_fn(backing_cb_args->cb_arg, rc);
 	}
+}
+
+/* This is the function provided to the reduceLib for sending reads/writes/unmaps
+ * directly to the backing device.
+ */
+static void
+_comp_reduce_submit_backing_io(struct spdk_reduce_backing_io *backing_io)
+{
+	switch (backing_io->backing_io_type) {
+	case SPDK_REDUCE_BACKING_IO_WRITE:
+		_comp_backing_bdev_write(backing_io);
+		break;
+	case SPDK_REDUCE_BACKING_IO_READ:
+		_comp_backing_bdev_read(backing_io);
+		break;
+	case SPDK_REDUCE_BACKING_IO_UNMAP:
+		_comp_backing_bdev_unmap(backing_io);
+		break;
+	default:
+		SPDK_ERRLOG("Unknown I/O type %d\n", backing_io->backing_io_type);
+		backing_io->backing_cb_args->cb_fn(backing_io->backing_cb_args->cb_arg, -EINVAL);
+		break;
+	}
+}
+
+static void
+_comp_reduce_resubmit_backing_io(void *_backing_io)
+{
+	struct spdk_reduce_backing_io *backing_io = _backing_io;
+
+	_comp_reduce_submit_backing_io(backing_io);
 }
 
 /* Called by reduceLib after performing unload vol actions following base bdev hotremove */
@@ -728,7 +990,8 @@ vbdev_compress_base_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bd
  * information for reducelib to init or load.
  */
 struct vbdev_compress *
-_prepare_for_load_init(struct spdk_bdev_desc *bdev_desc, uint32_t lb_size)
+_prepare_for_load_init(struct spdk_bdev_desc *bdev_desc, uint32_t lb_size, uint8_t comp_algo,
+		       uint32_t comp_level)
 {
 	struct vbdev_compress *comp_bdev;
 	struct spdk_bdev *bdev;
@@ -739,9 +1002,7 @@ _prepare_for_load_init(struct spdk_bdev_desc *bdev_desc, uint32_t lb_size)
 		return NULL;
 	}
 
-	comp_bdev->backing_dev.unmap = _comp_reduce_unmap;
-	comp_bdev->backing_dev.readv = _comp_reduce_readv;
-	comp_bdev->backing_dev.writev = _comp_reduce_writev;
+	comp_bdev->backing_dev.submit_backing_io = _comp_reduce_submit_backing_io;
 	comp_bdev->backing_dev.compress = _comp_reduce_compress;
 	comp_bdev->backing_dev.decompress = _comp_reduce_decompress;
 
@@ -752,6 +1013,12 @@ _prepare_for_load_init(struct spdk_bdev_desc *bdev_desc, uint32_t lb_size)
 	comp_bdev->backing_dev.blocklen = bdev->blocklen;
 	comp_bdev->backing_dev.blockcnt = bdev->blockcnt;
 
+	comp_bdev->backing_dev.user_ctx_size = sizeof(struct spdk_bdev_io_wait_entry);
+
+	comp_bdev->comp_algo = comp_algo;
+	comp_bdev->comp_level = comp_level;
+	comp_bdev->params.comp_algo = comp_algo;
+	comp_bdev->params.comp_level = comp_level;
 	comp_bdev->params.chunk_size = CHUNK_SIZE;
 	if (lb_size == 0) {
 		comp_bdev->params.logical_block_size = bdev->blocklen;
@@ -765,8 +1032,8 @@ _prepare_for_load_init(struct spdk_bdev_desc *bdev_desc, uint32_t lb_size)
 
 /* Call reducelib to initialize a new volume */
 static int
-vbdev_init_reduce(const char *bdev_name, const char *pm_path, uint32_t lb_size,
-		  bdev_compress_create_cb cb_fn, void *cb_arg)
+vbdev_init_reduce(const char *bdev_name, const char *pm_path, uint32_t lb_size, uint8_t comp_algo,
+		  uint32_t comp_level, bdev_compress_create_cb cb_fn, void *cb_arg)
 {
 	struct spdk_bdev_desc *bdev_desc = NULL;
 	struct vbdev_init_reduce_ctx *init_ctx;
@@ -790,7 +1057,7 @@ vbdev_init_reduce(const char *bdev_name, const char *pm_path, uint32_t lb_size,
 		return rc;
 	}
 
-	comp_bdev = _prepare_for_load_init(bdev_desc, lb_size);
+	comp_bdev = _prepare_for_load_init(bdev_desc, lb_size, comp_algo, comp_level);
 	if (comp_bdev == NULL) {
 		free(init_ctx);
 		spdk_bdev_close(bdev_desc);
@@ -883,13 +1150,40 @@ comp_bdev_ch_destroy_cb(void *io_device, void *ctx_buf)
 	pthread_mutex_unlock(&comp_bdev->reduce_lock);
 }
 
+static int
+_check_compress_bdev_comp_algo(enum spdk_accel_comp_algo algo, uint32_t comp_level)
+{
+	uint32_t min_level, max_level;
+	int rc;
+
+	rc = spdk_accel_get_compress_level_range(algo, &min_level, &max_level);
+	if (rc != 0) {
+		return rc;
+	}
+
+	/* If both min_level and max_level are 0, the compression level can be ignored.
+	 * The back-end implementation hardcodes the compression level.
+	 */
+	if (min_level == 0 && max_level == 0) {
+		return 0;
+	}
+
+	if (comp_level > max_level || comp_level < min_level) {
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 /* RPC entry point for compression vbdev creation. */
 int
 create_compress_bdev(const char *bdev_name, const char *pm_path, uint32_t lb_size,
+		     uint8_t comp_algo, uint32_t comp_level,
 		     bdev_compress_create_cb cb_fn, void *cb_arg)
 {
 	struct vbdev_compress *comp_bdev = NULL;
 	struct stat info;
+	int rc;
 
 	if (stat(pm_path, &info) != 0) {
 		SPDK_ERRLOG("PM path %s does not exist.\n", pm_path);
@@ -904,13 +1198,20 @@ create_compress_bdev(const char *bdev_name, const char *pm_path, uint32_t lb_siz
 		return -EINVAL;
 	}
 
+	rc = _check_compress_bdev_comp_algo(comp_algo, comp_level);
+	if (rc != 0) {
+		SPDK_ERRLOG("Compress bdev doesn't support compression algo(%u) or level(%u)\n",
+			    comp_algo, comp_level);
+		return rc;
+	}
+
 	TAILQ_FOREACH(comp_bdev, &g_vbdev_comp, link) {
 		if (strcmp(bdev_name, comp_bdev->base_bdev->name) == 0) {
 			SPDK_ERRLOG("Bass bdev %s already being used for a compress bdev\n", bdev_name);
 			return -EBUSY;
 		}
 	}
-	return vbdev_init_reduce(bdev_name, pm_path, lb_size, cb_fn, cb_arg);
+	return vbdev_init_reduce(bdev_name, pm_path, lb_size, comp_algo, comp_level, cb_fn, cb_arg);
 }
 
 static int
@@ -1196,6 +1497,8 @@ vbdev_reduce_load_cb(void *cb_arg, struct spdk_reduce_vol *vol, int reduce_errno
 		comp_bdev->vol = vol;
 		memcpy(&comp_bdev->params, spdk_reduce_vol_get_params(vol),
 		       sizeof(struct spdk_reduce_vol_params));
+		comp_bdev->comp_algo = comp_bdev->params.comp_algo;
+		comp_bdev->comp_level = comp_bdev->params.comp_level;
 	}
 
 	comp_bdev->reduce_errno = reduce_errno;
@@ -1232,7 +1535,7 @@ vbdev_compress_examine(struct spdk_bdev *bdev)
 		return;
 	}
 
-	comp_bdev = _prepare_for_load_init(bdev_desc, 0);
+	comp_bdev = _prepare_for_load_init(bdev_desc, 0, SPDK_ACCEL_COMP_ALGO_DEFLATE, 1);
 	if (comp_bdev == NULL) {
 		spdk_bdev_close(bdev_desc);
 		spdk_bdev_module_examine_done(&compress_if);

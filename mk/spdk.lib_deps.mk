@@ -35,8 +35,11 @@ endif
 
 DEPDIRS-conf := log util
 DEPDIRS-json := log util
-DEPDIRS-rdma_provider := log util
 DEPDIRS-rdma_utils := dma log util
+DEPDIRS-rdma_provider := log util rdma_utils
+ifeq ($(CONFIG_RDMA_PROV),mlx5_dv)
+DEPDIRS-rdma_provider += dma mlx5
+endif
 DEPDIRS-reduce := log util
 DEPDIRS-thread := log util trace
 DEPDIRS-keyring := log util $(JSON_LIBS)
@@ -49,7 +52,7 @@ ifeq ($(CONFIG_RDMA),y)
 DEPDIRS-nvme += rdma_provider rdma_utils
 endif
 
-DEPDIRS-blob := log util thread dma
+DEPDIRS-blob := log util thread dma trace
 DEPDIRS-accel := log util thread json rpc jsonrpc dma
 DEPDIRS-jsonrpc := log util json
 DEPDIRS-virtio := log util json thread vfio_user
@@ -138,7 +141,6 @@ DEPDIRS-bdev_ftl := $(BDEV_DEPS) ftl
 endif
 DEPDIRS-bdev_gpt := bdev json log thread util
 
-DEPDIRS-bdev_error := $(BDEV_DEPS)
 DEPDIRS-bdev_lvol := $(BDEV_DEPS) lvol blob blob_bdev
 DEPDIRS-bdev_rpc := $(BDEV_DEPS)
 DEPDIRS-bdev_split := $(BDEV_DEPS)
@@ -147,13 +149,14 @@ DEPDIRS-bdev_aio := $(BDEV_DEPS_THREAD)
 DEPDIRS-bdev_compress := $(BDEV_DEPS_THREAD) reduce accel
 DEPDIRS-bdev_crypto := $(BDEV_DEPS_THREAD) accel
 DEPDIRS-bdev_delay := $(BDEV_DEPS_THREAD)
+DEPDIRS-bdev_error := $(BDEV_DEPS_THREAD)
 DEPDIRS-bdev_iscsi := $(BDEV_DEPS_THREAD)
 DEPDIRS-bdev_malloc := $(BDEV_DEPS_THREAD) accel dma
 DEPDIRS-bdev_null := $(BDEV_DEPS_THREAD)
 DEPDIRS-bdev_nvme = $(BDEV_DEPS_THREAD) accel keyring nvme trace
 DEPDIRS-bdev_ocf := $(BDEV_DEPS_THREAD)
 DEPDIRS-bdev_passthru := $(BDEV_DEPS_THREAD)
-DEPDIRS-bdev_raid := $(BDEV_DEPS_THREAD)
+DEPDIRS-bdev_raid := $(BDEV_DEPS_THREAD) trace
 ifeq ($(CONFIG_RAID5F),y)
 DEPDIRS-bdev_raid += accel
 endif

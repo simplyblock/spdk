@@ -28,6 +28,7 @@
 #include "spdk/nvmf_spec.h"
 #include "spdk/tree.h"
 #include "spdk/uuid.h"
+#include "spdk/fd_group.h"
 
 #include "spdk_internal/assert.h"
 #include "spdk/log.h"
@@ -162,6 +163,7 @@ extern struct spdk_nvme_transport_opts g_spdk_nvme_transport_opts;
  *  try to configure, if available.
  */
 #define DEFAULT_MAX_IO_QUEUES		(1024)
+#define MAX_IO_QUEUES_WITH_INTERRUPTS	(256)
 #define DEFAULT_ADMIN_QUEUE_SIZE	(32)
 #define DEFAULT_IO_QUEUE_SIZE		(256)
 #define DEFAULT_IO_QUEUE_SIZE_FOR_QUIRK	(1024) /* Matches Linux kernel driver */
@@ -410,13 +412,6 @@ enum nvme_qpair_state {
 	NVME_QPAIR_DESTROYING,
 };
 
-enum nvme_qpair_connect_state {
-	NVME_QPAIR_CONNECT_STATE_CONNECTING,
-	NVME_QPAIR_CONNECT_STATE_AUTHENTICATING,
-	NVME_QPAIR_CONNECT_STATE_CONNECTED,
-	NVME_QPAIR_CONNECT_STATE_FAILED,
-};
-
 enum nvme_qpair_auth_state {
 	NVME_QPAIR_AUTH_STATE_NEGOTIATE,
 	NVME_QPAIR_AUTH_STATE_AWAIT_NEGOTIATE,
@@ -449,6 +444,9 @@ struct nvme_auth {
 	uint8_t				hash;
 	/* Buffer used for controller challenge */
 	uint8_t				challenge[NVME_AUTH_DIGEST_MAX_SIZE];
+	/* User's auth cb fn/ctx */
+	spdk_nvme_authenticate_cb	cb_fn;
+	void				*cb_ctx;
 };
 
 struct spdk_nvme_qpair {
@@ -519,7 +517,6 @@ struct spdk_nvme_qpair {
 	/* Entries below here are not touched in the main I/O path. */
 
 	struct nvme_completion_poll_status	*poll_status;
-	enum nvme_qpair_connect_state		connect_state;
 
 	/* List entry for spdk_nvme_ctrlr::active_io_qpairs */
 	TAILQ_ENTRY(spdk_nvme_qpair)		tailq;
@@ -540,6 +537,14 @@ struct spdk_nvme_poll_group {
 	struct spdk_nvme_accel_fn_table			accel_fn_table;
 	STAILQ_HEAD(, spdk_nvme_transport_poll_group)	tgroups;
 	bool						in_process_completions;
+	bool						enable_interrupts;
+	bool						enable_interrupts_is_valid;
+	int						disconnect_qpair_fd;
+	struct spdk_fd_group				*fgrp;
+	struct {
+		spdk_nvme_poll_group_interrupt_cb	cb_fn;
+		void					*cb_ctx;
+	} interrupt;
 };
 
 struct spdk_nvme_transport_poll_group {
@@ -591,6 +596,29 @@ struct spdk_nvme_ns {
 
 	RB_ENTRY(spdk_nvme_ns)		node;
 };
+
+#define CTRLR_STRING(ctrlr) \
+	(spdk_nvme_trtype_is_fabrics(ctrlr->trid.trtype) ? \
+	ctrlr->trid.subnqn : ctrlr->trid.traddr)
+
+#define NVME_CTRLR_ERRLOG(ctrlr, format, ...) \
+	SPDK_ERRLOG("[%s, %u] " format, CTRLR_STRING(ctrlr), ctrlr->cntlid, ##__VA_ARGS__);
+
+#define NVME_CTRLR_WARNLOG(ctrlr, format, ...) \
+	SPDK_WARNLOG("[%s, %u] " format, CTRLR_STRING(ctrlr), ctrlr->cntlid, ##__VA_ARGS__);
+
+#define NVME_CTRLR_NOTICELOG(ctrlr, format, ...) \
+	SPDK_NOTICELOG("[%s, %u] " format, CTRLR_STRING(ctrlr), ctrlr->cntlid, ##__VA_ARGS__);
+
+#define NVME_CTRLR_INFOLOG(ctrlr, format, ...) \
+	SPDK_INFOLOG(nvme, "[%s, %u] " format, CTRLR_STRING(ctrlr), ctrlr->cntlid, ##__VA_ARGS__);
+
+#ifdef DEBUG
+#define NVME_CTRLR_DEBUGLOG(ctrlr, format, ...) \
+	SPDK_DEBUGLOG(nvme, "[%s, %u] " format, CTRLR_STRING(ctrlr), ctrlr->cntlid, ##__VA_ARGS__);
+#else
+#define NVME_CTRLR_DEBUGLOG(ctrlr, ...) do { } while (0)
+#endif
 
 /**
  * State of struct spdk_nvme_ctrlr (in particular, during initialization).
@@ -881,9 +909,9 @@ enum nvme_ctrlr_state {
 #define NVME_TIMEOUT_INFINITE		0
 #define NVME_TIMEOUT_KEEP_EXISTING	UINT64_MAX
 
-struct spdk_nvme_ctrlr_aer_completion_list {
+struct spdk_nvme_ctrlr_aer_completion {
 	struct spdk_nvme_cpl	cpl;
-	STAILQ_ENTRY(spdk_nvme_ctrlr_aer_completion_list) link;
+	STAILQ_ENTRY(spdk_nvme_ctrlr_aer_completion) link;
 };
 
 /*
@@ -923,7 +951,7 @@ struct spdk_nvme_ctrlr_process {
 	uint64_t			timeout_admin_ticks;
 
 	/** List to publish AENs to all procs in multiprocess setup */
-	STAILQ_HEAD(, spdk_nvme_ctrlr_aer_completion_list)      async_events;
+	STAILQ_HEAD(, spdk_nvme_ctrlr_aer_completion)      async_events;
 };
 
 struct nvme_register_completion {
@@ -980,6 +1008,12 @@ struct spdk_nvme_ctrlr {
 	/* Cold data (not accessed in normal I/O path) is after this point. */
 
 	struct spdk_nvme_transport_id	trid;
+
+	struct {
+		/** Is numa.id valid? Ensures numa.id == 0 is interpreted correctly. */
+		uint32_t		id_valid : 1;
+		int32_t			id : 31;
+	} numa;
 
 	union spdk_nvme_cap_register	cap;
 	union spdk_nvme_vs_register	vs;
@@ -1095,14 +1129,21 @@ struct spdk_nvme_ctrlr {
 	uint32_t				auth_seqnum;
 };
 
+struct spdk_nvme_detach_ctx {
+	TAILQ_HEAD(, nvme_ctrlr_detach_ctx)	head;
+};
+
 struct spdk_nvme_probe_ctx {
 	struct spdk_nvme_transport_id		trid;
 	const struct spdk_nvme_ctrlr_opts	*opts;
 	void					*cb_ctx;
 	spdk_nvme_probe_cb			probe_cb;
 	spdk_nvme_attach_cb			attach_cb;
+	spdk_nvme_attach_fail_cb		attach_fail_cb;
 	spdk_nvme_remove_cb			remove_cb;
 	TAILQ_HEAD(, spdk_nvme_ctrlr)		init_ctrlrs;
+	/* detach contexts allocated for controllers that failed to initialize */
+	struct spdk_nvme_detach_ctx		failed_ctxs;
 };
 
 typedef void (*nvme_ctrlr_detach_cb)(struct spdk_nvme_ctrlr *ctrlr);
@@ -1123,10 +1164,6 @@ struct nvme_ctrlr_detach_ctx {
 	enum nvme_ctrlr_detach_state		state;
 	union spdk_nvme_csts_register		csts;
 	TAILQ_ENTRY(nvme_ctrlr_detach_ctx)	link;
-};
-
-struct spdk_nvme_detach_ctx {
-	TAILQ_HEAD(, nvme_ctrlr_detach_ctx)	head;
 };
 
 struct nvme_driver {
@@ -1204,6 +1241,7 @@ nvme_ctrlr_unlock(struct spdk_nvme_ctrlr *ctrlr)
 /* Poll group management functions. */
 int nvme_poll_group_connect_qpair(struct spdk_nvme_qpair *qpair);
 int nvme_poll_group_disconnect_qpair(struct spdk_nvme_qpair *qpair);
+void nvme_poll_group_write_disconnect_qpair_fd(struct spdk_nvme_poll_group *group);
 
 /* Admin functions */
 int	nvme_ctrlr_cmd_identify(struct spdk_nvme_ctrlr *ctrlr,
@@ -1346,6 +1384,7 @@ int	nvme_fabric_ctrlr_discover(struct spdk_nvme_ctrlr *ctrlr,
 int	nvme_fabric_qpair_connect(struct spdk_nvme_qpair *qpair, uint32_t num_entries);
 int	nvme_fabric_qpair_connect_async(struct spdk_nvme_qpair *qpair, uint32_t num_entries);
 int	nvme_fabric_qpair_connect_poll(struct spdk_nvme_qpair *qpair);
+bool	nvme_fabric_qpair_auth_required(struct spdk_nvme_qpair *qpair);
 int	nvme_fabric_qpair_authenticate_async(struct spdk_nvme_qpair *qpair);
 int	nvme_fabric_qpair_authenticate_poll(struct spdk_nvme_qpair *qpair);
 
@@ -1515,6 +1554,14 @@ nvme_cleanup_user_req(struct nvme_request *req)
 	req->user_cb_fn = NULL;
 }
 
+static inline bool
+nvme_request_abort_match(struct nvme_request *req, void *cmd_cb_arg)
+{
+	return req->cb_arg == cmd_cb_arg ||
+	       req->user_cb_arg == cmd_cb_arg ||
+	       (req->parent != NULL && req->parent->cb_arg == cmd_cb_arg);
+}
+
 static inline void
 nvme_qpair_set_state(struct spdk_nvme_qpair *qpair, enum nvme_qpair_state state)
 {
@@ -1628,6 +1675,7 @@ int nvme_transport_ctrlr_scan(struct spdk_nvme_probe_ctx *probe_ctx, bool direct
 int nvme_transport_ctrlr_scan_attached(struct spdk_nvme_probe_ctx *probe_ctx);
 int nvme_transport_ctrlr_enable(struct spdk_nvme_ctrlr *ctrlr);
 int nvme_transport_ctrlr_ready(struct spdk_nvme_ctrlr *ctrlr);
+int nvme_transport_ctrlr_enable_interrupts(struct spdk_nvme_ctrlr *ctrlr);
 int nvme_transport_ctrlr_set_reg_4(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint32_t value);
 int nvme_transport_ctrlr_set_reg_8(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint64_t value);
 int nvme_transport_ctrlr_get_reg_4(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint32_t *value);
@@ -1663,12 +1711,15 @@ int nvme_transport_ctrlr_get_memory_domains(const struct spdk_nvme_ctrlr *ctrlr,
 void nvme_transport_qpair_abort_reqs(struct spdk_nvme_qpair *qpair);
 int nvme_transport_qpair_reset(struct spdk_nvme_qpair *qpair);
 int nvme_transport_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request *req);
+int nvme_transport_qpair_get_fd(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair,
+				struct spdk_event_handler_opts *opts);
 int32_t nvme_transport_qpair_process_completions(struct spdk_nvme_qpair *qpair,
 		uint32_t max_completions);
 void nvme_transport_admin_qpair_abort_aers(struct spdk_nvme_qpair *qpair);
 int nvme_transport_qpair_iterate_requests(struct spdk_nvme_qpair *qpair,
 		int (*iter_fn)(struct nvme_request *req, void *arg),
 		void *arg);
+int nvme_transport_qpair_authenticate(struct spdk_nvme_qpair *qpair);
 
 struct spdk_nvme_transport_poll_group *nvme_transport_poll_group_create(
 	const struct spdk_nvme_transport *transport);
@@ -1683,6 +1734,9 @@ int nvme_transport_poll_group_disconnect_qpair(struct spdk_nvme_qpair *qpair);
 int nvme_transport_poll_group_connect_qpair(struct spdk_nvme_qpair *qpair);
 int64_t nvme_transport_poll_group_process_completions(struct spdk_nvme_transport_poll_group *tgroup,
 		uint32_t completions_per_qpair, spdk_nvme_disconnected_qpair_cb disconnected_qpair_cb);
+void nvme_transport_poll_group_check_disconnected_qpairs(
+	struct spdk_nvme_transport_poll_group *tgroup,
+	spdk_nvme_disconnected_qpair_cb disconnected_qpair_cb);
 int nvme_transport_poll_group_destroy(struct spdk_nvme_transport_poll_group *tgroup);
 int nvme_transport_poll_group_get_stats(struct spdk_nvme_transport_poll_group *tgroup,
 					struct spdk_nvme_transport_poll_group_stat **stats);

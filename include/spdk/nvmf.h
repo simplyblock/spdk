@@ -654,6 +654,23 @@ int spdk_nvmf_subsystem_add_host_ext(struct spdk_nvmf_subsystem *subsystem,
  */
 int spdk_nvmf_subsystem_remove_host(struct spdk_nvmf_subsystem *subsystem, const char *hostnqn);
 
+struct spdk_nvmf_subsystem_key_opts {
+	/** Size of this structure */
+	size_t				size;
+	/** DH-HMAC-CHAP key */
+	struct spdk_key			*dhchap_key;
+	/** DH-HMAC-CHAP controller key */
+	struct spdk_key			*dhchap_ctrlr_key;
+};
+
+/**
+ * Set keys required for a host to connect to a given subsystem.  This will override the keys set
+ * by `spdk_nvmf_subsystem_add_host_ext()`.
+ */
+int spdk_nvmf_subsystem_set_keys(struct spdk_nvmf_subsystem *subsystem, const char *hostnqn,
+				 struct spdk_nvmf_subsystem_key_opts *opts);
+
+
 /**
  * Disconnect all connections originating from the provided hostnqn
  *
@@ -949,6 +966,20 @@ int spdk_nvmf_subsystem_get_ana_state(struct spdk_nvmf_subsystem *subsystem,
 				      enum spdk_nvme_ana_state *ana_state);
 
 /**
+ * Change ANA group ID of a namespace of a subsystem.
+ *
+ * May only be performed on subsystems in the INACTIVE or PAUSED state.
+ *
+ * \param subsystem Subsystem the namespace belongs to.
+ * \param nsid Namespace ID to change.
+ * \param anagrpid A new ANA group ID to set.
+ *
+ * \return 0 on success, negated errno on failure.
+ */
+int spdk_nvmf_subsystem_set_ns_ana_group(struct spdk_nvmf_subsystem *subsystem,
+		uint32_t nsid, uint32_t anagrpid);
+
+/**
  * Sets the controller ID range for a subsystem.
  *
  * Valid range is [1, 0xFFEF].
@@ -1029,8 +1060,13 @@ struct spdk_nvmf_ns_opts {
 	 * after namespace has been added object becomes invalid.
 	 */
 	const struct spdk_json_val *transport_specific;
+
+	/**
+	 * Enable hide_metadata option to the bdev.
+	 */
+	bool hide_metadata;
 } __attribute__((packed));
-SPDK_STATIC_ASSERT(sizeof(struct spdk_nvmf_ns_opts) == 72, "Incorrect size");
+SPDK_STATIC_ASSERT(sizeof(struct spdk_nvmf_ns_opts) == 73, "Incorrect size");
 
 /**
  * Get default namespace creation options.
@@ -1535,6 +1571,20 @@ struct spdk_nvmf_ns_reservation_ops {
  * @param ops The reservation ops handers
  */
 void spdk_nvmf_set_custom_ns_reservation_ops(const struct spdk_nvmf_ns_reservation_ops *ops);
+
+/**
+ * Send discovery log page change AEN.
+ *
+ * This sends discovery log page change notice to all the controllers in the
+ * target's discovery subsystem associated with host 'hostnqn'.
+ *
+ * \param tgt The target for which discovery log page change notice is to be
+ *            sent.
+ * \param hostnqn The hostnqn to which the notice will be sent. If NULL, all
+ *                the controllers associated with discovery subsystem will have
+ *                the discovery log page change notice.
+ */
+void spdk_nvmf_send_discovery_log_notice(struct spdk_nvmf_tgt *tgt, const char *hostnqn);
 
 #ifdef __cplusplus
 }
