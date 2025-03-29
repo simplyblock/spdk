@@ -1301,6 +1301,59 @@ spdk_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz,
 	return 0;
 }
 
+int
+spdk_lvol_create_hublvol(struct spdk_lvol_store *lvs, spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg)
+{
+	struct spdk_lvol_with_handle_req *req;
+	struct spdk_blob_store *bs;
+	struct spdk_lvol *lvol;
+	struct spdk_blob_opts opts;
+	char *xattr_names[] = {LVOL_NAME, "uuid"};
+	int rc;
+
+	if (lvs == NULL) {
+		SPDK_ERRLOG("lvol store does not exist\n");
+		return -EINVAL;
+	}
+
+	rc = lvs_verify_lvol_name(lvs, "hublvol");
+	if (rc < 0) {
+		return rc;
+	}
+
+	bs = lvs->blobstore;
+
+	req = calloc(1, sizeof(*req));
+	if (!req) {
+		SPDK_ERRLOG("Cannot alloc memory for lvol request pointer\n");
+		return -ENOMEM;
+	}
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+
+	lvol = lvol_alloc(lvs, "hublvol", true, LVOL_CLEAR_WITH_DEFAULT, NULL);
+	if (!lvol) {
+		free(req);
+		SPDK_ERRLOG("Cannot alloc memory for lvol base pointer\n");
+		return -ENOMEM;
+	}
+
+	req->lvol = lvol;
+	spdk_blob_opts_init(&opts, sizeof(opts));
+	opts.thin_provision = true;
+	opts.num_clusters = spdk_divide_round_up(UINT64_MAX, spdk_bs_get_cluster_size(bs));
+	opts.clear_method = lvol->clear_method;
+	opts.xattrs.count = SPDK_COUNTOF(xattr_names);
+	opts.xattrs.names = xattr_names;
+	opts.xattrs.ctx = lvol;
+	opts.xattrs.get_value = lvol_get_xattr_value;
+
+	spdk_bs_create_hubblob(lvs->blobstore, &opts, lvol_create_open_cb, req);
+
+	// spdk_bs_create_blob_ext(lvs->blobstore, &opts, lvol_create_cb, req);
+
+	return 0;
+}
 
 // TODO check the reference for that blob incase of snapshots and clons
 int

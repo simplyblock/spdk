@@ -1584,6 +1584,28 @@ vbdev_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz,
 }
 
 int
+vbdev_lvol_create_hublvol(struct spdk_lvol_store *lvs, spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg)
+{
+	struct spdk_lvol_with_handle_req *req;
+	int rc;
+
+	req = calloc(1, sizeof(*req));
+	if (req == NULL) {
+		return -ENOMEM;
+	}
+	req->lvol_priority_class = 0;
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+
+	rc = spdk_lvol_create_hublvol(lvs, _vbdev_lvol_create_cb, req);
+	if (rc != 0) {
+		free(req);
+	}
+
+	return rc;
+}
+
+int
 vbdev_lvol_register(struct spdk_lvol_store *lvs, const char *name, const char *registered_uuid, uint64_t blobid,
 		  bool thin_provision, enum lvol_clear_method clear_method, int8_t lvol_priority_class,
 		  spdk_lvol_op_with_handle_complete cb_fn,

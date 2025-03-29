@@ -7830,6 +7830,63 @@ error:
 }
 
 void
+spdk_bs_create_hubblob(struct spdk_blob_store *bs,
+	       const struct spdk_blob_opts *opts,
+	       spdk_blob_op_with_handle_complete cb_fn, void *cb_arg)
+{
+	struct spdk_blob	*blob;
+	uint32_t		page_idx;
+	struct spdk_blob_opts	opts_local;
+	struct spdk_blob_xattr_opts internal_xattrs_default;
+	spdk_blob_id		id;
+	int rc;
+
+	assert(spdk_get_thread() == bs->md_thread);
+	page_idx = UINT32_MAX;
+	id = UINT32_MAX;
+	SPDK_DEBUGLOG(blob, "Creating blob with id 0x%" PRIx64 " at page %u\n", id, page_idx);
+
+	spdk_blob_opts_init(&opts_local, sizeof(opts_local));
+	if (opts) {
+		blob_opts_copy(opts, &opts_local);
+	}
+
+	blob = blob_alloc(bs, id);
+	if (!blob) {
+		rc = -ENOMEM;
+		cb_fn(cb_arg, blob, rc);
+	}
+	
+	blob->use_extent_table = opts_local.use_extent_table;
+	if (blob->use_extent_table) {
+		blob->invalid_flags |= SPDK_BLOB_EXTENT_TABLE;
+	}
+
+	rc = blob_set_xattrs(blob, &opts_local.xattrs, false);
+	if (rc < 0) {
+		blob_free(blob);
+		cb_fn(cb_arg, blob, rc);
+	}
+
+	rc = blob_set_xattrs(blob, &internal_xattrs_default, true);
+	if (rc < 0) {
+		blob_free(blob);
+		cb_fn(cb_arg, blob, rc);
+	}
+
+	if (opts_local.thin_provision) {
+		blob_set_thin_provision(blob);
+	}
+
+	blob_set_clear_method(blob, opts_local.clear_method);
+	blob->active.num_clusters = opts_local.num_clusters;
+	blob->open_ref = 1;
+	blob->state = SPDK_BLOB_STATE_CLEAN;
+	cb_fn(cb_arg, blob, rc);
+	return;
+}
+
+void
 spdk_bs_create_blob(struct spdk_blob_store *bs,
 		    spdk_blob_op_with_id_complete cb_fn, void *cb_arg)
 {
