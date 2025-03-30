@@ -1010,6 +1010,7 @@ blob_parse(const struct spdk_blob_md_page *pages, uint32_t page_count,
 	blob->active.pages = tmp;
 
 	blob->active.pages[0] = pages[0].id;
+	blob->map_id = pages[0].reserved0;
 
 	for (i = 1; i < page_count; i++) {
 		assert(spdk_bit_array_get(blob->bs->used_md_pages, pages[i - 1].next));
@@ -1066,6 +1067,7 @@ blob_serialize_add_page(const struct spdk_blob *blob,
 	page = &(*pages)[*page_count - 1];
 	memset(page, 0, sizeof(*page));
 	page->id = blob->id;
+	page->reserved0 = blob->map_id;
 	page->sequence_num = *page_count - 1;
 	page->next = SPDK_INVALID_MD_PAGE;
 	*last_page = page;
@@ -1785,6 +1787,10 @@ blob_load_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	if (rc) {
 		blob_load_final(ctx, rc);
 		return;
+	}
+
+	if (!spdk_bit_array_get(blob->bs->map_blobids, blob->map_id)) {
+		spdk_bit_array_set(blob->bs->map_blobids, blob->map_id);
 	}
 
 	if (blob->extent_table_found == true) {
@@ -4237,6 +4243,7 @@ bs_dev_destroy(void *io_device)
 	spdk_bit_array_free(&bs->open_blobids);
 	spdk_bit_array_free(&bs->used_blobids);
 	spdk_bit_array_free(&bs->used_md_pages);
+	spdk_bit_array_free(&bs->map_blobids);
 	spdk_bit_pool_free(&bs->used_clusters);
 	/*
 	 * If this function is called for any reason except a successful unload,
@@ -4545,13 +4552,14 @@ bs_alloc(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts, struct spdk_blob_st
 	bs->used_md_pages = spdk_bit_array_create(1);
 	bs->used_blobids = spdk_bit_array_create(0);
 	bs->open_blobids = spdk_bit_array_create(0);
+	bs->map_blobids = spdk_bit_array_create(SPDK_BS_MAX_BLOB_COUNT);
 
 	spdk_spin_init(&bs->used_lock);
 
 	spdk_io_device_register(bs, bs_channel_create, bs_channel_destroy,
 				sizeof(struct spdk_bs_channel), "blobstore");
 	rc = bs_register_md_thread(bs);
-	if (rc == -1) {
+	if (rc == -1 || bs->map_blobids == NULL) {
 		spdk_io_device_unregister(bs, NULL);
 		spdk_spin_destroy(&bs->used_lock);
 		spdk_bit_array_free(&bs->open_blobids);
@@ -5764,6 +5772,7 @@ bs_load_replay_md_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 			if (page->sequence_num == 0) {
 				SPDK_NOTICELOG("Recover: blob 0x%" PRIx32 "\n", page_num);
 				spdk_bit_array_set(ctx->bs->used_blobids, page_num);
+				spdk_bit_array_set(ctx->bs->map_blobids, page->reserved0);
 			}
 			if (bs_load_replay_md_parse_page(ctx, page)) {
 				SPDK_INFOLOG(blob, "Recover: blob 0x%" PRIx32 " failed\n", page_num);
@@ -6925,6 +6934,15 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 		return;
 	}
 
+	rc = spdk_bit_array_resize(&bs->map_blobids, SPDK_BS_MAX_BLOB_COUNT);
+	if (rc < 0) {
+		spdk_free(ctx->super);
+		free(ctx);
+		bs_free(bs);
+		cb_fn(cb_arg, NULL, -ENOMEM);
+		return;
+	}
+
 	memcpy(ctx->super->signature, SPDK_BS_SUPER_BLOCK_SIG,
 	       sizeof(ctx->super->signature));
 	ctx->super->version = SPDK_BS_VERSION;
@@ -7561,6 +7579,7 @@ bs_create_blob_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	if (bserrno != 0) {
 		spdk_spin_lock(&blob->bs->used_lock);
 		spdk_bit_array_clear(blob->bs->used_blobids, page_idx);
+		spdk_bit_array_clear(blob->bs->map_blobids, blob->map_id);
 		// remember
 		bs_release_md_page(blob->bs, page_idx);
 		spdk_spin_unlock(&blob->bs->used_lock);
@@ -7719,7 +7738,7 @@ bs_create_blob(struct spdk_blob_store *bs,
 	       spdk_blob_op_with_id_complete cb_fn, void *cb_arg)
 {
 	struct spdk_blob	*blob;
-	uint32_t		page_idx;
+	uint32_t		page_idx, map_id;
 	struct spdk_bs_cpl	cpl;
 	struct spdk_blob_opts	opts_local;
 	struct spdk_blob_xattr_opts internal_xattrs_default;
@@ -7731,12 +7750,14 @@ bs_create_blob(struct spdk_blob_store *bs,
 
 	spdk_spin_lock(&bs->used_lock);
 	page_idx = spdk_bit_array_find_first_clear(bs->used_md_pages, 0);
-	if (page_idx == UINT32_MAX) {
+	map_id = spdk_bit_array_find_first_clear(bs->map_blobids, 0);
+	if (page_idx == UINT32_MAX || map_id == UINT32_MAX) {
 		spdk_spin_unlock(&bs->used_lock);
 		cb_fn(cb_arg, 0, -ENOMEM);
 		return;
 	}
 	spdk_bit_array_set(bs->used_blobids, page_idx);
+	spdk_bit_array_set(bs->map_blobids, map_id);
 	bs_claim_md_page(bs, page_idx);
 	spdk_spin_unlock(&bs->used_lock);
 
@@ -7755,6 +7776,7 @@ bs_create_blob(struct spdk_blob_store *bs,
 		goto error;
 	}
 
+	blob->map_id = map_id;
 	blob->use_extent_table = opts_local.use_extent_table;
 	if (blob->use_extent_table) {
 		blob->invalid_flags |= SPDK_BLOB_EXTENT_TABLE;
@@ -7824,6 +7846,7 @@ error:
 	}
 	spdk_spin_lock(&bs->used_lock);
 	spdk_bit_array_clear(bs->used_blobids, page_idx);
+	spdk_bit_array_clear(bs->map_blobids, map_id);
 	bs_release_md_page(bs, page_idx);
 	spdk_spin_unlock(&bs->used_lock);
 	cb_fn(cb_arg, 0, rc);
@@ -10578,6 +10601,7 @@ bs_delete_blob_finish(void *cb_arg, struct spdk_blob *blob, int bserrno)
 
 	page_num = bs_blobid_to_page(blob->id);
 	spdk_bit_array_clear(blob->bs->used_blobids, page_num);
+	spdk_bit_array_clear(blob->bs->map_blobids, blob->map_id);
 	// remember
 	blob->state = SPDK_BLOB_STATE_DIRTY;
 	blob->active.num_pages = 0;
@@ -10743,6 +10767,7 @@ spdk_bs_delete_blob_non_leader(struct spdk_blob_store *bs, struct spdk_blob *blo
 			free(snapshot_entry);
 		}
 		blob->back_bs_dev = NULL;
+		spdk_bit_array_clear(bs->map_blobids, blob->map_id);
 		blob_free(blob);
 	} else {
 		/* This blob does not have any clones - just remove it */
@@ -10754,6 +10779,7 @@ spdk_bs_delete_blob_non_leader(struct spdk_blob_store *bs, struct spdk_blob *blo
 		page_num = bs_blobid_to_page(blob->id);
 
 		spdk_bit_array_clear(bs->used_blobids, page_num);
+		spdk_bit_array_clear(bs->map_blobids, blob->map_id);
 		bs_release_md_page(bs, page_num);
 
 		for (i = 1; i < blob->active.num_pages; i++) {
@@ -13184,6 +13210,7 @@ bs_update_replay_md_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 			if (page->sequence_num == 0) {
 				SPDK_NOTICELOG("Update: blob 0x%" PRIx32 "\n", page_num);
 				spdk_bit_array_set(ctx->used_blobids, page_num);
+				spdk_bit_array_set(ctx->used_blobids, page->reserved0);
 			}
 			if (bs_update_replay_md_parse_page(ctx, page)) {
 				SPDK_INFOLOG(blob, "Update: blob 0x%" PRIx32 " failed\n", page_num);

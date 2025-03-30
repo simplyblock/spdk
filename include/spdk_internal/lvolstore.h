@@ -110,6 +110,10 @@ struct spdk_pending_iorsp {
 	TAILQ_ENTRY(spdk_pending_iorsp)	entry;
 };
 
+struct spdk_lvs_redirect {
+	struct spdk_lvol *lvol[65535];
+};
+
 struct spdk_lvol_store {
 	struct spdk_bs_dev		*bs_dev;
 	struct spdk_blob_store		*blobstore;
@@ -141,7 +145,10 @@ struct spdk_lvol_store {
 	uint64_t			timeout_trigger;
 	bool 				trigger_leader_sent;
 	bool 				read_only;
+	bool 				primary;
+	bool 				secondary;
 	int 				subsystem_port;
+	struct spdk_lvs_redirect lvol_map;	
 };
 
 struct spdk_lvol {
@@ -151,8 +158,8 @@ struct spdk_lvol {
 	spdk_blob_id			blob_id;
 	bool				leader;
 	bool				update_in_progress;
-	// uint64_t 			timeout_update_bs;
-	// uint64_t 			timeout_change_leadership;
+	bool				hublvol;
+	
 	bool				failed_on_update;
 	char				unique_id[SPDK_LVOL_UNIQUE_ID_MAX];
 	char				name[SPDK_LVOL_NAME_MAX];

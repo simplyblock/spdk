@@ -1094,6 +1094,11 @@ lvol_op_comp(void *cb_arg, int bserrno)
 	if (bserrno != 0) {
 		struct spdk_lvol *lvol = bdev_io->bdev->ctxt;
 		struct spdk_lvol_store *lvs = lvol->lvol_store;
+		uint64_t offset = bdev_io->u.bdev.offset_blocks;
+		if (lvol->hublvol) {
+			lvol = lvs->lvol_map.lvol[offset >> 48];
+		}
+
 		if (lvs->queue_failed_rsp) {
 			if (spdk_lvs_queued_rsp(lvs, bdev_io)) {
 				return;
@@ -1172,6 +1177,25 @@ lvol_read(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 			       num_pages, lvol_op_comp, bdev_io, &lvol_io->ext_io_opts);
 }
 
+
+static void
+hublvol_read(struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
+{
+	uint64_t start_page, num_pages;	
+	struct spdk_blob *blob = lvol->blob;
+	struct vbdev_lvol_io *lvol_io = (struct vbdev_lvol_io *)bdev_io->driver_ctx;
+
+	start_page = bdev_io->u.bdev.offset_blocks;
+	num_pages = bdev_io->u.bdev.num_blocks;
+
+	lvol_io->ext_io_opts.size = sizeof(lvol_io->ext_io_opts);
+	lvol_io->ext_io_opts.memory_domain = bdev_io->u.bdev.memory_domain;
+	lvol_io->ext_io_opts.memory_domain_ctx = bdev_io->u.bdev.memory_domain_ctx;
+
+	spdk_blob_io_readv_ext(blob, ch, bdev_io->u.bdev.iovs, bdev_io->u.bdev.iovcnt, start_page,
+			       num_pages, lvol_op_comp, bdev_io, &lvol_io->ext_io_opts);
+}
+
 static void
 lvol_write(struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 {
@@ -1215,10 +1239,94 @@ lvol_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io, bool s
 }
 
 static void
+hublvol_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io, bool success)
+{
+	struct spdk_lvol *lvol = bdev_io->bdev->ctxt;
+	struct spdk_lvol_store *lvs = lvol->lvol_store;
+	uint64_t offset = bdev_io->u.bdev.offset_blocks;
+	struct spdk_lvol *org_lvol = lvs->lvol_map.lvol[offset >> 48];
+
+	if (!success) {		
+		SPDK_NOTICELOG("FAILED getbuf IO OP in blob: %" PRIu64 " blocks at LBA: %" PRIu64 " blocks CNT %" PRIu64 " and the type is %d \n",
+		 			lvol->blob_id, bdev_io->u.bdev.offset_blocks, bdev_io->u.bdev.num_blocks, bdev_io->type);
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		return;
+	}
+
+	hublvol_read(org_lvol, ch, bdev_io);
+}
+
+static void
+vbdev_hublvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io) {
+	struct spdk_lvol *lvol = bdev_io->bdev->ctxt;
+	struct spdk_lvol_store *lvs = lvol->lvol_store;
+	uint64_t offset =  bdev_io->u.bdev.offset_blocks;
+	struct spdk_lvol *org_lvol = lvs->lvol_map.lvol[offset >> 48];
+
+	if (!lvs->leader) {
+		SPDK_NOTICELOG("FAILED IO receive io for hublvol in nonleader mode  - blob: %" PRIu64 "  "
+								"Lba: %" PRIu64 "  Cnt %" PRIu64 "  t %d \n",
+								lvol->blob_id, bdev_io->u.bdev.offset_blocks,
+								bdev_io->u.bdev.num_blocks, bdev_io->type);
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+	}
+
+	switch (bdev_io->type) {
+	case SPDK_BDEV_IO_TYPE_READ:
+		spdk_bdev_io_get_buf(bdev_io, hublvol_get_buf_cb,
+				     bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen);
+		break;
+	case SPDK_BDEV_IO_TYPE_WRITE:
+		if (lvs->read_only) {
+			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+			return;
+		}
+		lvol_write(org_lvol, ch, bdev_io);
+		break;
+	case SPDK_BDEV_IO_TYPE_RESET:
+		lvol_reset(bdev_io);
+		break;
+	case SPDK_BDEV_IO_TYPE_UNMAP:
+		lvol_unmap(org_lvol, ch, bdev_io);
+		break;
+	case SPDK_BDEV_IO_TYPE_WRITE_ZEROES:
+		if (lvs->read_only) {
+			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+			return;
+		}
+		lvol_write_zeroes(org_lvol, ch, bdev_io);
+		break;
+	case SPDK_BDEV_IO_TYPE_SEEK_DATA:
+		lvol_seek_data(org_lvol, bdev_io);
+		break;
+	case SPDK_BDEV_IO_TYPE_SEEK_HOLE:
+		lvol_seek_hole(org_lvol, bdev_io);
+		break;
+	default:
+		SPDK_INFOLOG(vbdev_lvol, "lvol: unsupported I/O type %d\n", bdev_io->type);
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		return;
+	}
+	return;
+}
+
+
+static void
 vbdev_lvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 {
 	struct spdk_lvol *lvol = bdev_io->bdev->ctxt;
 	struct spdk_lvol_store *lvs = lvol->lvol_store;
+
+	if (!lvs->leader && lvs->secondary) {
+		// redirect the IO
+		// check if the offset is bigger than 48 bit
+		//  int key = (offset) | blob->map_id << 48;
+	}
+
+	if (lvs->primary && lvol->hublvol) {
+		vbdev_hublvol_submit_request(ch, bdev_io);
+		return;
+	}
 
 	if (!lvs->leader) {
 		if (spdk_lvs_nonleader_timeout(lvs)) {

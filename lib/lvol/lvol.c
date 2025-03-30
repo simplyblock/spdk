@@ -1337,7 +1337,7 @@ spdk_lvol_create_hublvol(struct spdk_lvol_store *lvs, spdk_lvol_op_with_handle_c
 		SPDK_ERRLOG("Cannot alloc memory for lvol base pointer\n");
 		return -ENOMEM;
 	}
-
+	lvol->hublvol = true;
 	req->lvol = lvol;
 	spdk_blob_opts_init(&opts, sizeof(opts));
 	opts.thin_provision = true;
@@ -2846,9 +2846,14 @@ lvol_op_comp_dequeue(void *cb_arg)
 {
 	struct spdk_bdev_io *bdev_io = cb_arg;
 	struct spdk_lvol *lvol = bdev_io->bdev->ctxt;
+	struct spdk_lvol_store *lvs = lvol->lvol_store;
+	uint64_t offset = bdev_io->u.bdev.offset_blocks;
+	if (lvol->hublvol) {
+		lvol = lvs->lvol_map.lvol[offset >> 48];
+	}
 
 	SPDK_NOTICELOG("Unfreeze failed IO blob: %" PRIu64 " LBA: %" PRIu64 " CNT %" PRIu64 " type %d \n",
-				lvol->blob_id, bdev_io->u.bdev.offset_blocks, bdev_io->u.bdev.num_blocks, bdev_io->type);
+				lvol->blob_id, offset, bdev_io->u.bdev.num_blocks, bdev_io->type);
 
 	spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 }
