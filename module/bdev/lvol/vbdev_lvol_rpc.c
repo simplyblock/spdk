@@ -390,21 +390,21 @@ cleanup:
 SPDK_RPC_REGISTER("bdev_lvol_create", rpc_bdev_lvol_create, SPDK_RPC_RUNTIME)
 
 
-struct rpc_bdev_hublvol_create {
+struct rpc_bdev_hublvol {
 	char *uuid;
 	char *lvs_name;
 };
 
 static void
-free_rpc_bdev_hublvol_create(struct rpc_bdev_hublvol_create *req)
+free_rpc_bdev_hublvol(struct rpc_bdev_hublvol *req)
 {
 	free(req->uuid);
 	free(req->lvs_name);
 }
 
-static const struct spdk_json_object_decoder rpc_bdev_hublvol_create_decoders[] = {
-	{"uuid", offsetof(struct rpc_bdev_lvol_create, uuid), spdk_json_decode_string, true},
-	{"lvs_name", offsetof(struct rpc_bdev_lvol_create, lvs_name), spdk_json_decode_string, true},
+static const struct spdk_json_object_decoder rpc_bdev_hublvol_decoders[] = {
+	{"uuid", offsetof(struct rpc_bdev_hublvol, uuid), spdk_json_decode_string, true},
+	{"lvs_name", offsetof(struct rpc_bdev_hublvol, lvs_name), spdk_json_decode_string, true},
 };
 
 static void
@@ -431,14 +431,14 @@ static void
 rpc_bdev_lvol_create_hublvol(struct spdk_jsonrpc_request *request,
 		     const struct spdk_json_val *params)
 {
-	struct rpc_bdev_hublvol_create req = {};
+	struct rpc_bdev_hublvol req = {};
 	int rc = 0;
 	struct spdk_lvol_store *lvs = NULL;
 
 	SPDK_NOTICELOG("Creating Hub lvol.\n");
 
-	if (spdk_json_decode_object(params, rpc_bdev_hublvol_create_decoders,
-				    SPDK_COUNTOF(rpc_bdev_hublvol_create_decoders),
+	if (spdk_json_decode_object(params, rpc_bdev_hublvol_decoders,
+				    SPDK_COUNTOF(rpc_bdev_hublvol_decoders),
 				    &req)) {
 		SPDK_INFOLOG(lvol_rpc, "spdk_json_decode_object failed\n");
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
@@ -459,10 +459,70 @@ rpc_bdev_lvol_create_hublvol(struct spdk_jsonrpc_request *request,
 	}
 
 cleanup:
-	free_rpc_bdev_hublvol_create(&req);
+	free_rpc_bdev_hublvol(&req);
 }
 
 SPDK_RPC_REGISTER("bdev_lvol_create_hublvol", rpc_bdev_lvol_create_hublvol, SPDK_RPC_RUNTIME)
+
+static void
+rpc_bdev_hublvol_delete_cb(void *cb_arg, int lvolerrno)
+{
+	struct spdk_jsonrpc_request *request = cb_arg;
+	if (lvolerrno != 0) {
+		goto invalid;
+	}
+
+	spdk_jsonrpc_send_bool_response(request, true);
+	return;
+
+invalid:
+	spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+					 spdk_strerror(-lvolerrno));
+}
+
+static void
+rpc_bdev_lvol_delete_hublvol(struct spdk_jsonrpc_request *request,
+		     const struct spdk_json_val *params)
+{
+	struct rpc_bdev_hublvol req = {};
+	int rc = 0;
+	struct spdk_lvol_store *lvs = NULL;
+	struct spdk_lvol *lvol = NULL;
+
+	SPDK_NOTICELOG("Deleting Hub lvol.\n");
+
+	if (spdk_json_decode_object(params, rpc_bdev_hublvol_decoders,
+				    SPDK_COUNTOF(rpc_bdev_hublvol_decoders),
+				    &req)) {
+		SPDK_INFOLOG(lvol_rpc, "spdk_json_decode_object failed\n");
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "spdk_json_decode_object failed");
+		goto cleanup;
+	}
+
+	rc = vbdev_get_lvol_store_by_uuid_xor_name(req.uuid, req.lvs_name, &lvs);
+	if (rc != 0) {
+		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
+		goto cleanup;
+	}
+
+	lvol = spdk_lvol_get_by_names(lvs->name, "hublvol");
+	if (!lvol) {
+		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
+		goto cleanup;
+	}
+
+	vbdev_lvol_delete_hublvol(lvol, rpc_bdev_hublvol_delete_cb, request);
+	if (rc < 0) {
+		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
+		goto cleanup;
+	}
+
+cleanup:
+	free_rpc_bdev_hublvol(&req);
+}
+
+SPDK_RPC_REGISTER("bdev_lvol_delete_hublvol", rpc_bdev_lvol_delete_hublvol, SPDK_RPC_RUNTIME)
 //********************************************************************************************** */
 
 struct rpc_bdev_lvol_register {
@@ -1891,37 +1951,44 @@ cleanup:
 SPDK_RPC_REGISTER("bdev_lvol_get_lvstores", rpc_bdev_lvol_get_lvstores, SPDK_RPC_RUNTIME)
 SPDK_RPC_REGISTER_ALIAS_DEPRECATED(bdev_lvol_get_lvstores, get_lvol_stores)
 
-struct rpc_bdev_lvol_set_lvs_op {
+struct rpc_bdev_lvol_set_lvs_opts {
 	char *uuid;
 	char *lvs_name;
 	uint64_t groupid;
 	uint64_t subsystem_port;
+	bool primary;
+	bool secondary;
+	char *remote_bdev;
 };
 
 static void
-free_rpc_bdev_lvol_set_lvs_op(struct rpc_bdev_lvol_set_lvs_op *req)
+free_rpc_bdev_lvol_set_lvs_opts(struct rpc_bdev_lvol_set_lvs_opts *req)
 {
 	free(req->uuid);
 	free(req->lvs_name);
+	free(req->remote_bdev);
 }
 
-static const struct spdk_json_object_decoder rpc_bdev_lvol_set_lvs_op_decoders[] = {
-	{"uuid", offsetof(struct rpc_bdev_lvol_set_lvs_op, uuid), spdk_json_decode_string, true},
-	{"lvs_name", offsetof(struct rpc_bdev_lvol_set_lvs_op, lvs_name), spdk_json_decode_string, true},
-	{"groupid", offsetof(struct rpc_bdev_lvol_set_lvs_op, groupid), spdk_json_decode_uint64},
-	{"subsystem_port", offsetof(struct rpc_bdev_lvol_set_lvs_op, subsystem_port), spdk_json_decode_uint64},
+static const struct spdk_json_object_decoder rpc_bdev_lvol_set_lvs_opts_decoders[] = {
+	{"uuid", offsetof(struct rpc_bdev_lvol_set_lvs_opts, uuid), spdk_json_decode_string, true},
+	{"lvs_name", offsetof(struct rpc_bdev_lvol_set_lvs_opts, lvs_name), spdk_json_decode_string, true},
+	{"groupid", offsetof(struct rpc_bdev_lvol_set_lvs_opts, groupid), spdk_json_decode_uint64},
+	{"subsystem_port", offsetof(struct rpc_bdev_lvol_set_lvs_opts, subsystem_port), spdk_json_decode_uint64},
+	{"remote_bdev", offsetof(struct rpc_bdev_lvol_set_lvs_opts, remote_bdev), spdk_json_decode_string, true},
+	{"primary", offsetof(struct rpc_bdev_lvol_set_lvs_opts, primary), spdk_json_decode_bool, true},
+	{"secondary", offsetof(struct rpc_bdev_lvol_set_lvs_opts, secondary), spdk_json_decode_bool, true},
 };
 
 static void
-rpc_bdev_lvol_set_lvs_op(struct spdk_jsonrpc_request *request,
+rpc_bdev_lvol_set_lvs_opts(struct spdk_jsonrpc_request *request,
 			   const struct spdk_json_val *params)
 {
-	struct rpc_bdev_lvol_set_lvs_op req = {};
+	struct rpc_bdev_lvol_set_lvs_opts req = {};
 	struct spdk_lvol_store *lvs = NULL;
 	int rc;
 
-	if (spdk_json_decode_object(params, rpc_bdev_lvol_set_lvs_op_decoders,
-					SPDK_COUNTOF(rpc_bdev_lvol_set_lvs_op_decoders),
+	if (spdk_json_decode_object(params, rpc_bdev_lvol_set_lvs_opts_decoders,
+					SPDK_COUNTOF(rpc_bdev_lvol_set_lvs_opts_decoders),
 					&req)) {
 		SPDK_INFOLOG(lvol_rpc, "spdk_json_decode_object failed\n");
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
@@ -1935,14 +2002,20 @@ rpc_bdev_lvol_set_lvs_op(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
-	spdk_lvs_set_op(lvs, req.groupid, req.subsystem_port);
+	if (req.secondary && !req.remote_bdev) {
+		SPDK_ERRLOG("missing remote bdev name param in secondary node.\n");
+		spdk_jsonrpc_send_error_response(request, -EINVAL, "Missing remote bdev name parameter");
+		goto cleanup;
+	}
+
+	spdk_lvs_set_opts(lvs, req.groupid, req.subsystem_port, req.primary, req.secondary, req.remote_bdev);
 	spdk_jsonrpc_send_bool_response(request, true);
 
 cleanup:
-	free_rpc_bdev_lvol_set_lvs_op(&req);
+	free_rpc_bdev_lvol_set_lvs_opts(&req);
 }
 
-SPDK_RPC_REGISTER("bdev_lvol_set_lvs_op", rpc_bdev_lvol_set_lvs_op, SPDK_RPC_RUNTIME)
+SPDK_RPC_REGISTER("bdev_lvol_set_lvs_opts", rpc_bdev_lvol_set_lvs_opts, SPDK_RPC_RUNTIME)
 
 struct rpc_bdev_lvol_get_lvols {
 	char *lvs_uuid;

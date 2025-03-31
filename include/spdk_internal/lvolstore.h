@@ -146,6 +146,7 @@ struct spdk_lvol_store {
 	bool 				trigger_leader_sent;
 	bool 				read_only;
 	bool 				primary;
+	bool				skip_redirecting;
 	bool 				secondary;
 	int 				subsystem_port;
 	struct spdk_lvs_redirect lvol_map;	
@@ -174,6 +175,7 @@ struct spdk_lvol {
 	TAILQ_ENTRY(spdk_lvol)		entry_to_update;
 	struct spdk_lvs_degraded_lvol_set *degraded_set;
 	TAILQ_ENTRY(spdk_lvol)		degraded_link;
+	TAILQ_HEAD(, spdk_pending_iorsp)   redirected_io;
 };
 
 struct lvol_store_bdev *vbdev_lvol_store_first(void);

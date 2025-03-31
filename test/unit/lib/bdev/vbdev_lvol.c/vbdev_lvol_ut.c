@@ -65,6 +65,7 @@ DEFINE_STUB(spdk_blob_get_esnap_bs_dev, struct spdk_bs_dev *, (const struct spdk
 DEFINE_STUB(spdk_lvol_is_degraded, bool, (const struct spdk_lvol *lvol), false);
 DEFINE_STUB(spdk_blob_get_num_allocated_clusters, uint64_t, (struct spdk_blob *blob), 0);
 DEFINE_STUB(spdk_blob_get_id, uint64_t, (struct spdk_blob *blob), 0);
+DEFINE_STUB(spdk_blob_get_map_id, uint16_t, (struct spdk_blob *blob), 0);
 DEFINE_STUB(spdk_blob_get_open_ref, uint32_t, (struct spdk_blob *blob), 0);
 DEFINE_STUB(spdk_lvol_copy_blob, int, (struct spdk_lvol *lvol), 0);
 

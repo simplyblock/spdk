@@ -538,6 +538,15 @@ uint64_t spdk_bs_total_data_cluster_count(struct spdk_blob_store *bs);
 spdk_blob_id spdk_blob_get_id(struct spdk_blob *blob);
 
 /**
+ * Get the blob map id.
+ *
+ * \param blob Blob struct to query.
+ *
+ * \return map id.
+ */
+uint16_t spdk_blob_get_map_id(struct spdk_blob *blob);
+
+/**
  * Get the blob open ref.
  *
  * \param blob Blob struct to query.

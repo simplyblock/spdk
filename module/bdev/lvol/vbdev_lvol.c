@@ -875,6 +875,11 @@ vbdev_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb
 		return;
 	}
 
+	uint16_t map_id = spdk_blob_get_map_id(lvol->blob);
+	if (map_id < 65535) {
+		lvol->lvol_store->lvol_map.lvol[map_id] = NULL;
+	}
+
 	if (!lvol->lvol_store->leader) {
 		// check blob state it must be CLEAN
 		// copy the blob
@@ -1271,6 +1276,14 @@ vbdev_hublvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bd
 		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 	}
 
+	if (org_lvol == NULL) {
+		SPDK_NOTICELOG("FAILED IO - orglvol in none  - blob: %" PRIu64 "  "
+								"Lba: %" PRIu64 "  Cnt %" PRIu64 "  t %d \n",
+								lvol->blob_id, bdev_io->u.bdev.offset_blocks,
+								bdev_io->u.bdev.num_blocks, bdev_io->type);
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+	}
+
 	switch (bdev_io->type) {
 	case SPDK_BDEV_IO_TYPE_READ:
 		spdk_bdev_io_get_buf(bdev_io, hublvol_get_buf_cb,
@@ -1317,7 +1330,8 @@ vbdev_lvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_
 	struct spdk_lvol *lvol = bdev_io->bdev->ctxt;
 	struct spdk_lvol_store *lvs = lvol->lvol_store;
 
-	if (!lvs->leader && lvs->secondary) {
+	if (lvs->secondary && !lvs->leader && !lvs->skip_redirecting ) {
+
 		// redirect the IO
 		// check if the offset is bigger than 48 bit
 		//  int key = (offset) | blob->map_id << 48;
@@ -1711,6 +1725,32 @@ vbdev_lvol_create_hublvol(struct spdk_lvol_store *lvs, spdk_lvol_op_with_handle_
 	}
 
 	return rc;
+}
+
+void
+vbdev_lvol_delete_hublvol(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg)
+{
+	struct lvol_store_bdev *lvs_bdev;	
+
+	if (lvol->action_in_progress == true) {
+		cb_fn(cb_arg, -EPERM);
+		return;
+	}
+
+	/*
+	 * During destruction of an lvolstore, _vbdev_lvs_unload() iterates through lvols until they
+	 * are all deleted. There may be some IO required
+	 */
+
+	lvs_bdev = vbdev_get_lvs_bdev_by_lvs(lvol->lvol_store);
+	if (lvs_bdev == NULL) {
+		SPDK_DEBUGLOG(vbdev_lvol, "lvol %s: lvolstore is being removed\n",
+			      lvol->unique_id);
+		cb_fn(cb_arg, -ENODEV);
+		return;
+	}
+
+	_vbdev_lvol_destroy(lvol, cb_fn, cb_arg, true);
 }
 
 int

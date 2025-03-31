@@ -150,6 +150,50 @@ def bdev_lvol_create(client, lvol_name, size_in_mib, thin_provision=False, uuid=
     params['lvol_priority_class'] = lvol_priority_class
     return client.call('bdev_lvol_create', params)
 
+def bdev_lvol_create_hublvol(client, uuid=None, lvs_name=None):
+    """Create a logical volume on a logical volume store.
+
+    Args:        
+        uuid: UUID of logical volume store to create logical volume on (optional)
+        lvs_name: name of logical volume store to create logical volume on (optional)
+
+    Either uuid or lvs_name must be specified, but not both.
+
+    Returns:
+        Name of created logical volume block device.
+    """
+    if (uuid and lvs_name) or (not uuid and not lvs_name):
+        raise ValueError("Either uuid or lvs_name must be specified, but not both")
+
+    params = {}
+    if uuid:
+        params['uuid'] = uuid
+    if lvs_name:
+        params['lvs_name'] = lvs_name
+    return client.call('bdev_lvol_create_hublvol', params)
+
+def bdev_lvol_delete_hublvol(client, uuid=None, lvs_name=None, ):
+    """Create a logical volume on a logical volume store.
+
+    Args:        
+        uuid: UUID of logical volume store to create logical volume on (optional)
+        lvs_name: name of logical volume store to create logical volume on (optional)
+
+    Either uuid or lvs_name must be specified, but not both.
+
+    Returns:
+        Name of created logical volume block device.
+    """
+    if (uuid and lvs_name) or (not uuid and not lvs_name):
+        raise ValueError("Either uuid or lvs_name must be specified, but not both")
+
+    params = {}
+    if uuid:
+        params['uuid'] = uuid
+    if lvs_name:
+        params['lvs_name'] = lvs_name
+    return client.call('bdev_lvol_delete_hublvol', params)
+
 def bdev_lvol_register(client, lvol_name, registered_uuid, blobid, thin_provision=False, uuid=None, lvs_name=None, clear_method=None, lvol_priority_class=0):
     """Create a logical volume on a logical volume store.
 
@@ -489,7 +533,7 @@ def bdev_lvol_get_lvstores(client, uuid=None, lvs_name=None):
         params['lvs_name'] = lvs_name
     return client.call('bdev_lvol_get_lvstores', params)
 
-def bdev_lvol_set_lvs_op(client, uuid=None, lvs_name=None, groupid=0, subsystem_port=0):
+def bdev_lvol_set_lvs_opts(client, uuid=None, lvs_name=None, groupid=0, subsystem_port=0, primary=False, secondary=False, bdev_name=''):
     """Set group id for lvolstore.
 
     Args:
@@ -504,7 +548,11 @@ def bdev_lvol_set_lvs_op(client, uuid=None, lvs_name=None, groupid=0, subsystem_
         raise ValueError("Exactly one of uuid or lvs_name may be specified")
     if (not groupid):
         raise ValueError("groupid must be specified")
-    params = {'groupid': groupid, 'subsystem_port': subsystem_port}
+    
+    if (secondary and not bdev_name):
+         raise ValueError("remote bdev name must be specified if the node is secondary")
+     
+    params = {'groupid': groupid, 'subsystem_port': subsystem_port, 'primary': primary, 'secondary': secondary, 'remote_bdev': bdev_name}
     if uuid:
         params['uuid'] = uuid
     if lvs_name:

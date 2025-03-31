@@ -50,6 +50,7 @@ const char *uuid = "828d9766-ae50-11e7-bd8d-001e67edf350";
 
 struct spdk_blob {
 	spdk_blob_id		id;
+	uint16_t		map_id;
 	uint32_t		ref;
 	struct spdk_blob_store *bs;
 	int			close_status;
@@ -411,6 +412,12 @@ spdk_blob_id
 spdk_blob_get_id(struct spdk_blob *blob)
 {
 	return blob->id;
+}
+
+uint16_t
+spdk_blob_get_map_id(struct spdk_blob *blob)
+{
+	return blob->map_id;
 }
 
 void

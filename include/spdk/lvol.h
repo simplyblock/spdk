@@ -315,7 +315,8 @@ bool spdk_lvs_nonleader_timeout(struct spdk_lvol_store *lvs);
 void spdk_lvs_change_leader_state(uint64_t groupid);
 bool spdk_lvs_trigger_leadership_switch(uint64_t *groupid);
 bool spdk_lvs_queued_rsp(struct spdk_lvol_store *lvs, struct spdk_bdev_io *bdev_io);
-void spdk_lvs_set_op(struct spdk_lvol_store *lvs, uint64_t groupid, uint64_t port);
+void spdk_lvs_set_opts(struct spdk_lvol_store *lvs, uint64_t groupid, uint64_t port, bool primary, 
+						bool secondary, const char *remote_bdev);
 void spdk_lvs_set_read_only(struct spdk_lvol_store *lvs, bool status);
 void spdk_lvs_set_failed_on_update(struct spdk_lvol_store *lvs, bool state);
 /**

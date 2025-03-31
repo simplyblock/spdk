@@ -7500,6 +7500,14 @@ spdk_blob_get_id(struct spdk_blob *blob)
 	return blob->id;
 }
 
+uint16_t
+spdk_blob_get_map_id(struct spdk_blob *blob)
+{
+	assert(blob != NULL);
+
+	return blob->map_id;
+}
+
 uint32_t
 spdk_blob_get_open_ref(struct spdk_blob *blob)
 {

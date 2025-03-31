@@ -1107,6 +1107,8 @@ lvol_create_open_cb(void *cb_arg, struct spdk_blob *blob, int lvolerrno)
 {
 	struct spdk_lvol_with_handle_req *req = cb_arg;
 	struct spdk_lvol *lvol = req->lvol;
+	struct spdk_lvol_store *lvs = lvol->lvol_store;
+	uint16_t map_id;
 
 	TAILQ_REMOVE(&req->lvol->lvol_store->pending_lvols, req->lvol, link);
 
@@ -1119,6 +1121,8 @@ lvol_create_open_cb(void *cb_arg, struct spdk_blob *blob, int lvolerrno)
 
 	lvol->blob = blob;
 	lvol->blob_id = spdk_blob_get_id(blob);
+	map_id = spdk_blob_get_map_id(blob);
+	lvs->lvol_map.lvol[map_id] = lvol;
 
 	TAILQ_INSERT_TAIL(&lvol->lvol_store->lvols, lvol, link);
 
@@ -1967,6 +1971,11 @@ spdk_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_
 	}
 
 	lvol->action_in_progress = true;
+	if (strcmp("hublvol", lvol->name) == 0) {
+		lvol_delete_blob_cb(req , 0);
+		return;
+	}
+
 	if (lvol->lvol_store->leader) {
 		spdk_bs_delete_blob(bs, lvol->blob_id, lvol_delete_blob_cb, req);
 	} else {
@@ -3021,7 +3030,7 @@ spdk_lvs_trigger_leadership_switch(uint64_t *groupid)
 }
 
 void
-spdk_lvs_set_op(struct spdk_lvol_store *lvs, uint64_t groupid, uint64_t port)
+spdk_lvs_set_opts(struct spdk_lvol_store *lvs, uint64_t groupid, uint64_t port, bool primary, bool secondary, const char *remote_bdev)
 {
 	SPDK_NOTICELOG("Set groupid %" PRIu64 " and port %" PRIu64 " to the lvolstore .\n", groupid, port);
 	pthread_mutex_lock(&g_lvol_stores_mutex);
