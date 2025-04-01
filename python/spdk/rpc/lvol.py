@@ -533,7 +533,7 @@ def bdev_lvol_get_lvstores(client, uuid=None, lvs_name=None):
         params['lvs_name'] = lvs_name
     return client.call('bdev_lvol_get_lvstores', params)
 
-def bdev_lvol_set_lvs_opts(client, uuid=None, lvs_name=None, groupid=0, subsystem_port=0, primary=False, secondary=False, bdev_name=''):
+def bdev_lvol_set_lvs_opts(client, uuid=None, lvs_name=None, groupid=0, subsystem_port=0, primary=False, secondary=False, remote_bdev=''):
     """Set group id for lvolstore.
 
     Args:
@@ -549,15 +549,17 @@ def bdev_lvol_set_lvs_opts(client, uuid=None, lvs_name=None, groupid=0, subsyste
     if (not groupid):
         raise ValueError("groupid must be specified")
     
-    if (secondary and not bdev_name):
+    if (secondary and not remote_bdev):
          raise ValueError("remote bdev name must be specified if the node is secondary")
      
-    params = {'groupid': groupid, 'subsystem_port': subsystem_port, 'primary': primary, 'secondary': secondary, 'remote_bdev': bdev_name}
+    params = {'groupid': groupid, 'subsystem_port': subsystem_port, 'primary': primary, 'secondary': secondary}
     if uuid:
         params['uuid'] = uuid
     if lvs_name:
         params['lvs_name'] = lvs_name
-    return client.call('bdev_lvol_set_lvs_op', params)
+    if secondary:
+         params['remote_bdev'] = remote_bdev     
+    return client.call('bdev_lvol_set_lvs_opts', params)
 
 def bdev_lvol_get_lvols(client, lvs_uuid=None, lvs_name=None):
     """List logical volumes

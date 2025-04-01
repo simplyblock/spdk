@@ -2350,14 +2350,14 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
                                                    secondary=args.secondary,
                                                    remote_bdev=args.remote_bdev))
 
-    p = subparsers.add_parser('bdev_lvol_set_lvs_op', help='Set options for lvolstore')
+    p = subparsers.add_parser('bdev_lvol_set_lvs_opts', help='Set options for lvolstore')
     p.add_argument('-u', '--uuid', help='lvol store UUID')
     p.add_argument('-l', '--lvs-name', help='lvol store name')
     p.add_argument('-i', '--groupid', help='lvol store group id', type=int)
     p.add_argument('-p', '--subsystem-port', help='lvols subsystem port', type=int)
     p.add_argument('-r', '--primary', action='store_true', help='primary state for lvolstore node, default False')
-    p.add_argument('-s', '--seccondary', action='store_true', help='secondary state for lvolstore node, default False')
-    p.add_argument('-h', '--remote-bdev', help='remote hublvol bdev name')
+    p.add_argument('-s', '--secondary', action='store_true', help='secondary state for lvolstore node, default False')
+    p.add_argument('-b', '--remote-bdev', help='remote hublvol bdev name')
     p.set_defaults(func=bdev_lvol_set_lvs_opts)
 
     def bdev_lvol_get_lvols(args):

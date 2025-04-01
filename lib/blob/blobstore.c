@@ -7875,7 +7875,7 @@ spdk_bs_create_hubblob(struct spdk_blob_store *bs,
 	assert(spdk_get_thread() == bs->md_thread);
 	page_idx = UINT32_MAX;
 	id = UINT32_MAX;
-	SPDK_DEBUGLOG(blob, "Creating blob with id 0x%" PRIx64 " at page %u\n", id, page_idx);
+	// SPDK_DEBUGLOG(blob, "Creating blob with id 0x%" PRIx64 " at page %u\n", id, page_idx);
 
 	spdk_blob_opts_init(&opts_local, sizeof(opts_local));
 	if (opts) {
@@ -7899,6 +7899,7 @@ spdk_bs_create_hubblob(struct spdk_blob_store *bs,
 		cb_fn(cb_arg, blob, rc);
 	}
 
+	blob_xattrs_init(&internal_xattrs_default);
 	rc = blob_set_xattrs(blob, &internal_xattrs_default, true);
 	if (rc < 0) {
 		blob_free(blob);

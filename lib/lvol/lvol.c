@@ -1345,7 +1345,7 @@ spdk_lvol_create_hublvol(struct spdk_lvol_store *lvs, spdk_lvol_op_with_handle_c
 	req->lvol = lvol;
 	spdk_blob_opts_init(&opts, sizeof(opts));
 	opts.thin_provision = true;
-	opts.num_clusters = spdk_divide_round_up(UINT64_MAX, spdk_bs_get_cluster_size(bs));
+	opts.num_clusters = UINT64_MAX;//spdk_divide_round_up(UINT64_MAX, spdk_bs_get_cluster_size(bs));
 	opts.clear_method = lvol->clear_method;
 	opts.xattrs.count = SPDK_COUNTOF(xattr_names);
 	opts.xattrs.names = xattr_names;
@@ -3036,6 +3036,11 @@ spdk_lvs_set_opts(struct spdk_lvol_store *lvs, uint64_t groupid, uint64_t port, 
 	pthread_mutex_lock(&g_lvol_stores_mutex);
 	lvs->groupid = groupid;
 	lvs->subsystem_port = port;
+	lvs->primary = primary;	
+ 	lvs->secondary = secondary;
+ 	if (lvs->secondary) {
+ 		// connect to the remote_bdev
+ 	}
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
 	return;
 }
