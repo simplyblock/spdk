@@ -2009,6 +2009,9 @@ rpc_bdev_lvol_set_lvs_opts(struct spdk_jsonrpc_request *request,
 	}
 
 	spdk_lvs_set_opts(lvs, req.groupid, req.subsystem_port, req.primary, req.secondary, req.remote_bdev);
+	if (req.secondary && req.remote_bdev) {
+		vbdev_lvol_set_hubbdev_module(lvs);
+	}
 	spdk_jsonrpc_send_bool_response(request, true);
 
 cleanup:

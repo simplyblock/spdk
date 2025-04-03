@@ -110,8 +110,24 @@ struct spdk_pending_iorsp {
 	TAILQ_ENTRY(spdk_pending_iorsp)	entry;
 };
 
+struct spdk_redirect_request {
+	struct spdk_bdev_io *bdev_io;
+	struct spdk_io_channel *ch;
+	uint64_t io_count;
+	TAILQ_ENTRY(spdk_redirect_request)	entry;
+};
+
 struct spdk_lvs_redirect {
 	struct spdk_lvol *lvol[65535];
+};
+
+struct spdk_redirect_dev {
+	struct spdk_bdev	*bdev;
+	struct spdk_bdev_desc	*desc;	
+	struct spdk_bdev_module *module;
+	struct spdk_thread		*thread;
+	enum hublvol_state	state;
+	bool dev_removed;
 };
 
 struct spdk_lvol_store {
@@ -150,6 +166,8 @@ struct spdk_lvol_store {
 	bool 				secondary;
 	int 				subsystem_port;
 	struct spdk_lvs_redirect lvol_map;	
+	struct spdk_redirect_dev *hub_dev;
+	char	remote_bdev[SPDK_LVOL_NAME_MAX];
 };
 
 struct spdk_lvol {
@@ -157,6 +175,7 @@ struct spdk_lvol {
 	struct spdk_blob		*blob;
 	struct spdk_blob		*tmp_blob;
 	spdk_blob_id			blob_id;
+	uint16_t		map_id;
 	bool				leader;
 	bool				update_in_progress;
 	bool				hublvol;

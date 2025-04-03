@@ -50,6 +50,8 @@ DEFINE_STUB_V(spdk_lvs_grow_live, (struct spdk_lvol_store *lvs,
 				   spdk_lvs_op_complete cb_fn, void *cb_arg));
 DEFINE_STUB_V(spdk_lvs_check_active_process, (struct spdk_lvol_store *lvs, struct spdk_lvol *lvol, uint8_t type));
 DEFINE_STUB_V(spdk_lvol_resize_unfreeze, (struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg));
+DEFINE_STUB(spdk_bs_queued_red_io,struct spdk_bs_redirect_request *, (struct spdk_io_channel *ch, void *bdev_io), NULL);
+DEFINE_STUB_V(spdk_bs_dequeued_red_io, (struct spdk_io_channel *ch, void *bdev_io));
 DEFINE_STUB(spdk_bdev_get_memory_domains, int, (struct spdk_bdev *bdev,
 		struct spdk_memory_domain **domains, int array_size), 0);
 DEFINE_STUB(spdk_blob_get_esnap_id, int,
@@ -62,13 +64,29 @@ DEFINE_STUB(spdk_lvs_esnap_missing_add, int,
 	    (struct spdk_lvol_store *lvs, struct spdk_lvol *lvol, const void *esnap_id,
 	     uint32_t id_len), -ENOTSUP);
 DEFINE_STUB(spdk_blob_get_esnap_bs_dev, struct spdk_bs_dev *, (const struct spdk_blob *blob), NULL);
+DEFINE_STUB(spdk_bs_get_hub_channel, struct spdk_io_channel	*, (struct spdk_io_channel *ch), NULL);
+DEFINE_STUB(spdk_bs_set_hub_channel, bool, (struct spdk_io_channel *ch, struct spdk_io_channel *hub_ch, void *desc), true);
 DEFINE_STUB(spdk_lvol_is_degraded, bool, (const struct spdk_lvol *lvol), false);
 DEFINE_STUB(spdk_blob_get_num_allocated_clusters, uint64_t, (struct spdk_blob *blob), 0);
 DEFINE_STUB(spdk_blob_get_id, uint64_t, (struct spdk_blob *blob), 0);
 DEFINE_STUB(spdk_blob_get_map_id, uint16_t, (struct spdk_blob *blob), 0);
 DEFINE_STUB(spdk_blob_get_open_ref, uint32_t, (struct spdk_blob *blob), 0);
 DEFINE_STUB(spdk_lvol_copy_blob, int, (struct spdk_lvol *lvol), 0);
-
+DEFINE_STUB(spdk_bdev_writev_blocks_ext, int,
+	    (struct spdk_bdev_desc *desc, struct spdk_io_channel *ch, struct iovec *iov, int iovcnt,
+	     uint64_t offset_blocks, uint64_t num_blocks, spdk_bdev_io_completion_cb cb,
+	     void *cb_arg, struct spdk_bdev_ext_io_opts *opts), 0);
+DEFINE_STUB_V(spdk_bdev_free_io, (struct spdk_bdev_io *g_bdev_io));
+DEFINE_STUB(spdk_bdev_write_zeroes_blocks, int,
+	    (struct spdk_bdev_desc *desc, struct spdk_io_channel *ch, uint64_t offset_blocks,
+	     uint64_t num_blocks, spdk_bdev_io_completion_cb cb, void *cb_arg), 0);
+DEFINE_STUB(spdk_bdev_unmap_blocks, int,
+	    (struct spdk_bdev_desc *desc, struct spdk_io_channel *ch, uint64_t offset_blocks,
+	     uint64_t num_blocks, spdk_bdev_io_completion_cb cb, void *cb_arg), 0);
+DEFINE_STUB(spdk_bdev_readv_blocks_ext, int,
+	    (struct spdk_bdev_desc *desc, struct spdk_io_channel *ch, struct iovec *iov, int iovcnt,
+	     uint64_t offset_blocks, uint64_t num_blocks, spdk_bdev_io_completion_cb cb,
+	     void *cb_arg, struct spdk_bdev_ext_io_opts *opts), 0);
 struct spdk_blob {
 	uint64_t	id;
 	char		name[32];
@@ -94,6 +112,15 @@ uint32_t
 spdk_bdev_get_md_size(const struct spdk_bdev *bdev)
 {
 	return bdev->md_len;
+}
+
+struct spdk_io_channel *
+spdk_bdev_get_io_channel(struct spdk_bdev_desc *desc)
+{
+	if (desc != NULL) {
+		return (struct spdk_io_channel *)0x1;
+	}
+	return NULL;
 }
 
 const struct spdk_uuid *

@@ -240,17 +240,24 @@ struct spdk_blob_store {
 struct spdk_bs_channel {
 	struct spdk_bs_request_set	*req_mem;
 	TAILQ_HEAD(, spdk_bs_request_set) reqs;
+	struct spdk_bs_redirect_request *redirect_reqs;
+	TAILQ_HEAD(, spdk_bs_redirect_request) rd_reqs;
 
 	struct spdk_blob_store		*bs;
-
 	struct spdk_bs_dev		*dev;
 	struct spdk_io_channel		*dev_channel;
+
+	struct spdk_io_channel		*redirect_ch;
+	// struct spdk_bdev_desc	*redirect_desc;
+	void *redirect_desc;
+	bool	set_redirect_ch;
 
 	/* This page is only used during insert of a new cluster. */
 	struct spdk_blob_md_page	*new_cluster_page;
 
 	TAILQ_HEAD(, spdk_bs_request_set) need_cluster_alloc;
 	TAILQ_HEAD(, spdk_bs_request_set) queued_io;
+	TAILQ_HEAD(, spdk_bs_redirect_request) redirect_queued;
 
 	RB_HEAD(blob_esnap_channel_tree, blob_esnap_channel) esnap_channels;
 };

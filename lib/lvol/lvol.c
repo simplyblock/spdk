@@ -1121,7 +1121,7 @@ lvol_create_open_cb(void *cb_arg, struct spdk_blob *blob, int lvolerrno)
 
 	lvol->blob = blob;
 	lvol->blob_id = spdk_blob_get_id(blob);
-	map_id = spdk_blob_get_map_id(blob);
+	lvol->map_id = spdk_blob_get_map_id(blob);
 	lvs->lvol_map.lvol[map_id] = lvol;
 
 	TAILQ_INSERT_TAIL(&lvol->lvol_store->lvols, lvol, link);
@@ -3029,6 +3029,68 @@ spdk_lvs_trigger_leadership_switch(uint64_t *groupid)
 	return false;
 }
 
+static void
+spdk_lvs_hub_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev,
+			     void *event_ctx)
+{
+	struct spdk_lvol_store *lvs = event_ctx;
+	switch (type) {
+	case SPDK_BDEV_EVENT_REMOVE:
+		pthread_mutex_lock(&g_lvs_queue_mutex);
+		lvs->skip_redirecting = true;
+		lvs->hub_dev->state = HUBLVOL_DISCONNECTED;
+		lvs->hub_dev->dev_removed = true;
+		pthread_mutex_unlock(&g_lvs_queue_mutex);
+		spdk_bdev_module_release_bdev(lvs->hub_dev->bdev);
+		spdk_bdev_close(lvs->hub_dev->desc);
+		lvs->hub_dev->desc = NULL;
+		lvs->hub_dev->bdev = NULL;
+		
+		break;
+	default:
+		SPDK_NOTICELOG("Unsupported bdev event: type %d\n", type);
+		break;
+	}
+}
+
+void
+spdk_lvs_open_hub_bdev(void *cb_arg) {
+	struct spdk_lvol_store *lvs = cb_arg;
+	int rc = 0;		
+	if (lvs->secondary) {
+		if ((lvs->hub_dev->state == HUBLVOL_CONNECTING_IN_PROCCESS ||
+		 	lvs->hub_dev->state == HUBLVOL_CONNECTED) || lvs->skip_redirecting) {
+				return;
+		}
+		
+		lvs->hub_dev->state = HUBLVOL_CONNECTING_IN_PROCCESS;
+ 		// connect to the remote_bdev
+		rc = spdk_bdev_open_ext(lvs->remote_bdev, true, spdk_lvs_hub_bdev_event_cb, lvs, &lvs->hub_dev->desc);
+		if (rc != 0) {
+			SPDK_ERRLOG("Lvolstore %s: bdev %s cannot be opened, error=%d\n",
+					lvs->name, lvs->remote_bdev, rc);
+			goto err;
+		}
+
+		lvs->hub_dev->bdev = spdk_bdev_desc_get_bdev(lvs->hub_dev->desc);
+		rc = spdk_bdev_module_claim_bdev(lvs->hub_dev->bdev, lvs->hub_dev->desc, lvs->hub_dev->module);
+		// rc = spdk_bdev_module_claim_bdev_desc(lvs->hub_dev->desc, SPDK_BDEV_CLAIM_READ_MANY_WRITE_ONE, NULL, module);
+		if (rc != 0) {
+			SPDK_ERRLOG("could not claim dev.\n");
+			spdk_bdev_close(lvs->hub_dev->desc);
+			lvs->hub_dev->desc = NULL;
+			lvs->hub_dev->bdev = NULL;
+			goto err;
+		}		
+		lvs->skip_redirecting = false;
+		lvs->hub_dev->state = HUBLVOL_CONNECTED;		
+		return;
+ 	}
+err:
+	lvs->skip_redirecting = true;
+	lvs->hub_dev->state = HUBLVOL_CONNECTED_FAILED;	
+}
+
 void
 spdk_lvs_set_opts(struct spdk_lvol_store *lvs, uint64_t groupid, uint64_t port, bool primary, bool secondary, const char *remote_bdev)
 {
@@ -3038,9 +3100,7 @@ spdk_lvs_set_opts(struct spdk_lvol_store *lvs, uint64_t groupid, uint64_t port, 
 	lvs->subsystem_port = port;
 	lvs->primary = primary;	
  	lvs->secondary = secondary;
- 	if (lvs->secondary) {
- 		// connect to the remote_bdev
- 	}
+	snprintf(lvs->remote_bdev, sizeof(lvs->remote_bdev), "%s", remote_bdev);	
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
 	return;
 }

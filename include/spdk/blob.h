@@ -53,6 +53,14 @@ enum blob_clear_method {
 	BLOB_CLEAR_WITH_WRITE_ZEROES,
 };
 
+enum hublvol_state {
+	HUBLVOL_NOT_CONNECTED,
+	HUBLVOL_CONNECTING_IN_PROCCESS,
+	HUBLVOL_CONNECTED,
+	HUBLVOL_CONNECTED_FAILED,
+	HUBLVOL_DISCONNECTED,
+};
+
 enum bs_clear_method {
 	BS_CLEAR_WITH_UNMAP,
 	BS_CLEAR_WITH_WRITE_ZEROES,
@@ -1067,6 +1075,18 @@ struct spdk_io_channel *spdk_bs_alloc_io_channel(struct spdk_blob_store *bs);
  * \param channel I/O channel to free.
  */
 void spdk_bs_free_io_channel(struct spdk_io_channel *channel);
+
+struct spdk_io_channel	*
+spdk_bs_get_hub_channel(struct spdk_io_channel *ch);
+bool
+spdk_bs_set_hub_channel(struct spdk_io_channel *ch, struct spdk_io_channel *hub_ch, void *desc);
+void
+spdk_bs_clear_hub_channel(struct spdk_io_channel *ch);
+struct spdk_bs_redirect_request *
+spdk_bs_queued_red_io(struct spdk_io_channel *ch, void *bdev_io);
+void
+spdk_bs_dequeued_red_io(struct spdk_io_channel *ch, void *bdev_io);
+
 
 /**
  * Write data to a blob.

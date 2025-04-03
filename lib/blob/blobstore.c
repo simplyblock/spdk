@@ -4173,9 +4173,23 @@ bs_channel_create(void *io_device, void *ctx_buf)
 		TAILQ_INSERT_TAIL(&channel->reqs, &channel->req_mem[i], link);
 	}
 
+	channel->redirect_reqs = calloc(max_ops, sizeof(struct spdk_bs_redirect_request));
+	if (!channel->redirect_reqs) {
+		return -1;
+	}
+
+	TAILQ_INIT(&channel->rd_reqs);
+
+	for (i = 0; i < max_ops; i++) {
+		TAILQ_INSERT_TAIL(&channel->rd_reqs, &channel->redirect_reqs[i], entry);
+	}
+
 	channel->bs = bs;
 	channel->dev = dev;
 	channel->dev_channel = dev->create_channel(dev);
+	channel->set_redirect_ch = false;
+	channel->redirect_ch = NULL;
+	channel->redirect_desc = NULL;
 
 	if (!channel->dev_channel) {
 		SPDK_ERRLOG("Failed to create device channel.\n");
@@ -4194,6 +4208,7 @@ bs_channel_create(void *io_device, void *ctx_buf)
 
 	TAILQ_INIT(&channel->need_cluster_alloc);
 	TAILQ_INIT(&channel->queued_io);
+	TAILQ_INIT(&channel->redirect_queued);
 	RB_INIT(&channel->esnap_channels);
 
 	return 0;
@@ -4204,6 +4219,7 @@ bs_channel_destroy(void *io_device, void *ctx_buf)
 {
 	struct spdk_bs_channel *channel = ctx_buf;
 	spdk_bs_user_op_t *op;
+	struct spdk_bs_redirect_request *req;
 
 	while (!TAILQ_EMPTY(&channel->need_cluster_alloc)) {
 		op = TAILQ_FIRST(&channel->need_cluster_alloc);
@@ -4221,7 +4237,95 @@ bs_channel_destroy(void *io_device, void *ctx_buf)
 
 	free(channel->req_mem);
 	spdk_free(channel->new_cluster_page);
+
+	// TODO we should confirm that we are not in the redirect mode 
+	// bcs this will create segfault for us
+	while (!TAILQ_EMPTY(&channel->redirect_queued)) {
+		req = TAILQ_FIRST(&channel->redirect_queued);
+		TAILQ_REMOVE(&channel->redirect_queued, req, entry);
+		
+		//TODO
+		// spdk_bdev_io_complete(req->bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		req->bdev_io = NULL;
+		req->ch = NULL;
+	}
+	free(channel->redirect_reqs);
+	if (channel->set_redirect_ch && channel->redirect_ch) {
+		spdk_put_io_channel(channel->redirect_ch);
+	}
+	channel->set_redirect_ch = false;
+	channel->redirect_ch = NULL;
+	channel->redirect_desc = NULL;
+
 	channel->dev->destroy_channel(channel->dev, channel->dev_channel);
+}
+
+struct spdk_io_channel	*
+spdk_bs_get_hub_channel(struct spdk_io_channel *ch)
+{
+	struct spdk_bs_channel *bs_channel = spdk_io_channel_get_ctx(ch);
+    if (bs_channel->set_redirect_ch && bs_channel->redirect_ch) {
+		return bs_channel->redirect_ch;
+	}
+	return NULL;
+}
+
+bool
+spdk_bs_set_hub_channel(struct spdk_io_channel *ch, struct spdk_io_channel *hub_ch, void *desc)
+{
+	struct spdk_bs_channel *bs_channel = spdk_io_channel_get_ctx(ch);
+    if (!bs_channel->set_redirect_ch) {
+		bs_channel->redirect_ch = hub_ch;
+		bs_channel->set_redirect_ch = true;
+		bs_channel->redirect_desc = desc;
+		return true;
+	}
+	return false;
+}
+
+void
+spdk_bs_clear_hub_channel(struct spdk_io_channel *ch)
+{
+	struct spdk_bs_channel *bs_channel = spdk_io_channel_get_ctx(ch);    
+	bs_channel->redirect_ch = NULL;
+	bs_channel->set_redirect_ch = false;
+	bs_channel->redirect_desc = NULL;
+}
+
+struct spdk_bs_redirect_request *
+spdk_bs_queued_red_io(struct spdk_io_channel *ch, void *bdev_io)
+{
+	struct spdk_bs_channel *channel = NULL;
+	struct spdk_bs_redirect_request *req;
+	channel = spdk_io_channel_get_ctx(ch);
+	assert(channel != NULL);
+	
+	req = TAILQ_FIRST(&channel->rd_reqs);
+	if (!req) {
+		return NULL;
+	}
+	TAILQ_REMOVE(&channel->rd_reqs, req, entry);
+	req->bdev_io = bdev_io;
+	req->ch = ch;
+	TAILQ_INSERT_TAIL(&channel->redirect_queued, req, entry);
+	return req;
+}
+
+void
+spdk_bs_dequeued_red_io(struct spdk_io_channel *ch, void *bdev_io)
+{
+	struct spdk_bs_channel *channel = NULL;
+	struct spdk_bs_redirect_request *req, *tmp;
+	channel = spdk_io_channel_get_ctx(ch);
+	assert(channel != NULL);
+	TAILQ_FOREACH_SAFE(req, &channel->redirect_queued, entry, tmp) {
+		if (!req && req->bdev_io && req->bdev_io == bdev_io) {
+			TAILQ_REMOVE(&channel->redirect_queued, req, entry);
+			req->bdev_io = NULL;
+			req->ch = NULL;
+			TAILQ_INSERT_TAIL(&channel->rd_reqs, req, entry);
+		}
+	}
 }
 
 static void
@@ -7866,14 +7970,14 @@ spdk_bs_create_hubblob(struct spdk_blob_store *bs,
 	       spdk_blob_op_with_handle_complete cb_fn, void *cb_arg)
 {
 	struct spdk_blob	*blob;
-	uint32_t		page_idx;
+	// uint32_t		page_idx;
 	struct spdk_blob_opts	opts_local;
 	struct spdk_blob_xattr_opts internal_xattrs_default;
 	spdk_blob_id		id;
 	int rc;
 
 	assert(spdk_get_thread() == bs->md_thread);
-	page_idx = UINT32_MAX;
+	// page_idx = UINT32_MAX;
 	id = UINT32_MAX;
 	// SPDK_DEBUGLOG(blob, "Creating blob with id 0x%" PRIx64 " at page %u\n", id, page_idx);
 
@@ -10071,7 +10175,7 @@ spdk_blob_update_on_failover_send_msg(struct spdk_blob *blob,
 	ctx->blob = blob;
 	ctx->cb_fn = cb_fn;
 	ctx->cb_arg = cb_arg;
-	spdk_thread_send_msg(blob->bs->md_thread, blob_update_on_failover_msg, ctx);	
+	spdk_thread_send_msg(blob->bs->md_thread, blob_update_on_failover_msg, ctx);
 }
 
 static void 

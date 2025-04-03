@@ -94,6 +94,8 @@ void vbdev_lvol_rename(struct spdk_lvol *lvol, const char *new_lvol_name,
  */
 void vbdev_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg, bool is_async);
 void vbdev_lvol_delete_hublvol(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg);
+// void vbdev_lvol_open_hubbdev(struct spdk_lvol_store *lvs);
+ void vbdev_lvol_set_hubbdev_module(struct spdk_lvol_store *lvs);
 
 /**
  * \brief Renames given lvolstore.
