@@ -3032,13 +3032,15 @@ spdk_lvs_hub_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bde
 	struct spdk_lvol_store *lvs = event_ctx;
 	switch (type) {
 	case SPDK_BDEV_EVENT_REMOVE:
-		pthread_mutex_lock(&g_lvs_queue_mutex);
-		lvs->skip_redirecting = true;
-		lvs->hub_dev.state = HUBLVOL_DISCONNECTED;
-		lvs->hub_dev.dev_removed = true;
-		pthread_mutex_unlock(&g_lvs_queue_mutex);
+		// pthread_mutex_lock(&g_lvs_queue_mutex);
+		// lvs->skip_redirecting = true;
+		// lvs->hub_dev.state = HUBLVOL_DISCONNECTED;
+		// lvs->hub_dev.dev_removed = true;
+		// pthread_mutex_unlock(&g_lvs_queue_mutex);
+		spdk_trigger_failover(lvs, true);
 		spdk_bdev_module_release_bdev(lvs->hub_dev.bdev);
 		spdk_bdev_close(lvs->hub_dev.desc);
+		// we should check if change this make problem for us
 		lvs->hub_dev.desc = NULL;
 		lvs->hub_dev.bdev = NULL;
 		
@@ -3052,10 +3054,16 @@ spdk_lvs_hub_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bde
 void
 spdk_lvs_open_hub_bdev(void *cb_arg) {
 	struct spdk_lvol_store *lvs = cb_arg;
-	int rc = 0;		
+	int rc = 0;
+	
+	if (lvs->primary) {
+		SPDK_ERRLOG("Lvolstore %s: is on the primary nod and does not need hub bdev.\n", lvs->name);
+		return;
+	}
+
 	if (lvs->secondary) {
-		if ((lvs->hub_dev.state == HUBLVOL_CONNECTING_IN_PROCCESS ||
-		 	lvs->hub_dev.state == HUBLVOL_CONNECTED) || lvs->skip_redirecting) {
+		if (lvs->hub_dev.state == HUBLVOL_CONNECTING_IN_PROCCESS ||
+		 	lvs->hub_dev.state == HUBLVOL_CONNECTED) {
 				return;
 		}
 		
@@ -3063,8 +3071,10 @@ spdk_lvs_open_hub_bdev(void *cb_arg) {
  		// connect to the remote_bdev
 		rc = spdk_bdev_open_ext(lvs->remote_bdev, true, spdk_lvs_hub_bdev_event_cb, lvs, &lvs->hub_dev.desc);
 		if (rc != 0) {
-			SPDK_ERRLOG("Lvolstore %s: bdev %s cannot be opened, error=%d\n",
+			SPDK_ERRLOG("Lvolstore %s: hub bdev %s cannot be opened, error=%d\n",
 					lvs->name, lvs->remote_bdev, rc);
+			lvs->hub_dev.desc = NULL;
+			lvs->hub_dev.bdev = NULL;
 			goto err;
 		}
 
@@ -3085,6 +3095,39 @@ spdk_lvs_open_hub_bdev(void *cb_arg) {
 err:
 	lvs->skip_redirecting = true;
 	lvs->hub_dev.state = HUBLVOL_CONNECTED_FAILED;	
+}
+
+static void
+spdk_trigger_failover_cpl(void *cb_arg, int bserrno) {
+	struct spdk_lvol_store *lvs = cb_arg;
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+	lvs->hub_dev.drain_in_action = false;
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+	if (lvs->hub_dev.state != HUBLVOL_CONNECTED) {
+		spdk_thread_send_msg(lvs->hub_dev.thread, spdk_lvs_open_hub_bdev, lvs);
+	}
+}
+
+void
+spdk_trigger_failover(struct spdk_lvol_store *lvs, bool disconnected) {
+	bool trigger_state = false;
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+	if (!lvs->skip_redirecting && !lvs->hub_dev.drain_in_action) {
+		lvs->skip_redirecting = true;
+		if (disconnected) {
+			lvs->hub_dev.state = HUBLVOL_NOT_CONNECTED;
+		}
+		lvs->hub_dev.drain_in_action = true;
+		trigger_state = true;
+	} else {
+		trigger_state = false;
+	}
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+
+	if (!trigger_state) {
+		return;
+	}
+	spdk_bs_drain_channel_queued(lvs->blobstore, lvs->hub_dev.submit_cb, spdk_trigger_failover_cpl, lvs);
 }
 
 void

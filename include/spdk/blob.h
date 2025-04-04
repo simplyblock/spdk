@@ -159,6 +159,9 @@ typedef int (*spdk_bs_esnap_dev_create)(void *bs_ctx, void *blob_ctx, struct spd
 					const void *esnap_id, uint32_t id_size,
 					struct spdk_bs_dev **bs_dev);
 
+typedef void (*spdk_drain_op_submit_handle)(void *cb, void *bdev_io);
+typedef void (*spdk_drain_op_cpl)(void *cb_arg, int bserrno);
+
 /**
  * Blob shallow copy status callback.
  *
@@ -1086,6 +1089,10 @@ struct spdk_bs_redirect_request *
 spdk_bs_queued_red_io(struct spdk_io_channel *ch, void *bdev_io);
 void
 spdk_bs_dequeued_red_io(struct spdk_io_channel *ch, void *bdev_io);
+
+void
+spdk_bs_drain_channel_queued(struct spdk_blob_store *bs, spdk_drain_op_submit_handle submit_cb,
+						 spdk_drain_op_cpl cb_fn, void *cb_arg);
 
 
 /**

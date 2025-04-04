@@ -48,6 +48,8 @@ DEFINE_STUB_V(spdk_lvs_update_on_failover, (struct spdk_lvol_store *lvs));
 DEFINE_STUB_V(spdk_lvol_update_on_failover, (struct spdk_lvol_store *lvs, struct spdk_lvol *lvol, bool send_md_thread));
 DEFINE_STUB_V(spdk_lvs_grow_live, (struct spdk_lvol_store *lvs,
 				   spdk_lvs_op_complete cb_fn, void *cb_arg));
+DEFINE_STUB_V(spdk_trigger_failover, (struct spdk_lvol_store *lvs, bool disconnect));
+DEFINE_STUB_V(spdk_bs_clear_hub_channel, (struct spdk_io_channel *ch));
 DEFINE_STUB_V(spdk_lvs_check_active_process, (struct spdk_lvol_store *lvs, struct spdk_lvol *lvol, uint8_t type));
 DEFINE_STUB_V(spdk_lvol_resize_unfreeze, (struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg));
 DEFINE_STUB(spdk_bs_queued_red_io,struct spdk_bs_redirect_request *, (struct spdk_io_channel *ch, void *bdev_io), NULL);

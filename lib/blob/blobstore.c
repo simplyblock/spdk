@@ -554,6 +554,58 @@ blob_freeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg
 	spdk_for_each_channel(blob->bs, blob_io_sync, ctx, blob_io_cpl);
 }
 
+struct drain_io_ctx {
+	void *cb_arg;
+	spdk_drain_op_cpl	cb_fn;
+	spdk_drain_op_submit_handle	submit_cb;
+};
+
+static void
+spdk_bs_drain_queued_io(struct spdk_io_channel_iter *i)
+{
+	struct spdk_io_channel *_ch = spdk_io_channel_iter_get_channel(i);
+	struct spdk_bs_channel *ch = spdk_io_channel_get_ctx(_ch);
+	struct drain_io_ctx *ctx = spdk_io_channel_iter_get_ctx(i);
+	struct spdk_bs_redirect_request *req, *tmp;
+
+	TAILQ_FOREACH_SAFE(req, &ch->redirect_queued, entry, tmp) {
+		TAILQ_REMOVE(&ch->redirect_queued, req, entry);
+		if (req->bdev_io) {			
+			ctx->submit_cb(req->ch, req->bdev_io);
+			req->bdev_io = NULL;
+			req->ch = NULL;			
+		}
+		TAILQ_INSERT_TAIL(&ch->rd_reqs, req, entry);
+	}
+	spdk_for_each_channel_continue(i, 0);
+}
+
+static void
+spdk_bs_drain_cpl(struct spdk_io_channel_iter *i, int status)
+{
+	struct drain_io_ctx *ctx = spdk_io_channel_iter_get_ctx(i);
+	ctx->cb_fn(ctx->cb_arg, 0);
+	free(ctx);
+}
+
+void
+spdk_bs_drain_channel_queued(struct spdk_blob_store *bs, spdk_drain_op_submit_handle submit_cb, spdk_drain_op_cpl cb_fn, void *cb_arg)
+{
+	struct drain_io_ctx *ctx;
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+
+	ctx->submit_cb = submit_cb;
+	ctx->cb_fn = cb_fn;
+	ctx->cb_arg = cb_arg;
+
+	spdk_for_each_channel(bs, spdk_bs_drain_queued_io, ctx, spdk_bs_drain_cpl);
+}
+
 static void
 blob_unfreeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
 {
@@ -4286,9 +4338,9 @@ spdk_bs_set_hub_channel(struct spdk_io_channel *ch, struct spdk_io_channel *hub_
 void
 spdk_bs_clear_hub_channel(struct spdk_io_channel *ch)
 {
-	struct spdk_bs_channel *bs_channel = spdk_io_channel_get_ctx(ch);    
-	bs_channel->redirect_ch = NULL;
+	struct spdk_bs_channel *bs_channel = spdk_io_channel_get_ctx(ch);
 	bs_channel->set_redirect_ch = false;
+	bs_channel->redirect_ch = NULL;
 	bs_channel->redirect_desc = NULL;
 }
 

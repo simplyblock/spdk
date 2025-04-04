@@ -1337,10 +1337,20 @@ blob_ext_io_opts_to_bdev_opts(struct spdk_bdev_ext_io_opts *dst, struct spdk_blo
 }
 
 static void
+retransmit_io(void *ch_arg, void *bdev_io_arg)
+{
+	struct spdk_bdev_io *bdev_io = bdev_io_arg;
+	struct spdk_io_channel *ch = ch_arg;	
+	vbdev_lvol_submit_request(ch, bdev_io);
+}
+
+static void
 _pt_complete_io(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
 	struct ctx_redirect_req *ctx = cb_arg;
 	struct spdk_bdev_io *orig_io = ctx->bdev_io;
+	struct spdk_lvol *lvol = orig_io->bdev->ctxt;
+	struct spdk_lvol_store *lvs = lvol->lvol_store;
 	int status = success ? SPDK_BDEV_IO_STATUS_SUCCESS : SPDK_BDEV_IO_STATUS_FAILED;
 	//TODO dequeue the bdev_io
 
@@ -1349,10 +1359,9 @@ _pt_complete_io(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	 */
 	if (status == SPDK_BDEV_IO_STATUS_SUCCESS) {
 		spdk_bs_dequeued_red_io(ctx->ch, ctx->bdev_io);
-	} else {
-		spdk_bs_dequeued_red_io(ctx->ch, ctx->bdev_io);
-		vbdev_lvol_submit_request(ctx->ch, ctx->bdev_io);
+	} else {		
 		//TODO failover start
+		spdk_trigger_failover(lvs, false);
 		spdk_bdev_free_io(bdev_io);
 		free(ctx);
 		return;
@@ -1360,7 +1369,6 @@ _pt_complete_io(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 
 	spdk_bdev_io_complete(orig_io, status);
 	spdk_bdev_free_io(bdev_io);
-
 	free(ctx);
 }
 
@@ -1385,6 +1393,13 @@ redirect_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io, bo
 		return;
 	}
 
+	if (hub_dev->state != HUBLVOL_CONNECTED) {
+		spdk_bs_clear_hub_channel(ch);
+		spdk_trigger_failover(lvs, false);
+		// vbdev_lvol_open_hubbdev(lvs);
+		return;
+	}
+
 	ctx = calloc(1, sizeof(*ctx));
 	ctx->bdev_io = bdev_io;
 	ctx->ch = ch;
@@ -1395,7 +1410,7 @@ redirect_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io, bo
 	lvol_io->ext_io_opts.memory_domain_ctx = bdev_io->u.bdev.memory_domain_ctx;
 	blob_ext_io_opts_to_bdev_opts(&bdev_io_opts, &lvol_io->ext_io_opts);
 	hub_ch = spdk_bs_get_hub_channel(ch);
-
+	
 	int rc = spdk_bdev_readv_blocks_ext(hub_dev->desc, hub_ch, bdev_io->u.bdev.iovs, bdev_io->u.bdev.iovcnt, offset,
 			       bdev_io->u.bdev.num_blocks, _pt_complete_io, ctx, &bdev_io_opts);
 	if (rc != 0) {
@@ -1405,8 +1420,8 @@ redirect_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io, bo
 		// 	vbdev_passthru_queue_io(bdev_io);
 		// } else {
 			SPDK_ERRLOG("ERROR on bdev_io submission!\n");
-			spdk_bs_dequeued_red_io(ch, bdev_io);
-			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+			spdk_bs_clear_hub_channel(ch);
+			spdk_trigger_failover(lvs, false);
 			free(ctx);
 		// }
 	}
@@ -1425,33 +1440,45 @@ vbdev_redirect_request_to_hublvol(struct spdk_lvol *lvol, struct spdk_io_channel
 	COMBINE_OFFSET(offset, lvol->map_id, bdev_io->u.bdev.offset_blocks);
 
 	spdk_bs_queued_red_io(ch, bdev_io);
-	if ( hub_dev->state == HUBLVOL_CONNECTED ) {
+	if (hub_dev->state == HUBLVOL_CONNECTED) {
 		//TODO check the state for channel
-		hub_ch = spdk_bs_get_hub_channel(ch);
+		if (hub_dev->desc == NULL) {
+			SPDK_ERRLOG("Hublvol desc is NULL. should not be.\n");
+			spdk_bs_clear_hub_channel(ch);
+			spdk_trigger_failover(lvs, true);
+			// vbdev_lvol_open_hubbdev(lvs);			
+			return;
+		}
+
+		hub_ch = spdk_bs_get_hub_channel(ch);		
 		if (!hub_ch) {
 			hub_ch = spdk_bdev_get_io_channel(hub_dev->desc);
 			if (!hub_ch || !spdk_bs_set_hub_channel(ch, hub_ch, hub_dev->desc)) {
-				spdk_bs_dequeued_red_io(ch, bdev_io);
-				vbdev_lvol_submit_request(ch, bdev_io);
-				//TODO print error
+				// spdk_bs_dequeued_red_io(ch, bdev_io);
+				// vbdev_lvol_submit_request(ch, bdev_io);
+				SPDK_NOTICELOG("Hublvol state is in connected mode but we lost the desc due to internal error."
+							"we try to connect now but we will not wait and the failover will started.\n");
+				//TODO release the hublvol desc in the mutux				
+				spdk_bs_clear_hub_channel(ch);
+				// vbdev_lvol_open_hubbdev(lvs);
+				spdk_trigger_failover(lvs, true);
 				// failover
 				return;
 			}
 		}
 	} else {
+		spdk_bs_clear_hub_channel(ch);		
 		if (hub_dev->state == HUBLVOL_CONNECTED_FAILED ||
-		 				hub_dev->state == HUBLVOL_DISCONNECTED) {
-			spdk_bs_dequeued_red_io(ch, bdev_io);
-			vbdev_lvol_submit_request(ch, bdev_io);
-			//TODO darin the queue
-			//failover
-			return;
+		 		hub_dev->state == HUBLVOL_DISCONNECTED ||
+				hub_dev->state == HUBLVOL_CONNECTING_IN_PROCCESS) {
+			SPDK_NOTICELOG("Hublvol is in failover status. we try to connect now but we will not wait and the failover will started.\n");
 		}
 
-		if (hub_dev->state == HUBLVOL_CONNECTING_IN_PROCCESS) {
-			//IDK what to do here ...
-
+		if (hub_dev->state == HUBLVOL_NOT_CONNECTED) {
+			SPDK_NOTICELOG("Hublvol is not connected. we try to connect now but we will not wait and the failover will started.\n");
 		}
+		spdk_trigger_failover(lvs, false);
+		// vbdev_lvol_open_hubbdev(lvs);
 		return;
 	}
 
@@ -1526,7 +1553,7 @@ vbdev_hublvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bd
 	uint64_t offset =  bdev_io->u.bdev.offset_blocks;
 
 	uint16_t id = EXTRACT_ID(offset);
-	if ( id == 0) {
+	if (id == 0) {
 		SPDK_ERRLOG("HUBLVOL - orglvol in none due to zero id - blob: %" PRIu64 "  "
 							"Lba: %" PRIu64 "  Cnt %" PRIu64 "  t %d \n",
 							lvol->blob_id, offset, bdev_io->u.bdev.num_blocks, bdev_io->type);
@@ -1546,7 +1573,7 @@ vbdev_hublvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bd
 	}
 
 	if (org_lvol == NULL) {
-		SPDK_NOTICELOG("FAILED - orglvol is none - blob map id: %" PRIu16 "  "
+		SPDK_ERRLOG("FAILED - orglvol is none - blob map id: %" PRIu16 "  "
 								"Lba: %" PRIu64 "  Cnt %" PRIu64 "  t %d \n",
 								id, offset, bdev_io->u.bdev.num_blocks, bdev_io->type);
 		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
@@ -1598,7 +1625,13 @@ vbdev_lvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_
 	}
 
 	if (lvs->primary && lvol->hublvol) {
-		vbdev_hublvol_submit_request(ch, bdev_io);
+		if (lvs->leader) {
+			vbdev_hublvol_submit_request(ch, bdev_io);
+			return;
+		}
+		SPDK_ERRLOG("hublvol on primary nonleader state: should not receive I/O %" PRIu64 " type %d\n", 
+				bdev_io->u.bdev.offset_blocks, bdev_io->type);
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 		return;
 	}
 
@@ -2942,6 +2975,7 @@ vbdev_lvol_set_hubbdev_module(struct spdk_lvol_store *lvs)
 		return;
 	}
 	lvs->hub_dev.module = &g_lvol_if;
+	lvs->hub_dev.submit_cb = retransmit_io;
 	lvs->hub_dev.thread = spdk_get_thread();
 	if (lvs->hub_dev.state != HUBLVOL_CONNECTED || lvs->hub_dev.state != HUBLVOL_CONNECTING_IN_PROCCESS) {
 		lvs->hub_dev.state = HUBLVOL_NOT_CONNECTED;
