@@ -1450,7 +1450,9 @@ vbdev_redirect_request_to_hublvol(struct spdk_lvol *lvol, struct spdk_io_channel
 
 		if (hub_dev->state == HUBLVOL_CONNECTING_IN_PROCCESS) {
 			//IDK what to do here ...
+
 		}
+		return;
 	}
 
 	if (bdev_io->type != SPDK_BDEV_IO_TYPE_READ && !lvs->read_only) {
