@@ -1108,7 +1108,6 @@ lvol_create_open_cb(void *cb_arg, struct spdk_blob *blob, int lvolerrno)
 	struct spdk_lvol_with_handle_req *req = cb_arg;
 	struct spdk_lvol *lvol = req->lvol;
 	struct spdk_lvol_store *lvs = lvol->lvol_store;
-	uint16_t map_id;
 
 	TAILQ_REMOVE(&req->lvol->lvol_store->pending_lvols, req->lvol, link);
 
@@ -1122,7 +1121,7 @@ lvol_create_open_cb(void *cb_arg, struct spdk_blob *blob, int lvolerrno)
 	lvol->blob = blob;
 	lvol->blob_id = spdk_blob_get_id(blob);
 	lvol->map_id = spdk_blob_get_map_id(blob);
-	lvs->lvol_map.lvol[map_id] = lvol;
+	lvs->lvol_map.lvol[lvol->map_id] = lvol;
 
 	TAILQ_INSERT_TAIL(&lvol->lvol_store->lvols, lvol, link);
 
@@ -1309,7 +1308,6 @@ int
 spdk_lvol_create_hublvol(struct spdk_lvol_store *lvs, spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg)
 {
 	struct spdk_lvol_with_handle_req *req;
-	struct spdk_blob_store *bs;
 	struct spdk_lvol *lvol;
 	struct spdk_blob_opts opts;
 	char *xattr_names[] = {LVOL_NAME, "uuid"};
@@ -1324,8 +1322,6 @@ spdk_lvol_create_hublvol(struct spdk_lvol_store *lvs, spdk_lvol_op_with_handle_c
 	if (rc < 0) {
 		return rc;
 	}
-
-	bs = lvs->blobstore;
 
 	req = calloc(1, sizeof(*req));
 	if (!req) {
@@ -3038,13 +3034,13 @@ spdk_lvs_hub_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bde
 	case SPDK_BDEV_EVENT_REMOVE:
 		pthread_mutex_lock(&g_lvs_queue_mutex);
 		lvs->skip_redirecting = true;
-		lvs->hub_dev->state = HUBLVOL_DISCONNECTED;
-		lvs->hub_dev->dev_removed = true;
+		lvs->hub_dev.state = HUBLVOL_DISCONNECTED;
+		lvs->hub_dev.dev_removed = true;
 		pthread_mutex_unlock(&g_lvs_queue_mutex);
-		spdk_bdev_module_release_bdev(lvs->hub_dev->bdev);
-		spdk_bdev_close(lvs->hub_dev->desc);
-		lvs->hub_dev->desc = NULL;
-		lvs->hub_dev->bdev = NULL;
+		spdk_bdev_module_release_bdev(lvs->hub_dev.bdev);
+		spdk_bdev_close(lvs->hub_dev.desc);
+		lvs->hub_dev.desc = NULL;
+		lvs->hub_dev.bdev = NULL;
 		
 		break;
 	default:
@@ -3058,37 +3054,37 @@ spdk_lvs_open_hub_bdev(void *cb_arg) {
 	struct spdk_lvol_store *lvs = cb_arg;
 	int rc = 0;		
 	if (lvs->secondary) {
-		if ((lvs->hub_dev->state == HUBLVOL_CONNECTING_IN_PROCCESS ||
-		 	lvs->hub_dev->state == HUBLVOL_CONNECTED) || lvs->skip_redirecting) {
+		if ((lvs->hub_dev.state == HUBLVOL_CONNECTING_IN_PROCCESS ||
+		 	lvs->hub_dev.state == HUBLVOL_CONNECTED) || lvs->skip_redirecting) {
 				return;
 		}
 		
-		lvs->hub_dev->state = HUBLVOL_CONNECTING_IN_PROCCESS;
+		lvs->hub_dev.state = HUBLVOL_CONNECTING_IN_PROCCESS;
  		// connect to the remote_bdev
-		rc = spdk_bdev_open_ext(lvs->remote_bdev, true, spdk_lvs_hub_bdev_event_cb, lvs, &lvs->hub_dev->desc);
+		rc = spdk_bdev_open_ext(lvs->remote_bdev, true, spdk_lvs_hub_bdev_event_cb, lvs, &lvs->hub_dev.desc);
 		if (rc != 0) {
 			SPDK_ERRLOG("Lvolstore %s: bdev %s cannot be opened, error=%d\n",
 					lvs->name, lvs->remote_bdev, rc);
 			goto err;
 		}
 
-		lvs->hub_dev->bdev = spdk_bdev_desc_get_bdev(lvs->hub_dev->desc);
-		rc = spdk_bdev_module_claim_bdev(lvs->hub_dev->bdev, lvs->hub_dev->desc, lvs->hub_dev->module);
+		lvs->hub_dev.bdev = spdk_bdev_desc_get_bdev(lvs->hub_dev.desc);
+		rc = spdk_bdev_module_claim_bdev(lvs->hub_dev.bdev, lvs->hub_dev.desc, lvs->hub_dev.module);
 		// rc = spdk_bdev_module_claim_bdev_desc(lvs->hub_dev->desc, SPDK_BDEV_CLAIM_READ_MANY_WRITE_ONE, NULL, module);
 		if (rc != 0) {
 			SPDK_ERRLOG("could not claim dev.\n");
-			spdk_bdev_close(lvs->hub_dev->desc);
-			lvs->hub_dev->desc = NULL;
-			lvs->hub_dev->bdev = NULL;
+			spdk_bdev_close(lvs->hub_dev.desc);
+			lvs->hub_dev.desc = NULL;
+			lvs->hub_dev.bdev = NULL;
 			goto err;
 		}		
 		lvs->skip_redirecting = false;
-		lvs->hub_dev->state = HUBLVOL_CONNECTED;		
+		lvs->hub_dev.state = HUBLVOL_CONNECTED;		
 		return;
  	}
 err:
 	lvs->skip_redirecting = true;
-	lvs->hub_dev->state = HUBLVOL_CONNECTED_FAILED;	
+	lvs->hub_dev.state = HUBLVOL_CONNECTED_FAILED;	
 }
 
 void

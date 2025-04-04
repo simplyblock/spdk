@@ -166,7 +166,7 @@ struct spdk_lvol_store {
 	bool 				secondary;
 	int 				subsystem_port;
 	struct spdk_lvs_redirect lvol_map;	
-	struct spdk_redirect_dev *hub_dev;
+	struct spdk_redirect_dev hub_dev;
 	char	remote_bdev[SPDK_LVOL_NAME_MAX];
 };
 
