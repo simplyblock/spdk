@@ -2948,7 +2948,7 @@ check_time(struct spdk_nvmf_tcp_req *tcp_req, struct spdk_nvmf_tcp_qpair *tqpair
 		uint64_t current = spdk_get_ticks();
 		uint8_t idx = (tqpair->target_port == 4420) ? 32 : 67;
 		// Check if more than 28 ticks have passed since tcp_req->time
-		if ((current - tcp_req->time) > tqpair->ticks_hz * 2 && (tcp_req->cmd.opc != SPDK_NVME_OPC_ASYNC_EVENT_REQUEST)) {
+		if ((current - tcp_req->time) > tqpair->ticks_hz * 1 && (tcp_req->cmd.opc != SPDK_NVME_OPC_ASYNC_EVENT_REQUEST)) {
 			char *uuid = spdk_nvmf_request_nqn(&tcp_req->req, idx);
 			uuid = (uuid) ? uuid : ""; // Handle NULL UUID
 
