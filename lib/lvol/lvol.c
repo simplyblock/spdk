@@ -3037,6 +3037,7 @@ spdk_lvs_hub_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bde
 		// lvs->hub_dev.state = HUBLVOL_DISCONNECTED;
 		// lvs->hub_dev.dev_removed = true;
 		// pthread_mutex_unlock(&g_lvs_queue_mutex);
+		SPDK_NOTICELOG("Receive remove event from callback. \n");
 		spdk_trigger_failover(lvs, true);
 		// spdk_bdev_module_release_bdev(lvs->hub_dev.bdev);
 		spdk_bdev_close(lvs->hub_dev.desc);
@@ -3068,7 +3069,7 @@ spdk_lvs_open_hub_bdev(void *cb_arg) {
 				pthread_mutex_unlock(&g_lvol_stores_mutex);
 				return;
 		}
-		// SPDK_ERRLOG("hubbdev 7\n");
+		SPDK_NOTICELOG("start to recreate the desc from hub dev.\n");
 		lvs->hub_dev.state = HUBLVOL_CONNECTING_IN_PROCCESS;
 		pthread_mutex_unlock(&g_lvol_stores_mutex);
  		// connect to the remote_bdev
@@ -3108,7 +3109,6 @@ static void
 spdk_trigger_failover_cpl(void *cb_arg, int bserrno) {
 	struct spdk_lvol_store *lvs = cb_arg;
 	pthread_mutex_lock(&g_lvol_stores_mutex);
-	// SPDK_ERRLOG("hubbdev 5\n");
 	lvs->hub_dev.drain_in_action = false;
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
 	if (lvs->hub_dev.state != HUBLVOL_CONNECTED) {
@@ -3119,12 +3119,12 @@ spdk_trigger_failover_cpl(void *cb_arg, int bserrno) {
 void
 spdk_trigger_failover(struct spdk_lvol_store *lvs, bool disconnected) {
 	bool trigger_state = false;
-	// SPDK_ERRLOG("hubbdev 3\n");
 	pthread_mutex_lock(&g_lvol_stores_mutex);
 	if (!lvs->skip_redirecting && !lvs->hub_dev.drain_in_action) {
-		// SPDK_ERRLOG("hubbdev 4\n");
+		SPDK_NOTICELOG("process the failover op.\n");
 		lvs->skip_redirecting = true;
 		if (disconnected) {
+			SPDK_NOTICELOG("change device connect state.\n");
 			lvs->hub_dev.state = HUBLVOL_NOT_CONNECTED;
 		}
 		lvs->hub_dev.drain_in_action = true;
@@ -3285,8 +3285,10 @@ spdk_set_leader_all(struct spdk_lvol_store *t_lvs, bool lvs_leader, bool bs_nonl
 
 	if (tmp_lvs) {
 		if (tmp_lvs->hub_dev.state == HUBLVOL_CONNECTED) {
+			SPDK_NOTICELOG("enable redirect IO mode.\n");
 			tmp_lvs->skip_redirecting = false;
 		} else {
+			SPDK_NOTICELOG("try to reconnect hub dev and enable redirect IO mode.\n");
 			spdk_lvs_open_hub_bdev(tmp_lvs);
 		}
 	}

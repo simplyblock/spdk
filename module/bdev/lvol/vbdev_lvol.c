@@ -1360,9 +1360,8 @@ _pt_complete_io(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	 */
 	if (status == SPDK_BDEV_IO_STATUS_SUCCESS) {
 		spdk_bs_dequeued_red_io(ctx->ch, ctx->bdev_io);
-	} else {		
-		//TODO failover start
-		// SPDK_ERRLOG("hubbdev 2\n");
+	} else {
+		SPDK_ERRLOG("FAILED IO on bdev_io respone from hublvol!. start failover.\n");
 		spdk_trigger_failover(lvs, false);
 		spdk_bdev_free_io(bdev_io);
 		vbdev_lvol_submit_request(ctx->ch, ctx->bdev_io);
@@ -1399,13 +1398,19 @@ redirect_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io, bo
 	if (hub_dev->state != HUBLVOL_CONNECTED) {
 		// spdk_bs_clear_hub_channel(ch);
 		// SPDK_ERRLOG("hubbdev 1\n");
-		spdk_trigger_failover(lvs, false);
+		SPDK_ERRLOG("ERROR on bdev_io submission! hubdev is not connected. start failover.\n");
+		spdk_trigger_failover(lvs, true);
 		vbdev_lvol_submit_request(ch, bdev_io);
-		// vbdev_lvol_open_hubbdev(lvs);
 		return;
 	}
 
 	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {	
+		SPDK_NOTICELOG("FAILED IO - Cannot allocate ctx for redirect IO. \n");
+		spdk_trigger_failover(lvs, false);
+		vbdev_lvol_submit_request(ch, bdev_io);
+		return;
+	}
 	ctx->bdev_io = bdev_io;
 	ctx->ch = ch;
 
@@ -1425,7 +1430,6 @@ redirect_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io, bo
 		// 	vbdev_passthru_queue_io(bdev_io);
 		// } else {
 			SPDK_ERRLOG("ERROR on bdev_io submission!\n");
-			// spdk_bs_clear_hub_channel(ch);
 			spdk_trigger_failover(lvs, false);
 			vbdev_lvol_submit_request(ch, bdev_io);
 			free(ctx);
@@ -1500,6 +1504,7 @@ vbdev_redirect_request_to_hublvol(struct spdk_lvol *lvol, struct spdk_io_channel
 		ctx = calloc(1, sizeof(*ctx));
 		if (!ctx) {
 			// spdk_bs_dequeued_red_io(ch, bdev_io);
+			SPDK_NOTICELOG("FAILED IO - Cannot allocate ctx for redirect IO. \n");
 			spdk_trigger_failover(lvs, false);
 			vbdev_lvol_submit_request(ch, bdev_io);
 			//TODO failover
@@ -1554,12 +1559,12 @@ vbdev_redirect_request_to_hublvol(struct spdk_lvol *lvol, struct spdk_io_channel
 
 	if (rc != 0) {
 		// spdk_bs_dequeued_red_io(ch, bdev_io);
+		SPDK_ERRLOG("ERROR on bdev_io submission!\n");		
 		spdk_trigger_failover(lvs, false);	
 		vbdev_lvol_submit_request(ch, bdev_io);
 		if (ctx) {
 			free(ctx);
 		}
-		//TODO failover
 	}
 	return;
 }
