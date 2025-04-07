@@ -3038,11 +3038,11 @@ spdk_lvs_hub_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bde
 		// lvs->hub_dev.dev_removed = true;
 		// pthread_mutex_unlock(&g_lvs_queue_mutex);
 		spdk_trigger_failover(lvs, true);
-		spdk_bdev_module_release_bdev(lvs->hub_dev.bdev);
+		// spdk_bdev_module_release_bdev(lvs->hub_dev.bdev);
 		spdk_bdev_close(lvs->hub_dev.desc);
 		// we should check if change this make problem for us
 		lvs->hub_dev.desc = NULL;
-		lvs->hub_dev.bdev = NULL;
+		// lvs->hub_dev.bdev = NULL;
 		
 		break;
 	default:
@@ -3055,19 +3055,22 @@ void
 spdk_lvs_open_hub_bdev(void *cb_arg) {
 	struct spdk_lvol_store *lvs = cb_arg;
 	int rc = 0;
-	
+	// SPDK_ERRLOG("hubbdev 6\n");
 	if (lvs->primary) {
 		SPDK_ERRLOG("Lvolstore %s: is on the primary nod and does not need hub bdev.\n", lvs->name);
 		return;
 	}
 
 	if (lvs->secondary) {
+		pthread_mutex_lock(&g_lvol_stores_mutex);
 		if (lvs->hub_dev.state == HUBLVOL_CONNECTING_IN_PROCCESS ||
 		 	lvs->hub_dev.state == HUBLVOL_CONNECTED) {
+				pthread_mutex_unlock(&g_lvol_stores_mutex);
 				return;
 		}
-		
+		// SPDK_ERRLOG("hubbdev 7\n");
 		lvs->hub_dev.state = HUBLVOL_CONNECTING_IN_PROCCESS;
+		pthread_mutex_unlock(&g_lvol_stores_mutex);
  		// connect to the remote_bdev
 		rc = spdk_bdev_open_ext(lvs->remote_bdev, true, spdk_lvs_hub_bdev_event_cb, lvs, &lvs->hub_dev.desc);
 		if (rc != 0) {
@@ -3078,29 +3081,34 @@ spdk_lvs_open_hub_bdev(void *cb_arg) {
 			goto err;
 		}
 
-		lvs->hub_dev.bdev = spdk_bdev_desc_get_bdev(lvs->hub_dev.desc);
-		rc = spdk_bdev_module_claim_bdev(lvs->hub_dev.bdev, lvs->hub_dev.desc, lvs->hub_dev.module);
-		// rc = spdk_bdev_module_claim_bdev_desc(lvs->hub_dev->desc, SPDK_BDEV_CLAIM_READ_MANY_WRITE_ONE, NULL, module);
-		if (rc != 0) {
-			SPDK_ERRLOG("could not claim dev.\n");
-			spdk_bdev_close(lvs->hub_dev.desc);
-			lvs->hub_dev.desc = NULL;
-			lvs->hub_dev.bdev = NULL;
-			goto err;
-		}		
+		// lvs->hub_dev.bdev = spdk_bdev_desc_get_bdev(lvs->hub_dev.desc);
+		// rc = spdk_bdev_module_claim_bdev(lvs->hub_dev.bdev, lvs->hub_dev.desc, lvs->hub_dev.module);
+		// // rc = spdk_bdev_module_claim_bdev_desc(lvs->hub_dev->desc, SPDK_BDEV_CLAIM_READ_MANY_WRITE_ONE, NULL, module);
+		// if (rc != 0) {
+		// 	SPDK_ERRLOG("could not claim dev.\n");
+		// 	spdk_bdev_close(lvs->hub_dev.desc);
+		// 	lvs->hub_dev.desc = NULL;
+		// 	lvs->hub_dev.bdev = NULL;
+		// 	goto err;
+		// }
+		pthread_mutex_lock(&g_lvol_stores_mutex);
 		lvs->skip_redirecting = false;
-		lvs->hub_dev.state = HUBLVOL_CONNECTED;		
+		lvs->hub_dev.state = HUBLVOL_CONNECTED;
+		pthread_mutex_unlock(&g_lvol_stores_mutex);	
 		return;
  	}
 err:
+	pthread_mutex_lock(&g_lvol_stores_mutex);
 	lvs->skip_redirecting = true;
-	lvs->hub_dev.state = HUBLVOL_CONNECTED_FAILED;	
+	lvs->hub_dev.state = HUBLVOL_CONNECTED_FAILED;
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
 }
 
 static void
 spdk_trigger_failover_cpl(void *cb_arg, int bserrno) {
 	struct spdk_lvol_store *lvs = cb_arg;
 	pthread_mutex_lock(&g_lvol_stores_mutex);
+	// SPDK_ERRLOG("hubbdev 5\n");
 	lvs->hub_dev.drain_in_action = false;
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
 	if (lvs->hub_dev.state != HUBLVOL_CONNECTED) {
@@ -3111,8 +3119,10 @@ spdk_trigger_failover_cpl(void *cb_arg, int bserrno) {
 void
 spdk_trigger_failover(struct spdk_lvol_store *lvs, bool disconnected) {
 	bool trigger_state = false;
+	// SPDK_ERRLOG("hubbdev 3\n");
 	pthread_mutex_lock(&g_lvol_stores_mutex);
 	if (!lvs->skip_redirecting && !lvs->hub_dev.drain_in_action) {
+		// SPDK_ERRLOG("hubbdev 4\n");
 		lvs->skip_redirecting = true;
 		if (disconnected) {
 			lvs->hub_dev.state = HUBLVOL_NOT_CONNECTED;
@@ -3127,6 +3137,7 @@ spdk_trigger_failover(struct spdk_lvol_store *lvs, bool disconnected) {
 	if (!trigger_state) {
 		return;
 	}
+	// spdk_trigger_failover_cpl(lvs, 0);
 	spdk_bs_drain_channel_queued(lvs->blobstore, lvs->hub_dev.submit_cb, spdk_trigger_failover_cpl, lvs);
 }
 
@@ -3244,6 +3255,7 @@ void
 spdk_set_leader_all(struct spdk_lvol_store *t_lvs, bool lvs_leader, bool bs_nonleadership)
 {
 	struct spdk_lvol_store *lvs;
+	struct spdk_lvol_store *tmp_lvs = NULL;
 	struct spdk_lvol *lvol;	
 	SPDK_NOTICELOG("Lvs_leader state changed via RPC to %s and bs_nonleader to %s.\n", 
                 lvs_leader ? "true" : "false",
@@ -3261,11 +3273,23 @@ spdk_set_leader_all(struct spdk_lvol_store *t_lvs, bool lvs_leader, bool bs_nonl
 				lvol->leader = lvs_leader;
 				lvol->update_in_progress = false;
 			}
+
 			lvs->leader = lvs_leader;
+
+			if (!lvs->leader && lvs->secondary ) {
+				tmp_lvs = lvs;
+			}
 		}
 	}
-
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
+
+	if (tmp_lvs) {
+		if (tmp_lvs->hub_dev.state == HUBLVOL_CONNECTED) {
+			tmp_lvs->skip_redirecting = false;
+		} else {
+			spdk_lvs_open_hub_bdev(tmp_lvs);
+		}
+	}
 }
 
 struct spdk_lvol *

@@ -565,18 +565,16 @@ spdk_bs_drain_queued_io(struct spdk_io_channel_iter *i)
 {
 	struct spdk_io_channel *_ch = spdk_io_channel_iter_get_channel(i);
 	struct spdk_bs_channel *ch = spdk_io_channel_get_ctx(_ch);
-	struct drain_io_ctx *ctx = spdk_io_channel_iter_get_ctx(i);
-	struct spdk_bs_redirect_request *req, *tmp;
+	// struct drain_io_ctx *ctx = spdk_io_channel_iter_get_ctx(i);
+	// struct spdk_bs_redirect_request *req, *tmp;
 
-	TAILQ_FOREACH_SAFE(req, &ch->redirect_queued, entry, tmp) {
-		TAILQ_REMOVE(&ch->redirect_queued, req, entry);
-		if (req->bdev_io) {			
-			ctx->submit_cb(req->ch, req->bdev_io);
-			req->bdev_io = NULL;
-			req->ch = NULL;			
-		}
-		TAILQ_INSERT_TAIL(&ch->rd_reqs, req, entry);
+	if (ch->set_redirect_ch && ch->redirect_ch) {
+		spdk_put_io_channel(ch->redirect_ch);
 	}
+
+	ch->set_redirect_ch = false;
+	ch->redirect_ch = NULL;
+	ch->redirect_desc = NULL;
 	spdk_for_each_channel_continue(i, 0);
 }
 
@@ -4225,16 +4223,18 @@ bs_channel_create(void *io_device, void *ctx_buf)
 		TAILQ_INSERT_TAIL(&channel->reqs, &channel->req_mem[i], link);
 	}
 
-	channel->redirect_reqs = calloc(max_ops, sizeof(struct spdk_bs_redirect_request));
-	if (!channel->redirect_reqs) {
-		return -1;
-	}
+	// channel->redirect_reqs = calloc(max_ops, sizeof(struct spdk_bs_redirect_request));
+	// if (!channel->redirect_reqs) {
+	// 	return -1;
+	// }
 
-	TAILQ_INIT(&channel->rd_reqs);
+	// TAILQ_INIT(&channel->rd_reqs);
 
-	for (i = 0; i < max_ops; i++) {
-		TAILQ_INSERT_TAIL(&channel->rd_reqs, &channel->redirect_reqs[i], entry);
-	}
+	// for (i = 0; i < max_ops; i++) {
+	// 	channel->redirect_reqs[i].bdev_io = NULL;
+	// 	channel->redirect_reqs[i].ch = NULL;
+	// 	TAILQ_INSERT_TAIL(&channel->rd_reqs, &channel->redirect_reqs[i], entry);
+	// }
 
 	channel->bs = bs;
 	channel->dev = dev;
@@ -4260,7 +4260,7 @@ bs_channel_create(void *io_device, void *ctx_buf)
 
 	TAILQ_INIT(&channel->need_cluster_alloc);
 	TAILQ_INIT(&channel->queued_io);
-	TAILQ_INIT(&channel->redirect_queued);
+	// TAILQ_INIT(&channel->redirect_queued);
 	RB_INIT(&channel->esnap_channels);
 
 	return 0;
@@ -4271,7 +4271,7 @@ bs_channel_destroy(void *io_device, void *ctx_buf)
 {
 	struct spdk_bs_channel *channel = ctx_buf;
 	spdk_bs_user_op_t *op;
-	struct spdk_bs_redirect_request *req;
+	// struct spdk_bs_redirect_request *req;
 
 	while (!TAILQ_EMPTY(&channel->need_cluster_alloc)) {
 		op = TAILQ_FIRST(&channel->need_cluster_alloc);
@@ -4292,16 +4292,16 @@ bs_channel_destroy(void *io_device, void *ctx_buf)
 
 	// TODO we should confirm that we are not in the redirect mode 
 	// bcs this will create segfault for us
-	while (!TAILQ_EMPTY(&channel->redirect_queued)) {
-		req = TAILQ_FIRST(&channel->redirect_queued);
-		TAILQ_REMOVE(&channel->redirect_queued, req, entry);
+	// while (!TAILQ_EMPTY(&channel->redirect_queued)) {
+	// 	req = TAILQ_FIRST(&channel->redirect_queued);
+	// 	TAILQ_REMOVE(&channel->redirect_queued, req, entry);
 		
-		//TODO
-		// spdk_bdev_io_complete(req->bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
-		req->bdev_io = NULL;
-		req->ch = NULL;
-	}
-	free(channel->redirect_reqs);
+	// 	//TODO
+	// 	// spdk_bdev_io_complete(req->bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+	// 	req->bdev_io = NULL;
+	// 	req->ch = NULL;
+	// }
+	// free(channel->redirect_reqs);
 	if (channel->set_redirect_ch && channel->redirect_ch) {
 		spdk_put_io_channel(channel->redirect_ch);
 	}
@@ -4347,37 +4347,38 @@ spdk_bs_clear_hub_channel(struct spdk_io_channel *ch)
 struct spdk_bs_redirect_request *
 spdk_bs_queued_red_io(struct spdk_io_channel *ch, void *bdev_io)
 {
-	struct spdk_bs_channel *channel = NULL;
-	struct spdk_bs_redirect_request *req;
-	channel = spdk_io_channel_get_ctx(ch);
-	assert(channel != NULL);
+	// struct spdk_bs_channel *channel = NULL;
+	// struct spdk_bs_redirect_request *req;
+	// channel = spdk_io_channel_get_ctx(ch);
+	// assert(channel != NULL);
 	
-	req = TAILQ_FIRST(&channel->rd_reqs);
-	if (!req) {
-		return NULL;
-	}
-	TAILQ_REMOVE(&channel->rd_reqs, req, entry);
-	req->bdev_io = bdev_io;
-	req->ch = ch;
-	TAILQ_INSERT_TAIL(&channel->redirect_queued, req, entry);
-	return req;
+	// req = TAILQ_FIRST(&channel->rd_reqs);
+	// if (!req) {
+	// 	return NULL;
+	// }
+	// TAILQ_REMOVE(&channel->rd_reqs, req, entry);
+	// req->bdev_io = bdev_io;
+	// req->ch = ch;
+	// TAILQ_INSERT_TAIL(&channel->redirect_queued, req, entry);
+	return NULL;
 }
 
 void
 spdk_bs_dequeued_red_io(struct spdk_io_channel *ch, void *bdev_io)
 {
-	struct spdk_bs_channel *channel = NULL;
-	struct spdk_bs_redirect_request *req, *tmp;
-	channel = spdk_io_channel_get_ctx(ch);
-	assert(channel != NULL);
-	TAILQ_FOREACH_SAFE(req, &channel->redirect_queued, entry, tmp) {
-		if (!req && req->bdev_io && req->bdev_io == bdev_io) {
-			TAILQ_REMOVE(&channel->redirect_queued, req, entry);
-			req->bdev_io = NULL;
-			req->ch = NULL;
-			TAILQ_INSERT_TAIL(&channel->rd_reqs, req, entry);
-		}
-	}
+	return;
+	// struct spdk_bs_channel *channel = NULL;
+	// struct spdk_bs_redirect_request *req, *tmp;
+	// channel = spdk_io_channel_get_ctx(ch);
+	// assert(channel != NULL);
+	// TAILQ_FOREACH_SAFE(req, &channel->redirect_queued, entry, tmp) {
+	// 	if (!req && req->bdev_io && req->bdev_io == bdev_io) {
+	// 		TAILQ_REMOVE(&channel->redirect_queued, req, entry);
+	// 		req->bdev_io = NULL;
+	// 		req->ch = NULL;
+	// 		TAILQ_INSERT_TAIL(&channel->rd_reqs, req, entry);
+	// 	}
+	// }
 }
 
 static void
