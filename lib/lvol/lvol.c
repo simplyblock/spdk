@@ -3032,11 +3032,6 @@ spdk_lvs_hub_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bde
 	struct spdk_lvol_store *lvs = event_ctx;
 	switch (type) {
 	case SPDK_BDEV_EVENT_REMOVE:
-		// pthread_mutex_lock(&g_lvs_queue_mutex);
-		// lvs->skip_redirecting = true;
-		// lvs->hub_dev.state = HUBLVOL_DISCONNECTED;
-		// lvs->hub_dev.dev_removed = true;
-		// pthread_mutex_unlock(&g_lvs_queue_mutex);
 		SPDK_NOTICELOG("Receive remove event from callback. \n");
 		spdk_trigger_failover(lvs, true);
 		// spdk_bdev_module_release_bdev(lvs->hub_dev.bdev);
@@ -3131,6 +3126,10 @@ spdk_trigger_failover(struct spdk_lvol_store *lvs, bool disconnected) {
 		trigger_state = true;
 	} else {
 		trigger_state = false;
+		if (lvs->skip_redirectidisconnectedng && ) {
+			SPDK_NOTICELOG("change device connect state 1.\n");
+			lvs->hub_dev.state = HUBLVOL_NOT_CONNECTED;
+		}
 	}
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
 
