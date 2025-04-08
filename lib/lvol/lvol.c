@@ -3142,16 +3142,31 @@ spdk_trigger_failover(struct spdk_lvol_store *lvs, bool disconnected) {
 }
 
 void
-spdk_lvs_set_opts(struct spdk_lvol_store *lvs, uint64_t groupid, uint64_t port, bool primary, bool secondary, const char *remote_bdev)
+spdk_lvs_set_opts(struct spdk_lvol_store *lvs, uint64_t groupid, uint64_t port, bool primary, bool secondary)
 {
 	SPDK_NOTICELOG("Set groupid %" PRIu64 " and port %" PRIu64 " to the lvolstore .\n", groupid, port);
 	pthread_mutex_lock(&g_lvol_stores_mutex);
 	lvs->groupid = groupid;
 	lvs->subsystem_port = port;
 	lvs->primary = primary;	
- 	lvs->secondary = secondary;
-	snprintf(lvs->remote_bdev, sizeof(lvs->remote_bdev), "%s", remote_bdev);	
+ 	lvs->secondary = secondary;	
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
+	return;
+}
+
+void
+spdk_lvs_connect_hublvol(struct spdk_lvol_store *lvs, const char *remote_bdev)
+{
+	SPDK_NOTICELOG("Connect remote hublvol %s.\n", remote_bdev);
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+	snprintf(lvs->remote_bdev, sizeof(lvs->remote_bdev), "%s", remote_bdev);
+	lvs->hub_dev.thread = spdk_get_thread();	
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+	
+	if (lvs->hub_dev.state != HUBLVOL_CONNECTED || lvs->hub_dev.state != HUBLVOL_CONNECTING_IN_PROCCESS) {
+		lvs->hub_dev.state = HUBLVOL_NOT_CONNECTED;
+		spdk_thread_send_msg(lvs->hub_dev.thread, spdk_lvs_open_hub_bdev, lvs);
+	}
 	return;
 }
 

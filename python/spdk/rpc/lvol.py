@@ -561,6 +561,30 @@ def bdev_lvol_set_lvs_opts(client, uuid=None, lvs_name=None, groupid=0, subsyste
          params['remote_bdev'] = remote_bdev     
     return client.call('bdev_lvol_set_lvs_opts', params)
 
+def bdev_lvol_connect_hublvol(client, uuid=None, lvs_name=None, remote_bdev=''):
+    """Connect to the hub lvol.
+
+    Args:
+        uuid: UUID of logical volume store to retrieve information about (optional)
+        lvs_name: name of logical volume store to retrieve information about (optional)
+        remote_bdev: name of remote bdev
+        
+    Either uuid or lvs_name may be specified, but not both.
+    If both uuid and lvs_name are omitted, information about all logical volume stores is returned.
+    """
+    if (uuid and lvs_name):
+        raise ValueError("Exactly one of uuid or lvs_name may be specified")
+
+    if (not remote_bdev):
+         raise ValueError("remote bdev name must be specified")
+     
+    params = {'remote_bdev': remote_bdev}
+    if uuid:
+        params['uuid'] = uuid
+    if lvs_name:
+        params['lvs_name'] = lvs_name
+    return client.call('bdev_lvol_connect_hublvol', params)
+
 def bdev_lvol_get_lvols(client, lvs_uuid=None, lvs_name=None):
     """List logical volumes
 

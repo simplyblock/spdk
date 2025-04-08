@@ -995,6 +995,7 @@ vbdev_lvol_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 	spdk_json_write_named_bool(w, "lvol_leadership", lvol->leader);
 	spdk_json_write_named_bool(w, "lvs_leadership", lvol->lvol_store->leader);
 	spdk_json_write_named_uint64(w, "blobid", spdk_blob_get_id(blob));
+	spdk_json_write_named_uint64(w, "map_id", lvol->map_id);
 	spdk_json_write_named_uint32(w, "open_ref", spdk_blob_get_open_ref(blob));
 	spdk_json_write_named_uint8(w, "lvol_priority_class", lvol->priority_class);
 
@@ -1337,15 +1338,6 @@ blob_ext_io_opts_to_bdev_opts(struct spdk_bdev_ext_io_opts *dst, struct spdk_blo
 }
 
 static void
-retransmit_io(void *ch_arg, void *bdev_io_arg)
-{
-	struct spdk_bdev_io *bdev_io = bdev_io_arg;
-	struct spdk_io_channel *ch = ch_arg;
-	// if (bdev_io->name)
-	vbdev_lvol_submit_request(ch, bdev_io);
-}
-
-static void
 _pt_complete_io(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
 	struct ctx_redirect_req *ctx = cb_arg;
@@ -1574,7 +1566,7 @@ vbdev_hublvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bd
 	struct spdk_lvol *lvol = bdev_io->bdev->ctxt;
 	struct spdk_lvol_store *lvs = lvol->lvol_store;
 	uint64_t offset =  bdev_io->u.bdev.offset_blocks;
-
+	bool io_type = check_IO_type(bdev_io->type);
 	uint16_t id = EXTRACT_ID(offset);
 	if (id == 0) {
 		SPDK_ERRLOG("HUBLVOL - orglvol in none due to zero id - blob: %" PRIu64 "  "
@@ -1587,20 +1579,40 @@ vbdev_hublvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bd
 	struct spdk_lvol *org_lvol = lvs->lvol_map.lvol[id];
 	offset = ADJUST_OFFSET(offset);
 
-	if (!lvs->leader) {
-		SPDK_ERRLOG("FAILED - receive io for hublvol in nonleader mode  - blob map id: %" PRIu16 "  "
-								"Lba: %" PRIu64 "  Cnt %" PRIu64 "  t %d \n",
-								id, offset, bdev_io->u.bdev.num_blocks, bdev_io->type);
-		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
-		return;
-	}
-
 	if (org_lvol == NULL) {
 		SPDK_ERRLOG("FAILED - orglvol is none - blob map id: %" PRIu16 "  "
 								"Lba: %" PRIu64 "  Cnt %" PRIu64 "  t %d \n",
 								id, offset, bdev_io->u.bdev.num_blocks, bdev_io->type);
 		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 		return;
+	}
+
+	if (!lvs->leader) {
+		SPDK_ERRLOG("FAILED - receive io for hublvol in nonleader mode  - blob map id: %" PRIu16 "  "
+										"Lba: %" PRIu64 "  Cnt %" PRIu64 "  t %d \n",
+										id, offset, bdev_io->u.bdev.num_blocks, bdev_io->type);
+		if (spdk_lvs_nonleader_timeout(lvs)) {
+			if (io_type) {
+				SPDK_NOTICELOG("FAILED IO-TO change leader - blob: %" PRIu64 "  "
+								"Lba: %" PRIu64 "  Cnt %" PRIu64 "  t %d \n",
+								org_lvol->blob_id, bdev_io->u.bdev.offset_blocks,
+								bdev_io->u.bdev.num_blocks, bdev_io->type);
+			}
+			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+			return;
+		}
+
+		if (!lvs->update_in_progress) {			
+			if (io_type) {
+				spdk_lvs_check_active_process(lvs, org_lvol, (uint8_t)bdev_io->type);
+			}
+		}
+	}
+
+	if (!org_lvol->leader && !org_lvol->update_in_progress) {
+		if (io_type) {
+			spdk_lvol_update_on_failover(lvs, org_lvol, true);
+		}
 	}
 
 	switch (bdev_io->type) {
@@ -1648,14 +1660,14 @@ vbdev_lvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_
 	}
 
 	if (lvs->primary && lvol->hublvol) {
-		if (lvs->leader) {
-			vbdev_hublvol_submit_request(ch, bdev_io);
-			return;
-		}
-		SPDK_ERRLOG("hublvol on primary nonleader state: should not receive I/O %" PRIu64 " type %d\n", 
-				bdev_io->u.bdev.offset_blocks, bdev_io->type);
-		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		// if (lvs->leader) {
+		vbdev_hublvol_submit_request(ch, bdev_io);
 		return;
+		// }
+		// SPDK_ERRLOG("hublvol on primary nonleader state: should not receive I/O %" PRIu64 " type %d\n", 
+		// 		bdev_io->u.bdev.offset_blocks, bdev_io->type);
+		// spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		// return;
 	}
 
 	// SPDK_NOTICELOG("IO - blob: %" PRIu64 "  "
@@ -2969,47 +2981,6 @@ _vbdev_lvol_shallow_copy_cb(void *cb_arg, int lvolerrno)
 	req->ext_dev->destroy(req->ext_dev);
 	req->cb_fn(req->cb_arg, lvolerrno);
 	free(req);
-}
-
-static void
-spdk_lvs_open_hub_bdev_msg(void *cb_arg)
-{
-	struct spdk_lvol_store *lvs = cb_arg;
-	if (lvs == NULL) {
-		SPDK_ERRLOG("lvs must not be NULL\n");
-		return;
-	}
-
-	spdk_lvs_open_hub_bdev(lvs);	
-	return;
-}
-
-static void
-vbdev_lvol_open_hubbdev(struct spdk_lvol_store *lvs)
-{
-	if (lvs == NULL) {
-		SPDK_ERRLOG("lvs must not be NULL\n");
-		return;
-	}
-	spdk_thread_send_msg(lvs->hub_dev.thread, spdk_lvs_open_hub_bdev_msg, lvs);
-	return;
-}
-
-void
-vbdev_lvol_set_hubbdev_module(struct spdk_lvol_store *lvs)
-{
-	if (lvs == NULL) {
-		SPDK_ERRLOG("lvs must not be NULL\n");
-		return;
-	}
-	lvs->hub_dev.module = &g_lvol_if;
-	lvs->hub_dev.submit_cb = retransmit_io;
-	lvs->hub_dev.thread = spdk_get_thread();
-	if (lvs->hub_dev.state != HUBLVOL_CONNECTED || lvs->hub_dev.state != HUBLVOL_CONNECTING_IN_PROCCESS) {
-		lvs->hub_dev.state = HUBLVOL_NOT_CONNECTED;
-		vbdev_lvol_open_hubbdev(lvs);
-	}	
-	return;
 }
 
 int

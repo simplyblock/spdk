@@ -1887,6 +1887,14 @@ rpc_dump_lvol_store_info(struct spdk_json_write_ctx *w, struct lvol_store_bdev *
 	spdk_json_write_named_string(w, "name", lvs_bdev->lvs->name);
 	spdk_json_write_named_bool(w, "lvs leadership", lvs_bdev->lvs->leader);
 	spdk_json_write_named_bool(w, "lvs_read_only", lvs_bdev->lvs->read_only);
+	if (lvs_bdev->lvs->secondary) {
+		spdk_json_write_named_bool(w, "lvs_secondary", lvs_bdev->lvs->secondary);
+		spdk_json_write_named_bool(w, "lvs_secondary", lvs_bdev->lvs->skip_redirecting);
+		spdk_json_write_named_string(w, "remote_bdev", lvs_bdev->lvs->remote_bdev);
+		spdk_json_write_named_bool(w, "connect_state", lvs_bdev->lvs->hub_dev.state == HUBLVOL_CONNECTED);
+	} else if (lvs_bdev->lvs->primary) {
+		spdk_json_write_named_bool(w, "lvs_primary", lvs_bdev->lvs->primary);
+	}
 	spdk_json_write_named_string(w, "base_bdev", spdk_bdev_get_name(lvs_bdev->bdev));
 	spdk_json_write_named_uint64(w, "total_data_clusters", spdk_bs_total_data_cluster_count(bs));
 	spdk_json_write_named_uint64(w, "free_clusters", spdk_bs_free_cluster_count(bs));
@@ -1958,7 +1966,6 @@ struct rpc_bdev_lvol_set_lvs_opts {
 	uint64_t subsystem_port;
 	bool primary;
 	bool secondary;
-	char *remote_bdev;
 };
 
 static void
@@ -1966,7 +1973,6 @@ free_rpc_bdev_lvol_set_lvs_opts(struct rpc_bdev_lvol_set_lvs_opts *req)
 {
 	free(req->uuid);
 	free(req->lvs_name);
-	free(req->remote_bdev);
 }
 
 static const struct spdk_json_object_decoder rpc_bdev_lvol_set_lvs_opts_decoders[] = {
@@ -1974,7 +1980,6 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_set_lvs_opts_decoders
 	{"lvs_name", offsetof(struct rpc_bdev_lvol_set_lvs_opts, lvs_name), spdk_json_decode_string, true},
 	{"groupid", offsetof(struct rpc_bdev_lvol_set_lvs_opts, groupid), spdk_json_decode_uint64},
 	{"subsystem_port", offsetof(struct rpc_bdev_lvol_set_lvs_opts, subsystem_port), spdk_json_decode_uint64},
-	{"remote_bdev", offsetof(struct rpc_bdev_lvol_set_lvs_opts, remote_bdev), spdk_json_decode_string, true},
 	{"primary", offsetof(struct rpc_bdev_lvol_set_lvs_opts, primary), spdk_json_decode_bool, true},
 	{"secondary", offsetof(struct rpc_bdev_lvol_set_lvs_opts, secondary), spdk_json_decode_bool, true},
 };
@@ -2002,16 +2007,7 @@ rpc_bdev_lvol_set_lvs_opts(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
-	if (req.secondary && !req.remote_bdev) {
-		SPDK_ERRLOG("missing remote bdev name param in secondary node.\n");
-		spdk_jsonrpc_send_error_response(request, -EINVAL, "Missing remote bdev name parameter");
-		goto cleanup;
-	}
-
-	spdk_lvs_set_opts(lvs, req.groupid, req.subsystem_port, req.primary, req.secondary, req.remote_bdev);
-	if (req.secondary && req.remote_bdev) {
-		vbdev_lvol_set_hubbdev_module(lvs);
-	}
+	spdk_lvs_set_opts(lvs, req.groupid, req.subsystem_port, req.primary, req.secondary);
 	spdk_jsonrpc_send_bool_response(request, true);
 
 cleanup:
@@ -2019,6 +2015,64 @@ cleanup:
 }
 
 SPDK_RPC_REGISTER("bdev_lvol_set_lvs_opts", rpc_bdev_lvol_set_lvs_opts, SPDK_RPC_RUNTIME)
+
+struct rpc_bdev_lvol_connect_hublvol {
+	char *uuid;
+	char *lvs_name;
+	char *remote_bdev;
+};
+
+static void
+free_rpc_bdev_lvol_connect_hublvol(struct rpc_bdev_lvol_connect_hublvol *req)
+{
+	free(req->uuid);
+	free(req->lvs_name);
+	free(req->remote_bdev);
+}
+
+static const struct spdk_json_object_decoder rpc_bdev_lvol_connect_hublvol_decoders[] = {
+	{"uuid", offsetof(struct rpc_bdev_lvol_connect_hublvol, uuid), spdk_json_decode_string, true},
+	{"lvs_name", offsetof(struct rpc_bdev_lvol_connect_hublvol, lvs_name), spdk_json_decode_string, true},	
+	{"remote_bdev", offsetof(struct rpc_bdev_lvol_connect_hublvol, remote_bdev), spdk_json_decode_string},
+};
+
+static void
+rpc_bdev_lvol_connect_hublvol(struct spdk_jsonrpc_request *request,
+			   const struct spdk_json_val *params)
+{
+	struct rpc_bdev_lvol_connect_hublvol req = {};
+	struct spdk_lvol_store *lvs = NULL;
+	int rc;
+
+	if (spdk_json_decode_object(params, rpc_bdev_lvol_connect_hublvol_decoders,
+					SPDK_COUNTOF(rpc_bdev_lvol_connect_hublvol_decoders),
+					&req)) {
+		SPDK_INFOLOG(lvol_rpc, "spdk_json_decode_object failed\n");
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+							"spdk_json_decode_object failed");
+		goto cleanup;
+	}
+
+	rc = vbdev_get_lvol_store_by_uuid_xor_name(req.uuid, req.lvs_name, &lvs);
+	if (rc != 0) {
+		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
+		goto cleanup;
+	}
+
+	if (!lvs->secondary) {
+		SPDK_ERRLOG("Try to connect hublvol from nonsecondary node.\n");
+		spdk_jsonrpc_send_error_response(request, -EINVAL, "nonsecondary node");
+		goto cleanup;
+	}
+
+	spdk_lvs_connect_hublvol(lvs, req.remote_bdev);
+	spdk_jsonrpc_send_bool_response(request, true);
+
+cleanup:
+	free_rpc_bdev_lvol_connect_hublvol(&req);
+}
+
+SPDK_RPC_REGISTER("bdev_lvol_connect_hublvol", rpc_bdev_lvol_connect_hublvol, SPDK_RPC_RUNTIME)
 
 struct rpc_bdev_lvol_get_lvols {
 	char *lvs_uuid;
@@ -2057,6 +2111,7 @@ rpc_dump_lvol(struct spdk_json_write_ctx *w, struct spdk_lvol *lvol)
 	spdk_json_write_named_uint64(w, "num_allocated_clusters",
 				     spdk_blob_get_num_allocated_clusters(lvol->blob));
 	spdk_json_write_named_uint64(w, "blobid", spdk_blob_get_id(lvol->blob));
+	spdk_json_write_named_uint64(w, "map_id", lvol->map_id);
 	spdk_json_write_named_uint32(w, "open_ref", spdk_blob_get_open_ref(lvol->blob));
 	spdk_json_write_named_object_begin(w, "lvs");
 	spdk_json_write_named_string(w, "name", lvs->name);

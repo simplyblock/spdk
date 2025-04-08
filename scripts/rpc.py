@@ -2347,8 +2347,7 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
                                                    groupid=args.groupid,
                                                    subsystem_port=args.subsystem_port,
                                                    primary=args.primary,
-                                                   secondary=args.secondary,
-                                                   remote_bdev=args.remote_bdev))
+                                                   secondary=args.secondary))
 
     p = subparsers.add_parser('bdev_lvol_set_lvs_opts', help='Set options for lvolstore')
     p.add_argument('-u', '--uuid', help='lvol store UUID')
@@ -2357,8 +2356,19 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('-p', '--subsystem-port', help='lvols subsystem port', type=int)
     p.add_argument('-r', '--primary', action='store_true', help='primary state for lvolstore node, default False')
     p.add_argument('-s', '--secondary', action='store_true', help='secondary state for lvolstore node, default False')
-    p.add_argument('-b', '--remote-bdev', help='remote hublvol bdev name')
     p.set_defaults(func=bdev_lvol_set_lvs_opts)
+    
+    def bdev_lvol_connect_hublvol(args):
+        print_dict(rpc.lvol.bdev_lvol_connect_hublvol(args.client,
+                                                   uuid=args.uuid,
+                                                   lvs_name=args.lvs_name,
+                                                   remote_bdev=args.remote_bdev))
+
+    p = subparsers.add_parser('bdev_lvol_connect_hublvol', help='Connect to the hub lvol on the secondary')
+    p.add_argument('-u', '--uuid', help='lvol store UUID')
+    p.add_argument('-l', '--lvs-name', help='lvol store name')    
+    p.add_argument('-b', '--remote-bdev', help='remote hublvol bdev name')
+    p.set_defaults(func=bdev_lvol_connect_hublvol)
 
     def bdev_lvol_get_lvols(args):
         print_dict(rpc.lvol.bdev_lvol_get_lvols(args.client,
