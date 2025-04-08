@@ -3126,7 +3126,7 @@ spdk_trigger_failover(struct spdk_lvol_store *lvs, bool disconnected) {
 		trigger_state = true;
 	} else {
 		trigger_state = false;
-		if (lvs->skip_redirectidisconnectedng && ) {
+		if (lvs->skip_redirecting && disconnected) {
 			SPDK_NOTICELOG("change device connect state 1.\n");
 			lvs->hub_dev.state = HUBLVOL_NOT_CONNECTED;
 		}
