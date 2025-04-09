@@ -868,11 +868,13 @@ blob_parse_page(const struct spdk_blob_md_page *page, struct spdk_blob *blob)
 				   desc_extent_table->num_clusters != blob->remaining_clusters_in_et) {
 				/* Number of clusters in this ET does not match number
 				 * from previously read EXTENT_TABLE. */
+				SPDK_ERRLOG("Number of clusters in this ET does not match number.\n");
 				return -EINVAL;
 			}
 
 			if (desc_extent_table->length == 0 ||
 			    (extent_pages_length % sizeof(desc_extent_table->extent_page[0]) != 0)) {
+				SPDK_ERRLOG("Size extent page in this ET does not match.\n");
 				return -EINVAL;
 			}
 
@@ -885,6 +887,7 @@ blob_parse_page(const struct spdk_blob_md_page *page, struct spdk_blob *blob)
 			if (num_extent_pages > 0) {
 				tmp = realloc(blob->active.extent_pages, num_extent_pages * sizeof(uint32_t));
 				if (tmp == NULL) {
+					SPDK_ERRLOG("Cannot allocate buffer for extent table 6.\n");
 					return -ENOMEM;
 				}
 				blob->active.extent_pages = tmp;
@@ -906,6 +909,7 @@ blob_parse_page(const struct spdk_blob_md_page *page, struct spdk_blob *blob)
 						blob->active.extent_pages[blob->active.num_extent_pages++] = 0;
 					}
 				} else {
+					SPDK_ERRLOG("Extent table value error 7.\n");
 					return -EINVAL;
 				}
 			}
@@ -926,7 +930,7 @@ blob_parse_page(const struct spdk_blob_md_page *page, struct spdk_blob *blob)
 
 			if (desc_extent->length <= sizeof(desc_extent->start_cluster_idx) ||
 			    (cluster_idx_length % sizeof(desc_extent->cluster_idx[0]) != 0)) {
-				SPDK_ERRLOG("Extenet metadata page not correct length. \n");	
+				SPDK_ERRLOG("Extenet page not correct length. \n");	
 				return -EINVAL;
 			}
 
@@ -957,6 +961,7 @@ blob_parse_page(const struct spdk_blob_md_page *page, struct spdk_blob *blob)
 			tmp = realloc(blob->active.clusters,
 				      (cluster_count + blob->active.num_clusters) * sizeof(*blob->active.clusters));
 			if (tmp == NULL) {
+				SPDK_ERRLOG("Cannot allocate buffer for extent page 6.\n");
 				return -ENOMEM;
 			}
 			blob->active.clusters = tmp;
@@ -970,6 +975,7 @@ blob_parse_page(const struct spdk_blob_md_page *page, struct spdk_blob *blob)
 				} else if (spdk_blob_is_thin_provisioned(blob)) {
 					blob->active.clusters[blob->active.num_clusters++] = 0;
 				} else {
+					SPDK_ERRLOG("Extent page - invalid value.\n");
 					return -EINVAL;
 				}
 			}
@@ -982,6 +988,7 @@ blob_parse_page(const struct spdk_blob_md_page *page, struct spdk_blob *blob)
 			rc = blob_deserialize_xattr(blob,
 						    (struct spdk_blob_md_descriptor_xattr *) desc, false);
 			if (rc != 0) {
+				SPDK_ERRLOG("blob root page - xattr invalid.\n");
 				return rc;
 			}
 		} else if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_XATTR_INTERNAL) {
@@ -990,6 +997,7 @@ blob_parse_page(const struct spdk_blob_md_page *page, struct spdk_blob *blob)
 			rc = blob_deserialize_xattr(blob,
 						    (struct spdk_blob_md_descriptor_xattr *) desc, true);
 			if (rc != 0) {
+				SPDK_ERRLOG("blob root page - intrenal xattr invalid.\n");
 				return rc;
 			}
 		} else {
@@ -5616,8 +5624,7 @@ bs_load_replay_md_parse_page(struct spdk_bs_load_ctx *ctx, struct spdk_blob_md_p
 					 * in the used cluster map.
 					 */
 					if (cluster_idx != 0) {
-						SPDK_NOTICELOG("Recover: cluster %" PRIu32 "\n", cluster_idx + j);
-						SPDK_INFOLOG(blob, "Recover: cluster %" PRIu32 "\n", cluster_idx + j);
+						SPDK_NOTICELOG("Recover: cluster %" PRIu32 "\n", cluster_idx + j);						
 						spdk_bit_array_set(ctx->used_clusters, cluster_idx + j);
 						if (bs->num_free_clusters == 0) {
 							return -ENOSPC;
@@ -5642,6 +5649,7 @@ bs_load_replay_md_parse_page(struct spdk_bs_load_ctx *ctx, struct spdk_blob_md_p
 
 			if (desc_extent->length <= sizeof(desc_extent->start_cluster_idx) ||
 			    (cluster_idx_length % sizeof(desc_extent->cluster_idx[0]) != 0)) {
+				SPDK_ERRLOG("Extenet metadata page dose not have correct length.\n");
 				return -EINVAL;
 			}
 
@@ -5654,10 +5662,12 @@ bs_load_replay_md_parse_page(struct spdk_bs_load_ctx *ctx, struct spdk_blob_md_p
 				if (cluster_idx != 0) {
 					if (cluster_idx < desc_extent->start_cluster_idx &&
 					    cluster_idx >= desc_extent->start_cluster_idx + cluster_count) {
+						SPDK_ERRLOG("Extenet metadata page cluster idx should be in range start cluster and cluster count.\n");
 						return -EINVAL;
 					}
 					spdk_bit_array_set(ctx->used_clusters, cluster_idx);
 					if (bs->num_free_clusters == 0) {
+						SPDK_ERRLOG("There no free Cluster num.\n");
 						return -ENOSPC;
 					}
 					bs->num_free_clusters--;
@@ -5666,6 +5676,7 @@ bs_load_replay_md_parse_page(struct spdk_bs_load_ctx *ctx, struct spdk_blob_md_p
 			}
 
 			if (cluster_count == 0) {
+				SPDK_ERRLOG("Extenet metadata page with no cluster.\n");
 				return -EINVAL;
 			}
 		} else if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_XATTR) {
@@ -5686,12 +5697,14 @@ bs_load_replay_md_parse_page(struct spdk_bs_load_ctx *ctx, struct spdk_blob_md_p
 
 			if (desc_extent_table->length == 0 ||
 			    (extent_pages_length % sizeof(desc_extent_table->extent_page[0]) != 0)) {
+				SPDK_ERRLOG("Extenet table page dose not have correct length.\n");
 				return -EINVAL;
 			}
 
 			for (i = 0; i < extent_pages_length / sizeof(desc_extent_table->extent_page[0]); i++) {
 				if (desc_extent_table->extent_page[i].page_idx != 0) {
 					if (desc_extent_table->extent_page[i].num_pages != 1) {
+						SPDK_ERRLOG("Extenet table page dose not have correct value.\n");
 						return -EINVAL;
 					}
 					num_extent_pages += 1;
@@ -5701,6 +5714,7 @@ bs_load_replay_md_parse_page(struct spdk_bs_load_ctx *ctx, struct spdk_blob_md_p
 			if (num_extent_pages > 0) {
 				tmp = realloc(ctx->extent_page_num, num_extent_pages * sizeof(uint32_t));
 				if (tmp == NULL) {
+					SPDK_ERRLOG("Extenet table page cannot allocate buffer.\n");
 					return -ENOMEM;
 				}
 				ctx->extent_page_num = tmp;
@@ -5844,7 +5858,7 @@ bs_load_replay_extent_page_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrn
 
 	if (bserrno != 0) {
 		spdk_free(ctx->extent_pages);
-		SPDK_NOTICELOG("Recover failed 2. \n");
+		SPDK_ERRLOG("Recover failed 2 read extent page error.\n");
 		bs_load_ctx_fail(ctx, bserrno);
 		return;
 	}
@@ -5854,6 +5868,7 @@ bs_load_replay_extent_page_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrn
 		 * Integrity of md is not right if that page was not a valid extent page. */
 		if (bs_load_cur_extent_page_valid(&ctx->extent_pages[i]) != true) {
 			spdk_free(ctx->extent_pages);
+			SPDK_NOTICELOG("Extent page not valid.\n");
 			bs_load_ctx_fail(ctx, -EILSEQ);
 			return;
 		}
@@ -5862,7 +5877,7 @@ bs_load_replay_extent_page_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrn
 		spdk_bit_array_set(ctx->bs->used_md_pages, page_num);
 		if (bs_load_replay_md_parse_page(ctx, &ctx->extent_pages[i])) {
 			spdk_free(ctx->extent_pages);
-			SPDK_NOTICELOG("Recover failed 3. \n");
+			SPDK_NOTICELOG("Recover failed 3 parse extent page failed.\n");
 			bs_load_ctx_fail(ctx, -EILSEQ);
 			return;
 		}
@@ -5887,7 +5902,7 @@ bs_load_replay_extent_pages(struct spdk_bs_load_ctx *ctx)
 	ctx->extent_pages = spdk_zmalloc(SPDK_BS_PAGE_SIZE * ctx->num_extent_pages, 0,
 					 NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
 	if (!ctx->extent_pages) {
-		SPDK_NOTICELOG("Recover failed 1. \n");
+		SPDK_NOTICELOG("Cannot allocate buffer for extent pages.\n");
 		bs_load_ctx_fail(ctx, -ENOMEM);
 		return;
 	}
@@ -12945,7 +12960,6 @@ bs_update_replay_md_parse_page(struct spdk_bs_update_ctx *ctx, struct spdk_blob_
 					 */
 					if (cluster_idx != 0) {
 						SPDK_NOTICELOG("Recover: cluster %" PRIu32 "\n", cluster_idx + j);
-						SPDK_INFOLOG(blob, "Recover: cluster %" PRIu32 "\n", cluster_idx + j);
 						spdk_bit_array_set(ctx->used_clusters, cluster_idx + j);
 						if (bs->num_free_clusters == 0) {
 							return -ENOSPC;
@@ -13018,12 +13032,14 @@ bs_update_replay_md_parse_page(struct spdk_bs_update_ctx *ctx, struct spdk_blob_
 
 			if (desc_extent_table->length == 0 ||
 			    (extent_pages_length % sizeof(desc_extent_table->extent_page[0]) != 0)) {
+				SPDK_ERRLOG("Extent table page has an incorrect length.\n");
 				return -EINVAL;
 			}
 
 			for (i = 0; i < extent_pages_length / sizeof(desc_extent_table->extent_page[0]); i++) {
 				if (desc_extent_table->extent_page[i].page_idx != 0) {
 					if (desc_extent_table->extent_page[i].num_pages != 1) {
+						SPDK_ERRLOG("The ET in the extent table page is not valid.\n");
 						return -EINVAL;
 					}
 					num_extent_pages += 1;
@@ -13033,6 +13049,7 @@ bs_update_replay_md_parse_page(struct spdk_bs_update_ctx *ctx, struct spdk_blob_
 			if (num_extent_pages > 0) {
 				tmp = realloc(ctx->extent_page_num, num_extent_pages * sizeof(uint32_t));
 				if (tmp == NULL) {
+					SPDK_ERRLOG("Cannot allocate buffer for et in extent table.\n");
 					return -ENOMEM;
 				}
 				ctx->extent_page_num = tmp;
@@ -13379,7 +13396,8 @@ bs_update_replay_md_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 				spdk_bit_array_set(ctx->used_blobids, page->reserved0);
 			}
 			if (bs_update_replay_md_parse_page(ctx, page)) {
-				SPDK_INFOLOG(blob, "Update: blob 0x%" PRIx32 " failed\n", page_num);
+				// SPDK_INFOLOG(blob, "Update: blob 0x%" PRIx32 " failed\n", page_num);
+				SPDK_ERRLOG("Update: blob 0x%" PRIx32 " failed\n", page_num);
 				bs_update_live_done(ctx, -EILSEQ);
 				return;
 			}
@@ -13419,6 +13437,7 @@ bs_update_replay_md(struct spdk_bs_update_ctx *ctx)
 	ctx->page = spdk_zmalloc(SPDK_BS_PAGE_SIZE, 0,
 				 NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
 	if (!ctx->page) {
+		SPDK_ERRLOG("Cannot allocate buffer for page in replay md.\n");
 		bs_update_live_done(ctx, -ENOMEM);
 		return;
 	}
