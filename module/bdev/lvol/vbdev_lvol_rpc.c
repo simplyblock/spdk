@@ -1889,7 +1889,7 @@ rpc_dump_lvol_store_info(struct spdk_json_write_ctx *w, struct lvol_store_bdev *
 	spdk_json_write_named_bool(w, "lvs_read_only", lvs_bdev->lvs->read_only);
 	if (lvs_bdev->lvs->secondary) {
 		spdk_json_write_named_bool(w, "lvs_secondary", lvs_bdev->lvs->secondary);
-		spdk_json_write_named_bool(w, "lvs_secondary", lvs_bdev->lvs->skip_redirecting);
+		spdk_json_write_named_bool(w, "lvs_redirect", !lvs_bdev->lvs->skip_redirecting);
 		spdk_json_write_named_string(w, "remote_bdev", lvs_bdev->lvs->remote_bdev);
 		spdk_json_write_named_bool(w, "connect_state", lvs_bdev->lvs->hub_dev.state == HUBLVOL_CONNECTED);
 	} else if (lvs_bdev->lvs->primary) {
