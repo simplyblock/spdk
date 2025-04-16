@@ -9753,9 +9753,8 @@ spdk_bdev_set_qos_rate_limits_to_group(uint64_t bdev_pool_id, uint64_t *limits,
 
 	qos_pool_id_object = get_qos_already_available_for_group(bdev_pool_id);
 	if(qos_pool_id_object == NULL) {
-		SPDK_ERRLOG("Group ID %" PRIu64 " not available.\n", bdev_pool_id);
-		cb_fn(cb_arg, -EPERM);
-		return;
+		qos_pool_id_object = create_qos_object_for_group(bdev_pool_id);
+		SPDK_DEBUGLOG("Group ID %" PRIu64 " not available. creating one.\n", bdev_pool_id);
 	}
 
 	if(qos_pool_id_object->bdev_list_size <= 0) {
