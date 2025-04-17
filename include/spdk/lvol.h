@@ -409,7 +409,7 @@ void spdk_lvs_grow(struct spdk_bs_dev *bs_dev, spdk_lvs_op_with_handle_complete 
  */
 void spdk_lvs_grow_live(struct spdk_lvol_store *lvs, spdk_lvs_op_complete cb_fn, void *cb_arg);
 
-void spdk_lvs_update_live(struct spdk_lvol_store *lvs, spdk_lvs_op_complete cb_fn, void *cb_arg);
+void spdk_lvs_update_live(struct spdk_lvol_store *lvs, uint64_t id, spdk_lvs_op_complete cb_fn, void *cb_arg);
 
 /**
  * Open a lvol.
