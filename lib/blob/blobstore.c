@@ -13258,6 +13258,7 @@ bs_update_replay_md_chain_cpl(struct spdk_bs_update_ctx *ctx)
 		spdk_spin_lock(&ctx->bs->used_lock);
 
 		do {
+			idx++;
 			idx = spdk_bit_array_find_first_set(ctx->used_md_pages, idx);
 			if (idx != UINT32_MAX && spdk_bit_array_get(ctx->used_md_pages, idx) == true) {
 				spdk_bit_array_set(ctx->bs->used_md_pages, idx);
@@ -13267,6 +13268,7 @@ bs_update_replay_md_chain_cpl(struct spdk_bs_update_ctx *ctx)
 		//set blobids
 		idx = 0;
 		do {
+			idx++;
 			idx = spdk_bit_array_find_first_set(ctx->used_blobids, idx);
 			if (idx != UINT32_MAX && spdk_bit_array_get(ctx->used_blobids, idx) == true) {
 				spdk_bit_array_set(ctx->bs->used_blobids, idx);
@@ -13276,6 +13278,7 @@ bs_update_replay_md_chain_cpl(struct spdk_bs_update_ctx *ctx)
 		// set cluster
 		idx = 0;
 		do {
+			idx++;
 			idx = spdk_bit_array_find_first_set(ctx->used_clusters, idx);
 			if (idx != UINT32_MAX && spdk_bit_array_get(ctx->used_clusters, idx) == true) {
 				spdk_bit_pool_allocate_specific_bit(ctx->bs->used_clusters, idx);
