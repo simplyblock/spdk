@@ -12712,6 +12712,7 @@ struct spdk_bs_update_ctx {
 	struct spdk_bit_array		*used_clusters;
 
 	struct spdk_bit_array		*used_blobids;
+	uint64_t			new_blobid;
 
 	struct spdk_bit_array		*used_md_pages;
 	struct spdk_bit_array		*synnced_used_blobid_pages;
@@ -13250,6 +13251,45 @@ bs_update_replay_md_chain_cpl(struct spdk_bs_update_ctx *ctx)
 	uint64_t i;
 
 	ctx->in_page_chain = false;
+	if (!ctx->failover && ctx->new_blobid) {
+		SPDK_NOTICELOG("Update the blobstore for new blob done.\n");
+		//set md pages
+		uint64_t idx = 0;		
+		spdk_spin_lock(&ctx->bs->used_lock);
+
+		do {
+			idx = spdk_bit_array_find_first_set(ctx->used_md_pages, idx);
+			if (idx != UINT32_MAX && spdk_bit_array_get(ctx->used_md_pages, idx) == true) {
+				spdk_bit_array_set(ctx->bs->used_md_pages, idx);
+			}
+		} while (idx != UINT32_MAX);
+
+		//set blobids
+		idx = 0;
+		do {
+			idx = spdk_bit_array_find_first_set(ctx->used_blobids, idx);
+			if (idx != UINT32_MAX && spdk_bit_array_get(ctx->used_blobids, idx) == true) {
+				spdk_bit_array_set(ctx->bs->used_blobids, idx);
+			}
+		} while (idx != UINT32_MAX);
+
+		// set cluster
+		idx = 0;
+		do {
+			idx = spdk_bit_array_find_first_set(ctx->used_clusters, idx);
+			if (idx != UINT32_MAX && spdk_bit_array_get(ctx->used_clusters, idx) == true) {
+				spdk_bit_pool_allocate_specific_bit(ctx->bs->used_clusters, idx);
+			}
+		} while (idx != UINT32_MAX);
+				
+		spdk_spin_unlock(&ctx->bs->used_lock);
+
+		spdk_bit_array_free(&ctx->used_clusters);		
+		spdk_bit_array_free(&ctx->used_md_pages);			
+		spdk_bit_array_free(&ctx->used_blobids);
+		bs_update_live_done(ctx, 0);
+		return;
+	} 
 
 	do {
 		ctx->page_index++;
@@ -13392,7 +13432,7 @@ bs_update_replay_md_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 			if (page->sequence_num == 0) {
 				SPDK_NOTICELOG("Update: blob 0x%" PRIx32 "\n", page_num);
 				spdk_bit_array_set(ctx->used_blobids, page_num);
-				spdk_bit_array_set(ctx->used_blobids, page->reserved0);
+				// spdk_bit_array_set(ctx->bs->map_blobids, page->reserved0);
 			}
 			if (bs_update_replay_md_parse_page(ctx, page)) {
 				// SPDK_INFOLOG(blob, "Update: blob 0x%" PRIx32 " failed\n", page_num);
@@ -13444,6 +13484,21 @@ bs_update_replay_md(struct spdk_bs_update_ctx *ctx)
 }
 
 static void
+bs_update_replay_blobid(struct spdk_bs_update_ctx *ctx)
+{
+	ctx->page_index = 0;
+	ctx->cur_page = ctx->new_blobid;
+	ctx->page = spdk_zmalloc(SPDK_BS_PAGE_SIZE, 0,
+				 NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+	if (!ctx->page) {
+		SPDK_ERRLOG("Cannot allocate buffer for page in replay md.\n");
+		bs_update_live_done(ctx, -ENOMEM);
+		return;
+	}
+	bs_update_replay_cur_md_page(ctx);
+}
+
+static void
 bs_recover_on_update(struct spdk_bs_update_ctx *ctx)
 {
 	int		rc;
@@ -13472,7 +13527,10 @@ bs_recover_on_update(struct spdk_bs_update_ctx *ctx)
 	// 	bs_load_ctx_fail(ctx, -ENOMEM);
 	// 	return;
 	// }
-
+	if (!ctx->failover && ctx->new_blobid) {
+		bs_update_replay_blobid(ctx);
+		return;
+	}
 	ctx->bs->num_free_clusters = ctx->bs->total_clusters;
 	bs_update_replay_md(ctx);
 }
@@ -13561,14 +13619,19 @@ bs_update_super_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 
 	ctx->bs->used_cluster_mask_start = ctx->super->used_cluster_mask_start;
 	ctx->bs->used_cluster_mask_len = ctx->super->used_cluster_mask_len;
+	
+	if (!ctx->failover && ctx->new_blobid) {
+		SPDK_NOTICELOG("Loading blob from base dev with blobid %" PRIu64 "\n", ctx->new_blobid);
+		bs_recover_on_update(ctx);
+		return;
+	}
 
 	SPDK_INFOLOG(blob, "Updating blobstore super block from base dev done\n");
-	// SPDK_INFOLOG(blob, "Loading lvols from base dev with semi gracefully unload start\n");
-	bs_update_read_only_used_blobid_pages(ctx);	
+	bs_update_read_only_used_blobid_pages(ctx);
 }
 
 void
-spdk_bs_update_live(struct spdk_blob_store *bs, bool failover,
+spdk_bs_update_live(struct spdk_blob_store *bs, bool failover, uint64_t id,
 		  spdk_bs_op_complete cb_fn, void *cb_arg)
 {
 	struct spdk_bs_cpl	cpl;
@@ -13589,7 +13652,9 @@ spdk_bs_update_live(struct spdk_blob_store *bs, bool failover,
 	}
 	ctx->bs = bs;
 	ctx->failover = failover;
-
+	if (!failover && id) {
+		ctx->new_blobid = bs_blobid_to_page(id);
+	}
 	ctx->super = spdk_zmalloc(sizeof(*ctx->super), 0x1000, NULL,
 				  SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
 	if (!ctx->super) {
@@ -13616,7 +13681,7 @@ spdk_bs_update_live(struct spdk_blob_store *bs, bool failover,
 static void
 bs_update_on_failover_msg(void *arg) {
 	struct spdk_bs_update_failover_ctx *ctx = arg;
-	spdk_bs_update_live(ctx->bs, true, ctx->cb_fn, ctx->cb_arg);
+	spdk_bs_update_live(ctx->bs, true, 0, ctx->cb_fn, ctx->cb_arg);
 	free(ctx);
 }
 

@@ -2161,7 +2161,7 @@ lvs_update_live_cb(void *cb_arg, int lvolerrno)
 }
 
 void
-spdk_lvs_update_live(struct spdk_lvol_store *lvs, spdk_lvs_op_complete cb_fn, void *cb_arg)
+spdk_lvs_update_live(struct spdk_lvol_store *lvs, uint64_t id, spdk_lvs_op_complete cb_fn, void *cb_arg)
 {
 	struct spdk_lvs_req *req;
 
@@ -2178,7 +2178,7 @@ spdk_lvs_update_live(struct spdk_lvol_store *lvs, spdk_lvs_op_complete cb_fn, vo
 	req->cb_arg = cb_arg;
 	req->lvol_store = lvs;
 	assert(lvs->leader == false);
-	spdk_bs_update_live(lvs->blobstore, false, lvs_update_live_cb, req);
+	spdk_bs_update_live(lvs->blobstore, false, id, lvs_update_live_cb, req);
 }
 
 static void

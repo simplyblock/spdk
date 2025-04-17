@@ -381,7 +381,7 @@ void spdk_bs_grow_live(struct spdk_blob_store *bs,
  * \param cb_fn Called when the updating is complete.
  * \param cb_arg Argument passed to function cb_fn.
  */
-void spdk_bs_update_live(struct spdk_blob_store *bs, bool failover,
+void spdk_bs_update_live(struct spdk_blob_store *bs, bool failover, uint64_t id,
 		       spdk_bs_op_complete cb_fn, void *cb_arg);
 
 void spdk_blob_failover_unfreaze(struct spdk_blob *blob, 

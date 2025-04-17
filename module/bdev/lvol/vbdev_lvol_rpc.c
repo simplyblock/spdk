@@ -676,7 +676,7 @@ rpc_bdev_lvol_register(struct spdk_jsonrpc_request *request,
 		spdk_jsonrpc_send_error_response(request, -EBUSY, spdk_strerror(EBUSY));
 		goto cleanup;
 	} else {
-		spdk_lvs_update_live(lvs, rpc_bdev_lvs_update_cb, ctx);
+		spdk_lvs_update_live(lvs, req->blobid, rpc_bdev_lvs_update_cb, ctx);
 	}
 	return;
 
@@ -992,7 +992,7 @@ rpc_bdev_lvol_snapshot_register(struct spdk_jsonrpc_request *request,
 		spdk_jsonrpc_send_error_response(request, -EBUSY, spdk_strerror(EBUSY));
 		goto cleanup;
 	} else {
-		spdk_lvs_update_live(lvol->lvol_store, rpc_snapshot_lvs_update_cb, ctx);
+		spdk_lvs_update_live(lvol->lvol_store, req->blobid, rpc_snapshot_lvs_update_cb, ctx);
 	}
 	return;
 cleanup:
@@ -1231,7 +1231,7 @@ rpc_bdev_lvol_clone_register(struct spdk_jsonrpc_request *request,
 		spdk_jsonrpc_send_error_response(request, -EBUSY, spdk_strerror(EBUSY));
 		goto cleanup;
 	} else {
-		spdk_lvs_update_live(lvol->lvol_store, rpc_clone_lvs_update_cb, ctx);
+		spdk_lvs_update_live(lvol->lvol_store, req->blobid, rpc_clone_lvs_update_cb, ctx);
 	}
 	return;
 cleanup:
@@ -2363,7 +2363,8 @@ rpc_bdev_lvol_update_lvstore(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 	// spdk_bdev_update_bs_blockcnt(lvs->bs_dev);
-	spdk_lvs_update_live(lvs, rpc_bdev_lvol_grow_lvstore_cb, request);
+	//TODO we should delete this part there is no need
+	spdk_lvs_update_live(lvs, 0, rpc_bdev_lvol_grow_lvstore_cb, request);
 
 cleanup:
 	free_rpc_bdev_lvol_grow_lvstore(&req);
