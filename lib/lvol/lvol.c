@@ -3035,9 +3035,11 @@ spdk_lvs_hub_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bde
 		SPDK_NOTICELOG("Receive remove event from callback. \n");
 		spdk_trigger_failover(lvs, true);
 		// spdk_bdev_module_release_bdev(lvs->hub_dev.bdev);
-		spdk_bdev_close(lvs->hub_dev.desc);
-		// we should check if change this make problem for us
-		lvs->hub_dev.desc = NULL;
+		if (lvs->hub_dev.desc) {
+			spdk_bdev_close(lvs->hub_dev.desc);
+			// we should check if change this make problem for us
+			lvs->hub_dev.desc = NULL;
+		}
 		// lvs->hub_dev.bdev = NULL;
 		
 		break;
