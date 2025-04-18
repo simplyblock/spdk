@@ -1350,19 +1350,21 @@ _pt_complete_io(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	/* Complete the original IO and then free the one that we created here
 	 * as a result of issuing an IO via submit_request.
 	 */
+	if (bdev_io) {
+		spdk_bdev_free_io(bdev_io);
+	}
+
 	if (status == SPDK_BDEV_IO_STATUS_SUCCESS) {
 		spdk_bs_dequeued_red_io(ctx->ch, ctx->bdev_io);
 	} else {
 		SPDK_ERRLOG("FAILED IO on bdev_io respone from hublvol!. start failover.\n");
 		spdk_trigger_failover(lvs, false);
-		spdk_bdev_free_io(bdev_io);
 		vbdev_lvol_submit_request(ctx->ch, ctx->bdev_io);
 		free(ctx);
 		return;
 	}
 
-	spdk_bdev_io_complete(orig_io, status);
-	spdk_bdev_free_io(bdev_io);
+	spdk_bdev_io_complete(orig_io, status);	
 	free(ctx);
 }
 
