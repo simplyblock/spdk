@@ -28,6 +28,7 @@
 
 struct vbdev_lvol_io {
 	struct spdk_blob_ext_io_opts ext_io_opts;
+	bool redirect_in_progress;
 };
 
 static TAILQ_HEAD(, lvol_store_bdev) g_spdk_lvol_pairs = TAILQ_HEAD_INITIALIZER(
@@ -1338,35 +1339,50 @@ blob_ext_io_opts_to_bdev_opts(struct spdk_bdev_ext_io_opts *dst, struct spdk_blo
 }
 
 static void
+spdk_deferred_trigger_failover(void *arg)
+{
+	struct spdk_lvol_store *lvs = arg;
+	spdk_trigger_failover(lvs);
+}
+
+static void
 _pt_complete_io(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
 	struct ctx_redirect_req *ctx = cb_arg;
 	struct spdk_bdev_io *orig_io = ctx->bdev_io;
 	struct spdk_lvol *lvol = orig_io->bdev->ctxt;
 	struct spdk_lvol_store *lvs = lvol->lvol_store;
+	struct vbdev_lvol_io *io_ctx = (struct vbdev_lvol_io *)orig_io->driver_ctx;
 	int status = success ? SPDK_BDEV_IO_STATUS_SUCCESS : SPDK_BDEV_IO_STATUS_FAILED;
-	//TODO dequeue the bdev_io
 
 	/* Complete the original IO and then free the one that we created here
 	 * as a result of issuing an IO via submit_request.
 	 */
-	if (bdev_io) {
-		spdk_bdev_free_io(bdev_io);
-	}
-
-	if (status == SPDK_BDEV_IO_STATUS_SUCCESS) {
-		spdk_bs_dequeued_red_io(ctx->ch, ctx->bdev_io);
-	} else {		
-		if (!lvs->skip_redirecting) {
-			SPDK_ERRLOG("FAILED IO on bdev_io respone from hublvol!. start failover.\n");
-			spdk_trigger_failover(lvs, false);
-		}
-		vbdev_lvol_submit_request(ctx->ch, ctx->bdev_io);
+	if (!io_ctx->redirect_in_progress) {
+		SPDK_ERRLOG("Double completion or use-after-complete for IO %p\n", orig_io);
 		free(ctx);
 		return;
 	}
 
-	spdk_bdev_io_complete(orig_io, status);	
+	io_ctx->redirect_in_progress = false;  // Clear flag
+
+	if (status == SPDK_BDEV_IO_STATUS_SUCCESS) {
+		spdk_bdev_io_complete(orig_io, status);
+		spdk_bdev_free_io(bdev_io);
+		free(ctx);
+		return;
+	}
+
+
+	// Failure path: trigger failover and resend original IO
+	if (!lvs->skip_redirecting) {
+		SPDK_ERRLOG("FAILED IO on hub bdev. Starting failover.\n");
+		spdk_change_redirect_state(lvs, false);
+		spdk_thread_send_msg(lvs->hub_dev.thread, spdk_deferred_trigger_failover, lvs);
+	}
+
+	spdk_bdev_free_io(bdev_io);  // Still safe here
+	vbdev_lvol_submit_request(ctx->ch, orig_io);
 	free(ctx);
 }
 
@@ -1395,7 +1411,8 @@ redirect_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io, bo
 		// spdk_bs_clear_hub_channel(ch);
 		// SPDK_ERRLOG("hubbdev 1\n");
 		SPDK_ERRLOG("ERROR on bdev_io submission! hubdev is not connected. start failover.\n");
-		spdk_trigger_failover(lvs, true);
+		spdk_change_redirect_state(lvs, true);
+		spdk_thread_send_msg(lvs->hub_dev.thread, spdk_deferred_trigger_failover, lvs);
 		vbdev_lvol_submit_request(ch, bdev_io);
 		return;
 	}
@@ -1403,7 +1420,8 @@ redirect_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io, bo
 	ctx = calloc(1, sizeof(*ctx));
 	if (!ctx) {	
 		SPDK_NOTICELOG("FAILED IO - Cannot allocate ctx for redirect IO. \n");
-		spdk_trigger_failover(lvs, false);
+		spdk_change_redirect_state(lvs, false);
+		spdk_thread_send_msg(lvs->hub_dev.thread, spdk_deferred_trigger_failover, lvs);
 		vbdev_lvol_submit_request(ch, bdev_io);
 		return;
 	}
@@ -1426,7 +1444,8 @@ redirect_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io, bo
 		// 	vbdev_passthru_queue_io(bdev_io);
 		// } else {
 			SPDK_ERRLOG("ERROR on bdev_io submission!\n");
-			spdk_trigger_failover(lvs, false);
+			spdk_change_redirect_state(lvs, false);
+			spdk_thread_send_msg(lvs->hub_dev.thread, spdk_deferred_trigger_failover, lvs);
 			vbdev_lvol_submit_request(ch, bdev_io);
 			free(ctx);
 		// }
@@ -1455,7 +1474,8 @@ vbdev_redirect_request_to_hublvol(struct spdk_lvol *lvol, struct spdk_io_channel
 		if (hub_dev->desc == NULL) {
 			SPDK_ERRLOG("Hublvol desc is NULL. should not be.\n");
 			// spdk_bs_clear_hub_channel(ch);
-			spdk_trigger_failover(lvs, true);
+			spdk_change_redirect_state(lvs, true);
+			spdk_thread_send_msg(lvs->hub_dev.thread, spdk_deferred_trigger_failover, lvs);
 			vbdev_lvol_submit_request(ch, bdev_io);
 			// vbdev_lvol_open_hubbdev(lvs);			
 			return;
@@ -1472,7 +1492,8 @@ vbdev_redirect_request_to_hublvol(struct spdk_lvol *lvol, struct spdk_io_channel
 				//TODO release the hublvol desc in the mutux				
 				// spdk_bs_clear_hub_channel(ch);
 				// vbdev_lvol_open_hubbdev(lvs);
-				spdk_trigger_failover(lvs, true);
+				spdk_change_redirect_state(lvs, true);
+				spdk_thread_send_msg(lvs->hub_dev.thread, spdk_deferred_trigger_failover, lvs);
 				vbdev_lvol_submit_request(ch, bdev_io);
 				// failover
 				return;
@@ -1489,8 +1510,9 @@ vbdev_redirect_request_to_hublvol(struct spdk_lvol *lvol, struct spdk_io_channel
 
 		if (hub_dev->state == HUBLVOL_NOT_CONNECTED) {
 			SPDK_NOTICELOG("Hublvol is not connected. we try to connect now but we will not wait and the failover will started.\n");
-		}
-		spdk_trigger_failover(lvs, false);
+		}		
+		spdk_change_redirect_state(lvs, false);
+		spdk_thread_send_msg(lvs->hub_dev.thread, spdk_deferred_trigger_failover, lvs);
 		vbdev_lvol_submit_request(ch, bdev_io);
 		// vbdev_lvol_open_hubbdev(lvs);
 		return;
@@ -1500,8 +1522,9 @@ vbdev_redirect_request_to_hublvol(struct spdk_lvol *lvol, struct spdk_io_channel
 		ctx = calloc(1, sizeof(*ctx));
 		if (!ctx) {
 			// spdk_bs_dequeued_red_io(ch, bdev_io);
-			SPDK_NOTICELOG("FAILED IO - Cannot allocate ctx for redirect IO. \n");
-			spdk_trigger_failover(lvs, false);
+			SPDK_NOTICELOG("FAILED IO - Cannot allocate ctx for redirect IO. \n");			
+			spdk_change_redirect_state(lvs, false);
+			spdk_thread_send_msg(lvs->hub_dev.thread, spdk_deferred_trigger_failover, lvs);
 			vbdev_lvol_submit_request(ch, bdev_io);
 			//TODO failover
 			return;
@@ -1509,6 +1532,8 @@ vbdev_redirect_request_to_hublvol(struct spdk_lvol *lvol, struct spdk_io_channel
 		ctx->bdev_io = bdev_io;
 		ctx->ch = ch;
 	}
+
+	lvol_io->redirect_in_progress = true;
 
 	switch (bdev_io->type) {
 	case SPDK_BDEV_IO_TYPE_READ:
@@ -1555,8 +1580,9 @@ vbdev_redirect_request_to_hublvol(struct spdk_lvol *lvol, struct spdk_io_channel
 
 	if (rc != 0) {
 		// spdk_bs_dequeued_red_io(ch, bdev_io);
-		SPDK_ERRLOG("ERROR on bdev_io submission!\n");		
-		spdk_trigger_failover(lvs, false);	
+		SPDK_ERRLOG("ERROR on bdev_io submission!\n");
+		spdk_change_redirect_state(lvs, false);
+		spdk_thread_send_msg(lvs->hub_dev.thread, spdk_deferred_trigger_failover, lvs);
 		vbdev_lvol_submit_request(ch, bdev_io);
 		if (ctx) {
 			free(ctx);

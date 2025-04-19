@@ -201,8 +201,8 @@ struct spdk_lvol {
 
 struct lvol_store_bdev *vbdev_lvol_store_first(void);
 struct lvol_store_bdev *vbdev_lvol_store_next(struct lvol_store_bdev *prev);
-
-void spdk_trigger_failover(struct spdk_lvol_store *lvs, bool disconnect);
+void spdk_change_redirect_state(struct spdk_lvol_store *lvs, bool disconnected);
+void spdk_trigger_failover(struct spdk_lvol_store *lvs);
 void spdk_lvol_resize(struct spdk_lvol *lvol, uint64_t sz, spdk_lvol_op_complete cb_fn,
 		      void *cb_arg);
 void spdk_lvol_resize_unfreeze(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg);

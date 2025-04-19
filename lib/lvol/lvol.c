@@ -3033,7 +3033,11 @@ spdk_lvs_hub_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bde
 	switch (type) {
 	case SPDK_BDEV_EVENT_REMOVE:
 		SPDK_NOTICELOG("Receive remove event from callback. \n");
-		spdk_trigger_failover(lvs, true);
+		
+
+		spdk_change_redirect_state(lvs, true);
+		spdk_trigger_failover(lvs);		
+
 		// spdk_bdev_module_release_bdev(lvs->hub_dev.bdev);
 		if (lvs->hub_dev.desc) {
 			spdk_bdev_close(lvs->hub_dev.desc);
@@ -3105,17 +3109,13 @@ err:
 static void
 spdk_trigger_failover_cpl(void *cb_arg, int bserrno) {
 	struct spdk_lvol_store *lvs = cb_arg;
-	pthread_mutex_lock(&g_lvol_stores_mutex);
-	lvs->hub_dev.drain_in_action = false;
-	pthread_mutex_unlock(&g_lvol_stores_mutex);
 	if (lvs->hub_dev.state != HUBLVOL_CONNECTED) {
 		spdk_thread_send_msg(lvs->hub_dev.thread, spdk_lvs_open_hub_bdev, lvs);
 	}
 }
 
 void
-spdk_trigger_failover(struct spdk_lvol_store *lvs, bool disconnected) {
-	bool trigger_state = false;
+spdk_change_redirect_state(struct spdk_lvol_store *lvs, bool disconnected) {
 	pthread_mutex_lock(&g_lvol_stores_mutex);
 	if (!lvs->skip_redirecting && !lvs->hub_dev.drain_in_action) {
 		SPDK_NOTICELOG("process the failover op.\n");
@@ -3125,19 +3125,21 @@ spdk_trigger_failover(struct spdk_lvol_store *lvs, bool disconnected) {
 			lvs->hub_dev.state = HUBLVOL_NOT_CONNECTED;
 		}
 		lvs->hub_dev.drain_in_action = true;
-		trigger_state = true;
 	} else {
-		trigger_state = false;
 		if (lvs->skip_redirecting && disconnected) {
 			SPDK_NOTICELOG("change device connect state 1.\n");
 			lvs->hub_dev.state = HUBLVOL_NOT_CONNECTED;
 		}
 	}
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
+}
 
-	if (!trigger_state) {
+void
+spdk_trigger_failover(struct spdk_lvol_store *lvs) {
+	if (!lvs->hub_dev.drain_in_action) {
 		return;
 	}
+	lvs->hub_dev.drain_in_action = false;
 	// spdk_trigger_failover_cpl(lvs, 0);
 	spdk_bs_drain_channel_queued(lvs->blobstore, lvs->hub_dev.submit_cb, spdk_trigger_failover_cpl, lvs);
 }
