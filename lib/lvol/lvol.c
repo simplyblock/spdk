@@ -3026,6 +3026,24 @@ spdk_lvs_trigger_leadership_switch(uint64_t *groupid)
 }
 
 static void
+spdk_delayed_close_hub_bdev(void *arg)
+{
+	struct spdk_lvol_store *lvs = arg;
+	if (lvs->hub_dev.desc) {
+		spdk_bdev_close(lvs->hub_dev.desc);
+		lvs->hub_dev.desc = NULL;
+	}
+	spdk_lvs_open_hub_bdev(lvs);
+}
+
+static void
+spdk_trigger_failover_msg_v2(void *arg)
+{
+	struct spdk_lvol_store *lvs = arg;	
+	spdk_trigger_failover(lvs);	
+}
+
+static void
 spdk_lvs_hub_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev,
 			     void *event_ctx)
 {
@@ -3033,19 +3051,10 @@ spdk_lvs_hub_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bde
 	switch (type) {
 	case SPDK_BDEV_EVENT_REMOVE:
 		SPDK_NOTICELOG("Receive remove event from callback. \n");
-		
 
 		spdk_change_redirect_state(lvs, true);
-		spdk_trigger_failover(lvs);		
+		spdk_thread_send_msg(lvs->hub_dev.thread, spdk_trigger_failover_msg_v2, lvs);
 
-		// spdk_bdev_module_release_bdev(lvs->hub_dev.bdev);
-		if (lvs->hub_dev.desc) {
-			spdk_bdev_close(lvs->hub_dev.desc);
-			// we should check if change this make problem for us
-			lvs->hub_dev.desc = NULL;
-		}
-		// lvs->hub_dev.bdev = NULL;
-		
 		break;
 	default:
 		SPDK_NOTICELOG("Unsupported bdev event: type %d\n", type);
@@ -3083,16 +3092,6 @@ spdk_lvs_open_hub_bdev(void *cb_arg) {
 			goto err;
 		}
 
-		// lvs->hub_dev.bdev = spdk_bdev_desc_get_bdev(lvs->hub_dev.desc);
-		// rc = spdk_bdev_module_claim_bdev(lvs->hub_dev.bdev, lvs->hub_dev.desc, lvs->hub_dev.module);
-		// // rc = spdk_bdev_module_claim_bdev_desc(lvs->hub_dev->desc, SPDK_BDEV_CLAIM_READ_MANY_WRITE_ONE, NULL, module);
-		// if (rc != 0) {
-		// 	SPDK_ERRLOG("could not claim dev.\n");
-		// 	spdk_bdev_close(lvs->hub_dev.desc);
-		// 	lvs->hub_dev.desc = NULL;
-		// 	lvs->hub_dev.bdev = NULL;
-		// 	goto err;
-		// }
 		pthread_mutex_lock(&g_lvol_stores_mutex);
 		lvs->skip_redirecting = false;
 		lvs->hub_dev.state = HUBLVOL_CONNECTED;
@@ -3110,7 +3109,7 @@ static void
 spdk_trigger_failover_cpl(void *cb_arg, int bserrno) {
 	struct spdk_lvol_store *lvs = cb_arg;
 	if (lvs->hub_dev.state != HUBLVOL_CONNECTED) {
-		spdk_thread_send_msg(lvs->hub_dev.thread, spdk_lvs_open_hub_bdev, lvs);
+		spdk_delayed_close_hub_bdev(lvs);
 	}
 }
 
@@ -3296,16 +3295,17 @@ spdk_set_leader_all(struct spdk_lvol_store *t_lvs, bool lvs_leader, bool bs_nonl
 
 			if (!lvs->leader && lvs->secondary ) {
 				tmp_lvs = lvs;
+				if (lvs->hub_dev.state == HUBLVOL_CONNECTED) {
+					SPDK_NOTICELOG("enable redirect IO mode.\n");
+					lvs->skip_redirecting = false;
+				}
 			}
 		}
 	}
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
 
 	if (tmp_lvs) {
-		if (tmp_lvs->hub_dev.state == HUBLVOL_CONNECTED) {
-			SPDK_NOTICELOG("enable redirect IO mode.\n");
-			tmp_lvs->skip_redirecting = false;
-		} else {
+		if (tmp_lvs->hub_dev.state != HUBLVOL_CONNECTED) {
 			SPDK_NOTICELOG("try to reconnect hub dev and enable redirect IO mode.\n");
 			spdk_lvs_open_hub_bdev(tmp_lvs);
 		}
