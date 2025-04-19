@@ -1341,7 +1341,8 @@ blob_ext_io_opts_to_bdev_opts(struct spdk_bdev_ext_io_opts *dst, struct spdk_blo
 static void
 spdk_trigger_failover_msg(void *arg)
 {
-	struct spdk_lvol_store *lvs = arg;	
+	struct spdk_lvol_store *lvs = arg;
+	SPDK_NOTICELOG("redirect failover poller start drain channels.\n");
 	spdk_trigger_failover(lvs);	
 }
 
@@ -1358,7 +1359,7 @@ spdk_deferred_trigger_failover(void *cb_arg)
 static void
 spdk_trigger_failover_poller(struct spdk_lvol_store *lvs)
 {
-	if (!lvs->hub_dev.failover_poller && !lvs->skip_redirecting) {
+	if (!lvs->hub_dev.failover_poller) {
 		SPDK_NOTICELOG("call redirect failover poller.\n");
 		lvs->hub_dev.failover_poller = spdk_poller_register_named(
 		spdk_deferred_trigger_failover,
