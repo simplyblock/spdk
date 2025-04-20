@@ -3037,10 +3037,20 @@ spdk_delayed_close_hub_bdev(void *arg)
 }
 
 static void
-spdk_trigger_failover_msg_v2(void *arg)
+spdk_trigger_failover_cpl(void *cb_arg, int bserrno) {
+	struct spdk_lvol_store *lvs = cb_arg;
+	if (lvs->hub_dev.state != HUBLVOL_CONNECTED) {
+		spdk_delayed_close_hub_bdev(lvs);
+	}
+}
+
+static void
+spdk_trigger_failover_msg(void *arg)
 {
-	struct spdk_lvol_store *lvs = arg;	
-	spdk_trigger_failover(lvs);	
+	struct spdk_lvol_store *lvs = arg;
+	lvs->hub_dev.drain_in_action = false;
+	spdk_bs_drain_channel_queued(lvs->blobstore, lvs->hub_dev.submit_cb, spdk_trigger_failover_cpl, lvs);
+	// spdk_trigger_failover(lvs);	
 }
 
 static void
@@ -3053,7 +3063,7 @@ spdk_lvs_hub_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bde
 		SPDK_NOTICELOG("Receive remove event from callback. \n");
 
 		spdk_change_redirect_state(lvs, true);
-		spdk_thread_send_msg(lvs->hub_dev.thread, spdk_trigger_failover_msg_v2, lvs);
+		spdk_thread_send_msg(lvs->hub_dev.thread, spdk_trigger_failover_msg, lvs);
 
 		break;
 	default:
@@ -3093,6 +3103,7 @@ spdk_lvs_open_hub_bdev(void *cb_arg) {
 		}
 
 		pthread_mutex_lock(&g_lvol_stores_mutex);
+		lvs->hub_dev.drain_in_action = false;
 		lvs->skip_redirecting = false;
 		lvs->hub_dev.state = HUBLVOL_CONNECTED;
 		pthread_mutex_unlock(&g_lvol_stores_mutex);	
@@ -3105,13 +3116,6 @@ err:
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
 }
 
-static void
-spdk_trigger_failover_cpl(void *cb_arg, int bserrno) {
-	struct spdk_lvol_store *lvs = cb_arg;
-	if (lvs->hub_dev.state != HUBLVOL_CONNECTED) {
-		spdk_delayed_close_hub_bdev(lvs);
-	}
-}
 
 void
 spdk_change_redirect_state(struct spdk_lvol_store *lvs, bool disconnected) {
@@ -3133,15 +3137,15 @@ spdk_change_redirect_state(struct spdk_lvol_store *lvs, bool disconnected) {
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
 }
 
-void
-spdk_trigger_failover(struct spdk_lvol_store *lvs) {
-	if (!lvs->hub_dev.drain_in_action) {
-		return;
-	}
-	lvs->hub_dev.drain_in_action = false;
-	// spdk_trigger_failover_cpl(lvs, 0);
-	spdk_bs_drain_channel_queued(lvs->blobstore, lvs->hub_dev.submit_cb, spdk_trigger_failover_cpl, lvs);
-}
+// void
+// spdk_trigger_failover(struct spdk_lvol_store *lvs) {
+// 	// if (!lvs->hub_dev.drain_in_action) {
+// 	// 	return;
+// 	// }
+// 	// lvs->hub_dev.drain_in_action = false;
+// 	// spdk_trigger_failover_cpl(lvs, 0);
+// 	spdk_bs_drain_channel_queued(lvs->blobstore, lvs->hub_dev.submit_cb, spdk_trigger_failover_cpl, lvs);
+// }
 
 void
 spdk_lvs_set_opts(struct spdk_lvol_store *lvs, uint64_t groupid, uint64_t port, bool primary, bool secondary)
@@ -3298,6 +3302,7 @@ spdk_set_leader_all(struct spdk_lvol_store *t_lvs, bool lvs_leader, bool bs_nonl
 				if (lvs->hub_dev.state == HUBLVOL_CONNECTED) {
 					SPDK_NOTICELOG("enable redirect IO mode.\n");
 					lvs->skip_redirecting = false;
+					lvs->hub_dev.drain_in_action = false;
 				}
 			}
 		}

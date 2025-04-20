@@ -570,11 +570,10 @@ spdk_bs_drain_queued_io(struct spdk_io_channel_iter *i)
 
 	if (ch->set_redirect_ch && ch->redirect_ch) {
 		spdk_put_io_channel(ch->redirect_ch);
+		ch->set_redirect_ch = false;
+		ch->redirect_ch = NULL;
+		ch->redirect_desc = NULL;
 	}
-
-	ch->set_redirect_ch = false;
-	ch->redirect_ch = NULL;
-	ch->redirect_desc = NULL;
 	spdk_for_each_channel_continue(i, 0);
 }
 
