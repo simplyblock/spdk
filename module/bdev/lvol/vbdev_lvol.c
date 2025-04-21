@@ -1338,37 +1338,6 @@ blob_ext_io_opts_to_bdev_opts(struct spdk_bdev_ext_io_opts *dst, struct spdk_blo
 	dst->memory_domain_ctx = src->memory_domain_ctx;
 }
 
-// static void
-// spdk_trigger_failover_msg(void *arg)
-// {
-// 	struct spdk_lvol_store *lvs = arg;
-// 	SPDK_NOTICELOG("redirect failover poller start drain channels.\n");
-// 	spdk_trigger_failover(lvs);	
-// }
-
-// static int
-// spdk_deferred_trigger_failover(void *cb_arg)
-// {
-// 	struct spdk_lvol_store *lvs = cb_arg;
-// 	spdk_thread_send_msg(lvs->hub_dev.thread, spdk_trigger_failover_msg, lvs);
-// 	spdk_poller_unregister(&lvs->hub_dev.failover_poller);
-// 	lvs->hub_dev.failover_poller = NULL;
-// 	return -1;
-// }
-
-// static void
-// spdk_trigger_failover_poller(struct spdk_lvol_store *lvs)
-// {
-// 	if (!lvs->hub_dev.failover_poller) {
-// 		SPDK_NOTICELOG("call redirect failover poller.\n");
-// 		lvs->hub_dev.failover_poller = spdk_poller_register_named(
-// 		spdk_deferred_trigger_failover,
-// 		lvs,
-// 		200000,  // 100ms in µs
-// 		"failover_delay");
-// 	}	
-// }
-
 static void
 _pt_complete_io(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
@@ -1434,8 +1403,6 @@ redirect_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io, bo
 	}
 
 	if (hub_dev->state != HUBLVOL_CONNECTED) {
-		// spdk_bs_clear_hub_channel(ch);
-		// SPDK_ERRLOG("hubbdev 1\n");
 		SPDK_ERRLOG("ERROR on bdev_io submission! hubdev is not connected. start failover.\n");
 		spdk_change_redirect_state(lvs, true);
 		__atomic_sub_fetch(&lvs->hub_dev.redirected_io_count, 1, __ATOMIC_SEQ_CST);
@@ -1493,11 +1460,6 @@ vbdev_redirect_request_to_hublvol(struct spdk_lvol *lvol, struct spdk_io_channel
 	uint64_t offset = 0;
 	COMBINE_OFFSET(offset, lvol->map_id, bdev_io->u.bdev.offset_blocks);
 
-
-	// SPDK_NOTICELOG("redirect - orglvol  - blob: %" PRIu64 "  "
-	// 						"Lba: %" PRIu64 "  Cnt %" PRIu64 "  t %d \n",
-	// 						lvol->blob_id, offset, bdev_io->u.bdev.num_blocks, bdev_io->type);
-	// spdk_bs_queued_red_io(ch, bdev_io);
 	if (hub_dev->state == HUBLVOL_CONNECTED) {
 		//TODO check the state for channel
 		if (hub_dev->desc == NULL) {

@@ -2919,14 +2919,8 @@ spdk_lvs_unfreeze_on_conflict_poller(void *cb_arg)
 
 static void
 spdk_lvs_conflict_signal(void *arg, int errorno) {
-
-	// SPDK_NOTICELOG("Receive signal to change leadership internally due to conflict.\n");
 	struct spdk_lvol_store *lvs = arg;
 	struct spdk_lvs_req *req;
-	// if (errorno != 0) {
-	// 	spdk_lvs_unfreeze_on_conflict(lvs, false);
-	// 	return;
-	// }
 
 	req = calloc(1, sizeof(*req));
 	if (req == NULL) {
@@ -2943,28 +2937,6 @@ spdk_lvs_conflict_signal(void *arg, int errorno) {
 	SPDK_NOTICELOG("Lvolstore on conflict set poller.\n");
 	req->poller = spdk_poller_register(spdk_lvs_unfreeze_on_conflict_poller, req, 50000); // Delay of 50ms
 }
-
-// void
-// spdk_lvs_send_signal_on_conflict(uint64_t groupid)
-// {
-// 	struct spdk_lvol_store *lvs;
-// 	// struct spdk_lvol *lvol;
-	
-// 	SPDK_NOTICELOG("Receive signal to change leadership internally due to conflict.\n");
-
-// 	pthread_mutex_lock(&g_lvol_stores_mutex);
-// 	TAILQ_FOREACH(lvs, &g_lvol_stores, link) {
-// 	if (lvs->groupid == groupid) {
-// 		if (lvs->leader) {
-// 			SPDK_NOTICELOG("Starting to apply freeze due to conflict. group id: %" PRIu64 ".\n", lvs->groupid);
-// 			we should send msg to md thread
-// 			spdk_blob_freeze_on_conflict_send_msg(lvs->blobstore, spdk_lvs_conflict_signal, lvs);
-// 		}
-// 	}
-// 	}
-// 	pthread_mutex_unlock(&g_lvol_stores_mutex);
-// 	return;
-// }
 
 void
 spdk_lvs_change_leader_state(uint64_t groupid)
@@ -3053,7 +3025,6 @@ spdk_wait_for_redirected_io_cleanup(void *arg)
 		SPDK_NOTICELOG("All redirected I/Os completed. Proceeding to cleanup.\n");
 		spdk_poller_unregister(&lvs->hub_dev.cleanup_poller);
 		spdk_bs_drain_channel_queued(lvs->blobstore, lvs->hub_dev.submit_cb, spdk_trigger_failover_cpl, lvs);
-		// spdk_delayed_close_hub_bdev(lvs); // <- Close desc and release channels safely
 		return -1;
 	}
 
@@ -3072,8 +3043,6 @@ spdk_trigger_failover_msg(void *arg)
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
 	lvs->hub_dev.cleanup_poller = spdk_poller_register(
 	spdk_wait_for_redirected_io_cleanup, lvs, 200000 );// check every 200ms
-	// spdk_bs_drain_channel_queued(lvs->blobstore, lvs->hub_dev.submit_cb, spdk_trigger_failover_cpl, lvs);
-	// spdk_trigger_failover(lvs);	
 }
 
 static void
@@ -3159,16 +3128,6 @@ spdk_change_redirect_state(struct spdk_lvol_store *lvs, bool disconnected) {
 	}
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
 }
-
-// void
-// spdk_trigger_failover(struct spdk_lvol_store *lvs) {
-// 	// if (!lvs->hub_dev.drain_in_action) {
-// 	// 	return;
-// 	// }
-// 	// lvs->hub_dev.drain_in_action = false;
-// 	// spdk_trigger_failover_cpl(lvs, 0);
-// 	spdk_bs_drain_channel_queued(lvs->blobstore, lvs->hub_dev.submit_cb, spdk_trigger_failover_cpl, lvs);
-// }
 
 void
 spdk_lvs_set_opts(struct spdk_lvol_store *lvs, uint64_t groupid, uint64_t port, bool primary, bool secondary)
