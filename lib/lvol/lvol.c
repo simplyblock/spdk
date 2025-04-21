@@ -3044,12 +3044,35 @@ spdk_trigger_failover_cpl(void *cb_arg, int bserrno) {
 	}
 }
 
+static int
+spdk_wait_for_redirected_io_cleanup(void *arg)
+{
+	struct spdk_lvol_store *lvs = arg;
+
+	if (__atomic_load_n(&lvs->hub_dev.redirected_io_count, __ATOMIC_SEQ_CST) == 0) {
+		SPDK_NOTICELOG("All redirected I/Os completed. Proceeding to cleanup.\n");
+		spdk_poller_unregister(&lvs->hub_dev.cleanup_poller);
+		spdk_bs_drain_channel_queued(lvs->blobstore, lvs->hub_dev.submit_cb, spdk_trigger_failover_cpl, lvs);
+		// spdk_delayed_close_hub_bdev(lvs); // <- Close desc and release channels safely
+		return -1;
+	}
+
+	SPDK_NOTICELOG("Waiting for %lu redirected I/Os to finish.\n",
+		__atomic_load_n(&lvs->hub_dev.redirected_io_count, __ATOMIC_SEQ_CST));
+
+	return SPDK_POLLER_BUSY;
+}
+
 static void
 spdk_trigger_failover_msg(void *arg)
 {
-	struct spdk_lvol_store *lvs = arg;
+	struct spdk_lvol_store *lvs = arg;	
+	pthread_mutex_lock(&g_lvol_stores_mutex);
 	lvs->hub_dev.drain_in_action = false;
-	spdk_bs_drain_channel_queued(lvs->blobstore, lvs->hub_dev.submit_cb, spdk_trigger_failover_cpl, lvs);
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+	lvs->hub_dev.cleanup_poller = spdk_poller_register(
+	spdk_wait_for_redirected_io_cleanup, lvs, 200000 );// check every 200ms
+	// spdk_bs_drain_channel_queued(lvs->blobstore, lvs->hub_dev.submit_cb, spdk_trigger_failover_cpl, lvs);
 	// spdk_trigger_failover(lvs);	
 }
 
