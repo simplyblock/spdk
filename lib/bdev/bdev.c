@@ -9753,14 +9753,24 @@ spdk_bdev_set_qos_rate_limits_to_group(uint64_t bdev_pool_id, uint64_t *limits,
 
 	qos_pool_id_object = get_qos_already_available_for_group(bdev_pool_id);
 	if(qos_pool_id_object == NULL) {
-		SPDK_ERRLOG("Group ID %" PRIu64 " not available.\n", bdev_pool_id);
-		cb_fn(cb_arg, -EPERM);
-		return;
+		SPDK_NOTICELOG("Group ID %" PRIu64 " not found. Creating a new group.\n", bdev_pool_id);
+		qos_pool_id_object = create_qos_object_for_group(bdev_pool_id);
+		if (qos_pool_id_object == NULL)
+		{
+			SPDK_ERRLOG("Failed to create group for ID %" PRIu64 "\n", bdev_pool_id);
+			cb_fn(cb_arg, -EPERM);
+			return;
+		}
 	}
 
-	if(qos_pool_id_object->bdev_list_size <= 0) {
-		SPDK_ERRLOG("Bdev list empty for Group ID %" PRIu64 " vs %" PRIu64 "\n", bdev_pool_id, qos_pool_id_object->bdev_list_size);
-		cb_fn(cb_arg, -EPERM);
+	if(qos_pool_id_object->bdev_list_size == 0)
+	{
+		// No bdevs yet — just store the limits for now
+		for (int i = 0; i < SPDK_BDEV_QOS_NUM_RATE_LIMIT_TYPES; i++)
+		{
+			qos_pool_id_object->limits[i] = limits[i];
+		}
+		cb_fn(cb_arg, 0);
 		return;
 	}
 
@@ -9777,7 +9787,7 @@ spdk_bdev_set_qos_rate_limits_to_group(uint64_t bdev_pool_id, uint64_t *limits,
 		qos_pool_id_object->limits[i] = limits[i];
 	}
 	spdk_bdev_set_qos_rate_limits_ex(spdk_bdev_desc_get_bdev(desc), limits, bdev_pool_id, qos_pool_id_object, qos_bdev_node,
-							1, qos_pool_id_object->bdev_list_size, false, NULL, cb_fn, cb_arg);
+									 1, qos_pool_id_object->bdev_list_size, false, NULL, cb_fn, cb_arg);
 	spdk_bdev_close(desc);
 	return;
 }
