@@ -632,6 +632,7 @@ def bdev_nvme_set_options(client, action_on_timeout=None, timeout_us=None, timeo
         dhchap_digests: List of allowed DH-HMAC-CHAP digests. (optional)
         dhchap_dhgroups: List of allowed DH-HMAC-CHAP DH groups. (optional)
         rdma_umr_per_io: Enable/disable scatter-gather UMR per IO in RDMA transport if supported by system (optional).
+        tcp_connect_timeout_ms: Time to wait until TCP connection is done. Default: 0 (no timeout).
     """
     params = dict()
     if action_on_timeout is not None:
