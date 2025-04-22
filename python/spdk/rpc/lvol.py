@@ -82,8 +82,8 @@ def bdev_lvol_update_lvstore(client, uuid=None, lvs_name=None):
         params['lvs_name'] = lvs_name
     return client.call('bdev_lvol_update_lvstore', params)
 
-# def bdev_lvol_set_leader_all(client, uuid=None, lvs_name=None, lvs_leadership=False, bs_nonleadership=False):
-def bdev_lvol_set_leader_all(client, uuid=None, lvs_name=None, leadership=False):
+def bdev_lvol_set_leader_all(client, uuid=None, lvs_name=None, lvs_leadership=False, bs_nonleadership=False):
+# def bdev_lvol_set_leader_all(client, uuid=None, lvs_name=None, leadership=False):
     """Change state of the leadership
 
     Args:
@@ -92,8 +92,8 @@ def bdev_lvol_set_leader_all(client, uuid=None, lvs_name=None, leadership=False)
         lvs_leadership: Leadership state for lvolstore (default: False)
         bs_leadership: Leadership state for blobstore (default: False)
     """ 
-    # params = {'lvs_leadership': lvs_leadership, 'bs_nonleadership': bs_nonleadership}
-    params = {'leadership': leadership}
+    params = {'lvs_leadership': lvs_leadership, 'bs_nonleadership': bs_nonleadership}
+    # params = {'leadership': leadership}
         
     if (uuid and lvs_name):
         raise ValueError("Exactly one of uuid or lvs_name may be specified")
@@ -103,10 +103,28 @@ def bdev_lvol_set_leader_all(client, uuid=None, lvs_name=None, leadership=False)
         params['lvs_name'] = lvs_name
     return client.call('bdev_lvol_set_leader_all', params)
 
+def bdev_lvol_set_lvs_read_only(client, uuid=None, lvs_name=None, read_only=False):
+    """Change state of the read only
+
+    Args:
+        uuid: UUID of the lvolstore
+        lvs_name: lvolstore name
+        read_only: Read only state for lvolstore (default: False)        
+    """ 
+    params = {'read_only': read_only}
+        
+    if (uuid and lvs_name):
+        raise ValueError("Exactly one of uuid or lvs_name may be specified")
+    if uuid:
+        params['uuid'] = uuid
+    if lvs_name:
+        params['lvs_name'] = lvs_name
+    return client.call('bdev_lvol_set_lvs_read_only', params)
+
 def bdev_lvol_create(client, lvol_name, size_in_mib, thin_provision=False, uuid=None, lvs_name=None, clear_method=None, lvol_priority_class=0,
     is_tiered=False,
     force_fetch=False,
-    sync_fetch=False,
+    sync_fetch=True,
     pure_flush_or_evict=False,
     not_evict_blob_md=0):
     """Create a logical volume on a logical volume store.
@@ -157,6 +175,50 @@ def bdev_lvol_create(client, lvol_name, size_in_mib, thin_provision=False, uuid=
     params['pure_flush_or_evict'] = pure_flush_or_evict
     params['not_evict_blob_md'] = not_evict_blob_md
     return client.call('bdev_lvol_create', params)
+
+def bdev_lvol_create_hublvol(client, uuid=None, lvs_name=None):
+    """Create a logical volume on a logical volume store.
+
+    Args:        
+        uuid: UUID of logical volume store to create logical volume on (optional)
+        lvs_name: name of logical volume store to create logical volume on (optional)
+
+    Either uuid or lvs_name must be specified, but not both.
+
+    Returns:
+        Name of created logical volume block device.
+    """
+    if (uuid and lvs_name) or (not uuid and not lvs_name):
+        raise ValueError("Either uuid or lvs_name must be specified, but not both")
+
+    params = {}
+    if uuid:
+        params['uuid'] = uuid
+    if lvs_name:
+        params['lvs_name'] = lvs_name
+    return client.call('bdev_lvol_create_hublvol', params)
+
+def bdev_lvol_delete_hublvol(client, uuid=None, lvs_name=None, ):
+    """Create a logical volume on a logical volume store.
+
+    Args:        
+        uuid: UUID of logical volume store to create logical volume on (optional)
+        lvs_name: name of logical volume store to create logical volume on (optional)
+
+    Either uuid or lvs_name must be specified, but not both.
+
+    Returns:
+        Name of created logical volume block device.
+    """
+    if (uuid and lvs_name) or (not uuid and not lvs_name):
+        raise ValueError("Either uuid or lvs_name must be specified, but not both")
+
+    params = {}
+    if uuid:
+        params['uuid'] = uuid
+    if lvs_name:
+        params['lvs_name'] = lvs_name
+    return client.call('bdev_lvol_delete_hublvol', params)
 
 def bdev_lvol_register(client, lvol_name, registered_uuid, blobid, thin_provision=False, uuid=None, lvs_name=None, clear_method=None, lvol_priority_class=0):
     """Create a logical volume on a logical volume store.
@@ -246,7 +308,7 @@ def bdev_lvol_snapshot(
     lvol_priority_class=0,   
     is_tiered=False,
     force_fetch=False,
-    sync_fetch=False,
+    sync_fetch=True,
     pure_flush_or_evict=False,
     not_evict_blob_md=0):
     """Capture a snapshot of the current state of a logical volume.
@@ -284,9 +346,10 @@ def bdev_lvol_clone(
     client, 
     snapshot_name, 
     clone_name,
+    lvol_priority_class=0,
     is_tiered=False,
     force_fetch=False,
-    sync_fetch=False,
+    sync_fetch=True,
     pure_flush_or_evict=False,
     not_evict_blob_md=0):
     """Create a logical volume based on a snapshot.
@@ -558,7 +621,7 @@ def bdev_lvol_get_lvstores(client, uuid=None, lvs_name=None):
         params['lvs_name'] = lvs_name
     return client.call('bdev_lvol_get_lvstores', params)
 
-def bdev_lvol_set_lvs_op(client, uuid=None, lvs_name=None, groupid=0, subsystem_port=0):
+def bdev_lvol_set_lvs_opts(client, uuid=None, lvs_name=None, groupid=0, subsystem_port=0, primary=False, secondary=False):
     """Set group id for lvolstore.
 
     Args:
@@ -573,12 +636,37 @@ def bdev_lvol_set_lvs_op(client, uuid=None, lvs_name=None, groupid=0, subsystem_
         raise ValueError("Exactly one of uuid or lvs_name may be specified")
     if (not groupid):
         raise ValueError("groupid must be specified")
-    params = {'groupid': groupid, 'subsystem_port': subsystem_port}
+     
+    params = {'groupid': groupid, 'subsystem_port': subsystem_port, 'primary': primary, 'secondary': secondary}
     if uuid:
         params['uuid'] = uuid
     if lvs_name:
         params['lvs_name'] = lvs_name
-    return client.call('bdev_lvol_set_lvs_op', params)
+    return client.call('bdev_lvol_set_lvs_opts', params)
+
+def bdev_lvol_connect_hublvol(client, uuid=None, lvs_name=None, remote_bdev=''):
+    """Connect to the hub lvol.
+
+    Args:
+        uuid: UUID of logical volume store to retrieve information about (optional)
+        lvs_name: name of logical volume store to retrieve information about (optional)
+        remote_bdev: name of remote bdev
+        
+    Either uuid or lvs_name may be specified, but not both.
+    If both uuid and lvs_name are omitted, information about all logical volume stores is returned.
+    """
+    if (uuid and lvs_name):
+        raise ValueError("Exactly one of uuid or lvs_name may be specified")
+
+    if (not remote_bdev):
+         raise ValueError("remote bdev name must be specified")
+     
+    params = {'remote_bdev': remote_bdev}
+    if uuid:
+        params['uuid'] = uuid
+    if lvs_name:
+        params['lvs_name'] = lvs_name
+    return client.call('bdev_lvol_connect_hublvol', params)
 
 def bdev_lvol_get_lvols(client, lvs_uuid=None, lvs_name=None):
     """List logical volumes

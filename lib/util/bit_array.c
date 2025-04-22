@@ -469,6 +469,21 @@ spdk_bit_pool_allocate_bit(struct spdk_bit_pool *pool)
 	return bit_index;
 }
 
+uint32_t
+spdk_bit_pool_allocate_specific_bit(struct spdk_bit_pool *pool, uint32_t bit_index)
+{
+
+	if (bit_index == UINT32_MAX) {
+		return UINT32_MAX;
+	}
+
+	spdk_bit_array_set(pool->array, bit_index);
+	pool->lowest_free_bit = spdk_bit_array_find_first_clear(pool->array, 0);
+
+	pool->free_count--;
+	return bit_index;
+}
+
 void
 spdk_bit_pool_free_bit(struct spdk_bit_pool *pool, uint32_t bit_index)
 {

@@ -43,6 +43,8 @@ int vbdev_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz
 			  int8_t lvol_priority_class, uint8_t tiering_info,
 		      spdk_lvol_op_with_handle_complete cb_fn,
 		      void *cb_arg);
+
+int vbdev_lvol_create_hublvol(struct spdk_lvol_store *lvs, spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
 int vbdev_lvol_register(struct spdk_lvol_store *lvs, const char *name, const char *registered_uuid, 
 			  uint64_t blobid, bool thin_provision, enum lvol_clear_method clear_method, 
 			  int8_t lvol_priority_class, spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
@@ -97,6 +99,7 @@ void vbdev_lvol_rename(struct spdk_lvol *lvol, const char *new_lvol_name,
  * \param cb_arg Completion callback custom arguments
  */
 void vbdev_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg, bool is_async);
+void vbdev_lvol_delete_hublvol(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg);
 
 /**
  * \brief Renames given lvolstore.

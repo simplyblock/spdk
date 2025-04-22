@@ -1664,15 +1664,70 @@ nvmf_subsystem_update_ns(struct spdk_nvmf_subsystem *subsystem,
 	return 0;
 }
 
+struct subsystem_ns_change_ctx_v2 {
+	// struct spdk_nvmf_subsystem		*subsystem;
+	uint32_t nsid;
+	struct spdk_nvmf_ctrlr *ctrlr;
+	// spdk_nvmf_subsystem_state_change_done	cb_fn;
+	// uint32_t				nsid;
+	struct spdk_nvmf_subsystem *subsystem;
+	bool last_one;
+	struct spdk_thread		*thread;
+};
+
+
+static void
+nvmf_subsystem_ns_changed_v3(void *cb_arg)
+{
+	struct spdk_nvmf_subsystem *subsystem = cb_arg;
+	SPDK_NOTICELOG("Running the subsystem.\n");
+	if (spdk_nvmf_subsystem_resume(subsystem, NULL, NULL) != 0) {
+		SPDK_ERRLOG("Failed to resume NVME-oF subsystem with id: %u\n", subsystem->id);
+	}
+}
+
+static void
+nvmf_subsystem_ns_changed_v2(void *cb_arg)
+{
+	struct subsystem_ns_change_ctx_v2 *ctx = cb_arg;		
+	nvmf_ctrlr_ns_changed(ctx->ctrlr, ctx->nsid);
+	if (ctx->last_one) {
+		SPDK_NOTICELOG("changing the ns list namespace: %d done.\n", ctx->nsid);
+		spdk_thread_send_msg(ctx->thread, nvmf_subsystem_ns_changed_v3, ctx->subsystem);
+	}
+	free(ctx);
+}
+
 static void
 nvmf_subsystem_ns_changed(struct spdk_nvmf_subsystem *subsystem, uint32_t nsid)
 {
 	struct spdk_nvmf_ctrlr *ctrlr;
-
+	struct subsystem_ns_change_ctx_v2 *ctx;
+	int count = 0;
+	ctx = calloc(subsystem->max_cntlid, sizeof(struct subsystem_ns_change_ctx_v2));	
+	if (!ctx) {
+		SPDK_ERRLOG("Cannot allocate memory for chnaging the ns list.\n");
+		if (spdk_nvmf_subsystem_resume(subsystem, NULL, NULL) != 0) {
+			SPDK_ERRLOG("Failed to resume NVME-oF subsystem with id: %u\n", subsystem->id);
+		}
+		return;
+	}
 	TAILQ_FOREACH(ctrlr, &subsystem->ctrlrs, link) {
 		if (nvmf_ctrlr_ns_is_visible(ctrlr, nsid)) {
-			nvmf_ctrlr_ns_changed(ctrlr, nsid);
+			ctx[count].nsid = nsid;
+			ctx[count].ctrlr = ctrlr;
+			ctx[count].subsystem = subsystem;
+			ctx[count].thread = spdk_get_thread();
+			count++;			
+			// nvmf_ctrlr_ns_changed(ctrlr, nsid);
+		}		
+	}
+
+	for (int i = 0; i < count; i++) {
+		if ( i == count -1) {
+			ctx[i].last_one = true;
 		}
+		spdk_thread_send_msg(ctx[i].ctrlr->thread, nvmf_subsystem_ns_changed_v2, &ctx[i]);
 	}
 }
 
@@ -1822,12 +1877,9 @@ static void
 _nvmf_ns_resize(struct spdk_nvmf_subsystem *subsystem, void *cb_arg, int status)
 {
 	struct subsystem_ns_change_ctx *ctx = cb_arg;
-
+	SPDK_NOTICELOG("starting to change the ns list namespace: %d.\n", ctx->nsid);
 	nvmf_subsystem_ns_changed(subsystem, ctx->nsid);
-	if (spdk_nvmf_subsystem_resume(subsystem, NULL, NULL) != 0) {
-		SPDK_ERRLOG("Failed to resume NVME-oF subsystem with id: %u\n", subsystem->id);
-	}
-
+	SPDK_NOTICELOG("ns list changed and resume the subsystem.\n");
 	free(ctx);
 }
 
@@ -3067,6 +3119,7 @@ nvmf_ns_reservation_register(struct spdk_nvmf_ns *ns,
 			}
 			rc = nvmf_ns_reservation_add_registrant(ns, ctrlr, key.nrkey);
 			if (rc < 0) {
+				SPDK_ERRLOG("Unable to process register 1.\n");
 				status = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 				goto exit;
 			}
@@ -3128,6 +3181,7 @@ nvmf_ns_reservation_register(struct spdk_nvmf_ns *ns,
 			/* new registrant */
 			rc = nvmf_ns_reservation_add_registrant(ns, ctrlr, key.nrkey);
 			if (rc < 0) {
+				SPDK_ERRLOG("Unable to process register 2.\n");
 				status = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 				goto exit;
 			}
@@ -3447,6 +3501,7 @@ nvmf_ns_reservation_report(struct spdk_nvmf_ns *ns,
 	transfer_len = (cmd->cdw10 + 1) * sizeof(uint32_t);
 
 	if (transfer_len < sizeof(struct spdk_nvme_reservation_status_extended_data)) {
+		SPDK_ERRLOG("Unable to process register 3.\n");
 		status = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 		goto exit;
 	}
@@ -3544,6 +3599,7 @@ nvmf_ns_reservation_request(void *ctx)
 	if (update_sgroup) {
 		if (ns->ptpl_activated || cmd->opc == SPDK_NVME_OPC_RESERVATION_REGISTER) {
 			if (nvmf_ns_update_reservation_info(ns) != 0) {
+				SPDK_ERRLOG("Unable to process register 4.\n");
 				req->rsp->nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 			}
 		}

@@ -13,8 +13,22 @@
 
 #include "vbdev_lvol.h"
 
+
+#define ID_SHIFT_AMOUNT       48                   // Number of bits to shift for ID extraction
+#define OFFSET_MASK_48_BITS   ((1ULL << ID_SHIFT_AMOUNT) - 1)  // Mask for the lower 48 bits
+#define OFFSET_SHIFT_AMOUNT   16                   // Number of bits to shift for original offset removal
+#define OFFSET_MASK_16_BITS   ((1ULL << OFFSET_SHIFT_AMOUNT) - 1)  // Mask for the lower 16 bits
+// Macro to extract the 16 highest bits (ID) from the offset
+#define EXTRACT_ID(offset)     ((offset >> ID_SHIFT_AMOUNT) & OFFSET_MASK_16_BITS)
+// Macro to adjust the offset, keeping only the 48 lowest bits
+#define ADJUST_OFFSET(offset)  (offset & OFFSET_MASK_48_BITS)
+#define COMBINE_OFFSET(offset, lvol_map_id, bdev_offset)  \
+    (offset) = ((uint64_t)(lvol_map_id) << 48) | (bdev_offset)
+	
+
 struct vbdev_lvol_io {
 	struct spdk_blob_ext_io_opts ext_io_opts;
+	bool redirect_in_progress;
 };
 
 static TAILQ_HEAD(, lvol_store_bdev) g_spdk_lvol_pairs = TAILQ_HEAD_INITIALIZER(
@@ -948,6 +962,11 @@ vbdev_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb
 		return;
 	}
 
+	uint16_t map_id = spdk_blob_get_map_id(lvol->blob);
+	if (map_id < 65535) {
+		lvol->lvol_store->lvol_map.lvol[map_id] = NULL;
+	}
+
 	if (!lvol->lvol_store->leader) {
 		// check blob state it must be CLEAN
 		// copy the blob
@@ -1050,6 +1069,7 @@ vbdev_lvol_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 	spdk_json_write_named_bool(w, "lvol_leadership", lvol->leader);
 	spdk_json_write_named_bool(w, "lvs_leadership", lvol->lvol_store->leader);
 	spdk_json_write_named_uint64(w, "blobid", spdk_blob_get_id(blob));
+	spdk_json_write_named_uint64(w, "map_id", lvol->map_id);
 	spdk_json_write_named_uint32(w, "open_ref", spdk_blob_get_open_ref(blob));
 	spdk_json_write_named_uint8(w, "lvol_priority_class", lvol->priority_class);
 
@@ -1159,6 +1179,9 @@ check_IO_type(enum spdk_bdev_io_type type) {
 }
 
 static void
+vbdev_lvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io);
+
+static void
 lvol_op_comp(void *cb_arg, int bserrno)
 {
 	struct spdk_bdev_io *bdev_io = cb_arg;
@@ -1166,6 +1189,17 @@ lvol_op_comp(void *cb_arg, int bserrno)
 
 	if (bserrno != 0) {
 		struct spdk_lvol *lvol = bdev_io->bdev->ctxt;
+		struct spdk_lvol_store *lvs = lvol->lvol_store;
+		uint64_t offset = bdev_io->u.bdev.offset_blocks;
+		if (lvol->hublvol) {
+			lvol = lvs->lvol_map.lvol[offset >> 48];
+		}
+
+		if (lvs->queue_failed_rsp) {
+			if (spdk_lvs_queued_rsp(lvs, bdev_io)) {
+				return;
+			}
+		}
 		SPDK_NOTICELOG("FAILED IO blob: %" PRIu64 " LBA: %" PRIu64 " CNT %" PRIu64 " type %d, rc %d \n",
 		 	lvol->blob_id, bdev_io->u.bdev.offset_blocks, bdev_io->u.bdev.num_blocks, bdev_io->type, bserrno);
 		if (bserrno == -ENOMEM) {
@@ -1185,6 +1219,18 @@ lvol_unmap(struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct spdk_bdev_
 	struct spdk_blob *blob = lvol->blob;
 
 	start_page = bdev_io->u.bdev.offset_blocks;
+	num_pages = bdev_io->u.bdev.num_blocks;
+
+	spdk_blob_io_unmap(blob, ch, start_page, num_pages, lvol_op_comp, bdev_io);
+}
+
+static void
+hublvol_unmap(struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
+{
+	uint64_t start_page, num_pages;
+	struct spdk_blob *blob = lvol->blob;
+
+	start_page = ADJUST_OFFSET(bdev_io->u.bdev.offset_blocks);
 	num_pages = bdev_io->u.bdev.num_blocks;
 
 	spdk_blob_io_unmap(blob, ch, start_page, num_pages, lvol_op_comp, bdev_io);
@@ -1221,6 +1267,18 @@ lvol_write_zeroes(struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct spd
 }
 
 static void
+hublvol_write_zeroes(struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
+{
+	uint64_t start_page, num_pages;
+	struct spdk_blob *blob = lvol->blob;
+	
+	start_page = ADJUST_OFFSET(bdev_io->u.bdev.offset_blocks);
+	num_pages = bdev_io->u.bdev.num_blocks;
+
+	spdk_blob_io_write_zeroes(blob, ch, start_page, num_pages, lvol_op_comp, bdev_io);
+}
+
+static void
 lvol_read(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 {
 	uint64_t start_page, num_pages;
@@ -1239,6 +1297,25 @@ lvol_read(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 			       num_pages, lvol_op_comp, bdev_io, &lvol_io->ext_io_opts);
 }
 
+
+static void
+hublvol_read(struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
+{
+	uint64_t start_page, num_pages;	
+	struct spdk_blob *blob = lvol->blob;
+	struct vbdev_lvol_io *lvol_io = (struct vbdev_lvol_io *)bdev_io->driver_ctx;
+
+	start_page = ADJUST_OFFSET(bdev_io->u.bdev.offset_blocks);
+	num_pages = bdev_io->u.bdev.num_blocks;
+
+	lvol_io->ext_io_opts.size = sizeof(lvol_io->ext_io_opts);
+	lvol_io->ext_io_opts.memory_domain = bdev_io->u.bdev.memory_domain;
+	lvol_io->ext_io_opts.memory_domain_ctx = bdev_io->u.bdev.memory_domain_ctx;
+
+	spdk_blob_io_readv_ext(blob, ch, bdev_io->u.bdev.iovs, bdev_io->u.bdev.iovcnt, start_page,
+			       num_pages, lvol_op_comp, bdev_io, &lvol_io->ext_io_opts);
+}
+
 static void
 lvol_write(struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 {
@@ -1247,6 +1324,24 @@ lvol_write(struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct spdk_bdev_
 	struct vbdev_lvol_io *lvol_io = (struct vbdev_lvol_io *)bdev_io->driver_ctx;
 	
 	start_page = bdev_io->u.bdev.offset_blocks;
+	num_pages = bdev_io->u.bdev.num_blocks;
+
+	lvol_io->ext_io_opts.size = sizeof(lvol_io->ext_io_opts);
+	lvol_io->ext_io_opts.memory_domain = bdev_io->u.bdev.memory_domain;
+	lvol_io->ext_io_opts.memory_domain_ctx = bdev_io->u.bdev.memory_domain_ctx;
+
+	spdk_blob_io_writev_ext(blob, ch, bdev_io->u.bdev.iovs, bdev_io->u.bdev.iovcnt, start_page,
+				num_pages, lvol_op_comp, bdev_io, &lvol_io->ext_io_opts);
+}
+
+static void
+hublvol_write(struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
+{
+	uint64_t start_page, num_pages;
+	struct spdk_blob *blob = lvol->blob;
+	struct vbdev_lvol_io *lvol_io = (struct vbdev_lvol_io *)bdev_io->driver_ctx;
+
+	start_page = ADJUST_OFFSET(bdev_io->u.bdev.offset_blocks);	
 	num_pages = bdev_io->u.bdev.num_blocks;
 
 	lvol_io->ext_io_opts.size = sizeof(lvol_io->ext_io_opts);
@@ -1282,14 +1377,402 @@ lvol_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io, bool s
 }
 
 static void
-vbdev_lvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
+hublvol_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io, bool success)
 {
 	struct spdk_lvol *lvol = bdev_io->bdev->ctxt;
 	struct spdk_lvol_store *lvs = lvol->lvol_store;
 
+	uint64_t offset =  bdev_io->u.bdev.offset_blocks;
+	uint16_t id = EXTRACT_ID(offset);
+	struct spdk_lvol *org_lvol = lvs->lvol_map.lvol[id];
+
+	if (!success) {
+		offset = ADJUST_OFFSET(offset);
+		SPDK_NOTICELOG("FAILED getbuf IO OP in blob: %" PRIu64 " blocks at LBA: %" PRIu64 " blocks CNT %" PRIu64 " and the type is %d \n",
+		 			org_lvol->blob_id, offset, bdev_io->u.bdev.num_blocks, bdev_io->type);
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		return;
+	}
+
+	hublvol_read(org_lvol, ch, bdev_io);
+}
+
+struct ctx_redirect_req {
+	struct spdk_io_channel *ch;
+	struct spdk_bdev_io *bdev_io;
+};
+
+static inline void
+blob_ext_io_opts_to_bdev_opts(struct spdk_bdev_ext_io_opts *dst, struct spdk_blob_ext_io_opts *src)
+{
+	memset(dst, 0, sizeof(*dst));
+	dst->size = sizeof(*dst);
+	dst->memory_domain = src->memory_domain;
+	dst->memory_domain_ctx = src->memory_domain_ctx;
+}
+
+static void
+_pt_complete_io(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct ctx_redirect_req *ctx = cb_arg;
+	struct spdk_bdev_io *orig_io = ctx->bdev_io;
+	struct spdk_lvol *lvol = orig_io->bdev->ctxt;
+	struct spdk_lvol_store *lvs = lvol->lvol_store;
+	struct vbdev_lvol_io *io_ctx = (struct vbdev_lvol_io *)orig_io->driver_ctx;
+	int status = success ? SPDK_BDEV_IO_STATUS_SUCCESS : SPDK_BDEV_IO_STATUS_FAILED;
+
+	/* Complete the original IO and then free the one that we created here
+	 * as a result of issuing an IO via submit_request.
+	 */
+	__atomic_sub_fetch(&lvs->hub_dev.redirected_io_count, 1, __ATOMIC_SEQ_CST);
+	if (!io_ctx->redirect_in_progress) {
+		SPDK_ERRLOG("Double completion or use-after-complete for IO %p\n", orig_io);
+		free(ctx);
+		return;
+	}
+
+	io_ctx->redirect_in_progress = false;  // Clear flag
+
+	if (status == SPDK_BDEV_IO_STATUS_SUCCESS) {
+		spdk_bdev_io_complete(orig_io, status);
+		spdk_bdev_free_io(bdev_io);
+		free(ctx);
+		return;
+	}
+
+
+	// Failure path: trigger failover and resend original IO
+	if (!lvs->skip_redirecting) {
+		SPDK_ERRLOG("FAILED IO on hub bdev. Starting failover.\n");
+		spdk_change_redirect_state(lvs, false);
+		// spdk_trigger_failover_poller(lvs);
+	}
+	SPDK_ERRLOG("FAILED IO on hub bdev. redirected.\n");
+	spdk_bdev_free_io(bdev_io);  // Still safe here
+	vbdev_lvol_submit_request(ctx->ch, orig_io);
+	free(ctx);
+}
+
+static void
+redirect_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io, bool success)
+{
+	struct spdk_lvol *lvol = bdev_io->bdev->ctxt;
+	struct spdk_lvol_store *lvs = lvol->lvol_store;
+	struct spdk_redirect_dev *hub_dev = &lvs->hub_dev;
+	struct spdk_bdev_ext_io_opts bdev_io_opts;
+	struct spdk_io_channel *hub_ch;
+	struct ctx_redirect_req *ctx;
+	
+	uint64_t offset = 0;
+	COMBINE_OFFSET(offset, lvol->map_id, bdev_io->u.bdev.offset_blocks);
+
+	if (!success) {		
+		SPDK_NOTICELOG("FAILED getbuf redirect blob: %" PRIu64 " blocks at LBA: %" PRIu64 " blocks CNT %" PRIu64 " and the type is %d \n",
+		 			lvol->blob_id, bdev_io->u.bdev.offset_blocks, bdev_io->u.bdev.num_blocks, bdev_io->type);
+		// spdk_bs_dequeued_red_io(ch, bdev_io);
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		__atomic_sub_fetch(&lvs->hub_dev.redirected_io_count, 1, __ATOMIC_SEQ_CST);
+		return;
+	}
+
+	if (hub_dev->state != HUBLVOL_CONNECTED) {
+		SPDK_ERRLOG("ERROR on bdev_io submission! hubdev is not connected. start failover.\n");
+		spdk_change_redirect_state(lvs, true);
+		__atomic_sub_fetch(&lvs->hub_dev.redirected_io_count, 1, __ATOMIC_SEQ_CST);
+		// spdk_trigger_failover_poller(lvs);
+		vbdev_lvol_submit_request(ch, bdev_io);
+		return;
+	}
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {	
+		SPDK_NOTICELOG("FAILED IO - Cannot allocate ctx for redirect IO. \n");
+		spdk_change_redirect_state(lvs, false);
+		// spdk_trigger_failover_poller(lvs);
+		__atomic_sub_fetch(&lvs->hub_dev.redirected_io_count, 1, __ATOMIC_SEQ_CST);
+		vbdev_lvol_submit_request(ch, bdev_io);
+		return;
+	}
+	ctx->bdev_io = bdev_io;
+	ctx->ch = ch;
+
+	struct vbdev_lvol_io *lvol_io = (struct vbdev_lvol_io *)bdev_io->driver_ctx;
+	lvol_io->ext_io_opts.size = sizeof(lvol_io->ext_io_opts);
+	lvol_io->ext_io_opts.memory_domain = bdev_io->u.bdev.memory_domain;
+	lvol_io->ext_io_opts.memory_domain_ctx = bdev_io->u.bdev.memory_domain_ctx;
+	blob_ext_io_opts_to_bdev_opts(&bdev_io_opts, &lvol_io->ext_io_opts);
+	hub_ch = spdk_bs_get_hub_channel(ch);
+	
+	int rc = spdk_bdev_readv_blocks_ext(hub_dev->desc, hub_ch, bdev_io->u.bdev.iovs, bdev_io->u.bdev.iovcnt, offset,
+			       bdev_io->u.bdev.num_blocks, _pt_complete_io, ctx, &bdev_io_opts);
+	if (rc != 0) {
+		// if (rc == -ENOMEM) {
+		// 	SPDK_ERRLOG("No memory, start to queue io for passthru.\n");
+		// 	io_ctx->ch = ch;
+		// 	vbdev_passthru_queue_io(bdev_io);
+		// } else {
+		__atomic_sub_fetch(&lvs->hub_dev.redirected_io_count, 1, __ATOMIC_SEQ_CST);
+			SPDK_ERRLOG("ERROR on bdev_io submission!\n");
+			spdk_change_redirect_state(lvs, false);
+			// spdk_trigger_failover_poller(lvs);
+			vbdev_lvol_submit_request(ch, bdev_io);
+			free(ctx);
+		// }
+	}
+}
+
+static void
+vbdev_redirect_request_to_hublvol(struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io) {
+	struct spdk_lvol_store *lvs = lvol->lvol_store;
+	struct vbdev_lvol_io *lvol_io = (struct vbdev_lvol_io *)bdev_io->driver_ctx;
+	struct spdk_redirect_dev *hub_dev = &lvs->hub_dev;
+	struct spdk_io_channel *hub_ch;
+	struct ctx_redirect_req *ctx = NULL;
+	struct spdk_bdev_ext_io_opts bdev_io_opts;
+	int rc = 0;
+	uint64_t offset = 0;
+	COMBINE_OFFSET(offset, lvol->map_id, bdev_io->u.bdev.offset_blocks);
+
+	if (hub_dev->state == HUBLVOL_CONNECTED) {
+		//TODO check the state for channel
+		if (hub_dev->desc == NULL) {
+			SPDK_ERRLOG("Hublvol desc is NULL. should not be.\n");
+			// spdk_bs_clear_hub_channel(ch);
+			spdk_change_redirect_state(lvs, true);
+			// spdk_trigger_failover_poller(lvs);
+			vbdev_lvol_submit_request(ch, bdev_io);
+			// vbdev_lvol_open_hubbdev(lvs);			
+			return;
+		}
+
+		hub_ch = spdk_bs_get_hub_channel(ch);
+		if (!hub_ch) {
+			hub_ch = spdk_bdev_get_io_channel(hub_dev->desc);
+			if (!hub_ch || !spdk_bs_set_hub_channel(ch, hub_ch, hub_dev->desc)) {
+				// spdk_bs_dequeued_red_io(ch, bdev_io);
+				// vbdev_lvol_submit_request(ch, bdev_io);
+				SPDK_NOTICELOG("Hublvol state is in connected mode but we lost the desc due to internal error."
+							"we try to connect now but we will not wait and the failover will started.\n");
+				//TODO release the hublvol desc in the mutux				
+				// spdk_bs_clear_hub_channel(ch);
+				// vbdev_lvol_open_hubbdev(lvs);
+				spdk_change_redirect_state(lvs, true);
+				// spdk_trigger_failover_poller(lvs);
+				vbdev_lvol_submit_request(ch, bdev_io);
+				// failover
+				return;
+			}
+		}
+		//TODO if we can not create ch from hub bdev
+	} else {
+		// spdk_bs_clear_hub_channel(ch);
+		if (hub_dev->state == HUBLVOL_CONNECTED_FAILED ||
+		 		hub_dev->state == HUBLVOL_DISCONNECTED ||
+				hub_dev->state == HUBLVOL_CONNECTING_IN_PROCCESS) {
+			SPDK_NOTICELOG("Hublvol is in failover status. we try to connect now but we will not wait and the failover will started.\n");
+		}
+
+		if (hub_dev->state == HUBLVOL_NOT_CONNECTED) {
+			SPDK_NOTICELOG("Hublvol is not connected. we try to connect now but we will not wait and the failover will started.\n");
+		}		
+		spdk_change_redirect_state(lvs, false);
+		// spdk_trigger_failover_poller(lvs);
+		vbdev_lvol_submit_request(ch, bdev_io);
+		// vbdev_lvol_open_hubbdev(lvs);
+		return;
+	}
+
+	if (bdev_io->type != SPDK_BDEV_IO_TYPE_READ && !lvs->read_only) {
+		ctx = calloc(1, sizeof(*ctx));
+		if (!ctx) {
+			// spdk_bs_dequeued_red_io(ch, bdev_io);
+			SPDK_NOTICELOG("FAILED IO - Cannot allocate ctx for redirect IO. \n");			
+			spdk_change_redirect_state(lvs, false);
+			// spdk_trigger_failover_poller(lvs);
+			vbdev_lvol_submit_request(ch, bdev_io);
+			//TODO failover
+			return;
+		}
+		ctx->bdev_io = bdev_io;
+		ctx->ch = ch;
+	}
+
+	lvol_io->redirect_in_progress = true;
+	__atomic_add_fetch(&lvs->hub_dev.redirected_io_count, 1, __ATOMIC_SEQ_CST);
+	switch (bdev_io->type) {
+	case SPDK_BDEV_IO_TYPE_READ:
+		spdk_bdev_io_get_buf(bdev_io, redirect_get_buf_cb,
+				     bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen);
+		break;
+	case SPDK_BDEV_IO_TYPE_WRITE:
+		if (lvs->read_only) {
+			// spdk_bs_dequeued_red_io(ch, bdev_io);
+			free(ctx);
+			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+			return;
+		}
+
+		lvol_io->ext_io_opts.size = sizeof(lvol_io->ext_io_opts);
+		lvol_io->ext_io_opts.memory_domain = bdev_io->u.bdev.memory_domain;
+		lvol_io->ext_io_opts.memory_domain_ctx = bdev_io->u.bdev.memory_domain_ctx;
+		blob_ext_io_opts_to_bdev_opts(&bdev_io_opts, &lvol_io->ext_io_opts);
+		rc = spdk_bdev_writev_blocks_ext(hub_dev->desc, hub_ch, bdev_io->u.bdev.iovs,
+						 bdev_io->u.bdev.iovcnt, offset, bdev_io->u.bdev.num_blocks,
+						  _pt_complete_io, ctx, &bdev_io_opts);
+		break;
+	case SPDK_BDEV_IO_TYPE_WRITE_ZEROES:
+		if (lvs->read_only) {
+			// spdk_bs_dequeued_red_io(ch, bdev_io);
+			free(ctx);
+			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+			return;
+		}
+		rc = spdk_bdev_write_zeroes_blocks(hub_dev->desc, hub_ch, offset,
+						   bdev_io->u.bdev.num_blocks,
+						   _pt_complete_io, ctx);
+		break;
+	case SPDK_BDEV_IO_TYPE_UNMAP:
+		rc = spdk_bdev_unmap_blocks(hub_dev->desc, hub_ch, offset,
+					    bdev_io->u.bdev.num_blocks,
+					    _pt_complete_io, ctx);
+		break;
+	default:
+		SPDK_INFOLOG(vbdev_lvol, "lvol: unsupported I/O type %d\n", bdev_io->type);
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		return;
+	}
+
+	if (rc != 0) {
+		// spdk_bs_dequeued_red_io(ch, bdev_io);
+		__atomic_sub_fetch(&lvs->hub_dev.redirected_io_count, 1, __ATOMIC_SEQ_CST);
+		SPDK_ERRLOG("ERROR on bdev_io submission!\n");
+		spdk_change_redirect_state(lvs, false);
+		// spdk_trigger_failover_poller(lvs);
+		vbdev_lvol_submit_request(ch, bdev_io);
+		if (ctx) {
+			free(ctx);
+		}
+	}
+	return;
+}
+
+static void
+vbdev_hublvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io) {
+	struct spdk_lvol *lvol = bdev_io->bdev->ctxt;
+	struct spdk_lvol_store *lvs = lvol->lvol_store;
+	uint64_t offset =  bdev_io->u.bdev.offset_blocks;
+	bool io_type = check_IO_type(bdev_io->type);
+	uint16_t id = EXTRACT_ID(offset);
+	if (id == 0) {
+		SPDK_ERRLOG("HUBLVOL - orglvol in none due to zero id - blob: %" PRIu64 "  "
+							"Lba: %" PRIu64 "  Cnt %" PRIu64 "  t %d \n",
+							lvol->blob_id, offset, bdev_io->u.bdev.num_blocks, bdev_io->type);
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		return;
+	}
+
+	struct spdk_lvol *org_lvol = lvs->lvol_map.lvol[id];
+	offset = ADJUST_OFFSET(offset);
+
+	if (org_lvol == NULL) {
+		SPDK_ERRLOG("FAILED - orglvol is none - blob map id: %" PRIu16 "  "
+								"Lba: %" PRIu64 "  Cnt %" PRIu64 "  t %d \n",
+								id, offset, bdev_io->u.bdev.num_blocks, bdev_io->type);
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		return;
+	}
+
+	if (!lvs->leader) {
+		SPDK_ERRLOG("FAILED - receive io for hublvol in nonleader mode  - blob map id: %" PRIu16 "  "
+										"Lba: %" PRIu64 "  Cnt %" PRIu64 "  t %d \n",
+										id, offset, bdev_io->u.bdev.num_blocks, bdev_io->type);
+		if (spdk_lvs_nonleader_timeout(lvs)) {
+			if (io_type) {
+				SPDK_NOTICELOG("FAILED IO-TO change leader - blob: %" PRIu64 "  "
+								"Lba: %" PRIu64 "  Cnt %" PRIu64 "  t %d \n",
+								org_lvol->blob_id, bdev_io->u.bdev.offset_blocks,
+								bdev_io->u.bdev.num_blocks, bdev_io->type);
+			}
+			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+			return;
+		}
+
+		if (!lvs->update_in_progress) {			
+			if (io_type) {
+				spdk_lvs_check_active_process(lvs, org_lvol, (uint8_t)bdev_io->type);
+			}
+		}
+	}
+
+	if (!org_lvol->leader && !org_lvol->update_in_progress) {
+		if (io_type) {
+			spdk_lvol_update_on_failover(lvs, org_lvol, true);
+		}
+	}
+
+	switch (bdev_io->type) {
+	case SPDK_BDEV_IO_TYPE_READ:
+		spdk_bdev_io_get_buf(bdev_io, hublvol_get_buf_cb,
+				     bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen);
+		break;
+	case SPDK_BDEV_IO_TYPE_WRITE:
+		if (lvs->read_only) {
+			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+			return;
+		}
+		hublvol_write(org_lvol, ch, bdev_io);
+		break;
+	case SPDK_BDEV_IO_TYPE_UNMAP:
+		hublvol_unmap(org_lvol, ch, bdev_io);
+		break;
+	case SPDK_BDEV_IO_TYPE_WRITE_ZEROES:
+		if (lvs->read_only) {
+			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+			return;
+		}
+		hublvol_write_zeroes(org_lvol, ch, bdev_io);
+		break;
+	default:
+		SPDK_ERRLOG("lvol: unsupported I/O type %d\n", bdev_io->type);
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		return;
+	}
+	return;
+}
+
+static void
+vbdev_lvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
+{
+	struct spdk_lvol *lvol = bdev_io->bdev->ctxt;
+	struct spdk_lvol_store *lvs = lvol->lvol_store;
+	bool io_type = check_IO_type(bdev_io->type);
+
+	if (lvs->secondary && (!lvs->leader && !lvs->update_in_progress) && !lvs->skip_redirecting ) {
+		if (io_type) {
+			vbdev_redirect_request_to_hublvol(lvol, ch, bdev_io);
+			return;
+		}		
+	}
+
+	if (lvs->primary && lvol->hublvol) {
+		// if (lvs->leader) {
+		vbdev_hublvol_submit_request(ch, bdev_io);
+		return;
+		// }
+		// SPDK_ERRLOG("hublvol on primary nonleader state: should not receive I/O %" PRIu64 " type %d\n", 
+		// 		bdev_io->u.bdev.offset_blocks, bdev_io->type);
+		// spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		// return;
+	}
+
+	// SPDK_NOTICELOG("IO - blob: %" PRIu64 "  "
+	// 							"Lba: %" PRIu64 "  Cnt %" PRIu64 "  t %d \n",
+	// 							lvol->blob_id, bdev_io->u.bdev.offset_blocks,
+	// 							bdev_io->u.bdev.num_blocks, bdev_io->type);
+
 	if (!lvs->leader) {
 		if (spdk_lvs_nonleader_timeout(lvs)) {
-			if (check_IO_type(bdev_io->type)) {
+			if (io_type) {
 				SPDK_NOTICELOG("FAILED IO-TO change leader - blob: %" PRIu64 "  "
 								"Lba: %" PRIu64 "  Cnt %" PRIu64 "  t %d \n",
 								lvol->blob_id, bdev_io->u.bdev.offset_blocks,
@@ -1300,20 +1783,20 @@ vbdev_lvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_
 		}
 
 		if (!lvs->update_in_progress) {			
-			if (check_IO_type(bdev_io->type)) {
+			if (io_type) {
 				spdk_lvs_check_active_process(lvs, lvol, (uint8_t)bdev_io->type);
 			}
 		}
 	}
 
 	if (!lvol->leader && !lvol->update_in_progress) {
-		if (check_IO_type(bdev_io->type)) {
+		if (io_type) {
 			spdk_lvol_update_on_failover(lvs, lvol, true);
 		}
 	}
 
 	if (lvol->failed_on_update || lvs->failed_on_update) {
-		if (check_IO_type(bdev_io->type)) {
+		if (io_type) {
 			SPDK_NOTICELOG("FAILED IO - update failed blob: %" PRIu64 "  Lba: %" PRIu64 "  Cnt %" PRIu64 "  t %d \n",
 		 				lvol->blob_id, bdev_io->u.bdev.offset_blocks, bdev_io->u.bdev.num_blocks, bdev_io->type);
 		}
@@ -1327,6 +1810,10 @@ vbdev_lvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_
 				     bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen);
 		break;
 	case SPDK_BDEV_IO_TYPE_WRITE:
+		if (lvs->read_only) {
+			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+			return;
+		}
 		lvol_write(lvol, ch, bdev_io);
 		break;
 	case SPDK_BDEV_IO_TYPE_RESET:
@@ -1336,6 +1823,10 @@ vbdev_lvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_
 		lvol_unmap(lvol, ch, bdev_io);
 		break;
 	case SPDK_BDEV_IO_TYPE_WRITE_ZEROES:
+		if (lvs->read_only) {
+			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+			return;
+		}
 		lvol_write_zeroes(lvol, ch, bdev_io);
 		break;
 	case SPDK_BDEV_IO_TYPE_SEEK_DATA:
@@ -1505,10 +1996,14 @@ _create_lvol_disk(struct spdk_lvol *lvol, bool destroy)
 	bdev->name = lvol->unique_id;
 	bdev->product_name = "Logical Volume";
 	bdev->blocklen = spdk_bs_get_io_unit_size(lvol->lvol_store->blobstore);
-	total_size = spdk_blob_get_num_clusters(lvol->blob) *
-		     spdk_bs_get_cluster_size(lvol->lvol_store->blobstore);
-	assert((total_size % bdev->blocklen) == 0);
-	bdev->blockcnt = total_size / bdev->blocklen;
+	if (!lvol->hublvol) {
+		total_size = spdk_blob_get_num_clusters(lvol->blob) *
+				spdk_bs_get_cluster_size(lvol->lvol_store->blobstore);
+		assert((total_size % bdev->blocklen) == 0);
+		bdev->blockcnt = total_size / bdev->blocklen;
+	} else {
+		bdev->blockcnt = UINT64_MAX;
+	}
 	bdev->uuid = lvol->uuid;
 	bdev->required_alignment = lvs_bdev->bdev->required_alignment;
 	bdev->split_on_optimal_io_boundary = true;
@@ -1645,6 +2140,54 @@ vbdev_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz,
 	}
 
 	return rc;
+}
+
+int
+vbdev_lvol_create_hublvol(struct spdk_lvol_store *lvs, spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg)
+{
+	struct spdk_lvol_with_handle_req *req;
+	int rc;
+
+	req = calloc(1, sizeof(*req));
+	if (req == NULL) {
+		return -ENOMEM;
+	}
+	req->lvol_priority_class = 0;
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+
+	rc = spdk_lvol_create_hublvol(lvs, _vbdev_lvol_create_cb, req);
+	if (rc != 0) {
+		free(req);
+	}
+
+	return rc;
+}
+
+void
+vbdev_lvol_delete_hublvol(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg)
+{
+	struct lvol_store_bdev *lvs_bdev;	
+
+	if (lvol->action_in_progress == true) {
+		cb_fn(cb_arg, -EPERM);
+		return;
+	}
+
+	/*
+	 * During destruction of an lvolstore, _vbdev_lvs_unload() iterates through lvols until they
+	 * are all deleted. There may be some IO required
+	 */
+
+	lvs_bdev = vbdev_get_lvs_bdev_by_lvs(lvol->lvol_store);
+	if (lvs_bdev == NULL) {
+		SPDK_DEBUGLOG(vbdev_lvol, "lvol %s: lvolstore is being removed\n",
+			      lvol->unique_id);
+		cb_fn(cb_arg, -ENODEV);
+		return;
+	}
+
+	_vbdev_lvol_destroy(lvol, cb_fn, cb_arg, true);
 }
 
 int

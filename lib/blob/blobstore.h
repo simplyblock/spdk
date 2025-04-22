@@ -136,6 +136,7 @@ struct spdk_blob {
 	uint32_t	open_ref;
 
 	spdk_blob_id	id;
+	uint16_t	map_id;
 	spdk_blob_id	parent_id;
 
 	enum spdk_blob_state		state;
@@ -244,6 +245,8 @@ struct spdk_blob_store {
 	struct spdk_bit_pool		*used_clusters;		/* Protected by used_lock */
 	struct spdk_bit_array		*used_blobids;
 	struct spdk_bit_array		*open_blobids;
+	struct spdk_bit_array		*map_blobids;
+	uint32_t 	blob_counter;
 
 	struct spdk_spinlock		used_lock;
 
@@ -269,6 +272,15 @@ struct spdk_blob_store {
 	 * Only when the distrib internal force state changes, it will be set to false.
 	 */
 	bool				is_leader;
+	bool				read_only;
+	bool 				stop;
+	uint64_t			total;
+	uint64_t			total_r;
+	uint64_t			total_w;
+	uint64_t			r_io;
+	uint64_t			w_io;
+	struct spdk_poller		*poller;
+
 
 	spdk_bs_esnap_dev_create	esnap_bs_dev_create;
 	void				*esnap_ctx;
@@ -285,17 +297,24 @@ struct spdk_blob_store {
 struct spdk_bs_channel {
 	struct spdk_bs_request_set	*req_mem;
 	TAILQ_HEAD(, spdk_bs_request_set) reqs;
+	struct spdk_bs_redirect_request *redirect_reqs;
+	TAILQ_HEAD(, spdk_bs_redirect_request) rd_reqs;
 
 	struct spdk_blob_store		*bs;
-
 	struct spdk_bs_dev		*dev;
 	struct spdk_io_channel		*dev_channel;
+
+	struct spdk_io_channel		*redirect_ch;
+	// struct spdk_bdev_desc	*redirect_desc;
+	void *redirect_desc;
+	bool	set_redirect_ch;
 
 	/* This page is only used during insert of a new cluster. */
 	struct spdk_blob_md_page	*new_cluster_page;
 
 	TAILQ_HEAD(, spdk_bs_request_set) need_cluster_alloc;
 	TAILQ_HEAD(, spdk_bs_request_set) queued_io;
+	TAILQ_HEAD(, spdk_bs_redirect_request) redirect_queued;
 
 	RB_HEAD(blob_esnap_channel_tree, blob_esnap_channel) esnap_channels;
 };
@@ -472,6 +491,7 @@ struct spdk_bit_page {
 };
 
 #define SPDK_BS_PAGE_SIZE 0x1000
+#define SPDK_BS_MAX_BLOB_COUNT 	65535
 #define SPDK_BS_PAGE_SIZE_INBIT  (SPDK_BS_PAGE_SIZE * 8)
 #define SPDK_BS_MD_STRUCT_INBIT  (sizeof(struct spdk_bs_md_mask) * 8)
 SPDK_STATIC_ASSERT(SPDK_BS_PAGE_SIZE == sizeof(struct spdk_blob_md_page), "Invalid md page size");

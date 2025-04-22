@@ -14,6 +14,7 @@
 #include "spdk/stdinc.h"
 #include "spdk/blob.h"
 #include "spdk/uuid.h"
+#include "spdk/bdev_module.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -201,6 +202,9 @@ int spdk_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz,
 		     bool thin_provisioned, enum lvol_clear_method clear_method,
 		     spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
 
+int spdk_lvol_create_hublvol(struct spdk_lvol_store *lvs, spdk_lvol_op_with_handle_complete cb_fn,
+ 				void *cb_arg);
+
 /**
  * Recover a backed up (via storage tiering) lvol on a given lvolstore, which may not be overall backed up.
  * Must pass in the original user lvol name, lvol uuid (the original lvol bdev name), and any (not necessarily the original) 
@@ -325,7 +329,12 @@ void spdk_lvs_check_active_process(struct spdk_lvol_store *lvs, struct spdk_lvol
 bool spdk_lvs_nonleader_timeout(struct spdk_lvol_store *lvs);
 void spdk_lvs_change_leader_state(uint64_t groupid);
 bool spdk_lvs_trigger_leadership_switch(uint64_t *groupid);
-void spdk_lvs_set_op(struct spdk_lvol_store *lvs, uint64_t groupid, uint64_t port);
+bool spdk_lvs_queued_rsp(struct spdk_lvol_store *lvs, struct spdk_bdev_io *bdev_io);
+void spdk_lvs_set_opts(struct spdk_lvol_store *lvs, uint64_t groupid, uint64_t port, 
+						bool primary, bool secondary);
+void spdk_lvs_open_hub_bdev(void * cb_arg);
+void spdk_lvs_connect_hublvol(struct spdk_lvol_store *lvs, const char *remote_bdev);
+void spdk_lvs_set_read_only(struct spdk_lvol_store *lvs, bool status);
 void spdk_lvs_set_failed_on_update(struct spdk_lvol_store *lvs, bool state);
 /**
  * Get the lvol that has a particular UUID.
@@ -415,7 +424,7 @@ void spdk_lvs_grow(struct spdk_bs_dev *bs_dev, spdk_lvs_op_with_handle_complete 
  */
 void spdk_lvs_grow_live(struct spdk_lvol_store *lvs, spdk_lvs_op_complete cb_fn, void *cb_arg);
 
-void spdk_lvs_update_live(struct spdk_lvol_store *lvs, spdk_lvs_op_complete cb_fn, void *cb_arg);
+void spdk_lvs_update_live(struct spdk_lvol_store *lvs, uint64_t id, spdk_lvs_op_complete cb_fn, void *cb_arg);
 
 /**
  * Open a lvol.

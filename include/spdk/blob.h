@@ -53,6 +53,14 @@ enum blob_clear_method {
 	BLOB_CLEAR_WITH_WRITE_ZEROES,
 };
 
+enum hublvol_state {
+	HUBLVOL_NOT_CONNECTED,
+	HUBLVOL_CONNECTING_IN_PROCCESS,
+	HUBLVOL_CONNECTED,
+	HUBLVOL_CONNECTED_FAILED,
+	HUBLVOL_DISCONNECTED,
+};
+
 enum bs_clear_method {
 	BS_CLEAR_WITH_UNMAP,
 	BS_CLEAR_WITH_WRITE_ZEROES,
@@ -150,6 +158,9 @@ typedef void (*spdk_blob_op_with_bs_dev)(void *cb_arg, struct spdk_bs_dev *bs_de
 typedef int (*spdk_bs_esnap_dev_create)(void *bs_ctx, void *blob_ctx, struct spdk_blob *blob,
 					const void *esnap_id, uint32_t id_size,
 					struct spdk_bs_dev **bs_dev);
+
+typedef void (*spdk_drain_op_submit_handle)(void *cb, void *bdev_io);
+typedef void (*spdk_drain_op_cpl)(void *cb_arg, int bserrno);
 
 /**
  * Blob shallow copy status callback.
@@ -368,7 +379,7 @@ void spdk_bs_grow_live(struct spdk_blob_store *bs,
  * \param cb_fn Called when the updating is complete.
  * \param cb_arg Argument passed to function cb_fn.
  */
-void spdk_bs_update_live(struct spdk_blob_store *bs, bool failover,
+void spdk_bs_update_live(struct spdk_blob_store *bs, bool failover, uint64_t id,
 		       spdk_bs_op_complete cb_fn, void *cb_arg);
 
 void spdk_blob_failover_unfreaze(struct spdk_blob *blob, 
@@ -386,6 +397,7 @@ void spdk_blob_update_failed_cleanup(struct spdk_blob *blob,
 				 spdk_blob_op_complete cb_fn, void *cb_arg);
 
 void spdk_bs_set_leader(struct spdk_blob_store *bs, bool state);
+void spdk_bs_set_read_only(struct spdk_blob_store *bs, bool state);
 /**
  * update a blobstore according to bit array synced.
  * Can be used on loaded blobstore, even with opened blobs.
@@ -400,9 +412,13 @@ spdk_bs_update_on_failover(struct spdk_blob_store *bs,
 
 void spdk_blob_update_on_failover(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
 
-void
-spdk_blob_update_on_failover_send_msg(struct spdk_blob *blob,
+void spdk_blob_update_on_failover_send_msg(struct spdk_blob *blob,
 				spdk_blob_op_complete cb_fn, void *cb_arg);
+
+int spdk_blob_freeze_on_conflict_send_msg(struct spdk_blob_store *bs,
+		  spdk_blob_op_complete cb_fn, void *cb_arg);
+
+void spdk_lvs_unfreeze_on_conflict_msg(struct spdk_blob_store *bs);
 /**
  * Initialize a blobstore on the given device.
  *
@@ -537,6 +553,15 @@ uint64_t spdk_bs_total_data_cluster_count(struct spdk_blob_store *bs);
 spdk_blob_id spdk_blob_get_id(struct spdk_blob *blob);
 
 uint8_t spdk_blob_get_tiering_info(struct spdk_blob *blob);
+
+/**
+ * Get the blob map id.
+ *
+ * \param blob Blob struct to query.
+ *
+ * \return map id.
+ */
+uint16_t spdk_blob_get_map_id(struct spdk_blob *blob);
 
 /**
  * Get the blob open ref.
@@ -997,6 +1022,9 @@ void spdk_bs_open_blob_on_failover(struct spdk_blob_store *bs, spdk_blob_id blob
 void spdk_bs_open_blob_ext(struct spdk_blob_store *bs, spdk_blob_id blobid,
 			   struct spdk_blob_open_opts *opts, spdk_blob_op_with_handle_complete cb_fn, void *cb_arg);
 
+void spdk_bs_create_hubblob(struct spdk_blob_store *bs, const struct spdk_blob_opts *opts,
+	       spdk_blob_op_with_handle_complete cb_fn, void *cb_arg);
+
 void spdk_bs_open_blob_without_reference(struct spdk_blob_store *bs, spdk_blob_id blobid,
 				struct spdk_blob_open_opts *opts, spdk_blob_op_with_handle_complete cb_fn, void *cb_arg);
 
@@ -1068,6 +1096,22 @@ struct spdk_io_channel *spdk_bs_alloc_io_channel(struct spdk_blob_store *bs);
  * \param channel I/O channel to free.
  */
 void spdk_bs_free_io_channel(struct spdk_io_channel *channel);
+
+struct spdk_io_channel	*
+spdk_bs_get_hub_channel(struct spdk_io_channel *ch);
+bool
+spdk_bs_set_hub_channel(struct spdk_io_channel *ch, struct spdk_io_channel *hub_ch, void *desc);
+void
+spdk_bs_clear_hub_channel(struct spdk_io_channel *ch);
+struct spdk_bs_redirect_request *
+spdk_bs_queued_red_io(struct spdk_io_channel *ch, void *bdev_io);
+void
+spdk_bs_dequeued_red_io(struct spdk_io_channel *ch, void *bdev_io);
+
+void
+spdk_bs_drain_channel_queued(struct spdk_blob_store *bs, spdk_drain_op_submit_handle submit_cb,
+						 spdk_drain_op_cpl cb_fn, void *cb_arg);
+
 
 /**
  * Write data to a blob.

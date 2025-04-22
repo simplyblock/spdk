@@ -4057,6 +4057,7 @@ uint32_t spdk_nvme_qpair_get_num_outstanding_reqs(struct spdk_nvme_qpair *qpair)
  * \param cmd Pointer to the submission queue command to be formatted.
  */
 void spdk_nvme_print_command(uint16_t qid, struct spdk_nvme_cmd *cmd);
+void spdk_nvme_print_command_s(uint16_t qid, struct spdk_nvme_cmd *cmd);
 
 /**
  * \brief Prints (SPDK_NOTICELOG) the contents of an NVMe completion queue entry.

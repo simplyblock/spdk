@@ -319,6 +319,7 @@ nvmf_auth_negotiate_exec(struct spdk_nvmf_request *req, struct spdk_nvmf_auth_ne
 	}
 
 	if (nvmf_auth_rearm_poller(qpair)) {
+		SPDK_ERRLOG("Unable to auth rearm poller 4 .\n");
 		nvmf_auth_request_complete(req, SPDK_NVME_SCT_GENERIC,
 					   SPDK_NVME_SC_INTERNAL_DEVICE_ERROR, 1);
 		nvmf_auth_disconnect_qpair(qpair);
@@ -448,6 +449,7 @@ nvmf_auth_reply_exec(struct spdk_nvmf_request *req, struct spdk_nvmf_dhchap_repl
 	}
 
 	if (nvmf_auth_rearm_poller(qpair)) {
+		SPDK_ERRLOG("Unable to auth rearm poller 3 .\n");
 		nvmf_auth_request_complete(req, SPDK_NVME_SCT_GENERIC,
 					   SPDK_NVME_SC_INTERNAL_DEVICE_ERROR, 1);
 		nvmf_auth_disconnect_qpair(qpair);
@@ -678,6 +680,7 @@ nvmf_auth_recv_challenge(struct spdk_nvmf_request *req)
 		return SPDK_NVMF_AUTH_FAILED;
 	}
 	if (nvmf_auth_rearm_poller(qpair)) {
+		SPDK_ERRLOG("Unable to auth rearm poller 2 .\n");
 		nvmf_auth_request_complete(req, SPDK_NVME_SCT_GENERIC,
 					   SPDK_NVME_SC_INTERNAL_DEVICE_ERROR, 1);
 		nvmf_auth_disconnect_qpair(qpair);
@@ -731,6 +734,7 @@ nvmf_auth_recv_success1(struct spdk_nvmf_request *req)
 		nvmf_auth_qpair_cleanup(auth);
 	} else {
 		if (nvmf_auth_rearm_poller(qpair)) {
+			SPDK_ERRLOG("Unable to auth rearm poller 1.\n");
 			nvmf_auth_request_complete(req, SPDK_NVME_SCT_GENERIC,
 						   SPDK_NVME_SC_INTERNAL_DEVICE_ERROR, 1);
 			nvmf_auth_disconnect_qpair(qpair);
