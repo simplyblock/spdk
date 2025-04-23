@@ -668,6 +668,58 @@ void spdk_bdev_set_qos_rate_limits(struct spdk_bdev *bdev, uint64_t *limits,
 				   void (*cb_fn)(void *cb_arg, int status), void *cb_arg);
 
 /**
+ * Set the quality of service rate limits on all the bdev. Used when setting the limits on poll level.
+ *
+ * \param bdev Block device.
+ * \param limits Pointer to the QoS rate limits array which holding the limits.
+ * \param qos_pool_id_object Pointer to the pool node.
+ * \param qos_bdev_node Pointer to the bdev in the pool for which setting the limits.
+ * \param bdev_node_cout Total number of bdevs in the pool.
+ * \param total_bdev_to_process Total number of bdevs to process in the pool.
+ * \param is_remove_bdev_request Set when the request is to remove the bdev from pool.
+ * \param **remove_bdev_list List of bdevs to remove from the pool.
+ * \param cb_fn Callback function to be called when the QoS limit has been updated.
+ * \param cb_arg Argument to pass to cb_fn.
+ *
+ * The limits are ordered based on the @ref spdk_bdev_qos_rate_limit_type enum.
+ */
+void
+spdk_bdev_set_qos_rate_limits_ex(struct spdk_bdev *bdev, uint64_t *limits, uint64_t bdev_pool_id,
+					void * qos_pool_id_object, void * qos_bdev_node, uint64_t bdev_node_cout,
+					uint64_t total_bdev_to_process, bool is_remove_bdev_request, char **remove_bdev_list,
+			    	void (*cb_fn)(void *cb_arg, int status), void *cb_arg);
+
+/**
+ * Set the quality of service rate limits on a bdev.
+ *
+ * \param bdev_pool_id Group ID
+ * \param limits Pointer to the QoS rate limits array which holding the limits.
+ * \param cb_fn Callback function to be called when the QoS limit has been updated.
+ * \param cb_arg Argument to pass to cb_fn.
+ *
+ * The limits are ordered based on the @ref spdk_bdev_qos_rate_limit_type enum.
+ */
+void
+spdk_bdev_set_qos_rate_limits_to_group(uint64_t bdev_pool_id, uint64_t *limits, 
+					void (*cb_fn)(void *cb_arg, int status), void *cb_arg);
+
+/**
+ * Set the quality of service rate limits on a bdev.
+ *
+ * \param bdev_pool_id Group ID
+ * \param num_bdevs Number of bdev to add/remove to/from the group.
+ * \param **names Names of the bdev to add/remove to/from the group.
+ * \param is_remove_bdev_request True of the request is to remove the bdevd from the group.
+ * \param cb_fn Callback function to be called when the QoS limit has been updated.
+ * \param cb_arg Argument to pass to cb_fn.
+ *
+ * The limits are ordered based on the @ref spdk_bdev_qos_rate_limit_type enum.
+ */
+void
+spdk_bdev_add_remove_bdev_to_pool(uint64_t bdev_pool_id, uint64_t num_bdevs, char	**names, 
+					bool is_remove_bdev_request, void (*cb_fn)(void *cb_arg, int status), void *cb_arg);
+
+/**
  * Get minimum I/O buffer address alignment for a bdev.
  *
  * \param bdev Block device to query.
