@@ -189,8 +189,7 @@ struct spdk_bdev_qos_limit {
 
 struct spdk_bdev_qos {
 	/** Types of structure of rate limits. */
-	//struct spdk_bdev_qos_limit rate_limits[SPDK_BDEV_QOS_NUM_RATE_LIMIT_TYPES];
-	struct spdk_bdev_qos_limit *rate_limits;
+	struct spdk_bdev_qos_limit rate_limits[SPDK_BDEV_QOS_NUM_RATE_LIMIT_TYPES];
 
 	/** The channel that all I/O are funneled through. */
 	struct spdk_bdev_channel *ch;
@@ -206,30 +205,7 @@ struct spdk_bdev_qos {
 
 	/** Poller that processes queued I/O commands each time slice. */
 	struct spdk_poller *poller;
-
-	/** Refrence count for the qos object. Used incase of appling the limit on group of bdevs. */
-	uint32_t ref_count;
 };
-
-struct qos_bdev_list_node {
-	struct spdk_bdev *bdev;
-	char 	*bdev_name;
-	TAILQ_ENTRY(qos_bdev_list_node)	link;
-};
-
-struct spdk_bdev_qos_pool_id_mapping {
-	uint64_t bdev_pool_id;
-	TAILQ_HEAD(, qos_bdev_list_node) bdev_list;
-	uint64_t bdev_list_size;
-	// rate_limits is common to multiple bdev. Can we accessed by multiple threads. So we need to protect it.
-	struct spdk_bdev_qos_limit *rate_limits;
-	// Stores the actual limits set by rpc.
-	uint64_t	limits[SPDK_BDEV_QOS_NUM_RATE_LIMIT_TYPES];
-	TAILQ_ENTRY(spdk_bdev_qos_pool_id_mapping)	link;
-};
-
-static TAILQ_HEAD(, spdk_bdev_qos_pool_id_mapping) g_qos_bdev_group_list = TAILQ_HEAD_INITIALIZER(g_qos_bdev_group_list);
-uint32_t g_qos_limit_update_pending_count = 0;
 
 struct spdk_bdev_mgmt_channel {
 	/*
@@ -392,14 +368,6 @@ struct set_qos_limit_ctx {
 	void (*cb_fn)(void *cb_arg, int status);
 	void *cb_arg;
 	struct spdk_bdev *bdev;
-	struct spdk_bdev_qos_pool_id_mapping *qos_pool_id_object;
-	struct qos_bdev_list_node *qos_bdev_node;
-	uint64_t	bdev_node_cout;
-	uint64_t	total_bdev_to_process;
-	uint64_t	bdev_pool_id;
-	bool		internal_request;
-	bool		is_remove_requets;
-	char		*remove_bdev_names[255];
 };
 
 struct spdk_bdev_channel_iter {
@@ -469,17 +437,6 @@ static void bdev_desc_release_claims(struct spdk_bdev_desc *desc);
 static void claim_reset(struct spdk_bdev *bdev);
 
 static void bdev_ch_retry_io(struct spdk_bdev_channel *bdev_ch);
-
-static void remove_bdev_from_group(char *bdev_names);
-static void delete_rate_limit(char *bdev_names, struct spdk_bdev_qos *qos);
-static bool is_bdev_exist_in_pool(char *bdev_names);
-static struct qos_bdev_list_node * find_existing_bdev(struct spdk_bdev_qos_pool_id_mapping *qos_pool_id_object, char *bdev_names);
-static int check_bdev_names_in_group(struct spdk_bdev_qos_pool_id_mapping *qos_pool_id_object, size_t num_lvols,char **bdev_names);
-static int check_bdev_name_in_group(struct spdk_bdev_qos_pool_id_mapping *qos_pool_id_object, char *bdev_names);
-static int check_bdev_exists(struct spdk_bdev_qos_pool_id_mapping *qos_pool_id_object, uint64_t num_bdevs, char   **bdev_names);
-static int add_bdev_list(struct spdk_bdev_qos_pool_id_mapping *qos_pool_id_object, uint64_t num_bdevs, char   **bdev_names);
-static struct spdk_bdev_qos_pool_id_mapping * create_qos_object_for_group(uint64_t bdev_pool_id);
-static struct spdk_bdev_qos_pool_id_mapping * get_qos_already_available_for_group(uint64_t bdev_pool_id);
 
 #define bdev_get_ext_io_opt(opts, field, defval) \
 	((opts) != NULL ? SPDK_GET_FIELD(opts, field, defval) : (defval))
@@ -3927,6 +3884,7 @@ bdev_enable_qos(struct spdk_bdev *bdev, struct spdk_bdev_channel *ch)
 			io_ch = spdk_get_io_channel(__bdev_to_io_dev(bdev));
 			assert(io_ch != NULL);
 			qos->ch = ch;
+
 			qos->thread = spdk_io_channel_get_thread(io_ch);
 
 			for (i = 0; i < SPDK_BDEV_QOS_NUM_RATE_LIMIT_TYPES; i++) {
@@ -4333,8 +4291,8 @@ bdev_qos_channel_destroy(void *cb_arg)
 	spdk_poller_unregister(&qos->poller);
 
 	SPDK_DEBUGLOG(bdev, "Free QoS %p.\n", qos);
+
 	free(qos);
-	qos = NULL;
 }
 
 static int
@@ -4364,6 +4322,7 @@ bdev_qos_destroy(struct spdk_bdev *bdev)
 
 	/* Copy the old QoS data into the newly allocated structure */
 	memcpy(new_qos, old_qos, sizeof(*new_qos));
+
 	/* Zero out the key parts of the QoS structure */
 	new_qos->ch = NULL;
 	new_qos->thread = NULL;
@@ -4381,10 +4340,7 @@ bdev_qos_destroy(struct spdk_bdev *bdev)
 	bdev->internal.qos = new_qos;
 
 	if (old_qos->thread == NULL) {
-		delete_rate_limit(bdev->name, old_qos);
-		remove_bdev_from_group(bdev->name);
 		free(old_qos);
-		old_qos = NULL;
 	} else {
 		spdk_thread_send_msg(old_qos->thread, bdev_qos_channel_destroy, old_qos);
 	}
@@ -7818,10 +7774,7 @@ bdev_destroy_cb(void *io_device)
 	cb_arg = bdev->internal.unregister_ctx;
 
 	spdk_spin_destroy(&bdev->internal.spinlock);
-	delete_rate_limit(bdev->name, bdev->internal.qos);
-	remove_bdev_from_group(bdev->name);
 	free(bdev->internal.qos);
-	bdev->internal.qos = NULL;
 	bdev_free_io_stat(bdev->internal.stat);
 	spdk_trace_unregister_owner(bdev->internal.trace_id);
 
@@ -9179,314 +9132,17 @@ bdev_write_zero_buffer_done(struct spdk_bdev_io *bdev_io, bool success, void *cb
 	parent_io->internal.cb(parent_io, success, parent_io->internal.caller_ctx);
 }
 
-static bool is_bdev_exist_in_pool(char *bdev_names) {
-	struct spdk_bdev_qos_pool_id_mapping *qos_pool_id_object = NULL;
-	struct qos_bdev_list_node *bdev_node = NULL;
-
-	TAILQ_FOREACH(qos_pool_id_object, &g_qos_bdev_group_list, link) {
-		TAILQ_FOREACH(bdev_node, &qos_pool_id_object->bdev_list, link) {
-			if (strcmp(bdev_node->bdev_name, bdev_names) == 0) {
-				return true;
-			}
-		}
-	}
-	return false;
-}
-
-static void delete_rate_limit(char *bdev_names, struct spdk_bdev_qos *qos) {
-
-	struct spdk_bdev_qos_pool_id_mapping *qos_pool_id_object = NULL;
-	struct qos_bdev_list_node *bdev_node = NULL;
-
-	TAILQ_FOREACH(qos_pool_id_object, &g_qos_bdev_group_list, link) {
-		TAILQ_FOREACH(bdev_node, &qos_pool_id_object->bdev_list, link) {
-        	if (strcmp(bdev_node->bdev_name, bdev_names) == 0) {
-            	return;
-        	}
-    	}
-	}
-	if(qos) {
-		if(qos->rate_limits != NULL) {
-			free(qos->rate_limits);
-			qos->rate_limits = NULL;
-		}
-	}
-	
-	return;
-}
-
-
-static void remove_bdev_from_group(char *bdev_names) {
-
-	struct spdk_bdev_qos_pool_id_mapping *qos_pool_id_object = NULL;
-	struct qos_bdev_list_node *bdev_node = NULL;
-
-	if (TAILQ_EMPTY(&g_qos_bdev_group_list)) {
-            return ;
-    }
-	TAILQ_FOREACH(qos_pool_id_object, &g_qos_bdev_group_list, link) {
-		TAILQ_FOREACH(bdev_node, &qos_pool_id_object->bdev_list, link) {
-        	if (strcmp(bdev_node->bdev_name, bdev_names) == 0) {
-				SPDK_NOTICELOG("Removing the bdev from list: %s vs %s\n", bdev_node->bdev_name, bdev_names);
-				TAILQ_REMOVE(&qos_pool_id_object->bdev_list, bdev_node, link);
-				if(bdev_node->bdev_name) {
-					free(bdev_node->bdev_name);
-					bdev_node->bdev_name = NULL;
-				}
-				if(bdev_node) {
-					free(bdev_node);
-					bdev_node = NULL;
-				}
-				--qos_pool_id_object->bdev_list_size;
-
-				if(qos_pool_id_object->bdev_list_size == 0) {
-					SPDK_NOTICELOG("Cleaning the group mapping for group %"PRIu64"\n",qos_pool_id_object->bdev_pool_id);
-					if(qos_pool_id_object->rate_limits != NULL) {
-						SPDK_NOTICELOG("Cleaning the rate limit\n");
-						free(qos_pool_id_object->rate_limits);
-						qos_pool_id_object->rate_limits = NULL;
-					}
-					TAILQ_REMOVE(&g_qos_bdev_group_list, qos_pool_id_object, link);
-					if(qos_pool_id_object) {
-						free(qos_pool_id_object);
-						qos_pool_id_object = NULL;
-					}
-				}
-            	return;
-        	}
-    	}
-	}
-	return;
-}
-
-static struct qos_bdev_list_node * find_existing_bdev(struct spdk_bdev_qos_pool_id_mapping *qos_pool_id_object, char *bdev_names) {
-	struct qos_bdev_list_node *bdev_node = NULL;
-	if(qos_pool_id_object == NULL || bdev_names == NULL){
-		return NULL;
-	}
-
-	TAILQ_FOREACH(bdev_node, &qos_pool_id_object->bdev_list, link) {
-        if (strcmp(bdev_node->bdev_name, bdev_names) == 0) {
-            /* Found a matching bdev name in existing list */
-            return bdev_node;
-        }
-    }
-	return bdev_node;
-}
-
-
-static int check_bdev_names_in_group(struct spdk_bdev_qos_pool_id_mapping *qos_pool_id_object, 
-								size_t num_lvols,
-                               char **bdev_names)
-{
-    struct qos_bdev_list_node *bdev_node;
-    size_t i, found_count = 0;
-
-    if (qos_pool_id_object == NULL || bdev_names == NULL || num_lvols == 0) {
-        return -1;
-    }
-
-    for (i = 0; i < num_lvols; i++) {
-        TAILQ_FOREACH(bdev_node, &qos_pool_id_object->bdev_list, link) {
-            if (strcmp(bdev_node->bdev_name, bdev_names[i]) == 0) {
-                found_count++;
-                break;
-            }
-        }
-    }
-    return (found_count == num_lvols) ? 0 : -1;
-}
-
-static int check_bdev_name_in_group(struct spdk_bdev_qos_pool_id_mapping *qos_pool_id_object, 
-                               char *bdev_names)
-{
-    struct qos_bdev_list_node *bdev_node = NULL;
-    size_t found_count = 0;
-
-    if (qos_pool_id_object == NULL || bdev_names == NULL) {
-        return -1;
-    }
-        TAILQ_FOREACH(bdev_node, &qos_pool_id_object->bdev_list, link) {
-            if (strcmp(bdev_node->bdev_name, bdev_names) == 0) {
-                found_count++;
-                break;
-            }
-    }
-
-    return found_count;
-}
-
-static int check_bdev_exists(struct spdk_bdev_qos_pool_id_mapping *qos_pool_id_object, uint64_t num_bdevs, char	**bdev_names) {
-
-	struct qos_bdev_list_node *bdev_node = NULL;
-	if(qos_pool_id_object == NULL || bdev_names == NULL){
-		return -1;
-	}
-    /* First check if any of the new bdev names already exist in the list */
-    TAILQ_FOREACH(bdev_node, &qos_pool_id_object->bdev_list, link) {
-        for (uint64_t i = 0; i < num_bdevs; i++) {
-            if (strcmp(bdev_node->bdev_name, bdev_names[i]) == 0) {
-                /* Found a duplicate name in existing list */
-                return -1;
-            }
-        }
-    }
-
-	/* Now check for duplicates within the new bdev names array */
-    for (uint64_t i = 0; i < num_bdevs - 1; i++) {
-        for (uint64_t j = i + 1; j < num_bdevs; j++) {
-            if (strcmp(bdev_names[i], bdev_names[j]) == 0) {
-                /* Found a duplicate name in new names */
-                return -1;
-            }
-        }
-    }
-
-	return 0;
-}
-
-static int add_bdev_list(struct spdk_bdev_qos_pool_id_mapping *qos_pool_id_object, uint64_t num_bdevs, char	**bdev_names) {
-
-	struct qos_bdev_list_node *bdev_node = NULL;
-	if(qos_pool_id_object == NULL || bdev_names == NULL) {
-		return -1;
-	}
-	for (uint64_t i = 0; i < num_bdevs ; i++) {
-		bdev_node = (struct qos_bdev_list_node *)calloc(1, sizeof(struct qos_bdev_list_node));
-		if(bdev_node == NULL) {
-			return -1;
-		}
-		bdev_node->bdev_name = strdup(bdev_names[i]);
-		TAILQ_INSERT_TAIL(&qos_pool_id_object->bdev_list, bdev_node,link);
-		++qos_pool_id_object->bdev_list_size;
-	}
-	return 0;
-}
-
-static struct spdk_bdev_qos_pool_id_mapping * create_qos_object_for_group(uint64_t bdev_pool_id)	{
-	struct spdk_bdev_qos_pool_id_mapping *qos_pool_id_mapping_node = NULL;
-
-	qos_pool_id_mapping_node = (struct spdk_bdev_qos_pool_id_mapping *)calloc(1, sizeof(struct spdk_bdev_qos_pool_id_mapping));
-	if(qos_pool_id_mapping_node == NULL)
-	{
-		SPDK_ERRLOG("No memory. \n");
-		return NULL;
-	}
-
-	qos_pool_id_mapping_node->bdev_pool_id = bdev_pool_id;
-	TAILQ_INIT(&qos_pool_id_mapping_node->bdev_list);
-	qos_pool_id_mapping_node->bdev_list_size = 0;
-	qos_pool_id_mapping_node->rate_limits = NULL;
-	TAILQ_INSERT_TAIL(&g_qos_bdev_group_list, qos_pool_id_mapping_node, link);
-	return qos_pool_id_mapping_node;
-}
-
-// Find the qos pointed for the bdev_pool_id from the list qos_pool_id_mapping_node.
-static struct spdk_bdev_qos_pool_id_mapping * get_qos_already_available_for_group(uint64_t bdev_pool_id) {
-	struct spdk_bdev_qos_pool_id_mapping *qos_pool_id_mapping_node = NULL;
-
-	TAILQ_FOREACH(qos_pool_id_mapping_node, &g_qos_bdev_group_list, link) {
-		if(qos_pool_id_mapping_node->bdev_pool_id == bdev_pool_id) {
-			return qos_pool_id_mapping_node;
-		}
-	}
-	return NULL;
-}
-
-static void
-dummy_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev, void *ctx)
-{
-}
-
 static void
 bdev_set_qos_limit_done(struct set_qos_limit_ctx *ctx, int status)
 {
-	struct qos_bdev_list_node *next_qos_bdev_node = NULL;
-	struct spdk_bdev_desc *desc;
-	int rc = 0;
-	uint64_t	limits[SPDK_BDEV_QOS_NUM_RATE_LIMIT_TYPES];
-	char		*tmp_remove_bdev_names[255] = {NULL};
 	spdk_spin_lock(&ctx->bdev->internal.spinlock);
 	ctx->bdev->internal.qos_mod_in_progress = false;
 	spdk_spin_unlock(&ctx->bdev->internal.spinlock);
-	SPDK_NOTICELOG("Set qos limit done for %s\n", ctx->bdev->name);
-	if(ctx->internal_request == true)
-	{
-		if(ctx->total_bdev_to_process > ctx->bdev_node_cout) {
-			if(ctx->is_remove_requets == true) {
-				remove_bdev_from_group(ctx->qos_bdev_node->bdev_name);
-				next_qos_bdev_node = find_existing_bdev(ctx->qos_pool_id_object, ctx->remove_bdev_names[ctx->bdev_node_cout]);
-				// Copy the limits in the transient variable.
-				for (uint64_t i = 0; i < ctx->total_bdev_to_process; i++) {
-					tmp_remove_bdev_names[i] = strdup(ctx->remove_bdev_names[i]);
-				}
-				// Copy the limits in the transient variable.
-				for (int i = 0; i < SPDK_BDEV_QOS_NUM_RATE_LIMIT_TYPES; i++) {
-					limits[i] = 0;
-				}
-			} else {
-				next_qos_bdev_node = TAILQ_NEXT(ctx->qos_bdev_node, link);
-				// Copy the limits in the transient variable.
-				for (uint64_t i = 0; i < SPDK_BDEV_QOS_NUM_RATE_LIMIT_TYPES; i++) {
-					limits[i] = ctx->qos_pool_id_object->limits[i];
-				}
-			}
-			// This case is not possible.
-			if(next_qos_bdev_node == NULL) {
-				ctx->cb_fn(ctx->cb_arg, 0);
-				free(ctx);
-				ctx = NULL;
-				return;
-			}
-			rc = spdk_bdev_open_ext(next_qos_bdev_node->bdev_name, false, dummy_bdev_event_cb, NULL, &desc);
-				if (rc != 0) {
-					SPDK_ERRLOG("Failed to open bdev '%s': %d\n", next_qos_bdev_node->bdev_name, rc);
-					ctx->cb_fn(ctx->cb_arg, -ENXIO);
-					free(ctx);
-					ctx = NULL;
-					return;
-				}
-			
-			spdk_bdev_set_qos_rate_limits_ex(spdk_bdev_desc_get_bdev(desc), limits, ctx->bdev_pool_id, ctx->qos_pool_id_object, 
-			next_qos_bdev_node, ++ctx->bdev_node_cout, ctx->total_bdev_to_process ,ctx->is_remove_requets, tmp_remove_bdev_names, ctx->cb_fn, ctx->cb_arg);
-			spdk_bdev_close(desc);
-			
-			if(ctx->is_remove_requets) {
-				for(uint64_t i = 0 ; i < ctx->total_bdev_to_process; i++) {
-					if(ctx->remove_bdev_names[i] != NULL) {
-						free(ctx->remove_bdev_names[i]);
-					}
-				}
-				for (uint64_t i = 0; i < ctx->total_bdev_to_process; i++) {
-					free(tmp_remove_bdev_names[i]);
-				}
-			}
-			free(ctx);
-		} else {
-			// End of the the nodes
-			if(ctx->is_remove_requets) {
-				remove_bdev_from_group(ctx->qos_bdev_node->bdev_name);
-				for(uint64_t i = 0 ; i < ctx->total_bdev_to_process; i++) {
-					if(ctx->remove_bdev_names[i] != NULL) {
-						free(ctx->remove_bdev_names[i]);
-					}
-				}
-			}
-			ctx->cb_fn(ctx->cb_arg,0);
-			free(ctx);
-		}
-	} else {
-		if(ctx->is_remove_requets) {
-				for(uint64_t i = 0 ; i < ctx->total_bdev_to_process; i++) {
-					if(ctx->remove_bdev_names[i] != NULL) {
-						free(ctx->remove_bdev_names[i]);
-					}
-				}
-			}
-		ctx->cb_fn(ctx->cb_arg,0);
-		free(ctx);
+
+	if (ctx->cb_fn) {
+		ctx->cb_fn(ctx->cb_arg, status);
 	}
-	return;
+	free(ctx);
 }
 
 static void
@@ -9506,18 +9162,7 @@ bdev_disable_qos_done(void *cb_arg)
 		spdk_poller_unregister(&qos->poller);
 	}
 
-	//When processing the request for the pool.
-	if ( ctx->internal_request == true && check_bdev_name_in_group(ctx->qos_pool_id_object, ctx->qos_bdev_node->bdev_name) != 0)
-	{
-		if (ctx->is_remove_requets == true) {
-			free(qos->rate_limits);
-		}
-	} else {
-		free(qos->rate_limits);
-	}
-	qos->rate_limits = NULL;
 	free(qos);
-	qos = NULL;
 
 	bdev_set_qos_limit_done(ctx, 0);
 }
@@ -9561,7 +9206,6 @@ bdev_disable_qos_msg(struct spdk_bdev_channel_iter *i, struct spdk_bdev *bdev,
 static void
 bdev_update_qos_rate_limit_msg(void *cb_arg)
 {
-
 	struct set_qos_limit_ctx *ctx = cb_arg;
 	struct spdk_bdev *bdev = ctx->bdev;
 
@@ -9588,6 +9232,7 @@ static void
 bdev_enable_qos_done(struct spdk_bdev *bdev, void *_ctx, int status)
 {
 	struct set_qos_limit_ctx *ctx = _ctx;
+
 	bdev_set_qos_limit_done(ctx, status);
 }
 
@@ -9597,9 +9242,11 @@ bdev_set_qos_rate_limits(struct spdk_bdev *bdev, uint64_t *limits)
 	int i;
 
 	assert(bdev->internal.qos != NULL);
+
 	for (i = 0; i < SPDK_BDEV_QOS_NUM_RATE_LIMIT_TYPES; i++) {
 		if (limits[i] != SPDK_BDEV_QOS_LIMIT_NOT_DEFINED) {
 			bdev->internal.qos->rate_limits[i].limit = limits[i];
+
 			if (limits[i] == 0) {
 				bdev->internal.qos->rate_limits[i].limit =
 					SPDK_BDEV_QOS_LIMIT_NOT_DEFINED;
@@ -9648,12 +9295,6 @@ spdk_bdev_set_qos_rate_limits(struct spdk_bdev *bdev, uint64_t *limits,
 			SPDK_ERRLOG("Round up the rate limit to %" PRIu64 "\n", limits[i]);
 		}
 	}
-	// Do not allow to set the limits if bdev is part of the pool.
-	if(is_bdev_exist_in_pool(bdev->name) == true) {
-		SPDK_ERRLOG("bdev %s exist in pool. Remove the bdev from pool before setting independent limits.\n", bdev->name);
-		cb_fn(cb_arg, -EPERM);
-		return;
-	}
 
 	ctx = calloc(1, sizeof(*ctx));
 	if (ctx == NULL) {
@@ -9664,7 +9305,6 @@ spdk_bdev_set_qos_rate_limits(struct spdk_bdev *bdev, uint64_t *limits,
 	ctx->cb_fn = cb_fn;
 	ctx->cb_arg = cb_arg;
 	ctx->bdev = bdev;
-	ctx->internal_request = false;
 
 	spdk_spin_lock(&bdev->internal.spinlock);
 	if (bdev->internal.qos_mod_in_progress) {
@@ -9691,13 +9331,6 @@ spdk_bdev_set_qos_rate_limits(struct spdk_bdev *bdev, uint64_t *limits,
 		if (bdev->internal.qos == NULL) {
 			bdev->internal.qos = calloc(1, sizeof(*bdev->internal.qos));
 			if (!bdev->internal.qos) {
-				spdk_spin_unlock(&bdev->internal.spinlock);
-				SPDK_ERRLOG("Unable to allocate memory for QoS tracking\n");
-				bdev_set_qos_limit_done(ctx, -ENOMEM);
-				return;
-			}
-			bdev->internal.qos->rate_limits = calloc(SPDK_BDEV_QOS_NUM_RATE_LIMIT_TYPES, sizeof(struct spdk_bdev_qos_limit));
-			if (!bdev->internal.qos->rate_limits) {
 				spdk_spin_unlock(&bdev->internal.spinlock);
 				SPDK_ERRLOG("Unable to allocate memory for QoS tracking\n");
 				bdev_set_qos_limit_done(ctx, -ENOMEM);
@@ -9733,348 +9366,6 @@ spdk_bdev_set_qos_rate_limits(struct spdk_bdev *bdev, uint64_t *limits,
 	}
 
 	spdk_spin_unlock(&bdev->internal.spinlock);
-}
-
-void
-spdk_bdev_set_qos_rate_limits_to_group(uint64_t bdev_pool_id, uint64_t *limits, 
-					void (*cb_fn)(void *cb_arg, int status), void *cb_arg) {
-
-	int					rc = 0;
-	struct qos_bdev_list_node * qos_bdev_node = NULL;
-	struct spdk_bdev_desc *desc;
-	struct spdk_bdev_qos_pool_id_mapping * qos_pool_id_object = NULL;
-
-
-	if(bdev_pool_id <= 0)
-	{
-		cb_fn(cb_arg, -EPERM);
-		return;
-	}
-
-	qos_pool_id_object = get_qos_already_available_for_group(bdev_pool_id);
-	if(qos_pool_id_object == NULL) {
-		SPDK_NOTICELOG("Group ID %" PRIu64 " not found. Creating a new group.\n", bdev_pool_id);
-		qos_pool_id_object = create_qos_object_for_group(bdev_pool_id);
-		if (qos_pool_id_object == NULL)
-		{
-			SPDK_ERRLOG("Failed to create group for ID %" PRIu64 "\n", bdev_pool_id);
-			cb_fn(cb_arg, -EPERM);
-			return;
-		}
-	}
-
-	if(qos_pool_id_object->bdev_list_size == 0)
-	{
-		// No bdevs yet — just store the limits for now
-		for (int i = 0; i < SPDK_BDEV_QOS_NUM_RATE_LIMIT_TYPES; i++)
-		{
-			qos_pool_id_object->limits[i] = limits[i];
-		}
-		cb_fn(cb_arg, 0);
-		return;
-	}
-
-	qos_bdev_node = TAILQ_FIRST(&qos_pool_id_object->bdev_list);
-
-	rc = spdk_bdev_open_ext(qos_bdev_node->bdev_name, false, dummy_bdev_event_cb, NULL, &desc);
-	if (rc != 0) {
-		SPDK_ERRLOG("Failed to open bdev '%s': %d\n", qos_bdev_node->bdev_name, rc);
-		cb_fn(cb_arg, -EPERM);
-		return;
-	}
-	// Copy the limits for future use.
-	for (int i = 0; i < SPDK_BDEV_QOS_NUM_RATE_LIMIT_TYPES; i++) {
-		qos_pool_id_object->limits[i] = limits[i];
-	}
-	spdk_bdev_set_qos_rate_limits_ex(spdk_bdev_desc_get_bdev(desc), limits, bdev_pool_id, qos_pool_id_object, qos_bdev_node,
-									 1, qos_pool_id_object->bdev_list_size, false, NULL, cb_fn, cb_arg);
-	spdk_bdev_close(desc);
-	return;
-}
-
-void
-spdk_bdev_set_qos_rate_limits_ex(struct spdk_bdev *bdev, uint64_t *limits, uint64_t bdev_pool_id,
-					void * qos_pool_id_object, void * qos_bdev_node, uint64_t bdev_node_cout,
-					uint64_t total_bdev_to_process, 
-					bool is_remove_bdev_request, char **remove_bdev_list,
-			    	void (*cb_fn)(void *cb_arg, int status), void *cb_arg) {
-	struct set_qos_limit_ctx	*ctx;
-	uint32_t			limit_set_complement;
-	uint64_t			min_limit_per_sec;
-	uint64_t				i;
-	bool				disable_rate_limit = true;
-	bool set_limits = false;
-	struct spdk_bdev_qos_limit *tmp_rate_limits;
-
-
-	struct spdk_bdev_qos_pool_id_mapping * qos_pool_id_object_l = qos_pool_id_object;
-	
-	SPDK_NOTICELOG("Setting the limits qos limits for bdev %s group id %" PRIu64 "\n",bdev->name, bdev_pool_id);
-	if(bdev_pool_id <= 0)
-	{
-		cb_fn(cb_arg, -EPERM);
-		return;
-	}
-	ctx = calloc(1, sizeof(*ctx));
-	if (ctx == NULL) {
-		cb_fn(cb_arg, -ENOMEM);
-		return;
-	}
-
-	ctx->cb_fn = cb_fn;
-	ctx->cb_arg = cb_arg;
-	ctx->bdev = bdev;
-	ctx->bdev_pool_id = bdev_pool_id;
-	ctx->qos_bdev_node = qos_bdev_node;
-	ctx->qos_pool_id_object = qos_pool_id_object;
-	ctx->bdev_node_cout = bdev_node_cout;
-	ctx->is_remove_requets = is_remove_bdev_request;
-	ctx->total_bdev_to_process = total_bdev_to_process;
-
-	for (i = 0; i <255; i++){
-		ctx->remove_bdev_names[i] = NULL;
-	}
-	
-	// This is used for appling the limits at pool level.
-	ctx->internal_request = true;
-
-	for (i = 0; i < SPDK_BDEV_QOS_NUM_RATE_LIMIT_TYPES; i++) {
-		if (limits[i] == SPDK_BDEV_QOS_LIMIT_NOT_DEFINED) {
-			continue;
-		}
-
-		if (limits[i] > 0) {
-			disable_rate_limit = false;
-		}
-
-		if (bdev_qos_is_iops_rate_limit(i) == true) {
-			min_limit_per_sec = SPDK_BDEV_QOS_MIN_IOS_PER_SEC;
-		} else {
-			if (limits[i] > SPDK_BDEV_QOS_MAX_MBYTES_PER_SEC) {
-				SPDK_WARNLOG("Requested rate limit %" PRIu64 " will result in uint64_t overflow, "
-					     "reset to %" PRIu64 "\n", limits[i], SPDK_BDEV_QOS_MAX_MBYTES_PER_SEC);
-				limits[i] = SPDK_BDEV_QOS_MAX_MBYTES_PER_SEC;
-			}
-			/* Change from megabyte to byte rate limit */
-			limits[i] = limits[i] * 1024 * 1024;
-			min_limit_per_sec = SPDK_BDEV_QOS_MIN_BYTES_PER_SEC;
-		}
-
-		limit_set_complement = limits[i] % min_limit_per_sec;
-		if (limit_set_complement) {
-			SPDK_ERRLOG("Requested rate limit %" PRIu64 " is not a multiple of %" PRIu64 "\n",
-				    limits[i], min_limit_per_sec);
-			limits[i] += min_limit_per_sec - limit_set_complement;
-			SPDK_ERRLOG("Round up the rate limit to %" PRIu64 "\n", limits[i]);
-		}
-	}
-
-	spdk_spin_lock(&bdev->internal.spinlock);
-	if (bdev->internal.qos_mod_in_progress) {
-		spdk_spin_unlock(&bdev->internal.spinlock);
-		free(ctx);
-		cb_fn(cb_arg, -EAGAIN);
-		return;
-	}
-	bdev->internal.qos_mod_in_progress = true;
-
-	if (disable_rate_limit == true && bdev->internal.qos) {
-		for (i = 0; i < SPDK_BDEV_QOS_NUM_RATE_LIMIT_TYPES; i++) {
-			if (limits[i] == SPDK_BDEV_QOS_LIMIT_NOT_DEFINED &&
-			    (bdev->internal.qos->rate_limits[i].limit > 0 &&
-			     bdev->internal.qos->rate_limits[i].limit !=
-			     SPDK_BDEV_QOS_LIMIT_NOT_DEFINED)) {
-				disable_rate_limit = false;
-				break;
-			}
-		}
-	}
-
-	if (disable_rate_limit == false) {
-		if (bdev->internal.qos == NULL) {
-			bdev->internal.qos = calloc(1, sizeof(*bdev->internal.qos));
-			if (!bdev->internal.qos) {
-				spdk_spin_unlock(&bdev->internal.spinlock);
-				SPDK_ERRLOG("Unable to allocate memory for QoS tracking\n");
-				free(ctx);
-				cb_fn(cb_arg, -ENOMEM);
-				return;
-			}
-			set_limits = true;
-			// Set the rate_limit to NULl for future validation.
-			bdev->internal.qos->rate_limits = NULL;
-		}
-
-		if(qos_pool_id_object_l->rate_limits == NULL) {
-			SPDK_NOTICELOG("Creating the rate_limit pointer \n");
-			qos_pool_id_object_l->rate_limits = calloc(SPDK_BDEV_QOS_NUM_RATE_LIMIT_TYPES, sizeof(struct spdk_bdev_qos_limit));
-			if (qos_pool_id_object_l->rate_limits == NULL) {
-				SPDK_ERRLOG("Unable to allocate memory for QoS tracking\n");
-				spdk_spin_unlock(&bdev->internal.spinlock);
-				free(ctx);
-				cb_fn(cb_arg, -ENOMEM);
-				return;
-			}
-		}
-		// Assining the common rate limit pointer.
-		if(bdev->internal.qos->rate_limits != NULL)
-		{
-			SPDK_NOTICELOG("Swapping the rate limits with group rate limits 1\n");
-			if (bdev->internal.qos->rate_limits != qos_pool_id_object_l->rate_limits) {
-				SPDK_NOTICELOG("Swapping the rate limits with group rate limits 2\n");
-				tmp_rate_limits = bdev->internal.qos->rate_limits;
-				bdev->internal.qos->rate_limits = qos_pool_id_object_l->rate_limits;
-				free(tmp_rate_limits);
-				tmp_rate_limits = NULL;
-			}
-		} else {
-			SPDK_NOTICELOG("Assining the qos rate limits.\n");
-			bdev->internal.qos->rate_limits = qos_pool_id_object_l->rate_limits;
-		}
-		
-		
-		if (bdev->internal.qos->thread == NULL) {
-			/* Enabling */
-			SPDK_NOTICELOG("ENEBLING the limits for bdev %s\n", bdev->name);
-			if(set_limits == true) {
-				SPDK_NOTICELOG("Setting the limits for group %" PRIu64 "\n", bdev_pool_id);
-				bdev_set_qos_rate_limits(bdev, limits);
-			}
-
-			spdk_bdev_for_each_channel(bdev, bdev_enable_qos_msg, ctx,
-						   bdev_enable_qos_done);
-		} else {
-			SPDK_NOTICELOG("UPDATING the limits for bdev %s\n", bdev->name);
-			/* Updating */
-			
-			if(is_remove_bdev_request == true) {
-				// Replace the rate_limits with new memory to make sure the group limits are intact.
-				bdev->internal.qos->rate_limits = calloc(SPDK_BDEV_QOS_NUM_RATE_LIMIT_TYPES, sizeof(struct spdk_bdev_qos_limit));
-				// Remove the bdev from the group.
-				if(remove_bdev_list != NULL) {
-					for (i = 0; i < total_bdev_to_process ; i++) {
-						ctx->remove_bdev_names[i] = strdup(remove_bdev_list[i]);
-					}
-				}
-			}
-			bdev_set_qos_rate_limits(bdev, limits);
-
-			spdk_thread_send_msg(bdev->internal.qos->thread,
-					     bdev_update_qos_rate_limit_msg, ctx);
-		}
-	} else {
-		if (bdev->internal.qos != NULL) {
-			SPDK_NOTICELOG("DISABLING the limits for bdev %s\n", bdev->name);
-			if(is_remove_bdev_request == true) {
-				// Replace the rate_limits with new memory to make sure the group limits are intact.
-				bdev->internal.qos->rate_limits = calloc(SPDK_BDEV_QOS_NUM_RATE_LIMIT_TYPES, sizeof(struct spdk_bdev_qos_limit));
-				if(remove_bdev_list != NULL) {
-					for (i = 0; i < total_bdev_to_process ; i++) {
-						ctx->remove_bdev_names[i] = strdup(remove_bdev_list[i]);
-					}
-				}
-			}
-			bdev_set_qos_rate_limits(bdev, limits);
-
-			/* Disabling */
-			spdk_bdev_for_each_channel(bdev, bdev_disable_qos_msg, ctx,
-						   bdev_disable_qos_msg_done);
-		} else {
-			spdk_spin_unlock(&bdev->internal.spinlock);
-			bdev_set_qos_limit_done(ctx, 0);
-			return;
-		}
-	}
-
-	spdk_spin_unlock(&bdev->internal.spinlock);
-}
-
-
-void
-spdk_bdev_add_remove_bdev_to_pool(uint64_t bdev_pool_id, uint64_t num_bdevs, char	**bdev_names, bool is_remove_bdev_request,
-					void (*cb_fn)(void *cb_arg, int status), void *cb_arg)	{
-	struct spdk_bdev_qos_pool_id_mapping * qos_pool_id_object = NULL;
-	struct qos_bdev_list_node * qos_bdev_list_node = NULL;
-	struct spdk_bdev_desc *desc;
-	int rc = 0, temp_bdev_count_in_list = 0;
-	uint64_t	limits[SPDK_BDEV_QOS_NUM_RATE_LIMIT_TYPES];
-	qos_pool_id_object = get_qos_already_available_for_group(bdev_pool_id);
-	// Object for the group id not yet created.
-	if(is_remove_bdev_request == false) {
-		if(qos_pool_id_object == NULL) {
-			SPDK_NOTICELOG("Creating mapping object for group id : %" PRIu64 "\n", bdev_pool_id);
-			qos_pool_id_object = create_qos_object_for_group(bdev_pool_id);
-			add_bdev_list(qos_pool_id_object, num_bdevs, bdev_names);
-		} else {
-			if (check_bdev_exists(qos_pool_id_object, num_bdevs, bdev_names) == 0)
-			{
-				temp_bdev_count_in_list = qos_pool_id_object->bdev_list_size;
-				add_bdev_list(qos_pool_id_object, num_bdevs, bdev_names);
-			} else {
-				// Return error as one of the lvol is already in the group.
-				cb_fn(cb_arg, -EINVAL);
-				return;
-			}
-		}
-
-		if (qos_pool_id_object->rate_limits != NULL) {
-			// Limits are already set so need to set the limits to newly added lvols.
-			// Iterate to the first newly added first lvol.
-			qos_bdev_list_node = find_existing_bdev(qos_pool_id_object, bdev_names[0]);
-			if(qos_bdev_list_node)
-			{
-				rc = spdk_bdev_open_ext(qos_bdev_list_node->bdev_name, false, dummy_bdev_event_cb, NULL, &desc);
-				if (rc != 0) {
-					SPDK_ERRLOG("Failed to open bdev '%s': %d\n", qos_bdev_list_node->bdev_name, rc);
-					cb_fn(cb_arg, -EINVAL);
-					return;
-				}
-				// Copy the original values of the transient variable.
-				for (int i = 0; i < SPDK_BDEV_QOS_NUM_RATE_LIMIT_TYPES; i++) {
-					limits[i] = qos_pool_id_object->limits[i];
-				}
-				spdk_bdev_set_qos_rate_limits_ex(spdk_bdev_desc_get_bdev(desc), limits, bdev_pool_id, qos_pool_id_object, qos_bdev_list_node,
-								++temp_bdev_count_in_list, qos_pool_id_object->bdev_list_size, false, NULL, cb_fn, cb_arg);
-				spdk_bdev_close(desc);
-			}
-		} else {
-			cb_fn(cb_arg, 0);
-			return;
-		}
-	}
-	else {
-		if(qos_pool_id_object == NULL) {
-			cb_fn(cb_arg, -EINVAL);
-		} else {
-			if (check_bdev_names_in_group(qos_pool_id_object, num_bdevs, bdev_names) == 0) {
-				qos_bdev_list_node = find_existing_bdev(qos_pool_id_object, bdev_names[0]);
-				if(qos_bdev_list_node) {
-				
-					rc = spdk_bdev_open_ext(qos_bdev_list_node->bdev_name, false, dummy_bdev_event_cb, NULL, &desc);
-					if (rc != 0) {
-						SPDK_ERRLOG("Failed to open bdev '%s': %d\n", qos_bdev_list_node->bdev_name, rc);
-						cb_fn(cb_arg, -EINVAL);
-						return;
-					}
-					// disable the limits for the bdev
-					for (int i = 0; i < SPDK_BDEV_QOS_NUM_RATE_LIMIT_TYPES; i++) {
-						// Set this to 0
-						limits[i] = 0;
-					}
-					spdk_bdev_set_qos_rate_limits_ex(spdk_bdev_desc_get_bdev(desc), limits, bdev_pool_id, qos_pool_id_object, qos_bdev_list_node,
-								1, num_bdevs, is_remove_bdev_request, bdev_names, cb_fn, cb_arg);
-					spdk_bdev_close(desc);
-				}
-				else {
-					// Very unlikely
-					cb_fn(cb_arg, -EINVAL);
-				}
-			} else {
-				cb_fn(cb_arg, -EINVAL);
-			}
-		}
-	}
-	return;
 }
 
 struct spdk_bdev_histogram_ctx {
