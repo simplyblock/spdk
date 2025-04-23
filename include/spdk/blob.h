@@ -1097,21 +1097,10 @@ struct spdk_io_channel *spdk_bs_alloc_io_channel(struct spdk_blob_store *bs);
  */
 void spdk_bs_free_io_channel(struct spdk_io_channel *channel);
 
-struct spdk_io_channel	*
-spdk_bs_get_hub_channel(struct spdk_io_channel *ch);
-bool
-spdk_bs_set_hub_channel(struct spdk_io_channel *ch, struct spdk_io_channel *hub_ch, void *desc);
-void
-spdk_bs_clear_hub_channel(struct spdk_io_channel *ch);
-struct spdk_bs_redirect_request *
-spdk_bs_queued_red_io(struct spdk_io_channel *ch, void *bdev_io);
-void
-spdk_bs_dequeued_red_io(struct spdk_io_channel *ch, void *bdev_io);
-
-void
-spdk_bs_drain_channel_queued(struct spdk_blob_store *bs, spdk_drain_op_submit_handle submit_cb,
+struct spdk_io_channel	*spdk_bs_get_hub_channel(struct spdk_io_channel *ch);
+bool spdk_bs_set_hub_channel(struct spdk_io_channel *ch, struct spdk_io_channel *hub_ch, void *desc);
+void spdk_bs_drain_channel_queued(struct spdk_blob_store *bs, spdk_drain_op_submit_handle submit_cb,
 						 spdk_drain_op_cpl cb_fn, void *cb_arg);
-
 
 /**
  * Write data to a blob.

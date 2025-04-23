@@ -1160,7 +1160,6 @@ lvol_delete_blob_cb(void *cb_arg, int lvolerrno)
 	if (lvolerrno < 0) {
 		SPDK_ERRLOG("Could not remove blob on lvol gracefully - forced removal\n");
 	} else {
-		// SPDK_INFOLOG(lvol, "Lvol %s deleted\n", lvol->unique_id);
 		SPDK_NOTICELOG("Lvol %s deleted\n", lvol->unique_id);
 	}
 
@@ -1442,8 +1441,6 @@ spdk_lvol_create_hublvol(struct spdk_lvol_store *lvs, spdk_lvol_op_with_handle_c
 
 	spdk_bs_create_hubblob(lvs->blobstore, &opts, lvol_create_open_cb, req);
 
-	// spdk_bs_create_blob_ext(lvs->blobstore, &opts, lvol_create_cb, req);
-
 	return 0;
 }
 
@@ -1666,13 +1663,10 @@ static void
 snapshot_clone_update_cb(void *cb_arg, struct spdk_blob *blob, int lvolerrno)
 {
 	struct spdk_lvol_with_handle_req *req = cb_arg;
-	// struct spdk_lvol *lvol = req->lvol;
 
 	if (lvolerrno < 0) {
 		// TODO on failover
 		SPDK_ERRLOG("Cannot update clone and snapshot on secondary.\n");
-		// assert(false);
-		// lvol_free(lvol);
 		req->cb_fn(req->cb_arg, NULL, lvolerrno);
 		free(req);
 		return;
@@ -1738,14 +1732,11 @@ spdk_lvol_update_snapshot_clone(struct spdk_lvol *lvol, struct spdk_lvol *origlv
 	if (update_on_failover) {
 		//TODO check should not send to md thread bcs we already there
 		spdk_lvol_update_on_failover(lvs, origlvol, false);
-		// snapshot_clone_update_cb(req, snapshot_blob, 0);
-		// return;
 	}
 
 	if (update_blob) {
 		// TODO here we will return origblob not snapshot blob
 		spdk_bs_update_snapshot_clone_live(origblob, snapshot_blob);
-		// return;
 	}
 
 	snapshot_clone_update_cb(req, snapshot_blob, 0);
@@ -1932,10 +1923,7 @@ spdk_lvol_register_live(struct spdk_lvol_store *lvs, const char *name, const cha
 		 void *cb_arg)
 {
 	struct spdk_lvol_with_handle_req *req;
-	// struct spdk_blob_store *bs;
 	struct spdk_lvol *lvol;
-	// struct spdk_blob_opts opts;
-	// char *xattr_names[] = {LVOL_NAME, "uuid"};
 	int rc;
 
 	if (lvs == NULL) {
@@ -1947,8 +1935,6 @@ spdk_lvol_register_live(struct spdk_lvol_store *lvs, const char *name, const cha
 	if (rc < 0) {
 		return rc;
 	}
-
-	// bs = lvs->blobstore;
 
 	req = calloc(1, sizeof(*req));
 	if (!req) {
@@ -1966,14 +1952,6 @@ spdk_lvol_register_live(struct spdk_lvol_store *lvs, const char *name, const cha
 	}
 
 	req->lvol = lvol;
-	// spdk_blob_opts_init(&opts, sizeof(opts));
-	// opts.thin_provision = thin_provision;
-	// opts.num_clusters = spdk_divide_round_up(sz, spdk_bs_get_cluster_size(bs));
-	// opts.clear_method = lvol->clear_method;
-	// opts.xattrs.count = SPDK_COUNTOF(xattr_names);
-	// opts.xattrs.names = xattr_names;
-	// opts.xattrs.ctx = lvol;
-	// opts.xattrs.get_value = lvol_get_xattr_value;
 	lvol_create_cb((void *)req, blobid, 0);	
 	return 0;	
 }
@@ -2336,7 +2314,6 @@ lvol_update_on_failover_cpl(void *cb_arg, int lvolerrno)
 {
 	struct spdk_lvol_update_on_failover_req *req = cb_arg;
 	struct spdk_lvol *lvol = req->lvol;	
-	// spdk_blob_failover_unfreaze(lvol->blob, NULL, NULL);
 	if (lvolerrno < 0) {
 		SPDK_ERRLOG("Cannot update lvol on failover blob 0x%" PRIx64 "\n", lvol->blob_id);
 		//remember call function to drop the IO for this lvol
@@ -2409,7 +2386,7 @@ lvs_update_on_failover_cpl(void *cb_arg, int lvolerrno)
 		}
 		return;
 	}
-	// no idea what to do it should never come here	
+
 	SPDK_ERRLOG("Cannot update lvolstore on failover ...\n");
 	if (lvolerrno == -ENOTCONN || (lvolerrno != 0 && lvs->timeout_trigger == 1)) {
     	SPDK_ERRLOG("Failed to update lvolstore during failover due to distrib-level functionality.\n");
@@ -2417,17 +2394,12 @@ lvs_update_on_failover_cpl(void *cb_arg, int lvolerrno)
 		// Ensure all log messages are flushed
     	fflush(stderr);
 		abort();
-		// assert(false);
 	}	
 	spdk_lvs_set_failed_on_update(lvs, true);
 	//remember call function to drop the IO for this lvol
 	TAILQ_FOREACH_SAFE(lvol, &lvs->pending_update_lvols, entry_to_update, tmp) {
 		TAILQ_REMOVE(&lvs->pending_update_lvols, lvol, entry_to_update);
 		assert(lvol->update_in_progress == true);
-		// still in md thread so we can call spdk_blob_update_failed_cleanup.
-		// 1.first set lvol to failed on update state.
-		// 2.set the blob on failed on update.
-		// 3.call unfreeze function.
 		lvol->failed_on_update = true;
 		spdk_blob_update_failed_cleanup(lvol->blob, lvol_update_failed_cpl, lvol);		
 	}
@@ -2480,9 +2452,6 @@ spdk_lvol_update_on_failover(struct spdk_lvol_store *lvs, struct spdk_lvol *lvol
 		}
 	}
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
-	// we need to first create function on blobstore to send msg to md thread
-	// second we need to call lvol update function or load
-	// third call callback function to change the state to leader
 	if (update) {
 		lvol_update_on_failover(lvs, lvol, send_md_thread);
 	}	
@@ -2961,8 +2930,6 @@ block_port(int port) {
     		"sudo iptables -C OUTPUT -p tcp --dport %d -j DROP 2>/dev/null || sudo iptables -A OUTPUT -p tcp --dport %d -j DROP",
     		port, port, port, port);
 
-
-		// SPDK_NOTICELOG("Command for blocking the port is %s.\n", command);
 		// Execute the command
 		int result = system(command);
 
@@ -3079,8 +3046,7 @@ spdk_lvs_conflict_signal(void *arg, int errorno) {
 		spdk_lvs_unfreeze_on_conflict(lvs);
 		return;
 	}
-	// TODO create a poller so after 50ms and unfreeze all the blobs and set blobstore to false
-	// in case we have snapshots and we need to allocate new cluster and do copy and write
+
 	req->cb_fn = NULL;
 	req->cb_arg = NULL;
 	req->lvol_store = lvs;
@@ -3155,15 +3121,18 @@ spdk_delayed_close_hub_bdev(void *arg)
 		spdk_bdev_close(lvs->hub_dev.desc);
 		lvs->hub_dev.desc = NULL;
 	}
+
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+	lvs->hub_dev.drain_in_action = false;
+	lvs->hub_dev.dev_in_remove = false;
+	pthread_mutex_unlock(&g_lvol_stores_mutex);	
 	spdk_lvs_open_hub_bdev(lvs);
 }
 
 static void
 spdk_trigger_failover_cpl(void *cb_arg, int bserrno) {
 	struct spdk_lvol_store *lvs = cb_arg;
-	if (lvs->hub_dev.state != HUBLVOL_CONNECTED) {
-		spdk_delayed_close_hub_bdev(lvs);
-	}
+	spdk_delayed_close_hub_bdev(lvs);
 }
 
 static int
@@ -3187,10 +3156,7 @@ spdk_wait_for_redirected_io_cleanup(void *arg)
 static void
 spdk_trigger_failover_msg(void *arg)
 {
-	struct spdk_lvol_store *lvs = arg;	
-	pthread_mutex_lock(&g_lvol_stores_mutex);
-	lvs->hub_dev.drain_in_action = false;
-	pthread_mutex_unlock(&g_lvol_stores_mutex);
+	struct spdk_lvol_store *lvs = arg;
 	lvs->hub_dev.cleanup_poller = spdk_poller_register(
 	spdk_wait_for_redirected_io_cleanup, lvs, 200000 );// check every 200ms
 }
@@ -3203,10 +3169,7 @@ spdk_lvs_hub_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bde
 	switch (type) {
 	case SPDK_BDEV_EVENT_REMOVE:
 		SPDK_NOTICELOG("Receive remove event from callback. \n");
-
 		spdk_change_redirect_state(lvs, true);
-		spdk_thread_send_msg(lvs->hub_dev.thread, spdk_trigger_failover_msg, lvs);
-
 		break;
 	default:
 		SPDK_NOTICELOG("Unsupported bdev event: type %d\n", type);
@@ -3218,7 +3181,6 @@ void
 spdk_lvs_open_hub_bdev(void *cb_arg) {
 	struct spdk_lvol_store *lvs = cb_arg;
 	int rc = 0;
-	// SPDK_ERRLOG("hubbdev 6\n");
 	if (lvs->primary) {
 		SPDK_ERRLOG("Lvolstore %s: is on the primary nod and does not need hub bdev.\n", lvs->name);
 		return;
@@ -3240,12 +3202,10 @@ spdk_lvs_open_hub_bdev(void *cb_arg) {
 			SPDK_ERRLOG("Lvolstore %s: hub bdev %s cannot be opened, error=%d\n",
 					lvs->name, lvs->remote_bdev, rc);
 			lvs->hub_dev.desc = NULL;
-			lvs->hub_dev.bdev = NULL;
 			goto err;
 		}
 
 		pthread_mutex_lock(&g_lvol_stores_mutex);
-		lvs->hub_dev.drain_in_action = false;
 		lvs->skip_redirecting = false;
 		lvs->hub_dev.state = HUBLVOL_CONNECTED;
 		pthread_mutex_unlock(&g_lvol_stores_mutex);	
@@ -3265,18 +3225,19 @@ spdk_change_redirect_state(struct spdk_lvol_store *lvs, bool disconnected) {
 	if (!lvs->skip_redirecting && !lvs->hub_dev.drain_in_action) {
 		SPDK_NOTICELOG("process the failover op.\n");
 		lvs->skip_redirecting = true;
-		if (disconnected) {
-			SPDK_NOTICELOG("change device connect state.\n");
-			lvs->hub_dev.state = HUBLVOL_NOT_CONNECTED;
-		}
 		lvs->hub_dev.drain_in_action = true;
-	} else {
-		if (lvs->skip_redirecting && disconnected) {
-			SPDK_NOTICELOG("change device connect state 1.\n");
-			lvs->hub_dev.state = HUBLVOL_NOT_CONNECTED;
-		}
+	}
+
+	if (disconnected && lvs->hub_dev.state == HUBLVOL_CONNECTED) {
+		SPDK_NOTICELOG("change device connect state.\n");
+		lvs->hub_dev.state = HUBLVOL_NOT_CONNECTED;
+		lvs->hub_dev.dev_in_remove = true;
 	}
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
+
+	if (lvs->hub_dev.dev_in_remove) {
+		spdk_thread_send_msg(lvs->hub_dev.thread, spdk_trigger_failover_msg, lvs);
+	}
 }
 
 void
@@ -3296,14 +3257,13 @@ void
 spdk_lvs_connect_hublvol(struct spdk_lvol_store *lvs, const char *remote_bdev)
 {
 	SPDK_NOTICELOG("Connect remote hublvol %s.\n", remote_bdev);
-	pthread_mutex_lock(&g_lvol_stores_mutex);
 	snprintf(lvs->remote_bdev, sizeof(lvs->remote_bdev), "%s", remote_bdev);
-	lvs->hub_dev.thread = spdk_get_thread();	
-	pthread_mutex_unlock(&g_lvol_stores_mutex);
+	lvs->hub_dev.thread = spdk_get_thread();
 	
 	if (lvs->hub_dev.state != HUBLVOL_CONNECTED || lvs->hub_dev.state != HUBLVOL_CONNECTING_IN_PROCCESS) {
-		lvs->hub_dev.state = HUBLVOL_NOT_CONNECTED;
-		spdk_thread_send_msg(lvs->hub_dev.thread, spdk_lvs_open_hub_bdev, lvs);
+		if (!lvs->hub_dev.dev_in_remove) {
+			spdk_thread_send_msg(lvs->hub_dev.thread, spdk_lvs_open_hub_bdev, lvs);
+		}
 	}
 	return;
 }
@@ -3381,16 +3341,6 @@ spdk_lvol_set_leader(struct spdk_lvol *lvol)
 	lvol->leader = true;
 	lvol->failed_on_update = false;
 	lvol->update_in_progress = false;
-	// TAILQ_FOREACH(lvs, &g_lvol_stores, link) {
-	// 	TAILQ_FOREACH(lvol, &lvs->lvols, link) {
-	// 		if (spdk_uuid_compare(uuid, &lvol->uuid) == 0) {
-	// 			lvol->leader = leader;
-	// 			lvol->failed_on_update = false;
-	// 			lvol->update_in_progress = false;
-	// 		}
-	// 	}
-	// }
-
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
 }
 
@@ -3427,9 +3377,7 @@ spdk_set_leader_all(struct spdk_lvol_store *t_lvs, bool lvs_leader, bool bs_nonl
 				lvol->update_in_progress = false;
 			}
 
-			lvs->leader = lvs_leader;
-
-			if (!lvs->leader && lvs->secondary ) {
+			if (!lvs_leader && lvs->secondary ) {
 				tmp_lvs = lvs;
 				if (lvs->hub_dev.state == HUBLVOL_CONNECTED) {
 					SPDK_NOTICELOG("enable redirect IO mode.\n");
@@ -3437,14 +3385,17 @@ spdk_set_leader_all(struct spdk_lvol_store *t_lvs, bool lvs_leader, bool bs_nonl
 					lvs->hub_dev.drain_in_action = false;
 				}
 			}
+			lvs->leader = lvs_leader;
 		}
 	}
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
 
 	if (tmp_lvs) {
 		if (tmp_lvs->hub_dev.state != HUBLVOL_CONNECTED) {
-			SPDK_NOTICELOG("try to reconnect hub dev and enable redirect IO mode.\n");
-			spdk_lvs_open_hub_bdev(tmp_lvs);
+			if (!lvs->hub_dev.drain_in_action && !lvs->hub_dev.dev_in_remove) {
+				SPDK_NOTICELOG("try to reconnect hub dev and enable redirect IO mode.\n");
+				spdk_lvs_open_hub_bdev(tmp_lvs);
+			}
 		}
 	}
 }
