@@ -122,15 +122,13 @@ struct spdk_lvs_redirect {
 };
 
 struct spdk_redirect_dev {
-	struct spdk_bdev	*bdev;
-	struct spdk_bdev_desc	*desc;	
-	struct spdk_bdev_module *module;
+	struct spdk_bdev_desc	*desc;
 	struct spdk_thread		*thread;
 	struct spdk_poller *cleanup_poller;
 	uint64_t redirected_io_count;
 	enum hublvol_state	state;
 	spdk_drain_op_submit_handle	submit_cb;
-	bool dev_removed;
+	bool dev_in_remove;
 	bool drain_in_action;
 };
 

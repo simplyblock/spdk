@@ -139,12 +139,6 @@ struct spdk_bs_request_set {
 	TAILQ_ENTRY(spdk_bs_request_set) link;
 };
 
-struct spdk_bs_redirect_request {
-	void *bdev_io;
-	struct spdk_io_channel *ch;
-	TAILQ_ENTRY(spdk_bs_redirect_request)	entry;
-};
-
 void bs_call_cpl(struct spdk_bs_cpl *cpl, int bserrno);
 
 spdk_bs_sequence_t *bs_sequence_start_bs(struct spdk_io_channel *channel,

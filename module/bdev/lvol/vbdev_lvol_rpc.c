@@ -524,7 +524,6 @@ cleanup:
 }
 
 SPDK_RPC_REGISTER("bdev_lvol_delete_hublvol", rpc_bdev_lvol_delete_hublvol, SPDK_RPC_RUNTIME)
-//********************************************************************************************** */
 
 struct rpc_bdev_lvol_register {
 	char *uuid;
@@ -688,7 +687,6 @@ cleanup:
 
 SPDK_RPC_REGISTER("bdev_lvol_register", rpc_bdev_lvol_register, SPDK_RPC_RUNTIME)
 
-//********************************************************************************************** */
 struct rpc_bdev_lvs_dump {
 	char *uuid;
 	char *lvs_name;
@@ -1140,7 +1138,6 @@ rpc_clone_lvol_register_cb(void *cb_arg, struct spdk_lvol *lvol, int lvolerrno) 
 		goto cleanup;
 	}
 
-	// vbdev_lvol_create_clone(lvol, req.clone_name, rpc_bdev_lvol_clone_update_cb, request);
 	vbdev_lvol_update_snapshot_clone(lvol, origlvol, true, rpc_bdev_lvol_clone_update_cb, ctx->request);
 
 cleanup:
@@ -1591,47 +1588,6 @@ cleanup:
 }
 
 SPDK_RPC_REGISTER("bdev_lvol_resize", rpc_bdev_lvol_resize, SPDK_RPC_RUNTIME)
-
-// static void
-// rpc_bdev_lvol_update(struct spdk_jsonrpc_request *request,
-// 		     const struct spdk_json_val *params)
-// {
-// 	struct rpc_bdev_lvol_resize req = {};
-// 	struct spdk_bdev *bdev;
-// 	struct spdk_lvol *lvol;
-
-// 	SPDK_INFOLOG(lvol_rpc, "Resizing lvol\n");
-
-// 	if (spdk_json_decode_object(params, rpc_bdev_lvol_resize_decoders,
-// 				    SPDK_COUNTOF(rpc_bdev_lvol_resize_decoders),
-// 				    &req)) {
-// 		SPDK_INFOLOG(lvol_rpc, "spdk_json_decode_object failed\n");
-// 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
-// 						 "spdk_json_decode_object failed");
-// 		goto cleanup;
-// 	}
-
-// 	bdev = spdk_bdev_get_by_name(req.name);
-// 	if (bdev == NULL) {
-// 		SPDK_ERRLOG("no bdev for provided name %s\n", req.name);
-// 		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
-// 		goto cleanup;
-// 	}
-
-// 	lvol = vbdev_lvol_get_from_bdev(bdev);
-// 	if (lvol == NULL) {
-// 		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
-// 		goto cleanup;
-// 	}
-
-
-// 	vbdev_lvol_resize(lvol, req.size_in_mib * 1024 * 1024, rpc_bdev_lvol_resize_cb, request);
-
-// cleanup:
-// 	free_rpc_bdev_lvol_resize(&req);
-// }
-
-// SPDK_RPC_REGISTER("bdev_lvol_update", rpc_bdev_lvol_update, SPDK_RPC_RUNTIME)
 
 struct rpc_set_ro_lvol_bdev {
 	char *name;
@@ -2377,7 +2333,6 @@ struct rpc_bdev_lvol_leadership {
 	char *uuid;
 	char *lvs_name;
 	bool lvs_leadership;
-	// bool leadership;
 	bool bs_nonleadership;
 };
 
@@ -2412,7 +2367,6 @@ rpc_bdev_lvol_set_leader_all(struct spdk_jsonrpc_request *request,
 	}
 
 	spdk_set_leader_all(lvs, req.lvs_leadership, req.bs_nonleadership);
-	// spdk_set_leader_all(lvs, req.leadership, false);
 	spdk_jsonrpc_send_bool_response(request, true);
 cleanup:
 	free(req.uuid);
