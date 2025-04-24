@@ -1676,22 +1676,11 @@ lvol_resize_done(void *cb_arg, int lvolerrno)
 	free(req);
 }
 
-static int
-spdk_lvol_resize_freeze_poller(void *cb_arg)
-{
-	struct spdk_lvol_req *req = cb_arg;
-	struct spdk_lvol *lvol = req->lvol;
-	spdk_poller_unregister(&req->poller);
-	SPDK_NOTICELOG("Freeze poller.\n");
-	spdk_blob_sync_md(lvol->blob, lvol_resize_done, req);
-	return -1;
-}
-
 static void
 lvol_blob_resize_cb(void *cb_arg, int bserrno)
 {
 	struct spdk_lvol_req *req = cb_arg;
-	// struct spdk_lvol *lvol = req->lvol;
+	struct spdk_lvol *lvol = req->lvol;
 
 	if (bserrno != 0) {
 		req->cb_fn(req->cb_arg, bserrno);
@@ -1699,39 +1688,7 @@ lvol_blob_resize_cb(void *cb_arg, int bserrno)
 		return;
 	}
 
-	SPDK_NOTICELOG("Lvolstore resize set freeze poller.\n");
-	req->poller = spdk_poller_register(spdk_lvol_resize_freeze_poller, req, 250000); // Delay of 250ms
-}
-
-static int
-spdk_lvol_resize_unfreeze_poller(void *cb_arg)
-{
-	struct spdk_lvol_req *req = cb_arg;
-	struct spdk_lvol *lvol = req->lvol;
-	spdk_poller_unregister(&req->poller);
-	SPDK_NOTICELOG("unfreeze poller.\n");
-	spdk_blob_resize_unfreeze(lvol->blob, lvol_resize_done, req);	
-	return -1;
-}
-
-void
-spdk_lvol_resize_unfreeze(struct spdk_lvol *lvol,
-		 spdk_lvol_op_complete cb_fn, void *cb_arg)
-{
-	struct spdk_lvol_req *req;
-
-	req = calloc(1, sizeof(*req));
-	if (!req) {
-		SPDK_ERRLOG("Cannot alloc memory for lvol request pointer for unfreeze the lvol\n");
-		cb_fn(cb_arg, -ENOMEM);
-		return;
-	}
-	req->cb_fn = cb_fn;
-	req->cb_arg = cb_arg;
-	req->lvol = lvol;
-
-	SPDK_NOTICELOG("Lvolstore resize set unfreeze poller.\n");
-	req->poller = spdk_poller_register(spdk_lvol_resize_unfreeze_poller, req, 250000); // Delay of 250ms
+	spdk_blob_sync_md(lvol->blob, lvol_resize_done, req);
 }
 
 void
