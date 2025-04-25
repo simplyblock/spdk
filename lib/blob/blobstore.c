@@ -9372,9 +9372,8 @@ bs_resize_freeze_cpl(void *cb_arg, int rc)
 
 	ctx->rc = blob_resize(ctx->blob, ctx->sz);
 
-	ctx->cb_fn(ctx->cb_arg, rc);
-	free(ctx);
-
+	// ctx->cb_fn(ctx->cb_arg, rc);
+	// free(ctx);
 	blob_unfreeze_io(ctx->blob, bs_resize_unfreeze_cpl, ctx);
 }
 
