@@ -391,29 +391,33 @@ def bdev_raid_get_bdevs(client, category):
     return client.call('bdev_raid_get_bdevs', params)
 
 
-def bdev_raid_create(client, name, raid_level, base_bdevs, strip_size_kb=None, uuid=None, superblock=None):
+def bdev_raid_create(client, name, raid_level, base_bdevs, strip_size=None, strip_size_kb=None, uuid=None, superblock=False, io_unmap_limit=2000):
     """Create raid bdev. Either strip size arg will work but one is required.
+
     Args:
         name: user defined raid bdev name
+        strip_size (deprecated): strip size of raid bdev in KB, supported values like 8, 16, 32, 64, 128, 256, etc
+        strip_size_kb: strip size of raid bdev in KB, supported values like 8, 16, 32, 64, 128, 256, etc
         raid_level: raid level of raid bdev, supported values 0
         base_bdevs: Space separated names of Nvme bdevs in double quotes, like "Nvme0n1 Nvme1n1 Nvme2n1"
-        strip_size_kb: strip size of raid bdev in KB, supported values like 8, 16, 32, 64, 128, 256, etc
         uuid: UUID for this raid bdev (optional)
         superblock: information about raid bdev will be stored in superblock on each base bdev,
                     disabled by default due to backward compatibility
+
     Returns:
         None
     """
-    params = dict()
-    params['name'] = name
-    params['raid_level'] = raid_level
-    params['base_bdevs'] = base_bdevs
-    if strip_size_kb is not None:
+    params = {'name': name, 'raid_level': raid_level, 'base_bdevs': base_bdevs, 'superblock': superblock, 'io_unmap_limit': io_unmap_limit}
+
+    if strip_size:
+        params['strip_size'] = strip_size
+
+    if strip_size_kb:
         params['strip_size_kb'] = strip_size_kb
-    if uuid is not None:
+
+    if uuid:
         params['uuid'] = uuid
-    if superblock is not None:
-        params['superblock'] = superblock
+
     return client.call('bdev_raid_create', params)
 
 
