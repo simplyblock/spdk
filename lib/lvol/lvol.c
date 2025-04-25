@@ -3201,7 +3201,7 @@ spdk_set_leader_all(struct spdk_lvol_store *t_lvs, bool lvs_leader, bool bs_nonl
 
 	if (tmp_lvs) {
 		if (tmp_lvs->hub_dev.state != HUBLVOL_CONNECTED) {
-			if (!lvs->hub_dev.drain_in_action && !lvs->hub_dev.dev_in_remove) {
+			if (!tmp_lvs->hub_dev.drain_in_action && !tmp_lvs->hub_dev.dev_in_remove) {
 				SPDK_NOTICELOG("try to reconnect hub dev and enable redirect IO mode.\n");
 				spdk_lvs_open_hub_bdev(tmp_lvs);
 			}
