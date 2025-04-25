@@ -304,6 +304,29 @@ spdk_bit_array_store_mask(const struct spdk_bit_array *ba, void *mask)
 }
 
 void
+spdk_bit_array_store_mask_one_page(const struct spdk_bit_array *ba, void *mask, uint64_t fisrtbit, uint64_t lastbit)
+{
+	uint32_t size, i, skip;
+	// uint32_t num_bits = spdk_bit_array_capacity(ba);
+	assert(spdk_bit_array_capacity(ba) >= lastbit);
+	size = (lastbit - fisrtbit) / CHAR_BIT;
+	if (!fisrtbit) {
+		skip = 0;
+	} else {
+		skip = fisrtbit / CHAR_BIT;
+	}
+	memcpy(mask, ba->words + skip, size);
+
+	for (i = 0; i < (lastbit - fisrtbit) % CHAR_BIT; i++) {
+		if (spdk_bit_array_get(ba, i + size * CHAR_BIT)) {
+			((uint8_t *)mask)[size] |= (1U << i);
+		} else {
+			((uint8_t *)mask)[size] &= ~(1U << i);
+		}
+	}
+}
+
+void
 spdk_bit_array_load_mask(struct spdk_bit_array *ba, const void *mask)
 {
 	uint32_t size, i;
@@ -442,6 +465,21 @@ spdk_bit_pool_allocate_bit(struct spdk_bit_pool *pool)
 
 	spdk_bit_array_set(pool->array, bit_index);
 	pool->lowest_free_bit = spdk_bit_array_find_first_clear(pool->array, bit_index);
+	pool->free_count--;
+	return bit_index;
+}
+
+uint32_t
+spdk_bit_pool_allocate_specific_bit(struct spdk_bit_pool *pool, uint32_t bit_index)
+{
+
+	if (bit_index == UINT32_MAX) {
+		return UINT32_MAX;
+	}
+
+	spdk_bit_array_set(pool->array, bit_index);
+	pool->lowest_free_bit = spdk_bit_array_find_first_clear(pool->array, 0);
+
 	pool->free_count--;
 	return bit_index;
 }

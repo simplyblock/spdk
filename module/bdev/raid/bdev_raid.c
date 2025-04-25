@@ -18,7 +18,7 @@
 #define RAID_OFFSET_BLOCKS_INVALID	UINT64_MAX
 #define RAID_BDEV_PROCESS_MAX_QD	16
 
-#define RAID_BDEV_PROCESS_WINDOW_SIZE_KB_DEFAULT	1024
+#define RAID_BDEV_PROCESS_WINDOW_SIZE_KB_DEFAULT 1024
 #define RAID_BDEV_PROCESS_MAX_BANDWIDTH_MB_SEC_DEFAULT	0
 
 static bool g_shutdown_started = false;
@@ -396,6 +396,9 @@ raid_bdev_free(struct raid_bdev *raid_bdev)
 	raid_bdev_free_superblock(raid_bdev);
 	free(raid_bdev->base_bdev_info);
 	free(raid_bdev->bdev.name);
+	if (raid_bdev->level == RAID0) {
+		spdk_spin_destroy(&raid_bdev->used_lock);
+	}
 	free(raid_bdev);
 }
 
@@ -602,6 +605,121 @@ raid_bdev_verify_dix_reftag(struct iovec *iovs, int iovcnt, void *md_buf,
 	return rc;
 }
 
+static struct spdk_thread *
+get_thread_from_bdev_io(struct spdk_bdev_io *bdev_io)
+{
+    // Get the I/O channel associated with the bdev_io
+    struct spdk_io_channel *io_channel = spdk_bdev_io_get_io_channel(bdev_io);
+    
+    // Get the SPDK thread associated with the I/O channel
+    struct spdk_thread *thread = spdk_io_channel_get_thread(io_channel);
+    
+    return thread;
+}
+
+
+static void
+_raid0_submit_null_payload_request_(void *_raid_io)
+{
+	struct raid_bdev_io *raid_io = _raid_io;
+	raid_io->raid_bdev->module->submit_null_payload_request(raid_io);
+}
+
+static void 
+process_queued_io(struct raid_bdev_io *raid_io) {
+	struct raid_bdev *raid_bdev;
+    struct spdk_thread *io_thread, *current_thread;
+    struct spdk_bdev_io *bdev_io;   
+	// If there is a valid raid_io retrieved from the queue, process it.
+	if (raid_io && raid_io->raid_bdev->level == RAID0) {
+		raid_bdev = raid_io->raid_bdev;
+		bdev_io = spdk_bdev_io_from_ctx(raid_io);
+		io_thread = get_thread_from_bdev_io(bdev_io); // Get the thread associated with this I/O.
+		current_thread = spdk_get_thread(); // Get the current executing thread.
+
+		// Thread Mismatch Handling: Check if the current thread matches the I/O thread.
+		if (current_thread == io_thread) {
+			// If we are in the correct thread, submit the request directly.
+			raid_bdev->module->submit_null_payload_request(raid_io);
+		} else {
+			// If we are not in the correct thread, send the request to the correct thread.
+			spdk_thread_send_msg(io_thread, _raid0_submit_null_payload_request_, raid_io);
+		}
+		return;
+	}
+	return;
+}
+
+static void
+bdev_io_unmap_limiter(struct raid_bdev_io *raid_io, bool unmap_done, bool new_unmap)
+{
+	assert(raid_io != NULL);
+    struct raid_bdev_io *queued_raid_io = NULL;
+    struct raid_bdev *raid_bdev = raid_io->raid_bdev;
+
+    // Ensure the raid_bdev is operating at RAID0 level. This assert is for debugging purposes.
+	assert(raid_bdev != NULL);
+    assert(raid_bdev->level == RAID0);	
+    // Check if the limit on inflight unmap operations is reached, and the operation isn't complete yet.
+    if ((raid_bdev->io_unmap_limit > 0 && raid_bdev->unmap_inflight > raid_bdev->io_unmap_limit && !unmap_done) ) {        
+        if (new_unmap) {
+            spdk_spin_lock(&raid_bdev->used_lock);			
+            // Add the current raid_io to the unmap queue if increase is true.
+            TAILQ_INSERT_TAIL(&raid_bdev->unmap_queue, raid_io, entries);
+            spdk_spin_unlock(&raid_bdev->used_lock);
+        }
+        return;
+    }
+	    
+    // If new_unmap is true, increase the inflight counter and submit the request.
+    if (new_unmap) {
+		bool direct_send = true;
+        spdk_spin_lock(&raid_bdev->used_lock);		
+		if (!TAILQ_EMPTY(&raid_bdev->unmap_queue)) {
+			TAILQ_INSERT_TAIL(&raid_bdev->unmap_queue, raid_io, entries);
+			queued_raid_io = TAILQ_FIRST(&raid_bdev->unmap_queue);
+        	if (queued_raid_io) {
+            	raid_bdev->unmap_inflight++; // Increase inflight count for the next operation.
+        	}
+			TAILQ_REMOVE(&raid_bdev->unmap_queue, queued_raid_io, entries); // Remove it from the queue.
+			direct_send = false;			
+		} else {
+			direct_send = true;
+			raid_bdev->unmap_inflight++;
+		}
+        spdk_spin_unlock(&raid_bdev->used_lock);
+
+		if (direct_send) {
+        	raid_bdev->module->submit_null_payload_request(raid_io);        	
+		} else {
+			if (queued_raid_io) {
+				process_queued_io(queued_raid_io);
+			}
+		}
+		return;
+    }
+
+    // If the unmap is completed, decrease the inflight count.
+    if (unmap_done) {
+    	spdk_spin_lock(&raid_bdev->used_lock);
+    	raid_bdev->unmap_inflight--;
+		// If there are more operations in the queue, retrieve and remove the first entry.
+		if (!TAILQ_EMPTY(&raid_bdev->unmap_queue)) {        
+			queued_raid_io = TAILQ_FIRST(&raid_bdev->unmap_queue);
+			if (queued_raid_io) {
+				raid_bdev->unmap_inflight++; // Increase inflight count for the next operation.
+			}
+			TAILQ_REMOVE(&raid_bdev->unmap_queue, queued_raid_io, entries); // Remove it from the queue.
+		}
+		spdk_spin_unlock(&raid_bdev->used_lock);
+
+		if (queued_raid_io) {
+			process_queued_io(queued_raid_io);
+		}
+    	return;
+	}
+}
+
 void
 raid_bdev_io_complete(struct raid_bdev_io *raid_io, enum spdk_bdev_io_status status)
 {
@@ -619,7 +737,7 @@ raid_bdev_io_complete(struct raid_bdev_io *raid_io, enum spdk_bdev_io_status sta
 		 * split I/O (the higher LBAs). Then, we submit the second part and set offset to 0.
 		 */
 		if (raid_io->split.offset != 0) {
-			raid_io->offset_blocks = bdev_io->u.bdev.offset_blocks;
+			raid_io->offset_blocks = bdev_io->u.bdev.offset_blocks & MASK_OUT_PRIORITY_CLASS;
 			raid_io->md_buf = bdev_io->u.bdev.md_buf;
 
 			if (status == SPDK_BDEV_IO_STATUS_SUCCESS) {
@@ -649,6 +767,12 @@ raid_bdev_io_complete(struct raid_bdev_io *raid_io, enum spdk_bdev_io_status sta
 		}
 	}
 
+	if (raid_io->raid_bdev->level == RAID0) {
+		if (raid_io->type == SPDK_BDEV_IO_TYPE_UNMAP) {
+			bdev_io_unmap_limiter(raid_io, true, false);
+		}
+	}
+
 	if (spdk_unlikely(raid_io->completion_cb != NULL)) {
 		raid_io->completion_cb(raid_io, status);
 	} else {
@@ -659,10 +783,14 @@ raid_bdev_io_complete(struct raid_bdev_io *raid_io, enum spdk_bdev_io_status sta
 
 			rc = raid_bdev_remap_dix_reftag(bdev_io->u.bdev.md_buf,
 							bdev_io->u.bdev.num_blocks, bdev_io->bdev,
-							bdev_io->u.bdev.offset_blocks);
+							bdev_io->u.bdev.offset_blocks & MASK_OUT_PRIORITY_CLASS);
 			if (rc != 0) {
 				status = SPDK_BDEV_IO_STATUS_FAILED;
 			}
+		}
+
+		if (status == SPDK_BDEV_IO_STATUS_FAILED) {
+			SPDK_NOTICELOG("FAILED in proccess IO RAID.\n");	
 		}
 		spdk_bdev_io_complete(bdev_io, status);
 	}
@@ -942,10 +1070,11 @@ raid_bdev_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_i
 	struct raid_bdev_io *raid_io = (struct raid_bdev_io *)bdev_io->driver_ctx;
 
 	raid_bdev_io_init(raid_io, spdk_io_channel_get_ctx(ch), bdev_io->type,
-			  bdev_io->u.bdev.offset_blocks, bdev_io->u.bdev.num_blocks,
+			  bdev_io->u.bdev.offset_blocks & MASK_OUT_PRIORITY_CLASS, bdev_io->u.bdev.num_blocks,
 			  bdev_io->u.bdev.iovs, bdev_io->u.bdev.iovcnt, bdev_io->u.bdev.md_buf,
 			  bdev_io->u.bdev.memory_domain, bdev_io->u.bdev.memory_domain_ctx);
-
+	raid_io->priority_class = (bdev_io->u.bdev.offset_blocks & PRIORITY_CLASS_MASK) >> PRIORITY_CLASS_BITS_POS;
+	if (raid_io->priority_class) { raid_io->raid_bdev->supports_priority_class = 1; }
 	spdk_trace_record(TRACE_BDEV_RAID_IO_START, 0, 0, (uintptr_t)raid_io, (uintptr_t)bdev_io);
 
 	switch (bdev_io->type) {
@@ -961,14 +1090,27 @@ raid_bdev_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_i
 		raid_bdev_submit_reset_request(raid_io);
 		break;
 
-	case SPDK_BDEV_IO_TYPE_FLUSH:
-	case SPDK_BDEV_IO_TYPE_UNMAP:
+	case SPDK_BDEV_IO_TYPE_FLUSH:	
 		if (raid_io->raid_bdev->process != NULL) {
 			/* TODO: rebuild support */
 			raid_bdev_io_complete(raid_io, SPDK_BDEV_IO_STATUS_FAILED);
 			return;
 		}
 		raid_io->raid_bdev->module->submit_null_payload_request(raid_io);
+		break;
+
+	case SPDK_BDEV_IO_TYPE_UNMAP:
+		if (raid_io->raid_bdev->process != NULL) {
+			/* TODO: rebuild support */
+			raid_bdev_io_complete(raid_io, SPDK_BDEV_IO_STATUS_FAILED);
+			return;
+		}
+
+		if (raid_io->raid_bdev->level == RAID0) {
+			bdev_io_unmap_limiter(raid_io, false, true);	
+		} else {
+			raid_io->raid_bdev->module->submit_null_payload_request(raid_io);
+		}
 		break;
 
 	default:
@@ -1488,7 +1630,7 @@ raid_bdev_init(void)
 static int
 _raid_bdev_create(const char *name, uint32_t strip_size, uint8_t num_base_bdevs,
 		  enum raid_level level, bool superblock_enabled, const struct spdk_uuid *uuid,
-		  struct raid_bdev **raid_bdev_out)
+		  struct raid_bdev **raid_bdev_out, uint32_t io_unmap_limit)
 {
 	struct raid_bdev *raid_bdev;
 	struct spdk_bdev *raid_bdev_gen;
@@ -1578,6 +1720,8 @@ _raid_bdev_create(const char *name, uint32_t strip_size, uint8_t num_base_bdevs,
 		base_info->raid_bdev = raid_bdev;
 	}
 
+	raid_bdev->supports_priority_class = 0;
+
 	/* strip_size_kb is from the rpc param.  strip_size is in blocks and used
 	 * internally and set later.
 	 */
@@ -1603,7 +1747,13 @@ _raid_bdev_create(const char *name, uint32_t strip_size, uint8_t num_base_bdevs,
 	raid_bdev_gen->module = &g_raid_if;
 	raid_bdev_gen->write_cache = 0;
 	spdk_uuid_copy(&raid_bdev_gen->uuid, uuid);
-
+	raid_bdev->io_unmap_limit = 0;
+	if (raid_bdev->level == RAID0) {
+		TAILQ_INIT(&raid_bdev->unmap_queue);
+		spdk_spin_init(&raid_bdev->used_lock);
+		raid_bdev->io_unmap_limit = io_unmap_limit;
+		raid_bdev->unmap_inflight = 0;
+	}
 	TAILQ_INSERT_TAIL(&g_raid_bdev_list, raid_bdev, global_link);
 
 	*raid_bdev_out = raid_bdev;
@@ -1629,7 +1779,7 @@ _raid_bdev_create(const char *name, uint32_t strip_size, uint8_t num_base_bdevs,
 int
 raid_bdev_create(const char *name, uint32_t strip_size, uint8_t num_base_bdevs,
 		 enum raid_level level, bool superblock_enabled, const struct spdk_uuid *uuid,
-		 struct raid_bdev **raid_bdev_out)
+		 struct raid_bdev **raid_bdev_out, uint32_t io_unmap_limit)
 {
 	struct raid_bdev *raid_bdev;
 	int rc;
@@ -1637,7 +1787,7 @@ raid_bdev_create(const char *name, uint32_t strip_size, uint8_t num_base_bdevs,
 	assert(uuid != NULL);
 
 	rc = _raid_bdev_create(name, strip_size, num_base_bdevs, level, superblock_enabled, uuid,
-			       &raid_bdev);
+			       &raid_bdev, io_unmap_limit);
 	if (rc != 0) {
 		return rc;
 	}
@@ -3514,7 +3664,7 @@ raid_bdev_create_from_sb(const struct raid_bdev_superblock *sb, struct raid_bdev
 	int rc;
 
 	rc = _raid_bdev_create(sb->name, (sb->strip_size * sb->block_size) / 1024, sb->num_base_bdevs,
-			       sb->level, true, &sb->uuid, &raid_bdev);
+			       sb->level, true, &sb->uuid, &raid_bdev, 0);
 	if (rc != 0) {
 		return rc;
 	}

@@ -116,6 +116,7 @@ blob_bs_dev_read(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void 
 	iov.iov_len = lba_count * b->bs_dev.blocklen;
 	/* The backing blob may be smaller than this blob, so zero any trailing bytes. */
 	zero_trailing_bytes(b, &iov, 1, lba, &lba_count);
+	b->blob->priority_class = dev->priority_class;
 
 	spdk_blob_io_read(b->blob, channel, payload, lba, lba_count,
 			  blob_bs_dev_read_cpl, cb_args);
@@ -130,6 +131,7 @@ blob_bs_dev_readv(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 
 	/* The backing blob may be smaller than this blob, so zero any trailing bytes. */
 	zero_trailing_bytes(b, iov, iovcnt, lba, &lba_count);
+	b->blob->priority_class = dev->priority_class;
 
 	spdk_blob_io_readv(b->blob, channel, iov, iovcnt, lba, lba_count,
 			   blob_bs_dev_read_cpl, cb_args);
@@ -145,6 +147,7 @@ blob_bs_dev_readv_ext(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 
 	/* The backing blob may be smaller than this blob, so zero any trailing bytes. */
 	zero_trailing_bytes(b, iov, iovcnt, lba, &lba_count);
+	b->blob->priority_class = dev->priority_class;
 
 	spdk_blob_io_readv_ext(b->blob, channel, iov, iovcnt, lba, lba_count,
 			       blob_bs_dev_read_cpl, cb_args, ext_opts);
@@ -195,14 +198,16 @@ blob_bs_is_range_valid(struct spdk_bs_dev *dev, uint64_t lba, uint64_t lba_count
 {
 	struct spdk_blob_bs_dev *b = (struct spdk_blob_bs_dev *)dev;
 	struct spdk_blob *blob = b->blob;
-	uint64_t	io_units_per_cluster;
+	uint64_t	page;
+	uint64_t	pages_per_cluster;
 
 	/* The lba here is supposed to be the first lba of cluster. lba_count
 	 * will typically be fixed e.g. 8192 for 4MiB cluster. */
 	assert(lba_count == blob->bs->cluster_sz / dev->blocklen);
 	assert(lba % lba_count == 0);
 
-	io_units_per_cluster = blob->bs->io_units_per_cluster;
+	pages_per_cluster = blob->bs->pages_per_cluster;
+	page = bs_io_unit_to_page(blob->bs, lba);
 
 	/* A blob will either have:
 	* - no backing bs_bdev (normal thick blob), or
@@ -210,9 +215,9 @@ blob_bs_is_range_valid(struct spdk_bs_dev *dev, uint64_t lba, uint64_t lba_count
 	* - blob backing bs_bdev (e.g snapshot)
 	* It may be possible that backing bs_bdev has lesser number of clusters
 	* than the child lvol blob because lvol blob has been expanded after
-	* taking snapshot. In such a case, page will be outside the cluster io_unit
+	* taking snapshot. In such a case, page will be outside the cluster page
 	* range of the backing dev. Always return true for zeroes backing bdev. */
-	return lba < blob->active.num_clusters * io_units_per_cluster;
+	return page < blob->active.num_clusters * pages_per_cluster;
 }
 
 static bool
@@ -257,7 +262,8 @@ bs_create_blob_bs_dev(struct spdk_blob *blob)
 		return NULL;
 	}
 	/* snapshot blob */
-	b->bs_dev.blockcnt = blob->active.num_clusters * blob->bs->io_units_per_cluster;
+	b->bs_dev.blockcnt = blob->active.num_clusters *
+			     blob->bs->pages_per_cluster * bs_io_unit_per_page(blob->bs);
 	b->bs_dev.blocklen = spdk_bs_get_io_unit_size(blob->bs);
 	b->bs_dev.create_channel = NULL;
 	b->bs_dev.destroy_channel = NULL;

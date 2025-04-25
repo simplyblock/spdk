@@ -3051,7 +3051,7 @@ bs_test_recover_cluster_count(void)
 	super_block.used_cluster_mask_len = 0x01;
 	super_block.used_blobid_mask_start = 0x03;
 	super_block.used_blobid_mask_len = 0x01;
-	super_block.md_page_size = g_phys_blocklen;
+	// super_block.md_page_size = g_phys_blocklen;
 	super_block.md_start = 0x04;
 	super_block.md_len = 0x40;
 	memset(super_block.bstype.bstype, 0, sizeof(super_block.bstype.bstype));
@@ -4473,7 +4473,7 @@ blob_insert_cluster_msg_test(void)
 	spdk_spin_unlock(&bs->used_lock);
 
 	blob_insert_cluster_on_md_thread(blob, cluster_num, new_cluster, extent_page, &md.page,
-					 blob_op_complete, NULL);
+					 false, blob_op_complete, NULL);
 	poll_threads();
 
 	CU_ASSERT(blob->active.clusters[cluster_num] != 0);
@@ -5037,7 +5037,7 @@ blob_thin_prov_rle(void)
 	CU_ASSERT(channel != NULL);
 
 	/* Target specifically second cluster in a blob as first allocation */
-	io_unit = bs_cluster_to_io_unit(bs, 1);
+	io_unit = bs_cluster_to_page(bs, 1) * bs_io_unit_per_page(bs);
 
 	/* Payload should be all zeros from unallocated clusters */
 	memset(payload_read, 0xFF, sizeof(payload_read));

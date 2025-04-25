@@ -14,6 +14,7 @@
 #include "spdk/stdinc.h"
 #include "spdk/blob.h"
 #include "spdk/uuid.h"
+#include "spdk/bdev_module.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -69,11 +70,8 @@ struct spdk_lvs_opts {
 	 * is being loaded, the lvolstore will not support external snapshots.
 	 */
 	spdk_bs_esnap_dev_create esnap_bs_dev_create;
-
-	/** Metadata page size */
-	uint32_t                md_page_size;
 } __attribute__((packed));
-SPDK_STATIC_ASSERT(sizeof(struct spdk_lvs_opts) == 92, "Incorrect size");
+SPDK_STATIC_ASSERT(sizeof(struct spdk_lvs_opts) == 88, "Incorrect size");
 
 /**
  * Initialize an spdk_lvs_opts structure to the defaults.
@@ -197,6 +195,9 @@ int spdk_lvs_destroy(struct spdk_lvol_store *lvol_store,
 int spdk_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz,
 		     bool thin_provisioned, enum lvol_clear_method clear_method,
 		     spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
+
+int spdk_lvol_create_hublvol(struct spdk_lvol_store *lvs, spdk_lvol_op_with_handle_complete cb_fn,
+ 				void *cb_arg);
 /**
  * Create snapshot of given lvol.
  *
@@ -207,6 +208,13 @@ int spdk_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz,
  */
 void spdk_lvol_create_snapshot(struct spdk_lvol *lvol, const char *snapshot_name,
 			       spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
+			
+void spdk_lvol_update_snapshot_clone(struct spdk_lvol *lvol, 
+			struct spdk_lvol *origlvol, 
+			spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
+			
+void spdk_lvol_update_clone(struct spdk_lvol *lvol,
+			spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
 
 /**
  * Create clone of given snapshot.
@@ -240,6 +248,8 @@ void spdk_lvol_create_clone(struct spdk_lvol *lvol, const char *clone_name,
 int spdk_lvol_create_esnap_clone(const void *esnap_id, uint32_t id_len, uint64_t size_bytes,
 				 struct spdk_lvol_store *lvs, const char *clone_name,
 				 spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
+
+int spdk_lvol_copy_blob(struct spdk_lvol *lvol);
 
 /**
  * Rename lvol with new_name.
@@ -284,7 +294,7 @@ void spdk_lvol_close(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *
  *
  * \param lvol Handle to lvol.
  * \param cb_fn Function to call for each lvol that clones this lvol.
- * \param cb_arg Context to pass with cb_fn.
+ * \param cb_arg Context to pass wtih cb_fn.
  * \return -ENOMEM if memory allocation failed, non-zero return from cb_fn(), or 0.
  */
 int spdk_lvol_iter_immediate_clones(struct spdk_lvol *lvol, spdk_lvol_iter_cb cb_fn, void *cb_arg);
@@ -297,11 +307,51 @@ int spdk_lvol_iter_immediate_clones(struct spdk_lvol *lvol, spdk_lvol_iter_cb cb
  */
 struct spdk_lvol *spdk_lvol_get_by_uuid(const struct spdk_uuid *uuid);
 
+void spdk_lvol_update_on_failover(struct spdk_lvol_store *lvs, struct spdk_lvol *lvol, bool send_md_thread);
+void lvol_update_on_failover(struct spdk_lvol_store *lvs, struct spdk_lvol *lvol, bool send_msg);
+void spdk_lvs_update_on_failover(struct spdk_lvol_store *lvs);
+void spdk_lvs_check_active_process(struct spdk_lvol_store *lvs, struct spdk_lvol *lvol, uint8_t type);
+bool spdk_lvs_nonleader_timeout(struct spdk_lvol_store *lvs);
+void spdk_lvs_change_leader_state(uint64_t groupid);
+bool spdk_lvs_trigger_leadership_switch(uint64_t *groupid);
+bool spdk_lvs_queued_rsp(struct spdk_lvol_store *lvs, struct spdk_bdev_io *bdev_io);
+void spdk_lvs_set_opts(struct spdk_lvol_store *lvs, uint64_t groupid, uint64_t port, 
+						bool primary, bool secondary);
+void spdk_lvs_open_hub_bdev(void * cb_arg);
+void spdk_lvs_connect_hublvol(struct spdk_lvol_store *lvs, const char *remote_bdev);
+void spdk_lvs_set_read_only(struct spdk_lvol_store *lvs, bool status);
+void spdk_lvs_set_failed_on_update(struct spdk_lvol_store *lvs, bool state);
+/**
+ * Get the lvol that has a particular UUID.
+ *
+ * \param uuid The lvs's UUID.
+ * \param leader The lvs's flag to set as leader or non leader.
+ * \return A pointer to the requested lvol on success, else NULL.
+ */
+void spdk_lvs_set_leader(struct spdk_lvol_store *lvs, bool leader);
+void spdk_lvol_set_leader_failed_on_update(struct spdk_lvol *lvol);
+
+/**
+ * Get the lvol that has a particular UUID.
+ *
+ * \param uuid The lvol's UUID.
+ * \param leader The lvs's flag to set as leader or non leader.
+ * \return A pointer to the requested lvol on success, else NULL.
+ */
+void spdk_lvol_set_leader(struct spdk_lvol *lvol);
+
+/**
+ * set the leadership for all lvs and lvol.
+ *
+ * \param leader The lvs's flag to set as leader or non leader.
+ */
+void spdk_set_leader_all(struct spdk_lvol_store *t_lvs, bool lvs_leader, bool bs_leadership);
+
 /**
  * Get the lvol that has the specified name in the specified lvolstore.
  *
  * \param lvs_name Name of the lvolstore.
- * \param lvol_name Name of the lvol.
+ * \param lvol_name Name ofthe lvol.
  * \return A pointer to the requested lvol on success, else NULL.
  */
 struct spdk_lvol *spdk_lvol_get_by_names(const char *lvs_name, const char *lvol_name);
@@ -328,7 +378,7 @@ void spdk_lvs_load(struct spdk_bs_dev *bs_dev, spdk_lvs_op_with_handle_complete 
 /**
  * Load lvolstore from the given blobstore device with options.
  *
- * If lvs_opts is not NULL, it should be initialized with spdk_lvs_opts_init().
+ * If lvs_opts is not NULL, it should be initalized with spdk_lvs_opts_init().
  *
  * \param bs_dev Pointer to the blobstore device.
  * \param lvs_opts lvolstore options.
@@ -358,6 +408,8 @@ void spdk_lvs_grow(struct spdk_bs_dev *bs_dev, spdk_lvs_op_with_handle_complete 
  * \param cb_arg Completion callback custom arguments.
  */
 void spdk_lvs_grow_live(struct spdk_lvol_store *lvs, spdk_lvs_op_complete cb_fn, void *cb_arg);
+
+void spdk_lvs_update_live(struct spdk_lvol_store *lvs, uint64_t id, spdk_lvs_op_complete cb_fn, void *cb_arg);
 
 /**
  * Open a lvol.
