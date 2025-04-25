@@ -46,6 +46,8 @@ raid0_bdev_io_completion(struct spdk_bdev_io *bdev_io, bool success, void *cb_ar
 		}
 
 		raid_bdev_io_complete(raid_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+	} else if (spdk_bdev_io_get_status(bdev_io) == SPDK_BDEV_IO_STATUS_ABORTED) {
+		raid_bdev_io_complete(raid_io, SPDK_BDEV_IO_STATUS_ABORTED);
 	} else {
 		raid_bdev_io_complete(raid_io, SPDK_BDEV_IO_STATUS_FAILED);
 	}
