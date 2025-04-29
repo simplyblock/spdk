@@ -19,6 +19,10 @@ RUN pip install requests
 
 RUN cd spdk && git submodule update --init --depth 1
 
+RUN cd spdk && rm -rf isa-l_crypto 
+
+RUN cd spdk && git clone https://github.com/waldoweng/isa-l_crypto.git
+
 RUN cd spdk && scripts/pkgdep.sh --rdma --pmem --idxd
 
 RUN mkdir /tmp/pmem
