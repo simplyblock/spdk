@@ -4926,6 +4926,20 @@ nvmf_check_qpair_active(struct spdk_nvmf_request *req)
 	return false;
 }
 
+char *
+spdk_nvmf_request_nqn(struct spdk_nvmf_request *req, uint8_t idx)
+{
+	struct spdk_nvmf_qpair *qpair = req->qpair;
+	struct spdk_nvmf_ctrlr *ctrlr;
+	if (qpair->ctrlr && qpair->qid != 0) {
+		ctrlr = qpair->ctrlr;
+		if (ctrlr->subsys) {
+			return &ctrlr->subsys->subnqn[idx];
+		}
+	}
+	return NULL;
+}
+
 void
 spdk_nvmf_request_exec(struct spdk_nvmf_request *req)
 {

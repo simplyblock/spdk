@@ -4374,6 +4374,7 @@ uint32_t spdk_nvme_qpair_get_num_outstanding_reqs(struct spdk_nvme_qpair *qpair)
  * \param cmd Pointer to the submission queue command to be formatted.
  */
 void spdk_nvme_print_command(uint16_t qid, struct spdk_nvme_cmd *cmd);
+void spdk_nvme_print_command_s(uint16_t qid, struct spdk_nvme_cmd *cmd);
 
 /**
  * \brief Prints (SPDK_NOTICELOG) the contents of an NVMe completion queue entry.
@@ -4382,6 +4383,7 @@ void spdk_nvme_print_command(uint16_t qid, struct spdk_nvme_cmd *cmd);
  * \param cpl Pointer to the completion queue element to be formatted.
  */
 void spdk_nvme_print_completion(uint16_t qid, struct spdk_nvme_cpl *cpl);
+void spdk_nvme_print_completion_s(uint16_t qid, struct spdk_nvme_cpl *cpl);
 
 /**
  * Return the name of a digest.

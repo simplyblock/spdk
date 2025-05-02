@@ -225,6 +225,8 @@ DEFINE_STUB_V(nvmf_qpair_set_state, (struct spdk_nvmf_qpair *q, enum spdk_nvmf_q
 
 DEFINE_STUB_V(spdk_nvme_print_command, (uint16_t qid, struct spdk_nvme_cmd *cmd));
 DEFINE_STUB_V(spdk_nvme_print_completion, (uint16_t qid, struct spdk_nvme_cpl *cpl));
+DEFINE_STUB_V(spdk_nvme_print_command_s, (uint16_t qid, struct spdk_nvme_cmd *cmd));
+DEFINE_STUB_V(spdk_nvme_print_completion_s, (uint16_t qid, struct spdk_nvme_cpl *cpl));
 
 DEFINE_STUB(nvmf_transport_req_free,
 	    int,
