@@ -563,13 +563,15 @@ nvmf_tcp_request_get_buffers_abort(struct spdk_nvmf_tcp_req *tcp_req)
 	struct spdk_nvmf_tcp_req *tmp_req, *abort_req;
 
 	assert(tcp_req->state == TCP_REQUEST_STATE_NEED_BUFFER);
-
-	STAILQ_FOREACH_SAFE(abort_req, &tcp_group->control_msg_list->waiting_for_msg_reqs, control_msg_link,
-			    tmp_req) {
-		if (abort_req == tcp_req) {
-			STAILQ_REMOVE(&tcp_group->control_msg_list->waiting_for_msg_reqs, abort_req, spdk_nvmf_tcp_req,
-				      control_msg_link);
-			return;
+	
+	if (tcp_group->control_msg_list) {
+		STAILQ_FOREACH_SAFE(abort_req, &tcp_group->control_msg_list->waiting_for_msg_reqs, control_msg_link,
+					tmp_req) {
+			if (abort_req == tcp_req) {
+				STAILQ_REMOVE(&tcp_group->control_msg_list->waiting_for_msg_reqs, abort_req, spdk_nvmf_tcp_req,
+						control_msg_link);
+				return;
+			}
 		}
 	}
 
@@ -3551,7 +3553,7 @@ nvmf_tcp_poll_group_remove(struct spdk_nvmf_transport_poll_group *group,
 {
 	struct spdk_nvmf_tcp_poll_group	*tgroup;
 	struct spdk_nvmf_tcp_qpair		*tqpair;
-	// struct spdk_nvmf_tcp_req *tcp_req, *req_tmp;
+	struct spdk_nvmf_tcp_req *tcp_req, *req_tmp;
 	int				rc;
 
 	tgroup = SPDK_CONTAINEROF(group, struct spdk_nvmf_tcp_poll_group, group);
@@ -3577,14 +3579,14 @@ nvmf_tcp_poll_group_remove(struct spdk_nvmf_transport_poll_group *group,
 	}
 
 	/* Wipe the requests waiting for buffer from the waiting list */
-	// nvmf_tcp_qpair_set_state(tqpair, NVMF_TCP_QPAIR_STATE_EXITED);
-	// TAILQ_FOREACH_SAFE(tcp_req, &tqpair->tcp_req_working_queue, state_link, req_tmp) {
-	// 	if (tcp_req->state == TCP_REQUEST_STATE_NEED_BUFFER) {
-	// 		nvmf_tcp_request_get_buffers_abort(tcp_req);
-	// 	}
-	// }
+	nvmf_tcp_qpair_set_state(tqpair, NVMF_TCP_QPAIR_STATE_EXITED);
+	TAILQ_FOREACH_SAFE(tcp_req, &tqpair->tcp_req_working_queue, state_link, req_tmp) {
+		if (tcp_req->state == TCP_REQUEST_STATE_NEED_BUFFER) {
+			nvmf_tcp_request_get_buffers_abort(tcp_req);
+		}
+	}
 
-	// nvmf_tcp_drain_state_queue(tqpair, TCP_REQUEST_STATE_NEED_BUFFER);
+	nvmf_tcp_drain_state_queue(tqpair, TCP_REQUEST_STATE_NEED_BUFFER);
 
 	return rc;
 }
