@@ -8245,7 +8245,12 @@ bs_xattr_clone(void *arg, const char *name,
 static void
 bs_clone_newblob_open_cpl(void *cb_arg, struct spdk_blob *_blob, int bserrno)
 {
-	struct spdk_clone_snapshot_ctx *ctx = (struct spdk_clone_snapshot_ctx *)cb_arg;
+	struct spdk_clone_snapshot_ctx *ctx = (struct spdk_clone_snapshot_ctx *)cb_arg;	
+	if (bserrno != 0) {
+		ctx->bserrno = bserrno;
+		spdk_blob_close(ctx->original.blob, bs_clone_snapshot_cleanup_finish, ctx);
+		return;
+	}
 	struct spdk_blob *clone = _blob;
 
 	ctx->new.blob = clone;
@@ -8258,7 +8263,11 @@ static void
 bs_clone_newblob_create_cpl(void *cb_arg, spdk_blob_id blobid, int bserrno)
 {
 	struct spdk_clone_snapshot_ctx *ctx = (struct spdk_clone_snapshot_ctx *)cb_arg;
-
+	if (bserrno != 0) {
+		ctx->bserrno = bserrno;
+		spdk_blob_close(ctx->original.blob, bs_clone_snapshot_cleanup_finish, ctx);
+		return;
+	}
 	ctx->cpl.u.blobid.blobid = blobid;
 	spdk_bs_open_blob(ctx->original.blob->bs, blobid, bs_clone_newblob_open_cpl, ctx);
 }

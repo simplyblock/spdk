@@ -20,7 +20,7 @@ RUN cd spdk && scripts/pkgdep.sh --rdma --pmem
 
 RUN mkdir /tmp/pmem
 
-RUN sed -i "s/^#define SPDK_JSONRPC_RECV_BUF_SIZE.*/#define SPDK_JSONRPC_RECV_BUF_SIZE\t(32 * 1024 * 1024)/" /root/spdk/lib/jsonrpc/jsonrpc_internal.h
+RUN sed -i "s/^#define SPDK_JSONRPC_RECV_BUF_SIZE.*/#define SPDK_JSONRPC_RECV_BUF_SIZE\t(2 * 1024 * 1024)/" /root/spdk/lib/jsonrpc/jsonrpc_internal.h
 
 RUN sed -i "s/^#define SPDK_BDEV_QOS_MIN_IOS_PER_SEC.*/#define SPDK_BDEV_QOS_MIN_IOS_PER_SEC\t200/" /root/spdk/lib/bdev/bdev.c
 
