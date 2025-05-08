@@ -8247,6 +8247,7 @@ bs_clone_newblob_open_cpl(void *cb_arg, struct spdk_blob *_blob, int bserrno)
 {
 	struct spdk_clone_snapshot_ctx *ctx = (struct spdk_clone_snapshot_ctx *)cb_arg;	
 	if (bserrno != 0) {
+		//TODO we should delete the newblob first
 		ctx->bserrno = bserrno;
 		spdk_blob_close(ctx->original.blob, bs_clone_snapshot_cleanup_finish, ctx);
 		return;
@@ -10421,12 +10422,16 @@ spdk_bs_delete_blob_non_leader(struct spdk_blob_store *bs, struct spdk_blob *blo
 		return -EBUSY;
 	}
 
-	/*
-	 * Remove the blob from the blob_store list now, to ensure it does not
-	 *  get returned after this point by blob_lookup().
-	 */
-
-	if (update_clone) {
+	if (update_clone) {		
+		struct spdk_blob *tmp_blob = blob_lookup(blob->bs, blob->id);
+		if (tmp_blob) {
+			/*
+			* Remove the blob from the blob_store list now, to ensure it does not
+			*  get returned after this point by blob_lookup().
+			*/
+			spdk_bit_array_clear(blob->bs->open_blobids, blob->id);
+			RB_REMOVE(spdk_blob_tree, &blob->bs->open_blobs, tmp_blob);
+		}
 		struct spdk_blob *snapshot = blob;
 		struct spdk_blob_list *parent_snapshot_entry = NULL;
 		struct spdk_blob_list *snapshot_entry = NULL;

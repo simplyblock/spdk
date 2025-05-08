@@ -2952,6 +2952,7 @@ spdk_wait_for_redirected_io_cleanup(void *arg)
 	if (__atomic_load_n(&lvs->hub_dev.redirected_io_count, __ATOMIC_SEQ_CST) == 0) {
 		SPDK_NOTICELOG("All redirected I/Os completed. Proceeding to cleanup.\n");
 		spdk_poller_unregister(&lvs->hub_dev.cleanup_poller);
+		lvs->hub_dev.cleanup_poller = NULL;
 		spdk_bs_drain_channel_queued(lvs->blobstore, lvs->hub_dev.submit_cb, spdk_trigger_failover_cpl, lvs);
 		return -1;
 	}
@@ -2966,8 +2967,10 @@ static void
 spdk_trigger_failover_msg(void *arg)
 {
 	struct spdk_lvol_store *lvs = arg;
-	lvs->hub_dev.cleanup_poller = spdk_poller_register(
-	spdk_wait_for_redirected_io_cleanup, lvs, 200000 );// check every 200ms
+	if (!lvs->hub_dev.cleanup_poller) {
+		lvs->hub_dev.cleanup_poller = spdk_poller_register(
+			spdk_wait_for_redirected_io_cleanup, lvs, 200000 );// check every 200ms
+	}
 }
 
 static void
