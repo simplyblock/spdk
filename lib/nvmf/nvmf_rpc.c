@@ -761,7 +761,7 @@ nvmf_rpc_listen_paused(struct spdk_nvmf_subsystem *subsystem,
 		if (nvmf_subsystem_find_listener(subsystem, &ctx->trid)) {
 			SPDK_ERRLOG("Listener already exists\n");
 			spdk_jsonrpc_send_error_response(ctx->request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
-							 "Invalid parameters");
+							 "Listener already exists");
 			ctx->response_sent = true;
 			break;
 		}

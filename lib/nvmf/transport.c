@@ -861,7 +861,7 @@ spdk_nvmf_request_free_buffers(struct spdk_nvmf_request *req,
 			       struct spdk_nvmf_transport *transport)
 {
 	uint32_t i;
-
+	SPDK_NOTICELOG("free buf group %p \n", group);
 	for (i = 0; i < req->iovcnt; i++) {
 		spdk_iobuf_put(group->buf_cache, req->iov[i].iov_base, req->iov[i].iov_len);
 		req->iov[i].iov_base = NULL;
@@ -976,9 +976,14 @@ spdk_nvmf_request_get_buffers(struct spdk_nvmf_request *req,
 	assert(nvmf_transport_use_iobuf(transport));
 
 	req->iovcnt = 0;
+	SPDK_NOTICELOG("get buf group %p \n", group);
 	rc = nvmf_request_get_buffers(req, group, transport, length, transport->opts.io_unit_size, false);
 	if (spdk_unlikely(rc == -ENOMEM && transport->ops->req_get_buffers_done == NULL)) {
 		spdk_nvmf_request_free_buffers(req, group, transport);
+	}
+
+	if (req->cmd->nvme_cmd.opc == SPDK_NVME_OPC_ASYNC_EVENT_REQUEST) {
+		SPDK_NOTICELOG("getting buf for async event.\n");
 	}
 
 	return rc;

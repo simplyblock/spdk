@@ -147,7 +147,8 @@ static struct spdk_lvol* lvol_delete_requests_dequeue(void) {
 }
 
 // Check if a specific lvol is already in the queue
-static bool lvol_delete_requests_contains(struct spdk_lvol *lvol) {
+bool 
+lvol_delete_requests_contains(struct spdk_lvol *lvol) {
 	// Flag to track if lvol is found
 	bool found = false;
 	struct lvol_delete_request *current = NULL;
