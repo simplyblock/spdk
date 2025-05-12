@@ -222,6 +222,7 @@ struct spdk_blob_store {
 	uint64_t			total_w;
 	uint64_t			r_io;
 	uint64_t			w_io;
+	uint64_t	r_latancy_us;
 	struct spdk_poller		*poller;
 
 

@@ -93,6 +93,7 @@ bs_sequence_start(struct spdk_io_channel *_channel, struct spdk_bs_cpl *cpl,
 	set->back_channel = back_channel;
 
 	set->priority_class = channel->bs->priority_class;
+	set->start_time = 0;
 	set->cb_args.cb_fn = bs_sequence_completion;
 	set->cb_args.cb_arg = set;
 	set->cb_args.channel = channel->dev_channel;

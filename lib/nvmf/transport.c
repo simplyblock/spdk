@@ -861,8 +861,9 @@ spdk_nvmf_request_free_buffers(struct spdk_nvmf_request *req,
 			       struct spdk_nvmf_transport *transport)
 {
 	uint32_t i;
-	// SPDK_NOTICELOG("free buf group %p \n", group);
+
 	for (i = 0; i < req->iovcnt; i++) {
+		// SPDK_NOTICELOG("free buf %p group %p \n", req->iov[i].iov_base, group);
 		spdk_iobuf_put(group->buf_cache, req->iov[i].iov_base, req->iov[i].iov_len);
 		req->iov[i].iov_base = NULL;
 		req->iov[i].iov_len = 0;

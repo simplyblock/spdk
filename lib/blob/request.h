@@ -106,6 +106,7 @@ struct spdk_bs_request_set {
 	struct spdk_bs_dev_cb_args	cb_args;
 
 	int priority_class;
+	uint64_t start_time;
 
 	union {
 		struct {

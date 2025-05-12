@@ -1702,6 +1702,7 @@ blob_load_cpl_extents_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		ctx->num_pages = 1;
 		ctx->next_extent_page = 0;
 	} else {
+		blob->bs->r_latancy_us += spdk_get_ticks() - seq->start_time;
 		page = &ctx->pages[0];
 		crc = blob_md_page_calc_crc(page);
 		if (crc != page->crc) {
@@ -1733,6 +1734,7 @@ blob_load_cpl_extents_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 			lba = bs_md_page_to_lba(blob->bs, blob->active.extent_pages[i]);
 			ctx->next_extent_page = i + 1;
 			blob->bs->r_io++;
+			seq->start_time = spdk_get_ticks();
 			bs_sequence_read_dev(seq, &ctx->pages[0], lba,
 					     bs_byte_to_lba(blob->bs, SPDK_BS_PAGE_SIZE),
 					     blob_load_cpl_extents_cpl, ctx);
@@ -1781,7 +1783,7 @@ blob_load_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		page = &ctx->pages[ctx->num_pages - 2];
 		current_page = page->next;
 	}
-
+	blob->bs->r_latancy_us += spdk_get_ticks() - seq->start_time;
 	if (bserrno) {
 		SPDK_ERRLOG("Metadata page %d read failed for blobid 0x%" PRIx64 ": %d\n",
 			    current_page, blob->id, bserrno);
@@ -1813,6 +1815,7 @@ blob_load_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		ctx->num_pages++;
 		ctx->pages = tmp_pages;
 		blob->bs->r_io++;
+		seq->start_time = spdk_get_ticks();
 		bs_sequence_read_dev(seq, &ctx->pages[ctx->num_pages - 1],
 				     next_lba,
 				     bs_byte_to_lba(blob->bs, sizeof(*page)),
@@ -1898,6 +1901,7 @@ blob_load(spdk_bs_sequence_t *seq, struct spdk_blob *blob,
 
 	blob->state = SPDK_BLOB_STATE_LOADING;
 	bs->r_io++;
+	seq->start_time = spdk_get_ticks();
 	bs_sequence_read_dev(seq, &ctx->pages[0], lba,
 			     bs_byte_to_lba(bs, SPDK_BS_PAGE_SIZE),
 			     blob_load_cpl, ctx);
@@ -2936,7 +2940,7 @@ bs_mark_dirty_write(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
 	struct spdk_bs_mark_dirty *ctx = cb_arg;
 	int rc;
-
+	ctx->bs->r_latancy_us += spdk_get_ticks() - seq->start_time;
 	if (bserrno != 0) {
 		bs_mark_dirty_write_cpl(seq, ctx, bserrno);
 		return;
@@ -2985,6 +2989,7 @@ bs_mark_dirty(spdk_bs_sequence_t *seq, struct spdk_blob_store *bs,
 		return;
 	}
 	bs->r_io++;
+	seq->start_time = spdk_get_ticks();
 	bs_sequence_read_dev(seq, ctx->super, bs_page_to_lba(bs, 0),
 			     bs_byte_to_lba(bs, sizeof(*ctx->super)),
 			     bs_mark_dirty_write, ctx);
@@ -4357,10 +4362,15 @@ spdk_bs_monitoring_poller(void *cb_arg) {
 		bs->total += ccm_io;
 		bs->total_r += bs->r_io;
 		bs->total_w += bs->w_io;
-		SPDK_NOTICELOG("LSTAT [%" PRIu64 "]  [%" PRIu64 "]  [%" PRIu64 "]  [%" PRIu64 "]  [%" PRIu64 "]  [%" PRIu64 "]\n",
-							bs->total, bs->total_r, bs->total_w, ccm_io, bs->r_io, bs->w_io);		
+		double avg_latency_us = 0;
+		if (bs->r_latancy_us) {
+			avg_latency_us = (double)(bs->r_latancy_us * 1e6 / spdk_get_ticks_hz()) / bs->r_io;
+		}
+		SPDK_NOTICELOG("LSTAT [%" PRIu64 "]  [%" PRIu64 "]  [%" PRIu64 "]  [%" PRIu64 "]  [%" PRIu64 "]  [%" PRIu64 "] r_latancy[%.4f] \n",
+							bs->total, bs->total_r, bs->total_w, ccm_io, bs->r_io, bs->w_io, avg_latency_us);		
 		bs->w_io = 0;
 		bs->r_io = 0;
+		bs->r_latancy_us = 0;
 		return SPDK_POLLER_BUSY;
 	}
 	return -1;
@@ -4472,6 +4482,7 @@ bs_alloc(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts, struct spdk_blob_st
 		/* FIXME: this is a lie but don't know how to get a proper error code here */
 		return -ENOMEM;
 	}
+	bs->r_latancy_us = 0;
 	bs->poller = spdk_poller_register(spdk_bs_monitoring_poller, bs, 1000000); // Delay of 50ms
 
 	*_ctx = ctx;
@@ -5022,7 +5033,7 @@ bs_load_used_blobids_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
 	struct spdk_bs_load_ctx *ctx = cb_arg;
 	int rc;
-
+	ctx->bs->r_latancy_us += spdk_get_ticks() - seq->start_time;
 	/* The type must be correct */
 	assert(ctx->mask->type == SPDK_MD_MASK_TYPE_USED_BLOBIDS);
 
@@ -5051,7 +5062,7 @@ bs_load_used_clusters_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	struct spdk_bs_load_ctx *ctx = cb_arg;
 	uint64_t		lba, lba_count, mask_size;
 	int			rc;
-
+	ctx->bs->r_latancy_us += spdk_get_ticks() - seq->start_time;
 	if (bserrno != 0) {
 		bs_load_ctx_fail(ctx, bserrno);
 		return;
@@ -5096,6 +5107,7 @@ bs_load_used_clusters_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	lba = bs_page_to_lba(ctx->bs, ctx->super->used_blobid_mask_start);
 	lba_count = bs_page_to_lba(ctx->bs, ctx->super->used_blobid_mask_len);
 	ctx->bs->r_io++;
+	seq->start_time = spdk_get_ticks();
 	bs_sequence_read_dev(seq, ctx->mask, lba, lba_count,
 			     bs_load_used_blobids_cpl, ctx);
 }
@@ -5106,7 +5118,7 @@ bs_load_used_pages_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	struct spdk_bs_load_ctx *ctx = cb_arg;
 	uint64_t		lba, lba_count, mask_size;
 	int			rc;
-
+	ctx->bs->r_latancy_us += spdk_get_ticks() - seq->start_time;
 	if (bserrno != 0) {
 		bs_load_ctx_fail(ctx, bserrno);
 		return;
@@ -5146,6 +5158,7 @@ bs_load_used_pages_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	lba = bs_page_to_lba(ctx->bs, ctx->super->used_cluster_mask_start);
 	lba_count = bs_page_to_lba(ctx->bs, ctx->super->used_cluster_mask_len);
 	ctx->bs->r_io++;
+	seq->start_time = spdk_get_ticks();
 	bs_sequence_read_dev(seq, ctx->mask, lba, lba_count,
 			     bs_load_used_clusters_cpl, ctx);
 }
@@ -5167,6 +5180,7 @@ bs_load_read_used_pages(struct spdk_bs_load_ctx *ctx)
 	lba = bs_page_to_lba(ctx->bs, ctx->super->used_page_mask_start);
 	lba_count = bs_page_to_lba(ctx->bs, ctx->super->used_page_mask_len);
 	ctx->bs->r_io++;
+	ctx->seq->start_time = spdk_get_ticks();
 	bs_sequence_read_dev(ctx->seq, ctx->mask, lba, lba_count,
 			     bs_load_used_pages_cpl, ctx);
 }
@@ -5176,7 +5190,7 @@ bs_load_used_blobids_cpl_clean_mode(spdk_bs_sequence_t *seq, void *cb_arg, int b
 {
 	struct spdk_bs_load_ctx *ctx = cb_arg;
 	int rc;
-
+	ctx->bs->r_latancy_us += spdk_get_ticks() - seq->start_time;
 	/* The type must be correct */
 	assert(ctx->mask->type == SPDK_MD_MASK_TYPE_USED_BLOBIDS);
 
@@ -5206,7 +5220,7 @@ bs_load_used_clusters_cpl_clean_mode(spdk_bs_sequence_t *seq, void *cb_arg, int 
 	struct spdk_bs_load_ctx *ctx = cb_arg;
 	uint64_t		lba, lba_count, mask_size;
 	int			rc;
-
+	ctx->bs->r_latancy_us += spdk_get_ticks() - seq->start_time;
 	if (bserrno != 0) {
 		bs_load_ctx_fail(ctx, bserrno);
 		return;
@@ -5251,6 +5265,7 @@ bs_load_used_clusters_cpl_clean_mode(spdk_bs_sequence_t *seq, void *cb_arg, int 
 	lba = bs_page_to_lba(ctx->bs, ctx->super->used_blobid_mask_start);
 	lba_count = bs_page_to_lba(ctx->bs, ctx->super->used_blobid_mask_len);
 	ctx->bs->r_io++;
+	seq->start_time = spdk_get_ticks();
 	bs_sequence_read_dev(seq, ctx->mask, lba, lba_count,
 			     bs_load_used_blobids_cpl_clean_mode, ctx);
 }
@@ -5261,7 +5276,7 @@ bs_load_used_pages_cpl_clean_mode(spdk_bs_sequence_t *seq, void *cb_arg, int bse
 	struct spdk_bs_load_ctx *ctx = cb_arg;
 	uint64_t		lba, lba_count, mask_size;
 	int			rc;
-
+	ctx->bs->r_latancy_us += spdk_get_ticks() - seq->start_time;
 	if (bserrno != 0) {
 		bs_load_ctx_fail(ctx, bserrno);
 		return;
@@ -5301,6 +5316,7 @@ bs_load_used_pages_cpl_clean_mode(spdk_bs_sequence_t *seq, void *cb_arg, int bse
 	lba = bs_page_to_lba(ctx->bs, ctx->super->used_cluster_mask_start);
 	lba_count = bs_page_to_lba(ctx->bs, ctx->super->used_cluster_mask_len);
 	ctx->bs->r_io++;
+	seq->start_time = spdk_get_ticks();
 	bs_sequence_read_dev(seq, ctx->mask, lba, lba_count,
 			     bs_load_used_clusters_cpl_clean_mode, ctx);
 }
@@ -5322,6 +5338,7 @@ bs_load_read_used_pages_clean_mode(struct spdk_bs_load_ctx *ctx)
 	lba = bs_page_to_lba(ctx->bs, ctx->super->used_page_mask_start);
 	lba_count = bs_page_to_lba(ctx->bs, ctx->super->used_page_mask_len);
 	ctx->bs->r_io++;
+	ctx->seq->start_time = spdk_get_ticks();
 	bs_sequence_read_dev(ctx->seq, ctx->mask, lba, lba_count,
 			     bs_load_used_pages_cpl_clean_mode, ctx);
 }
@@ -5585,7 +5602,7 @@ bs_load_replay_extent_page_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrn
 	struct spdk_bs_load_ctx *ctx = cb_arg;
 	uint32_t page_num;
 	uint64_t i;
-
+	ctx->bs->r_latancy_us += spdk_get_ticks() - seq->start_time;
 	if (bserrno != 0) {
 		spdk_free(ctx->extent_pages);
 		SPDK_ERRLOG("Recover failed 2 read extent page error.\n");
@@ -5638,7 +5655,7 @@ bs_load_replay_extent_pages(struct spdk_bs_load_ctx *ctx)
 	}
 
 	batch = bs_sequence_to_batch(ctx->seq, bs_load_replay_extent_page_cpl, ctx);
-
+	ctx->seq->start_time = spdk_get_ticks();
 	for (i = 0; i < ctx->num_extent_pages; i++) {
 		page = ctx->extent_page_num[i];
 		assert(page < ctx->super->md_len);
@@ -5657,7 +5674,7 @@ bs_load_replay_md_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	struct spdk_bs_load_ctx *ctx = cb_arg;
 	uint32_t page_num;
 	struct spdk_blob_md_page *page;
-
+	ctx->bs->r_latancy_us += spdk_get_ticks() - seq->start_time;
 	if (bserrno != 0) {
 		SPDK_ERRLOG("Read md page failed.\n");
 		bs_load_ctx_fail(ctx, bserrno);
@@ -5704,6 +5721,7 @@ bs_load_replay_cur_md_page(struct spdk_bs_load_ctx *ctx)
 	assert(ctx->cur_page < ctx->super->md_len);
 	lba = bs_md_page_to_lba(ctx->bs, ctx->cur_page);
 	ctx->bs->r_io++;
+	ctx->seq->start_time = spdk_get_ticks();
 	bs_sequence_read_dev(ctx->seq, ctx->page, lba,
 			     bs_byte_to_lba(ctx->bs, SPDK_BS_PAGE_SIZE),
 			     bs_load_replay_md_cpl, ctx);
@@ -5763,7 +5781,7 @@ bs_load_only_used_blobid_pages_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bs
 {
 	struct spdk_bs_load_ctx *ctx = cb_arg;
 	int			rc;
-
+	ctx->bs->r_latancy_us += spdk_get_ticks() - seq->start_time;
 	if (bserrno != 0) {
 		bs_load_ctx_fail(ctx, bserrno);
 		return;
@@ -5812,6 +5830,7 @@ bs_load_read_only_used_blobid_pages(struct spdk_bs_load_ctx *ctx)
 	lba = bs_page_to_lba(ctx->bs, ctx->super->used_blobid_mask_start);
 	lba_count = bs_page_to_lba(ctx->bs, ctx->super->used_blobid_mask_len);
 	ctx->bs->r_io++;
+	ctx->seq->start_time = spdk_get_ticks();
 	bs_sequence_read_dev(ctx->seq, ctx->mask, lba, lba_count,
 			     bs_load_only_used_blobid_pages_cpl, ctx);
 }
@@ -5882,7 +5901,7 @@ bs_load_super_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
 	struct spdk_bs_load_ctx *ctx = cb_arg;
 	int rc;
-
+	ctx->bs->r_latancy_us += spdk_get_ticks() - seq->start_time;
 	rc = bs_super_validate(ctx->super, ctx->bs);
 	if (rc != 0) {
 		// print_packet_format((void *)ctx->super, sizeof(*ctx->super), 20);
@@ -6015,6 +6034,7 @@ spdk_bs_load(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 
 	/* Read the super block */
 	bs->r_io++;
+	ctx->seq->start_time = spdk_get_ticks();
 	bs_sequence_read_dev(ctx->seq, ctx->super, bs_page_to_lba(bs, 0),
 			     bs_byte_to_lba(bs, sizeof(*ctx->super)),
 			     bs_load_super_cpl, ctx);
@@ -6378,7 +6398,7 @@ static void
 bs_dump_read_md_page_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
 	struct spdk_bs_load_ctx *ctx = cb_arg;
-
+	ctx->bs->r_latancy_us += spdk_get_ticks() - seq->start_time;
 	if (bserrno != 0) {
 		spdk_free(ctx->page);
 		ctx->page = NULL;		
@@ -6410,6 +6430,7 @@ bs_dump_read_md_page(spdk_bs_sequence_t *seq, void *cb_arg)
 	assert(ctx->cur_page < ctx->super->md_len);
 	lba = bs_page_to_lba(ctx->bs, ctx->super->md_start + ctx->cur_page);
 	ctx->bs->r_io++;
+	seq->start_time = spdk_get_ticks();
 	bs_sequence_read_dev(seq, ctx->page, lba,
 			     bs_byte_to_lba(ctx->bs, SPDK_BS_PAGE_SIZE),
 			     bs_dump_read_md_page_cpl, ctx);
@@ -6421,6 +6442,7 @@ bs_load_used_blobids_cpl_dump(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno
 	struct spdk_bs_load_ctx *ctx = cb_arg;
 	struct spdk_bs_md_mask *mask;
 	uint64_t	mask_size, comp_size;
+	ctx->bs->r_latancy_us += spdk_get_ticks() - seq->start_time;
 	/* The type must be correct */
 	assert(ctx->mask->type == SPDK_MD_MASK_TYPE_USED_BLOBIDS);
 
@@ -6471,6 +6493,7 @@ bs_load_read_used_blobid_page_dump(spdk_bs_sequence_t *seq, struct spdk_bs_load_
 	lba = bs_page_to_lba(ctx->bs, ctx->super->used_blobid_mask_start);
 	lba_count = bs_page_to_lba(ctx->bs, ctx->super->used_blobid_mask_len);
 	ctx->bs->r_io++;
+	seq->start_time = spdk_get_ticks();
 	bs_sequence_read_dev(seq, ctx->mask, lba, lba_count,
 			     bs_load_used_blobids_cpl_dump, ctx);
 }
@@ -6482,7 +6505,7 @@ bs_dump_super_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
 	struct spdk_bs_load_ctx *ctx = cb_arg;
 	int rc;
-
+	ctx->bs->r_latancy_us += spdk_get_ticks() - seq->start_time;
 	fprintf(ctx->fp, "Signature: \"%.8s\" ", ctx->super->signature);
 	if (memcmp(ctx->super->signature, SPDK_BS_SUPER_BLOCK_SIG,
 		   sizeof(ctx->super->signature)) != 0) {
@@ -6589,6 +6612,7 @@ spdk_bs_dump(struct spdk_bs_dev *dev, FILE *fp, spdk_bs_dump_print_xattr print_x
 
 	/* Read the super block */
 	bs->r_io++;
+	ctx->seq->start_time = spdk_get_ticks();
 	bs_sequence_read_dev(ctx->seq, ctx->super, bs_page_to_lba(bs, 0),
 			     bs_byte_to_lba(bs, sizeof(*ctx->super)),
 			     bs_dump_super_cpl, ctx);
@@ -6643,6 +6667,7 @@ spdk_bs_dumpv2(struct spdk_blob_store *bs, FILE *fp, spdk_bs_op_complete cb_fn, 
 
 	/* Read the super block */
 	bs->r_io++;
+	ctx->seq->start_time = spdk_get_ticks();
 	bs_sequence_read_dev(ctx->seq, ctx->super, bs_page_to_lba(bs, 0),
 			     bs_byte_to_lba(bs, sizeof(*ctx->super)),
 			     bs_dump_super_cpl, ctx);
@@ -7057,7 +7082,7 @@ bs_unload_read_super_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
 	struct spdk_bs_load_ctx	*ctx = cb_arg;
 	int rc;
-
+	ctx->bs->r_latancy_us += spdk_get_ticks() - seq->start_time;
 	if (bserrno != 0) {
 		bs_unload_finish(ctx, bserrno);
 		return;
@@ -7141,6 +7166,7 @@ spdk_bs_unload(struct spdk_blob_store *bs, spdk_bs_op_complete cb_fn, void *cb_a
 
 	/* Read super block */
 	bs->r_io++;
+	ctx->seq->start_time = spdk_get_ticks();
 	bs_sequence_read_dev(ctx->seq, ctx->super, bs_page_to_lba(bs, 0),
 			     bs_byte_to_lba(bs, sizeof(*ctx->super)),
 			     bs_unload_read_super_cpl, ctx);
@@ -7176,7 +7202,7 @@ bs_set_super_read_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
 	struct spdk_bs_set_super_ctx	*ctx = cb_arg;
 	int rc;
-
+	ctx->bs->r_latancy_us += spdk_get_ticks() - seq->start_time;
 	if (bserrno != 0) {
 		SPDK_ERRLOG("Unable to read super block of blobstore\n");
 		spdk_free(ctx->super);
@@ -7239,6 +7265,7 @@ spdk_bs_set_super(struct spdk_blob_store *bs, spdk_blob_id blobid,
 
 	/* Read super block */
 	bs->r_io++;
+	seq->start_time = spdk_get_ticks();
 	bs_sequence_read_dev(seq, ctx->super, bs_page_to_lba(bs, 0),
 			     bs_byte_to_lba(bs, sizeof(*ctx->super)),
 			     bs_set_super_read_cpl, ctx);
@@ -12071,7 +12098,7 @@ bs_load_grow_used_clusters_read_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int b
 	uint64_t		lba, lba_count;
 	uint64_t		dev_size;
 	uint64_t		total_clusters;
-
+	ctx->bs->r_latancy_us += spdk_get_ticks() - seq->start_time;
 	if (bserrno != 0) {
 		bs_load_ctx_fail(ctx, bserrno);
 		return;
@@ -12128,6 +12155,7 @@ bs_load_try_to_grow(struct spdk_bs_load_ctx *ctx)
 	lba = bs_page_to_lba(ctx->bs, ctx->super->used_cluster_mask_start);
 	lba_count = bs_page_to_lba(ctx->bs, ctx->super->used_cluster_mask_len);
 	ctx->bs->r_io++;
+	ctx->seq->start_time = spdk_get_ticks();
 	bs_sequence_read_dev(ctx->seq, ctx->mask, lba, lba_count,
 			     bs_load_grow_used_clusters_read_cpl, ctx);
 }
@@ -12137,7 +12165,7 @@ bs_grow_load_super_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
 	struct spdk_bs_load_ctx *ctx = cb_arg;
 	int rc;
-
+	ctx->bs->r_latancy_us += spdk_get_ticks() - seq->start_time;
 	rc = bs_super_validate(ctx->super, ctx->bs);
 	if (rc != 0) {
 		bs_load_ctx_fail(ctx, rc);
@@ -12257,7 +12285,7 @@ bs_grow_live_load_super_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	struct spdk_bs_grow_ctx *ctx = cb_arg;
 	uint64_t dev_size, total_clusters, used_cluster_mask_len, max_used_cluster_mask;
 	int rc;
-
+	ctx->bs->r_latancy_us += spdk_get_ticks() - seq->start_time;
 	if (bserrno != 0) {
 		bs_grow_live_done(ctx, bserrno);
 		return;
@@ -12354,6 +12382,7 @@ spdk_bs_grow_live(struct spdk_blob_store *bs,
 
 	/* Read the super block */
 	bs->r_io++;
+	ctx->seq->start_time = spdk_get_ticks();
 	bs_sequence_read_dev(ctx->seq, ctx->super, bs_page_to_lba(bs, 0),
 			     bs_byte_to_lba(bs, sizeof(*ctx->super)),
 			     bs_grow_live_load_super_cpl, ctx);
@@ -12817,7 +12846,7 @@ bs_update_replay_extent_page_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bser
 	struct spdk_bs_update_ctx *ctx = cb_arg;
 	uint32_t page_num;
 	uint64_t i;
-
+	ctx->bs->r_latancy_us += spdk_get_ticks() - seq->start_time;
 	if (bserrno != 0) {
 		SPDK_ERRLOG("Read extent md page failed 2.\n");
 		bs_update_live_done(ctx, -ENOTCONN);
@@ -12868,7 +12897,7 @@ bs_update_replay_extent_pages(struct spdk_bs_update_ctx *ctx)
 	}
 
 	batch = bs_sequence_to_batch(ctx->seq, bs_update_replay_extent_page_cpl, ctx);
-
+	ctx->seq->start_time = spdk_get_ticks();
 	for (i = 0; i < ctx->num_extent_pages; i++) {
 		page = ctx->extent_page_num[i];
 		assert(page < ctx->super->md_len);
@@ -12887,7 +12916,7 @@ bs_update_replay_md_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	struct spdk_bs_update_ctx *ctx = cb_arg;
 	uint32_t page_num;
 	struct spdk_blob_md_page *page;
-
+	ctx->bs->r_latancy_us += spdk_get_ticks() - seq->start_time;
 	if (bserrno != 0) {
 		SPDK_ERRLOG("Read md page failed.\n");
 		bs_update_live_done(ctx, -ENOTCONN);
@@ -12932,6 +12961,7 @@ bs_update_replay_cur_md_page(struct spdk_bs_update_ctx *ctx)
 	assert(ctx->cur_page < ctx->super->md_len);
 	lba = bs_md_page_to_lba(ctx->bs, ctx->cur_page);
 	ctx->bs->r_io++;
+	ctx->seq->start_time = spdk_get_ticks();
 	bs_sequence_read_dev(ctx->seq, ctx->page, lba,
 			     bs_byte_to_lba(ctx->bs, SPDK_BS_PAGE_SIZE),
 			     bs_update_replay_md_cpl, ctx);
@@ -13009,7 +13039,7 @@ bs_update_only_used_blobid_pages_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int 
 {
 	struct spdk_bs_update_ctx *ctx = cb_arg;
 	int			rc;
-
+	ctx->bs->r_latancy_us += spdk_get_ticks() - seq->start_time;
 	if (bserrno != 0) {
 		// read failed
 		bs_update_live_done(ctx, -ENOTCONN);
@@ -13058,6 +13088,7 @@ bs_update_read_only_used_blobid_pages(struct spdk_bs_update_ctx *ctx)
 	lba = bs_page_to_lba(ctx->bs, ctx->super->used_blobid_mask_start);
 	lba_count = bs_page_to_lba(ctx->bs, ctx->super->used_blobid_mask_len);
 	ctx->bs->r_io++;
+	ctx->seq->start_time = spdk_get_ticks();
 	bs_sequence_read_dev(ctx->seq, ctx->mask, lba, lba_count,
 			     bs_update_only_used_blobid_pages_cpl, ctx);
 }
@@ -13067,7 +13098,7 @@ bs_update_super_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
 	struct spdk_bs_update_ctx *ctx = cb_arg;
 	int rc;
-
+	ctx->bs->r_latancy_us += spdk_get_ticks() - seq->start_time;
 	if (bserrno < 0) {
 		// read superblock failed
 		bs_update_live_done(ctx, -ENOTCONN);
@@ -13142,6 +13173,7 @@ spdk_bs_update_live(struct spdk_blob_store *bs, bool failover, uint64_t id,
 
 	/* Read the super block */
 	bs->r_io++;
+	ctx->seq->start_time = spdk_get_ticks();
 	bs_sequence_read_dev(ctx->seq, ctx->super, bs_page_to_lba(bs, 0),
 			     bs_byte_to_lba(bs, sizeof(*ctx->super)),
 			     bs_update_super_cpl, ctx);
@@ -13226,6 +13258,7 @@ spdk_bs_grow(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 
 	/* Read the super block */
 	bs->r_io++;
+	ctx->seq->start_time = spdk_get_ticks();
 	bs_sequence_read_dev(ctx->seq, ctx->super, bs_page_to_lba(bs, 0),
 			     bs_byte_to_lba(bs, sizeof(*ctx->super)),
 			     bs_grow_load_super_cpl, ctx);
