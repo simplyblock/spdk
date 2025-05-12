@@ -1534,13 +1534,13 @@ poll_group_update_subsystem(struct spdk_nvmf_poll_group *group,
 				      group,
 				      ns_info->num_blocks,
 				      spdk_bdev_get_num_blocks(ns->bdev));
-			SPDK_NOTICELOG("Namespace resized: subsystem_id %u,"
-				      " nsid %u, pg %p, old %" PRIu64 ", new %" PRIu64 "\n",
-				      subsystem->id,
-				      ns->nsid,
-				      group,
-				      ns_info->num_blocks,
-				      spdk_bdev_get_num_blocks(ns->bdev));
+			// SPDK_NOTICELOG("Namespace resized: subsystem_id %u,"
+			// 	      " nsid %u, pg %p, old %" PRIu64 ", new %" PRIu64 "\n",
+			// 	      subsystem->id,
+			// 	      ns->nsid,
+			// 	      group,
+			// 	      ns_info->num_blocks,
+			// 	      spdk_bdev_get_num_blocks(ns->bdev));
 			ns_changed = true;
 		} else if (ns_info->anagrpid != ns->anagrpid) {
 			/* Namespace is still there but ANA group ID has changed */

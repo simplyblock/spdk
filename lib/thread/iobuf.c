@@ -740,7 +740,7 @@ spdk_iobuf_get(struct spdk_iobuf_channel *ch, uint64_t len,
 		/* The last one is the one we'll return */
 		buf = bufs[i];
 	}
-	SPDK_NOTICELOG("get cache_count %d buf %p \n", pool->cache_count, buf);
+	// SPDK_NOTICELOG("get cache_count %d buf %p \n", pool->cache_count, buf);
 	return (char *)buf;
 }
 
@@ -779,7 +779,7 @@ spdk_iobuf_put(struct spdk_iobuf_channel *ch, void *buf, uint64_t len)
 
 		STAILQ_INSERT_HEAD(&pool->cache, iobuf_buf, stailq);
 		pool->cache_count++;
-		SPDK_NOTICELOG("put cache_count %d buf %p \n", pool->cache_count, buf);
+		// SPDK_NOTICELOG("put cache_count %d buf %p \n", pool->cache_count, buf);
 		/* The cache size may exceed the configured amount. We always dequeue from the
 		 * central pool in batches of known size, so wait until at least a batch
 		 * has been returned to actually return the buffers to the central pool. */
@@ -787,7 +787,7 @@ spdk_iobuf_put(struct spdk_iobuf_channel *ch, void *buf, uint64_t len)
 		if (pool->cache_count >= pool->cache_size + sz) {
 			struct spdk_iobuf_buffer *bufs[IOBUF_BATCH_SIZE];
 			size_t i;
-			SPDK_NOTICELOG("return cache_count %d \n", pool->cache_count);
+			// SPDK_NOTICELOG("return cache_count %d \n", pool->cache_count);
 			for (i = 0; i < sz; i++) {
 				bufs[i] = STAILQ_FIRST(&pool->cache);
 				STAILQ_REMOVE_HEAD(&pool->cache, stailq);
