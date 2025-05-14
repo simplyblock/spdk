@@ -14083,23 +14083,21 @@ snapshot_backup_poller(void *ctx) {
 	// event loop
 	struct spdk_blob *blob = ctx;
 
-	/* Optimization: since the max number of jobs is not too large, we can save branch predictions by just changing counters in a first loop 
-	and then trying to start or retry jobs under one branch prediction for overall failure in a second loop
-	*/
-
-	for (int i = 0; i < blob->nmax_flush_jobs; ++i) {
-		struct t_flush_job *job = &blob->flush_jobs[i];
-		if (job->status == FLUSH_IS_SUCCEEDED || job->status == FLUSH_IS_ABORTED) {
-			--blob->nflush_jobs_current;
-			const uint64_t dev_pages_per_cluster = blob->bs->cluster_sz / blob->dev_page_size;
-			// if this job succeeded and was on the prior array, then this job is fully done if it has no more dev pages to flush in its cluster
-			blob->nflush_jobs_on_prior_array -= (job->status == FLUSH_IS_SUCCEEDED) && (blob->nflush_jobs_on_prior_array > 0) && (job->dev_page_number == (blob->current_array_ordinal != 3 ? dev_pages_per_cluster - 1 : 0));
-		} else if (job->status == FLUSH_IS_FAILED) {
-			--blob->nflush_jobs_current;
-			++blob->nretries_current;
+	if (blob->nflush_jobs_current > 0) {
+		for (int i = 0; i < blob->nmax_flush_jobs; ++i) {
+			struct t_flush_job *job = &blob->flush_jobs[i];
+			if (job->status == FLUSH_IS_SUCCEEDED || job->status == FLUSH_IS_ABORTED) {
+				--blob->nflush_jobs_current;
+				const uint64_t dev_pages_per_cluster = blob->bs->cluster_sz / blob->dev_page_size;
+				// if this job succeeded and was on the prior array, then this job is fully done if it has no more dev pages to flush in its cluster
+				blob->nflush_jobs_on_prior_array -= (job->status == FLUSH_IS_SUCCEEDED) && (blob->nflush_jobs_on_prior_array > 0) && (job->dev_page_number == (blob->current_array_ordinal != 3 ? dev_pages_per_cluster - 1 : 0));
+			} else if (job->status == FLUSH_IS_FAILED) {
+				--blob->nflush_jobs_current;
+				++blob->nretries_current;
+			}
 		}
 	}
-
+	
 	// do not start or retry a job if overall status is failure
 	if (!(blob->nretries_current && blob->nretries_current >= blob->nmax_retries)) {
 		bool nomem = false;
