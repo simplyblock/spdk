@@ -1633,12 +1633,14 @@ vbdev_lvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_
 
 	if (lvs->secondary && (!lvs->leader && !lvs->update_in_progress) && !lvs->skip_redirecting ) {
 		if (io_type) {
+			__atomic_add_fetch(&lvs->current_io, 1, __ATOMIC_SEQ_CST);
 			vbdev_redirect_request_to_hublvol(lvol, ch, bdev_io);
 			return;
 		}		
 	}
 
 	if (lvs->primary && lvol->hublvol) {
+		__atomic_add_fetch(&lvs->current_io, 1, __ATOMIC_SEQ_CST);
 		vbdev_hublvol_submit_request(ch, bdev_io);
 		return;
 	}

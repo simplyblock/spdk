@@ -167,6 +167,10 @@ struct spdk_lvol_store {
 	bool				skip_redirecting;
 	bool 				secondary;
 	int 				subsystem_port;
+	struct spdk_poller *redirect_poller;
+	struct spdk_poller *hublvol_poller;
+	uint64_t			total_io;
+	uint64_t			current_io;
 	struct spdk_lvs_redirect lvol_map;	
 	struct spdk_redirect_dev hub_dev;
 	char	remote_bdev[SPDK_LVOL_NAME_MAX];
