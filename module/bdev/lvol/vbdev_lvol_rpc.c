@@ -139,6 +139,7 @@ rpc_bdev_lvol_create_lvstore(struct spdk_jsonrpc_request *request,
 	} else {
 		clear_method = LVS_CLEAR_WITH_UNMAP;
 	}
+	req.not_evict_lvstore_md_pages = true;
 
 	rc = vbdev_lvs_create(req.bdev_name, req.lvs_name, req.cluster_sz, clear_method,
 			      req.num_md_pages_per_cluster_ratio, req.not_evict_lvstore_md_pages, rpc_lvol_store_construct_cb, request);
@@ -186,7 +187,8 @@ rpc_bdev_lvol_create_lvstore_persistent(struct spdk_jsonrpc_request *request,
 	} else {
 		clear_method = LVS_CLEAR_WITH_UNMAP;
 	}
-
+	req.not_evict_lvstore_md_pages = true;
+	
 	rc = vbdev_lvs_create_persistent(req.bdev_name, req.lvs_name, req.cluster_sz, clear_method,
 			      req.num_md_pages_per_cluster_ratio, req.not_evict_lvstore_md_pages, rpc_lvol_store_construct_cb, request);
 	if (rc < 0) {
@@ -483,6 +485,7 @@ rpc_bdev_lvol_create(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
+	req.sync_fetch = true;
 	req.tiering_info = 0;
 	req.tiering_info |= req.is_tiered ? TIERED_BIT : 0;
 	req.tiering_info |= req.force_fetch ? FORCE_FETCH_BIT : 0;
@@ -969,6 +972,7 @@ rpc_bdev_lvol_snapshot(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
+	req.sync_fetch = true;
 	req.tiering_info = 0;
 	req.tiering_info |= req.is_tiered ? TIERED_BIT : 0;
 	req.tiering_info |= req.force_fetch ? FORCE_FETCH_BIT : 0;
@@ -1235,6 +1239,7 @@ rpc_bdev_lvol_clone(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
+	req.sync_fetch = true;
 	req.tiering_info = 0;
 	req.tiering_info |= req.is_tiered ? TIERED_BIT : 0;
 	req.tiering_info |= req.force_fetch ? FORCE_FETCH_BIT : 0;
@@ -3047,6 +3052,7 @@ rpc_bdev_lvol_set_tiering_info(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
+	req.sync_fetch = true;
 	req.tiering_info = 0;
 	req.tiering_info |= req.is_tiered ? TIERED_BIT : 0;
 	req.tiering_info |= req.force_fetch ? FORCE_FETCH_BIT : 0;
