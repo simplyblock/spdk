@@ -72,7 +72,7 @@ zero_trailing_bytes(struct spdk_blob_bs_dev *b, struct iovec *iov, int iovcnt,
 {
 	uint32_t zero_lba_count;
 	uint64_t zero_bytes, zero_len;
-	uint64_t payload_bytes;
+	uint64_t payload_bytes = 0, payload_bytes1 = 0;
 	uint64_t valid_bytes;
 	void *zero_start;
 	struct iovec *i;
@@ -81,19 +81,34 @@ zero_trailing_bytes(struct spdk_blob_bs_dev *b, struct iovec *iov, int iovcnt,
 		return;
 	}
 
+	if (lba >= b->bs_dev.blockcnt) {
+		SPDK_NOTICELOG("read 4.1 \n");
+		/* Entire request is beyond end of device — zero all iovecs */
+		for (int j = 0; j < iovcnt; j++) {
+			memset(iov[j].iov_base, 0, iov[j].iov_len);
+		}
+		*lba_count = 0;
+		return;
+	}
+
 	/* Figure out how many bytes in the payload will need to be zeroed. */
 	zero_lba_count = spdk_min(*lba_count, lba + *lba_count - b->bs_dev.blockcnt);
 	zero_bytes = zero_lba_count * (uint64_t)b->bs_dev.blocklen;
-
-	payload_bytes = *lba_count * (uint64_t)b->bs_dev.blocklen;
+	uint32_t counter = iovcnt;
+	for (int j = 0; j < iovcnt; j++) {
+    	payload_bytes += iov[j].iov_len;
+	}
+	payload_bytes1 = *lba_count * (uint64_t)b->bs_dev.blocklen;
+	assert(payload_bytes != payload_bytes1);
 	valid_bytes = payload_bytes - zero_bytes;
-
+	assert(payload_bytes < valid_bytes);
+	// SPDK_NOTICELOG("read 5 %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu32 "\n",payload_bytes, valid_bytes, zero_bytes, lba, *lba_count);
 	i = iov;
-	while (zero_bytes > 0) {
+	while (zero_bytes > 0 && counter > 0) {
 		if (i->iov_len > valid_bytes) {
 			zero_start = i->iov_base + valid_bytes;
 			zero_len = spdk_min(payload_bytes, i->iov_len - valid_bytes);
-			memset(zero_start, 0, zero_bytes);
+			memset(zero_start, 0, zero_len);
 			valid_bytes = 0;
 			zero_bytes -= zero_len;
 		}
@@ -101,8 +116,9 @@ zero_trailing_bytes(struct spdk_blob_bs_dev *b, struct iovec *iov, int iovcnt,
 		payload_bytes -= spdk_min(payload_bytes, i->iov_len);
 		i++;
 	}
-
+	counter--;
 	*lba_count -= zero_lba_count;
+	// SPDK_NOTICELOG("read 5.1 %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu32 "\n", payload_bytes, valid_bytes, zero_bytes, lba, *lba_count);
 }
 
 static inline void
@@ -117,6 +133,11 @@ blob_bs_dev_read(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void 
 	/* The backing blob may be smaller than this blob, so zero any trailing bytes. */
 	zero_trailing_bytes(b, &iov, 1, lba, &lba_count);
 	b->blob->priority_class = dev->priority_class;
+
+	if (lba_count == 0) {
+		blob_bs_dev_read_cpl(cb_args, 0);
+		return;
+	}
 
 	spdk_blob_io_read(b->blob, channel, payload, lba, lba_count,
 			  blob_bs_dev_read_cpl, cb_args);
@@ -133,6 +154,11 @@ blob_bs_dev_readv(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	zero_trailing_bytes(b, iov, iovcnt, lba, &lba_count);
 	b->blob->priority_class = dev->priority_class;
 
+	if (lba_count == 0) {
+		blob_bs_dev_read_cpl(cb_args, 0);
+		return;
+	}
+
 	spdk_blob_io_readv(b->blob, channel, iov, iovcnt, lba, lba_count,
 			   blob_bs_dev_read_cpl, cb_args);
 }
@@ -148,6 +174,11 @@ blob_bs_dev_readv_ext(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	/* The backing blob may be smaller than this blob, so zero any trailing bytes. */
 	zero_trailing_bytes(b, iov, iovcnt, lba, &lba_count);
 	b->blob->priority_class = dev->priority_class;
+
+	if (lba_count == 0) {
+		blob_bs_dev_read_cpl(cb_args, 0);
+		return;
+	}
 
 	spdk_blob_io_readv_ext(b->blob, channel, iov, iovcnt, lba, lba_count,
 			       blob_bs_dev_read_cpl, cb_args, ext_opts);
