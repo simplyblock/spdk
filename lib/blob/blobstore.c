@@ -3337,6 +3337,25 @@ bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 }
 
 static inline bool
+blob_calculate_lba_and_lba_count_dump(struct spdk_blob *blob, uint64_t io_unit, uint64_t length,
+				 uint64_t *lba,	uint64_t *lba_count, uint64_t *index)
+{
+	*lba_count = length;
+
+	if (!bs_io_unit_is_allocated(blob, io_unit)) {
+		assert(blob->back_bs_dev != NULL);
+		*lba = bs_io_unit_to_back_dev_lba(blob, io_unit);
+		*lba_count = bs_io_unit_to_back_dev_lba(blob, *lba_count);
+		bs_blob_io_unit_to_lba_dump(blob, io_unit, index, false);
+		return false;
+	} else {
+		*lba = bs_blob_io_unit_to_lba_dump(blob, io_unit, index, true);
+		return true;
+	}
+}
+
+
+static inline bool
 blob_calculate_lba_and_lba_count(struct spdk_blob *blob, uint64_t io_unit, uint64_t length,
 				 uint64_t *lba,	uint64_t *lba_count)
 {
@@ -3827,6 +3846,13 @@ rw_iov_split_next(void *cb_arg, int bserrno)
 		spdk_blob_io_writev_ext(ctx->blob, ctx->channel, iov, iovcnt, io_unit_offset,
 					io_units_count, rw_iov_split_next, ctx, ctx->ext_io_opts);
 	}
+}
+
+bool
+calculate_lba_blob(struct spdk_blob *blob, uint64_t offset, uint64_t length, uint64_t *t_offset, uint64_t *t_length, uint64_t *index) {
+	bool is_allocated = false;	
+	is_allocated = blob_calculate_lba_and_lba_count_dump(blob, offset, length, t_offset, t_length, index);	
+	return is_allocated;
 }
 
 static void

@@ -636,6 +636,46 @@ bs_page_to_blobid(uint64_t page_idx)
 	return SPDK_BLOB_BLOBID_HIGH_BIT | page_idx;
 }
 
+static inline uint64_t
+bs_blob_io_unit_to_lba_dump(struct spdk_blob *blob, uint64_t io_unit, uint64_t *index, bool is_alloc)
+{
+	uint64_t	lba;
+	uint64_t	pages_per_cluster;
+	uint8_t		shift;
+	uint64_t	io_units_per_cluster;
+	uint64_t	io_units_per_page;
+	uint64_t	page;
+
+	page = bs_io_unit_to_page(blob->bs, io_unit);
+
+	pages_per_cluster = blob->bs->pages_per_cluster;
+	shift = blob->bs->pages_per_cluster_shift;
+	io_units_per_page = bs_io_unit_per_page(blob->bs);
+	if (!is_alloc) {
+		if (shift != 0) {
+			*index = page >> shift;
+		} else {
+			*index = page / pages_per_cluster;
+		}
+		return 0;
+	}
+	
+	assert(page < blob->active.num_clusters * pages_per_cluster);
+
+	if (shift != 0) {
+		io_units_per_cluster = io_units_per_page << shift;
+		lba = blob->active.clusters[page >> shift];
+		*index = page >> shift;
+	} else {
+		io_units_per_cluster = io_units_per_page * pages_per_cluster;
+		lba = blob->active.clusters[page / pages_per_cluster];
+		*index = page / pages_per_cluster;
+	}
+	lba += io_unit % io_units_per_cluster;
+	return lba;
+}
+
+
 /* Given an io unit offset into a blob, look up the LBA for the
  * start of that io unit.
  */

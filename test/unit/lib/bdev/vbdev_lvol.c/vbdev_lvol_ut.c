@@ -49,6 +49,7 @@ DEFINE_STUB_V(spdk_lvs_update_on_failover, (struct spdk_lvol_store *lvs));
 DEFINE_STUB_V(spdk_lvol_update_on_failover, (struct spdk_lvol_store *lvs, struct spdk_lvol *lvol, bool send_md_thread));
 DEFINE_STUB_V(spdk_lvs_grow_live, (struct spdk_lvol_store *lvs,
 				   spdk_lvs_op_complete cb_fn, void *cb_arg));
+DEFINE_STUB(calculate_lba_blob, bool, (struct spdk_blob *blob, uint64_t offset, uint64_t length, uint64_t *t_offset, uint64_t *t_length, uint64_t *index), true);
 DEFINE_STUB_V(spdk_change_redirect_state, (struct spdk_lvol_store *lvs, bool disconnect));
 DEFINE_STUB_V(spdk_lvs_check_active_process, (struct spdk_lvol_store *lvs, struct spdk_lvol *lvol, uint8_t type));
 DEFINE_STUB(spdk_bdev_get_memory_domains, int, (struct spdk_bdev *bdev,

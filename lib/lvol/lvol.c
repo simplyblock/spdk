@@ -279,7 +279,7 @@ load_next_lvol(void *cb_arg, struct spdk_blob *blob, int lvolerrno)
 	lvol->map_id = spdk_blob_get_map_id(blob);
 	lvs->lvol_map.lvol[lvol->map_id] = lvol;
 	uint32_t blockcnt = sizeof(uint32_t) * ((spdk_blob_get_num_clusters(blob) * spdk_bs_get_cluster_size(lvs->blobstore)) / SPDK_BS_PAGE_SIZE);
-	lvol->block_crc = spdk_malloc(blockcnt, sizeof(uint32_t),
+	lvol->block_crc = spdk_zmalloc(blockcnt, sizeof(uint32_t),
 						NULL, SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
 	rc = spdk_blob_get_xattr_value(blob, "uuid", (const void **)&attr, &value_len);
 	if (rc != 0 || value_len != SPDK_UUID_STRING_LEN || attr[SPDK_UUID_STRING_LEN - 1] != '\0' ||
@@ -1308,7 +1308,7 @@ spdk_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz,
 	opts.thin_provision = thin_provision;
 	opts.num_clusters = spdk_divide_round_up(sz, spdk_bs_get_cluster_size(bs));
 	uint32_t blockcnt = sizeof(uint32_t) * ((opts.num_clusters * spdk_bs_get_cluster_size(bs)) / SPDK_BS_PAGE_SIZE);
-	lvol->block_crc = spdk_malloc(blockcnt, sizeof(uint32_t),
+	lvol->block_crc = spdk_zmalloc(blockcnt, sizeof(uint32_t),
 						NULL, SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
 	opts.clear_method = lvol->clear_method;
 	opts.xattrs.count = SPDK_COUNTOF(xattr_names);
@@ -1670,7 +1670,7 @@ spdk_lvol_create_clone(struct spdk_lvol *origlvol, const char *clone_name,
 		return;
 	}
 	uint32_t blockcnt = sizeof(uint32_t) * ((spdk_blob_get_num_clusters(origblob) * spdk_bs_get_cluster_size(lvs->blobstore)) / SPDK_BS_PAGE_SIZE);
-	newlvol->block_crc = spdk_malloc(blockcnt, sizeof(uint32_t),
+	newlvol->block_crc = spdk_zmalloc(blockcnt, sizeof(uint32_t),
 						NULL, SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
 	clone_xattrs.count = SPDK_COUNTOF(xattr_names);
 	clone_xattrs.ctx = newlvol;

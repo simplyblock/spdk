@@ -1113,13 +1113,21 @@ static void
 vbdev_lvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io);
 
 static void
-verify_block_crc_on_read(struct spdk_bdev_io *bdev_io, struct spdk_lvol *lvol, const uint32_t *block_crc_array)
+verify_block_crc_on_read(struct spdk_bdev_io *bdev_io, struct spdk_lvol *lvol)
 {
     struct iovec *iov = bdev_io->u.bdev.iovs;
     int iovcnt = bdev_io->u.bdev.iovcnt;
     uint64_t offset_blocks = bdev_io->u.bdev.offset_blocks;
     uint64_t num_blocks = bdev_io->u.bdev.num_blocks;
-
+	uint32_t *block_crc_array;
+	struct spdk_lvol *tmp_lvol = lvol;
+	if (lvol->hublvol) {
+		uint16_t id = EXTRACT_ID(offset_blocks);
+		tmp_lvol = lvol->lvol_store->lvol_map.lvol[id];
+		offset_blocks = ADJUST_OFFSET(offset_blocks);
+	}
+ 	block_crc_array = tmp_lvol->block_crc;
+	
     int iov_idx = 0;
     size_t iov_offset = 0; // current offset inside the current iov
     uint64_t block_index = 0;
@@ -1147,6 +1155,7 @@ verify_block_crc_on_read(struct spdk_bdev_io *bdev_io, struct spdk_lvol *lvol, c
             }
 
             if (block_iovcnt >= MAX_IOV_PER_BLOCK && remaining > 0) {
+				SPDK_NOTICELOG("Safety check: should never happen unless extremely fragmented\n");
                 // Safety check: should never happen unless extremely fragmented
                 return;
             }
@@ -1154,15 +1163,21 @@ verify_block_crc_on_read(struct spdk_bdev_io *bdev_io, struct spdk_lvol *lvol, c
 
         if (remaining > 0) {
             // Not enough data for one block — should not happen
+			SPDK_NOTICELOG("Not enough data for one block — should not happen\n");
             return;
         }
 
         // Calculate CRC for the 4KB block from its iov slices
         uint32_t crc = spdk_crc32c_iov_update(block_iovs, block_iovcnt, 0);
-        if (crc != block_crc_array[offset_blocks + block_index]) {
+        if (block_crc_array[offset_blocks + block_index] != 0 && crc != block_crc_array[offset_blocks + block_index]) {
             // CRC mismatch
+			uint64_t index, t_length, t_offset;
+			bool is_alloc = calculate_lba_blob(tmp_lvol->blob, offset_blocks, num_blocks, &t_offset, &t_length, &index);
+			SPDK_NOTICELOG("CRC mismatch expected %" PRIu32 ", received %" PRIu32 " offset %" PRIu64 ", blockcnt %" PRIu64 " blobid %" PRIu64 " index %" PRIu64 " cluster lba %" PRIu64 " alloc %d\n",
+			 			block_crc_array[offset_blocks + block_index], crc, offset_blocks, num_blocks, tmp_lvol->blob_id, index, t_offset, is_alloc);
             return;
         }
+
     }
 
     return; // All blocks passed
@@ -1194,11 +1209,7 @@ lvol_op_comp(void *cb_arg, int bserrno)
 			status = SPDK_BDEV_IO_STATUS_FAILED;
 		}
 	} else if (lvs->primary && bdev_io->type == SPDK_BDEV_IO_TYPE_READ) {
-		uint64_t offset = bdev_io->u.bdev.offset_blocks;
-		if (lvol->hublvol) {
-			lvol = lvs->lvol_map.lvol[offset >> 48];
-		}
-		verify_block_crc_on_read(bdev_io, lvol, lvol->block_crc);
+		verify_block_crc_on_read(bdev_io, lvol);
 	}
 
 	spdk_bdev_io_complete(bdev_io, status);
@@ -1247,6 +1258,17 @@ lvol_seek_hole(struct spdk_lvol *lvol, struct spdk_bdev_io *bdev_io)
 }
 
 static void
+calculate_block_crc_on_zerowrite(struct spdk_bdev_io *bdev_io, uint32_t *block_crc_array)
+{
+ 	uint64_t offset_blocks = bdev_io->u.bdev.offset_blocks;
+	uint64_t num_blocks = bdev_io->u.bdev.num_blocks;
+
+	for (uint64_t block = 0; block < num_blocks; block++) {
+		block_crc_array[offset_blocks + block] = 0;
+	}
+}
+
+static void
 lvol_write_zeroes(struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 {
 	uint64_t start_page, num_pages;
@@ -1254,7 +1276,9 @@ lvol_write_zeroes(struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct spd
 
 	start_page = bdev_io->u.bdev.offset_blocks;
 	num_pages = bdev_io->u.bdev.num_blocks;
-
+	if (lvol->lvol_store->primary) {
+		calculate_block_crc_on_zerowrite(bdev_io, lvol->block_crc);
+	}
 	spdk_blob_io_write_zeroes(blob, ch, start_page, num_pages, lvol_op_comp, bdev_io);
 }
 
@@ -1266,7 +1290,9 @@ hublvol_write_zeroes(struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct 
 	
 	start_page = ADJUST_OFFSET(bdev_io->u.bdev.offset_blocks);
 	num_pages = bdev_io->u.bdev.num_blocks;
-
+	if (lvol->lvol_store->primary) {
+		calculate_block_crc_on_zerowrite(bdev_io, lvol->block_crc);
+	}
 	spdk_blob_io_write_zeroes(blob, ch, start_page, num_pages, lvol_op_comp, bdev_io);
 }
 
@@ -1306,6 +1332,21 @@ hublvol_read(struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct spdk_bde
 
 	spdk_blob_io_readv_ext(blob, ch, bdev_io->u.bdev.iovs, bdev_io->u.bdev.iovcnt, start_page,
 			       num_pages, lvol_op_comp, bdev_io, &lvol_io->ext_io_opts);
+}
+
+static bool
+is_iov_data_zeroed(struct iovec *iovs, int iovcnt)
+{
+    for (int i = 0; i < iovcnt; i++) {
+        uint8_t *data = (uint8_t *)iovs[i].iov_base;
+        size_t len = iovs[i].iov_len;
+        for (size_t j = 0; j < len; j++) {
+            if (data[j] != 0) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 static void
@@ -1351,6 +1392,11 @@ calculate_block_crc_on_write(struct spdk_bdev_io *bdev_io, struct spdk_lvol *lvo
 
 		// Compute CRC for this block and store it
 		uint32_t crc = spdk_crc32c_iov_update(block_iovs, block_iovcnt, 0);
+		// if (crc == 0) {
+		// 	if (!is_iov_data_zeroed(block_iovs, block_iovcnt)) {
+		// 		SPDK_ERRLOG("the CRC write is zero.\n");
+		// 	}
+		// }
 		block_crc_array[offset_blocks + block] = crc;
 	}
 }
