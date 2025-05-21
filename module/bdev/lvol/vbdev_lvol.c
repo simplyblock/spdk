@@ -1258,9 +1258,12 @@ lvol_seek_hole(struct spdk_lvol *lvol, struct spdk_bdev_io *bdev_io)
 }
 
 static void
-calculate_block_crc_on_zerowrite(struct spdk_bdev_io *bdev_io, uint32_t *block_crc_array)
+calculate_block_crc_on_zerowrite(struct spdk_bdev_io *bdev_io, uint32_t *block_crc_array, bool is_hub)
 {
  	uint64_t offset_blocks = bdev_io->u.bdev.offset_blocks;
+	if (is_hub) {
+		offset_blocks = ADJUST_OFFSET(bdev_io->u.bdev.offset_blocks);
+	}
 	uint64_t num_blocks = bdev_io->u.bdev.num_blocks;
 
 	for (uint64_t block = 0; block < num_blocks; block++) {
@@ -1277,7 +1280,7 @@ lvol_write_zeroes(struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct spd
 	start_page = bdev_io->u.bdev.offset_blocks;
 	num_pages = bdev_io->u.bdev.num_blocks;
 	if (lvol->lvol_store->primary) {
-		calculate_block_crc_on_zerowrite(bdev_io, lvol->block_crc);
+		calculate_block_crc_on_zerowrite(bdev_io, lvol->block_crc, false);
 	}
 	spdk_blob_io_write_zeroes(blob, ch, start_page, num_pages, lvol_op_comp, bdev_io);
 }
@@ -1291,7 +1294,7 @@ hublvol_write_zeroes(struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct 
 	start_page = ADJUST_OFFSET(bdev_io->u.bdev.offset_blocks);
 	num_pages = bdev_io->u.bdev.num_blocks;
 	if (lvol->lvol_store->primary) {
-		calculate_block_crc_on_zerowrite(bdev_io, lvol->block_crc);
+		calculate_block_crc_on_zerowrite(bdev_io, lvol->block_crc, true);
 	}
 	spdk_blob_io_write_zeroes(blob, ch, start_page, num_pages, lvol_op_comp, bdev_io);
 }
@@ -1334,25 +1337,28 @@ hublvol_read(struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct spdk_bde
 			       num_pages, lvol_op_comp, bdev_io, &lvol_io->ext_io_opts);
 }
 
-static bool
-is_iov_data_zeroed(struct iovec *iovs, int iovcnt)
-{
-    for (int i = 0; i < iovcnt; i++) {
-        uint8_t *data = (uint8_t *)iovs[i].iov_base;
-        size_t len = iovs[i].iov_len;
-        for (size_t j = 0; j < len; j++) {
-            if (data[j] != 0) {
-                return false;
-            }
-        }
-    }
-    return true;
-}
+// static bool
+// is_iov_data_zeroed(struct iovec *iovs, int iovcnt)
+// {
+//     for (int i = 0; i < iovcnt; i++) {
+//         uint8_t *data = (uint8_t *)iovs[i].iov_base;
+//         size_t len = iovs[i].iov_len;
+//         for (size_t j = 0; j < len; j++) {
+//             if (data[j] != 0) {
+//                 return false;
+//             }
+//         }
+//     }
+//     return true;
+// }
 
 static void
-calculate_block_crc_on_write(struct spdk_bdev_io *bdev_io, struct spdk_lvol *lvol, uint32_t *block_crc_array)
+calculate_block_crc_on_write(struct spdk_bdev_io *bdev_io, struct spdk_lvol *lvol, uint32_t *block_crc_array, bool is_hub)
 {
  	uint64_t offset_blocks = bdev_io->u.bdev.offset_blocks;
+	if (is_hub) {
+		offset_blocks = ADJUST_OFFSET(bdev_io->u.bdev.offset_blocks);
+	}
 	uint64_t num_blocks = bdev_io->u.bdev.num_blocks;
 	struct iovec *iovs = bdev_io->u.bdev.iovs;
 	int iovcnt = bdev_io->u.bdev.iovcnt;
@@ -1415,7 +1421,7 @@ lvol_write(struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct spdk_bdev_
 	lvol_io->ext_io_opts.memory_domain = bdev_io->u.bdev.memory_domain;
 	lvol_io->ext_io_opts.memory_domain_ctx = bdev_io->u.bdev.memory_domain_ctx;
 	if (lvol->lvol_store->primary) {
-		calculate_block_crc_on_write(bdev_io, lvol, lvol->block_crc);
+		calculate_block_crc_on_write(bdev_io, lvol, lvol->block_crc, false);
 	}
 	spdk_blob_io_writev_ext(blob, ch, bdev_io->u.bdev.iovs, bdev_io->u.bdev.iovcnt, start_page,
 				num_pages, lvol_op_comp, bdev_io, &lvol_io->ext_io_opts);
@@ -1435,7 +1441,7 @@ hublvol_write(struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct spdk_bd
 	lvol_io->ext_io_opts.memory_domain = bdev_io->u.bdev.memory_domain;
 	lvol_io->ext_io_opts.memory_domain_ctx = bdev_io->u.bdev.memory_domain_ctx;
 	if (lvol->lvol_store->primary) {
-		calculate_block_crc_on_write(bdev_io, lvol, lvol->block_crc);
+		calculate_block_crc_on_write(bdev_io, lvol, lvol->block_crc, true);
 	}
 
 	spdk_blob_io_writev_ext(blob, ch, bdev_io->u.bdev.iovs, bdev_io->u.bdev.iovcnt, start_page,
