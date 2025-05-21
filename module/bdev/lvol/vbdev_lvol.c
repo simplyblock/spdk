@@ -10,10 +10,13 @@
 #include "spdk/string.h"
 #include "spdk/uuid.h"
 #include "spdk/blob.h"
+#include "spdk/crc32.h"
 
 #include "vbdev_lvol.h"
 
-
+#define BLOCK_SIZE 0x1000
+#define BLOB_CRC32C_INITIAL    0xffffffffUL
+#define MAX_IOV_PER_BLOCK	32
 #define ID_SHIFT_AMOUNT       48                   // Number of bits to shift for ID extraction
 #define OFFSET_MASK_48_BITS   ((1ULL << ID_SHIFT_AMOUNT) - 1)  // Mask for the lower 48 bits
 #define OFFSET_SHIFT_AMOUNT   16                   // Number of bits to shift for original offset removal
@@ -1110,14 +1113,69 @@ static void
 vbdev_lvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io);
 
 static void
+verify_block_crc_on_read(struct spdk_bdev_io *bdev_io, struct spdk_lvol *lvol, const uint32_t *block_crc_array)
+{
+    struct iovec *iov = bdev_io->u.bdev.iovs;
+    int iovcnt = bdev_io->u.bdev.iovcnt;
+    uint64_t offset_blocks = bdev_io->u.bdev.offset_blocks;
+    uint64_t num_blocks = bdev_io->u.bdev.num_blocks;
+
+    int iov_idx = 0;
+    size_t iov_offset = 0; // current offset inside the current iov
+    uint64_t block_index = 0;
+
+    for (block_index = 0; block_index < num_blocks; block_index++) {
+        size_t remaining = BLOCK_SIZE;
+        struct iovec block_iovs[MAX_IOV_PER_BLOCK];
+        int block_iovcnt = 0;
+
+        while (remaining > 0 && iov_idx < iovcnt) {
+            struct iovec *cur_iov = &iov[iov_idx];
+            size_t cur_len = cur_iov->iov_len - iov_offset;
+            size_t to_use = (remaining < cur_len) ? remaining : cur_len;
+
+            block_iovs[block_iovcnt].iov_base = (char *)cur_iov->iov_base + iov_offset;
+            block_iovs[block_iovcnt].iov_len = to_use;
+            block_iovcnt++;
+
+            remaining -= to_use;
+            iov_offset += to_use;
+
+            if (iov_offset == cur_iov->iov_len) {
+                iov_idx++;
+                iov_offset = 0;
+            }
+
+            if (block_iovcnt >= MAX_IOV_PER_BLOCK && remaining > 0) {
+                // Safety check: should never happen unless extremely fragmented
+                return;
+            }
+        }
+
+        if (remaining > 0) {
+            // Not enough data for one block — should not happen
+            return;
+        }
+
+        // Calculate CRC for the 4KB block from its iov slices
+        uint32_t crc = spdk_crc32c_iov_update(block_iovs, block_iovcnt, 0);
+        if (crc != block_crc_array[offset_blocks + block_index]) {
+            // CRC mismatch
+            return;
+        }
+    }
+
+    return; // All blocks passed
+}
+
+static void
 lvol_op_comp(void *cb_arg, int bserrno)
 {
 	struct spdk_bdev_io *bdev_io = cb_arg;
 	enum spdk_bdev_io_status status = SPDK_BDEV_IO_STATUS_SUCCESS;
-
+	struct spdk_lvol *lvol = bdev_io->bdev->ctxt;
+	struct spdk_lvol_store *lvs = lvol->lvol_store;
 	if (bserrno != 0) {
-		struct spdk_lvol *lvol = bdev_io->bdev->ctxt;
-		struct spdk_lvol_store *lvs = lvol->lvol_store;
 		uint64_t offset = bdev_io->u.bdev.offset_blocks;
 		if (lvol->hublvol) {
 			lvol = lvs->lvol_map.lvol[offset >> 48];
@@ -1135,6 +1193,12 @@ lvol_op_comp(void *cb_arg, int bserrno)
 		} else {
 			status = SPDK_BDEV_IO_STATUS_FAILED;
 		}
+	} else if (lvs->primary && bdev_io->type == SPDK_BDEV_IO_TYPE_READ) {
+		uint64_t offset = bdev_io->u.bdev.offset_blocks;
+		if (lvol->hublvol) {
+			lvol = lvs->lvol_map.lvol[offset >> 48];
+		}
+		verify_block_crc_on_read(bdev_io, lvol, lvol->block_crc);
 	}
 
 	spdk_bdev_io_complete(bdev_io, status);
@@ -1245,19 +1309,68 @@ hublvol_read(struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct spdk_bde
 }
 
 static void
+calculate_block_crc_on_write(struct spdk_bdev_io *bdev_io, struct spdk_lvol *lvol, uint32_t *block_crc_array)
+{
+ 	uint64_t offset_blocks = bdev_io->u.bdev.offset_blocks;
+	uint64_t num_blocks = bdev_io->u.bdev.num_blocks;
+	struct iovec *iovs = bdev_io->u.bdev.iovs;
+	int iovcnt = bdev_io->u.bdev.iovcnt;
+
+	int current_iov_idx = 0;
+	size_t current_iov_offset = 0;
+
+	for (uint64_t block = 0; block < num_blocks; block++) {
+		struct iovec block_iovs[MAX_IOV_PER_BLOCK];
+		int block_iovcnt = 0;
+		size_t remaining = BLOCK_SIZE;
+
+		// Build the iovec array for this 4KB block
+		while (remaining > 0 && current_iov_idx < iovcnt) {
+			char *base = (char *)iovs[current_iov_idx].iov_base + current_iov_offset;
+			size_t len = iovs[current_iov_idx].iov_len - current_iov_offset;
+
+			size_t chunk_len = (len > remaining) ? remaining : len;
+
+			block_iovs[block_iovcnt].iov_base = base;
+			block_iovs[block_iovcnt].iov_len = chunk_len;
+			block_iovcnt++;
+
+			current_iov_offset += chunk_len;
+			if (current_iov_offset == iovs[current_iov_idx].iov_len) {
+				current_iov_idx++;
+				current_iov_offset = 0;
+			}
+
+			remaining -= chunk_len;
+		}
+
+		if (remaining != 0) {
+			SPDK_ERRLOG("Incomplete block in iovecs during CRC write\n");
+			break;
+		}
+
+		// Compute CRC for this block and store it
+		uint32_t crc = spdk_crc32c_iov_update(block_iovs, block_iovcnt, 0);
+		block_crc_array[offset_blocks + block] = crc;
+	}
+}
+
+static void
 lvol_write(struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 {
 	uint64_t start_page, num_pages;
 	struct spdk_blob *blob = lvol->blob;
 	struct vbdev_lvol_io *lvol_io = (struct vbdev_lvol_io *)bdev_io->driver_ctx;
-	
+
 	start_page = bdev_io->u.bdev.offset_blocks;
 	num_pages = bdev_io->u.bdev.num_blocks;
 
 	lvol_io->ext_io_opts.size = sizeof(lvol_io->ext_io_opts);
 	lvol_io->ext_io_opts.memory_domain = bdev_io->u.bdev.memory_domain;
 	lvol_io->ext_io_opts.memory_domain_ctx = bdev_io->u.bdev.memory_domain_ctx;
-
+	if (lvol->lvol_store->primary) {
+		calculate_block_crc_on_write(bdev_io, lvol, lvol->block_crc);
+	}
 	spdk_blob_io_writev_ext(blob, ch, bdev_io->u.bdev.iovs, bdev_io->u.bdev.iovcnt, start_page,
 				num_pages, lvol_op_comp, bdev_io, &lvol_io->ext_io_opts);
 }
@@ -1275,6 +1388,9 @@ hublvol_write(struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct spdk_bd
 	lvol_io->ext_io_opts.size = sizeof(lvol_io->ext_io_opts);
 	lvol_io->ext_io_opts.memory_domain = bdev_io->u.bdev.memory_domain;
 	lvol_io->ext_io_opts.memory_domain_ctx = bdev_io->u.bdev.memory_domain_ctx;
+	if (lvol->lvol_store->primary) {
+		calculate_block_crc_on_write(bdev_io, lvol, lvol->block_crc);
+	}
 
 	spdk_blob_io_writev_ext(blob, ch, bdev_io->u.bdev.iovs, bdev_io->u.bdev.iovcnt, start_page,
 				num_pages, lvol_op_comp, bdev_io, &lvol_io->ext_io_opts);

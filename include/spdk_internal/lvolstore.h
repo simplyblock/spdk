@@ -201,6 +201,7 @@ struct spdk_lvol {
 	struct spdk_lvs_degraded_lvol_set *degraded_set;
 	TAILQ_ENTRY(spdk_lvol)		degraded_link;
 	TAILQ_HEAD(, spdk_pending_iorsp)   redirected_io;
+	uint32_t 	*block_crc;
 };
 
 struct lvol_store_bdev *vbdev_lvol_store_first(void);
