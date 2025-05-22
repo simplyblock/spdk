@@ -1676,9 +1676,13 @@ blob_load_backing_dev(spdk_bs_sequence_t *seq, void *cb_arg)
 					spdk_bs_open_blob_on_failover(blob->bs, blob->parent_id,
 					  		blob_load_snapshot_cpl, ctx);
 				}
-			} else {
+			} else if (!blob->is_recovery) {
 				spdk_bs_open_blob(blob->bs, blob->parent_id,
 					  	blob_load_snapshot_cpl, ctx);
+			} else {
+				SPDK_NOTICELOG("Loaded backing dev for recovering snapshot, now starting recovery\n");
+				bs_open_recover_blob(blob->bs, blob->id, 0,
+						blob_load_snapshot_cpl, ctx);
 			}
 			return;
 		} else {
