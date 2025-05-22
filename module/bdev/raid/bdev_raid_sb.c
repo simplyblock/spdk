@@ -213,7 +213,7 @@ raid_bdev_read_sb_remainder(struct raid_bdev_read_sb_ctx *ctx)
 	}
 	ctx->buf = buf;
 
-	rc = spdk_bdev_read_blocks(ctx->desc, ctx->ch, ctx->buf + buf_size_prev, (buf_size_prev / bdev->blocklen) | METADATA_PAGE_MASK | RAID_READ_SUPERBLOCK_MASK,
+	rc = spdk_bdev_read_blocks(ctx->desc, ctx->ch, ctx->buf + buf_size_prev, (buf_size_prev / bdev->blocklen),
 			    (ctx->buf_size - buf_size_prev) / bdev->blocklen, raid_bdev_read_sb_cb, ctx);
 	if (rc != 0) {
 		SPDK_ERRLOG("Failed to read bdev %s superblock remainder: %s\n",
@@ -295,7 +295,7 @@ raid_bdev_load_base_bdev_superblock(struct spdk_bdev_desc *desc, struct spdk_io_
 		goto err;
 	}
 
-	rc = spdk_bdev_read_blocks(desc, ch, ctx->buf, 0 | METADATA_PAGE_MASK | RAID_READ_SUPERBLOCK_MASK, ctx->buf_size / bdev->blocklen, raid_bdev_read_sb_cb, ctx);
+	rc = spdk_bdev_read_blocks(desc, ch, ctx->buf, 0, ctx->buf_size / bdev->blocklen, raid_bdev_read_sb_cb, ctx);
 	if (rc) {
 		goto err;
 	}
@@ -361,7 +361,7 @@ _raid_bdev_write_superblock(void *_ctx)
 		const uint64_t num_blocks = raid_bdev->sb_io_buf_size / bdev->blocklen;
 
 		rc = spdk_bdev_write_blocks(base_info->desc, base_info->app_thread_ch,
-				     raid_bdev->sb_io_buf, offset_blocks | METADATA_PAGE_MASK, num_blocks,
+				     raid_bdev->sb_io_buf, offset_blocks, num_blocks,
 				     raid_bdev_write_superblock_cb, ctx);
 		if (rc != 0) {
 			if (rc == -ENOMEM) {
