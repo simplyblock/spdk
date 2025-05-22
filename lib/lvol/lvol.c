@@ -13,7 +13,7 @@
 #include "spdk/util.h"
 
 /* Default blob channel opts for lvol */
-#define SPDK_LVOL_BLOB_OPTS_CHANNEL_OPS 4096
+#define SPDK_LVOL_BLOB_OPTS_CHANNEL_OPS 12000
 
 #define LVOL_NAME "name"
 
