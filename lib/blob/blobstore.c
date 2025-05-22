@@ -53,6 +53,13 @@ void spdk_bs_iter_next_without_close(struct spdk_blob_store *bs, struct spdk_blo
 
 static void bs_delete_open_cpl(void *cb_arg, struct spdk_blob *blob, int bserrno);
 
+static void
+bs_open_recover_blob(struct spdk_blob_store *bs,
+	     spdk_blob_id blobid,
+	     struct spdk_blob_open_opts *opts,
+	     spdk_blob_op_with_handle_complete cb_fn,
+	     void *cb_arg);
+
 /*
  * External snapshots require a channel per thread per esnap bdev.  The tree
  * is populated lazily as blob IOs are handled by the back_bs_dev. When this
