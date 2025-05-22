@@ -3,13 +3,14 @@
 
 #include "spdk/priority_class.h"
 
+#define RAID_READ_SUPERBLOCK_MASK (1UL << (64 - NBITS_PRIORITY_CLASS  - 4)) // do not read raid superblock with sync fetch on disaster recovery
 #define TIERED_IO_MASK (1UL << (64 - NBITS_PRIORITY_CLASS - 3))
 #define FORCE_FETCH_MASK (1UL << (64 - NBITS_PRIORITY_CLASS - 2)) // force a fetch write even into already-fetched chunks in case of a client fetch
 #define SYNC_FETCH_MASK FORCE_FETCH_MASK // in case of a regular client read, wait for all its ranges on its pages to be fetched for any not in hot tier
 #define FLUSH_MODE_MASK FORCE_FETCH_MASK // whether a tiered write should be pure flush (mode 1) or eviction (mode 0)
 #define METADATA_PAGE_MASK (1UL << (64 - NBITS_PRIORITY_CLASS - 1)) // whether the pages accessed are metadata, always set by an lvol metadata channel
 
-#define TOTAL_TIERING_MASK (TIERED_IO_MASK | FORCE_FETCH_MASK | METADATA_PAGE_MASK)
+#define TOTAL_TIERING_MASK (TIERED_IO_MASK | FORCE_FETCH_MASK | METADATA_PAGE_MASK | RAID_READ_SUPERBLOCK_MASK)
 #define TIERING_BITS_POS (64 - NBITS_PRIORITY_CLASS - 3)
 #define LBA_METADATA_BITS_MASK (PRIORITY_CLASS_MASK | TOTAL_TIERING_MASK)
 
