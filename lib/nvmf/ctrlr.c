@@ -870,6 +870,7 @@ _nvmf_ctrlr_connect(struct spdk_nvmf_request *req)
 
 	subsystem = spdk_nvmf_tgt_find_subsystem(transport->tgt, data->subnqn);
 	if (!subsystem) {
+		SPDK_NOTICELOG("Invalid subsystem......... 2\n");
 		SPDK_NVMF_INVALID_CONNECT_DATA(rsp, subnqn);
 		return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
 	}
@@ -986,6 +987,7 @@ spdk_nvmf_ctrlr_connect(struct spdk_nvmf_request *req)
 
 	sgroup = nvmf_subsystem_pg_from_connect_cmd(req);
 	if (!sgroup) {
+		SPDK_NOTICELOG("Invalid subsystem......... 10\n");
 		SPDK_NVMF_INVALID_CONNECT_DATA(rsp, subnqn);
 		status = SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
 		goto out;
@@ -1026,6 +1028,7 @@ nvmf_ctrlr_cmd_connect(struct spdk_nvmf_request *req)
 
 	subsystem = spdk_nvmf_tgt_find_subsystem(transport->tgt, data->subnqn);
 	if (!subsystem) {
+		SPDK_NOTICELOG("Invalid subsystem......... 1\n");
 		SPDK_NVMF_INVALID_CONNECT_DATA(rsp, subnqn);
 		return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
 	}
@@ -1498,6 +1501,7 @@ nvmf_property_get(struct spdk_nvmf_request *req)
 		break;
 	default:
 		SPDK_DEBUGLOG(nvmf, "Invalid size value %d\n", cmd->attrib.size);
+		SPDK_NOTICELOG("Invalid size 2...value %d\n", cmd->attrib.size);
 		response->status.sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
 		response->status.sc = SPDK_NVMF_FABRIC_SC_INVALID_PARAM;
 		return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
@@ -1505,6 +1509,7 @@ nvmf_property_get(struct spdk_nvmf_request *req)
 
 	prop = find_prop(cmd->ofst, size);
 	if (prop == NULL || prop->get_cb == NULL) {
+		SPDK_NOTICELOG("Invalid offset 1...value\n");
 		response->status.sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
 		response->status.sc = SPDK_NVMF_FABRIC_SC_INVALID_PARAM;
 		return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
@@ -1556,6 +1561,7 @@ nvmf_property_set(struct spdk_nvmf_request *req)
 		break;
 	default:
 		SPDK_DEBUGLOG(nvmf, "Invalid size value %d\n", cmd->attrib.size);
+		SPDK_NOTICELOG("Invalid size...value %d\n", cmd->attrib.size);
 		response->status.sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
 		response->status.sc = SPDK_NVMF_FABRIC_SC_INVALID_PARAM;
 		return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
@@ -1564,6 +1570,7 @@ nvmf_property_set(struct spdk_nvmf_request *req)
 	prop = find_prop(cmd->ofst, size);
 	if (prop == NULL || prop->set_cb == NULL) {
 		SPDK_INFOLOG(nvmf, "Invalid offset 0x%x\n", cmd->ofst);
+		SPDK_NOTICELOG("Invalid offset ... 0x%x\n", cmd->ofst);
 		response->status.sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
 		response->status.sc = SPDK_NVMF_FABRIC_SC_INVALID_PARAM;
 		return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
