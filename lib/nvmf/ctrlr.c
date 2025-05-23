@@ -870,7 +870,7 @@ _nvmf_ctrlr_connect(struct spdk_nvmf_request *req)
 
 	subsystem = spdk_nvmf_tgt_find_subsystem(transport->tgt, data->subnqn);
 	if (!subsystem) {
-		SPDK_NOTICELOG("Invalid subsystem......... 2\n");
+		SPDK_NOTICELOG("Invalid subsystem...2...%s\n", data->subnqn);
 		SPDK_NVMF_INVALID_CONNECT_DATA(rsp, subnqn);
 		return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
 	}
@@ -987,7 +987,8 @@ spdk_nvmf_ctrlr_connect(struct spdk_nvmf_request *req)
 
 	sgroup = nvmf_subsystem_pg_from_connect_cmd(req);
 	if (!sgroup) {
-		SPDK_NOTICELOG("Invalid subsystem......... 10\n");
+		struct spdk_nvmf_fabric_connect_data *data = req->iov[0].iov_base;
+		SPDK_NOTICELOG("Invalid subsystem...10...%s\n", data->subnqn);
 		SPDK_NVMF_INVALID_CONNECT_DATA(rsp, subnqn);
 		status = SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
 		goto out;
@@ -1028,7 +1029,7 @@ nvmf_ctrlr_cmd_connect(struct spdk_nvmf_request *req)
 
 	subsystem = spdk_nvmf_tgt_find_subsystem(transport->tgt, data->subnqn);
 	if (!subsystem) {
-		SPDK_NOTICELOG("Invalid subsystem......... 1\n");
+		SPDK_NOTICELOG("Invalid subsystem...1...%s\n", data->subnqn);
 		SPDK_NVMF_INVALID_CONNECT_DATA(rsp, subnqn);
 		return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
 	}
