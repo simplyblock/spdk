@@ -33,11 +33,6 @@ The tags can be matched with the level 4 headers below.
 Returning -1 and setting errno on these functions is deprecated and will be changed in the 26.01
 release. These functions will return negative errno values instead.
 
-#### `spdk_sock_flush`
-
-This function returnes number of bytes sent on success, whereas this behavior is deprecated and
-will be changed in 25.09 release in the way it will return 0 on success.
-
 ### gpt
 
 #### `old_gpt_guid`
