@@ -944,14 +944,14 @@ blob_parse_page(const struct spdk_blob_md_page *page, struct spdk_blob *blob)
 				return -EINVAL;
 			}
 
-			tmp = realloc(blob->active.clusters,
-				      (cluster_count + blob->active.num_clusters) * sizeof(*blob->active.clusters));
-			if (tmp == NULL) {
-				SPDK_ERRLOG("Cannot allocate buffer for extent page 6.\n");
-				return -ENOMEM;
-			}
-			blob->active.clusters = tmp;
-			blob->active.cluster_array_size = (cluster_count + blob->active.num_clusters);
+			// tmp = realloc(blob->active.clusters,
+			// 	      (cluster_count + blob->active.num_clusters) * sizeof(*blob->active.clusters));
+			// if (tmp == NULL) {
+			// 	SPDK_ERRLOG("Cannot allocate buffer for extent page 6.\n");
+			// 	return -ENOMEM;
+			// }
+			// blob->active.clusters = tmp;
+			// blob->active.cluster_array_size = (cluster_count + blob->active.num_clusters);
 
 			for (i = 0; i < cluster_idx_length / sizeof(desc_extent->cluster_idx[0]); i++) {
 				if (desc_extent->cluster_idx[i] != 0) {
@@ -1701,6 +1701,16 @@ blob_load_cpl_extents_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		}
 		ctx->num_pages = 1;
 		ctx->next_extent_page = 0;
+		tmp = realloc(blob->active.clusters, blob->remaining_clusters_in_et * sizeof(*blob->active.clusters));
+		if (tmp == NULL) {
+			SPDK_ERRLOG("Cannot alloc memory for cluster array open blob.\n");
+			blob_load_final(ctx, -ENOMEM);
+			return;
+		}
+		memset(tmp + sizeof(*blob->active.clusters) * blob->active.cluster_array_size, 0,
+				sizeof(*blob->active.clusters) * (blob->remaining_clusters_in_et - blob->active.cluster_array_size));
+		blob->active.clusters = tmp;
+		blob->active.cluster_array_size = blob->remaining_clusters_in_et;
 	} else {
 		blob->bs->r_latancy_us += spdk_get_ticks() - seq->start_time;
 		page = &ctx->pages[0];
@@ -1750,16 +1760,16 @@ blob_load_cpl_extents_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 			assert(spdk_blob_is_thin_provisioned(blob));
 			assert(i + 1 < blob->active.num_extent_pages || blob->remaining_clusters_in_et == 0);
 
-			tmp = realloc(blob->active.clusters, blob->active.num_clusters * sizeof(*blob->active.clusters));
-			if (tmp == NULL) {
-				SPDK_ERRLOG("Cannot alloc memory for cluster array open blob.\n");
-				blob_load_final(ctx, -ENOMEM);
-				return;
-			}
-			memset(tmp + sizeof(*blob->active.clusters) * blob->active.cluster_array_size, 0,
-			       sizeof(*blob->active.clusters) * (blob->active.num_clusters - blob->active.cluster_array_size));
-			blob->active.clusters = tmp;
-			blob->active.cluster_array_size = blob->active.num_clusters;
+			// tmp = realloc(blob->active.clusters, blob->active.num_clusters * sizeof(*blob->active.clusters));
+			// if (tmp == NULL) {
+			// 	SPDK_ERRLOG("Cannot alloc memory for cluster array open blob.\n");
+			// 	blob_load_final(ctx, -ENOMEM);
+			// 	return;
+			// }
+			// memset(tmp + sizeof(*blob->active.clusters) * blob->active.cluster_array_size, 0,
+			//        sizeof(*blob->active.clusters) * (blob->active.num_clusters - blob->active.cluster_array_size));
+			// blob->active.clusters = tmp;
+			// blob->active.cluster_array_size = blob->active.num_clusters;
 		}
 	}
 
