@@ -9708,6 +9708,7 @@ spdk_bs_update_snapshot_clone_live(struct spdk_blob *origblob, struct spdk_blob 
 
 	/* Set internal xattr for snapshot id */
 	blob_set_xattr(origblob, BLOB_SNAPSHOT, &newblob->id, sizeof(spdk_blob_id), true);
+	origblob->state = SPDK_BLOB_STATE_CLEAN;
 	origblob->back_bs_dev = bs_create_blob_bs_dev(newblob);
 	newblob->open_ref=2;
 	SPDK_NOTICELOG("Updating origblob after register snap "
