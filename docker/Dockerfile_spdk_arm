@@ -28,6 +28,6 @@ RUN sed -i "s/^#define SPDK_BDEV_QOS_TIMESLICE_IN_USEC.*/#define SPDK_BDEV_QOS_T
 RUN chmod +x /root/spdk/docker/crypto.sh
 RUN /root/spdk/docker/crypto.sh
 
-RUN cd spdk && ./configure --with-crypto --with-rdma --disable-tests --disable-unit-tests --disable-examples --with-ocf --with-fuse --with-nvme-cuse --target-arch=native
+RUN cd spdk && ./configure --with-crypto --with-rdma --disable-tests --disable-unit-tests --disable-examples --with-ocf --with-fuse --with-nvme-cuse --target-arch=armv8-a
 
-RUN cd spdk && make --no-builtin-rules -j16
+RUN cd spdk && make --no-builtin-rules
