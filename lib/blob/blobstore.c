@@ -14001,10 +14001,14 @@ blob_search_for_new_flush_job(struct spdk_blob *blob, struct t_flush_job *job) {
 				job->cluster_idx = bs_lba_to_cluster(blob->bs, blob->active.clusters[blob->next_idx_in_array]);
 				job->dev_page_number = 0;
 
-				// move to the next cluster
-				++blob->next_idx_in_array;
+				int8_t res = blob_do_flush_job(blob, job);
 
-				return blob_do_flush_job(blob, job);
+				// search for the next cluster in the snapshot while the flush is ongoing
+				do {
+					++blob->next_idx_in_array;
+				} while (blob->next_idx_in_array < blob->active.cluster_array_size && blob->active.clusters[blob->next_idx_in_array] == 0);
+
+				return res;
 			} else // move to the extent pages array
 			{
 				blob->nflush_jobs_on_prior_array = blob->nflush_jobs_current;
@@ -14027,13 +14031,15 @@ blob_search_for_new_flush_job(struct spdk_blob *blob, struct t_flush_job *job) {
 						job->cluster_idx = bs_lba_to_cluster(blob->bs, bs_md_page_to_lba(blob->bs, page_idxs_arr[blob->next_idx_in_array]));
 						job->dev_page_number = 0;
 
-						// search for the next md cluster in the snapshot
+						int8_t res = blob_do_flush_job(blob, job);
+
+						// search for the next md cluster in the snapshot while the flush is ongoing
 						do {
 							++blob->next_idx_in_array;
 						} while (blob->next_idx_in_array < blob->active.extent_pages_array_size && (page_idxs_arr[blob->next_idx_in_array] == 0 
 						|| bs_lba_to_cluster(blob->bs, bs_md_page_to_lba(blob->bs, page_idxs_arr[blob->next_idx_in_array])) == job->cluster_idx));
-
-						return blob_do_flush_job(blob, job);
+						
+						return res;
 					} else // move to the non-extent md pages array
 					{
 						blob->nflush_jobs_on_prior_array = blob->nflush_jobs_current;
@@ -14069,14 +14075,16 @@ blob_search_for_new_flush_job(struct spdk_blob *blob, struct t_flush_job *job) {
 						if (blob->next_idx_in_array < blob->active.num_pages) {
 							job->cluster_idx = bs_lba_to_cluster(blob->bs, bs_md_page_to_lba(blob->bs, page_idxs_arr[blob->next_idx_in_array]));
 							job->dev_page_number = 0;
+							
+							int8_t res = blob_do_flush_job(blob, job);
 
-							// search for the next md cluster in the snapshot
+							// search for the next md cluster in the snapshot while the flush is ongoing
 							do {
 								++blob->next_idx_in_array;
 							} while (blob->next_idx_in_array < blob->active.num_pages && (page_idxs_arr[blob->next_idx_in_array] == 0 
 							|| bs_lba_to_cluster(blob->bs, bs_md_page_to_lba(blob->bs, page_idxs_arr[blob->next_idx_in_array])) == job->cluster_idx));
-							
-							return blob_do_flush_job(blob, job);
+
+							return res;
 						} else // remaining page to flush is page root
 						{
 							blob->next_idx_in_array = 0;
