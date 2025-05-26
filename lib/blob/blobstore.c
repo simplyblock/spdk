@@ -11866,6 +11866,7 @@ spdk_blob_io_readv_ext(struct spdk_blob *blob, struct spdk_io_channel *channel,
 		       spdk_blob_op_complete cb_fn, void *cb_arg, struct spdk_blob_ext_io_opts *io_opts)
 {
 	offset &= ~LBA_METADATA_BITS_MASK;
+	SPDK_NOTICELOG("Read request offset=%llu, length=%llu\n", offset, length);
 	blob_request_submit_rw_iov(blob, channel, iov, iovcnt, offset, length, cb_fn, cb_arg, true,
 				   io_opts);
 }
