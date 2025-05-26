@@ -819,7 +819,7 @@ blob_parse_page(const struct spdk_blob_md_page *page, struct spdk_blob *blob)
 							if (!blob->is_recovery) {
 								return -EINVAL;
 							} else {
-								SPDK_NOTICELOG("Recover desc_extent_rle idx %i, cluster idx base = %u, j=%d\n", i, desc_extent_rle->extents[i].cluster_idx, j);
+								SPDK_NOTICELOG("Recover desc_extent_rle idx %u, cluster idx base = %u, j=%d\n", i, desc_extent_rle->extents[i].cluster_idx, j);
 								int rc = spdk_bit_pool_allocate_specific_bit(blob->bs->used_clusters, desc_extent_rle->extents[i].cluster_idx + j);
 								if (rc != 0) {
 									return -ENOMEM;
@@ -945,7 +945,7 @@ blob_parse_page(const struct spdk_blob_md_page *page, struct spdk_blob *blob)
 						 		desc_extent->cluster_idx[i]);
 							return -EINVAL;
 						} else {
-							SPDK_NOTICELOG("Recover desc_extent idx %i, cluster idx = %u\n", i, desc_extent->cluster_idx[i]);
+							SPDK_NOTICELOG("Recover desc_extent idx %u, cluster idx = %u\n", i, desc_extent->cluster_idx[i]);
 							int rc = spdk_bit_pool_allocate_specific_bit(blob->bs->used_clusters, desc_extent->cluster_idx[i]);
 							if (rc != 0) {
 								return -ENOMEM;
