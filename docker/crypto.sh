@@ -46,3 +46,15 @@ sed -i 's/^\tadr\s\+sha1key_adr, KEY_3$/\tadrp    sha1key_adr, KEY_3\
 
 sed -i 's/^\tadr\s\+md5key_adr,MD5_CONST_KEYS$/\tadrp    md5key_adr,MD5_CONST_KEYS\
 \tadd     md5key_adr, md5key_adr, :lo12:MD5_CONST_KEYS/' /root/spdk/isa-l-crypto/md5_mb/aarch64/md5_mb_sve.S
+
+sed -i 's/^\tadr\s\+sha1key_adr, KEY_0$/\tadrp    sha1key_adr, KEY_0\
+\tadd     sha1key_adr, sha1key_adr, :lo12:KEY_0/' isa-l-crypto/mh_sha1/aarch64/sha1_asimd_common.S
+
+sed -i 's/^\tadr\s\+sha1key_adr, KEY_1$/\tadrp    sha1key_adr, KEY_1\
+\tadd     sha1key_adr, sha1key_adr, :lo12:KEY_1/' isa-l-crypto/mh_sha1/aarch64/sha1_asimd_common.S
+
+sed -i 's/^\tadr\s\+sha1key_adr, KEY_2$/\tadrp    sha1key_adr, KEY_2\
+\tadd     sha1key_adr, sha1key_adr, :lo12:KEY_2/' isa-l-crypto/mh_sha1/aarch64/sha1_asimd_common.S
+
+sed -i 's/^\tadr\s\+sha1key_adr, KEY_3$/\tadrp    sha1key_adr, KEY_3\
+\tadd     sha1key_adr, sha1key_adr, :lo12:KEY_3/' isa-l-crypto/mh_sha1/aarch64/sha1_asimd_common.S
