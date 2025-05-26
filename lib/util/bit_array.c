@@ -529,9 +529,3 @@ spdk_bit_pool_free_all_bits(struct spdk_bit_pool *pool)
 	pool->lowest_free_bit = 0;
 	pool->free_count = spdk_bit_array_capacity(pool->array);
 }
-
-struct spdk_bit_array *
-spdk_bit_pool_get_bit_array(struct spdk_bit_pool *pool)
-{
-	return pool->array;
-}

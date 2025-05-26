@@ -819,7 +819,8 @@ blob_parse_page(const struct spdk_blob_md_page *page, struct spdk_blob *blob)
 							if (!blob->is_recovery) {
 								return -EINVAL;
 							} else {
-								int rc = spdk_bit_array_set(spdk_bit_pool_get_bit_array(blob->bs->used_clusters), desc_extent_rle->extents[i].cluster_idx + j);
+								SPDK_NOTICELOG("Recover desc_extent_rle idx %i, cluster idx base = %u, j=%d\n", i, desc_extent_rle->extents[i].cluster_idx, j);
+								int rc = spdk_bit_pool_allocate_specific_bit(blob->bs->used_clusters, desc_extent_rle->extents[i].cluster_idx + j);
 								if (rc != 0) {
 									return -ENOMEM;
 								}
@@ -944,7 +945,8 @@ blob_parse_page(const struct spdk_blob_md_page *page, struct spdk_blob *blob)
 						 		desc_extent->cluster_idx[i]);
 							return -EINVAL;
 						} else {
-							int rc = spdk_bit_array_set(spdk_bit_pool_get_bit_array(blob->bs->used_clusters), desc_extent->cluster_idx[i]);
+							SPDK_NOTICELOG("Recover desc_extent idx %i, cluster idx = %u\n", i, desc_extent->cluster_idx[i]);
+							int rc = spdk_bit_pool_allocate_specific_bit(blob->bs->used_clusters, desc_extent->cluster_idx[i]);
 							if (rc != 0) {
 								return -ENOMEM;
 							}
@@ -1083,6 +1085,7 @@ blob_parse(const struct spdk_blob_md_page *pages, uint32_t page_count,
 		if (!blob->is_recovery) {
 			assert(spdk_bit_array_get(blob->bs->used_md_pages, pages[i - 1].next));
 		} else {
+			SPDK_NOTICELOG("Recover md page, page num = %u\n", pages[i - 1].next);
 			spdk_bit_array_set(blob->bs->used_md_pages, pages[i - 1].next);
 		}
 		blob->active.pages[i] = pages[i - 1].next;
@@ -1683,13 +1686,9 @@ blob_load_backing_dev(spdk_bs_sequence_t *seq, void *cb_arg)
 					spdk_bs_open_blob_on_failover(blob->bs, blob->parent_id,
 					  		blob_load_snapshot_cpl, ctx);
 				}
-			} else if (!blob->is_recovery) {
+			} else {
 				spdk_bs_open_blob(blob->bs, blob->parent_id,
 					  	blob_load_snapshot_cpl, ctx);
-			} else {
-				SPDK_NOTICELOG("Loaded backing dev for recovering snapshot, now starting recovery\n");
-				bs_open_recover_blob(blob->bs, blob->id, 0,
-						blob_load_snapshot_cpl, ctx);
 			}
 			return;
 		} else {
