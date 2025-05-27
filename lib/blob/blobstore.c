@@ -1929,12 +1929,6 @@ blob_load(spdk_bs_sequence_t *seq, struct spdk_blob *blob,
 
 	blob->state = SPDK_BLOB_STATE_LOADING;
 	bs->r_io++;
-	/* tier blob-specific metadata if the blob is configured to do so
-	*/
-	const uint8_t blob_tiering_bits = blob->tiering_bits;
-	// set the metadata page bit mode if the blob must never evict metadata, else unset it
-	seq->tiering_bits |= (blob_tiering_bits & NOT_EVICT_BLOB_MD_BIT) ? METADATA_PAGE_BIT : 0;
-	seq->tiering_bits &= (blob_tiering_bits & DO_EVICT_BLOB_MD_BIT) ? ~METADATA_PAGE_BIT : 255;
 
 	bs_sequence_read_dev(seq, &ctx->pages[0], lba,
 			     bs_byte_to_lba(bs, SPDK_BS_PAGE_SIZE),
@@ -1963,13 +1957,6 @@ static void
 bs_batch_clear_dev(struct spdk_blob *blob, spdk_bs_batch_t *batch, uint64_t lba,
 		   uint64_t lba_count)
 {
-	/* tier blob-specific metadata if the blob is configured to do so
-	*/
-	const uint8_t blob_tiering_bits = blob->tiering_bits;
-	// set the metadata page bit mode if the blob must never evict metadata, else unset it
-	batch->tiering_bits |= (blob_tiering_bits & NOT_EVICT_BLOB_MD_BIT) ? METADATA_PAGE_BIT : 0;
-	batch->tiering_bits &= (blob_tiering_bits & DO_EVICT_BLOB_MD_BIT) ? ~METADATA_PAGE_BIT : 255;
-
 	switch (blob->clear_method) {
 	case BLOB_CLEAR_WITH_DEFAULT:
 	case BLOB_CLEAR_WITH_UNMAP:	
@@ -3068,13 +3055,6 @@ blob_persist(spdk_bs_sequence_t *seq, struct spdk_blob *blob,
 	}
 	TAILQ_INSERT_HEAD(&blob->persists_to_complete, ctx, link);
 
-	/* tier blob-specific metadata if the blob is configured to do so
-	*/
-	const uint8_t blob_tiering_bits = blob->tiering_bits;
-	// set the metadata page bit mode if the blob must never evict metadata, else unset it
-	seq->tiering_bits |= (blob_tiering_bits & NOT_EVICT_BLOB_MD_BIT) ? METADATA_PAGE_BIT : 0;
-	seq->tiering_bits &= (blob_tiering_bits & DO_EVICT_BLOB_MD_BIT) ? ~METADATA_PAGE_BIT : 255;
-
 	bs_mark_dirty(seq, blob->bs, blob_persist_start, ctx);
 }
 
@@ -3367,13 +3347,6 @@ bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 		bs_user_op_abort(op, -ENOMEM);
 		return;
 	}
-
-	/* tier blob-specific metadata if the blob is configured to do so
-	*/
-	const uint8_t blob_tiering_bits = blob->tiering_bits;
-	// set the metadata page bit mode if the blob must never evict metadata, else unset it
-	ctx->seq->tiering_bits |= (blob_tiering_bits & NOT_EVICT_BLOB_MD_BIT) ? METADATA_PAGE_BIT : 0;
-	ctx->seq->tiering_bits &= (blob_tiering_bits & DO_EVICT_BLOB_MD_BIT) ? ~METADATA_PAGE_BIT : 255;
 
 	/* Queue the user op to block other incoming operations */
 	TAILQ_INSERT_TAIL(&ch->need_cluster_alloc, op, link);
@@ -11536,13 +11509,6 @@ blob_write_extent_page(struct spdk_blob *blob, uint32_t extent, uint64_t cluster
 	page->next = SPDK_INVALID_MD_PAGE;
 	page->id = blob->id;
 	page->sequence_num = 0;
-
-	/* tier blob-specific metadata if the blob is configured to do so
-	*/
-	const uint8_t blob_tiering_bits = blob->tiering_bits;
-	// set the metadata page bit mode if the blob must never evict metadata, else unset it
-	seq->tiering_bits |= (blob_tiering_bits & NOT_EVICT_BLOB_MD_BIT) ? METADATA_PAGE_BIT : 0;
-	seq->tiering_bits &= (blob_tiering_bits & DO_EVICT_BLOB_MD_BIT) ? ~METADATA_PAGE_BIT : 255;
 
 	blob_serialize_extent_page(blob, cluster_num, page);
 
