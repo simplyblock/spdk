@@ -11058,6 +11058,19 @@ bs_open_blob(struct spdk_blob_store *bs,
 }
 
 static void
+bs_open_recover_blob_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno) {
+	struct spdk_blob *blob = cb_arg;
+	if (bserrno != 0) {
+		blob_free(blob);
+		seq->cpl.u.blob_handle.blob = NULL;
+		bs_sequence_finish(seq, bserrno);
+		return;
+	}
+
+	blob_persist(seq, blob, bs_open_blob_cpl, blob);
+}
+
+static void
 bs_open_recover_blob(struct spdk_blob_store *bs,
 	     spdk_blob_id blobid,
 	     struct spdk_blob_open_opts *opts,
@@ -11116,7 +11129,7 @@ bs_open_recover_blob(struct spdk_blob_store *bs,
 	}
 	seq->tiering_bits |= SYNC_FETCH_BIT;
 
-	blob_load(seq, blob, bs_open_blob_cpl, blob, SPDK_BLOB_UPDATE_NORMAL);
+	blob_load(seq, blob, bs_open_recover_blob_cpl, blob, SPDK_BLOB_UPDATE_NORMAL);
 }
 
 static void
