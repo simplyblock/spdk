@@ -1569,7 +1569,7 @@ blob_load_snapshot_cpl(void *cb_arg, struct spdk_blob *snapshot, int bserrno)
 {
 	struct spdk_blob_load_ctx	*ctx = cb_arg;
 	struct spdk_blob		*blob = ctx->blob;
-
+	SPDK_NOTICELOG("Blob load snapshot cpl create blob_bs_dev, snapshot num_clusters=%llu\n", blob->active.num_clusters);
 	if (bserrno == 0) {
 		blob->back_bs_dev = bs_create_blob_bs_dev(snapshot);
 		if (blob->back_bs_dev == NULL) {
@@ -8603,6 +8603,7 @@ bs_clone_origblob_open_cpl(void *cb_arg, struct spdk_blob *_blob, int bserrno)
 
 	opts.thin_provision = true;
 	opts.num_clusters = spdk_blob_get_num_clusters(_blob);
+	SPDK_NOTICELOG("Clone num_clusters=%llu\n", opts.num_clusters);
 	opts.use_extent_table = _blob->use_extent_table;
 	if (ctx->xattrs) {
 		memcpy(&opts.xattrs, ctx->xattrs, sizeof(*ctx->xattrs));
@@ -11879,7 +11880,15 @@ spdk_blob_io_readv_ext(struct spdk_blob *blob, struct spdk_io_channel *channel,
 		       spdk_blob_op_complete cb_fn, void *cb_arg, struct spdk_blob_ext_io_opts *io_opts)
 {
 	offset &= ~LBA_METADATA_BITS_MASK;
-	SPDK_NOTICELOG("Read request offset=%llu, length=%llu\n", offset, length);
+	if (spdk_blob_is_clone(blob)) {
+		SPDK_NOTICELOG("Read request offset=%llu, length=%llu\n", offset, length);
+		for (uint64_t i = 0; i < blob->active.cluster_array_size; ++i) {
+			uint64_t cluster_lba = blob->active.clusters[i];
+			if (cluster_lba != 0) {
+				SPDK_NOTICELOG("Cluster LBA: %llu\n", cluster_lba);
+			}
+		}
+	}
 	blob_request_submit_rw_iov(blob, channel, iov, iovcnt, offset, length, cb_fn, cb_arg, true,
 				   io_opts);
 }
