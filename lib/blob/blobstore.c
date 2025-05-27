@@ -5609,8 +5609,9 @@ bs_load_replay_extent_page_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrn
 		if (bs_load_cur_extent_page_valid(&ctx->extent_pages[i]) != true) {
 			spdk_free(ctx->extent_pages);
 			SPDK_NOTICELOG("Extent page not valid.\n");
-			bs_load_ctx_fail(ctx, -EILSEQ);
-			return;
+			// bs_load_ctx_fail(ctx, -EILSEQ);
+			break;
+			// return;
 		}
 
 		page_num = ctx->extent_page_num[i];
@@ -5618,8 +5619,9 @@ bs_load_replay_extent_page_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrn
 		if (bs_load_replay_md_parse_page(ctx, &ctx->extent_pages[i])) {
 			spdk_free(ctx->extent_pages);
 			SPDK_NOTICELOG("Recover failed 3 parse extent page failed.\n");
-			bs_load_ctx_fail(ctx, -EILSEQ);
-			return;
+			// bs_load_ctx_fail(ctx, -EILSEQ);
+			break;
+			// return;
 		}
 	}
 
@@ -5687,8 +5689,9 @@ bs_load_replay_md_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 				spdk_bit_array_set(ctx->bs->map_blobids, page->reserved0);
 			}
 			if (bs_load_replay_md_parse_page(ctx, page)) {
-				SPDK_INFOLOG(blob, "Recover: blob 0x%" PRIx32 " failed\n", page_num);
-				bs_load_ctx_fail(ctx, -EILSEQ);
+				SPDK_NOTICELOG("Recover: blob 0x%" PRIx32 " failed\n", page_num);
+				bs_load_replay_md_chain_cpl(ctx);
+				// bs_load_ctx_fail(ctx, -EILSEQ);
 				return;
 			}
 			if (page->next != SPDK_INVALID_MD_PAGE) {
