@@ -5610,7 +5610,7 @@ bs_load_replay_extent_page_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrn
 			spdk_free(ctx->extent_pages);
 			SPDK_NOTICELOG("Extent page not valid.\n");
 			// bs_load_ctx_fail(ctx, -EILSEQ);
-			break;
+			goto error;
 			// return;
 		}
 
@@ -5620,11 +5620,12 @@ bs_load_replay_extent_page_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrn
 			spdk_free(ctx->extent_pages);
 			SPDK_NOTICELOG("Recover failed 3 parse extent page failed.\n");
 			// bs_load_ctx_fail(ctx, -EILSEQ);
-			break;
+			goto error;
 			// return;
 		}
 	}
 
+error:
 	spdk_free(ctx->extent_pages);
 	free(ctx->extent_page_num);
 	ctx->extent_page_num = NULL;
