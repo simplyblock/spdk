@@ -1573,7 +1573,7 @@ blob_load_snapshot_cpl(void *cb_arg, struct spdk_blob *snapshot, int bserrno)
 {
 	struct spdk_blob_load_ctx	*ctx = cb_arg;
 	struct spdk_blob		*blob = ctx->blob;
-	SPDK_NOTICELOG("Blob load snapshot cpl create blob_bs_dev, snapshot num_clusters=%llu\n", blob->active.num_clusters);
+	SPDK_NOTICELOG("Blob load snapshot cpl create blob_bs_dev, cur blob num_clusters=%llu, snapshot num_clusters=%llu\n", blob->active.num_clusters, snapshot->active.num_clusters);
 	if (bserrno == 0) {
 		blob->back_bs_dev = bs_create_blob_bs_dev(snapshot);
 		if (blob->back_bs_dev == NULL) {
@@ -11912,7 +11912,7 @@ spdk_blob_io_readv_ext(struct spdk_blob *blob, struct spdk_io_channel *channel,
 		       spdk_blob_op_complete cb_fn, void *cb_arg, struct spdk_blob_ext_io_opts *io_opts)
 {
 	offset &= ~LBA_METADATA_BITS_MASK;
-	if (spdk_blob_is_clone(blob)) {
+	if (spdk_blob_is_clone(blob) || spdk_blob_is_snapshot(blob)) {
 		SPDK_NOTICELOG("Read request offset=%llu, length=%llu\n", offset, length);
 		for (uint64_t i = 0; i < blob->active.cluster_array_size; ++i) {
 			uint64_t cluster_lba = blob->active.clusters[i];
