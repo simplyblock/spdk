@@ -11067,7 +11067,7 @@ bs_open_recover_blob_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno) {
 		bs_sequence_finish(seq, bserrno);
 		return;
 	}
-
+	blob->state = SPDK_BLOB_STATE_DIRTY;
 	blob_persist(seq, blob, bs_open_blob_cpl, blob);
 }
 
@@ -11348,7 +11348,7 @@ spdk_blob_sync_md(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_
 
 	SPDK_DEBUGLOG(blob, "Syncing blob 0x%" PRIx64 "\n", blob->id);
 
-	if (blob->md_ro) {
+	if (blob->md_ro && !blob->is_recovery) {
 		assert(blob->state == SPDK_BLOB_STATE_CLEAN);
 		cb_fn(cb_arg, 0);
 		return;
