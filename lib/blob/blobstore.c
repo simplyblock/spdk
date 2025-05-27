@@ -11380,7 +11380,7 @@ spdk_blob_sync_md(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_
 
 	SPDK_DEBUGLOG(blob, "Syncing blob 0x%" PRIx64 "\n", blob->id);
 
-	if (blob->md_ro && !blob->is_recovery) {
+	if (blob->md_ro) {
 		assert(blob->state == SPDK_BLOB_STATE_CLEAN);
 		cb_fn(cb_arg, 0);
 		return;
