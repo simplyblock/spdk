@@ -820,12 +820,10 @@ blob_parse_page(const struct spdk_blob_md_page *page, struct spdk_blob *blob)
 								return -EINVAL;
 							} else {
 								SPDK_NOTICELOG("Recover desc_extent_rle idx %u, cluster idx base = %u, j=%d\n", i, desc_extent_rle->extents[i].cluster_idx, j);
-								/*
 								int res = spdk_bit_pool_allocate_specific_bit(blob->bs->used_clusters, desc_extent_rle->extents[i].cluster_idx + j);
 								if (res == UINT32_MAX) {
 									return -EINVAL;
 								}
-								*/
 							}
 						}
 					}
@@ -948,12 +946,10 @@ blob_parse_page(const struct spdk_blob_md_page *page, struct spdk_blob *blob)
 							return -EINVAL;
 						} else {
 							SPDK_NOTICELOG("Recover desc_extent idx %u, cluster idx = %u\n", i, desc_extent->cluster_idx[i]);
-							/*
 							int res = spdk_bit_pool_allocate_specific_bit(blob->bs->used_clusters, desc_extent->cluster_idx[i]);
 							if (res == UINT32_MAX) {
 								return -EINVAL;
 							}
-							*/
 						}
 					}
 				}
