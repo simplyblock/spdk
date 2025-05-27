@@ -84,7 +84,7 @@ zero_trailing_bytes(struct spdk_blob_bs_dev *b, struct iovec *iov, int iovcnt,
 	/* Figure out how many bytes in the payload will need to be zeroed. */
 	zero_lba_count = spdk_min(*lba_count, lba + *lba_count - b->bs_dev.blockcnt);
 	zero_bytes = zero_lba_count * (uint64_t)b->bs_dev.blocklen;
-	SPDK_NOTICELOG("lba=%llu, lba_count=%llu, zero lba count = %llu, blocklen=%llu\n", lba, lba_count, zero_lba_count, b->bs_dev.blocklen);
+	SPDK_NOTICELOG("lba=%llu, lba_count=%llu, zero lba count = %llu, blocklen=%llu\n", lba, *lba_count, zero_lba_count, b->bs_dev.blocklen);
 
 	payload_bytes = *lba_count * (uint64_t)b->bs_dev.blocklen;
 	valid_bytes = payload_bytes - zero_bytes;
@@ -110,6 +110,7 @@ static inline void
 blob_bs_dev_read(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
 		 uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
 {
+	lba &= ~LBA_METADATA_BITS_MASK;
 	struct spdk_blob_bs_dev *b = (struct spdk_blob_bs_dev *)dev;
 	struct iovec iov;
 
@@ -127,6 +128,7 @@ blob_bs_dev_readv(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		  struct iovec *iov, int iovcnt,
 		  uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
 {
+	lba &= ~LBA_METADATA_BITS_MASK;
 	struct spdk_blob_bs_dev *b = (struct spdk_blob_bs_dev *)dev;
 
 	/* The backing blob may be smaller than this blob, so zero any trailing bytes. */
@@ -143,6 +145,7 @@ blob_bs_dev_readv_ext(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		      uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args,
 		      struct spdk_blob_ext_io_opts *ext_opts)
 {
+	lba &= ~LBA_METADATA_BITS_MASK;
 	struct spdk_blob_bs_dev *b = (struct spdk_blob_bs_dev *)dev;
 
 	/* The backing blob may be smaller than this blob, so zero any trailing bytes. */
@@ -175,6 +178,7 @@ blob_bs_dev_destroy(struct spdk_bs_dev *bs_dev)
 static bool
 blob_bs_is_zeroes(struct spdk_bs_dev *dev, uint64_t lba, uint64_t lba_count)
 {
+	lba &= ~LBA_METADATA_BITS_MASK;
 	struct spdk_blob_bs_dev *b = (struct spdk_blob_bs_dev *)dev;
 	struct spdk_blob *blob = b->blob;
 	bool is_valid_range;
@@ -196,6 +200,7 @@ blob_bs_is_zeroes(struct spdk_bs_dev *dev, uint64_t lba, uint64_t lba_count)
 static bool
 blob_bs_is_range_valid(struct spdk_bs_dev *dev, uint64_t lba, uint64_t lba_count)
 {
+	lba &= ~LBA_METADATA_BITS_MASK;
 	struct spdk_blob_bs_dev *b = (struct spdk_blob_bs_dev *)dev;
 	struct spdk_blob *blob = b->blob;
 	uint64_t	page;
@@ -223,6 +228,7 @@ blob_bs_is_range_valid(struct spdk_bs_dev *dev, uint64_t lba, uint64_t lba_count
 static bool
 blob_bs_translate_lba(struct spdk_bs_dev *dev, uint64_t lba, uint64_t *base_lba)
 {
+	lba &= ~LBA_METADATA_BITS_MASK;
 	struct spdk_blob_bs_dev *b = (struct spdk_blob_bs_dev *)dev;
 	struct spdk_blob *blob = b->blob;
 	bool is_valid_range;
