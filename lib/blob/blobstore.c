@@ -1572,6 +1572,7 @@ blob_load_snapshot_cpl(void *cb_arg, struct spdk_blob *snapshot, int bserrno)
 	SPDK_NOTICELOG("Blob load snapshot cpl create blob_bs_dev, cur blob num_clusters=%llu, snapshot num_clusters=%llu\n", blob->active.num_clusters, snapshot->active.num_clusters);
 	if (bserrno == 0) {
 		blob->back_bs_dev = bs_create_blob_bs_dev(snapshot);
+		SPDK_NOTICELOG("Snapshot active.num_clusters=%llu, pages_per_cluster=%llu, io_unit_per_page=%d\n", snapshot->active.num_clusters, snapshot->bs->pages_per_cluster, bs_io_unit_per_page(snapshot->bs));
 		if (blob->back_bs_dev == NULL) {
 			bserrno = -ENOMEM;
 		}
