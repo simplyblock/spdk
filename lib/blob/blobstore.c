@@ -820,10 +820,12 @@ blob_parse_page(const struct spdk_blob_md_page *page, struct spdk_blob *blob)
 								return -EINVAL;
 							} else {
 								SPDK_NOTICELOG("Recover desc_extent_rle idx %u, cluster idx base = %u, j=%d\n", i, desc_extent_rle->extents[i].cluster_idx, j);
+								/*
 								int res = spdk_bit_pool_allocate_specific_bit(blob->bs->used_clusters, desc_extent_rle->extents[i].cluster_idx + j);
 								if (res == UINT32_MAX) {
 									return -EINVAL;
 								}
+								*/
 							}
 						}
 					}
@@ -946,10 +948,12 @@ blob_parse_page(const struct spdk_blob_md_page *page, struct spdk_blob *blob)
 							return -EINVAL;
 						} else {
 							SPDK_NOTICELOG("Recover desc_extent idx %u, cluster idx = %u\n", i, desc_extent->cluster_idx[i]);
+							/*
 							int res = spdk_bit_pool_allocate_specific_bit(blob->bs->used_clusters, desc_extent->cluster_idx[i]);
 							if (res == UINT32_MAX) {
 								return -EINVAL;
 							}
+							*/
 						}
 					}
 				}
@@ -11059,7 +11063,23 @@ bs_open_blob(struct spdk_blob_store *bs,
 }
 
 static void
-bs_open_recover_blob_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno) {
+bs_open_recover_bit_persist_cb(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno) 
+{
+	struct spdk_blob_persist_ctx *ctx = cb_arg;
+
+	/* Call user callback */
+	ctx->cb_fn(ctx->seq, ctx->cb_arg, bserrno);
+
+	/* Free the memory */
+	if (ctx->bit_page) {
+		spdk_free(ctx->bit_page);
+	}
+	free(ctx);
+}
+
+static void
+bs_open_recover_blob_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno) 
+{
 	struct spdk_blob *blob = cb_arg;
 	if (bserrno != 0) {
 		blob_free(blob);
@@ -11067,8 +11087,20 @@ bs_open_recover_blob_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno) {
 		bs_sequence_finish(seq, bserrno);
 		return;
 	}
-	blob->state = SPDK_BLOB_STATE_DIRTY;
-	blob_persist(seq, blob, bs_open_blob_cpl, blob);
+
+	struct spdk_blob_persist_ctx *ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		bs_open_blob_cpl(seq, cb_arg, -ENOMEM);
+		return;
+	}
+	ctx->blob = blob;
+	ctx->seq = seq;
+	ctx->cb_fn = bs_open_blob_cpl;
+	ctx->bit_cb_fn_persist = bs_open_recover_bit_persist_cb;
+	ctx->cb_arg = cb_arg;
+	ctx->idx_blobids = bs_blobid_to_page(blob->id);
+
+	persist_bs_write_used_blobids(seq, ctx, 0);
 }
 
 static void
