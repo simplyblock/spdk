@@ -84,7 +84,6 @@ zero_trailing_bytes(struct spdk_blob_bs_dev *b, struct iovec *iov, int iovcnt,
 	/* Figure out how many bytes in the payload will need to be zeroed. */
 	zero_lba_count = spdk_min(*lba_count, lba + *lba_count - b->bs_dev.blockcnt);
 	zero_bytes = zero_lba_count * (uint64_t)b->bs_dev.blocklen;
-	SPDK_NOTICELOG("lba=%llu, lba_count=%llu, zero lba count = %llu, blocklen=%llu\n", lba, *lba_count, zero_lba_count, b->bs_dev.blocklen);
 
 	payload_bytes = *lba_count * (uint64_t)b->bs_dev.blocklen;
 	valid_bytes = payload_bytes - zero_bytes;
@@ -133,7 +132,6 @@ blob_bs_dev_readv(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 
 	/* The backing blob may be smaller than this blob, so zero any trailing bytes. */
 	zero_trailing_bytes(b, iov, iovcnt, lba, &lba_count);
-	SPDK_NOTICELOG("Zeroed trailing bytes, lba_count=%llu\n", lba_count);
 
 	spdk_blob_io_readv(b->blob, channel, iov, iovcnt, lba, lba_count,
 			   blob_bs_dev_read_cpl, cb_args);
@@ -150,7 +148,6 @@ blob_bs_dev_readv_ext(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 
 	/* The backing blob may be smaller than this blob, so zero any trailing bytes. */
 	zero_trailing_bytes(b, iov, iovcnt, lba, &lba_count);
-	SPDK_NOTICELOG("Zeroed trailing bytes, lba_count=%llu\n", lba_count);
 
 	spdk_blob_io_readv_ext(b->blob, channel, iov, iovcnt, lba, lba_count,
 			       blob_bs_dev_read_cpl, cb_args, ext_opts);

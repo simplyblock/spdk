@@ -819,7 +819,6 @@ blob_parse_page(const struct spdk_blob_md_page *page, struct spdk_blob *blob)
 							if (!blob->is_recovery) {
 								return -EINVAL;
 							} else {
-								SPDK_NOTICELOG("Recover desc_extent_rle idx %u, cluster idx base = %u, j=%d\n", i, desc_extent_rle->extents[i].cluster_idx, j);
 								int res = spdk_bit_pool_allocate_specific_bit(blob->bs->used_clusters, desc_extent_rle->extents[i].cluster_idx + j);
 								if (res == UINT32_MAX) {
 									return -EINVAL;
@@ -945,7 +944,6 @@ blob_parse_page(const struct spdk_blob_md_page *page, struct spdk_blob *blob)
 						 		desc_extent->cluster_idx[i]);
 							return -EINVAL;
 						} else {
-							SPDK_NOTICELOG("Recover desc_extent idx %u, cluster idx = %u\n", i, desc_extent->cluster_idx[i]);
 							int res = spdk_bit_pool_allocate_specific_bit(blob->bs->used_clusters, desc_extent->cluster_idx[i]);
 							if (res == UINT32_MAX) {
 								return -EINVAL;
@@ -1085,7 +1083,6 @@ blob_parse(const struct spdk_blob_md_page *pages, uint32_t page_count,
 		if (!blob->is_recovery) {
 			assert(spdk_bit_array_get(blob->bs->used_md_pages, pages[i - 1].next));
 		} else {
-			SPDK_NOTICELOG("Recover md page, page num = %u\n", pages[i - 1].next);
 			spdk_bit_array_set(blob->bs->used_md_pages, pages[i - 1].next);
 		}
 		blob->active.pages[i] = pages[i - 1].next;
@@ -1569,10 +1566,8 @@ blob_load_snapshot_cpl(void *cb_arg, struct spdk_blob *snapshot, int bserrno)
 {
 	struct spdk_blob_load_ctx	*ctx = cb_arg;
 	struct spdk_blob		*blob = ctx->blob;
-	SPDK_NOTICELOG("Blob load snapshot cpl create blob_bs_dev, cur blob num_clusters=%llu, snapshot num_clusters=%llu\n", blob->active.num_clusters, snapshot->active.num_clusters);
 	if (bserrno == 0) {
 		blob->back_bs_dev = bs_create_blob_bs_dev(snapshot);
-		SPDK_NOTICELOG("Snapshot active.num_clusters=%llu, pages_per_cluster=%llu, io_unit_per_page=%d\n", snapshot->active.num_clusters, snapshot->bs->pages_per_cluster, bs_io_unit_per_page(snapshot->bs));
 		if (blob->back_bs_dev == NULL) {
 			bserrno = -ENOMEM;
 		}
@@ -8577,7 +8572,6 @@ bs_clone_origblob_open_cpl(void *cb_arg, struct spdk_blob *_blob, int bserrno)
 
 	opts.thin_provision = true;
 	opts.num_clusters = spdk_blob_get_num_clusters(_blob);
-	SPDK_NOTICELOG("Clone num_clusters=%llu\n", opts.num_clusters);
 	opts.use_extent_table = _blob->use_extent_table;
 	if (ctx->xattrs) {
 		memcpy(&opts.xattrs, ctx->xattrs, sizeof(*ctx->xattrs));
@@ -11875,15 +11869,6 @@ spdk_blob_io_readv_ext(struct spdk_blob *blob, struct spdk_io_channel *channel,
 		       spdk_blob_op_complete cb_fn, void *cb_arg, struct spdk_blob_ext_io_opts *io_opts)
 {
 	offset &= ~LBA_METADATA_BITS_MASK;
-	if (spdk_blob_is_clone(blob) || spdk_blob_is_snapshot(blob)) {
-		SPDK_NOTICELOG("Read request offset=%llu, length=%llu\n", offset, length);
-		for (uint64_t i = 0; i < blob->active.cluster_array_size; ++i) {
-			uint64_t cluster_lba = blob->active.clusters[i];
-			if (cluster_lba != 0) {
-				SPDK_NOTICELOG("Cluster LBA: %llu\n", cluster_lba);
-			}
-		}
-	}
 	blob_request_submit_rw_iov(blob, channel, iov, iovcnt, offset, length, cb_fn, cb_arg, true,
 				   io_opts);
 }
