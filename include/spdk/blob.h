@@ -1166,7 +1166,11 @@ void spdk_blob_io_writev_ext(struct spdk_blob *blob, struct spdk_io_channel *cha
 			     struct iovec *iov, int iovcnt, uint64_t offset, uint64_t length,
 			     spdk_blob_op_complete cb_fn, void *cb_arg,
 			     struct spdk_blob_ext_io_opts *io_opts);
+void
+spdk_add_stat_ext(struct spdk_io_channel *channel);
 
+void
+spdk_sub_stat_ext(struct spdk_io_channel *channel);
 /**
  * Read 'length' io_units starting at 'offset' io_units into the blob into the memory
  * described by 'iov'. Accepts extended IO request options

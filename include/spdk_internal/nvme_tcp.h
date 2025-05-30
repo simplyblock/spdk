@@ -417,10 +417,10 @@ nvme_tcp_read_data(struct spdk_sock *sock, int bytes,
 		}
 
 		/* For connect reset issue, do not output error log */
-		if (errno != ECONNRESET) {
+		// if (errno != ECONNRESET) {
 			SPDK_ERRLOG("spdk_sock_recv() failed, errno %d: %s\n",
 				    errno, spdk_strerror(errno));
-		}
+		// }
 	}
 
 	/* connection closed */

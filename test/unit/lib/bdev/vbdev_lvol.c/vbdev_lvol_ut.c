@@ -65,6 +65,8 @@ DEFINE_STUB(spdk_lvs_esnap_missing_add, int,
 DEFINE_STUB(spdk_blob_get_esnap_bs_dev, struct spdk_bs_dev *, (const struct spdk_blob *blob), NULL);
 DEFINE_STUB(spdk_lvol_is_degraded, bool, (const struct spdk_lvol *lvol), false);
 DEFINE_STUB(spdk_bs_get_hub_channel, struct spdk_io_channel	*, (struct spdk_io_channel *ch), NULL);
+DEFINE_STUB_V(spdk_sub_stat_ext, (struct spdk_io_channel *ch));
+DEFINE_STUB_V(spdk_add_stat_ext, (struct spdk_io_channel *ch));
 DEFINE_STUB(spdk_bs_set_hub_channel, bool, (struct spdk_io_channel *ch, struct spdk_io_channel *hub_ch, void *desc), true);
 DEFINE_STUB(spdk_blob_get_num_allocated_clusters, uint64_t, (struct spdk_blob *blob), 0);
 DEFINE_STUB(spdk_blob_get_id, uint64_t, (struct spdk_blob *blob), 0);
@@ -99,6 +101,14 @@ const struct spdk_bdev_aliases_list *
 spdk_bdev_get_aliases(const struct spdk_bdev *bdev)
 {
 	return &bdev->aliases;
+}
+
+struct spdk_io_channel *
+spdk_bdev_io_get_io_channel(struct spdk_bdev_io *bdev_io)
+{
+	struct spdk_lvol *lvol = bdev_io->bdev->ctxt;
+	CU_ASSERT(lvol == g_lvol);
+	return g_ch;	
 }
 
 bool

@@ -1018,6 +1018,13 @@ spdk_lvs_destroy(struct spdk_lvol_store *lvs, spdk_lvs_op_complete cb_fn,
 		}
 	}
 
+	if (lvs->primary) {
+		if (lvs->hublvol_poller) {
+			spdk_poller_unregister(&lvs->hublvol_poller);
+			lvs->hublvol_poller = NULL;
+		}
+	}
+
 	TAILQ_FOREACH_SAFE(iter_lvol, &lvs->lvols, link, tmp) {
 		free(iter_lvol);
 	}
@@ -2922,6 +2929,31 @@ spdk_lvs_trigger_leadership_switch(uint64_t *groupid)
 	return false;
 }
 
+int
+spdk_lvs_IO_redirect(void *cb_arg)
+{
+	struct spdk_lvol_store *lvs = cb_arg;
+	if (lvs->secondary) {
+		uint64_t current = lvs->current_io > lvs->total_io ? lvs->current_io - lvs->total_io : lvs->total_io - lvs->current_io;
+		SPDK_NOTICELOG("IO redirect CNT: t[%" PRIu64 "] c[%" PRIu64 "] f[%" PRIu64 "] \n",
+				lvs->total_io, current, lvs->hub_dev.redirected_io_count);
+		lvs->total_io += current;
+	}
+	return 0;
+}
+
+int
+spdk_lvs_IO_hublvol(void *cb_arg)
+{
+	struct spdk_lvol_store *lvs = cb_arg;
+	if (lvs->primary) {
+		uint64_t current = lvs->current_io > lvs->total_io ? lvs->current_io - lvs->total_io : lvs->total_io - lvs->current_io;
+		SPDK_NOTICELOG("IO hublvol CNT: t[%" PRIu64 "] c[%" PRIu64 "] \n", lvs->total_io, current);
+		lvs->total_io += current;
+	}
+	return 0;
+}
+
 static void
 spdk_delayed_close_hub_bdev(void *arg)
 {
@@ -2953,6 +2985,8 @@ spdk_wait_for_redirected_io_cleanup(void *arg)
 		SPDK_NOTICELOG("All redirected I/Os completed. Proceeding to cleanup.\n");
 		spdk_poller_unregister(&lvs->hub_dev.cleanup_poller);
 		lvs->hub_dev.cleanup_poller = NULL;
+		spdk_poller_unregister(&lvs->redirect_poller);
+		lvs->redirect_poller = NULL;
 		spdk_bs_drain_channel_queued(lvs->blobstore, lvs->hub_dev.submit_cb, spdk_trigger_failover_cpl, lvs);
 		return -1;
 	}
@@ -3008,6 +3042,10 @@ spdk_lvs_open_hub_bdev(void *cb_arg) {
 		SPDK_NOTICELOG("start to recreate the desc from hub dev.\n");
 		lvs->hub_dev.state = HUBLVOL_CONNECTING_IN_PROCCESS;
 		pthread_mutex_unlock(&g_lvol_stores_mutex);
+		if (!lvs->redirect_poller) {
+			lvs->redirect_poller = spdk_poller_register(
+			spdk_lvs_IO_redirect, lvs, 1000000 );
+		}
  		// connect to the remote_bdev
 		rc = spdk_bdev_open_ext(lvs->remote_bdev, true, spdk_lvs_hub_bdev_event_cb, lvs, &lvs->hub_dev.desc);
 		if (rc != 0) {
@@ -3060,6 +3098,12 @@ spdk_lvs_set_opts(struct spdk_lvol_store *lvs, uint64_t groupid, uint64_t port, 
 	lvs->groupid = groupid;
 	lvs->subsystem_port = port;
 	lvs->primary = primary;	
+	if (primary) {
+		if (!lvs->hublvol_poller) {
+			lvs->hublvol_poller = spdk_poller_register(
+			spdk_lvs_IO_hublvol, lvs, 1000000 );
+		}
+	}	
  	lvs->secondary = secondary;	
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
 	return;
