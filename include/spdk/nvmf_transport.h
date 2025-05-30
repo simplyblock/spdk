@@ -551,6 +551,7 @@ bool spdk_nvmf_request_get_dif_ctx(struct spdk_nvmf_request *req, struct spdk_di
 
 void spdk_nvmf_request_exec(struct spdk_nvmf_request *req);
 char *spdk_nvmf_request_nqn(struct spdk_nvmf_request *req, uint8_t idx);
+char *spdk_nvmf_request_nqn1(struct spdk_nvmf_qpair *qpair, uint8_t idx);
 int spdk_nvmf_request_free(struct spdk_nvmf_request *req);
 int spdk_nvmf_request_complete(struct spdk_nvmf_request *req);
 void spdk_nvmf_request_zcopy_start(struct spdk_nvmf_request *req);

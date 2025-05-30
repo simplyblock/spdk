@@ -1114,7 +1114,8 @@ lvol_op_comp(void *cb_arg, int bserrno)
 {
 	struct spdk_bdev_io *bdev_io = cb_arg;
 	enum spdk_bdev_io_status status = SPDK_BDEV_IO_STATUS_SUCCESS;
-
+	// struct spdk_io_channel *ch = spdk_bdev_io_get_io_channel(bdev_io);
+	// spdk_sub_stat_ext(ch);
 	if (bserrno != 0) {
 		struct spdk_lvol *lvol = bdev_io->bdev->ctxt;
 		struct spdk_lvol_store *lvs = lvol->lvol_store;
@@ -1631,6 +1632,7 @@ vbdev_lvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_
 	struct spdk_lvol_store *lvs = lvol->lvol_store;
 	bool io_type = check_IO_type(bdev_io->type);
 
+	// spdk_add_stat_ext(ch);
 	if (lvs->secondary && (!lvs->leader && !lvs->update_in_progress) && !lvs->skip_redirecting ) {
 		if (io_type) {
 			__atomic_add_fetch(&lvs->current_io, 1, __ATOMIC_SEQ_CST);

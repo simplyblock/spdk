@@ -4358,6 +4358,63 @@ struct spdk_bs_load_ctx {
 	char					xattr_name[4096];
 };
 
+// struct stat_io {
+// 	uint64_t current_io[21];
+// 	uint64_t t_current_io[21];
+// 	struct spdk_blob_store	*bs;
+// 	int len;
+// };
+
+// static void
+// spdk_bs_stat_io(struct spdk_io_channel_iter *i)
+// {
+// 	struct spdk_io_channel *_ch = spdk_io_channel_iter_get_channel(i);
+// 	struct spdk_bs_channel *ch = spdk_io_channel_get_ctx(_ch);
+// 	struct stat_io *ctx = spdk_io_channel_iter_get_ctx(i);
+
+// 	if (ctx->len < 20 && ch->t_current_io > 0) {
+// 		ctx->current_io[ctx->len] = ch->current_io;
+// 		ctx->t_current_io[ctx->len] = ch->t_current_io;
+// 		ch->t_current_io = 0;
+// 		ctx->len++;
+// 	}
+// 	spdk_for_each_channel_continue(i, 0);
+// }
+
+// static void
+// spdk_bs_stat_io_cpl(struct spdk_io_channel_iter *i, int status)
+// {
+// 	struct stat_io *ctx = spdk_io_channel_iter_get_ctx(i);
+// 	int j;
+// 	char buf[255]; // Adjust the size as necessary
+// 	char t_buf[255]; // Adjust the size as necessary
+// 	int t_offset = 0;
+// 	int offset = 0;
+// 	uint64_t total_io = 0;
+// 	uint64_t t_total_io = 0;
+
+// 	if (ctx->len == 0) {
+// 		free(ctx);
+//     	return;
+// 	}
+
+// 	for (j = 0; j < ctx->len; j++) {
+// 		if (ctx->current_io[j]) {
+// 			total_io += ctx->current_io[j];
+// 			offset += snprintf(buf + offset, sizeof(buf) - offset, "[%d]=%" PRIu64 " ", j, ctx->current_io[j]);
+
+// 			t_total_io += ctx->t_current_io[j];
+// 			t_offset += snprintf(t_buf + t_offset, sizeof(t_buf) - t_offset, "[%d]=%" PRIu64 " ", j, ctx->t_current_io[j] / 3);
+// 		}
+// 	}
+// 	uint64_t counter = ctx->bs->channel_stat_counter / 3;
+// 	ctx->bs->avg_total = ((counter * ctx->bs->avg_total) + ((total_io) / ctx->len) / (counter + 1));
+// 	snprintf(buf + offset, sizeof(buf) - offset, "[AVG-PC]=%" PRIu64 " [AVG-T]=%" PRIu64 "", total_io / ctx->len, ctx->bs->avg_total);
+// 	SPDK_ERRLOG("LSTAT-A: %s \n", buf);
+// 	snprintf(t_buf + t_offset, sizeof(t_buf) - t_offset, "[AVG]=%" PRIu64 " \n",  (t_total_io / 3) / ctx->len);
+// 	SPDK_ERRLOG("LSTAT-T: %s \n", t_buf);
+// 	free(ctx);
+// }
 
 static int
 spdk_bs_monitoring_poller(void *cb_arg) {
@@ -4371,6 +4428,17 @@ spdk_bs_monitoring_poller(void *cb_arg) {
 							bs->total, bs->total_r, bs->total_w, ccm_io, bs->r_io, bs->w_io);		
 		bs->w_io = 0;
 		bs->r_io = 0;
+		// if (bs->channel_stat_counter % 3 == 0) {
+		// 	struct stat_io *ctx;
+		// 	// bs->channel_stat_counter = 0;
+		// 	ctx = calloc(1, sizeof(*ctx));
+		// 	if (!ctx) {			
+		// 		return SPDK_POLLER_BUSY;
+		// 	}
+		// 	ctx->bs = bs;
+		// 	spdk_for_each_channel(bs, spdk_bs_stat_io, ctx, spdk_bs_stat_io_cpl);
+		// }
+		// bs->channel_stat_counter++;
 		return SPDK_POLLER_BUSY;
 	}
 	return -1;
@@ -11496,6 +11564,21 @@ spdk_blob_io_writev_ext(struct spdk_blob *blob, struct spdk_io_channel *channel,
 {
 	blob_request_submit_rw_iov(blob, channel, iov, iovcnt, offset, length, cb_fn, cb_arg, false,
 				   io_opts);
+}
+
+void
+spdk_add_stat_ext(struct spdk_io_channel *channel)
+{
+	struct spdk_bs_channel *bs_channel = spdk_io_channel_get_ctx(channel);
+	bs_channel->current_io++;
+	bs_channel->t_current_io++;
+}
+
+void
+spdk_sub_stat_ext(struct spdk_io_channel *channel)
+{
+	struct spdk_bs_channel *bs_channel = spdk_io_channel_get_ctx(channel);
+	bs_channel->current_io--;
 }
 
 void

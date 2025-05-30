@@ -2937,7 +2937,7 @@ spdk_lvs_IO_redirect(void *cb_arg)
 		uint64_t current = lvs->current_io > lvs->total_io ? lvs->current_io - lvs->total_io : lvs->total_io - lvs->current_io;
 		SPDK_NOTICELOG("IO redirect CNT: t[%" PRIu64 "] c[%" PRIu64 "] f[%" PRIu64 "] \n",
 				lvs->total_io, current, lvs->hub_dev.redirected_io_count);
-		lvs->total_io += lvs->current_io;
+		lvs->total_io += current;
 	}
 	return 0;
 }
@@ -2949,7 +2949,7 @@ spdk_lvs_IO_hublvol(void *cb_arg)
 	if (lvs->primary) {
 		uint64_t current = lvs->current_io > lvs->total_io ? lvs->current_io - lvs->total_io : lvs->total_io - lvs->current_io;
 		SPDK_NOTICELOG("IO hublvol CNT: t[%" PRIu64 "] c[%" PRIu64 "] \n", lvs->total_io, current);
-		lvs->total_io += lvs->current_io;
+		lvs->total_io += current;
 	}
 	return 0;
 }

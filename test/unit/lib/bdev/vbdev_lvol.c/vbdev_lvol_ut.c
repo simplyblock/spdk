@@ -51,6 +51,8 @@ DEFINE_STUB_V(spdk_lvs_grow_live, (struct spdk_lvol_store *lvs,
 				   spdk_lvs_op_complete cb_fn, void *cb_arg));
 DEFINE_STUB_V(spdk_change_redirect_state, (struct spdk_lvol_store *lvs, bool disconnect));
 DEFINE_STUB_V(spdk_lvs_check_active_process, (struct spdk_lvol_store *lvs, struct spdk_lvol *lvol, uint8_t type));
+DEFINE_STUB_V(spdk_sub_stat_ext, (struct spdk_io_channel *ch));
+DEFINE_STUB_V(spdk_add_stat_ext, (struct spdk_io_channel *ch));
 DEFINE_STUB(spdk_bdev_get_memory_domains, int, (struct spdk_bdev *bdev,
 		struct spdk_memory_domain **domains, int array_size), 0);
 DEFINE_STUB(spdk_blob_get_esnap_id, int,
@@ -117,6 +119,14 @@ const struct spdk_uuid *
 spdk_bdev_get_uuid(const struct spdk_bdev *bdev)
 {
 	return &bdev->uuid;
+}
+
+struct spdk_io_channel *
+spdk_bdev_io_get_io_channel(struct spdk_bdev_io *bdev_io)
+{
+	struct spdk_lvol *lvol = bdev_io->bdev->ctxt;
+	CU_ASSERT(lvol == g_lvol);
+	return g_ch;	
 }
 
 struct spdk_io_channel *

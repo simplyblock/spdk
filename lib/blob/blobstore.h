@@ -222,6 +222,8 @@ struct spdk_blob_store {
 	uint64_t			total_w;
 	uint64_t			r_io;
 	uint64_t			w_io;
+	uint64_t 			avg_total;
+	uint64_t			channel_stat_counter;
 	struct spdk_poller		*poller;
 
 
@@ -244,7 +246,8 @@ struct spdk_bs_channel {
 	struct spdk_blob_store		*bs;
 	struct spdk_bs_dev		*dev;
 	struct spdk_io_channel		*dev_channel;
-
+	uint64_t 					current_io;
+	uint64_t 					t_current_io;
 	struct spdk_io_channel		*redirect_ch;
 	void *redirect_desc;
 	bool	set_redirect_ch;
