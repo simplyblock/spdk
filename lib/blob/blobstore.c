@@ -4352,6 +4352,7 @@ struct spdk_bs_load_ctx {
 
 	/* These fields are used in the spdk_bs_dump path. */
 	bool					dumping;
+	uint32_t				page_counter;
 	bool 					dump_type;
 	FILE					*fp;
 	spdk_bs_dump_print_xattr		print_xattr_fn;
@@ -5592,6 +5593,38 @@ bs_load_cur_extent_page_valid(struct spdk_blob_md_page *page)
 	return true;
 }
 
+// added by sadegh
+static void
+print_packet_format(const uint8_t *bit_array, size_t length, size_t bytes_per_line) {
+    size_t i;
+
+    // Print each byte in the bit array, grouped into lines based on `bytes_per_line`
+    for (i = 0; i < length; i++) {
+        printf("%02X ", bit_array[i]);  // Print each byte in hexadecimal format
+
+        // Print a newline after printing `bytes_per_line` bytes
+        if ((i + 1) % bytes_per_line == 0) {
+            printf("\n");
+        }
+    }
+
+    // Print a final newline if the last line isn't fully printed
+    if (length % bytes_per_line != 0) {
+        printf("\n");
+    }
+}
+
+static bool 
+is_page_all_zero(void *page, size_t size) {
+    const uint8_t *ptr = (const uint8_t *)page;
+    for (size_t i = 0; i < size; i++) {
+        if (ptr[i] != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool
 bs_load_cur_md_page_valid(struct spdk_bs_load_ctx *ctx)
 {
@@ -5600,11 +5633,16 @@ bs_load_cur_md_page_valid(struct spdk_bs_load_ctx *ctx)
 
 	crc = blob_md_page_calc_crc(page);
 	if (crc != page->crc) {
-		SPDK_ERRLOG("Metadata page %d crc mismatch for blob.\n",
-			    ctx->cur_page);
+		if (is_page_all_zero((void *)page, sizeof(*page))) {
+			SPDK_ERRLOG("Metadata page is all zero.\n");
+		} else {
+			print_packet_format((void *)page, sizeof(*page), 20);
+		}
+		SPDK_ERRLOG("Metadata page %d crc mismatch for blob. page counter %d\n",
+			    ctx->cur_page, ctx->page_counter);
 		return false;
 	}
-
+	ctx->page_counter++;
 	/* First page of a sequence should match the blobid. */
 	if (page->sequence_num == 0 &&
 	    bs_page_to_blobid(ctx->cur_page) != page->id) {
@@ -5624,7 +5662,7 @@ bs_load_replay_md_chain_cpl(struct spdk_bs_load_ctx *ctx)
 	uint64_t i;
 
 	ctx->in_page_chain = false;
-
+	ctx->page_counter = 0;
 	do {
 		ctx->page_index++;
 		if (spdk_bit_array_get(ctx->used_blobid_pages, ctx->page_index) == true && 
@@ -5933,27 +5971,6 @@ bs_parse_super(struct spdk_bs_load_ctx *ctx)
 
 	return 0;
 }
-
-// added by sadegh
-// static void
-// print_packet_format(const uint8_t *bit_array, size_t length, size_t bytes_per_line) {
-//     size_t i;
-
-//     // Print each byte in the bit array, grouped into lines based on `bytes_per_line`
-//     for (i = 0; i < length; i++) {
-//         printf("%02X ", bit_array[i]);  // Print each byte in hexadecimal format
-
-//         // Print a newline after printing `bytes_per_line` bytes
-//         if ((i + 1) % bytes_per_line == 0) {
-//             printf("\n");
-//         }
-//     }
-
-//     // Print a final newline if the last line isn't fully printed
-//     if (length % bytes_per_line != 0) {
-//         printf("\n");
-//     }
-// }
 
 static void
 bs_load_super_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
