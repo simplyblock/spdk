@@ -185,7 +185,6 @@ bs_sequence_read_dev(spdk_bs_sequence_t *seq, void *payload,
 
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
-	channel->dev->priority_class = set->priority_class;
 
 	channel->dev->read(channel->dev, channel->dev_channel, payload, lba, lba_count, &set->cb_args);
 }
@@ -203,7 +202,6 @@ bs_sequence_write_dev(spdk_bs_sequence_t *seq, void *payload,
 
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
-	channel->dev->priority_class = set->priority_class;
 
 	channel->dev->write(channel->dev, channel->dev_channel, payload, lba, lba_count,
 			    &set->cb_args);
@@ -638,7 +636,6 @@ bs_batch_write_zeroes_dev(spdk_bs_batch_t *batch,
 	SPDK_DEBUGLOG(blob_rw, "Zeroing %" PRIu64 " blocks at LBA %" PRIu64 "\n", lba_count, lba);
 
 	set->u.batch.outstanding_ops++;
-	channel->dev->priority_class = batch->priority_class;
 	if (spdk_likely(channel->bs->is_leader)) {
 		channel->dev->write_zeroes(channel->dev, channel->dev_channel, lba, lba_count,
 				   	&set->cb_args);

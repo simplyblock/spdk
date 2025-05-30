@@ -272,10 +272,8 @@ bdev_blob_copy(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	       struct spdk_bs_dev_cb_args *cb_args)
 {
 	int rc;
-	// offset_blocks field of bdev_io of spdk_bdev_copy_blocks() is in fact the destination LBA
-	const uint64_t priority_dst_lba = (((uint64_t)(dev->priority_class)) << PRIORITY_CLASS_BITS_POS) | dst_lba;
 	rc = spdk_bdev_copy_blocks(__get_desc(dev), channel,
-				   priority_dst_lba, src_lba, lba_count,
+				   dst_lba, src_lba, lba_count,
 				   bdev_blob_io_complete, cb_args);
 	if (rc == -ENOMEM) {
 		bdev_blob_queue_io(dev, channel, NULL, 0, dst_lba, src_lba,
