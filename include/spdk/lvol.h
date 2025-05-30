@@ -140,6 +140,12 @@ typedef int (*spdk_lvol_iter_cb)(void *cb_arg, struct spdk_lvol *lvol);
 int spdk_lvs_init(struct spdk_bs_dev *bs_dev, struct spdk_lvs_opts *o,
 		  spdk_lvs_op_with_handle_complete cb_fn, void *cb_arg);
 
+/* Same as spdk_lvs_init() but meant for recovery via storage tiering: respects storage tiering 
+by not wiping out data via zeroing-out or unmapping, only writes the super block in the I/O part.
+*/
+int spdk_lvs_init_persistent(struct spdk_bs_dev *bs_dev, struct spdk_lvs_opts *o,
+	spdk_lvs_op_with_handle_complete cb_fn, void *cb_arg);
+
 /**
  * Rename the given lvolstore.
  *
@@ -198,6 +204,15 @@ int spdk_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz,
 
 int spdk_lvol_create_hublvol(struct spdk_lvol_store *lvs, spdk_lvol_op_with_handle_complete cb_fn,
  				void *cb_arg);
+
+/**
+ * Recover a backed up (via storage tiering) lvol on a given lvolstore, which may not be overall backed up.
+ * Must pass in the original user lvol name, lvol uuid (the original lvol bdev name), and any (not necessarily the original) 
+ * clear method.
+ */
+int spdk_lvol_recover(struct spdk_lvol_store *lvs, const char *orig_name, const char *orig_uuid, enum lvol_clear_method clear_method, 
+	spdk_blob_id id_to_recover, spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
+
 /**
  * Create snapshot of given lvol.
  *

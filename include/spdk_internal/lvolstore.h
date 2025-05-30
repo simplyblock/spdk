@@ -74,6 +74,7 @@ struct spdk_lvs_with_handle_req {
 	struct spdk_bs_dev		*bs_dev;
 	struct spdk_bdev		*base_bdev;
 	int				lvserrno;
+	bool not_evict_lvstore_md_pages;
 	bool 			examine;
 };
 
@@ -88,6 +89,9 @@ struct spdk_lvol_with_handle_req {
 	void				*cb_arg;
 	FILE *fp;
 	int lvol_priority_class;
+	bool is_recovery;
+	int lvol_priority_class;
+	uint8_t tiering_info;
 	struct spdk_poller *poller;
 	int force_failure;
 	int frozen_refcnt;

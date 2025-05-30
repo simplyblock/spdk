@@ -2216,6 +2216,9 @@ void spdk_bdev_io_get_scsi_status(const struct spdk_bdev_io *bdev_io,
  */
 void spdk_bdev_io_get_aio_status(const struct spdk_bdev_io *bdev_io, int *aio_result);
 
+// Get the exact SPDK status of an I/O request.
+int8_t spdk_bdev_io_get_status(struct spdk_bdev_io *bdev_io);
+
 /**
  * Get the iovec describing the data buffer of a bdev_io.
  *

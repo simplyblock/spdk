@@ -13,7 +13,6 @@
 #include "spdk/endian.h"
 #define __SPDK_BDEV_MODULE_ONLY
 #include "spdk/bdev_module.h"
-#include "spdk/priority_class.h"
 
 struct blob_bdev {
 	struct spdk_bs_dev	bs_dev;
@@ -55,10 +54,13 @@ static void
 bdev_blob_io_complete(struct spdk_bdev_io *bdev_io, bool success, void *arg)
 {
 	struct spdk_bs_dev_cb_args *cb_args = arg;
+	int8_t status = spdk_bdev_io_get_status(bdev_io);
 	int bserrno;
 
 	if (success) {
 		bserrno = 0;
+	} else if (status == -7) {
+		bserrno = -ECONNABORTED; // best Linux abort error code there is
 	} else {
 		bserrno = -EIO;
 	}
@@ -113,8 +115,7 @@ bdev_blob_read(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *p
 {
 	int rc;
 
-	const uint64_t priority_lba = (((uint64_t)(dev->priority_class)) << PRIORITY_CLASS_BITS_POS) | lba;
-	rc = spdk_bdev_read_blocks(__get_desc(dev), channel, payload, priority_lba,
+	rc = spdk_bdev_read_blocks(__get_desc(dev), channel, payload, lba,
 				   lba_count, bdev_blob_io_complete, cb_args);
 	if (rc == -ENOMEM) {
 		bdev_blob_queue_io(dev, channel, payload, 0, lba, 0,
@@ -130,8 +131,7 @@ bdev_blob_write(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *
 {
 	int rc;
 
-	const uint64_t priority_lba = (((uint64_t)(dev->priority_class)) << PRIORITY_CLASS_BITS_POS) | lba;
-	rc = spdk_bdev_write_blocks(__get_desc(dev), channel, payload, priority_lba,
+	rc = spdk_bdev_write_blocks(__get_desc(dev), channel, payload, lba,
 				    lba_count, bdev_blob_io_complete, cb_args);
 	if (rc == -ENOMEM) {
 		bdev_blob_queue_io(dev, channel, payload, 0, lba, 0,
@@ -148,8 +148,7 @@ bdev_blob_readv(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 {
 	int rc;
 
-	const uint64_t priority_lba = (((uint64_t)(dev->priority_class)) << PRIORITY_CLASS_BITS_POS) | lba;
-	rc = spdk_bdev_readv_blocks(__get_desc(dev), channel, iov, iovcnt, priority_lba,
+	rc = spdk_bdev_readv_blocks(__get_desc(dev), channel, iov, iovcnt, lba,
 				    lba_count, bdev_blob_io_complete, cb_args);
 	if (rc == -ENOMEM) {
 		bdev_blob_queue_io(dev, channel, iov, iovcnt, lba, 0,
@@ -166,8 +165,7 @@ bdev_blob_writev(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 {
 	int rc;
 
-	const uint64_t priority_lba = (((uint64_t)(dev->priority_class)) << PRIORITY_CLASS_BITS_POS) | lba;
-	rc = spdk_bdev_writev_blocks(__get_desc(dev), channel, iov, iovcnt, priority_lba,
+	rc = spdk_bdev_writev_blocks(__get_desc(dev), channel, iov, iovcnt, lba,
 				     lba_count, bdev_blob_io_complete, cb_args);
 	if (rc == -ENOMEM) {
 		bdev_blob_queue_io(dev, channel, iov, iovcnt, lba, 0,
@@ -196,8 +194,7 @@ bdev_blob_readv_ext(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	int rc;
 
 	blob_ext_io_opts_to_bdev_opts(&bdev_io_opts, io_opts);
-	const uint64_t priority_lba = (((uint64_t)(dev->priority_class)) << PRIORITY_CLASS_BITS_POS) | lba;
-	rc = spdk_bdev_readv_blocks_ext(__get_desc(dev), channel, iov, iovcnt, priority_lba, lba_count,
+	rc = spdk_bdev_readv_blocks_ext(__get_desc(dev), channel, iov, iovcnt, lba, lba_count,
 					bdev_blob_io_complete, cb_args, &bdev_io_opts);
 	if (rc == -ENOMEM) {
 		bdev_blob_queue_io(dev, channel, iov, iovcnt, lba, 0, lba_count, SPDK_BDEV_IO_TYPE_READ, cb_args,
@@ -217,8 +214,7 @@ bdev_blob_writev_ext(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	int rc;
 
 	blob_ext_io_opts_to_bdev_opts(&bdev_io_opts, io_opts);
-	const uint64_t priority_lba = (((uint64_t)(dev->priority_class)) << PRIORITY_CLASS_BITS_POS) | lba;
-	rc = spdk_bdev_writev_blocks_ext(__get_desc(dev), channel, iov, iovcnt, priority_lba, lba_count,
+	rc = spdk_bdev_writev_blocks_ext(__get_desc(dev), channel, iov, iovcnt, lba, lba_count,
 					 bdev_blob_io_complete, cb_args, &bdev_io_opts);
 	if (rc == -ENOMEM) {
 		bdev_blob_queue_io(dev, channel, iov, iovcnt, lba, 0, lba_count, SPDK_BDEV_IO_TYPE_WRITE, cb_args,
@@ -234,8 +230,7 @@ bdev_blob_write_zeroes(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 {
 	int rc;
 
-	const uint64_t priority_lba = (((uint64_t)(dev->priority_class)) << PRIORITY_CLASS_BITS_POS) | lba;
-	rc = spdk_bdev_write_zeroes_blocks(__get_desc(dev), channel, priority_lba,
+	rc = spdk_bdev_write_zeroes_blocks(__get_desc(dev), channel, lba,
 					   lba_count, bdev_blob_io_complete, cb_args);
 	if (rc == -ENOMEM) {
 		bdev_blob_queue_io(dev, channel, NULL, 0, lba, 0,
@@ -253,8 +248,7 @@ bdev_blob_unmap(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, uint64
 	int rc;
 
 	if (spdk_bdev_io_type_supported(blob_bdev->bdev, SPDK_BDEV_IO_TYPE_UNMAP)) {
-		const uint64_t priority_lba = (((uint64_t)(dev->priority_class)) << PRIORITY_CLASS_BITS_POS) | lba;
-		rc = spdk_bdev_unmap_blocks(__get_desc(dev), channel, priority_lba, lba_count,
+		rc = spdk_bdev_unmap_blocks(__get_desc(dev), channel, lba, lba_count,
 					    bdev_blob_io_complete, cb_args);
 		if (rc == -ENOMEM) {
 			bdev_blob_queue_io(dev, channel, NULL, 0, lba, 0,
