@@ -812,7 +812,7 @@ blob_parse_page(const struct spdk_blob_md_page *page, struct spdk_blob *blob)
 							if (!blob->is_recovery) {
 								return -EINVAL;
 							} else {
-								int res = spdk_bit_pool_allocate_specific_bit(blob->bs->used_clusters, desc_extent_rle->extents[i].cluster_idx + j);
+								uint32_t res = spdk_bit_pool_allocate_specific_bit(blob->bs->used_clusters, desc_extent_rle->extents[i].cluster_idx + j);
 								if (res == UINT32_MAX) {
 									return -EINVAL;
 								}
@@ -939,7 +939,7 @@ blob_parse_page(const struct spdk_blob_md_page *page, struct spdk_blob *blob)
 									desc_extent->cluster_idx[i]);
 							return -EINVAL;
 						} else {
-							int res = spdk_bit_pool_allocate_specific_bit(blob->bs->used_clusters, desc_extent->cluster_idx[i]);
+							uint32_t res = spdk_bit_pool_allocate_specific_bit(blob->bs->used_clusters, desc_extent->cluster_idx[i]);
 							if (res == UINT32_MAX) {
 								return -EINVAL;
 							}
