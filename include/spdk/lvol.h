@@ -321,6 +321,8 @@ void spdk_lvs_open_hub_bdev(void * cb_arg);
 void spdk_lvs_connect_hublvol(struct spdk_lvol_store *lvs, const char *remote_bdev);
 void spdk_lvs_set_read_only(struct spdk_lvol_store *lvs, bool status);
 void spdk_lvs_set_failed_on_update(struct spdk_lvol_store *lvs, bool state);
+int spdk_lvs_IO_redirect(void * cb_arg);
+int spdk_lvs_IO_hublvol(void *cb_arg);
 /**
  * Get the lvol that has a particular UUID.
  *
