@@ -339,7 +339,7 @@ end:
 int
 vbdev_lvs_create(const char *base_bdev_name, const char *name, uint32_t cluster_sz,
 		 enum lvs_clear_method clear_method, uint32_t num_md_pages_per_cluster_ratio, bool not_evict_lvstore_md_pages,
-		 spdk_lvs_op_with_handle_complete cb_fn, void *cb_arg)
+		 bool disaster_recovery, spdk_lvs_op_with_handle_complete cb_fn, void *cb_arg)
 {
 	struct spdk_bs_dev *bs_dev;
 	struct spdk_lvs_with_handle_req *lvs_req;
