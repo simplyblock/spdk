@@ -2567,7 +2567,7 @@ nvmf_tcp_sock_process(struct spdk_nvmf_tcp_qpair *tqpair)
 						sizeof(struct spdk_nvme_tcp_common_pdu_hdr) - pdu->ch_valid_bytes,
 						(void *)&pdu->hdr.common + pdu->ch_valid_bytes);
 			if (rc < 0) {
-				char *uuid = spdk_nvmf_request_nqn1(&tqpair->qpair, 32);
+				char *uuid = spdk_nvmf_request_nqn1(&tqpair->qpair, 4);
 				uuid = (uuid) ? uuid : ""; // Handle NULL UUID
 				SPDK_DEBUGLOG(nvmf_tcp, "will disconnect tqpair=%p\n", tqpair);
 				SPDK_ERRLOG("1will disconnect tqpair=%p (QID %d) cp %d sp %d nqn %s\n", tqpair, tqpair->qpair.qid, tqpair->initiator_port, tqpair->target_port, uuid);
@@ -2591,7 +2591,7 @@ nvmf_tcp_sock_process(struct spdk_nvmf_tcp_qpair *tqpair)
 						pdu->psh_len - pdu->psh_valid_bytes,
 						(void *)&pdu->hdr.raw + sizeof(struct spdk_nvme_tcp_common_pdu_hdr) + pdu->psh_valid_bytes);
 			if (rc < 0) {
-				char *uuid = spdk_nvmf_request_nqn1(&tqpair->qpair, 32);
+				char *uuid = spdk_nvmf_request_nqn1(&tqpair->qpair, 4);
 				uuid = (uuid) ? uuid : ""; // Handle NULL UUID
 				SPDK_ERRLOG("2will disconnect tqpair=%p (QID %d) cp %d sp %d nqn %s\n", tqpair, tqpair->qpair.qid, tqpair->initiator_port, tqpair->target_port, uuid);
 				nvmf_tcp_qpair_set_recv_state(tqpair, NVME_TCP_PDU_RECV_STATE_QUIESCING);
