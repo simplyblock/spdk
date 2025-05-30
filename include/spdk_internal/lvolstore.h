@@ -90,7 +90,6 @@ struct spdk_lvol_with_handle_req {
 	FILE *fp;
 	int lvol_priority_class;
 	bool is_recovery;
-	int lvol_priority_class;
 	uint8_t tiering_info;
 	struct spdk_poller *poller;
 	int force_failure;

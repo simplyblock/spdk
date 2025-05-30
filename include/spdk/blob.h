@@ -206,8 +206,6 @@ struct spdk_bs_dev {
 	 */
 	void (*destroy)(struct spdk_bs_dev *dev);
 
-	int priority_class;
-
 	void (*read)(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
 		     uint64_t lba, uint32_t lba_count,
 		     struct spdk_bs_dev_cb_args *cb_args);
