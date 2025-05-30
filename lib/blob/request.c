@@ -153,9 +153,23 @@ bs_sequence_read_bs_dev(spdk_bs_sequence_t *seq, struct spdk_bs_dev *bs_dev,
 
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
-	bs_dev->priority_class = set->priority_class;
 
-	bs_dev->read(bs_dev, back_channel, payload, lba, lba_count, &set->cb_args);
+	const int priority_class = set->priority_class;
+	const uint8_t tiering_bits = set->tiering_bits;
+	const uint64_t priority_lba = (((uint64_t)(priority_class)) << PRIORITY_CLASS_BITS_POS) | lba;
+	uint64_t meta_lba = priority_lba;
+
+	if (!(tiering_bits & TIERED_BIT)) {
+		meta_lba |= (tiering_bits & SYNC_FETCH_BIT) ? SYNC_FETCH_MASK : 0; // read may require sync fetch
+		meta_lba |= (tiering_bits & METADATA_PAGE_BIT) ? METADATA_PAGE_MASK : 0;
+	} else 
+	{
+		meta_lba |= TIERED_IO_MASK;
+
+		meta_lba |= tiering_bits & FORCE_FETCH_BIT ? FORCE_FETCH_MASK : 0; // tiered read may be a force fetch
+	}
+
+	bs_dev->read(bs_dev, back_channel, payload, meta_lba, lba_count, &set->cb_args);
 }
 
 void
@@ -209,13 +223,28 @@ bs_sequence_readv_bs_dev(spdk_bs_sequence_t *seq, struct spdk_bs_dev *bs_dev,
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
 
-	bs_dev->priority_class = set->priority_class;
+	const int priority_class = set->priority_class;
+	const uint8_t tiering_bits = set->tiering_bits;
+
+	const uint64_t priority_lba = (((uint64_t)(priority_class)) << PRIORITY_CLASS_BITS_POS) | lba;
+	uint64_t meta_lba = priority_lba;
+
+	if (!(tiering_bits & TIERED_BIT)) {
+		meta_lba |= (tiering_bits & SYNC_FETCH_BIT) ? SYNC_FETCH_MASK : 0; // read may require sync fetch
+		meta_lba |= (tiering_bits & METADATA_PAGE_BIT) ? METADATA_PAGE_MASK : 0;
+	} else 
+	{
+		meta_lba |= TIERED_IO_MASK;
+
+		meta_lba |= tiering_bits & FORCE_FETCH_BIT ? FORCE_FETCH_MASK : 0; // tiered read may be a force fetch
+	}
+
 	if (set->ext_io_opts) {
 		assert(bs_dev->readv_ext);
-		bs_dev->readv_ext(bs_dev, back_channel, iov, iovcnt, lba, lba_count,
+		bs_dev->readv_ext(bs_dev, back_channel, iov, iovcnt, meta_lba, lba_count,
 				  &set->cb_args, set->ext_io_opts);
 	} else {
-		bs_dev->readv(bs_dev, back_channel, iov, iovcnt, lba, lba_count, &set->cb_args);
+		bs_dev->readv(bs_dev, back_channel, iov, iovcnt, meta_lba, lba_count, &set->cb_args);
 	}
 }
 
@@ -231,14 +260,28 @@ bs_sequence_readv_dev(spdk_bs_sequence_t *seq, struct iovec *iov, int iovcnt,
 
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
-	channel->dev->priority_class = set->priority_class;
+	const int priority_class = set->priority_class;
+	const uint8_t tiering_bits = set->tiering_bits;
+
+	const uint64_t priority_lba = (((uint64_t)(priority_class)) << PRIORITY_CLASS_BITS_POS) | lba;
+	uint64_t meta_lba = priority_lba;
+
+	if (!(tiering_bits & TIERED_BIT)) {
+		meta_lba |= (tiering_bits & SYNC_FETCH_BIT) ? SYNC_FETCH_MASK : 0; // read may require sync fetch
+		meta_lba |= (tiering_bits & METADATA_PAGE_BIT) ? METADATA_PAGE_MASK : 0;
+	} else 
+	{
+		meta_lba |= TIERED_IO_MASK;
+
+		meta_lba |= tiering_bits & FORCE_FETCH_BIT ? FORCE_FETCH_MASK : 0; // tiered read may be a force fetch
+	}
 	
 	if (set->ext_io_opts) {
 		assert(channel->dev->readv_ext);
-		channel->dev->readv_ext(channel->dev, channel->dev_channel, iov, iovcnt, lba, lba_count,
+		channel->dev->readv_ext(channel->dev, channel->dev_channel, iov, iovcnt, meta_lba, lba_count,
 					&set->cb_args, set->ext_io_opts);
 	} else {
-		channel->dev->readv(channel->dev, channel->dev_channel, iov, iovcnt, lba, lba_count, &set->cb_args);
+		channel->dev->readv(channel->dev, channel->dev_channel, iov, iovcnt, meta_lba, lba_count, &set->cb_args);
 	}
 }
 
@@ -255,14 +298,33 @@ bs_sequence_writev_dev(spdk_bs_sequence_t *seq, struct iovec *iov, int iovcnt,
 
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
-	channel->dev->priority_class = set->priority_class;
+
+	const int priority_class = set->priority_class;
+	const uint8_t tiering_bits = set->tiering_bits;
+
+	const uint64_t priority_lba = (((uint64_t)(priority_class)) << PRIORITY_CLASS_BITS_POS) | lba;
+	uint64_t meta_lba = priority_lba;
+
+	if (!(tiering_bits & TIERED_BIT)) {
+		if (!(tiering_bits & METADATA_PAGE_BIT)) {
+
+		} else 
+		{
+			meta_lba |= METADATA_PAGE_MASK;
+		}
+	} else 
+	{
+		meta_lba |= TIERED_IO_MASK;
+
+		meta_lba |= tiering_bits & FLUSH_MODE_BIT ? FLUSH_MODE_MASK : 0; // tiered write may be a pure flush
+	}
 
 	if (set->ext_io_opts) {
 		assert(channel->dev->writev_ext);
-		channel->dev->writev_ext(channel->dev, channel->dev_channel, iov, iovcnt, lba, lba_count,
+		channel->dev->writev_ext(channel->dev, channel->dev_channel, iov, iovcnt, meta_lba, lba_count,
 					 &set->cb_args, set->ext_io_opts);
 	} else {
-		channel->dev->writev(channel->dev, channel->dev_channel, iov, iovcnt, lba, lba_count,
+		channel->dev->writev(channel->dev, channel->dev_channel, iov, iovcnt, meta_lba, lba_count,
 				     &set->cb_args);
 	}
 }
@@ -280,7 +342,6 @@ bs_sequence_write_zeroes_dev(spdk_bs_sequence_t *seq,
 
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
-	channel->dev->priority_class = set->priority_class;
 
 	channel->dev->write_zeroes(channel->dev, channel->dev_channel, lba, lba_count,
 				   &set->cb_args);
@@ -298,7 +359,6 @@ bs_sequence_copy_dev(spdk_bs_sequence_t *seq, uint64_t dst_lba, uint64_t src_lba
 
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
-	channel->dev->priority_class = set->priority_class;
 
 	channel->dev->copy(channel->dev, channel->dev_channel, dst_lba, src_lba, lba_count, &set->cb_args);
 }
@@ -337,8 +397,32 @@ bs_batch_completion(struct spdk_io_channel *_channel,
 			ctx = TAILQ_FIRST(&set->u.batch.unmap_queue);
 			assert(ctx != NULL);
 			TAILQ_REMOVE(&set->u.batch.unmap_queue, ctx, entries); // Remove it from the queue.			
-			channel->dev->priority_class = set->priority_class;
 			if (spdk_likely(channel->bs->is_leader)) {
+				const int priority_class = set->priority_class;
+				const uint8_t tiering_bits = set->tiering_bits;
+	
+				const uint64_t priority_lba = (((uint64_t)(priority_class)) << PRIORITY_CLASS_BITS_POS) | ctx->lba;
+				uint64_t meta_lba = priority_lba;
+	
+				if (!(tiering_bits & TIERED_BIT)) {
+					if (!(tiering_bits & METADATA_PAGE_BIT)) {
+	
+					} else 
+					{
+						meta_lba |= METADATA_PAGE_MASK;
+					}
+				} else 
+				{
+					meta_lba |= TIERED_IO_MASK;
+				}
+	
+				if (spdk_likely(channel->bs->is_leader)) {
+					channel->dev->unmap(channel->dev, channel->dev_channel, meta_lba, ctx->lba_count,
+							&set->cb_args);
+				} else {
+					SPDK_NOTICELOG("The unmap IO return with EIO error due to leader.\n");
+					bs_batch_completion(_channel, set->cb_args.cb_arg, -EIO);
+				}
 				channel->dev->unmap(channel->dev, channel->dev_channel, ctx->lba, ctx->lba_count,
 						&set->cb_args);
 			} else {
@@ -392,6 +476,8 @@ bs_batch_open(struct spdk_io_channel *_channel, struct spdk_bs_cpl *cpl, struct 
 	set->u.batch.batch_closed = 0;
 
 	set->priority_class = blob->priority_class;
+	set->tiering_bits = (channel->bs->not_evict_lvstore_md_pages && _channel == channel->bs->md_channel) ? METADATA_PAGE_BIT : 0;
+	set->tiering_bits |= blob->tiering_bits;
 	set->cb_args.cb_fn = bs_batch_completion;
 	set->cb_args.cb_arg = set;
 	set->cb_args.channel = channel->dev_channel;
@@ -410,7 +496,21 @@ bs_batch_read_bs_dev(spdk_bs_batch_t *batch, struct spdk_bs_dev *bs_dev,
 		      lba);
 
 	set->u.batch.outstanding_ops++;
-	bs_dev->priority_class = set->priority_class;
+	const int priority_class = set->priority_class;
+	const uint8_t tiering_bits = set->tiering_bits;
+
+	const uint64_t priority_lba = (((uint64_t)(priority_class)) << PRIORITY_CLASS_BITS_POS) | lba;
+	uint64_t meta_lba = priority_lba;
+
+	if (!(tiering_bits & TIERED_BIT)) {
+		meta_lba |= (tiering_bits & SYNC_FETCH_BIT) ? SYNC_FETCH_MASK : 0; // read may require sync fetch
+		meta_lba |= (tiering_bits & METADATA_PAGE_BIT) ? METADATA_PAGE_MASK : 0;
+	} else 
+	{
+		meta_lba |= TIERED_IO_MASK;
+
+		meta_lba |= tiering_bits & FORCE_FETCH_BIT ? FORCE_FETCH_MASK : 0; // tiered read may be a force fetch
+	}
 	bs_dev->read(bs_dev, back_channel, payload, lba, lba_count, &set->cb_args);
 }
 
@@ -425,8 +525,23 @@ bs_batch_read_dev(spdk_bs_batch_t *batch, void *payload,
 		      lba);
 
 	set->u.batch.outstanding_ops++;
-	channel->dev->priority_class = batch->priority_class;
-	channel->dev->read(channel->dev, channel->dev_channel, payload, lba, lba_count, &set->cb_args);
+	const int priority_class = set->priority_class;
+	const uint8_t tiering_bits = set->tiering_bits;
+
+	const uint64_t priority_lba = (((uint64_t)(priority_class)) << PRIORITY_CLASS_BITS_POS) | lba;
+	uint64_t meta_lba = priority_lba;
+
+	if (!(tiering_bits & TIERED_BIT)) {
+		meta_lba |= (tiering_bits & SYNC_FETCH_BIT) ? SYNC_FETCH_MASK : 0; // read may require sync fetch
+		meta_lba |= (tiering_bits & METADATA_PAGE_BIT) ? METADATA_PAGE_MASK : 0;
+	} else 
+	{
+		meta_lba |= TIERED_IO_MASK;
+
+		meta_lba |= tiering_bits & FORCE_FETCH_BIT ? FORCE_FETCH_MASK : 0; // tiered read may be a force fetch
+	}
+
+	channel->dev->read(channel->dev, channel->dev_channel, payload, meta_lba, lba_count, &set->cb_args);
 }
 
 void
@@ -439,8 +554,27 @@ bs_batch_write_dev(spdk_bs_batch_t *batch, void *payload,
 	SPDK_DEBUGLOG(blob_rw, "Writing %" PRIu32 " blocks to LBA %" PRIu64 "\n", lba_count, lba);
 
 	set->u.batch.outstanding_ops++;
-	channel->dev->priority_class = batch->priority_class;
-	channel->dev->write(channel->dev, channel->dev_channel, payload, lba, lba_count,
+	const int priority_class = set->priority_class;
+	const uint8_t tiering_bits = set->tiering_bits;
+
+	const uint64_t priority_lba = (((uint64_t)(priority_class)) << PRIORITY_CLASS_BITS_POS) | lba;
+	uint64_t meta_lba = priority_lba;
+
+	if (!(tiering_bits & TIERED_BIT)) {
+		if (!(tiering_bits & METADATA_PAGE_BIT)) {
+
+		} else 
+		{
+			meta_lba |= METADATA_PAGE_MASK;
+		}
+	} else 
+	{
+		meta_lba |= TIERED_IO_MASK;
+
+		meta_lba |= tiering_bits & FLUSH_MODE_BIT ? FLUSH_MODE_MASK : 0; // tiered write may be a pure flush
+	}
+
+	channel->dev->write(channel->dev, channel->dev_channel, payload, meta_lba, lba_count,
 			    &set->cb_args);
 }
 
@@ -468,8 +602,24 @@ bs_batch_unmap_dev(spdk_bs_batch_t *batch,
 	}
 out:
 	set->u.batch.outstanding_ops++;	
-	channel->dev->priority_class = batch->priority_class;
 	if (spdk_likely(channel->bs->is_leader)) {
+		const int priority_class = batch->priority_class;
+		const uint8_t tiering_bits = batch->tiering_bits;
+	
+		const uint64_t priority_lba = (((uint64_t)(priority_class)) << PRIORITY_CLASS_BITS_POS) | lba;
+		uint64_t meta_lba = priority_lba;
+	
+		if (!(tiering_bits & TIERED_BIT)) {
+			if (!(tiering_bits & METADATA_PAGE_BIT)) {
+	
+			} else 
+			{
+				meta_lba |= METADATA_PAGE_MASK;
+			}
+		} else 
+		{
+			meta_lba |= TIERED_IO_MASK;
+		}
 		channel->dev->unmap(channel->dev, channel->dev_channel, lba, lba_count,
 					&set->cb_args);
 	} else {
