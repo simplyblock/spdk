@@ -315,6 +315,7 @@ _vbdev_lvs_create_cb(void *cb_arg, struct spdk_lvol_store *lvs, int lvserrno)
 	}
 
 	assert(lvs != NULL);
+	vbdev_lvs_not_evict_lvstore_md_pages(lvs, req->not_evict_lvstore_md_pages);
 
 	lvs_bdev = calloc(1, sizeof(*lvs_bdev));
 	if (!lvs_bdev) {
@@ -337,7 +338,7 @@ end:
 
 int
 vbdev_lvs_create(const char *base_bdev_name, const char *name, uint32_t cluster_sz,
-		 enum lvs_clear_method clear_method, uint32_t num_md_pages_per_cluster_ratio,
+		 enum lvs_clear_method clear_method, uint32_t num_md_pages_per_cluster_ratio, bool not_evict_lvstore_md_pages,
 		 spdk_lvs_op_with_handle_complete cb_fn, void *cb_arg)
 {
 	struct spdk_bs_dev *bs_dev;
@@ -396,6 +397,7 @@ vbdev_lvs_create(const char *base_bdev_name, const char *name, uint32_t cluster_
 	lvs_req->base_bdev = bs_dev->get_base_bdev(bs_dev);
 	lvs_req->cb_fn = cb_fn;
 	lvs_req->cb_arg = cb_arg;
+	lvs_req->not_evict_lvstore_md_pages = not_evict_lvstore_md_pages;
 
 	rc = spdk_lvs_init(bs_dev, &opts, _vbdev_lvs_create_cb, lvs_req);
 	if (rc < 0) {
@@ -1930,6 +1932,7 @@ _vbdev_lvol_create_cb(void *cb_arg, struct spdk_lvol *lvol, int lvolerrno)
 		goto end;
 	}
 
+	vbdev_lvol_set_tiering_info(lvol, req->tiering_info);
 	lvol->priority_class = req->lvol_priority_class;
 	vbdev_lvol_set_io_priority_class(lvol);
 
@@ -1987,7 +1990,7 @@ vbdev_lvs_dump(struct spdk_lvol_store *lvs, const char *file, spdk_lvol_op_with_
 
 int
 vbdev_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz,
-		  bool thin_provision, enum lvol_clear_method clear_method, int8_t lvol_priority_class,
+		  bool thin_provision, enum lvol_clear_method clear_method, int8_t lvol_priority_class, uint8_t tiering_info,
 		  spdk_lvol_op_with_handle_complete cb_fn,
 		  void *cb_arg)
 {
@@ -1999,6 +2002,7 @@ vbdev_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz,
 		return -ENOMEM;
 	}
 	req->lvol_priority_class = lvol_priority_class;
+	req->tiering_info = tiering_info;
 	req->cb_fn = cb_fn;
 	req->cb_arg = cb_arg;
 
@@ -2085,8 +2089,31 @@ vbdev_lvol_register(struct spdk_lvol_store *lvs, const char *name, const char *r
 	return rc;
 }
 
+int
+vbdev_lvol_recover(struct spdk_lvol_store *lvs, const char *orig_name, const char *orig_uuid, enum lvol_clear_method clear_method, 
+spdk_blob_id id_to_recover, spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg)
+{	
+	struct spdk_lvol_with_handle_req *req;
+	int rc;
+
+	req = calloc(1, sizeof(*req));
+	if (req == NULL) {
+		return -ENOMEM;
+	}
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+	req->is_recovery = true;
+
+	rc = spdk_lvol_recover(lvs, orig_name, orig_uuid, clear_method, id_to_recover, _vbdev_lvol_create_cb, req);
+	if (rc != 0) {
+		free(req);
+	}
+
+	return rc;
+}
+
 void
-vbdev_lvol_create_snapshot(struct spdk_lvol *lvol, const char *snapshot_name,
+vbdev_lvol_create_snapshot(struct spdk_lvol *lvol, const char *snapshot_name, uint8_t lvol_priority_class, uint8_t tiering_info,
 			   spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg)
 {
 	struct spdk_lvol_with_handle_req *req;
@@ -2099,6 +2126,8 @@ vbdev_lvol_create_snapshot(struct spdk_lvol *lvol, const char *snapshot_name,
 
 	req->cb_fn = cb_fn;
 	req->cb_arg = cb_arg;
+	req->lvol_priority_class = lvol_priority_class;
+	req->tiering_info = tiering_info;
 
 	spdk_lvol_create_snapshot(lvol, snapshot_name, _vbdev_lvol_create_cb, req);
 }
@@ -2134,7 +2163,7 @@ vbdev_lvol_update_snapshot_clone(struct spdk_lvol *lvol, struct spdk_lvol *origl
 }
 
 void
-vbdev_lvol_create_clone(struct spdk_lvol *lvol, const char *clone_name,
+vbdev_lvol_create_clone(struct spdk_lvol *lvol, const char *clone_name, uint8_t lvol_priority_class, uint8_t tiering_info,
 			spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg)
 {
 	struct spdk_lvol_with_handle_req *req;
@@ -2147,6 +2176,8 @@ vbdev_lvol_create_clone(struct spdk_lvol *lvol, const char *clone_name,
 
 	req->cb_fn = cb_fn;
 	req->cb_arg = cb_arg;
+	req->lvol_priority_class = lvol_priority_class;
+	req->tiering_info = tiering_info;
 
 	spdk_lvol_create_clone(lvol, clone_name, _vbdev_lvol_create_cb, req);
 }
@@ -2990,6 +3021,30 @@ vbdev_lvol_set_external_parent(struct spdk_lvol *lvol, const char *esnap_name,
 
 void vbdev_lvol_set_io_priority_class(struct spdk_lvol *lvol) {
 	spdk_blob_set_io_priority_class(lvol->blob, lvol->priority_class);
+}
+
+void vbdev_lvol_set_tiering_info(struct spdk_lvol *lvol, uint8_t tiering_bits) {
+	spdk_blob_set_tiering_info(lvol->blob, tiering_bits);
+}
+
+uint8_t vbdev_lvol_get_tiering_info(struct spdk_lvol *lvol) {
+	return spdk_blob_get_tiering_info(lvol->blob);
+}
+
+void vbdev_lvs_not_evict_lvstore_md_pages(struct spdk_lvol_store *lvs, bool not_evict_lvstore_md_pages) {
+	spdk_bs_not_evict_lvstore_md_pages(lvs->blobstore, not_evict_lvstore_md_pages);
+}
+
+bool vbdev_lvs_get_not_evict_lvstore_md_pages(struct spdk_lvol_store *lvs) {
+	return spdk_bs_get_not_evict_lvstore_md_pages(lvs->blobstore);
+}
+
+void vbdev_lvol_backup_snapshot(struct snapshot_backup_ctx *sctx) {
+	spdk_blob_start_snapshot_backup(sctx);
+}
+
+void vbdev_lvol_get_snapshot_backup_status(struct snapshot_backup_ctx *sctx) {
+	spdk_blob_get_snapshot_backup_status(sctx);
 }
 
 SPDK_LOG_REGISTER_COMPONENT(vbdev_lvol)

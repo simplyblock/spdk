@@ -35,7 +35,7 @@
 
 #include "spdk/stdinc.h"
 #include "spdk/assert.h"
-#include "spdk/priority_class.h"
+#include "spdk/tiering_bits.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -432,6 +432,12 @@ void spdk_lvs_unfreeze_on_conflict_msg(struct spdk_blob_store *bs);
 void spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts,
 		  spdk_bs_op_with_handle_complete cb_fn, void *cb_arg);
 
+/* Same as spdk_bs_init() but meant for recovery via storage tiering: respects storage tiering 
+by not wiping out data via zeroing-out or unmapping, only writes the super block in the I/O part.
+*/
+void spdk_bs_init_persistent(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts,
+	spdk_bs_op_with_handle_complete cb_fn, void *cb_arg);
+
 typedef void (*spdk_bs_dump_print_xattr)(FILE *fp, const char *bstype, const char *name,
 		const void *value, size_t value_length);
 
@@ -547,6 +553,8 @@ uint64_t spdk_bs_total_data_cluster_count(struct spdk_blob_store *bs);
  * \return blob id.
  */
 spdk_blob_id spdk_blob_get_id(struct spdk_blob *blob);
+
+uint8_t spdk_blob_get_tiering_info(struct spdk_blob *blob);
 
 /**
  * Get the blob map id.
@@ -701,6 +709,12 @@ void spdk_blob_opts_init(struct spdk_blob_opts *opts, size_t opts_size);
  */
 void spdk_bs_create_blob_ext(struct spdk_blob_store *bs, const struct spdk_blob_opts *opts,
 			     spdk_blob_op_with_id_complete cb_fn, void *cb_arg);
+
+/* Start recovering a backed up (via storage tiering) blob on the given blobstore, which may not be 
+overall backed up.
+*/
+void spdk_bs_start_recover_blob_ext(struct spdk_blob_store *bs, spdk_blob_id id_to_recover,
+	spdk_blob_op_with_id_complete cb_fn, void *cb_arg);
 
 /**
  * Create a new blob with default option values on the given blobstore.
@@ -1015,6 +1029,12 @@ void spdk_bs_create_hubblob(struct spdk_blob_store *bs, const struct spdk_blob_o
 
 void spdk_bs_open_blob_without_reference(struct spdk_blob_store *bs, spdk_blob_id blobid,
 		  struct spdk_blob_open_opts *opts, spdk_blob_op_with_handle_complete cb_fn, void *cb_arg);
+
+/* Open a backed up (via storage tiering) blob from the given blobstore, which may not be overall backed up.
+See spdk_bs_open_blob_ext() for further details.
+*/
+void spdk_bs_open_recover_blob_ext(struct spdk_blob_store *bs, spdk_blob_id blobid,
+	struct spdk_blob_open_opts *opts, spdk_blob_op_with_handle_complete cb_fn, void *cb_arg);
 
 /**
  * Resize a blob to 'sz' clusters. These changes are not persisted to disk until
@@ -1381,6 +1401,44 @@ lvol's priority class bits. These bits must be cleared when the I/O reaches the 
 again when it exits the lvolstore so that no internal lvolstore operation sees these bits.
 */
 void spdk_blob_set_io_priority_class(struct spdk_blob *blob, int priority_class);
+
+void spdk_blob_set_tiering_info(struct spdk_blob *blob, uint8_t tiering_bits);
+
+void spdk_bs_not_evict_lvstore_md_pages(struct spdk_blob_store *bs, bool not_evict_lvstore_md_pages);
+
+bool spdk_bs_get_not_evict_lvstore_md_pages(struct spdk_blob_store *bs);
+
+enum EFlushStatus {
+	FLUSH_NEVER_STARTED = 0,
+	FLUSH_IS_SUCCEEDED = 1,
+	FLUSH_IS_PENDING = 2,
+	FLUSH_IS_FAILED = -1,
+	// aborted due to conflict with another I/O (possible only with shared md clusters), not a timeout abort (timeout abort is failure)
+	FLUSH_IS_ABORTED = -2
+};
+
+typedef void (*spdk_snapshot_backup_complete)(void *cb_arg);
+struct snapshot_backup_ctx {
+	char* lvol_name;
+	struct spdk_blob *blob;
+	uint64_t timeout_us;
+	uint32_t dev_page_size;
+	uint8_t nmax_retries;
+	uint8_t nmax_flush_jobs;
+	struct spdk_thread* caller_th;
+	spdk_snapshot_backup_complete cb_fn;
+	void *cb_arg;
+	struct spdk_jsonrpc_request *payload;
+	int rc;
+	int backup_status; // used only for polling the backup status
+};
+
+/* Start an asynchronous backup of a snapshot represented by the given blob. Returns -EEXIST if the backup is 
+already in progress, otherwise returns the relevant code.
+*/
+void spdk_blob_start_snapshot_backup(struct snapshot_backup_ctx* sctx);
+
+void spdk_blob_get_snapshot_backup_status(struct snapshot_backup_ctx* sctx);
 
 #ifdef __cplusplus
 }

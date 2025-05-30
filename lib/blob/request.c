@@ -12,6 +12,8 @@
 #include "spdk/thread.h"
 #include "spdk/queue.h"
 
+#include "spdk/tiering_bits.h"
+
 #include "spdk/log.h"
 
 void
@@ -93,6 +95,7 @@ bs_sequence_start(struct spdk_io_channel *_channel, struct spdk_bs_cpl *cpl,
 	set->back_channel = back_channel;
 
 	set->priority_class = channel->bs->priority_class;
+	set->tiering_bits = (channel->bs->not_evict_lvstore_md_pages && _channel == channel->bs->md_channel) ? METADATA_PAGE_BIT : 0;
 	set->cb_args.cb_fn = bs_sequence_completion;
 	set->cb_args.cb_arg = set;
 	set->cb_args.channel = channel->dev_channel;

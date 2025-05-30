@@ -30,14 +30,14 @@ struct lvol_bdev {
 };
 
 int vbdev_lvs_create(const char *base_bdev_name, const char *name, uint32_t cluster_sz,
-		     enum lvs_clear_method clear_method, uint32_t num_md_pages_per_cluster_ratio,
-		     spdk_lvs_op_with_handle_complete cb_fn, void *cb_arg);
+		     enum lvs_clear_method clear_method, uint32_t num_md_pages_per_cluster_ratio, bool not_evict_lvstore_md_pages, 
+			 bool disaster_recovery, spdk_lvs_op_with_handle_complete cb_fn, void *cb_arg);
 void vbdev_lvs_destruct(struct spdk_lvol_store *lvs, spdk_lvs_op_complete cb_fn, void *cb_arg);
 void vbdev_lvs_unload(struct spdk_lvol_store *lvs, spdk_lvs_op_complete cb_fn, void *cb_arg);
 
 int vbdev_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz,
 		      bool thin_provisioned, enum lvol_clear_method clear_method,
-			  int8_t lvol_priority_class,
+			  int8_t lvol_priority_class, uint8_t tiering_info,
 		      spdk_lvol_op_with_handle_complete cb_fn,
 		      void *cb_arg);
 
@@ -46,17 +46,20 @@ int vbdev_lvol_register(struct spdk_lvol_store *lvs, const char *name, const cha
 			  uint64_t blobid, bool thin_provision, enum lvol_clear_method clear_method, 
 			  int8_t lvol_priority_class, spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
 
+int vbdev_lvol_recover(struct spdk_lvol_store *lvs, const char *orig_name, const char *orig_uuid, enum lvol_clear_method clear_method, 
+	spdk_blob_id id_to_recover, spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
+
 int vbdev_lvs_dump(struct spdk_lvol_store *lvs, const char *file,
 		      spdk_lvol_op_with_handle_complete cb_fn,
 		      void *cb_arg);			  
 
-void vbdev_lvol_create_snapshot(struct spdk_lvol *lvol, const char *snapshot_name,
+void vbdev_lvol_create_snapshot(struct spdk_lvol *lvol, const char *snapshot_name, uint8_t lvol_priority_class, uint8_t tiering_info,
 				spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
 void
 vbdev_lvol_update_snapshot_clone(struct spdk_lvol *lvol, struct spdk_lvol *origlvol,
 			   bool clone, spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
 
-void vbdev_lvol_create_clone(struct spdk_lvol *lvol, const char *clone_name,
+void vbdev_lvol_create_clone(struct spdk_lvol *lvol, const char *clone_name, uint8_t lvol_priority_class, uint8_t tiering_info,
 			     spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
 void vbdev_lvol_create_bdev_clone(const char *esnap_uuid,
 				  struct spdk_lvol_store *lvs, const char *clone_name,
@@ -166,5 +169,17 @@ the lvol's priority class bits. These bits must be cleared when the I/O reaches 
 again when it exits the lvolstore so that no internal lvolstore operation sees these bits.
 */
 void vbdev_lvol_set_io_priority_class(struct spdk_lvol* lvol);
+
+void vbdev_lvol_set_tiering_info(struct spdk_lvol *lvol, uint8_t tiering_bits);
+
+uint8_t vbdev_lvol_get_tiering_info(struct spdk_lvol *lvol);
+
+void vbdev_lvs_not_evict_lvstore_md_pages(struct spdk_lvol_store *lvs, bool not_evict_lvstore_md_pages);
+
+bool vbdev_lvs_get_not_evict_lvstore_md_pages(struct spdk_lvol_store *lvs);
+
+void vbdev_lvol_backup_snapshot(struct snapshot_backup_ctx *sctx);
+
+void vbdev_lvol_get_snapshot_backup_status(struct snapshot_backup_ctx *sctx);
 
 #endif /* SPDK_VBDEV_LVOL_H */

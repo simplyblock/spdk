@@ -125,6 +125,7 @@ static inline void
 blob_bs_dev_read(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
 		 uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
 {
+	lba &= ~LBA_METADATA_BITS_MASK;
 	struct spdk_blob_bs_dev *b = (struct spdk_blob_bs_dev *)dev;
 	struct iovec iov;
 
@@ -148,6 +149,7 @@ blob_bs_dev_readv(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		  struct iovec *iov, int iovcnt,
 		  uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
 {
+	lba &= ~LBA_METADATA_BITS_MASK;
 	struct spdk_blob_bs_dev *b = (struct spdk_blob_bs_dev *)dev;
 
 	/* The backing blob may be smaller than this blob, so zero any trailing bytes. */
@@ -169,6 +171,7 @@ blob_bs_dev_readv_ext(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		      uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args,
 		      struct spdk_blob_ext_io_opts *ext_opts)
 {
+	lba &= ~LBA_METADATA_BITS_MASK;
 	struct spdk_blob_bs_dev *b = (struct spdk_blob_bs_dev *)dev;
 
 	/* The backing blob may be smaller than this blob, so zero any trailing bytes. */
@@ -206,6 +209,7 @@ blob_bs_dev_destroy(struct spdk_bs_dev *bs_dev)
 static bool
 blob_bs_is_zeroes(struct spdk_bs_dev *dev, uint64_t lba, uint64_t lba_count)
 {
+	lba &= ~LBA_METADATA_BITS_MASK;
 	struct spdk_blob_bs_dev *b = (struct spdk_blob_bs_dev *)dev;
 	struct spdk_blob *blob = b->blob;
 	bool is_valid_range;
@@ -227,6 +231,7 @@ blob_bs_is_zeroes(struct spdk_bs_dev *dev, uint64_t lba, uint64_t lba_count)
 static bool
 blob_bs_is_range_valid(struct spdk_bs_dev *dev, uint64_t lba, uint64_t lba_count)
 {
+	lba &= ~LBA_METADATA_BITS_MASK;
 	struct spdk_blob_bs_dev *b = (struct spdk_blob_bs_dev *)dev;
 	struct spdk_blob *blob = b->blob;
 	uint64_t	page;
@@ -254,6 +259,7 @@ blob_bs_is_range_valid(struct spdk_bs_dev *dev, uint64_t lba, uint64_t lba_count
 static bool
 blob_bs_translate_lba(struct spdk_bs_dev *dev, uint64_t lba, uint64_t *base_lba)
 {
+	lba &= ~LBA_METADATA_BITS_MASK;
 	struct spdk_blob_bs_dev *b = (struct spdk_blob_bs_dev *)dev;
 	struct spdk_blob *blob = b->blob;
 	bool is_valid_range;

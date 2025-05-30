@@ -7969,6 +7969,11 @@ spdk_bdev_io_get_aio_status(const struct spdk_bdev_io *bdev_io, int *aio_result)
 	}
 }
 
+int8_t 
+spdk_bdev_io_get_status(struct spdk_bdev_io *bdev_io) {
+	return bdev_io->internal.status;
+}
+
 void
 spdk_bdev_io_complete_nvme_status(struct spdk_bdev_io *bdev_io, uint32_t cdw0, int sct, int sc)
 {

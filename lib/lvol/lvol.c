@@ -810,6 +810,89 @@ spdk_lvs_init(struct spdk_bs_dev *bs_dev, struct spdk_lvs_opts *o,
 	return 0;
 }
 
+int
+spdk_lvs_init_persistent(struct spdk_bs_dev *bs_dev, struct spdk_lvs_opts *o,
+		  spdk_lvs_op_with_handle_complete cb_fn, void *cb_arg)
+{
+	struct spdk_lvol_store *lvs;
+	struct spdk_lvs_with_handle_req *lvs_req;
+	struct spdk_bs_opts opts = {};
+	struct spdk_lvs_opts lvs_opts;
+	uint32_t total_clusters;
+	int rc;
+
+	if (bs_dev == NULL) {
+		SPDK_ERRLOG("Blobstore device does not exist\n");
+		return -ENODEV;
+	}
+
+	if (o == NULL) {
+		SPDK_ERRLOG("spdk_lvs_opts not specified\n");
+		return -EINVAL;
+	}
+
+	spdk_lvs_opts_init(&lvs_opts);
+	if (lvs_opts_copy(o, &lvs_opts) != 0) {
+		SPDK_ERRLOG("spdk_lvs_opts invalid\n");
+		return -EINVAL;
+	}
+
+	if (lvs_opts.cluster_sz < bs_dev->blocklen) {
+		SPDK_ERRLOG("Cluster size %" PRIu32 " is smaller than blocklen %" PRIu32 "\n",
+			    lvs_opts.cluster_sz, bs_dev->blocklen);
+		return -EINVAL;
+	}
+	total_clusters = bs_dev->blockcnt / (lvs_opts.cluster_sz / bs_dev->blocklen);
+
+	lvs = lvs_alloc();
+	if (!lvs) {
+		SPDK_ERRLOG("Cannot alloc memory for lvol store base pointer\n");
+		return -ENOMEM;
+	}
+
+	setup_lvs_opts(&opts, o, total_clusters, lvs);
+
+	if (strnlen(lvs_opts.name, SPDK_LVS_NAME_MAX) == SPDK_LVS_NAME_MAX) {
+		SPDK_ERRLOG("Name has no null terminator.\n");
+		lvs_free(lvs);
+		return -EINVAL;
+	}
+
+	if (strnlen(lvs_opts.name, SPDK_LVS_NAME_MAX) == 0) {
+		SPDK_ERRLOG("No name specified.\n");
+		lvs_free(lvs);
+		return -EINVAL;
+	}
+
+	spdk_uuid_generate(&lvs->uuid);
+	snprintf(lvs->name, sizeof(lvs->name), "%s", lvs_opts.name);
+
+	rc = add_lvs_to_list(lvs);
+	if (rc) {
+		SPDK_ERRLOG("lvolstore with name %s already exists\n", lvs->name);
+		lvs_free(lvs);
+		return -EEXIST;
+	}
+
+	lvs_req = calloc(1, sizeof(*lvs_req));
+	if (!lvs_req) {
+		lvs_free(lvs);
+		SPDK_ERRLOG("Cannot alloc memory for lvol store request pointer\n");
+		return -ENOMEM;
+	}
+
+	assert(cb_fn != NULL);
+	lvs_req->cb_fn = cb_fn;
+	lvs_req->cb_arg = cb_arg;
+	lvs_req->lvol_store = lvs;
+	lvs->bs_dev = bs_dev;
+
+	SPDK_INFOLOG(lvol, "Initializing lvol store FOR RECOVERY\n");
+	spdk_bs_init_persistent(bs_dev, &opts, lvs_init_cb, lvs_req);
+
+	return 0;
+}
+
 static void
 lvs_rename_cb(void *cb_arg, int lvolerrno)
 {
@@ -1203,7 +1286,11 @@ lvol_create_cb(void *cb_arg, spdk_blob_id blobid, int lvolerrno)
 		lvs_degraded_lvol_set_add(degraded_set, req->lvol);
 	}
 
-	spdk_bs_open_blob_ext(bs, blobid, &opts, lvol_create_open_cb, req);
+	if (!req->is_recovery) {
+		spdk_bs_open_blob_ext(bs, blobid, &opts, lvol_create_open_cb, req);
+	} else {
+		spdk_bs_open_recover_blob_ext(bs, blobid, &opts, lvol_create_open_cb, req);
+	}
 }
 
 static void
@@ -1263,6 +1350,8 @@ spdk_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz,
 		 bool thin_provision, enum lvol_clear_method clear_method, spdk_lvol_op_with_handle_complete cb_fn,
 		 void *cb_arg)
 {
+	const uint8_t tiering_info = ((struct spdk_lvol_with_handle_req*)(cb_arg))->tiering_info;
+	const int lvol_priority_class = ((struct spdk_lvol_with_handle_req*)(cb_arg))->lvol_priority_class;
 	struct spdk_lvol_with_handle_req *req;
 	struct spdk_blob_store *bs;
 	struct spdk_lvol *lvol;
@@ -1289,6 +1378,8 @@ spdk_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz,
 	}
 	req->cb_fn = cb_fn;
 	req->cb_arg = cb_arg;
+	req->tiering_info = tiering_info;
+	req->lvol_priority_class = lvol_priority_class;
 
 	lvol = lvol_alloc(lvs, name, thin_provision, clear_method, NULL);
 	if (!lvol) {
@@ -1369,6 +1460,55 @@ spdk_lvol_copy_blob(struct spdk_lvol *lvol)
 	if (!lvol->tmp_blob) {
 		return -1;
 	}
+	return 0;
+}
+
+int
+spdk_lvol_recover(struct spdk_lvol_store *lvs, const char *orig_name, const char *orig_uuid, enum lvol_clear_method clear_method,
+spdk_blob_id id_to_recover, spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg)
+{
+	int rc = lvs_verify_lvol_name(lvs, orig_name);
+	if (rc < 0) {
+		return rc;
+	}
+	if (spdk_bdev_get_by_name(orig_uuid) != NULL) {
+		return -EEXIST;
+	}
+
+	struct spdk_lvol_with_handle_req *req = calloc(1, sizeof(*req));
+	if (!req) {
+		SPDK_ERRLOG("Cannot alloc memory for lvol request pointer\n");
+		return -ENOMEM;
+	}
+	req->is_recovery = true;
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+
+	struct spdk_lvol *lvol;
+
+	lvol = calloc(1, sizeof(*lvol));
+	if (lvol == NULL) {
+		free(req);
+		return -ENOMEM;
+	}
+
+	lvol->lvol_store = lvs;
+	lvol->clear_method = (enum blob_clear_method)clear_method;
+	snprintf(lvol->name, sizeof(lvol->name), "%s", orig_name);
+	if (spdk_uuid_parse(&lvol->uuid, orig_uuid) != 0) {
+		SPDK_INFOLOG(lvol, "incorrect UUID '%s'\n", orig_uuid);
+		free(req);
+		lvol_free(lvol);
+		return -EINVAL;
+	}
+	spdk_uuid_fmt_lower(lvol->uuid_str, sizeof(lvol->uuid_str), &lvol->uuid);
+	spdk_uuid_fmt_lower(lvol->unique_id, sizeof(lvol->uuid_str), &lvol->uuid);
+
+	TAILQ_INSERT_TAIL(&lvs->pending_lvols, lvol, link);
+
+	req->lvol = lvol;
+	spdk_bs_start_recover_blob_ext(lvs->blobstore, id_to_recover, lvol_create_cb, req);
+
 	return 0;
 }
 
@@ -1472,6 +1612,8 @@ void
 spdk_lvol_create_snapshot(struct spdk_lvol *origlvol, const char *snapshot_name,
 			  spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg)
 {
+	const uint8_t tiering_info = ((struct spdk_lvol_with_handle_req*)(cb_arg))->tiering_info;
+	const int lvol_priority_class = ((struct spdk_lvol_with_handle_req*)(cb_arg))->lvol_priority_class;
 	struct spdk_lvol_store *lvs;
 	struct spdk_lvol *newlvol;
 	struct spdk_blob *origblob;
@@ -1517,6 +1659,8 @@ spdk_lvol_create_snapshot(struct spdk_lvol *origlvol, const char *snapshot_name,
 	req->origlvol = origlvol;
 	req->cb_fn = cb_fn;
 	req->cb_arg = cb_arg;
+	req->lvol_priority_class = lvol_priority_class;
+	req->tiering_info = tiering_info;
 
 	req->frozen_refcnt = blob_freeze(origblob);
 	// TODO: Consider taking the delay value from RPC; it might be better.
@@ -1618,6 +1762,8 @@ void
 spdk_lvol_create_clone(struct spdk_lvol *origlvol, const char *clone_name,
 		       spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg)
 {
+	const uint8_t tiering_info = ((struct spdk_lvol_with_handle_req*)(cb_arg))->tiering_info;
+	const int lvol_priority_class = ((struct spdk_lvol_with_handle_req*)(cb_arg))->lvol_priority_class;
 	struct spdk_lvol *newlvol;
 	struct spdk_lvol_with_handle_req *req;
 	struct spdk_lvol_store *lvs;
@@ -1668,6 +1814,8 @@ spdk_lvol_create_clone(struct spdk_lvol *origlvol, const char *clone_name,
 	req->lvol = newlvol;
 	req->cb_fn = cb_fn;
 	req->cb_arg = cb_arg;
+	req->tiering_info = tiering_info;
+	req->lvol_priority_class = lvol_priority_class;
 
 	spdk_bs_create_clone(lvs->blobstore, spdk_blob_get_id(origblob), &clone_xattrs,
 			     lvol_create_cb,
