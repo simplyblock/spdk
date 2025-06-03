@@ -3118,9 +3118,9 @@ check_time(struct spdk_nvmf_tcp_req *tcp_req, struct spdk_nvmf_tcp_qpair *tqpair
 			uuid = (uuid) ? uuid : ""; // Handle NULL UUID
 
 			// Log relevant information
-			SPDK_NOTICELOG("delay-qpair %p ttag %d (QID %d) cp %d sp %d, nqn %s\n",
+			SPDK_NOTICELOG("delay-qpair %p ttag %d (QID %d) cp %d sp %d, state %d, nqn %s\n",
 				tqpair, tcp_req->ttag, tqpair->qpair.qid, tqpair->initiator_port,
-				tqpair->target_port, uuid);
+				tqpair->target_port, tcp_req->state, uuid);
 			spdk_nvme_print_command_s(tqpair->qpair.qid, &tcp_req->cmd);
 
 			// If more than 30 ticks have passed for the qpair, dump its contents
