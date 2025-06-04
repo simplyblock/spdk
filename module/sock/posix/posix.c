@@ -1390,6 +1390,9 @@ _sock_flush(struct spdk_sock *sock)
 	if (rc <= 0) {
 		if (rc == 0 || errno == EAGAIN || errno == EWOULDBLOCK || (errno == ENOBUFS && psock->zcopy)) {
 			errno = EAGAIN;
+		} else {
+			SPDK_ERRLOG("sendmsg() failed, errno %ld: %s\n",
+			    	rc, spdk_strerror(rc));
 		}
 		return -1;
 	}
