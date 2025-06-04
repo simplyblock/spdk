@@ -3624,6 +3624,9 @@ nvmf_tcp_req_process(struct spdk_nvmf_tcp_transport *ttransport,
 			 * due to the qpair being disconnected.  We must delay the completion until
 			 * that write is done to avoid freeing the request twice. */
 			if (spdk_unlikely(tcp_req->pdu_in_use)) {
+				
+				SPDK_NOTICELOG("delayed here: ttag %d\n", tcp_req->ttag);
+			
 				SPDK_DEBUGLOG(nvmf_tcp, "Delaying completion due to outstanding "
 					      "write on req=%p\n", tcp_req);
 				/* This can only happen for zcopy requests */
