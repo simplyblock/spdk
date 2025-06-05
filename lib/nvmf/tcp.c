@@ -3196,7 +3196,7 @@ nvmf_tcp_dump_delay_req_status(struct spdk_nvmf_tcp_req *tcp_req, struct spdk_nv
 	}
 
 	// Print the entire string in one line
-	SPDK_NOTICELOG("time per state %s \n", buf);
+	SPDK_NOTICELOG("time per state(us) %s \n", buf);
 }
 
 static void 
@@ -3211,7 +3211,7 @@ check_time(struct spdk_nvmf_tcp_req *tcp_req, struct spdk_nvmf_tcp_qpair *tqpair
 			uuid = (uuid) ? uuid : ""; // Handle NULL UUID
 			double duration_us = ((double)(current - tcp_req->time) * 1000.0) / (double)ticks_hz;
 			// Log relevant information
-			SPDK_NOTICELOG("delay-qpair %p ttag %d (QID %d) cp %d sp %d, state %d, time %.2f, nqn %s\n",
+			SPDK_NOTICELOG("delay-qpair %p ttag %d (QID %d) cp %d sp %d, state %d, time %.2f (ms), nqn %s\n",
 				tqpair, tcp_req->ttag, tqpair->qpair.qid, tqpair->initiator_port,
 				tqpair->target_port, tcp_req->state, duration_us, uuid);
 			nvmf_tcp_dump_delay_req_status(tcp_req, tqpair);
@@ -3379,7 +3379,6 @@ nvmf_tcp_req_process(struct spdk_nvmf_tcp_transport *ttransport,
 			if (tcp_req->req.xfer == SPDK_NVME_DATA_HOST_TO_CONTROLLER) {
 				if (tcp_req->req.data_from_pool) {
 					SPDK_DEBUGLOG(nvmf_tcp, "Sending R2T for tcp_req(%p) on tqpair=%p\n", tcp_req, tqpair);
-					tcp_req->tps.time_per_state[TCP_REQUEST_STATE_HAVE_BUFFER] = spdk_get_ticks() - tcp_req->tps.time_per_state[TCP_REQUEST_STATE_HAVE_BUFFER];
 					nvmf_tcp_send_r2t_pdu(tqpair, tcp_req);
 				} else {
 					struct nvme_tcp_pdu *pdu;
