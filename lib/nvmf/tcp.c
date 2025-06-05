@@ -539,7 +539,9 @@ nvmf_tcp_request_free(void *cb_arg)
 	SPDK_DEBUGLOG(nvmf_tcp, "tcp_req=%p will be freed\n", tcp_req);
 	ttransport = SPDK_CONTAINEROF(tcp_req->req.qpair->transport,
 				      struct spdk_nvmf_tcp_transport, transport);
-	tcp_req->tps.time_per_state[tcp_req->state] = spdk_get_ticks() - tcp_req->tps.time_per_state[tcp_req->state];
+	if (tcp_req->state != TCP_REQUEST_STATE_COMPLETED) {
+		tcp_req->tps.time_per_state[tcp_req->state] = spdk_get_ticks() - tcp_req->tps.time_per_state[tcp_req->state];
+	}
 	nvmf_tcp_req_set_state(tcp_req, TCP_REQUEST_STATE_COMPLETED);
 	if (tcp_req->tps.state[TCP_REQUEST_STATE_COMPLETED] == 0) {
 		tcp_req->tps.state[TCP_REQUEST_STATE_COMPLETED] = 1;
@@ -3251,7 +3253,9 @@ nvmf_tcp_req_process(struct spdk_nvmf_tcp_transport *ttransport,
 		if (tcp_req->state == TCP_REQUEST_STATE_NEED_BUFFER) {
 			nvmf_tcp_request_get_buffers_abort(tcp_req);
 		}
-		tcp_req->tps.time_per_state[tcp_req->state] = spdk_get_ticks() - tcp_req->tps.time_per_state[tcp_req->state];
+		if (tcp_req->state != TCP_REQUEST_STATE_COMPLETED) {
+			tcp_req->tps.time_per_state[tcp_req->state] = spdk_get_ticks() - tcp_req->tps.time_per_state[tcp_req->state];
+		}
 		nvmf_tcp_req_set_state(tcp_req, TCP_REQUEST_STATE_COMPLETED);
 		if (tcp_req->tps.state[TCP_REQUEST_STATE_COMPLETED] == 0) {
 			tcp_req->tps.state[TCP_REQUEST_STATE_COMPLETED] = 1;
