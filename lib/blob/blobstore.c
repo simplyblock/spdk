@@ -4397,7 +4397,7 @@ spdk_bs_stat_io_cpl(struct spdk_io_channel_iter *i, int status)
 	int offset = 0;
 	uint64_t total_io = 0;
 	uint64_t t_total_io = 0;
-
+	bool has_print = false;
 	if (ctx->len == 0) {
 		free(ctx);
     	return;
@@ -4405,6 +4405,7 @@ spdk_bs_stat_io_cpl(struct spdk_io_channel_iter *i, int status)
 
 	for (j = 0; j < ctx->len; j++) {
 		if (ctx->current_io[j]) {
+			has_print = true;
 			total_io += ctx->current_io[j];
 			offset += snprintf(buf + offset, sizeof(buf) - offset, "[%d]=%" PRIu64 " ", j, ctx->current_io[j]);
 
@@ -4414,10 +4415,12 @@ spdk_bs_stat_io_cpl(struct spdk_io_channel_iter *i, int status)
 	}
 	uint64_t counter = ctx->bs->channel_stat_counter / 3;
 	ctx->bs->avg_total = ((counter * ctx->bs->avg_total) + ((total_io) / ctx->len) / (counter + 1));
-	snprintf(buf + offset, sizeof(buf) - offset, "[AVG-PC]=%" PRIu64 " [AVG-T]=%" PRIu64 "", total_io / ctx->len, ctx->bs->avg_total);
-	SPDK_ERRLOG("LSTAT-A: %s \n", buf);
-	snprintf(t_buf + t_offset, sizeof(t_buf) - t_offset, "[AVG]=%" PRIu64 " \n",  (t_total_io / 3) / ctx->len);
-	SPDK_ERRLOG("LSTAT-T: %s \n", t_buf);
+	if (has_print) {
+		snprintf(buf + offset, sizeof(buf) - offset, "[AVG-PC]=%" PRIu64 " [AVG-T]=%" PRIu64 "", total_io / ctx->len, ctx->bs->avg_total);
+		SPDK_NOTICELOG("LSTAT-A: %s \n", buf);
+		snprintf(t_buf + t_offset, sizeof(t_buf) - t_offset, "[AVG]=%" PRIu64 " \n",  (t_total_io / 3) / ctx->len);
+		SPDK_NOTICELOG("LSTAT-T: %s \n", t_buf);
+	}
 	free(ctx);
 }
 
@@ -4429,10 +4432,15 @@ spdk_bs_monitoring_poller(void *cb_arg) {
 		bs->total += ccm_io;
 		bs->total_r += bs->r_io;
 		bs->total_w += bs->w_io;
-		SPDK_NOTICELOG("LSTAT [%" PRIu64 "]  [%" PRIu64 "]  [%" PRIu64 "]  [%" PRIu64 "]  [%" PRIu64 "]  [%" PRIu64 "]\n",
-							bs->total, bs->total_r, bs->total_w, ccm_io, bs->r_io, bs->w_io);		
+		double avg_latency_us = 0;
+		if (bs->r_latancy_us) {
+			avg_latency_us = (double)(bs->r_latancy_us * 1e6 / spdk_get_ticks_hz()) / bs->r_io;
+		}
+		SPDK_NOTICELOG("LSTAT [%" PRIu64 "]  [%" PRIu64 "]  [%" PRIu64 "]  [%" PRIu64 "]  [%" PRIu64 "]  [%" PRIu64 "]  r_latancy[%.4f]\n",
+							bs->total, bs->total_r, bs->total_w, ccm_io, bs->r_io, bs->w_io, avg_latency_us);
 		bs->w_io = 0;
 		bs->r_io = 0;
+		bs->r_latancy_us = 0;
 		if (bs->channel_stat_counter % 3 == 0) {
 			struct stat_io *ctx;
 			// bs->channel_stat_counter = 0;
