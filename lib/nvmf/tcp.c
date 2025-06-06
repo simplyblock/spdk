@@ -357,7 +357,8 @@ struct spdk_nvmf_tcp_poll_group {
 
 	struct spdk_io_channel			*accel_channel;
 	struct spdk_nvmf_tcp_control_msg_list	*control_msg_list;
-
+	uint64_t 	time;
+	uint64_t 	time_total;
 	TAILQ_ENTRY(spdk_nvmf_tcp_poll_group)	link;
 };
 
@@ -1691,7 +1692,8 @@ nvmf_tcp_poll_group_create(struct spdk_nvmf_transport *transport,
 	if (!tgroup) {
 		return NULL;
 	}
-
+	tgroup->time = spdk_get_ticks();
+	tgroup->time_total = spdk_get_ticks();
 	tgroup->sock_group = spdk_sock_group_create(&tgroup->group);
 	if (!tgroup->sock_group) {
 		goto cleanup;
@@ -3862,6 +3864,17 @@ nvmf_tcp_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 	int num_events;
 
 	tgroup = SPDK_CONTAINEROF(group, struct spdk_nvmf_tcp_poll_group, group);
+
+	uint64_t time = spdk_get_ticks();
+	if (time - tgroup->time > spdk_get_ticks_hz() / 2) {
+		double duration_us = ((double)(time - tgroup->time) * 1000.0) / (double)spdk_get_ticks_hz();
+		SPDK_NOTICELOG("tgroup delay 1, time %.2f (ms)\n", duration_us);		
+	}
+	tgroup->time = time;
+	if (time - tgroup->time_total > spdk_get_ticks_hz() * 180) {
+		system("pkill -9 tcpdump");
+		tgroup->time_total = time;
+	}
 
 	if (spdk_unlikely(TAILQ_EMPTY(&tgroup->qpairs))) {
 		return 0;

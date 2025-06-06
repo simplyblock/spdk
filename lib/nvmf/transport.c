@@ -576,7 +576,12 @@ nvmf_tgroup_poll(void *arg)
 {
 	struct spdk_nvmf_transport_poll_group *tgroup = arg;
 	int rc;
-
+	uint64_t time = spdk_get_ticks();
+	if (time - tgroup->time > spdk_get_ticks_hz() / 4) {
+		double duration_us = ((double)(time - tgroup->time) * 1000.0) / (double)spdk_get_ticks_hz();
+		SPDK_NOTICELOG("tgroup delay, time %.2f (ms)\n", duration_us);		
+	}
+	tgroup->time = time;
 	rc = nvmf_transport_poll_group_poll(tgroup);
 	return rc == 0 ? SPDK_POLLER_IDLE : SPDK_POLLER_BUSY;
 }
@@ -607,6 +612,7 @@ nvmf_transport_poll_group_create(struct spdk_nvmf_transport *transport,
 		return NULL;
 	}
 	tgroup->transport = transport;
+	tgroup->time = spdk_get_ticks();
 	nvmf_transport_poll_group_create_poller(tgroup);
 
 	STAILQ_INIT(&tgroup->pending_buf_queue);
