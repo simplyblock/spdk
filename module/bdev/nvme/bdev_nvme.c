@@ -2398,7 +2398,10 @@ bdev_nvme_reset_check_qpair_connected(void *ctx)
 	}
 
 	qpair = nvme_qpair->qpair;
-	assert(qpair != NULL);
+	// assert(qpair != NULL);
+	if (qpair == NULL) {
+		return SPDK_POLLER_BUSY;
+	}
 
 	if (!spdk_nvme_qpair_is_connected(qpair)) {
 		return SPDK_POLLER_BUSY;
