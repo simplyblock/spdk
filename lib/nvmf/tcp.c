@@ -358,7 +358,6 @@ struct spdk_nvmf_tcp_poll_group {
 	struct spdk_io_channel			*accel_channel;
 	struct spdk_nvmf_tcp_control_msg_list	*control_msg_list;
 	uint64_t 	time;
-	uint64_t 	time_total;
 	TAILQ_ENTRY(spdk_nvmf_tcp_poll_group)	link;
 };
 
@@ -1693,7 +1692,7 @@ nvmf_tcp_poll_group_create(struct spdk_nvmf_transport *transport,
 		return NULL;
 	}
 	tgroup->time = spdk_get_ticks();
-	tgroup->time_total = spdk_get_ticks();
+	// tgroup->time_total = spdk_get_ticks();
 	tgroup->sock_group = spdk_sock_group_create(&tgroup->group);
 	if (!tgroup->sock_group) {
 		goto cleanup;
@@ -3195,6 +3194,10 @@ nvmf_tcp_dump_delay_req_status(struct spdk_nvmf_tcp_req *tcp_req, struct spdk_nv
 		if (tcp_req->tps.state[i] != 0) {
 			uint64_t ticks = tcp_req->tps.time_per_state[i];
 			double duration_us = ((double)ticks * 1000000.0) / (double)ticks_hz;
+			if ((int)duration_us > 500000) {
+				SPDK_NOTICELOG("stop the tcpdump on the state 6 bigger than 500ms.\n");
+				system("pkill -9 tcpdump");
+			}
 			offset += snprintf(buf + offset, sizeof(buf) - offset, "[%d]=%.3f ", i, duration_us);
 		}
 	}
@@ -3871,10 +3874,10 @@ nvmf_tcp_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 		SPDK_NOTICELOG("tgroup delay 1, time %.2f (ms)\n", duration_us);		
 	}
 	tgroup->time = time;
-	if (time - tgroup->time_total > spdk_get_ticks_hz() * 180) {
-		system("pkill -9 tcpdump");
-		tgroup->time_total = time;
-	}
+	// if (time - tgroup->time_total > spdk_get_ticks_hz() * 180) {
+	// 	system("pkill -9 tcpdump");
+	// 	tgroup->time_total = time;
+	// }
 
 	if (spdk_unlikely(TAILQ_EMPTY(&tgroup->qpairs))) {
 		return 0;

@@ -2400,6 +2400,18 @@ bdev_nvme_reset_check_qpair_connected(void *ctx)
 	qpair = nvme_qpair->qpair;
 	// assert(qpair != NULL);
 	if (qpair == NULL) {
+		// qpair was disconnected while waiting
+		NVME_CTRLR_INFOLOG(nvme_qpair->ctrlr,
+			"qpair disappeared before connection check. Aborting reset.\n");
+
+		if (ctrlr_ch->connect_poller) {
+			spdk_poller_unregister(&ctrlr_ch->connect_poller);
+		}
+
+		if (ctrlr_ch->reset_iter) {
+			nvme_ctrlr_for_each_channel_continue(ctrlr_ch->reset_iter, -1);
+			ctrlr_ch->reset_iter = NULL;
+		}
 		return SPDK_POLLER_BUSY;
 	}
 
