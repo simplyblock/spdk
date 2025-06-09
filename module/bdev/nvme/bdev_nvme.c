@@ -3643,8 +3643,10 @@ bdev_nvme_destroy_ctrlr_channel_cb(void *io_device, void *ctx_buf)
 {
 	struct nvme_ctrlr_channel *ctrlr_ch = ctx_buf;
 	struct nvme_qpair *nvme_qpair;
-
+	struct nvme_ctrlr *nvme_ctrlr;
+	
 	nvme_qpair = ctrlr_ch->qpair;
+	nvme_ctrlr = nvme_qpair->ctrlr;
 	assert(nvme_qpair != NULL);
 
 	_bdev_nvme_clear_io_path_cache(nvme_qpair);
