@@ -1282,7 +1282,7 @@ _sock_flush(struct spdk_sock *sock)
 	int retval;
 	struct spdk_sock_request *req;
 	int i;
-	ssize_t rc, sent;
+	ssize_t rc;
 	unsigned int offset;
 	size_t len;
 	bool is_zcopy = false;
@@ -1330,8 +1330,6 @@ _sock_flush(struct spdk_sock *sock)
 		return -1;
 	}
 
-	sent = rc;
-
 	if (is_zcopy) {
 		psock->sendmsg_idx++;
 	}
@@ -1361,7 +1359,7 @@ _sock_flush(struct spdk_sock *sock)
 			if (len > (size_t)rc) {
 				/* This element was partially sent. */
 				req->internal.offset += rc;
-				return sent;
+				return 0;
 			}
 
 			offset = 0;
@@ -1390,7 +1388,7 @@ _sock_flush(struct spdk_sock *sock)
 		req = TAILQ_FIRST(&sock->queued_reqs);
 	}
 
-	return sent;
+	return 0;
 }
 
 static int
