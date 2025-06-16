@@ -196,7 +196,6 @@ struct spdk_nvmf_transport_poll_group {
 	struct spdk_iobuf_channel					*buf_cache;
 	struct spdk_nvmf_poll_group					*group;
 	struct spdk_poller						*poller;
-	uint64_t   	time;
 	TAILQ_ENTRY(spdk_nvmf_transport_poll_group)			link;
 };
 
