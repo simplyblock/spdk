@@ -411,7 +411,7 @@ nvme_tcp_read_data(struct spdk_sock *sock, int bytes,
 		return ret;
 	}
 
-	if (ret < 0) {
+	if (ret <= 0) {
 		if (errno == EAGAIN || errno == EWOULDBLOCK) {
 			return 0;
 		}
@@ -422,6 +422,11 @@ nvme_tcp_read_data(struct spdk_sock *sock, int bytes,
 				    errno, spdk_strerror(errno));
 		// }
 	}
+
+	// if (ret == 0) {
+	// 	SPDK_ERRLOG("receive zero byte from spdk_sock_recv() failed, errno %d: %s\n",
+	// 			    errno, spdk_strerror(errno));
+	// }
 
 	/* connection closed */
 	return NVME_TCP_CONNECTION_FATAL;
@@ -447,16 +452,16 @@ nvme_tcp_readv_data(struct spdk_sock *sock, struct iovec *iov, int iovcnt)
 		return ret;
 	}
 
-	if (ret < 0) {
+	if (ret <= 0) {
 		if (errno == EAGAIN || errno == EWOULDBLOCK) {
 			return 0;
 		}
 
 		/* For connect reset issue, do not output error log */
-		if (errno != ECONNRESET) {
+		// if (errno != ECONNRESET) {
 			SPDK_ERRLOG("spdk_sock_readv() failed, errno %d: %s\n",
 				    errno, spdk_strerror(errno));
-		}
+		// }
 	}
 
 	/* connection closed */

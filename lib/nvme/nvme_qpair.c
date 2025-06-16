@@ -944,6 +944,9 @@ spdk_nvme_qpair_set_abort_dnr(struct spdk_nvme_qpair *qpair, bool dnr)
 bool
 spdk_nvme_qpair_is_connected(struct spdk_nvme_qpair *qpair)
 {
+	if (qpair == NULL) {
+		return false;
+	}
 	return nvme_qpair_get_state(qpair) >= NVME_QPAIR_CONNECTED &&
 	       nvme_qpair_get_state(qpair) <= NVME_QPAIR_ENABLED;
 }

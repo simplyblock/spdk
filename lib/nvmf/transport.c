@@ -576,7 +576,6 @@ nvmf_tgroup_poll(void *arg)
 {
 	struct spdk_nvmf_transport_poll_group *tgroup = arg;
 	int rc;
-
 	rc = nvmf_transport_poll_group_poll(tgroup);
 	return rc == 0 ? SPDK_POLLER_IDLE : SPDK_POLLER_BUSY;
 }

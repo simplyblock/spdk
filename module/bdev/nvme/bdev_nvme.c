@@ -2398,7 +2398,22 @@ bdev_nvme_reset_check_qpair_connected(void *ctx)
 	}
 
 	qpair = nvme_qpair->qpair;
-	assert(qpair != NULL);
+	// assert(qpair != NULL);
+	if (qpair == NULL) {
+		// qpair was disconnected while waiting
+		NVME_CTRLR_INFOLOG(nvme_qpair->ctrlr,
+			"qpair disappeared before connection check. Aborting reset.\n");
+
+		if (ctrlr_ch->connect_poller) {
+			spdk_poller_unregister(&ctrlr_ch->connect_poller);
+		}
+
+		if (ctrlr_ch->reset_iter) {
+			nvme_ctrlr_for_each_channel_continue(ctrlr_ch->reset_iter, -1);
+			ctrlr_ch->reset_iter = NULL;
+		}
+		return SPDK_POLLER_BUSY;
+	}
 
 	if (!spdk_nvme_qpair_is_connected(qpair)) {
 		return SPDK_POLLER_BUSY;
@@ -3640,8 +3655,10 @@ bdev_nvme_destroy_ctrlr_channel_cb(void *io_device, void *ctx_buf)
 {
 	struct nvme_ctrlr_channel *ctrlr_ch = ctx_buf;
 	struct nvme_qpair *nvme_qpair;
-
+	struct nvme_ctrlr *nvme_ctrlr;
+	
 	nvme_qpair = ctrlr_ch->qpair;
+	nvme_ctrlr = nvme_qpair->ctrlr;
 	assert(nvme_qpair != NULL);
 
 	_bdev_nvme_clear_io_path_cache(nvme_qpair);
@@ -3655,7 +3672,23 @@ bdev_nvme_destroy_ctrlr_channel_cb(void *io_device, void *ctx_buf)
 			/* Skip current ctrlr_channel in a full reset sequence because
 			 * it is being deleted now.
 			 */
+			// int status;
+			if (ctrlr_ch->connect_poller != NULL) {
+				/* qpair was failed to connect. Abort the reset sequence. */
+				NVME_CTRLR_INFOLOG(nvme_ctrlr,
+						   "qpair %p was disconnect by the user. abort the reset ctrlr sequence.\n",
+						   nvme_qpair->qpair);
+				spdk_poller_unregister(&ctrlr_ch->connect_poller);
+				// status = -1;
+			} else {
+				/* qpair was completed to disconnect. Just move to the next ctrlr_channel. */
+				NVME_CTRLR_INFOLOG(nvme_ctrlr,
+						   "qpair %p was disconnected and move to the next ctrlr sequence.\n",
+						   nvme_qpair->qpair);
+				// status = 0;
+			}
 			nvme_ctrlr_for_each_channel_continue(ctrlr_ch->reset_iter, 0);
+			ctrlr_ch->reset_iter = NULL;
 		}
 
 		/* We cannot release a reference to the poll group now.
