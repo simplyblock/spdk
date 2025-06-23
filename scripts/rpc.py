@@ -2117,19 +2117,17 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('-u', '--uuid', help='lvol store UUID')
     p.add_argument('-s', '--lvs-name', help='lvol store name')
     p.set_defaults(func=bdev_lvol_set_leader_all)
-    # def bdev_lvol_set_leader_all(args):
-    #     print_dict(rpc.lvol.bdev_lvol_set_leader_all(args.client,
-    #                                                uuid=args.uuid,
-    #                                                lvs_name=args.lvs_name,
-    #                                                leadership=args.leadership))
+    
+    def bdev_lvol_block_data_port(args):
+        print_dict(rpc.lvol.bdev_lvol_block_data_port(args.client,
+                                                   uuid=args.uuid,
+                                                   lvs_name=args.lvs_name))
 
-    # p = subparsers.add_parser('bdev_lvol_set_leader_all',
-    #                           help='Change leadership state for lvstore and lvols')
-    # p.add_argument('-l', '--leadership', action='store_true', help='Leadership state for lvolstore level, default False')
-    # # p.add_argument('-b', '--bs-nonleadership', action='store_true', help='Leadership state for blobstore level, default False')
-    # p.add_argument('-u', '--uuid', help='lvol store UUID')
-    # p.add_argument('-s', '--lvs-name', help='lvol store name')
-    # p.set_defaults(func=bdev_lvol_set_leader_all)
+    p = subparsers.add_parser('bdev_lvol_block_data_port',
+                              help='Block data port of the lvolstore')
+    p.add_argument('-u', '--uuid', help='lvol store UUID')
+    p.add_argument('-s', '--lvs-name', help='lvol store name')
+    p.set_defaults(func=bdev_lvol_block_data_port)
     
     def bdev_lvol_set_lvs_read_only(args):
         print_dict(rpc.lvol.bdev_lvol_set_lvs_read_only(args.client,

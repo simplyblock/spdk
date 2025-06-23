@@ -75,7 +75,6 @@ def bdev_lvol_update_lvstore(client, uuid=None, lvs_name=None):
     return client.call('bdev_lvol_update_lvstore', params)
 
 def bdev_lvol_set_leader_all(client, uuid=None, lvs_name=None, lvs_leadership=False, bs_nonleadership=False):
-# def bdev_lvol_set_leader_all(client, uuid=None, lvs_name=None, leadership=False):
     """Change state of the leadership
 
     Args:
@@ -85,7 +84,6 @@ def bdev_lvol_set_leader_all(client, uuid=None, lvs_name=None, lvs_leadership=Fa
         bs_leadership: Leadership state for blobstore (default: False)
     """ 
     params = {'lvs_leadership': lvs_leadership, 'bs_nonleadership': bs_nonleadership}
-    # params = {'leadership': leadership}
         
     if (uuid and lvs_name):
         raise ValueError("Exactly one of uuid or lvs_name may be specified")
@@ -94,6 +92,23 @@ def bdev_lvol_set_leader_all(client, uuid=None, lvs_name=None, lvs_leadership=Fa
     if lvs_name:
         params['lvs_name'] = lvs_name
     return client.call('bdev_lvol_set_leader_all', params)
+
+def bdev_lvol_block_data_port(client, uuid=None, lvs_name=None):
+    """Block data port of the lvolstore
+
+    Args:
+        uuid: UUID of the lvolstore
+        lvs_name: lvolstore name
+    """ 
+    params = {}
+        
+    if (uuid and lvs_name):
+        raise ValueError("Exactly one of uuid or lvs_name may be specified")
+    if uuid:
+        params['uuid'] = uuid
+    if lvs_name:
+        params['lvs_name'] = lvs_name
+    return client.call('bdev_lvol_block_data_port', params)
 
 def bdev_lvol_set_lvs_read_only(client, uuid=None, lvs_name=None, read_only=False):
     """Change state of the read only

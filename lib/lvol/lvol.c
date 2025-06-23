@@ -3256,6 +3256,13 @@ spdk_set_leader_all(struct spdk_lvol_store *t_lvs, bool lvs_leader, bool bs_nonl
 	}
 }
 
+void
+spdk_block_data_port(struct spdk_lvol_store *lvs)
+{
+	SPDK_NOTICELOG("Lvs_leader block the port %d via RPC.\n", lvs->subsystem_port);
+	block_port(lvs->subsystem_port);	
+}
+
 struct spdk_lvol *
 spdk_lvol_get_by_names(const char *lvs_name, const char *lvol_name)
 {
