@@ -190,6 +190,7 @@ struct spdk_lvol {
 	
 	bool				failed_on_update;
 	bool				deletion_failed;
+	bool				deletion_start;
 	char				unique_id[SPDK_LVOL_UNIQUE_ID_MAX];
 	char				name[SPDK_LVOL_NAME_MAX];
 	struct spdk_uuid		uuid;

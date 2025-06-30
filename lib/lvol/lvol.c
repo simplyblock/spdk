@@ -1119,11 +1119,11 @@ lvol_delete_async_cb(void *cb_arg, int lvolerrno)
 	struct spdk_lvol *lvol = req->lvol;	
 
 	if (lvolerrno < 0) {
-		SPDK_ERRLOG("Could not async unmap cluster lvol %s - forced removal\n", lvol->unique_id);
+		SPDK_ERRLOG("Could not async unmap cluster lvol uuid %s name %s - forced removal\n", lvol->unique_id, lvol->name);
 	} else {
-		SPDK_NOTICELOG("Lvol %s async unmap clusters done.\n", lvol->unique_id);
+		SPDK_NOTICELOG("Lvol uuid %s name %s async unmap clusters done.\n", lvol->unique_id, lvol->name);
 	}
-
+	lvol->action_in_progress = false;
 	req->cb_fn(req->cb_arg, lvolerrno);
 	free(req);
 }

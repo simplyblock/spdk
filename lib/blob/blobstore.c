@@ -10205,6 +10205,10 @@ delete_snapshot_sync_clone_cpl(void *cb_arg, int bserrno)
 		}
 	}
 
+	/* change snapshot to be normal lvol without clones and snapshot*/
+	blob_remove_xattr(ctx->snapshot, SNAPSHOT_PENDING_REMOVAL, true);
+	blob_remove_xattr(ctx->snapshot, BLOB_SNAPSHOT, true);
+	
 	blob_set_thin_provision(ctx->snapshot);
 	ctx->snapshot->state = SPDK_BLOB_STATE_DIRTY;
 
@@ -10782,6 +10786,9 @@ blob_clear_clusters_async_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno
 		if (blob->active.clusters[i] != 0) {
 			bs_release_cluster(bs, cluster_num);
 			blob->active.clusters[i] = 0;
+			if (blob->active.num_allocated_clusters > 0) {
+				blob->active.num_allocated_clusters--;
+			}
 		}
 	}
 	spdk_spin_unlock(&bs->used_lock);
@@ -10871,7 +10878,7 @@ spdk_bs_delete_blob_async(struct spdk_blob_store *bs, struct spdk_blob *blob,
 	struct delete_snapshot_ctx *ctx;
 	bool update_clone = false;
 
-	SPDK_ERRLOG("Deleting blob 0x%" PRIx64 "\n", blob->id);
+	SPDK_NOTICELOG("Deleting clusters for blob 0x%" PRIx64 "\n", blob->id);
 
 	assert(spdk_get_thread() == bs->md_thread);
 
@@ -10922,6 +10929,7 @@ spdk_bs_delete_blob_async(struct spdk_blob_store *bs, struct spdk_blob *blob,
 		update_clone_on_snapshot_deletion(blob, ctx);
 	} else {
 		/* This blob does not have any clones - just remove it */
+		blob_remove_xattr(blob, BLOB_SNAPSHOT, true);
 		bs_blob_list_remove(blob);
 		bs_delete_blob_finish_async(seq, blob, 0);
 		free(ctx);

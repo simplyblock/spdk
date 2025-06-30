@@ -690,6 +690,7 @@ bdev_lvol_async_delete_cpl_cb(void *cb_arg, int lvolerrno) {
 		}
 
 		lvs->is_deletion_in_progress = true;
+		lvol->deletion_start = true;
 		spdk_lvol_destroy_async(lvol, bdev_lvol_async_delete_cb, ctx);		
 		return;
 	}
@@ -706,8 +707,8 @@ bdev_lvol_async_delete_cb(void *cb_arg, int lvolerrno)
 	struct spdk_lvol_store *lvs = lvol->lvol_store;
 
 	if (lvolerrno != 0) {
-		// Set the previous error. This will be used to check is the asyn delete lvol request has failed.
-		SPDK_ERRLOG("Error deleting lvol %s, errorcode %d. \n", lvol->unique_id, lvolerrno);
+		// Set the previous error. This will be used to check is the async delete lvol request has failed.
+		SPDK_ERRLOG("Error async deleting lvol %s in clearing the clusters, errorcode %d. \n", lvol->unique_id, lvolerrno);
 		lvol->deletion_failed = true;
 		TAILQ_REMOVE(&lvs->pending_delete_requests, lvol, entry_to_delete);
 		bdev_lvol_async_delete_cpl_cb(lvs, lvolerrno);
@@ -715,7 +716,7 @@ bdev_lvol_async_delete_cb(void *cb_arg, int lvolerrno)
 		return;
 	}
 
-	SPDK_NOTICELOG("lvol %s deleted. \n", lvol->unique_id);
+	SPDK_NOTICELOG("lvol uuid %s name %s async start unregister and totally delete. \n", lvol->unique_id , lvol->name);
 
 	// Remove the lvol from the pending delete requests queue.
 	TAILQ_REMOVE(&lvs->pending_delete_requests, lvol, entry_to_delete);
@@ -850,6 +851,7 @@ vbdev_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb
 			cb_fn(cb_arg, 0);
 			return;	
 		}
+		lvol->deletion_start = false;
 		SPDK_NOTICELOG("async Lvol %s delete requests is queued, other lvol delete in progress.\n", lvol->unique_id);
 		// ret = lvol_delete_requests_enqueue(lvol);
 		TAILQ_INSERT_TAIL(&lvs->pending_delete_requests, lvol, entry_to_delete);
@@ -857,6 +859,7 @@ vbdev_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb
 		return;
 	}
 	lvs->is_deletion_in_progress = true;
+	lvol->deletion_start = true;
 	TAILQ_INSERT_TAIL(&lvs->pending_delete_requests, lvol, entry_to_delete);
 	_vbdev_lvol_destroy(lvol, cb_fn, cb_arg, is_sync);
 }

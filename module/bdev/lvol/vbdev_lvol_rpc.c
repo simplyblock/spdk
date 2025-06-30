@@ -2191,6 +2191,12 @@ rpc_bdev_lvol_get_lvol_delete_status(struct spdk_jsonrpc_request *request, const
 		}
 	}
 
+	if (lvs_name == NULL) {
+		SPDK_ERRLOG("lvolstore: %s not found.\n", req.name);
+		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
+		goto cleanup;
+	}
+
 	rc = vbdev_get_lvol_store_by_uuid_xor_name(NULL, lvs_name, &lvs);
 	if (rc != 0) {
 		SPDK_ERRLOG("lvolstore: %s not found.\n", lvs_name);
@@ -2207,9 +2213,15 @@ rpc_bdev_lvol_get_lvol_delete_status(struct spdk_jsonrpc_request *request, const
 	} else {
 		w = spdk_jsonrpc_begin_result(request);
 		if (lvol_delete_requests_contains(lvol)) {
-			SPDK_NOTICELOG("lvol: %s the delete requests still waiting in queue or in progress.\n", req.name);
-			spdk_json_write_int32(w, 1);
-			spdk_jsonrpc_end_result(request, w);
+			if (lvol->deletion_start) {
+				SPDK_NOTICELOG("lvol: %s the delete requests in progress.\n", req.name);
+				spdk_json_write_int32(w, 1);
+				spdk_jsonrpc_end_result(request, w);
+			} else {
+				SPDK_NOTICELOG("lvol: %s the delete requests still waiting in queue.\n", req.name);
+				spdk_json_write_int32(w, 1);
+				spdk_jsonrpc_end_result(request, w);
+			}
  		} else if (lvol->deletion_failed) {
 			SPDK_NOTICELOG("lvol: %s delete request failed due to error.\n", req.name);
 			spdk_json_write_int32(w, 2);
