@@ -145,6 +145,8 @@ struct spdk_lvol_store {
 	TAILQ_HEAD(, spdk_lvol)		retry_open_lvols;
 	TAILQ_HEAD(, spdk_lvol)		pending_update_lvols;
 	TAILQ_HEAD(, spdk_pending_iorsp)   pending_iorsp;
+	TAILQ_HEAD(, spdk_lvol)		pending_delete_requests;
+	bool is_deletion_in_progress;
 	bool				queue_failed_rsp;
 	bool				load_esnaps;
 	bool				on_list;
@@ -187,6 +189,7 @@ struct spdk_lvol {
 	bool				hublvol;
 	
 	bool				failed_on_update;
+	bool				deletion_failed;
 	char				unique_id[SPDK_LVOL_UNIQUE_ID_MAX];
 	char				name[SPDK_LVOL_NAME_MAX];
 	struct spdk_uuid		uuid;
@@ -198,6 +201,7 @@ struct spdk_lvol {
 	enum blob_clear_method		clear_method;
 	TAILQ_ENTRY(spdk_lvol)		link;
 	TAILQ_ENTRY(spdk_lvol)		entry_to_update;
+	TAILQ_ENTRY(spdk_lvol)		entry_to_delete;
 	struct spdk_lvs_degraded_lvol_set *degraded_set;
 	TAILQ_ENTRY(spdk_lvol)		degraded_link;
 	TAILQ_HEAD(, spdk_pending_iorsp)   redirected_io;

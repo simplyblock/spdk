@@ -78,6 +78,8 @@ lvs_alloc(void)
 	TAILQ_INIT(&lvs->retry_open_lvols);
 	TAILQ_INIT(&lvs->pending_update_lvols);
 	TAILQ_INIT(&lvs->pending_iorsp);
+	TAILQ_INIT(&lvs->pending_delete_requests);
+	lvs->is_deletion_in_progress = false;
 	lvs->queue_failed_rsp = false;
 
 	lvs->load_esnaps = false;
@@ -1111,6 +1113,22 @@ lvol_delete_blob_cb(void *cb_arg, int lvolerrno)
 }
 
 static void
+lvol_delete_async_cb(void *cb_arg, int lvolerrno)
+{
+	struct spdk_lvol_req *req = cb_arg;
+	struct spdk_lvol *lvol = req->lvol;	
+
+	if (lvolerrno < 0) {
+		SPDK_ERRLOG("Could not async unmap cluster lvol %s - forced removal\n", lvol->unique_id);
+	} else {
+		SPDK_NOTICELOG("Lvol %s async unmap clusters done.\n", lvol->unique_id);
+	}
+
+	req->cb_fn(req->cb_arg, lvolerrno);
+	free(req);
+}
+
+static void
 lvol_create_open_cb(void *cb_arg, struct spdk_blob *blob, int lvolerrno)
 {
 	struct spdk_lvol_with_handle_req *req = cb_arg;
@@ -1882,9 +1900,74 @@ spdk_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_
 
 	if (lvol->ref_count != 0) {
 		SPDK_ERRLOG("Cannot destroy lvol %s because it is still open\n", lvol->unique_id);
+		lvol->deletion_failed = true;
 		cb_fn(cb_arg, -EBUSY);
 		return;
 	}
+
+	req = calloc(1, sizeof(*req));
+	if (!req) {
+		SPDK_ERRLOG("Cannot alloc memory for lvol request pointer\n");
+		lvol->deletion_failed = true;
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+	req->lvol = lvol;
+	bs = lvol->lvol_store->blobstore;
+
+	rc = spdk_blob_get_clones(lvs->blobstore, lvol->blob_id, &clone_id, &count);
+	if (rc == 0 && count == 1) {
+		req->clone_lvol = lvs_get_lvol_by_blob_id(lvs, clone_id);
+	} else if (rc == -ENOMEM) {
+		SPDK_INFOLOG(lvol, "lvol %s: cannot destroy: has %" PRIu64 " clones\n",
+			     lvol->unique_id, count);
+		free(req);
+		assert(count > 1);
+		lvol->deletion_failed = true;
+		cb_fn(cb_arg, -EBUSY);
+		return;
+	}
+
+	lvol->action_in_progress = true;
+	if (strcmp("hublvol", lvol->name) == 0) {
+		lvol_delete_blob_cb(req , 0);
+		return;
+	}
+
+	if (lvol->lvol_store->leader) {
+		spdk_bs_delete_blob(bs, lvol->blob_id, lvol_delete_blob_cb, req);
+	} else {
+		SPDK_NOTICELOG("Deleting tmpblob 0x%" PRIx64 " on failover.\n", lvol->blob_id);
+		// TODO add check for snapshots and clons
+		pthread_mutex_lock(&g_lvol_stores_mutex);
+		spdk_bs_delete_blob_non_leader(bs, lvol->tmp_blob);
+		pthread_mutex_unlock(&g_lvol_stores_mutex);
+		lvol_delete_blob_cb(req , 0);
+	}
+}
+
+void
+spdk_lvol_destroy_async(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_lvol_req *req;
+	struct spdk_blob_store *bs;
+	struct spdk_lvol_store	*lvs;
+	spdk_blob_id	clone_id;
+	size_t		count = 1;
+	int		rc;
+
+	assert(cb_fn != NULL);
+
+	if (lvol == NULL) {
+		SPDK_ERRLOG("lvol does not exist\n");
+		cb_fn(cb_arg, -ENODEV);
+		return;
+	}
+
+	lvs = lvol->lvol_store;
 
 	req = calloc(1, sizeof(*req));
 	if (!req) {
@@ -1911,21 +1994,7 @@ spdk_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_
 	}
 
 	lvol->action_in_progress = true;
-	if (strcmp("hublvol", lvol->name) == 0) {
-		lvol_delete_blob_cb(req , 0);
-		return;
-	}
-
-	if (lvol->lvol_store->leader) {
-		spdk_bs_delete_blob(bs, lvol->blob_id, lvol_delete_blob_cb, req);
-	} else {
-		SPDK_NOTICELOG("Deleting tmpblob 0x%" PRIx64 " on failover.\n", lvol->blob_id);
-		// TODO add check for snapshots and clons
-		pthread_mutex_lock(&g_lvol_stores_mutex);
-		spdk_bs_delete_blob_non_leader(bs, lvol->tmp_blob);
-		pthread_mutex_unlock(&g_lvol_stores_mutex);
-		lvol_delete_blob_cb(req , 0);
-	}
+	spdk_bs_delete_blob_async(bs, lvol->blob, lvol_delete_async_cb, req);
 }
 
 void

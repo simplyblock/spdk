@@ -10024,6 +10024,7 @@ struct delete_snapshot_ctx {
 	bool snapshot_md_ro;
 	struct spdk_blob *clone;
 	bool clone_md_ro;
+	bool is_async;
 	spdk_blob_op_with_handle_complete cb_fn;
 	void *cb_arg;
 	int bserrno;
@@ -10060,7 +10061,7 @@ delete_snapshot_cleanup_snapshot(void *cb_arg, int bserrno)
 		SPDK_ERRLOG("Clone cleanup error %d\n", bserrno);
 	}
 
-	if (ctx->bserrno != 0) {
+	if (ctx->bserrno != 0 && !ctx->is_async) {
 		assert(blob_lookup(ctx->snapshot->bs, ctx->snapshot->id) == NULL);
 		RB_INSERT(spdk_blob_tree, &ctx->snapshot->bs->open_blobs, ctx->snapshot);
 		spdk_bit_array_set(ctx->snapshot->bs->open_blobids, ctx->snapshot->id);
@@ -10068,6 +10069,11 @@ delete_snapshot_cleanup_snapshot(void *cb_arg, int bserrno)
 
 	ctx->snapshot->locked_operation_in_progress = false;
 	ctx->snapshot->md_ro = ctx->snapshot_md_ro;
+
+	if (ctx->is_async) {
+		delete_blob_cleanup_finish(ctx, 0);
+		return;
+	}
 
 	spdk_blob_close(ctx->snapshot, delete_blob_cleanup_finish, ctx);
 }
@@ -10672,7 +10678,7 @@ bs_delete_open_cpl(void *cb_arg, struct spdk_blob *blob, int bserrno)
 		spdk_blob_close(blob, bs_delete_enomem_close_cpl, seq);
 		return;
 	}
-
+	ctx->is_async = false;
 	ctx->snapshot = blob;
 	ctx->cb_fn = bs_delete_blob_finish;
 	ctx->cb_arg = seq;
@@ -10741,6 +10747,186 @@ spdk_bs_delete_blob(struct spdk_blob_store *bs, spdk_blob_id blobid,
 	spdk_bs_open_blob(bs, blobid, bs_delete_open_cpl, seq);
 }
 
+static void
+bs_delete_async_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct spdk_blob *blob = cb_arg;
+
+	blob->locked_operation_in_progress = false;
+
+	if (bserrno != 0) {
+		SPDK_ERRLOG("Failed to async delete blob id %" PRIx64 "\n", blob->id);
+	}
+
+	bs_sequence_finish(seq, bserrno);
+}
+
+static void
+blob_clear_clusters_async_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct spdk_blob  *blob= cb_arg;
+	struct spdk_blob_store		*bs = blob->bs;
+	size_t				i;
+
+	if (bserrno != 0) {
+		bs_delete_async_cpl(seq, blob, bserrno);
+		return;
+	}
+
+	spdk_spin_lock(&bs->used_lock);
+	/* Release all clusters that were truncated */
+	for (i = 0; i < blob->active.cluster_array_size; i++) {
+		uint32_t cluster_num = bs_lba_to_cluster(bs, blob->active.clusters[i]);
+
+		/* Nothing to release if it was not allocated */
+		if (blob->active.clusters[i] != 0) {
+			bs_release_cluster(bs, cluster_num);
+			blob->active.clusters[i] = 0;
+		}
+	}
+	spdk_spin_unlock(&bs->used_lock);
+
+	blob->state = SPDK_BLOB_STATE_DIRTY;
+	blob_resize(blob, 0);
+	blob->active.cluster_array_size = 0;
+	blob_persist(seq, blob, bs_delete_async_cpl, blob);
+}
+
+static void
+blob_clear_clusters_async(spdk_bs_sequence_t *seq, struct spdk_blob	*blob)
+{
+	struct spdk_blob_store		*bs = blob->bs;
+	spdk_bs_batch_t			*batch;
+	size_t				i;
+	uint64_t			lba;
+	uint64_t			lba_count;
+
+	batch = bs_sequence_to_batch(seq, blob_clear_clusters_async_cpl, blob);
+
+	/* Clear all clusters that were truncated */
+	lba = 0;
+	lba_count = 0;
+	for (i = 0; i < blob->active.cluster_array_size; i++) {
+		uint64_t next_lba = blob->active.clusters[i];
+		uint64_t next_lba_count = bs_cluster_to_lba(bs, 1);
+
+		if (next_lba > 0 && (lba + lba_count) == next_lba && lba_count < 2048) {
+			/* This cluster is contiguous with the previous one. */
+			lba_count += next_lba_count;
+			continue;
+		} else if (next_lba == 0) {
+			continue;
+		}
+
+		/* This cluster is not contiguous with the previous one. */
+
+		/* If a run of LBAs previously existing, clear them now */
+		if (lba_count > 0) {
+			bs_batch_clear_dev(blob, batch, lba, lba_count);
+		}
+
+		/* Start building the next batch */
+		lba = next_lba;
+		if (next_lba > 0) {
+			lba_count = next_lba_count;
+		} else {
+			lba_count = 0;
+		}
+	}
+
+	/* If we ended with a contiguous set of LBAs, clear them now */
+	if (lba_count > 0) {
+		bs_batch_clear_dev(blob, batch, lba, lba_count);
+	}
+
+	bs_batch_close(batch);
+}
+
+static void
+bs_delete_blob_finish_async(void *cb_arg, struct spdk_blob *blob, int bserrno)
+{
+	spdk_bs_sequence_t *seq = cb_arg;
+	struct spdk_blob_list *snapshot_entry = NULL;
+
+	if (bserrno) {
+		bs_delete_async_cpl(seq, blob, bserrno);
+		return;
+	}
+
+	/* Remove snapshot from the list */
+	snapshot_entry = bs_get_snapshot_entry(blob->bs, blob->id);
+	if (snapshot_entry != NULL) {
+		TAILQ_REMOVE(&blob->bs->snapshots, snapshot_entry, link);
+		free(snapshot_entry);
+	}
+	blob_clear_clusters_async(seq, blob);
+}
+
+void
+spdk_bs_delete_blob_async(struct spdk_blob_store *bs, struct spdk_blob *blob,
+		    spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_bs_cpl	cpl;
+	spdk_bs_sequence_t	*seq;	
+	struct delete_snapshot_ctx *ctx;
+	bool update_clone = false;
+
+	SPDK_ERRLOG("Deleting blob 0x%" PRIx64 "\n", blob->id);
+
+	assert(spdk_get_thread() == bs->md_thread);
+
+	cpl.type = SPDK_BS_CPL_TYPE_BLOB_BASIC;
+	cpl.u.blob_basic.cb_fn = cb_fn;
+	cpl.u.blob_basic.cb_arg = cb_arg;
+
+	seq = bs_sequence_start_bs(bs->md_channel, &cpl);
+	if (!seq) {
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+
+	blob_verify_md_op(blob);
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL) {
+		bs_sequence_finish(seq, -ENOMEM);
+		return;
+	}
+	ctx->is_async = true;
+	ctx->snapshot = blob;
+	ctx->cb_fn = bs_delete_blob_finish_async;
+	ctx->cb_arg = seq;
+
+	/* Check if blob can be removed and if it is a snapshot with clone on top of it */
+	ctx->bserrno = bs_is_blob_deletable(blob, &update_clone);
+	if (ctx->bserrno) {		
+		delete_blob_cleanup_finish(ctx, ctx->bserrno);
+		return;
+	}
+
+	if (blob->locked_operation_in_progress) {
+		SPDK_ERRLOG("Cannot remove blob - another operation in progress\n");
+		delete_blob_cleanup_finish(ctx, -EBUSY);
+		return;
+	}
+
+	blob->locked_operation_in_progress = true;
+
+	if (update_clone) {
+		ctx->page = spdk_zmalloc(SPDK_BS_PAGE_SIZE, 0, NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+		if (!ctx->page) {
+			delete_blob_cleanup_finish(ctx, -ENOMEM);
+			return;
+		}
+		/* This blob is a snapshot with active clone - update clone first */
+		update_clone_on_snapshot_deletion(blob, ctx);
+	} else {
+		/* This blob does not have any clones - just remove it */
+		bs_blob_list_remove(blob);
+		bs_delete_blob_finish_async(seq, blob, 0);
+		free(ctx);
+	}
+}
 /* END spdk_bs_delete_blob */
 
 /* START spdk_bs_open_blob */

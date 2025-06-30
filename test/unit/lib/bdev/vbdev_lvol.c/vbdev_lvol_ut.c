@@ -714,6 +714,22 @@ spdk_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_
 }
 
 void
+spdk_lvol_destroy_async(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg)
+{
+	if (lvol->ref_count != 0) {
+		cb_fn(cb_arg, -ENODEV);
+	}
+
+	TAILQ_REMOVE(&lvol->lvol_store->lvols, lvol, link);
+
+	SPDK_CU_ASSERT_FATAL(cb_fn != NULL);
+	cb_fn(cb_arg, 0);
+
+	g_lvol = NULL;
+	free(lvol);
+}
+
+void
 spdk_bdev_io_complete(struct spdk_bdev_io *bdev_io, enum spdk_bdev_io_status status)
 {
 	bdev_io->internal.status = status;
