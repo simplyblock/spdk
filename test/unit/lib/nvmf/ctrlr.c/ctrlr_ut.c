@@ -76,6 +76,7 @@ DEFINE_STUB(nvmf_subsystem_get_ctrlr,
 	    NULL);
 DEFINE_STUB(nvmf_subsystem_zone_append_supported, bool,
 	    (struct spdk_nvmf_subsystem *subsystem), false);
+DEFINE_STUB_V(spdk_nvmf_tgt_dump_subsystem, (struct spdk_nvmf_tgt *tgt));
 DEFINE_STUB(nvmf_ctrlr_dsm_supported,
 	    bool,
 	    (struct spdk_nvmf_ctrlr *ctrlr),

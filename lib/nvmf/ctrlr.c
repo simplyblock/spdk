@@ -1028,7 +1028,10 @@ nvmf_ctrlr_cmd_connect(struct spdk_nvmf_request *req)
 
 	subsystem = spdk_nvmf_tgt_find_subsystem(transport->tgt, data->subnqn);
 	if (!subsystem) {
-		SPDK_NOTICELOG("Invalid subsystem......... 1\n");
+		SPDK_NOTICELOG("Invalid subsystem...1...%s\n", data->subnqn);
+		if (data->subnqn) {
+			spdk_nvmf_tgt_dump_subsystem(transport->tgt);
+		}
 		SPDK_NVMF_INVALID_CONNECT_DATA(rsp, subnqn);
 		return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
 	}
