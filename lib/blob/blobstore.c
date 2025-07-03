@@ -1693,6 +1693,7 @@ blob_load_cpl_extents_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	if (ctx->pages == NULL) {
 		/* First iteration of this function, allocate buffer for single EXTENT_PAGE */
 		ctx->pages = spdk_zmalloc(SPDK_BS_PAGE_SIZE, 0,
+		// ctx->pages = spdk_zmalloc(blob->bs->pages_per_cluster * SPDK_BS_PAGE_SIZE, SPDK_BS_PAGE_SIZE,
 					  NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
 		if (!ctx->pages) {
 			SPDK_ERRLOG("Cannot alloc memory for extent page open blob 5.\n");
@@ -4326,6 +4327,20 @@ bs_opts_verify(struct spdk_bs_opts *opts)
 
 /* spdk_bs_load_ctx is used for init, load, unload and dump code paths. */
 
+struct spdk_bs_swap_corrupted_ctx {
+	struct spdk_blob_store		*bs;
+	bool				snapshot_flag;
+	bool				clone_flag;
+	struct spdk_blob_md_page	*extent_page;
+
+	spdk_bs_sequence_t			*seq;
+	// spdk_blob_op_with_handle_complete	cb_fn;
+	// void					*cb_arg;
+	struct spdk_blob		*blob;
+	struct spdk_blob		*clone;
+	spdk_blob_id			blobid;
+};
+
 struct spdk_bs_load_ctx {
 	struct spdk_blob_store		*bs;
 	struct spdk_bs_super_block	*super;
@@ -4346,12 +4361,15 @@ struct spdk_bs_load_ctx {
 	spdk_blob_op_with_handle_complete	iter_cb_fn;
 	void					*iter_cb_arg;
 	struct spdk_blob			*blob;
+	struct spdk_blob			*clone;
 	spdk_blob_id				blobid;
 
 	bool					force_recover;
 
 	/* These fields are used in the spdk_bs_dump path. */
 	bool					dumping;
+	bool              		snapshot_create_mode;
+	bool              		snapshot_md_flag;
 	uint32_t				page_counter;
 	bool 					dump_type;
 	FILE					*fp;
@@ -4966,6 +4984,183 @@ bs_delete_corrupted_blob_without_close(void *cb_arg, int bserrno)
 	spdk_blob_sync_md(ctx->blob, bs_delete_corrupted_blob_examine_cb, ctx);
 }
 
+// static void
+// bs_examine_swap_corrupted_blob_cleanup(void *cb_arg, int bserrno) {
+// 	struct spdk_bs_load_ctx *ctx = cb_arg;
+
+// 	if (bserrno != 0) {
+// 		SPDK_ERRLOG("Failed to swap corrupted blob\n");
+// 		spdk_blob_close(ctx->clone, bs_delete_corrupted_blob_without_close, ctx);
+// 	}
+// 	SPDK_NOTICELOG("Sync md corrupted snapblob 0x%" PRIx64 " done.\n", ctx->blobid);
+// 	spdk_blob_close(ctx->clone, bs_delete_corrupted_blob_examine_cpl, ctx);
+// }
+
+// static void
+// bs_swap_corrupted_blob_cleanup(void *cb_arg, int bserrno) {
+// 	struct spdk_bs_swap_corrupted_ctx *ctx = cb_arg;
+
+// 	if (bserrno != 0) {
+// 		SPDK_ERRLOG("Failed to Sync md corrupted snapblob\n");
+// 	}
+
+// 	ctx->blob->md_ro = ctx->snapshot_md_flag;
+
+// 	// ctx->cb_fn(ctx->cb_arg, bserrno);
+// 	bs_sequence_finish(ctx->seq, bserrno);
+// 	if (ctx->page) {
+// 		spdk_free(ctx->page);
+// 		ctx->page = NULL;
+// 	}
+// 	free(ctx);
+// }
+
+// static void
+// blob_persist_extent_page_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+// {
+// 	struct spdk_blob_write_extent_page_ctx *ctx = cb_arg;
+// 	free(ctx);
+// 	bs_sequence_finish(seq, bserrno);
+// }
+
+// static void
+// bs_swap_corrupted_blob_cpl(void *cb_arg, int bserrno) {
+// 	struct spdk_bs_swap_corrupted_ctx *ctx = cb_arg;
+
+// 	if (bserrno != 0) {
+// 		SPDK_ERRLOG("Failed to swap clone and snapshot of a corrupted blob.\n");
+// 		bs_swap_corrupted_blob_cleanup(ctx, bserrno);
+// 	}
+
+// 	blob_remove_xattr(ctx->blob, SNAPSHOT_PENDING_REMOVAL, true);
+// 	blob_remove_xattr(ctx->blob, SNAPSHOT_IN_PROGRESS, true);
+// 	spdk_blob_set_read_only(ctx->blob);
+// 	ctx->blob->md_ro = false;
+// 	blob_set_thin_provision(ctx->blob);
+
+// 	// spdk_blob_close(ctx->blob, bs_delete_corrupted_close_cb, ctx);
+// 	// here I need to sync the blob md pages
+// 	SPDK_NOTICELOG("Sync md corrupted snapblob 0x%" PRIx64 "\n", ctx->blobid);
+// 	spdk_blob_sync_md(ctx->blob, bs_swap_corrupted_blob_cleanup, ctx);
+// }
+
+// static void
+// bs_swap_corrupted_blob(struct spdk_bs_swap_corrupted_ctx *ctx)
+// {
+// 	struct spdk_bs_swap_corrupted_ctx *ctx = cb_arg;
+// 	spdk_bs_batch_t *batch;
+// 	uint32_t *extent_page;
+// 	uint64_t i;
+
+// 	/* Snapshot and clone have the same copy of cluster map and extent pages
+// 	 * at this point. Let's clear both for snapshot now,
+// 	 * so that it won't be cleared for clone later when we remove snapshot.
+// 	 * Also set thin provision to pass data corruption check */
+// 	batch = bs_sequence_to_batch(ctx->seq, bs_swap_corrupted_blob_cpl, ctx);
+
+// 	for (i = 0; i < ctx->blob->active.num_extent_pages && i < ctx->clone->active.num_extent_pages; i++) {		
+// 		if (ctx->blob->active.extent_pages[i] == 0) {
+// 			/* No extent page to use from snapshot */
+// 			continue;
+// 		}
+
+// 		if (ctx->blob->active.extent_pages[i] == ctx->clone->active.extent_pages[i]) {
+// 			ctx->blob->active.extent_pages[i] = 0;
+// 			continue;
+// 		}
+
+// 		extent_page = &ctx->blob->active.extent_pages[i];
+
+// 		/* Clone and snapshot both contain partially filled matching extent pages.
+// 		 * Update the clone extent page in place with cluster map containing the mix of both. */
+// 		ctx->next_extent_page = i + 1;
+		
+// 		uint32_t idx = 0;
+// 		bool match =false ;
+// 		for (uint32_t j = i * SPDK_EXTENTS_PER_EP; j < ctx->blob->active.num_clusters && j < ctx->clone->active.num_clusters; j++) {
+// 			idx++;
+
+// 			if (ctx->blob->active.clusters[j] == 0) {
+// 				/* No cluster to use from snapshot */
+// 				continue;
+// 			}
+
+// 			if (ctx->blob->active.clusters[j] == ctx->clone->active.clusters[j]) {
+// 				ctx->blob->active.clusters[j] = 0;
+// 				if (ctx->blob->active.num_allocated_clusters > 0) {
+// 					ctx->blob->active.num_allocated_clusters--;
+// 				}
+// 				match = true;
+// 			}
+
+// 			if (idx >= SPDK_EXTENTS_PER_EP) {
+// 				if (match) {
+// 					ctx->extent_page[i].next = SPDK_INVALID_MD_PAGE;
+// 					ctx->extent_page[i].id = blob->id;
+// 					ctx->extent_page[i].sequence_num = 0;
+// 					blob_serialize_extent_page(ctx->blob, i * SPDK_EXTENTS_PER_EP, &ctx->extent_page[i]);
+// 					ctx->extent_page[i].crc = blob_md_page_calc_crc(ctx->extent_page[i]);
+// 					ctx->bs->w_io++;
+// 					bs_batch_write_dev(batch, &ctx->extent_page[i], bs_md_page_to_lba(ctx->bs, *extent_page),
+// 				  					bs_byte_to_lba(ctx->bs, SPDK_BS_PAGE_SIZE));
+// 				}
+// 				break;
+// 			}
+// 		}
+// 		// the condition for empty ep should be considered here or in the next load
+// 		// blob_write_extent_page(ctx->blob, *extent_page, i * SPDK_EXTENTS_PER_EP, ctx->page,
+// 		// 		       bs_swap_corrupted_blob, ctx);
+// 		return;
+// 	}
+
+// 	bs_batch_close(batch);
+// }
+
+// static void
+// bs_swap_corrupted_blob_start(struct spdk_blob *origblob, struct spdk_blob *clone, spdk_blob_op_with_handle_complete cb_fn, void *cb_arg)
+// {
+// 	struct spdk_bs_swap_corrupted_ctx *ctx;
+// 	spdk_bs_sequence_t			*seq;
+// 	ctx = calloc(1, sizeof(struct spdk_bs_swap_corrupted_ctx));
+// 	if (!ctx) {
+// 		SPDK_NOTICELOG("Cannot allocate buffer for ctx in swap process for corrupted snapshot.\n");
+// 		cb_fn(cb_arg, -ENOMEM);
+// 		return;
+// 	}
+
+// 	ctx->bs = origblob->bs;
+// 	ctx->blob = origblob;
+// 	ctx->clone = clone;
+// 	// ctx->cb_fn = cb_fn;
+// 	// ctx->cb_arg = cb_arg;
+// 	ctx->snapshot_md_flag = origblob->md_ro;
+// 	ctx->clone_md_flag = clone->md_ro;
+
+// 	ctx->extent_pages = spdk_zmalloc(SPDK_BS_PAGE_SIZE * origblob->num_extent_pages, 0,
+// 					 NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+// 	if (!ctx->extent_pages) {
+// 		SPDK_NOTICELOG("Cannot allocate buffer for extent pages in swap process for corrupted snapshot.\n");
+// 		free(ctx);
+// 		cb_fn(cb_arg, -ENOMEM);
+// 		return;
+// 	}
+
+// 	cpl.type = SPDK_BS_CPL_TYPE_BLOB_BASIC;
+// 	cpl.u.blob_basic.cb_fn = cb_fn;
+// 	cpl.u.blob_basic.cb_arg = cb_arg;
+
+// 	seq = bs_sequence_start_bs(blob->bs->md_channel, &cpl);
+// 	if (!seq) {
+// 		SPDK_ERRLOG("Failed to start sequence for swapping corrupted blob.\n");
+// 		spdk_free(ctx->extent_pages);
+// 		free(ctx);
+// 		cb_fn(cb_arg, -ENOMEM);
+// 		return;
+// 	}
+// 	ctx->seq = seq;
+// 	bs_swap_corrupted_blob(ctx);
+// }
+
 static void
 blob_op_update_corrupted_cb(void *cb_arg, int bserrno)
 {
@@ -4973,6 +5168,8 @@ blob_op_update_corrupted_cb(void *cb_arg, int bserrno)
 	if (bserrno != 0) {
 		SPDK_ERRLOG("Failed to update corrupted blob\n");		
 	}
+	ctx->blob->md_ro = ctx->snapshot_md_flag;
+	ctx->snapshot_md_flag = false;
 	spdk_bs_iter_next_without_close(ctx->bs, ctx->blob, bs_load_iter_without_close, ctx);
 }
 
@@ -4986,7 +5183,7 @@ bs_update_corrupted_blob_without_close(void *cb_arg, int bserrno)
 		spdk_bs_iter_next_without_close(ctx->bs, ctx->blob, bs_load_iter_without_close, ctx);
 		return;
 	}
-
+	ctx->snapshot_md_flag = ctx->blob->md_ro;
 	ctx->blob->md_ro = false;
 	blob_remove_xattr(ctx->blob, SNAPSHOT_PENDING_REMOVAL, true);
 	blob_remove_xattr(ctx->blob, SNAPSHOT_IN_PROGRESS, true);
@@ -5013,14 +5210,35 @@ bs_examine_clone_without_close(void *cb_arg, struct spdk_blob *blob, int bserrno
 	if (blob->parent_id == ctx->blob->id) {
 		SPDK_INFOLOG(blob, "Updatable corrupted snapblob 0x%" PRIx64 ".\n", blob->id);
 		/* Power failure occurred before updating clone (snapshot delete case)
-		 * or after updating clone (creating snapshot case) - keep snapshot */
+		* or after updating clone (creating snapshot case) - keep snapshot */
 		spdk_blob_close(blob, bs_update_corrupted_blob_without_close, ctx);
 	} else {
-		SPDK_INFOLOG(blob, "Cannot examine corrupted snapblob 0x%" PRIx64 ".\n", blob->id);
-		/* Power failure occurred after updating clone (snapshot delete case)
-		 * or before updating clone (creating snapshot case) - remove snapshot */
-		spdk_blob_close(blob, bs_delete_corrupted_blob_without_close, ctx);
+		if (ctx->snapshot_create_mode) {
+			SPDK_INFOLOG(blob, "Cannot examine corrupted snapblob in creation mode 0x%" PRIx64 ".\n", blob->id);
+			/* Power failure occurred before updating clone (creating snapshot case) - remove snapshot */
+			spdk_blob_close(blob, bs_delete_corrupted_blob_without_close, ctx);
+			return;
+		}
+		ctx->blobid = ctx->blob->id;
+		SPDK_INFOLOG(blob, "Cannot examine corrupted snapblob in deletion mode 0x%" PRIx64 ".\n", blob->id);
+		/* Power failure occurred after updating clone (snapshot delete case) - remove snapshot */
+		// bs_swap_corrupted_blob_start(ctx->blob, blob, bs_examine_swap_corrupted_blob_cleanup, ctx);
+		spdk_blob_close(blob, bs_delete_corrupted_blob_examine_cpl, ctx);
+		return;
 	}
+}
+
+spdk_blob_id
+bs_get_xattr_removal(struct spdk_blob *blob)
+{
+	const void *value;
+	int rc;
+	size_t len;
+	rc = blob_get_xattr_value(blob, SNAPSHOT_PENDING_REMOVAL, &value, &len, true);
+	if (rc != 0) {
+		return SPDK_BLOBID_INVALID;
+	}
+	return *(spdk_blob_id *)value;
 }
 
 static void
@@ -5035,6 +5253,7 @@ bs_load_iter_without_close(void *arg, struct spdk_blob *blob, int bserrno)
 		/* Examine blob if it is corrupted after power failure. Fix
 		 * the ones that can be fixed and remove any other corrupted
 		 * ones. If it is not corrupted just process it */
+		ctx->snapshot_create_mode = false;
 		rc = blob_get_xattr_value(blob, SNAPSHOT_PENDING_REMOVAL, &value, &len, true);
 		if (rc != 0) {
 			rc = blob_get_xattr_value(blob, SNAPSHOT_IN_PROGRESS, &value, &len, true);
@@ -5047,7 +5266,7 @@ bs_load_iter_without_close(void *arg, struct spdk_blob *blob, int bserrno)
 				spdk_bs_iter_next_without_close(ctx->bs, blob, bs_load_iter_without_close, ctx);
 				return;
 			}
-
+			ctx->snapshot_create_mode = true;
 		}
 
 		assert(len == sizeof(spdk_blob_id));
@@ -10020,6 +10239,8 @@ bs_delete_persist_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 struct delete_snapshot_ctx {
 	struct spdk_blob_list *parent_snapshot_entry;
 	struct spdk_blob *snapshot;
+	struct spdk_blob *corrupted_clone;
+	bool corrupted_mode;
 	struct spdk_blob_md_page *page;
 	bool snapshot_md_ro;
 	struct spdk_blob *clone;
@@ -10122,21 +10343,25 @@ delete_snapshot_sync_snapshot_cpl(void *cb_arg, int bserrno)
 
 	/* Get snapshot entry for the snapshot we want to remove */
 	snapshot_entry = bs_get_snapshot_entry(ctx->snapshot->bs, ctx->snapshot->id);
-
-	assert(snapshot_entry != NULL);
-
-	/* Remove clone entry in this snapshot (at this point there can be only one clone) */
-	clone_entry = TAILQ_FIRST(&snapshot_entry->clones);
-	assert(clone_entry != NULL);
-	TAILQ_REMOVE(&snapshot_entry->clones, clone_entry, link);
-	snapshot_entry->clone_count--;
-	assert(TAILQ_EMPTY(&snapshot_entry->clones));
+	if (snapshot_entry) {
+		assert(snapshot_entry != NULL);
+		/* Remove clone entry in this snapshot (at this point there can be only one clone) */
+		clone_entry = TAILQ_FIRST(&snapshot_entry->clones);
+		if	(clone_entry) {
+			assert(clone_entry != NULL);
+			TAILQ_REMOVE(&snapshot_entry->clones, clone_entry, link);
+		}
+		snapshot_entry->clone_count--;
+		assert(TAILQ_EMPTY(&snapshot_entry->clones));
+	}
 
 	switch (ctx->snapshot->parent_id) {
 	case SPDK_BLOBID_INVALID:
 	case SPDK_BLOBID_EXTERNAL_SNAPSHOT:
 		/* No parent snapshot - just remove clone entry */
-		free(clone_entry);
+		if (clone_entry) {
+			free(clone_entry);
+		}
 		break;
 	default:
 		/* This snapshot is at the same time a clone of another snapshot - we need to
@@ -10150,7 +10375,11 @@ delete_snapshot_sync_snapshot_cpl(void *cb_arg, int bserrno)
 
 		/* Switch clone entry in parent snapshot */
 		if (parent_snapshot_entry != NULL) {
-			TAILQ_INSERT_TAIL(&parent_snapshot_entry->clones, clone_entry, link);
+			// if (!clone_entry) {
+			bs_blob_list_add(ctx->clone);
+			// } else {				
+			// 	TAILQ_INSERT_TAIL(&parent_snapshot_entry->clones, clone_entry, link);
+			// }
 		}
 
 		if (snapshot_clone_entry != NULL) {
@@ -10204,10 +10433,6 @@ delete_snapshot_sync_clone_cpl(void *cb_arg, int bserrno)
 			ctx->snapshot->active.extent_pages[i] = 0;
 		}
 	}
-
-	/* change snapshot to be normal lvol without clones and snapshot*/
-	blob_remove_xattr(ctx->snapshot, SNAPSHOT_PENDING_REMOVAL, true);
-	blob_remove_xattr(ctx->snapshot, BLOB_SNAPSHOT, true);
 	
 	blob_set_thin_provision(ctx->snapshot);
 	ctx->snapshot->state = SPDK_BLOB_STATE_DIRTY;
@@ -10225,7 +10450,9 @@ delete_snapshot_update_extent_pages_cpl(struct delete_snapshot_ctx *ctx)
 	int bserrno;
 
 	/* Delete old backing bs_dev from clone (related to snapshot that will be removed) */
-	blob_back_bs_destroy(ctx->clone);
+	if (ctx->clone->parent_id != SPDK_BLOBID_INVALID) {
+		blob_back_bs_destroy(ctx->clone);
+	}
 
 	/* Set/remove snapshot xattr and switch parent ID and backing bs_dev on clone... */
 	if (ctx->snapshot->parent_id == SPDK_BLOBID_EXTERNAL_SNAPSHOT) {
@@ -10410,22 +10637,30 @@ update_clone_on_snapshot_deletion(struct spdk_blob *snapshot, struct delete_snap
 	struct spdk_blob_list *clone_entry = NULL;
 	struct spdk_blob_list *snapshot_clone_entry = NULL;
 
+
 	/* Get snapshot entry for the snapshot we want to remove */
 	snapshot_entry = bs_get_snapshot_entry(snapshot->bs, snapshot->id);
+	if (snapshot_entry) {
+		assert(snapshot_entry != NULL);
 
-	assert(snapshot_entry != NULL);
-
-	/* Get clone of the snapshot (at this point there can be only one clone) */
-	clone_entry = TAILQ_FIRST(&snapshot_entry->clones);
-	assert(snapshot_entry->clone_count == 1);
-	assert(clone_entry != NULL);
+		/* Get clone of the snapshot (at this point there can be only one clone) */
+		clone_entry = TAILQ_FIRST(&snapshot_entry->clones);
+		if (clone_entry) {
+			assert(snapshot_entry->clone_count == 1);
+			assert(clone_entry != NULL);
+		}
+	}
 
 	/* Get snapshot entry for parent snapshot and clone entry within that snapshot for
 	 * snapshot that we are removing */
 	blob_get_snapshot_and_clone_entries(snapshot, &ctx->parent_snapshot_entry,
 					    &snapshot_clone_entry);
-
-	spdk_bs_open_blob(snapshot->bs, clone_entry->id, delete_snapshot_open_clone_cb, ctx);
+	
+	if (!ctx->corrupted_mode) {
+		spdk_bs_open_blob(snapshot->bs, clone_entry->id, delete_snapshot_open_clone_cb, ctx);
+	} else {
+		spdk_bs_open_blob(snapshot->bs, ctx->corrupted_clone->id, delete_snapshot_open_clone_cb, ctx);
+	}
 }
 
 static void
@@ -10796,6 +11031,8 @@ blob_clear_clusters_async_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno
 	blob->state = SPDK_BLOB_STATE_DIRTY;
 	blob_resize(blob, 0);
 	blob->active.cluster_array_size = 0;
+	/* change snapshot to be normal lvol without clones*/
+	blob_remove_xattr(blob, SNAPSHOT_PENDING_REMOVAL, true);
 	blob_persist(seq, blob, bs_delete_async_cpl, blob);
 }
 
@@ -10877,6 +11114,10 @@ spdk_bs_delete_blob_async(struct spdk_blob_store *bs, struct spdk_blob *blob,
 	spdk_bs_sequence_t	*seq;	
 	struct delete_snapshot_ctx *ctx;
 	bool update_clone = false;
+	struct spdk_blob *clone;
+	const void *value;
+	int rc;
+	size_t len;
 
 	SPDK_NOTICELOG("Deleting clusters for blob 0x%" PRIx64 "\n", blob->id);
 
@@ -10904,6 +11145,21 @@ spdk_bs_delete_blob_async(struct spdk_blob_store *bs, struct spdk_blob *blob,
 	ctx->cb_fn = bs_delete_blob_finish_async;
 	ctx->cb_arg = seq;
 
+	rc = blob_get_xattr_value(blob, SNAPSHOT_PENDING_REMOVAL, &value, &len, true);
+	if (rc == 0) {
+		clone = blob_lookup(bs, *(spdk_blob_id *)value);
+		if (clone) {
+			if (clone->parent_id == blob->id) {
+				blob_remove_xattr(blob, SNAPSHOT_PENDING_REMOVAL, true);
+			} else {
+				ctx->corrupted_clone = clone;
+				ctx->corrupted_mode = true;
+				SPDK_INFOLOG(blob, "Cannot examine corrupted snapblob in deletion mode 0x%" PRIx64 ".\n", blob->id);
+				/* Power failure occurred after updating clone (snapshot delete case) - remove snapshot */
+			}
+		}
+	}
+
 	/* Check if blob can be removed and if it is a snapshot with clone on top of it */
 	ctx->bserrno = bs_is_blob_deletable(blob, &update_clone);
 	if (ctx->bserrno) {		
@@ -10919,7 +11175,7 @@ spdk_bs_delete_blob_async(struct spdk_blob_store *bs, struct spdk_blob *blob,
 
 	blob->locked_operation_in_progress = true;
 
-	if (update_clone) {
+	if (update_clone || ctx->corrupted_mode) {
 		ctx->page = spdk_zmalloc(SPDK_BS_PAGE_SIZE, 0, NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
 		if (!ctx->page) {
 			delete_blob_cleanup_finish(ctx, -ENOMEM);
@@ -10929,7 +11185,6 @@ spdk_bs_delete_blob_async(struct spdk_blob_store *bs, struct spdk_blob *blob,
 		update_clone_on_snapshot_deletion(blob, ctx);
 	} else {
 		/* This blob does not have any clones - just remove it */
-		blob_remove_xattr(blob, BLOB_SNAPSHOT, true);
 		bs_blob_list_remove(blob);
 		bs_delete_blob_finish_async(seq, blob, 0);
 		free(ctx);

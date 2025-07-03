@@ -1949,6 +1949,83 @@ spdk_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_
 	}
 }
 
+static void
+lvol_update_async_delete(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg)
+{
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+	if (!lvol->update_in_progress) {
+		assert(lvol->leader == false);
+		lvol->update_in_progress = true;
+		lvol->failed_on_update = false;
+		blob_freeze_on_failover(lvol->blob);			
+	}
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+	spdk_blob_update_on_failover(lvol->blob, cb_fn, cb_arg);
+	//we should do something for error handling here
+}
+
+static void
+clone_lvol_update_delete_async_cpl(void *cb_arg, int lvolerrno)
+{
+	struct spdk_lvol_req *req = cb_arg;
+	struct spdk_lvol *clone_lvol = req->clone_lvol;
+	struct spdk_lvol *lvol = req->lvol;
+
+	if (lvolerrno < 0) {
+		SPDK_ERRLOG("Could not update clone lvol for async lvol delete uuid %s name %s - forced removal\n", clone_lvol->unique_id, clone_lvol->name);
+		clone_lvol->failed_on_update = true;
+		req->cb_fn(req->cb_arg, lvolerrno);
+		free(req);
+	}
+
+	SPDK_NOTICELOG("update clone lvol for async lvol delete uuid %s name %s done.\n", clone_lvol->unique_id, clone_lvol->name);
+
+	spdk_lvol_set_leader(clone_lvol);
+	spdk_lvol_destroy_async(lvol, req->cb_fn, req->cb_arg);
+	free(req);
+}
+
+static void
+origlvol_update_delete_async_cpl(void *cb_arg, int lvolerrno)
+{
+	struct spdk_lvol_req *req = cb_arg;
+	struct spdk_lvol *lvol = req->lvol;
+	struct spdk_lvol_store *lvs = lvol->lvol_store;
+	spdk_blob_id	clone_id;
+
+	if (lvolerrno < 0) {
+		SPDK_ERRLOG("Could not update origlvol for async lvol delete uuid %s name %s - forced removal\n", lvol->unique_id, lvol->name);
+		lvol->failed_on_update = true;
+		req->cb_fn(req->cb_arg, lvolerrno);
+		free(req);
+		return;
+	}
+
+	SPDK_NOTICELOG("update origlvol for async lvol delete uuid %s name %s done.\n", lvol->unique_id, lvol->name);
+
+	spdk_lvol_set_leader(lvol);
+	// check if we have a clone lvol
+	if (req->clone_lvol) {
+		if (!req->clone_lvol->leader) {
+			// we have a clone lvol, so we need to update it
+			SPDK_NOTICELOG("Updating clone lvol %s for lvol %s\n", req->clone_lvol->unique_id, lvol->unique_id);
+			lvol_update_async_delete(req->clone_lvol, clone_lvol_update_delete_async_cpl, req);
+			return;
+		}
+	} else {
+		clone_id = bs_get_xattr_removal(lvol->blob);
+		if (clone_id != SPDK_BLOBID_INVALID) {
+			req->clone_lvol = lvs_get_lvol_by_blob_id(lvs, clone_id);
+			if (req->clone_lvol && !req->clone_lvol->leader) {
+				lvol_update_async_delete(req->clone_lvol, clone_lvol_update_delete_async_cpl, req);
+				return;
+			}
+		}
+	}
+	spdk_lvol_destroy_async(lvol, req->cb_fn, req->cb_arg);
+	free(req);
+}
+
 void
 spdk_lvol_destroy_async(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg)
 {
@@ -1993,8 +2070,11 @@ spdk_lvol_destroy_async(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, voi
 		return;
 	}
 
-	lvol->action_in_progress = true;
-	spdk_bs_delete_blob_async(bs, lvol->blob, lvol_delete_async_cb, req);
+	if (lvol->leader) {
+		lvol->action_in_progress = true;
+		spdk_bs_delete_blob_async(bs, lvol->blob, lvol_delete_async_cb, req);
+	}
+	lvol_update_async_delete(req->lvol, origlvol_update_delete_async_cpl, req);
 }
 
 void

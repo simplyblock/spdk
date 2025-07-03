@@ -662,14 +662,30 @@ _vbdev_lvol_destroy_cb(void *cb_arg, int bdeverrno)
 static void
 bdev_lvol_async_delete_cpl_cb(void *cb_arg, int lvolerrno) {
 	struct spdk_lvol_store *lvs = cb_arg;
-	struct spdk_lvol *lvol;
+	struct spdk_lvol *lvol, *tmp;
 	struct vbdev_lvol_destroy_ctx *ctx;
-	// check_and_process_delete_lvol_from_queue();
+
+	if (lvolerrno != 0) {
+		SPDK_ERRLOG("Error async deleting lvol in lvs %s, error code %d.\n", lvs->name, lvolerrno);
+		if (!lvs->leader) {
+			// If there is an error, we need to set the deletion status to failed.
+			// This will be used to check if the async delete request has failed.
+			SPDK_ERRLOG("drain async deleting lvol queue in lvs %s, error code %d.\n", lvs->name, lvolerrno);
+			TAILQ_FOREACH_SAFE(lvol, &lvs->pending_delete_requests, entry_to_delete, tmp) {
+				TAILQ_REMOVE(&lvs->pending_delete_requests, lvol, entry_to_delete);
+				// lvol->deletion_failed = true;
+				// lvol->failed_rc = -ENODEV;
+			}
+			lvs->is_deletion_in_progress = false;
+			return;
+		}
+	}
 
 	if (!TAILQ_EMPTY(&lvs->pending_delete_requests)) {
 		lvol = TAILQ_FIRST(&lvs->pending_delete_requests);
 		if (!lvol) {
-			SPDK_ERRLOG("Error: No lvol found in pending delete requests.\n");
+			SPDK_ERRLOG("NULL lvol found in pending delete requests.\n");
+			bdev_lvol_async_delete_cpl_cb(lvs, -ENODEV);
 			return;
 		}
 
@@ -677,6 +693,7 @@ bdev_lvol_async_delete_cpl_cb(void *cb_arg, int lvolerrno) {
 		if (!ctx) {
 			SPDK_ERRLOG("Cannot allocate ctx for delete lvol.\n");
 			lvol->deletion_failed = true;
+			lvol->failed_rc = -ENOMEM;
 			bdev_lvol_async_delete_cpl_cb(lvs, -ENOMEM);
 			return;
 		}
@@ -684,14 +701,9 @@ bdev_lvol_async_delete_cpl_cb(void *cb_arg, int lvolerrno) {
 		ctx->lvol = lvol;
 		ctx->is_sync = false;
 
-		uint16_t map_id = spdk_blob_get_map_id(lvol->blob);
-		if (map_id < 65535) {
-			lvs->lvol_map.lvol[map_id] = NULL;
-		}
-
 		lvs->is_deletion_in_progress = true;
-		lvol->deletion_start = true;
-		spdk_lvol_destroy_async(lvol, bdev_lvol_async_delete_cb, ctx);		
+		lvol->deletion_status = 1;
+		spdk_lvol_destroy_async(lvol, bdev_lvol_async_delete_cb, ctx);
 		return;
 	}
 
@@ -710,25 +722,20 @@ bdev_lvol_async_delete_cb(void *cb_arg, int lvolerrno)
 		// Set the previous error. This will be used to check is the async delete lvol request has failed.
 		SPDK_ERRLOG("Error async deleting lvol %s in clearing the clusters, errorcode %d. \n", lvol->unique_id, lvolerrno);
 		lvol->deletion_failed = true;
+		lvol->failed_rc = lvolerrno;
 		TAILQ_REMOVE(&lvs->pending_delete_requests, lvol, entry_to_delete);
 		bdev_lvol_async_delete_cpl_cb(lvs, lvolerrno);
 		free(ctx);
 		return;
 	}
 
-	SPDK_NOTICELOG("lvol uuid %s name %s async start unregister and totally delete. \n", lvol->unique_id , lvol->name);
+	SPDK_NOTICELOG("lvol uuid %s name %s async delete completed. \n", lvol->unique_id, lvol->name);
 
 	// Remove the lvol from the pending delete requests queue.
+	lvol->deletion_status = 2;
 	TAILQ_REMOVE(&lvs->pending_delete_requests, lvol, entry_to_delete);
-	ctx->cb_arg = lvs;
-	ctx->cb_fn = bdev_lvol_async_delete_cpl_cb;
-
-	if (spdk_lvol_is_degraded(lvol)) {
-		spdk_lvol_close(lvol, _vbdev_lvol_destroy_cb, ctx);
-		return;
-	}
-
-	spdk_bdev_unregister(lvol->bdev, _vbdev_lvol_destroy_cb, ctx);
+	bdev_lvol_async_delete_cpl_cb(lvs, lvolerrno);
+	free(ctx);
 	return;
 }
 
@@ -754,11 +761,6 @@ _vbdev_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *c
 		return;
 	}
 
-	uint16_t map_id = spdk_blob_get_map_id(lvol->blob);
-	if (map_id < 65535) {
-		lvol->lvol_store->lvol_map.lvol[map_id] = NULL;
-	}
-
 	ctx = calloc(1, sizeof(*ctx));
 	if (!ctx) {
 		cb_fn(cb_arg, -ENOMEM);
@@ -770,7 +772,13 @@ _vbdev_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *c
 	ctx->cb_fn = cb_fn;
 	ctx->cb_arg = cb_arg;
 
-	if (is_sync || (strcmp("hublvol", lvol->name) == 0)) {
+	// If it is sync delete request or lvol is hublvol, we can directly unregister the bdev.
+	if (is_sync || (strcmp("hublvol", lvol->name) == 0)) {	
+		uint16_t map_id = spdk_blob_get_map_id(lvol->blob);
+		if (map_id < 65535) {
+			lvol->lvol_store->lvol_map.lvol[map_id] = NULL;
+		}
+
 		if (spdk_lvol_is_degraded(lvol)) {
 			spdk_lvol_close(lvol, _vbdev_lvol_destroy_cb, ctx);
 			return;
@@ -805,7 +813,6 @@ vbdev_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb
 		return;
 	}
 
-	lvol->deletion_failed = false;
 	/*
 	 * During destruction of an lvolstore, _vbdev_lvs_unload() iterates through lvols until they
 	 * are all deleted. There may be some IO required
@@ -827,15 +834,24 @@ vbdev_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb
 			cb_fn(cb_arg, -ENODEV);
 			return;
 		}
+		//we should check the chain of snapshot -> snapshot
+		//and update the clone if the clone is snapshot
 		_vbdev_lvol_destroy(lvol, cb_fn, cb_arg, true);
 		return;
 	}
 
 	//Check if any other deletion request is in progress
 	if (is_sync == true) {
-		if(lvs->is_deletion_in_progress == true) {
+		if(lvs->is_deletion_in_progress == true && (lvol->deletion_status == 0)) {
 			// Operation not permitted as there is already async delete request in progress.
 			SPDK_NOTICELOG("Cannot operate sync delete request as Async delete lvol is already in progress.\n");
+			cb_fn(cb_arg, -EPERM);
+			return;
+		}
+
+		if ((lvol->deletion_status == 1) || lvol->deletion_failed) {
+			// Operation not permitted as there is already sync delete request in progress.
+			SPDK_NOTICELOG("Cannot operate sync delete request as async delete lvol is failed or not completed.\n");
 			cb_fn(cb_arg, -EPERM);
 			return;
 		}
@@ -851,7 +867,8 @@ vbdev_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb
 			cb_fn(cb_arg, 0);
 			return;	
 		}
-		lvol->deletion_start = false;
+		lvol->deletion_status = 0;
+		lvol->deletion_failed = false;
 		SPDK_NOTICELOG("async Lvol %s delete requests is queued, other lvol delete in progress.\n", lvol->unique_id);
 		// ret = lvol_delete_requests_enqueue(lvol);
 		TAILQ_INSERT_TAIL(&lvs->pending_delete_requests, lvol, entry_to_delete);
@@ -859,7 +876,8 @@ vbdev_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb
 		return;
 	}
 	lvs->is_deletion_in_progress = true;
-	lvol->deletion_start = true;
+	lvol->deletion_status = 1;
+	lvol->deletion_failed = false;
 	TAILQ_INSERT_TAIL(&lvs->pending_delete_requests, lvol, entry_to_delete);
 	_vbdev_lvol_destroy(lvol, cb_fn, cb_arg, is_sync);
 }

@@ -790,6 +790,7 @@ int spdk_blob_get_clones(struct spdk_blob_store *bs, spdk_blob_id blobid, spdk_b
  * \return blob id of parent blob or SPDK_BLOBID_INVALID if have no parent
  */
 spdk_blob_id spdk_blob_get_parent_snapshot(struct spdk_blob_store *bs, spdk_blob_id blobid);
+spdk_blob_id bs_get_xattr_removal(struct spdk_blob *blob);
 
 /**
  * Get the id used to access the esnap clone's parent.
