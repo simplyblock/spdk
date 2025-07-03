@@ -1098,6 +1098,17 @@ spdk_nvmf_tgt_find_subsystem(struct spdk_nvmf_tgt *tgt, const char *subnqn)
 	return RB_FIND(subsystem_tree, &tgt->subsystems, &subsystem);
 }
 
+void
+spdk_nvmf_tgt_dump_subsystem(struct spdk_nvmf_tgt *tgt)
+{
+	struct spdk_nvmf_subsystem *subsystem;
+
+	RB_FOREACH(subsystem, subsystem_tree, &tgt->subsystems) {
+		// Access each subnqn here
+		SPDK_NOTICELOG("SUBNQN %s\n", subsystem->subnqn);
+	}
+}
+
 struct spdk_nvmf_transport *
 spdk_nvmf_tgt_get_transport(struct spdk_nvmf_tgt *tgt, const char *transport_name)
 {

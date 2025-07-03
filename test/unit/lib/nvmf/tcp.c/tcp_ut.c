@@ -48,7 +48,7 @@ DEFINE_STUB(nvmf_subsystem_get_ctrlr,
 	    struct spdk_nvmf_ctrlr *,
 	    (struct spdk_nvmf_subsystem *subsystem, uint16_t cntlid),
 	    NULL);
-
+DEFINE_STUB_V(spdk_nvmf_tgt_dump_subsystem, (struct spdk_nvmf_tgt *tgt));
 DEFINE_STUB(spdk_nvmf_tgt_find_subsystem,
 	    struct spdk_nvmf_subsystem *,
 	    (struct spdk_nvmf_tgt *tgt, const char *subnqn),
