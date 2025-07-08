@@ -213,6 +213,9 @@ raid_bdev_read_sb_remainder(struct raid_bdev_read_sb_ctx *ctx)
 	}
 	ctx->buf = buf;
 
+	SPDK_NOTICELOG("Failed to read bdev %s first part %u -> second part %u - total size %u\n",
+		    spdk_bdev_get_name(bdev), buf_size_prev, ctx->buf_size, sb->length);
+
 	rc = spdk_bdev_read(ctx->desc, ctx->ch, ctx->buf + buf_size_prev, buf_size_prev,
 			    ctx->buf_size - buf_size_prev, raid_bdev_read_sb_cb, ctx);
 	if (rc != 0) {
@@ -245,19 +248,30 @@ raid_bdev_read_sb_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 
 	spdk_bdev_free_io(bdev_io);
 
+	if (!ctx) {
+		SPDK_ERRLOG("Callback argument is NULL!\n");
+	}
+
 	if (!success) {
+		SPDK_ERRLOG("Not successful read ops!\n");
 		status = -EIO;
 		goto out;
 	}
 
 	status = raid_bdev_parse_superblock(ctx);
 	if (status == -EAGAIN) {
+		SPDK_ERRLOG("Need to read more to parse bdev %s superblock\n",
+			      spdk_bdev_get_name(spdk_bdev_desc_get_bdev(ctx->desc)));
 		status = raid_bdev_read_sb_remainder(ctx);
 		if (status == 0) {
 			return;
 		}
+		SPDK_ERRLOG("Failed to read more to parse bdev %s superblock\n",
+			      spdk_bdev_get_name(spdk_bdev_desc_get_bdev(ctx->desc)));
 	} else if (status != 0) {
 		SPDK_DEBUGLOG(bdev_raid_sb, "failed to parse bdev %s superblock\n",
+			      spdk_bdev_get_name(spdk_bdev_desc_get_bdev(ctx->desc)));
+		SPDK_ERRLOG("failed-to parse bdev %s superblock\n",
 			      spdk_bdev_get_name(spdk_bdev_desc_get_bdev(ctx->desc)));
 	} else {
 		sb = ctx->buf;
@@ -355,15 +369,12 @@ _raid_bdev_write_superblock(void *_ctx)
 			continue;
 		}
 
-		struct spdk_bdev *bdev = spdk_bdev_desc_get_bdev(base_info->desc);
-
-		const uint64_t offset_blocks = 0;
-		const uint64_t num_blocks = raid_bdev->sb_io_buf_size / bdev->blocklen;
-
-		rc = spdk_bdev_write_blocks(base_info->desc, base_info->app_thread_ch,
-				     raid_bdev->sb_io_buf, offset_blocks, num_blocks,
+		rc = spdk_bdev_write(base_info->desc, base_info->app_thread_ch,
+				     raid_bdev->sb_io_buf, 0, raid_bdev->sb_io_buf_size,
 				     raid_bdev_write_superblock_cb, ctx);
 		if (rc != 0) {
+			struct spdk_bdev *bdev = spdk_bdev_desc_get_bdev(base_info->desc);
+
 			if (rc == -ENOMEM) {
 				ctx->wait_entry.bdev = bdev;
 				ctx->wait_entry.cb_fn = _raid_bdev_write_superblock;
