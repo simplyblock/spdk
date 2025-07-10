@@ -1952,16 +1952,24 @@ spdk_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_
 static void
 lvol_update_async_delete(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg)
 {
+	bool update = false;
 	pthread_mutex_lock(&g_lvol_stores_mutex);
-	if (!lvol->update_in_progress) {
-		assert(lvol->leader == false);
+	if (!lvol->leader && !lvol->update_in_progress) {
 		lvol->update_in_progress = true;
 		lvol->failed_on_update = false;
-		blob_freeze_on_failover(lvol->blob);			
+		blob_freeze_on_failover(lvol->blob);
+		update = true;
 	}
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
-	spdk_blob_update_on_failover(lvol->blob, cb_fn, cb_arg);
-	//we should do something for error handling here
+	// if we are not leader and update is not in progress, we need to update the blob
+	if (update) {
+		spdk_blob_update_on_failover(lvol->blob, cb_fn, cb_arg);
+		return;
+	}
+	//TODO set poller the activite if the lvol update is in progress
+	SPDK_NOTICELOG("lvol %s is already updated, no need to update again.\n", lvol->unique_id);
+	// if we are leader or update is in progress
+	cb_fn(cb_arg, 0);
 }
 
 static void
@@ -1972,15 +1980,17 @@ clone_lvol_update_delete_async_cpl(void *cb_arg, int lvolerrno)
 	struct spdk_lvol *lvol = req->lvol;
 
 	if (lvolerrno < 0) {
-		SPDK_ERRLOG("Could not update clone lvol for async lvol delete uuid %s name %s - forced removal\n", clone_lvol->unique_id, clone_lvol->name);
+		SPDK_ERRLOG("Could not update clone lvol for async delete uuid %s name %s .\n", clone_lvol->unique_id, clone_lvol->name);
 		clone_lvol->failed_on_update = true;
-		req->cb_fn(req->cb_arg, lvolerrno);
+		req->cb_fn(req->cb_arg, ERR_UPDATE_FAILED);
 		free(req);
+		return;
 	}
 
-	SPDK_NOTICELOG("update clone lvol for async lvol delete uuid %s name %s done.\n", clone_lvol->unique_id, clone_lvol->name);
-
-	spdk_lvol_set_leader(clone_lvol);
+	SPDK_NOTICELOG("update clone lvol for async delete uuid %s name %s done.\n", clone_lvol->unique_id, clone_lvol->name);
+	if (!clone_lvol->leader) {
+		spdk_lvol_set_leader(clone_lvol);
+	}
 	spdk_lvol_destroy_async(lvol, req->cb_fn, req->cb_arg);
 	free(req);
 }
@@ -1994,16 +2004,18 @@ origlvol_update_delete_async_cpl(void *cb_arg, int lvolerrno)
 	spdk_blob_id	clone_id;
 
 	if (lvolerrno < 0) {
-		SPDK_ERRLOG("Could not update origlvol for async lvol delete uuid %s name %s - forced removal\n", lvol->unique_id, lvol->name);
+		SPDK_ERRLOG("Could not update origlvol for async delete uuid %s name %s .\n", lvol->unique_id, lvol->name);
 		lvol->failed_on_update = true;
-		req->cb_fn(req->cb_arg, lvolerrno);
+		req->cb_fn(req->cb_arg, ERR_UPDATE_FAILED);
 		free(req);
 		return;
 	}
 
-	SPDK_NOTICELOG("update origlvol for async lvol delete uuid %s name %s done.\n", lvol->unique_id, lvol->name);
+	SPDK_NOTICELOG("update origlvol for async delete uuid %s name %s done.\n", lvol->unique_id, lvol->name);
 
-	spdk_lvol_set_leader(lvol);
+	if (!lvol->leader) {
+		spdk_lvol_set_leader(lvol);
+	}
 	// check if we have a clone lvol
 	if (req->clone_lvol) {
 		if (!req->clone_lvol->leader) {
@@ -2015,6 +2027,7 @@ origlvol_update_delete_async_cpl(void *cb_arg, int lvolerrno)
 	} else {
 		clone_id = bs_get_xattr_removal(lvol->blob);
 		if (clone_id != SPDK_BLOBID_INVALID) {
+			SPDK_NOTICELOG("snapshot %s was in delete before - corrupted snapblob in primary mode - clone %" PRIu64 "\n", lvol->unique_id, clone_id);
 			req->clone_lvol = lvs_get_lvol_by_blob_id(lvs, clone_id);
 			if (req->clone_lvol && !req->clone_lvol->leader) {
 				lvol_update_async_delete(req->clone_lvol, clone_lvol_update_delete_async_cpl, req);
@@ -2070,9 +2083,17 @@ spdk_lvol_destroy_async(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, voi
 		return;
 	}
 
+	if (!lvs->leader) {
+		SPDK_ERRLOG("lvol %s: cannot destroy: due to leadership change\n", lvol->unique_id);
+		free(req);
+		cb_fn(cb_arg, ERR_LEADERSHIP_CHANGED);
+		return;
+	}
+
 	if (lvol->leader) {
 		lvol->action_in_progress = true;
 		spdk_bs_delete_blob_async(bs, lvol->blob, lvol_delete_async_cb, req);
+		return;
 	}
 	lvol_update_async_delete(req->lvol, origlvol_update_delete_async_cpl, req);
 }

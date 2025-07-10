@@ -45,6 +45,8 @@ typedef uint64_t spdk_blob_id;
 #define SPDK_BLOBID_INVALID		(uint64_t)-1
 #define SPDK_BLOBID_EXTERNAL_SNAPSHOT	(uint64_t)-2
 #define SPDK_BLOBSTORE_TYPE_LENGTH 16
+#define ERR_LEADERSHIP_CHANGED  -35
+#define ERR_UPDATE_FAILED  -36
 
 enum blob_clear_method {
 	BLOB_CLEAR_WITH_DEFAULT,

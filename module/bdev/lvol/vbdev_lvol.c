@@ -666,15 +666,15 @@ bdev_lvol_async_delete_cpl_cb(void *cb_arg, int lvolerrno) {
 	struct vbdev_lvol_destroy_ctx *ctx;
 
 	if (lvolerrno != 0) {
-		SPDK_ERRLOG("Error async deleting lvol in lvs %s, error code %d.\n", lvs->name, lvolerrno);
-		if (!lvs->leader) {
+		SPDK_ERRLOG("Error async deleting lvol in lvs %s, error %d.\n", lvs->name, lvolerrno);
+		if (!lvs->leader || lvolerrno == ERR_LEADERSHIP_CHANGED) {
 			// If there is an error, we need to set the deletion status to failed.
 			// This will be used to check if the async delete request has failed.
-			SPDK_ERRLOG("drain async deleting lvol queue in lvs %s, error code %d.\n", lvs->name, lvolerrno);
+			SPDK_ERRLOG("drain async deleting lvol queue in lvs %s, error ERR_LEADERSHIP_CHANGED.\n", lvs->name);
 			TAILQ_FOREACH_SAFE(lvol, &lvs->pending_delete_requests, entry_to_delete, tmp) {
 				TAILQ_REMOVE(&lvs->pending_delete_requests, lvol, entry_to_delete);
-				// lvol->deletion_failed = true;
-				// lvol->failed_rc = -ENODEV;
+				lvol->deletion_failed = true;
+				lvol->failed_rc = ERR_LEADERSHIP_CHANGED;
 			}
 			lvs->is_deletion_in_progress = false;
 			return;
@@ -720,9 +720,13 @@ bdev_lvol_async_delete_cb(void *cb_arg, int lvolerrno)
 
 	if (lvolerrno != 0) {
 		// Set the previous error. This will be used to check is the async delete lvol request has failed.
-		SPDK_ERRLOG("Error async deleting lvol %s in clearing the clusters, errorcode %d. \n", lvol->unique_id, lvolerrno);
+		SPDK_ERRLOG("Error async deleting lvol %s in clearing the clusters, error %d. \n", lvol->unique_id, lvolerrno);
 		lvol->deletion_failed = true;
-		lvol->failed_rc = lvolerrno;
+		if (!lvs->leader) {
+			lvol->failed_rc = ERR_LEADERSHIP_CHANGED;
+		} else {
+			lvol->failed_rc = lvolerrno;
+		}
 		TAILQ_REMOVE(&lvs->pending_delete_requests, lvol, entry_to_delete);
 		bdev_lvol_async_delete_cpl_cb(lvs, lvolerrno);
 		free(ctx);
@@ -763,6 +767,7 @@ _vbdev_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *c
 
 	ctx = calloc(1, sizeof(*ctx));
 	if (!ctx) {
+		SPDK_ERRLOG("Cannot allocate MEM for delete ctx lvol.\n");
 		cb_fn(cb_arg, -ENOMEM);
 		return;
 	}
@@ -800,7 +805,8 @@ vbdev_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb
 	size_t count;
 
 	if (lvol->action_in_progress == true) {
-		cb_fn(cb_arg, -EPERM);
+		SPDK_ERRLOG("lvol %s: cannot destroy: has other action in progress.\n", lvol->unique_id);
+		cb_fn(cb_arg, -EBUSY);
 		return;
 	}
 
@@ -808,7 +814,7 @@ vbdev_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb
 	spdk_blob_get_clones(lvs->blobstore, lvol->blob_id, NULL, &count);
 	if (count > 1) {
 		/* throw an error */
-		SPDK_ERRLOG("Cannot delete lvol\n");
+		SPDK_ERRLOG("lvol %s: cannot destroy: has %lu clones\n", lvol->unique_id, count);
 		cb_fn(cb_arg, -EPERM);
 		return;
 	}
@@ -820,7 +826,7 @@ vbdev_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb
 
 	lvs_bdev = vbdev_get_lvs_bdev_by_lvs(lvs);
 	if (lvs_bdev == NULL) {
-		SPDK_DEBUGLOG(vbdev_lvol, "lvol %s: lvolstore is being removed\n",
+		SPDK_ERRLOG("lvol %s: lvolstore is being removed\n",
 			      lvol->unique_id);
 		cb_fn(cb_arg, -ENODEV);
 		return;
@@ -831,7 +837,8 @@ vbdev_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb
 		// copy the blob
 		SPDK_NOTICELOG("Deleting blob 0x%" PRIx64 " in secondary mode.\n", lvol->blob_id);
 		if (spdk_lvol_copy_blob(lvol)) {
-			cb_fn(cb_arg, -ENODEV);
+			SPDK_ERRLOG("Deleting blob 0x%" PRIx64 " in secondary mode failed not enough resources.\n", lvol->blob_id);
+			cb_fn(cb_arg, -ENOMEM);
 			return;
 		}
 		//we should check the chain of snapshot -> snapshot
@@ -844,14 +851,14 @@ vbdev_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb
 	if (is_sync == true) {
 		if(lvs->is_deletion_in_progress == true && (lvol->deletion_status == 0)) {
 			// Operation not permitted as there is already async delete request in progress.
-			SPDK_NOTICELOG("Cannot operate sync delete request as Async delete lvol is already in progress.\n");
-			cb_fn(cb_arg, -EPERM);
+			SPDK_ERRLOG("Cannot operate sync delete request as Async delete lvol is already in progress.\n");
+			cb_fn(cb_arg, -EBUSY);
 			return;
 		}
 
-		if ((lvol->deletion_status == 1) || lvol->deletion_failed) {
+		if ((lvol->deletion_status == 1) || lvol->deletion_failed || lvol_delete_requests_contains(lvol)) {
 			// Operation not permitted as there is already sync delete request in progress.
-			SPDK_NOTICELOG("Cannot operate sync delete request as async delete lvol is failed or not completed.\n");
+			SPDK_ERRLOG("Cannot operate sync delete request as async delete lvol is failed or not completed.\n");
 			cb_fn(cb_arg, -EPERM);
 			return;
 		}

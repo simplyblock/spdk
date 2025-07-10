@@ -3725,11 +3725,13 @@ blob_request_submit_op(struct spdk_blob *blob, struct spdk_io_channel *_channel,
 		(op_type == SPDK_BLOB_WRITE || op_type == SPDK_BLOB_WRITE_ZEROES)) {
 		// SPDK_NOTICELOG("FAILED IO on update filed condition.\n");
 		cb_fn(cb_arg, -EIO);
+		return;
 	}
 
 	if (blob->failed_on_update) {
 		SPDK_NOTICELOG("FAILED IO on update filed condition.\n");
 		cb_fn(cb_arg, -EIO);
+		return;
 	}
 
 	if (offset + length > bs_cluster_to_lba(blob->bs, blob->active.num_clusters)) {
@@ -3862,11 +3864,13 @@ blob_request_submit_rw_iov(struct spdk_blob *blob, struct spdk_io_channel *_chan
 
 	if (blob->bs->read_only && !read) {
 		cb_fn(cb_arg, -EIO);
+		return;
 	}
 
 	if (blob->failed_on_update) {
-		SPDK_NOTICELOG("FAILED IO on update filed condition \n");
+		SPDK_NOTICELOG("FAILED IO on update filed condition at LBA: %" PRIu64 " blob: %" PRIu64 " \n", blob->id, offset);
 		cb_fn(cb_arg, -EIO);
+		return;
 	}
 
 	if (offset + length > bs_cluster_to_lba(blob->bs, blob->active.num_clusters)) {
@@ -7802,6 +7806,10 @@ spdk_bs_copy_blob(struct spdk_blob_store *bs,
 	       struct spdk_blob	*blob)
 {
 	struct spdk_blob	*tmp_blob = NULL;
+	const void *value;
+	int rc;
+	size_t len;
+
 	tmp_blob = blob_alloc(bs, blob->id);
 	if (!tmp_blob) {
 		return NULL;
@@ -7817,6 +7825,14 @@ spdk_bs_copy_blob(struct spdk_blob_store *bs,
 	tmp_blob->clean.extent_pages = calloc(1, sizeof(*blob->active.extent_pages));
 	tmp_blob->clean.clusters = calloc(1, sizeof(*blob->active.clusters));
 	
+	rc = blob_get_xattr_value(blob, SNAPSHOT_PENDING_REMOVAL, &value, &len, true);
+	if (rc == 0) {
+		/* Mark blob as pending for removal for power failure safety, use clone id for recovery */
+		blob_set_xattr(tmp_blob, SNAPSHOT_PENDING_REMOVAL, (spdk_blob_id *)value,
+						sizeof(spdk_blob_id), true);
+	}
+
+
 	uint32_t *extent_pages = NULL;
 	uint64_t *clusters = NULL;
 	uint32_t *pages = NULL;
@@ -9571,6 +9587,7 @@ struct spdk_blob_update_ctx {
 	spdk_blob_op_complete cb_fn;
 	void *cb_arg;
 	struct spdk_blob *blob;
+	bool md_ro_blob;
 	int rc;
 };
 
@@ -9885,6 +9902,7 @@ static void
 bs_update_blob_on_failover_cpl(void *cb_arg, struct spdk_blob *blob, int bserrno)
 {
 	struct spdk_blob_update_ctx *ctx = cb_arg;
+	ctx->blob->md_ro = ctx->md_ro_blob;
 	if (bserrno != 0) {
 		if (blob) {
 			blob->failed_on_update = true;
@@ -10059,6 +10077,8 @@ spdk_blob_update_on_failover(struct spdk_blob *blob, spdk_blob_op_complete cb_fn
 	ctx->cb_fn = cb_fn;
 	ctx->cb_arg = cb_arg;
 	ctx->blob = blob;
+	ctx->md_ro_blob = blob->md_ro;
+	blob->md_ro = false;
 
 	if (blob->md_ro) {
 		bs_update_blob_on_failover_cpl(ctx , blob, -EPERM);
@@ -10304,9 +10324,12 @@ delete_snapshot_cleanup_clone(void *cb_arg, int bserrno)
 {
 	struct delete_snapshot_ctx *ctx = cb_arg;
 
-	ctx->clone->locked_operation_in_progress = false;
+	if (ctx->clone->frozen_refcnt > 0) {
+		blob_unfreeze_io(ctx->clone, delete_snapshot_cleanup_clone, ctx);
+		return;
+	}
 	ctx->clone->md_ro = ctx->clone_md_ro;
-
+	ctx->clone->locked_operation_in_progress = false;
 	spdk_blob_close(ctx->clone, delete_snapshot_cleanup_snapshot, ctx);
 }
 
@@ -10347,12 +10370,13 @@ delete_snapshot_sync_snapshot_cpl(void *cb_arg, int bserrno)
 		assert(snapshot_entry != NULL);
 		/* Remove clone entry in this snapshot (at this point there can be only one clone) */
 		clone_entry = TAILQ_FIRST(&snapshot_entry->clones);
-		if	(clone_entry) {
+		if (clone_entry) {
 			assert(clone_entry != NULL);
 			TAILQ_REMOVE(&snapshot_entry->clones, clone_entry, link);
+			snapshot_entry->clone_count--;
 		}
-		snapshot_entry->clone_count--;
 		assert(TAILQ_EMPTY(&snapshot_entry->clones));
+		assert(snapshot_entry->clone_count == 0);
 	}
 
 	switch (ctx->snapshot->parent_id) {
@@ -10375,11 +10399,12 @@ delete_snapshot_sync_snapshot_cpl(void *cb_arg, int bserrno)
 
 		/* Switch clone entry in parent snapshot */
 		if (parent_snapshot_entry != NULL) {
-			// if (!clone_entry) {
-			bs_blob_list_add(ctx->clone);
-			// } else {				
-			// 	TAILQ_INSERT_TAIL(&parent_snapshot_entry->clones, clone_entry, link);
-			// }
+			if (!clone_entry) {
+				bs_blob_list_add(ctx->clone);
+				parent_snapshot_entry->clone_count--;
+			} else {
+				TAILQ_INSERT_TAIL(&parent_snapshot_entry->clones, clone_entry, link);
+			}
 		}
 
 		if (snapshot_clone_entry != NULL) {
@@ -10617,6 +10642,8 @@ delete_snapshot_open_clone_cb(void *cb_arg, struct spdk_blob *clone, int bserrno
 	}
 
 	ctx->clone = clone;
+	ctx->snapshot_md_ro = ctx->snapshot->md_ro;
+	ctx->clone_md_ro = ctx->clone->md_ro;
 
 	if (clone->locked_operation_in_progress) {
 		SPDK_DEBUGLOG(blob, "Cannot remove blob - another operation in progress on its clone\n");
@@ -10742,10 +10769,29 @@ bs_is_blob_deletable(struct spdk_blob *blob, bool *update_clone)
 }
 
 // added by sadegh
+static void
+clone_update_delete_sync_cpl(void *cb_arg, int lvolerrno)
+{
+	struct spdk_blob *clone = cb_arg;
+	clone->md_ro = true;
+	clone->state = SPDK_BLOB_STATE_CLEAN;
+	if (lvolerrno < 0) {
+		SPDK_ERRLOG("Could not update clone blob for sync lvol delete blobid 0x%" PRIx64 " \n", clone->id);
+		return;
+	}
+	SPDK_NOTICELOG("update clone blob for async lvol delete blobid 0x%" PRIx64 " done.\n", clone->id);
+}
+
 int
 spdk_bs_delete_blob_non_leader(struct spdk_blob_store *bs, struct spdk_blob *blob) 
 {
 	bool update_clone = false;
+
+	struct spdk_blob *removal_clone;
+	bool corrupted_mode = false;
+	const void *value;
+	int rc;
+	size_t len;
 
 	/* Check if blob can be removed and if it is a snapshot with clone on top of it */
 	int bserrno = bs_is_blob_deletable(blob, &update_clone);
@@ -10763,7 +10809,16 @@ spdk_bs_delete_blob_non_leader(struct spdk_blob_store *bs, struct spdk_blob *blo
 		return -EBUSY;
 	}
 
-	if (update_clone) {		
+	rc = blob_get_xattr_value(blob, SNAPSHOT_PENDING_REMOVAL, &value, &len, true);
+	if (rc == 0) {
+		removal_clone = blob_lookup(bs, *(spdk_blob_id *)value);
+		if (removal_clone) {
+			corrupted_mode = true;
+			SPDK_NOTICELOG("Blob is a snapshot and was in delete before - corrupted snapblob in secondary mode 0x%" PRIx64 ".\n", blob->id);
+		}
+	}
+
+	if (update_clone || corrupted_mode) {
 		struct spdk_blob *tmp_blob = blob_lookup(blob->bs, blob->id);
 		if (tmp_blob) {
 			/*
@@ -10784,14 +10839,24 @@ spdk_bs_delete_blob_non_leader(struct spdk_blob_store *bs, struct spdk_blob *blo
 		/* This blob is a snapshot with active clone - update clone first */
 
 		snapshot_entry = bs_get_snapshot_entry(snapshot->bs, snapshot->id);
+		if (snapshot_entry) {
+			/* Get clone of the snapshot (at this point there can be only one clone) */
+			clone_entry = TAILQ_FIRST(&snapshot_entry->clones);
+			if (clone_entry) {
+				assert(snapshot_entry->clone_count == 1);
+				clone = blob_lookup(blob->bs, clone_entry->id);
+								
+			} else if (corrupted_mode) {
+				clone = removal_clone;
+			}
+		} else if (corrupted_mode) {
+			clone = removal_clone;
+		}
 
-		assert(snapshot_entry != NULL);
+		if (!clone) {
+			SPDK_ERRLOG("The clone for snapshot 0x%" PRIx64 " is missing\n", blob->id);
+		}
 
-		/* Get clone of the snapshot (at this point there can be only one clone) */
-		clone_entry = TAILQ_FIRST(&snapshot_entry->clones);
-		assert(snapshot_entry->clone_count == 1);
-		assert(clone_entry != NULL);
-		clone = blob_lookup(blob->bs, clone_entry->id);
 		assert(clone != NULL);
 		/* Get snapshot entry for parent snapshot and clone entry within that snapshot for
 		* snapshot that we are removing */
@@ -10811,16 +10876,22 @@ spdk_bs_delete_blob_non_leader(struct spdk_blob_store *bs, struct spdk_blob *blo
 			clone->back_bs_dev = bs_create_zeroes_dev();
 			blob_remove_xattr(clone, BLOB_SNAPSHOT, true);
 		}
+
 		clone->state = SPDK_BLOB_STATE_CLEAN;
 
-		TAILQ_REMOVE(&snapshot_entry->clones, clone_entry, link);
-		snapshot_entry->clone_count--;
-		assert(TAILQ_EMPTY(&snapshot_entry->clones));
+		if (snapshot_entry && clone_entry) {
+			TAILQ_REMOVE(&snapshot_entry->clones, clone_entry, link);
+			snapshot_entry->clone_count--;
+			assert(TAILQ_EMPTY(&snapshot_entry->clones));
+		}
+
 		switch (snapshot->parent_id) {
 			case SPDK_BLOBID_INVALID:
 			case SPDK_BLOBID_EXTERNAL_SNAPSHOT:
 				/* No parent snapshot - just remove clone entry */
-				free(clone_entry);
+				if (clone_entry) {
+					free(clone_entry);
+				}
 				break;
 			default:
 				/* This snapshot is at the same time a clone of another snapshot - we need to
@@ -10829,7 +10900,12 @@ spdk_bs_delete_blob_non_leader(struct spdk_blob_store *bs, struct spdk_blob *blo
 
 				/* Switch clone entry in parent snapshot */
 				if (parent_snapshot_entry != NULL) {
-					TAILQ_INSERT_TAIL(&parent_snapshot_entry->clones, clone_entry, link);
+					if (!clone_entry) {
+						bs_blob_list_add(clone);
+						parent_snapshot_entry->clone_count--;
+					} else {
+						TAILQ_INSERT_TAIL(&parent_snapshot_entry->clones, clone_entry, link);
+					}
 				}
 
 				if (snapshot_clone_entry != NULL) {
@@ -10844,8 +10920,24 @@ spdk_bs_delete_blob_non_leader(struct spdk_blob_store *bs, struct spdk_blob *blo
 			free(snapshot_entry);
 		}
 		blob->back_bs_dev = NULL;
+		uint32_t page_num;
+		spdk_spin_lock(&bs->used_lock);
+		
+		page_num = bs_blobid_to_page(blob->id);
+		spdk_bit_array_clear(bs->used_blobids, page_num);
 		spdk_bit_array_clear(bs->map_blobids, blob->map_id);
+		bs_release_md_page(bs, page_num);
+		
+		spdk_spin_unlock(&bs->used_lock);
 		blob_free(blob);
+		clone_entry = bs_get_snapshot_entry(clone->bs, clone->id);
+		if (clone_entry || clone->md_ro) {
+			// The clone is snapshot too so we should update it
+			clone->md_ro = false;
+			SPDK_NOTICELOG("start updating clone for sync blob delete blobid 0x%" PRIx64 ".\n", clone->id);
+			blob_freeze_on_failover(clone);
+			spdk_blob_update_on_failover(clone, clone_update_delete_sync_cpl, clone);
+		}
 	} else {
 		/* This blob does not have any clones - just remove it */
 		bs_blob_list_remove(blob);
@@ -11012,6 +11104,12 @@ blob_clear_clusters_async_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno
 		return;
 	}
 
+	if (!blob->bs->is_leader) {
+		SPDK_ERRLOG("Failed to async delete blob id %" PRIx64 ": due to leadership change\n", blob->id);
+		bs_delete_async_cpl(seq, blob, ERR_LEADERSHIP_CHANGED);
+		return;
+	}
+
 	spdk_spin_lock(&bs->used_lock);
 	/* Release all clusters that were truncated */
 	for (i = 0; i < blob->active.cluster_array_size; i++) {
@@ -11097,6 +11195,11 @@ bs_delete_blob_finish_async(void *cb_arg, struct spdk_blob *blob, int bserrno)
 		return;
 	}
 
+	if (!blob->bs->is_leader) {
+		SPDK_ERRLOG("Failed to async delete blob id %" PRIx64 ": due to leadership change\n", blob->id);
+		bs_delete_async_cpl(seq, blob, ERR_LEADERSHIP_CHANGED);
+		return;
+	}
 	/* Remove snapshot from the list */
 	snapshot_entry = bs_get_snapshot_entry(blob->bs, blob->id);
 	if (snapshot_entry != NULL) {
@@ -11129,6 +11232,7 @@ spdk_bs_delete_blob_async(struct spdk_blob_store *bs, struct spdk_blob *blob,
 
 	seq = bs_sequence_start_bs(bs->md_channel, &cpl);
 	if (!seq) {
+		SPDK_ERRLOG("Cannot allocate seq delete async lvol.\n");
 		cb_fn(cb_arg, -ENOMEM);
 		return;
 	}
@@ -11137,6 +11241,7 @@ spdk_bs_delete_blob_async(struct spdk_blob_store *bs, struct spdk_blob *blob,
 
 	ctx = calloc(1, sizeof(*ctx));
 	if (ctx == NULL) {
+		SPDK_ERRLOG("Cannot allocate ctx delete async lvol.\n");
 		bs_sequence_finish(seq, -ENOMEM);
 		return;
 	}

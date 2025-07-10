@@ -2170,7 +2170,7 @@ rpc_bdev_lvol_get_lvol_delete_status(struct spdk_jsonrpc_request *request, const
 {
 	struct rpc_bdev_lvol_get_lvol_delete_status req = {};
 	struct spdk_lvol *lvol;
-	char *lvs_name, *lvol_name;
+	char *lvs_name = NULL, *lvol_name = NULL;
 	struct spdk_lvol_store *lvs = NULL;
 	int rc;
 	struct spdk_json_write_ctx *w;
@@ -2203,16 +2203,18 @@ rpc_bdev_lvol_get_lvol_delete_status(struct spdk_jsonrpc_request *request, const
 		goto cleanup;
 	}
 
-	rc = vbdev_get_lvol_store_by_uuid_xor_name(NULL, lvs_name, &lvs);
-	if (rc != 0) {
-		SPDK_ERRLOG("lvolstore: %s not found.\n", lvs_name);
-		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
-		goto cleanup;
+	if (lvs_name) {
+		rc = vbdev_get_lvol_store_by_uuid_xor_name(NULL, lvs_name, &lvs);
+		if (rc != 0) {
+			SPDK_ERRLOG("lvolstore: %s not found.\n", lvs_name);
+			spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
+			goto cleanup;
+		}
 	}
 
 	done:
 	if(lvol == NULL) {
-		SPDK_NOTICELOG("lvol: %s delete request completed successfully.\n", req.name);
+		SPDK_NOTICELOG("lvol: %s delete request completed successfully before.\n", req.name);
 		w = spdk_jsonrpc_begin_result(request);
 		spdk_json_write_int32(w, 0);
 		spdk_jsonrpc_end_result(request, w);
@@ -2223,13 +2225,17 @@ rpc_bdev_lvol_get_lvol_delete_status(struct spdk_jsonrpc_request *request, const
 				SPDK_NOTICELOG("lvol: %s the delete requests in progress.\n", req.name);
 				spdk_json_write_int32(w, 1);
 				spdk_jsonrpc_end_result(request, w);
-			} else if (lvol->deletion_status == 2) {
-				SPDK_NOTICELOG("lvol: %s the async delete requests done.\n", req.name);
-				spdk_json_write_int32(w, 0);
-				spdk_jsonrpc_end_result(request, w);
 			} else if (lvol->deletion_status == 0) {
 				SPDK_NOTICELOG("lvol: %s the delete requests still waiting in queue.\n", req.name);
 				spdk_json_write_int32(w, 1);
+				spdk_jsonrpc_end_result(request, w);
+			} else if (lvol->deletion_status == 2 && lvs->leader) {
+				SPDK_NOTICELOG("lvol: %s the async delete requests done.\n", req.name);
+				spdk_json_write_int32(w, 2);
+				spdk_jsonrpc_end_result(request, w);
+			} else if (lvol->deletion_status == 2 && !lvs->leader) {
+				SPDK_NOTICELOG("lvol: %s the async delete requests done.\n", req.name);
+				spdk_json_write_int32(w, 3);
 				spdk_jsonrpc_end_result(request, w);
 			}
  		} else if (lvol->deletion_failed) {
@@ -2238,7 +2244,7 @@ rpc_bdev_lvol_get_lvol_delete_status(struct spdk_jsonrpc_request *request, const
 			spdk_jsonrpc_end_result(request, w);
 		} else {
 			SPDK_NOTICELOG("No delete action on lvol: %s.\n", req.name);
-			spdk_json_write_int32(w, 2);
+			spdk_json_write_int32(w, 4);
 			spdk_jsonrpc_end_result(request, w);
 		}
 	}
