@@ -2229,6 +2229,14 @@ rpc_bdev_lvol_get_lvol_delete_status(struct spdk_jsonrpc_request *request, const
 				SPDK_NOTICELOG("lvol: %s the delete requests still waiting in queue.\n", req.name);
 				spdk_json_write_int32(w, 1);
 				spdk_jsonrpc_end_result(request, w);
+			} else if (lvol->deletion_status == 2 && lvs->leader) {
+				SPDK_NOTICELOG("lvol: %s the async delete requests done.\n", req.name);
+				spdk_json_write_int32(w, 2);
+				spdk_jsonrpc_end_result(request, w);
+			} else if (lvol->deletion_status == 2 && !lvs->leader) {
+				SPDK_NOTICELOG("lvol: %s the async delete requests done.\n", req.name);
+				spdk_json_write_int32(w, 3);
+				spdk_jsonrpc_end_result(request, w);
 			}
 		} else if (lvol->deletion_status == 2 && lvs->leader) {
 				SPDK_NOTICELOG("lvol: %s the async delete requests done.\n", req.name);
