@@ -2911,6 +2911,17 @@ spdk_lvs_change_leader_state(uint64_t groupid)
 	return;
 }
 
+void
+spdk_abort_node()
+{
+    SPDK_ERRLOG("Failed to recover the state of remote bdevs due to distrib-level functionality.\n");
+    SPDK_ERRLOG("Forcing application shutdown via abort.\n");
+	// Ensure all log messages are flushed
+    fflush(stderr);
+	abort();
+	return;
+}
+
 bool
 spdk_lvs_trigger_leadership_switch(uint64_t *groupid)
 {
