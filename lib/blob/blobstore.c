@@ -3724,11 +3724,13 @@ blob_request_submit_op(struct spdk_blob *blob, struct spdk_io_channel *_channel,
 		(op_type == SPDK_BLOB_WRITE || op_type == SPDK_BLOB_WRITE_ZEROES)) {
 		// SPDK_NOTICELOG("FAILED IO on update filed condition.\n");
 		cb_fn(cb_arg, -EIO);
+		return;
 	}
 
 	if (blob->failed_on_update) {
 		SPDK_NOTICELOG("FAILED IO on update filed condition.\n");
 		cb_fn(cb_arg, -EIO);
+		return;
 	}
 
 	if (offset + length > bs_cluster_to_lba(blob->bs, blob->active.num_clusters)) {
@@ -3861,11 +3863,13 @@ blob_request_submit_rw_iov(struct spdk_blob *blob, struct spdk_io_channel *_chan
 
 	if (blob->bs->read_only && !read) {
 		cb_fn(cb_arg, -EIO);
+		return;
 	}
 
 	if (blob->failed_on_update) {
 		SPDK_NOTICELOG("FAILED IO on update filed condition \n");
 		cb_fn(cb_arg, -EIO);
+		return;
 	}
 
 	if (offset + length > bs_cluster_to_lba(blob->bs, blob->active.num_clusters)) {

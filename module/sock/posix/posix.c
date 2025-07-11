@@ -1425,7 +1425,7 @@ _sock_flush(struct spdk_sock *sock)
 			errno = EAGAIN;
 		} else {
 			SPDK_ERRLOG("sendmsg() failed, errno %ld: %s\n",
-			    	rc, spdk_strerror(rc));
+			    	errno, spdk_strerror(errno));
 		}
 		return -1;
 	}
