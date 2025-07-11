@@ -3738,7 +3738,6 @@ nvmf_tcp_poll_group_remove(struct spdk_nvmf_transport_poll_group *group,
 {
 	struct spdk_nvmf_tcp_poll_group	*tgroup;
 	struct spdk_nvmf_tcp_qpair		*tqpair;
-	struct spdk_nvmf_tcp_req *tcp_req, *req_tmp;
 	int				rc;
 
 	tgroup = SPDK_CONTAINEROF(group, struct spdk_nvmf_tcp_poll_group, group);
