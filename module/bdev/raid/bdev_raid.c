@@ -18,7 +18,7 @@
 #define RAID_OFFSET_BLOCKS_INVALID	UINT64_MAX
 #define RAID_BDEV_PROCESS_MAX_QD	16
 
-#define RAID_BDEV_PROCESS_WINDOW_SIZE_KB_DEFAULT 1024
+#define RAID_BDEV_PROCESS_WINDOW_SIZE_KB_DEFAULT	1024
 #define RAID_BDEV_PROCESS_MAX_BANDWIDTH_MB_SEC_DEFAULT	0
 
 static bool g_shutdown_started = false;
@@ -1090,7 +1090,7 @@ raid_bdev_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_i
 		raid_bdev_submit_reset_request(raid_io);
 		break;
 
-	case SPDK_BDEV_IO_TYPE_FLUSH:	
+	case SPDK_BDEV_IO_TYPE_FLUSH:
 		if (raid_io->raid_bdev->process != NULL) {
 			/* TODO: rebuild support */
 			raid_bdev_io_complete(raid_io, SPDK_BDEV_IO_STATUS_FAILED);
