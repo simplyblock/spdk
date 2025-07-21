@@ -1498,6 +1498,7 @@ struct spdk_blob_load_ctx {
 	struct spdk_blob_md_page	*pages;
 	uint32_t			num_pages;
 	uint32_t			next_extent_page;
+	uint32_t			next_idx_page;
 	enum spdk_blob_load_status   status;
 	spdk_bs_sequence_t	        *seq;
 
@@ -1672,6 +1673,115 @@ blob_load_backing_dev(spdk_bs_sequence_t *seq, void *cb_arg)
 	blob_load_final(ctx, 0);
 }
 
+// static void
+// blob_load_cpl_extents_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+// {
+// 	struct spdk_blob_load_ctx	*ctx = cb_arg;
+// 	struct spdk_blob		*blob = ctx->blob;
+// 	struct spdk_blob_md_page	*page;
+// 	uint64_t			i;
+// 	uint32_t			crc;
+// 	uint64_t			lba;
+// 	void				*tmp;
+// 	uint64_t			sz;
+
+// 	if (bserrno) {
+// 		SPDK_ERRLOG("Extent page read failed: %d\n", bserrno);
+// 		blob_load_final(ctx, bserrno);
+// 		return;
+// 	}
+
+// 	if (ctx->pages == NULL) {
+// 		/* First iteration of this function, allocate buffer for single EXTENT_PAGE */
+// 		// ctx->pages = spdk_zmalloc(SPDK_BS_PAGE_SIZE, 0,
+// 		ctx->pages = spdk_zmalloc(blob->bs->pages_per_cluster * SPDK_BS_PAGE_SIZE, SPDK_BS_PAGE_SIZE,
+// 					  NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);		
+// 		if (!ctx->pages) {
+// 			SPDK_ERRLOG("Cannot alloc memory for extent page open blob 5.\n");
+// 			blob_load_final(ctx, -ENOMEM);
+// 			return;
+// 		}
+// 		ctx->reset_buf = false;
+// 		ctx->num_pages = 1;
+// 		ctx->total_num_pages = blob->bs->pages_per_cluster;
+// 		ctx->next_extent_page = 0;
+// 		tmp = realloc(blob->active.clusters, blob->remaining_clusters_in_et * sizeof(*blob->active.clusters));
+// 		if (tmp == NULL) {
+// 			SPDK_ERRLOG("Cannot alloc memory for cluster array open blob.\n");
+// 			blob_load_final(ctx, -ENOMEM);
+// 			return;
+// 		}
+// 		memset(tmp + sizeof(*blob->active.clusters) * blob->active.cluster_array_size, 0,
+// 				sizeof(*blob->active.clusters) * (blob->remaining_clusters_in_et - blob->active.cluster_array_size));
+// 		blob->active.clusters = tmp;
+// 		blob->active.cluster_array_size = blob->remaining_clusters_in_et;
+// 		batch = bs_sequence_to_batch(seq, blob_clear_clusters_async_cpl, blob);
+// 	} else {
+// 		page = &ctx->pages[0];
+// 		crc = blob_md_page_calc_crc(page);
+// 		if (crc != page->crc) {
+// 			SPDK_ERRLOG("Extenet metadata page %d crc mismatch for blobid 0x%" PRIx64 "\n",
+// 			    ctx->next_extent_page, blob->id);
+// 			blob_load_final(ctx, -EINVAL);
+// 			return;
+// 		}
+
+// 		if (page->next != SPDK_INVALID_MD_PAGE) {
+// 			SPDK_ERRLOG("Extenet metadata page %d refer to INVALID MD PAGE for blobid 0x%" PRIx64 "\n",
+// 			    ctx->next_extent_page, blob->id);
+// 			blob_load_final(ctx, -EINVAL);
+// 			return;
+// 		}
+
+// 		bserrno = blob_parse_extent_page(page, blob);
+// 		if (bserrno) {
+// 			SPDK_ERRLOG("Parse extenet metadata page %d failed for blobid 0x%" PRIx64 "\n",
+// 			    ctx->next_extent_page, blob->id);
+// 			blob_load_final(ctx, bserrno);
+// 			return;
+// 		}
+// 	}
+
+// 	for (i = ctx->next_extent_page; i < blob->active.num_extent_pages; i++) {
+// 		if (blob->active.extent_pages[i] != 0) {
+// 			/* Extent page was allocated, read and parse it. */
+// 			lba = bs_md_page_to_lba(blob->bs, blob->active.extent_pages[i]);
+// 			ctx->next_extent_page = i + 1;
+// 			blob->bs->r_io++;
+// 			bs_sequence_read_dev(seq, &ctx->pages[0], lba,
+// 					     bs_byte_to_lba(blob->bs, SPDK_BS_PAGE_SIZE),
+// 					     blob_load_cpl_extents_cpl, ctx);
+// 			return;
+// 		} else {
+// 			/* Thin provisioned blobs can point to unallocated extent pages.
+// 			 * In this case blob size should be increased by up to the amount left in remaining_clusters_in_et. */
+
+// 			sz = spdk_min(blob->remaining_clusters_in_et, SPDK_EXTENTS_PER_EP);
+// 			blob->active.num_clusters += sz;
+// 			blob->remaining_clusters_in_et -= sz;
+
+// 			assert(spdk_blob_is_thin_provisioned(blob));
+// 			assert(i + 1 < blob->active.num_extent_pages || blob->remaining_clusters_in_et == 0);
+
+// 			// tmp = realloc(blob->active.clusters, blob->active.num_clusters * sizeof(*blob->active.clusters));
+// 			// if (tmp == NULL) {
+// 			// 	SPDK_ERRLOG("Cannot alloc memory for cluster array open blob.\n");
+// 			// 	blob_load_final(ctx, -ENOMEM);
+// 			// 	return;
+// 			// }
+// 			// memset(tmp + sizeof(*blob->active.clusters) * blob->active.cluster_array_size, 0,
+// 			//        sizeof(*blob->active.clusters) * (blob->active.num_clusters - blob->active.cluster_array_size));
+// 			// blob->active.clusters = tmp;
+// 			// blob->active.cluster_array_size = blob->active.num_clusters;
+// 		}
+// 	}
+
+// 	blob_load_backing_dev(seq, ctx);
+// }
+
+static void
+blob_load_read_extents_partial(spdk_bs_sequence_t *seq, struct spdk_blob_load_ctx *ctx);
+
 static void
 blob_load_cpl_extents_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
@@ -1679,9 +1789,8 @@ blob_load_cpl_extents_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	struct spdk_blob		*blob = ctx->blob;
 	struct spdk_blob_md_page	*page;
 	uint64_t			i;
+	uint64_t			idx = 0;
 	uint32_t			crc;
-	uint64_t			lba;
-	void				*tmp;
 	uint64_t			sz;
 
 	if (bserrno) {
@@ -1690,64 +1799,38 @@ blob_load_cpl_extents_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		return;
 	}
 
-	if (ctx->pages == NULL) {
-		/* First iteration of this function, allocate buffer for single EXTENT_PAGE */
-		ctx->pages = spdk_zmalloc(SPDK_BS_PAGE_SIZE, 0,
-		// ctx->pages = spdk_zmalloc(blob->bs->pages_per_cluster * SPDK_BS_PAGE_SIZE, SPDK_BS_PAGE_SIZE,
-					  NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
-		if (!ctx->pages) {
-			SPDK_ERRLOG("Cannot alloc memory for extent page open blob 5.\n");
-			blob_load_final(ctx, -ENOMEM);
-			return;
-		}
-		ctx->num_pages = 1;
-		ctx->next_extent_page = 0;
-		tmp = realloc(blob->active.clusters, blob->remaining_clusters_in_et * sizeof(*blob->active.clusters));
-		if (tmp == NULL) {
-			SPDK_ERRLOG("Cannot alloc memory for cluster array open blob.\n");
-			blob_load_final(ctx, -ENOMEM);
-			return;
-		}
-		memset(tmp + sizeof(*blob->active.clusters) * blob->active.cluster_array_size, 0,
-				sizeof(*blob->active.clusters) * (blob->remaining_clusters_in_et - blob->active.cluster_array_size));
-		blob->active.clusters = tmp;
-		blob->active.cluster_array_size = blob->remaining_clusters_in_et;
-	} else {
-		page = &ctx->pages[0];
-		crc = blob_md_page_calc_crc(page);
-		if (crc != page->crc) {
-			SPDK_ERRLOG("Extenet metadata page %d crc mismatch for blobid 0x%" PRIx64 "\n",
-			    ctx->next_extent_page, blob->id);
-			blob_load_final(ctx, -EINVAL);
-			return;
-		}
-
-		if (page->next != SPDK_INVALID_MD_PAGE) {
-			SPDK_ERRLOG("Extenet metadata page %d refer to INVALID MD PAGE for blobid 0x%" PRIx64 "\n",
-			    ctx->next_extent_page, blob->id);
-			blob_load_final(ctx, -EINVAL);
-			return;
-		}
-
-		bserrno = blob_parse_extent_page(page, blob);
-		if (bserrno) {
-			SPDK_ERRLOG("Parse extenet metadata page %d failed for blobid 0x%" PRIx64 "\n",
-			    ctx->next_extent_page, blob->id);
-			blob_load_final(ctx, bserrno);
-			return;
-		}
-	}
-
 	for (i = ctx->next_extent_page; i < blob->active.num_extent_pages; i++) {
+		ctx->next_extent_page++;
 		if (blob->active.extent_pages[i] != 0) {
+			if (idx >= ctx->next_idx_page) {
+				ctx->next_extent_page--;
+				break;
+			}
 			/* Extent page was allocated, read and parse it. */
-			lba = bs_md_page_to_lba(blob->bs, blob->active.extent_pages[i]);
-			ctx->next_extent_page = i + 1;
-			blob->bs->r_io++;
-			bs_sequence_read_dev(seq, &ctx->pages[0], lba,
-					     bs_byte_to_lba(blob->bs, SPDK_BS_PAGE_SIZE),
-					     blob_load_cpl_extents_cpl, ctx);
-			return;
+			page = &ctx->pages[idx];
+			idx++;
+			crc = blob_md_page_calc_crc(page);
+			if (crc != page->crc) {
+				SPDK_ERRLOG("Extenet metadata page %d crc mismatch for blobid 0x%" PRIx64 "\n",
+					ctx->next_extent_page, blob->id);
+				blob_load_final(ctx, -EINVAL);
+				return;
+			}
+
+			if (page->next != SPDK_INVALID_MD_PAGE) {
+				SPDK_ERRLOG("Extenet metadata page %d refer to INVALID MD PAGE for blobid 0x%" PRIx64 "\n",
+					ctx->next_extent_page, blob->id);
+				blob_load_final(ctx, -EINVAL);
+				return;
+			}
+
+			bserrno = blob_parse_extent_page(page, blob);
+			if (bserrno) {
+				SPDK_ERRLOG("Parse extenet metadata page %d failed for blobid 0x%" PRIx64 "\n",
+					ctx->next_extent_page, blob->id);
+				blob_load_final(ctx, bserrno);
+				return;
+			}
 		} else {
 			/* Thin provisioned blobs can point to unallocated extent pages.
 			 * In this case blob size should be increased by up to the amount left in remaining_clusters_in_et. */
@@ -1758,21 +1841,72 @@ blob_load_cpl_extents_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 
 			assert(spdk_blob_is_thin_provisioned(blob));
 			assert(i + 1 < blob->active.num_extent_pages || blob->remaining_clusters_in_et == 0);
-
-			// tmp = realloc(blob->active.clusters, blob->active.num_clusters * sizeof(*blob->active.clusters));
-			// if (tmp == NULL) {
-			// 	SPDK_ERRLOG("Cannot alloc memory for cluster array open blob.\n");
-			// 	blob_load_final(ctx, -ENOMEM);
-			// 	return;
-			// }
-			// memset(tmp + sizeof(*blob->active.clusters) * blob->active.cluster_array_size, 0,
-			//        sizeof(*blob->active.clusters) * (blob->active.num_clusters - blob->active.cluster_array_size));
-			// blob->active.clusters = tmp;
-			// blob->active.cluster_array_size = blob->active.num_clusters;
 		}
 	}
 
-	blob_load_backing_dev(seq, ctx);
+	if (ctx->next_extent_page < blob->active.num_extent_pages) {
+		blob_load_read_extents_partial(seq, ctx);
+	} else {
+		blob_load_backing_dev(seq, ctx);
+	}
+}
+
+static void
+blob_load_read_extents_partial(spdk_bs_sequence_t *seq, struct spdk_blob_load_ctx *ctx)
+{
+	struct spdk_blob		*blob = ctx->blob;
+	spdk_bs_batch_t			*batch;
+	uint64_t				i;
+	uint64_t				lba;
+
+	ctx->next_idx_page = 0;
+	batch = bs_sequence_to_batch(seq, blob_load_cpl_extents_cpl, ctx);
+
+	for (i = ctx->next_extent_page; i < blob->active.num_extent_pages; i++) {
+		if (blob->active.extent_pages[i] != 0) {
+			/* Extent page was allocated, read and parse it. */
+			lba = bs_md_page_to_lba(blob->bs, blob->active.extent_pages[i]);
+			blob->bs->r_io++;
+			bs_batch_read_dev(batch, &ctx->pages[ctx->next_idx_page], lba,
+				  bs_byte_to_lba(blob->bs, SPDK_BS_PAGE_SIZE));
+			ctx->next_idx_page++;
+			if (ctx->next_idx_page >= ctx->num_pages) {
+				break;
+			}
+		}
+	}
+
+	bs_batch_close(batch);
+}
+
+static void
+blob_load_prepare_extents_read(spdk_bs_sequence_t *seq, struct spdk_blob_load_ctx *ctx)
+{
+	struct spdk_blob		*blob = ctx->blob;
+	void					*tmp;
+	ctx->num_pages = spdk_min(blob->bs->pages_per_cluster,
+					blob->active.num_extent_pages);
+	/* First iteration of this function, allocate buffer for EXTENT_PAGES */
+	ctx->pages = spdk_zmalloc(ctx->num_pages * SPDK_BS_PAGE_SIZE, SPDK_BS_PAGE_SIZE,
+					NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+	if (!ctx->pages) {
+		SPDK_ERRLOG("Cannot alloc memory for extent page open blob 5.\n");
+		blob_load_final(ctx, -ENOMEM);
+		return;
+	}
+	
+	ctx->next_extent_page = 0;
+	tmp = realloc(blob->active.clusters, blob->remaining_clusters_in_et * sizeof(*blob->active.clusters));
+	if (tmp == NULL) {
+		SPDK_ERRLOG("Cannot alloc memory for cluster array open blob.\n");
+		blob_load_final(ctx, -ENOMEM);
+		return;
+	}
+	memset(tmp + sizeof(*blob->active.clusters) * blob->active.cluster_array_size, 0,
+			sizeof(*blob->active.clusters) * (blob->remaining_clusters_in_et - blob->active.cluster_array_size));
+	blob->active.clusters = tmp;
+	blob->active.cluster_array_size = blob->remaining_clusters_in_et;
+	blob_load_read_extents_partial(seq, ctx);
 }
 
 static void
@@ -1863,7 +1997,7 @@ blob_load_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	ctx->pages = NULL;
 
 	if (blob->extent_table_found) {
-		blob_load_cpl_extents_cpl(seq, ctx, 0);
+		blob_load_prepare_extents_read(seq, ctx);
 	} else {
 		blob_load_backing_dev(seq, ctx);
 	}
