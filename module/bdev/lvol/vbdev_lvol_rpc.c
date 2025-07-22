@@ -1747,7 +1747,9 @@ rpc_bdev_lvol_delete_cb(void *cb_arg, int lvolerrno)
 	return;
 
 invalid:
-	spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+	// spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+	// 				 spdk_strerror(-lvolerrno));
+		spdk_jsonrpc_send_error_response(request, lvolerrno,
 					 spdk_strerror(-lvolerrno));
 }
 

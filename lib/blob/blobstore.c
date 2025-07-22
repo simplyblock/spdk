@@ -1693,17 +1693,15 @@ blob_load_backing_dev(spdk_bs_sequence_t *seq, void *cb_arg)
 
 // 	if (ctx->pages == NULL) {
 // 		/* First iteration of this function, allocate buffer for single EXTENT_PAGE */
-// 		// ctx->pages = spdk_zmalloc(SPDK_BS_PAGE_SIZE, 0,
-// 		ctx->pages = spdk_zmalloc(blob->bs->pages_per_cluster * SPDK_BS_PAGE_SIZE, SPDK_BS_PAGE_SIZE,
+// 		ctx->pages = spdk_zmalloc(SPDK_BS_PAGE_SIZE, 0,
+// 		// ctx->pages = spdk_zmalloc(blob->bs->pages_per_cluster * SPDK_BS_PAGE_SIZE, SPDK_BS_PAGE_SIZE,
 // 					  NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);		
 // 		if (!ctx->pages) {
 // 			SPDK_ERRLOG("Cannot alloc memory for extent page open blob 5.\n");
 // 			blob_load_final(ctx, -ENOMEM);
 // 			return;
 // 		}
-// 		ctx->reset_buf = false;
-// 		ctx->num_pages = 1;
-// 		ctx->total_num_pages = blob->bs->pages_per_cluster;
+// 		ctx->num_pages = 1;		
 // 		ctx->next_extent_page = 0;
 // 		tmp = realloc(blob->active.clusters, blob->remaining_clusters_in_et * sizeof(*blob->active.clusters));
 // 		if (tmp == NULL) {
@@ -1715,7 +1713,6 @@ blob_load_backing_dev(spdk_bs_sequence_t *seq, void *cb_arg)
 // 				sizeof(*blob->active.clusters) * (blob->remaining_clusters_in_et - blob->active.cluster_array_size));
 // 		blob->active.clusters = tmp;
 // 		blob->active.cluster_array_size = blob->remaining_clusters_in_et;
-// 		batch = bs_sequence_to_batch(seq, blob_clear_clusters_async_cpl, blob);
 // 	} else {
 // 		page = &ctx->pages[0];
 // 		crc = blob_md_page_calc_crc(page);
@@ -1885,7 +1882,7 @@ blob_load_prepare_extents_read(spdk_bs_sequence_t *seq, struct spdk_blob_load_ct
 	struct spdk_blob		*blob = ctx->blob;
 	void					*tmp;
 	ctx->num_pages = spdk_min(blob->bs->pages_per_cluster,
-					blob->active.num_extent_pages);
+					spdk_max(blob->active.num_extent_pages, 1));
 	/* First iteration of this function, allocate buffer for EXTENT_PAGES */
 	ctx->pages = spdk_zmalloc(ctx->num_pages * SPDK_BS_PAGE_SIZE, SPDK_BS_PAGE_SIZE,
 					NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
