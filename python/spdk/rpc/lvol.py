@@ -540,6 +540,25 @@ def bdev_lvol_delete_lvstore(client, uuid=None, lvs_name=None):
         params['lvs_name'] = lvs_name
     return client.call('bdev_lvol_delete_lvstore', params)
 
+def bdev_lvol_cleanup_lvstore(client, uuid=None, lvs_name=None):
+    """Cleanup a logical volume store.
+
+    Args:
+        uuid: UUID of logical volume store to cleanup (optional)
+        lvs_name: name of logical volume store to cleanup (optional)
+
+    Either uuid or lvs_name must be specified, but not both.
+    """
+    if (uuid and lvs_name) or (not uuid and not lvs_name):
+        raise ValueError("Exactly one of uuid or lvs_name must be specified")
+
+    params = {}
+    if uuid:
+        params['uuid'] = uuid
+    if lvs_name:
+        params['lvs_name'] = lvs_name
+    return client.call('bdev_lvol_cleanup_lvstore', params)
+
 
 def bdev_lvol_get_lvstores(client, uuid=None, lvs_name=None):
     """List logical volume stores.

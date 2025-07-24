@@ -278,6 +278,7 @@ bool spdk_lvol_deletable(struct spdk_lvol *lvol);
  */
 void spdk_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg);
 void spdk_lvol_destroy_async(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg);
+void spdk_lvolsotre_cleanup(struct spdk_lvol_store *lvs, spdk_lvs_op_complete cb_fn, void *cb_arg);
 
 /**
  * Close lvol, but information is kept on lvolstore.

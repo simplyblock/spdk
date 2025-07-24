@@ -865,6 +865,8 @@ void spdk_bs_delete_blob(struct spdk_blob_store *bs, spdk_blob_id blobid,
 			 spdk_blob_op_complete cb_fn, void *cb_arg);
 void spdk_bs_delete_blob_async(struct spdk_blob_store *bs, struct spdk_blob *blob,
 		    spdk_blob_op_complete cb_fn, void *cb_arg);
+void spdk_bs_cleanup(struct spdk_blob_store *bs,
+		    spdk_bs_op_complete cb_fn, void *cb_arg);
 
 /**
  * Allocate all clusters in this blob. Data for allocated clusters is copied

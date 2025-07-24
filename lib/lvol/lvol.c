@@ -2098,6 +2098,59 @@ spdk_lvol_destroy_async(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, voi
 	lvol_update_async_delete(req->lvol, origlvol_update_delete_async_cpl, req);
 }
 
+static void
+lvolstore_cleanup_cb(void *cb_arg, int lvolerrno)
+{
+	struct spdk_lvs_req *req = cb_arg;
+	struct spdk_lvol_store *lvs = req->lvol_store;
+
+	if (lvolerrno < 0) {
+		SPDK_ERRLOG("Could not cleanup cluster for lvolstore name %s error %d.\n", lvs->name, lvolerrno);
+	} else {
+		SPDK_NOTICELOG("Lvolstore name %s cleanup clusters done.\n", lvs->name);
+	}
+
+	free(req);
+	return;
+}
+
+void
+spdk_lvolsotre_cleanup(struct spdk_lvol_store *lvs, spdk_lvs_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_blob_store *bs = lvs->blobstore;
+	struct spdk_lvs_req *req;
+
+	assert(cb_fn != NULL);
+
+	if (lvs == NULL) {
+		SPDK_ERRLOG("lvolstore does not exist\n");
+		cb_fn(cb_arg, -ENODEV);
+		return;
+	}
+
+	req = calloc(1, sizeof(*req));
+	if (req == NULL) {
+		SPDK_ERRLOG("Cannot alloc memory for request structure\n");
+		if (cb_fn) {
+			cb_fn(cb_arg, -ENOMEM);
+		}
+		return;
+	}
+
+	req->lvol_store = lvs;
+
+	if (!lvs->leader) {
+		SPDK_ERRLOG("lvolstore name %s: cannot destroy: due to leadership change.\n", lvs->name);
+		cb_fn(cb_arg, ERR_LEADERSHIP_CHANGED);
+		free(req);
+		return;
+	}
+
+	SPDK_NOTICELOG("Cleanup clusters for lvolstore name %s start.\n", lvs->name);
+	spdk_bs_cleanup(bs, lvolstore_cleanup_cb, req);
+	cb_fn(cb_arg, 0);
+}
+
 void
 spdk_lvol_close(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg)
 {
