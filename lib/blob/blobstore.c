@@ -3724,11 +3724,13 @@ blob_request_submit_op(struct spdk_blob *blob, struct spdk_io_channel *_channel,
 		(op_type == SPDK_BLOB_WRITE || op_type == SPDK_BLOB_WRITE_ZEROES)) {
 		// SPDK_NOTICELOG("FAILED IO on update filed condition.\n");
 		cb_fn(cb_arg, -EIO);
+		return;
 	}
 
 	if (blob->failed_on_update) {
 		SPDK_NOTICELOG("FAILED IO on update filed condition.\n");
 		cb_fn(cb_arg, -EIO);
+		return;
 	}
 
 	if (offset + length > bs_cluster_to_lba(blob->bs, blob->active.num_clusters)) {
@@ -3861,11 +3863,13 @@ blob_request_submit_rw_iov(struct spdk_blob *blob, struct spdk_io_channel *_chan
 
 	if (blob->bs->read_only && !read) {
 		cb_fn(cb_arg, -EIO);
+		return;
 	}
 
 	if (blob->failed_on_update) {
 		SPDK_NOTICELOG("FAILED IO on update filed condition \n");
 		cb_fn(cb_arg, -EIO);
+		return;
 	}
 
 	if (offset + length > bs_cluster_to_lba(blob->bs, blob->active.num_clusters)) {
@@ -11597,6 +11601,177 @@ spdk_sub_stat_ext(struct spdk_io_channel *channel)
 	struct spdk_bs_channel *bs_channel = spdk_io_channel_get_ctx(channel);
 	bs_channel->current_io--;
 }
+
+/* START cleanup lvolstore from garbage */
+struct cleanup_bs_ctx {
+	struct spdk_blob_store *bs;
+	uint32_t clusters[4096];
+	uint32_t num_clusters;
+	uint32_t clusters_idx;
+	spdk_bs_sequence_t	*seq;
+};
+
+static void bs_cleanup_find_unallocate_clusters(struct cleanup_bs_ctx *ctx);
+
+static void
+bs_cleanup_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct cleanup_bs_ctx *ctx = cb_arg;
+
+	if (bserrno != 0) {
+		SPDK_ERRLOG("Failed to cleanup blobstore %d.\n", bserrno);
+	}
+
+	bs_sequence_finish(seq, bserrno);
+	free(ctx);
+}
+
+static void
+bs_release_allocated_clusters(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct cleanup_bs_ctx *ctx = cb_arg;
+	struct spdk_blob_store		*bs = ctx->bs;
+	size_t				i;
+
+	spdk_spin_lock(&bs->used_lock);
+	/* Release all clusters that were truncated */
+	for (i = 0; i < ctx->num_clusters; i++) {
+		bs_release_cluster(bs,  ctx->clusters[i]);
+		ctx->clusters[i] = 0;
+	}
+	spdk_spin_unlock(&bs->used_lock);
+
+	if (bserrno != 0) {
+		bs_cleanup_cpl(seq, ctx, bserrno);
+		return;
+	}
+
+	if (!bs->is_leader) {
+		SPDK_ERRLOG("Failed to cleanup blobstore: due to leadership change.\n");
+		bs_cleanup_cpl(seq, ctx, ERR_LEADERSHIP_CHANGED);
+		return;
+	}
+
+	if (ctx->clusters_idx < spdk_bit_pool_capacity(bs->used_clusters)) {
+		bs_cleanup_find_unallocate_clusters(ctx);
+		return;
+	}
+
+	SPDK_NOTICELOG("cleanup blobstore done.\n");
+	bs_cleanup_cpl(seq, ctx, 0);
+}
+
+static void
+bs_cleanup_allocated_clusters(struct cleanup_bs_ctx *ctx)
+{
+	struct spdk_blob_store		*bs = ctx->bs;
+	spdk_bs_batch_t			*batch;
+	size_t				i;
+	uint64_t			lba;
+	uint64_t			lba_count;
+
+	batch = bs_sequence_to_batch(ctx->seq, bs_release_allocated_clusters, ctx);
+	batch->u.batch.is_unmap = true;	
+	/* Clear all clusters that were truncated */
+	lba = 0;
+	lba_count = 0;
+	for (i = 0; i < ctx->num_clusters; i++) {
+		uint64_t next_lba = bs_cluster_to_lba(bs, ctx->clusters[i]);
+		uint64_t next_lba_count = bs_cluster_to_lba(bs, 1);
+
+		if (next_lba > 0 && (lba + lba_count) == next_lba && lba_count < 2048) {
+			/* This cluster is contiguous with the previous one. */
+			lba_count += next_lba_count;
+			continue;
+		} else if (next_lba == 0) {
+			continue;
+		}
+
+		/* This cluster is not contiguous with the previous one. */
+
+		/* If a run of LBAs previously existing, clear them now */
+		if (lba_count > 0) {
+			bs_batch_unmap_dev(batch, lba, lba_count);
+		}
+
+		/* Start building the next batch */
+		lba = next_lba;
+		if (next_lba > 0) {
+			lba_count = next_lba_count;
+		} else {
+			lba_count = 0;
+		}
+	}
+
+	/* If we ended with a contiguous set of LBAs, clear them now */
+	if (lba_count > 0) {
+		bs_batch_unmap_dev(batch, lba, lba_count);
+	}
+
+	bs_batch_close(batch);
+
+}
+
+static void
+bs_cleanup_find_unallocate_clusters(struct cleanup_bs_ctx *ctx)
+{
+	struct spdk_blob_store *bs = ctx->bs;
+	uint32_t i, total_clusters;
+
+	ctx->num_clusters = 0;
+	total_clusters = spdk_bit_pool_capacity(bs->used_clusters);
+
+	spdk_spin_lock(&bs->used_lock);
+
+	for (i = ctx->clusters_idx; i < total_clusters && ctx->num_clusters < 4096; i++) {
+		if (!spdk_bit_pool_is_allocated(bs->used_clusters, i)) {
+			ctx->clusters[ctx->num_clusters++] = i;
+			spdk_bit_pool_allocate_specific_bit(bs->used_clusters, i);
+			bs->num_free_clusters --;
+		}
+	}
+
+	spdk_spin_unlock(&bs->used_lock);
+
+	ctx->clusters_idx = i;
+	bs_cleanup_allocated_clusters(ctx);
+}
+
+void
+spdk_bs_cleanup(struct spdk_blob_store *bs, 
+		    spdk_bs_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_bs_cpl	cpl;
+	spdk_bs_sequence_t	*seq;
+	struct cleanup_bs_ctx *ctx;
+
+	assert(spdk_get_thread() == bs->md_thread);
+
+	cpl.type = SPDK_BS_CPL_TYPE_BLOB_BASIC;
+	cpl.u.blob_basic.cb_fn = cb_fn;
+	cpl.u.blob_basic.cb_arg = cb_arg;
+
+	seq = bs_sequence_start_bs(bs->md_channel, &cpl);
+	if (!seq) {
+		SPDK_ERRLOG("Cannot allocate seq cleanup blobstore.\n");
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL) {
+		SPDK_ERRLOG("Cannot allocate ctx cleanup blobstore.\n");
+		bs_sequence_finish(seq, -ENOMEM);
+		return;
+	}
+
+	ctx->seq = seq;
+	ctx->bs = bs;
+	ctx->clusters_idx = 0;
+	SPDK_NOTICELOG("Deleting garbage clusters for blobstore start.\n");
+	bs_cleanup_find_unallocate_clusters(ctx);
+}
+/* END cleanup lvolstore from garbage*/
 
 void
 spdk_blob_io_readv_ext(struct spdk_blob *blob, struct spdk_io_channel *channel,
