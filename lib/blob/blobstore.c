@@ -5917,7 +5917,8 @@ bs_load_cur_extent_page_valid(struct spdk_blob_md_page *page)
 	size_t desc_len;
 
 	crc = blob_md_page_calc_crc(page);
-	if (crc != page->crc) {		
+	if (crc != page->crc) {
+		SPDK_ERRLOG("Extent page crc mismmatch.1.\n");
 		return false;
 	}
 
@@ -13796,7 +13797,8 @@ bs_update_replay_extent_page_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bser
 		/* Extent pages are only read when present within in chain md.
 		 * Integrity of md is not right if that page was not a valid extent page. */
 		if (bs_load_cur_extent_page_valid(&ctx->extent_pages[i]) != true) {
-			SPDK_ERRLOG("Extent page is not valid.\n");
+			uint64_t lba = bs_md_page_to_lba(ctx->bs, ctx->extent_page_num[i]);
+			SPDK_ERRLOG("Extent page %" PRIu64 " is not valid.\n", lba);
 			bs_update_live_done(ctx, -EILSEQ);
 			return;
 		}
@@ -14058,7 +14060,7 @@ bs_update_super_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	ctx->bs->used_cluster_mask_len = ctx->super->used_cluster_mask_len;
 	
 	if (!ctx->failover && ctx->new_blobid) {
-		SPDK_NOTICELOG("Loading blob from base dev with blobid %" PRIu64 "\n", ctx->new_blobid);
+		SPDK_NOTICELOG("Loading blob from base dev with blobid %" PRIu64 " at lba %" PRIu64 "\n", ctx->new_blobid, bs_md_page_to_lba(ctx->bs, ctx->new_blobid));
 		bs_recover_on_update(ctx);
 		return;
 	}
