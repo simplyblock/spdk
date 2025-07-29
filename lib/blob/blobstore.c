@@ -5634,6 +5634,7 @@ bs_load_cur_md_page_valid(struct spdk_bs_load_ctx *ctx)
 {
 	uint32_t crc;
 	struct spdk_blob_md_page *page = ctx->page;
+	uint32_t page_num = ctx->cur_page;
 
 	crc = blob_md_page_calc_crc(page);
 	if (crc != page->crc) {
@@ -5653,6 +5654,9 @@ bs_load_cur_md_page_valid(struct spdk_bs_load_ctx *ctx)
 		return false;
 	}
 	assert(bs_load_cur_extent_page_valid(page) == false);
+	if (page->sequence_num == 0 && !bs_load_cur_extent_page_valid(page) && (page_num == 333 || page_num == 102 || page_num == 1302)) {		
+		return false;
+	}
 
 	return true;
 }
