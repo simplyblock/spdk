@@ -142,7 +142,7 @@ rpc_bdev_lvol_create_lvstore(struct spdk_jsonrpc_request *request,
 		clear_method = LVS_CLEAR_WITH_UNMAP;
 	}
 	req.not_evict_lvstore_md_pages = true;
-
+	if (req.disaster_recovery) { SPDK_NOTICELOG("Calling lvstore creation API in disaster recovery mode\n"); }
 	rc = vbdev_lvs_create(req.bdev_name, req.lvs_name, req.cluster_sz, clear_method,
 			      req.num_md_pages_per_cluster_ratio, req.not_evict_lvstore_md_pages, req.disaster_recovery,
 				  rpc_lvol_store_construct_cb, request);

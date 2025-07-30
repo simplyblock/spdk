@@ -399,7 +399,12 @@ vbdev_lvs_create(const char *base_bdev_name, const char *name, uint32_t cluster_
 	lvs_req->cb_arg = cb_arg;
 	lvs_req->not_evict_lvstore_md_pages = not_evict_lvstore_md_pages;
 
-	rc = spdk_lvs_init(bs_dev, &opts, _vbdev_lvs_create_cb, lvs_req);
+	SPDK_NOTICELOG("Creating new lvstore, disaster_recovery=%d\n", disaster_recovery);
+	if (!disaster_recovery) {
+		rc = spdk_lvs_init(bs_dev, &opts, _vbdev_lvs_create_cb, lvs_req);
+	} else {
+		rc = spdk_lvs_init_persistent(bs_dev, &opts, _vbdev_lvs_create_cb, lvs_req);
+	}
 	if (rc < 0) {
 		free(lvs_req);
 		bs_dev->destroy(bs_dev);
@@ -1933,7 +1938,8 @@ _vbdev_lvol_create_cb(void *cb_arg, struct spdk_lvol *lvol, int lvolerrno)
 	if (lvolerrno < 0) {
 		goto end;
 	}
-
+	// recovered snapshot lvol should require synchronous fetches on reads by default
+	req->tiering_info = req->is_recovery ? SYNC_FETCH_BIT : req->tiering_info;
 	vbdev_lvol_set_tiering_info(lvol, req->tiering_info);
 	lvol->priority_class = req->lvol_priority_class;
 	vbdev_lvol_set_io_priority_class(lvol);

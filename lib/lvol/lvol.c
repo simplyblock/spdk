@@ -1320,6 +1320,7 @@ lvs_verify_lvol_name(struct spdk_lvol_store *lvs, const char *name)
 
 	if (name == NULL || strnlen(name, SPDK_LVOL_NAME_MAX) == 0) {
 		SPDK_INFOLOG(lvol, "lvol name not provided.\n");
+		fprintf(stderr, "lvol name not provided.\n");
 		return -EINVAL;
 	}
 

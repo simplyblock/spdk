@@ -136,6 +136,7 @@ bs_sequence_start_blob(struct spdk_io_channel *_channel, struct spdk_bs_cpl *cpl
 	spdk_bs_sequence_t *seq = bs_sequence_start(_channel, cpl, esnap_ch);
 	if (seq) {
 		seq->priority_class = blob->priority_class; // set here if blobstore priority is different from this specific blob's priority
+		seq->tiering_bits |= blob->tiering_bits;
 	}
 	return seq;
 }
@@ -186,7 +187,23 @@ bs_sequence_read_dev(spdk_bs_sequence_t *seq, void *payload,
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
 
-	channel->dev->read(channel->dev, channel->dev_channel, payload, lba, lba_count, &set->cb_args);
+	const int priority_class = set->priority_class;
+	const uint8_t tiering_bits = set->tiering_bits;
+
+	const uint64_t priority_lba = (((uint64_t)(priority_class)) << PRIORITY_CLASS_BITS_POS) | lba;
+	uint64_t meta_lba = priority_lba;
+
+	if (!(tiering_bits & TIERED_BIT)) {
+		meta_lba |= (tiering_bits & SYNC_FETCH_BIT) ? SYNC_FETCH_MASK : 0; // read may require sync fetch
+		meta_lba |= (tiering_bits & METADATA_PAGE_BIT) ? METADATA_PAGE_MASK : 0;
+	} else 
+	{
+		meta_lba |= TIERED_IO_MASK;
+
+		meta_lba |= tiering_bits & FORCE_FETCH_BIT ? FORCE_FETCH_MASK : 0; // tiered read may be a force fetch
+	}
+
+	channel->dev->read(channel->dev, channel->dev_channel, payload, meta_lba, lba_count, &set->cb_args);
 }
 
 void
@@ -203,7 +220,27 @@ bs_sequence_write_dev(spdk_bs_sequence_t *seq, void *payload,
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
 
-	channel->dev->write(channel->dev, channel->dev_channel, payload, lba, lba_count,
+	const int priority_class = set->priority_class;
+	const uint8_t tiering_bits = set->tiering_bits;
+
+	const uint64_t priority_lba = (((uint64_t)(priority_class)) << PRIORITY_CLASS_BITS_POS) | lba;
+	uint64_t meta_lba = priority_lba;
+
+	if (!(tiering_bits & TIERED_BIT)) {
+		if (!(tiering_bits & METADATA_PAGE_BIT)) {
+
+		} else 
+		{
+			meta_lba |= METADATA_PAGE_MASK;
+		}
+	} else 
+	{
+		meta_lba |= TIERED_IO_MASK;
+
+		meta_lba |= tiering_bits & FLUSH_MODE_BIT ? FLUSH_MODE_MASK : 0; // tiered write may be a pure flush
+	}
+
+	channel->dev->write(channel->dev, channel->dev_channel, payload, meta_lba, lba_count,
 			    &set->cb_args);
 }
 
@@ -395,33 +432,26 @@ bs_batch_completion(struct spdk_io_channel *_channel,
 			ctx = TAILQ_FIRST(&set->u.batch.unmap_queue);
 			assert(ctx != NULL);
 			TAILQ_REMOVE(&set->u.batch.unmap_queue, ctx, entries); // Remove it from the queue.			
-			if (spdk_likely(channel->bs->is_leader)) {
-				const int priority_class = set->priority_class;
-				const uint8_t tiering_bits = set->tiering_bits;
-	
-				const uint64_t priority_lba = (((uint64_t)(priority_class)) << PRIORITY_CLASS_BITS_POS) | ctx->lba;
-				uint64_t meta_lba = priority_lba;
-	
-				if (!(tiering_bits & TIERED_BIT)) {
-					if (!(tiering_bits & METADATA_PAGE_BIT)) {
-	
-					} else 
-					{
-						meta_lba |= METADATA_PAGE_MASK;
-					}
+			const int priority_class = set->priority_class;
+			const uint8_t tiering_bits = set->tiering_bits;
+
+			const uint64_t priority_lba = (((uint64_t)(priority_class)) << PRIORITY_CLASS_BITS_POS) | ctx->lba;
+			uint64_t meta_lba = priority_lba;
+
+			if (!(tiering_bits & TIERED_BIT)) {
+				if (!(tiering_bits & METADATA_PAGE_BIT)) {
+
 				} else 
 				{
-					meta_lba |= TIERED_IO_MASK;
+					meta_lba |= METADATA_PAGE_MASK;
 				}
-	
-				if (spdk_likely(channel->bs->is_leader)) {
-					channel->dev->unmap(channel->dev, channel->dev_channel, meta_lba, ctx->lba_count,
-							&set->cb_args);
-				} else {
-					SPDK_NOTICELOG("The unmap IO return with EIO error due to leader.\n");
-					bs_batch_completion(_channel, set->cb_args.cb_arg, -EIO);
-				}
-				channel->dev->unmap(channel->dev, channel->dev_channel, ctx->lba, ctx->lba_count,
+			} else 
+			{
+				meta_lba |= TIERED_IO_MASK;
+			}
+
+			if (spdk_likely(channel->bs->is_leader)) {
+				channel->dev->unmap(channel->dev, channel->dev_channel, meta_lba, ctx->lba_count,
 						&set->cb_args);
 			} else {
 				SPDK_NOTICELOG("The unmap IO return with EIO error due to leader.\n");
@@ -509,7 +539,7 @@ bs_batch_read_bs_dev(spdk_bs_batch_t *batch, struct spdk_bs_dev *bs_dev,
 
 		meta_lba |= tiering_bits & FORCE_FETCH_BIT ? FORCE_FETCH_MASK : 0; // tiered read may be a force fetch
 	}
-	bs_dev->read(bs_dev, back_channel, payload, lba, lba_count, &set->cb_args);
+	bs_dev->read(bs_dev, back_channel, payload, meta_lba, lba_count, &set->cb_args);
 }
 
 void
@@ -618,7 +648,7 @@ out:
 		{
 			meta_lba |= TIERED_IO_MASK;
 		}
-		channel->dev->unmap(channel->dev, channel->dev_channel, lba, lba_count,
+		channel->dev->unmap(channel->dev, channel->dev_channel, meta_lba, lba_count,
 					&set->cb_args);
 	} else {
 		SPDK_NOTICELOG("The unmap IO return with EIO error due to leader 1.\n");

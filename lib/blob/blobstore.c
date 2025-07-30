@@ -11907,6 +11907,7 @@ void
 spdk_blob_io_unmap(struct spdk_blob *blob, struct spdk_io_channel *channel,
 		   uint64_t offset, uint64_t length, spdk_blob_op_complete cb_fn, void *cb_arg)
 {
+	offset &= ~LBA_METADATA_BITS_MASK;
 	blob_request_submit_op(blob, channel, NULL, offset, length, cb_fn, cb_arg,
 			       SPDK_BLOB_UNMAP);
 }
@@ -11915,6 +11916,7 @@ void
 spdk_blob_io_write_zeroes(struct spdk_blob *blob, struct spdk_io_channel *channel,
 			  uint64_t offset, uint64_t length, spdk_blob_op_complete cb_fn, void *cb_arg)
 {
+	offset &= ~LBA_METADATA_BITS_MASK;
 	blob_request_submit_op(blob, channel, NULL, offset, length, cb_fn, cb_arg,
 			       SPDK_BLOB_WRITE_ZEROES);
 }
@@ -11924,6 +11926,7 @@ spdk_blob_io_write(struct spdk_blob *blob, struct spdk_io_channel *channel,
 		   void *payload, uint64_t offset, uint64_t length,
 		   spdk_blob_op_complete cb_fn, void *cb_arg)
 {
+	offset &= ~LBA_METADATA_BITS_MASK;
 	blob_request_submit_op(blob, channel, payload, offset, length, cb_fn, cb_arg,
 			       SPDK_BLOB_WRITE);
 }
@@ -11933,6 +11936,7 @@ spdk_blob_io_read(struct spdk_blob *blob, struct spdk_io_channel *channel,
 		  void *payload, uint64_t offset, uint64_t length,
 		  spdk_blob_op_complete cb_fn, void *cb_arg)
 {
+	offset &= ~LBA_METADATA_BITS_MASK;
 	blob_request_submit_op(blob, channel, payload, offset, length, cb_fn, cb_arg,
 			       SPDK_BLOB_READ);
 }
@@ -11942,6 +11946,7 @@ spdk_blob_io_writev(struct spdk_blob *blob, struct spdk_io_channel *channel,
 		    struct iovec *iov, int iovcnt, uint64_t offset, uint64_t length,
 		    spdk_blob_op_complete cb_fn, void *cb_arg)
 {
+	offset &= ~LBA_METADATA_BITS_MASK;
 	blob_request_submit_rw_iov(blob, channel, iov, iovcnt, offset, length, cb_fn, cb_arg, false, NULL);
 }
 
@@ -11950,6 +11955,7 @@ spdk_blob_io_readv(struct spdk_blob *blob, struct spdk_io_channel *channel,
 		   struct iovec *iov, int iovcnt, uint64_t offset, uint64_t length,
 		   spdk_blob_op_complete cb_fn, void *cb_arg)
 {
+	offset &= ~LBA_METADATA_BITS_MASK;
 	blob_request_submit_rw_iov(blob, channel, iov, iovcnt, offset, length, cb_fn, cb_arg, true, NULL);
 }
 
@@ -11958,6 +11964,7 @@ spdk_blob_io_writev_ext(struct spdk_blob *blob, struct spdk_io_channel *channel,
 			struct iovec *iov, int iovcnt, uint64_t offset, uint64_t length,
 			spdk_blob_op_complete cb_fn, void *cb_arg, struct spdk_blob_ext_io_opts *io_opts)
 {
+	offset &= ~LBA_METADATA_BITS_MASK;
 	blob_request_submit_rw_iov(blob, channel, iov, iovcnt, offset, length, cb_fn, cb_arg, false,
 				   io_opts);
 }
@@ -11982,6 +11989,7 @@ spdk_blob_io_readv_ext(struct spdk_blob *blob, struct spdk_io_channel *channel,
 		       struct iovec *iov, int iovcnt, uint64_t offset, uint64_t length,
 		       spdk_blob_op_complete cb_fn, void *cb_arg, struct spdk_blob_ext_io_opts *io_opts)
 {
+	offset &= ~LBA_METADATA_BITS_MASK;
 	blob_request_submit_rw_iov(blob, channel, iov, iovcnt, offset, length, cb_fn, cb_arg, true,
 				   io_opts);
 }
