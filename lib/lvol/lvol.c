@@ -1536,7 +1536,16 @@ spdk_lvol_create_snapshot(struct spdk_lvol *origlvol, const char *snapshot_name,
 	req->cb_fn = cb_fn;
 	req->cb_arg = cb_arg;
 
-	req->frozen_refcnt = blob_freeze(origblob);
+	rc = blob_freeze(origblob);
+	if (rc < 0) {
+		SPDK_ERRLOG("Cannot freeze blob for snapshot creation\n");
+		cb_fn(cb_arg, NULL, rc);
+		lvol_free(req->lvol);
+		free(req);
+		return;
+	}
+	req->frozen_refcnt = rc;
+
 	// TODO: Consider taking the delay value from RPC; it might be better.
 	req->poller = spdk_poller_register(spdk_lvol_create_snapshot_poller, req, 50000); // Delay of 50ms	
 }
