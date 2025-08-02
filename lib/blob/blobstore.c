@@ -8676,17 +8676,57 @@ spdk_bs_create_snapshot(struct spdk_blob_store *bs, spdk_blob_id blobid,
 	spdk_bs_open_blob(bs, ctx->original.id, bs_snapshot_origblob_open_cpl, ctx);
 }
 
-int
-blob_freeze(struct spdk_blob *blob)
+struct create_snapshot_ctx {
+	struct spdk_blob	*blob;	
+	spdk_blob_op_complete	cb_fn;
+	void			*cb_arg;
+	int			bserrno;
+};
+
+static void
+blob_freeze_cpl_cb(void *cb_arg, int bserrno)
 {
+	struct create_snapshot_ctx *ctx = cb_arg;
+	int rc = 0;
+	/* Freeze I/O on blob for create snapshot */
+	if (bserrno < 0) {
+		rc = bserrno;
+	} else {
+		rc = ctx->blob->frozen_refcnt;
+	}
+
+	ctx->cb_fn(ctx->cb_arg, rc);
+	free(ctx);
+	return;
+}
+
+void
+spdk_snapshot_freeze_blob(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	struct create_snapshot_ctx	*ctx;
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL) {
+		SPDK_ERRLOG("blob 0x%" PRIx64 ": out of memory while creating snapshot\n", blob->id);
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+
+	ctx->cb_fn = cb_fn;
+	ctx->cb_arg = cb_arg;
+	ctx->blob = blob;
+
 	/* Freeze I/O on blob for create snapshot */
 	if (blob->locked_operation_in_progress) {
-		SPDK_ERRLOG("Cannot create snapshot - another operation in progress.\n");		
-		return -EBUSY;
+		SPDK_ERRLOG("Cannot create snapshot - another operation in progress.\n");
+		free(ctx);
+		cb_fn(cb_arg, -EBUSY);
+		return;
 	}
 
 	blob->locked_operation_in_progress = true;
-	return blob->frozen_refcnt++;
+	blob_freeze_io(blob, blob_freeze_cpl_cb, ctx);
+	return;
 }
 
 int

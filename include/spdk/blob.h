@@ -389,7 +389,7 @@ void spdk_bs_update_live(struct spdk_blob_store *bs, bool failover, uint64_t id,
 void spdk_blob_failover_unfreaze(struct spdk_blob *blob, 
 				spdk_blob_op_complete cb_fn, void *cb_arg);
 
-int blob_freeze(struct spdk_blob *blob);
+void spdk_snapshot_freeze_blob(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
 int spdk_blob_get_freeze_cnt(struct spdk_blob *blob);
 
 void spdk_blob_unfreeze_cleanup(struct spdk_blob *blob,
