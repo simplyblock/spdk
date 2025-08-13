@@ -3816,8 +3816,14 @@ blob_request_submit_op_single(struct spdk_io_channel *_ch, struct spdk_blob *blo
 
 		batch = bs_batch_open(_ch, &cpl, blob);
 		if (!batch) {
+			if (ctx != NULL) {
+				assert(ctx->seq != NULL);
+				/* Finish the sequence allocated for metadata update */
+				bs_sequence_finish(ctx->seq, -ENOMEM);
+			} else {
+				cb_fn(cb_arg, -ENOMEM);
+			}
 			free(ctx);
-			cb_fn(cb_arg, -ENOMEM);
 			return;
 		}
 
@@ -4499,6 +4505,7 @@ struct spdk_bs_load_ctx {
 	struct spdk_blob			*blob;
 	struct spdk_blob			*clone;
 	spdk_blob_id				blobid;
+	uint32_t			idx_dump;
 
 	bool					force_recover;
 
@@ -6730,10 +6737,9 @@ bs_dump_print_extent_table(struct spdk_bs_load_ctx *ctx, struct spdk_blob_md_des
 }
 
 static void
-bs_dump_print_md_page(struct spdk_bs_load_ctx *ctx)
+bs_dump_print_md_page(struct spdk_bs_load_ctx *ctx, struct spdk_blob_md_page *page)
 {
 	uint32_t page_idx = ctx->cur_page;
-	struct spdk_blob_md_page *page = ctx->page;
 	struct spdk_blob_md_descriptor *desc;
 	size_t cur_desc = 0;
 	uint32_t crc;
@@ -6837,11 +6843,14 @@ bs_dump_read_md_page_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		return;
 	}
 
-	if (ctx->page->id != 0) {
-		bs_dump_print_md_page(ctx);
+	for(uint32_t i = 0; i < ctx->idx_dump; i++) {
+		if (ctx->page[i].id != 0) {
+			bs_dump_print_md_page(ctx, &ctx->page[i]);
+		}
+
+		ctx->cur_page++;
 	}
 
-	ctx->cur_page++;
 
 	if (ctx->cur_page < ctx->super->md_len) {
 		bs_dump_read_md_page(seq, ctx);
@@ -6858,12 +6867,21 @@ bs_dump_read_md_page(spdk_bs_sequence_t *seq, void *cb_arg)
 	struct spdk_bs_load_ctx *ctx = cb_arg;
 	uint64_t lba;
 
-	assert(ctx->cur_page < ctx->super->md_len);
-	lba = bs_page_to_lba(ctx->bs, ctx->super->md_start + ctx->cur_page);
-	ctx->bs->r_io++;
-	bs_sequence_read_dev(seq, ctx->page, lba,
-			     bs_byte_to_lba(ctx->bs, SPDK_BS_PAGE_SIZE),
-			     bs_dump_read_md_page_cpl, ctx);
+	struct spdk_blob_store		*bs = ctx->bs;
+	spdk_bs_batch_t			*batch;
+	size_t				i;
+
+	batch = bs_sequence_to_batch(seq, bs_dump_read_md_page_cpl, ctx);
+	ctx->idx_dump = 0;
+	i = ctx->cur_page;
+	for (i = 0; ctx->idx_dump < 2048 && i < ctx->super->md_len; i++) {
+		assert(ctx->cur_page < ctx->super->md_len);
+		lba = bs_page_to_lba(bs, ctx->super->md_start + i);
+		ctx->bs->r_io++;
+		bs_batch_read_dev(seq, &ctx->page[ctx->idx_dump++], lba,
+					bs_byte_to_lba(bs, SPDK_BS_PAGE_SIZE));
+	}
+	bs_batch_close(batch);
 }
 
 static void
@@ -6965,7 +6983,9 @@ bs_dump_super_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	fprintf(ctx->fp, "Metadata Length: %" PRIu32 "\n", ctx->super->md_len);
 
 	ctx->cur_page = 0;
-	ctx->page = spdk_zmalloc(SPDK_BS_PAGE_SIZE, 0,
+	// ctx->page = spdk_zmalloc(SPDK_BS_PAGE_SIZE, 0,
+	// 			 NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+	ctx->page = spdk_zmalloc(2048 * SPDK_BS_PAGE_SIZE, SPDK_BS_PAGE_SIZE,
 				 NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
 	if (!ctx->page) {
 		bs_dump_finish(seq, ctx, -ENOMEM);
