@@ -6847,10 +6847,8 @@ bs_dump_read_md_page_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		if (ctx->page[i].id != 0) {
 			bs_dump_print_md_page(ctx, &ctx->page[i]);
 		}
-
 		ctx->cur_page++;
 	}
-
 
 	if (ctx->cur_page < ctx->super->md_len) {
 		bs_dump_read_md_page(seq, ctx);
@@ -6874,7 +6872,7 @@ bs_dump_read_md_page(spdk_bs_sequence_t *seq, void *cb_arg)
 	batch = bs_sequence_to_batch(seq, bs_dump_read_md_page_cpl, ctx);
 	ctx->idx_dump = 0;
 	i = ctx->cur_page;
-	for (i = 0; ctx->idx_dump < 2048 && i < ctx->super->md_len; i++) {
+	for (i = 0; ctx->idx_dump < 4096 && i < ctx->super->md_len; i++) {
 		assert(ctx->cur_page < ctx->super->md_len);
 		lba = bs_page_to_lba(bs, ctx->super->md_start + i);
 		ctx->bs->r_io++;
@@ -6985,7 +6983,7 @@ bs_dump_super_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	ctx->cur_page = 0;
 	// ctx->page = spdk_zmalloc(SPDK_BS_PAGE_SIZE, 0,
 	// 			 NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
-	ctx->page = spdk_zmalloc(2048 * SPDK_BS_PAGE_SIZE, SPDK_BS_PAGE_SIZE,
+	ctx->page = spdk_zmalloc(4096 * SPDK_BS_PAGE_SIZE, SPDK_BS_PAGE_SIZE,
 				 NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
 	if (!ctx->page) {
 		bs_dump_finish(seq, ctx, -ENOMEM);
@@ -8710,6 +8708,7 @@ blob_freeze_cpl_cb(void *cb_arg, int bserrno)
 	int rc = 0;
 	/* Freeze I/O on blob for create snapshot */
 	if (bserrno < 0) {
+		ctx->blob->locked_operation_in_progress = false;
 		rc = bserrno;
 	} else {
 		rc = ctx->blob->frozen_refcnt;
@@ -9879,11 +9878,6 @@ spdk_blob_unfreeze_cleanup(struct spdk_blob *blob, spdk_blob_op_with_id_complete
 	blob_verify_md_op(blob);
 
 	SPDK_NOTICELOG("Unfreezing IOs in blob 0x%" PRIx64 " due to losing leadership.\n", blob->id);
-
-	if (blob->locked_operation_in_progress) {
-		cb_fn(cb_arg, 0, -EBUSY);
-		return;
-	}
 
 	ctx = calloc(1, sizeof(*ctx));
 	if (!ctx) {
