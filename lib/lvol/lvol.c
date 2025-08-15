@@ -1491,8 +1491,9 @@ spdk_create_snapshot_freez_cpl(void *cb_arg, int lvolerrno) {
 	struct spdk_lvol_with_handle_req *req = cb_arg;
 	if (lvolerrno < 0) {
 		SPDK_ERRLOG("Cannot freeze blob for snapshot creation.\n");
-		req->cb_fn(req->cb_arg, NULL, lvolerrno);
+		TAILQ_REMOVE(&req->lvol->lvol_store->pending_lvols, req->lvol, link);
 		lvol_free(req->lvol);
+		req->cb_fn(req->cb_arg, NULL, lvolerrno);
 		free(req);
 		return;
 	}
