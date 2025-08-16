@@ -27,7 +27,7 @@
 
 #define NVMF_CTRLR_RESET_SHN_TIMEOUT_IN_MS	(NVMF_CC_RESET_SHN_TIMEOUT_IN_MS + 5000)
 
-#define DUPLICATE_QID_RETRY_US 1000
+#define DUPLICATE_QID_RETRY_US 100000
 
 /*
  * Report the SPDK version as the firmware revision.
@@ -295,8 +295,12 @@ nvmf_ctrlr_add_qpair(struct spdk_nvmf_qpair *qpair,
 			qpair->ctrlr = NULL;
 			spdk_nvmf_request_complete(req);
 		} else {
-			SPDK_WARNLOG("Duplicate QID detected (cntlid:%u, qid:%u), re-check in %dus\n",
-				     ctrlr->cntlid, qpair->qid, DUPLICATE_QID_RETRY_US);
+			if (strstr(ctrlr->subsys->subnqn, "vm") != NULL) {
+				uint32_t count = spdk_bit_array_count_set(ctrlr->qpair_mask);
+				SPDK_NOTICELOG("ctrlr %p active queue count %u\n", ctrlr, count);
+			}
+			SPDK_WARNLOG("Duplicate QID detected (cntlid:%u, qid:%u), re-check in %d us on subsystem %s\n",
+				     ctrlr->cntlid, qpair->qid, DUPLICATE_QID_RETRY_US, ctrlr->subsys->subnqn);
 			qpair->connect_req = req;
 			/* Set qpair->ctrlr here so that we'll have it when the poller expires. */
 			nvmf_qpair_set_ctrlr(qpair, ctrlr);
@@ -312,6 +316,11 @@ nvmf_ctrlr_add_qpair(struct spdk_nvmf_qpair *qpair,
 				 ctrlr->hostnqn);
 	nvmf_qpair_set_ctrlr(qpair, ctrlr);
 	spdk_bit_array_set(ctrlr->qpair_mask, qpair->qid);
+	if (strstr(ctrlr->subsys->subnqn, "vm") != NULL) {
+		SPDK_NOTICELOG("established qpair %p (cntlid:%u, qid:%u) on subsystem %s\n",
+				     qpair, ctrlr->cntlid, qpair->qid, ctrlr->subsys->subnqn);
+	}
+	
 	SPDK_DEBUGLOG(nvmf, "qpair_mask set, qid %u\n", qpair->qid);
 
 	spdk_thread_send_msg(qpair->group->thread, nvmf_ctrlr_send_connect_rsp, req);

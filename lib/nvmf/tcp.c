@@ -1539,6 +1539,11 @@ nvmf_tcp_handle_connect(struct spdk_nvmf_tcp_port *port, struct spdk_sock *sock)
 		return;
 	}
 
+	if (tqpair->target_port <= 9030 && tqpair->target_port >= 9070) {
+		SPDK_NOTICELOG("New connection accepted on %d sport %d\n",
+		      tqpair->target_port, tqpair->initiator_port);
+	}
+	
 	spdk_nvmf_tgt_new_qpair(port->transport->tgt, &tqpair->qpair);
 }
 
@@ -2051,7 +2056,8 @@ err:
 
 static void 
 print_error(struct spdk_nvmf_tcp_req *tcp_req, struct spdk_nvmf_tcp_qpair *tqpair) {
-	uint8_t idx = (tqpair->target_port == 4420) ? 32 : 67;
+	// uint8_t idx = (tqpair->target_port == 4420) ? 32 : 67;
+	uint8_t idx = 0;
 	char *uuid = spdk_nvmf_request_nqn(&tcp_req->req, idx);
 	uuid = (uuid) ? uuid : ""; // Handle NULL UUID
 

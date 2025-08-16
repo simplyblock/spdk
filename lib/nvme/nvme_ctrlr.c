@@ -397,6 +397,9 @@ nvme_ctrlr_create_io_qpair(struct spdk_nvme_ctrlr *ctrlr,
 		return NULL;
 	}
 
+	SPDK_NOTICELOG("nvme Create new IO qpair %p with qid:%u on subsystem %s\n",
+			       qpair, qid, ctrlr->trid.subnqn);
+
 	TAILQ_INSERT_TAIL(&ctrlr->active_io_qpairs, qpair, tailq);
 
 	nvme_ctrlr_proc_add_io_qpair(qpair);
@@ -506,6 +509,8 @@ spdk_nvme_ctrlr_alloc_io_qpair(struct spdk_nvme_ctrlr *ctrlr,
 		nvme_ctrlr_proc_remove_io_qpair(qpair);
 		TAILQ_REMOVE(&ctrlr->active_io_qpairs, qpair, tailq);
 		spdk_bit_array_set(ctrlr->free_io_qids, qpair->id);
+		SPDK_NOTICELOG("2-nvme failed connect IO qpair %p with qid:%u on subsystem %s and reset the bit array.\n",
+			       qpair, qpair->id, ctrlr->trid.subnqn);
 		nvme_transport_ctrlr_delete_io_qpair(ctrlr, qpair);
 		qpair = NULL;
 		goto unlock;
@@ -639,6 +644,8 @@ spdk_nvme_ctrlr_free_io_qpair(struct spdk_nvme_qpair *qpair)
 
 	TAILQ_REMOVE(&ctrlr->active_io_qpairs, qpair, tailq);
 	spdk_nvme_ctrlr_free_qid(ctrlr, qpair->id);
+	SPDK_NOTICELOG("1-nvme Free IO qpair %p with qid:%u on subsystem %s\n",
+		       qpair, qpair->id, ctrlr->trid.subnqn);
 
 	nvme_transport_ctrlr_delete_io_qpair(ctrlr, qpair);
 	nvme_ctrlr_unlock(ctrlr);
@@ -1754,7 +1761,7 @@ nvme_ctrlr_disconnect_done(struct spdk_nvme_ctrlr *ctrlr)
 	nvme_ctrlr_free_iocs_specific_data(ctrlr);
 
 	spdk_bit_array_free(&ctrlr->free_io_qids);
-
+	SPDK_NOTICELOG("3-nvme clear all IO qpairs on subsystem %s.\n", ctrlr->trid.subnqn);
 	/* Set the state back to DISCONNECTED to cause a full hardware reset. */
 	nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_DISCONNECTED, NVME_TIMEOUT_INFINITE);
 }
@@ -1846,6 +1853,8 @@ spdk_nvme_ctrlr_reconnect_poll_async(struct spdk_nvme_ctrlr *ctrlr)
 			 */
 			assert(spdk_bit_array_get(ctrlr->free_io_qids, qpair->id));
 			spdk_bit_array_clear(ctrlr->free_io_qids, qpair->id);
+			SPDK_NOTICELOG("4-nvme reinitialize IO qpair %p with qid:%u on subsystem %s\n",
+				       qpair, qpair->id, ctrlr->trid.subnqn);
 			if (nvme_ctrlr_get_current_process(ctrlr) != qpair->active_proc) {
 				/*
 				 * We cannot reinitialize a foreign qpair. The qpair's owning
@@ -4446,7 +4455,7 @@ nvme_ctrlr_destruct_poll_async(struct spdk_nvme_ctrlr *ctrlr,
 	ctrlr->active_ns_count = 0;
 
 	spdk_bit_array_free(&ctrlr->free_io_qids);
-
+	SPDK_NOTICELOG("5-nvme clear all IO qpairs on subsystem %s.\n", ctrlr->trid.subnqn);
 	free(ctrlr->ana_log_page);
 	free(ctrlr->copied_ana_desc);
 	ctrlr->ana_log_page = NULL;
@@ -5524,6 +5533,8 @@ spdk_nvme_ctrlr_alloc_qid(struct spdk_nvme_ctrlr *ctrlr)
 		nvme_ctrlr_unlock(ctrlr);
 		return -1;
 	}
+	SPDK_NOTICELOG("nvme alloc bit array for the qpair with qid:%u on subsystem %s\n",
+			       qid, ctrlr->trid.subnqn);
 
 	spdk_bit_array_clear(ctrlr->free_io_qids, qid);
 	nvme_ctrlr_unlock(ctrlr);
@@ -5540,6 +5551,9 @@ spdk_nvme_ctrlr_free_qid(struct spdk_nvme_ctrlr *ctrlr, uint16_t qid)
 	if (spdk_likely(ctrlr->free_io_qids)) {
 		spdk_bit_array_set(ctrlr->free_io_qids, qid);
 	}
+
+	SPDK_NOTICELOG("nvme free bit array for the qpair with qid:%u on subsystem %s\n",
+			       qid, ctrlr->trid.subnqn);
 
 	nvme_ctrlr_unlock(ctrlr);
 }

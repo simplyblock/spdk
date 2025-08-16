@@ -1258,6 +1258,11 @@ _nvmf_ctrlr_free_from_qpair(void *ctx)
 	uint32_t count;
 
 	spdk_bit_array_clear(ctrlr->qpair_mask, qpair_ctx->qid);
+	if (strstr(ctrlr->subsys->subnqn, "vm") != NULL) {
+		SPDK_NOTICELOG("destroy qpair %p (cntlid:%u, qid:%u) on subsystem %s\n",
+				     qpair_ctx->qpair, ctrlr->cntlid, qpair_ctx->qid, ctrlr->subsys->subnqn);
+	}
+
 	SPDK_DEBUGLOG(nvmf, "qpair_mask cleared, qid %u\n", qpair_ctx->qid);
 	count = spdk_bit_array_count_set(ctrlr->qpair_mask);
 	if (count == 0) {
