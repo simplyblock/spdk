@@ -1539,8 +1539,8 @@ nvmf_tcp_handle_connect(struct spdk_nvmf_tcp_port *port, struct spdk_sock *sock)
 		return;
 	}
 
-	if (tqpair->target_port <= 9030 && tqpair->target_port >= 9070) {
-		SPDK_NOTICELOG("New connection accepted on %d sport %d\n",
+	if (tqpair->target_port >= 9030 && tqpair->target_port <= 9080) {
+		SPDK_NOTICELOG("New connection accepted sp %d cp %d\n",
 		      tqpair->target_port, tqpair->initiator_port);
 	}
 	
