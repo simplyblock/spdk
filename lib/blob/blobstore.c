@@ -6520,6 +6520,49 @@ bs_dump_read_md_page(spdk_bs_sequence_t *seq, void *cb_arg)
 			     bs_dump_read_md_page_cpl, ctx);
 }
 
+
+static void
+bs_write_used_blobids_on_dump_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct spdk_bs_load_ctx *ctx = cb_arg;
+	spdk_free(ctx->mask);
+	bs_load_complete(ctx);	
+}
+
+static void
+bs_write_used_blobids_on_dump(spdk_bs_sequence_t *seq, void *arg, spdk_bs_sequence_cpl cb_fn)
+{
+	struct spdk_bs_load_ctx *ctx = arg;
+	uint64_t	mask_size, lba, lba_count;
+
+	if (ctx->super->used_blobid_mask_len == 0) {
+		/*
+		 * This is a pre-v3 on-disk format where the blobid mask does not get
+		 *  written to disk.
+		 */
+		cb_fn(seq, arg, 0);
+		return;
+	}
+
+	mask_size = ctx->super->used_blobid_mask_len * SPDK_BS_PAGE_SIZE;
+	ctx->mask = spdk_zmalloc(mask_size, 0x1000, NULL, SPDK_ENV_SOCKET_ID_ANY,
+				 SPDK_MALLOC_DMA);
+	if (!ctx->mask) {
+		bs_load_complete(ctx);
+		return;
+	}
+
+	ctx->mask->type = SPDK_MD_MASK_TYPE_USED_BLOBIDS;
+	ctx->mask->length = ctx->super->md_len;
+	assert(ctx->mask->length == spdk_bit_array_capacity(ctx->bs->used_blobids));
+
+	spdk_bit_array_store_mask(ctx->bs->used_blobids, ctx->mask->mask);
+	lba = bs_page_to_lba(ctx->bs, ctx->super->used_blobid_mask_start);
+	lba_count = bs_page_to_lba(ctx->bs, ctx->super->used_blobid_mask_len);
+	ctx->bs->w_io++;
+	bs_sequence_write_dev(seq, ctx->mask, lba, lba_count, cb_fn, arg);
+}
+
 static void
 bs_load_used_blobids_cpl_dump(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
@@ -6555,8 +6598,7 @@ bs_load_used_blobids_cpl_dump(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno
 	}
 	spdk_free(ctx->mask);
 	spdk_free(mask);
-
-	bs_load_complete(ctx);
+	bs_write_used_blobids_on_dump(seq, ctx, bs_write_used_blobids_on_dump_cpl);	
 }
 
 static void
