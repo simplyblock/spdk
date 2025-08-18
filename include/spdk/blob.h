@@ -45,6 +45,7 @@ typedef uint64_t spdk_blob_id;
 #define SPDK_BLOBID_INVALID		(uint64_t)-1
 #define SPDK_BLOBID_EXTERNAL_SNAPSHOT	(uint64_t)-2
 #define SPDK_BLOBSTORE_TYPE_LENGTH 16
+#define ERR_LEADERSHIP_CHANGED  -35
 
 enum blob_clear_method {
 	BLOB_CLEAR_WITH_DEFAULT,
@@ -860,6 +861,9 @@ bool spdk_blob_is_esnap_clone(const struct spdk_blob *blob);
  */
 void spdk_bs_delete_blob(struct spdk_blob_store *bs, spdk_blob_id blobid,
 			 spdk_blob_op_complete cb_fn, void *cb_arg);
+
+void spdk_bs_cleanup(struct spdk_blob_store *bs,
+		    spdk_bs_op_complete cb_fn, void *cb_arg);
 
 /**
  * Allocate all clusters in this blob. Data for allocated clusters is copied

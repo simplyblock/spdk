@@ -478,7 +478,9 @@ spdk_bit_pool_allocate_specific_bit(struct spdk_bit_pool *pool, uint32_t bit_ind
 	}
 
 	spdk_bit_array_set(pool->array, bit_index);
-	pool->lowest_free_bit = spdk_bit_array_find_first_clear(pool->array, 0);
+	if (pool->lowest_free_bit >= bit_index) {
+		pool->lowest_free_bit = spdk_bit_array_find_first_clear(pool->array, bit_index);
+	}
 
 	pool->free_count--;
 	return bit_index;
