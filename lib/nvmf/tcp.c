@@ -1539,7 +1539,7 @@ nvmf_tcp_handle_connect(struct spdk_nvmf_tcp_port *port, struct spdk_sock *sock)
 		return;
 	}
 
-	if (tqpair->target_port >= 9030 && tqpair->target_port <= 9080) {
+	if (tqpair->target_port >= 9030 && tqpair->target_port <= 9090) {
 		SPDK_NOTICELOG("New connection accepted sp %d cp %d\n",
 		      tqpair->target_port, tqpair->initiator_port);
 	}
@@ -3205,7 +3205,7 @@ nvmf_tcp_dump_delay_req_status(struct spdk_nvmf_tcp_req *tcp_req, struct spdk_nv
 
 static void 
 check_time(struct spdk_nvmf_tcp_req *tcp_req, struct spdk_nvmf_tcp_qpair *tqpair) {
-	if (!tcp_req->loged && tcp_req->time && tqpair->qpair.qid != 0 &&(tqpair->target_port > 9050 && tqpair->target_port < 9090)) {
+	if (!tcp_req->loged && tcp_req->time && tqpair->qpair.qid != 0 &&(tqpair->target_port >= 9030 && tqpair->target_port <= 9090)) {
 		uint64_t current = spdk_get_ticks();
 		uint64_t ticks_hz = spdk_get_ticks_hz();
 		// Check if more than 28 ticks have passed since tcp_req->time
