@@ -3191,10 +3191,10 @@ nvmf_tcp_dump_delay_req_status(struct spdk_nvmf_tcp_req *tcp_req, struct spdk_nv
 		if (tcp_req->tps.state[i] != 0) {
 			uint64_t ticks = tcp_req->tps.time_per_state[i];
 			double duration_us = ((double)ticks * 1000000.0) / (double)ticks_hz;
-			if ((i == 6) && (int)duration_us > 500000) {
-				SPDK_NOTICELOG("stop the tcpdump on the state 6 bigger than 500ms.\n");
-				system("pkill -9 tcpdump");
-			}
+			// if ((i == 6) && (int)duration_us > 500000) {
+			// 	SPDK_NOTICELOG("stop the tcpdump on the state 6 bigger than 500ms.\n");
+			// 	system("pkill -9 tcpdump");
+			// }
 			offset += snprintf(buf + offset, sizeof(buf) - offset, "[%d]=%.3f ", i, duration_us);
 		}
 	}
