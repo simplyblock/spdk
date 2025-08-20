@@ -393,6 +393,8 @@ nvme_ctrlr_create_io_qpair(struct spdk_nvme_ctrlr *ctrlr,
 	if (qpair == NULL) {
 		NVME_CTRLR_ERRLOG(ctrlr, "nvme_transport_ctrlr_create_io_qpair() failed\n");
 		spdk_nvme_ctrlr_free_qid(ctrlr, qid);
+		SPDK_NOTICELOG("nvme free bit qpair id:%u on subsystem %s\n",
+			       qid, ctrlr->trid.subnqn);
 		nvme_ctrlr_unlock(ctrlr);
 		return NULL;
 	}
@@ -3003,6 +3005,8 @@ nvme_ctrlr_set_num_queues_done(void *arg, const struct spdk_nvme_cpl *cpl)
 		spdk_nvme_ctrlr_free_qid(ctrlr, i);
 	}
 
+	SPDK_NOTICELOG("Initialize list of free I/O queue IDs on subsystem %s\n", ctrlr->trid.subnqn);
+
 	nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_IDENTIFY_ACTIVE_NS,
 			     ctrlr->opts.admin_timeout_ms);
 }
@@ -5533,7 +5537,7 @@ spdk_nvme_ctrlr_alloc_qid(struct spdk_nvme_ctrlr *ctrlr)
 		nvme_ctrlr_unlock(ctrlr);
 		return -1;
 	}
-	SPDK_NOTICELOG("nvme alloc bit array for the qpair with qid:%u on subsystem %s\n",
+	SPDK_NOTICELOG("nvme alloc bit qpair id:%u on subsystem %s\n",
 			       qid, ctrlr->trid.subnqn);
 
 	spdk_bit_array_clear(ctrlr->free_io_qids, qid);
@@ -5552,8 +5556,8 @@ spdk_nvme_ctrlr_free_qid(struct spdk_nvme_ctrlr *ctrlr, uint16_t qid)
 		spdk_bit_array_set(ctrlr->free_io_qids, qid);
 	}
 
-	SPDK_NOTICELOG("nvme free bit array for the qpair with qid:%u on subsystem %s\n",
-			       qid, ctrlr->trid.subnqn);
+	// SPDK_NOTICELOG("nvme free bit qpair id:%u on subsystem %s\n",
+	// 		       qid, ctrlr->trid.subnqn);
 
 	nvme_ctrlr_unlock(ctrlr);
 }
