@@ -985,7 +985,10 @@ static void
 bdev_nvme_destroy_bdev_channel_cb(void *io_device, void *ctx_buf)
 {
 	struct nvme_bdev_channel *nbdev_ch = ctx_buf;
-
+	struct nvme_bdev *nbdev = io_device;
+	SPDK_NOTICELOG("Destroying bdev channel %p for device: %s.\n", nbdev_ch, nbdev->disk.name);
+	// Ensure all log messages are flushed
+    fflush(stderr);
 	bdev_nvme_abort_retry_ios(nbdev_ch);
 	_bdev_nvme_delete_io_paths(nbdev_ch);
 }
