@@ -4678,6 +4678,9 @@ nvmf_qpair_request_cleanup(struct spdk_nvmf_qpair *qpair)
 		if (TAILQ_EMPTY(&qpair->outstanding)) {
 			qpair->state_cb(qpair->state_cb_arg, 0);
 		}
+	} else if (spdk_unlikely(qpair->state == SPDK_NVMF_QPAIR_CONNECTING && qpair->ctrlr == NULL) ) {
+		SPDK_NOTICELOG("QPair %p is in connecting state but has no controller.\n", qpair);
+		spdk_nvmf_qpair_disconnect(qpair);
 	}
 }
 
