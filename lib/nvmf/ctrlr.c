@@ -4720,6 +4720,10 @@ _nvmf_request_complete(void *ctx)
 	opcode = req->cmd->nvmf_cmd.opcode;
 
 	qpair = req->qpair;
+
+	/* request should not be on a ns reservations list */
+	assert(req->reservation_queued == false);
+
 	if (spdk_likely(qpair->ctrlr)) {
 		sgroup = &qpair->group->sgroups[qpair->ctrlr->subsys->id];
 		assert(sgroup != NULL);
