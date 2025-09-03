@@ -2456,6 +2456,8 @@ put_io_channel(void *arg)
 	ch->destroy_ref--;
 
 	if (ch->ref > 0 || ch->destroy_ref > 0) {
+		SPDK_NOTICELOG("Releasing io_channel %p for io_device %s (%p) on thread %s destroy %u refcnt %u.\n",
+		      ch, ch->dev->name, ch->dev->io_device, thread->name, ch->destroy_ref, ch->ref);
 		/*
 		 * Another reference to the associated io_device was requested
 		 *  after this message was sent but before it had a chance to
@@ -2507,12 +2509,15 @@ spdk_put_io_channel(struct spdk_io_channel *ch)
 	}
 
 	if (ch->thread != thread) {
+		SPDK_ERRLOG("called from wrong thread\n");
 		wrong_thread(__func__, "ch", ch->thread, thread);
 		return;
 	}
 
 	SPDK_DEBUGLOG(thread,
 		      "Putting io_channel %p for io_device %s (%p) on thread %s refcnt %u\n",
+		      ch, ch->dev->name, ch->dev->io_device, thread->name, ch->ref);
+	SPDK_NOTICELOG("Putting io_channel %p for io_device %s (%p) on thread %s refcnt %u\n",
 		      ch, ch->dev->name, ch->dev->io_device, thread->name, ch->ref);
 
 	ch->ref--;
