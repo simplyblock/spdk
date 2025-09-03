@@ -2152,7 +2152,9 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
                                              clear_method=args.clear_method,
                                              uuid=args.uuid,
                                              lvs_name=args.lvs_name,
-                                             lvol_priority_class=args.lvol_priority_class))
+                                             lvol_priority_class=args.lvol_priority_class,
+                                             ndcs=args.ndcs,
+                                             npcs=args.npcs))
 
     p = subparsers.add_parser('bdev_lvol_create', help='Add a bdev with an logical volume backend')
     p.add_argument('-u', '--uuid', help='lvol store UUID')
@@ -2163,6 +2165,8 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('lvol_name', help='name for this lvol')
     p.add_argument('size_in_mib', help='size in MiB for this bdev', type=int)
     p.add_argument('lvol_priority_class', help='integer I/O priority class for this lvol in the range [0, 15], default 0', type=int)
+    p.add_argument('-d', '--ndcs', help='number of data pages for this lvol in the range [0, 4], default 0', type=int)
+    p.add_argument('-p', '--npcs', help='number of parity pages for this lvol in the range [0, 4], default 0', type=int)
     p.set_defaults(func=bdev_lvol_create)
     
     def bdev_lvol_create_hublvol(args):

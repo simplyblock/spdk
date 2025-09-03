@@ -265,6 +265,7 @@ spdk_blob_opts_init(struct spdk_blob_opts *opts, size_t opts_size)
 	}
 
 	SET_FIELD(use_extent_table, true);
+	SET_FIELD(geometry, 0);
 
 #undef FIELD_OK
 #undef SET_FIELD
@@ -1054,7 +1055,8 @@ blob_parse(const struct spdk_blob_md_page *pages, uint32_t page_count,
 	blob->active.pages = tmp;
 
 	blob->active.pages[0] = pages[0].id;
-	blob->map_id = pages[0].reserved0;
+	blob->map_id = (uint16_t)(pages[0].reserved0 & 0xFFFF);
+	blob->geometry = (uint8_t)((pages[0].reserved0 >> 16) & 0xFF);
 
 	for (i = 1; i < page_count; i++) {
 		assert(spdk_bit_array_get(blob->bs->used_md_pages, pages[i - 1].next));
@@ -1111,7 +1113,14 @@ blob_serialize_add_page(const struct spdk_blob *blob,
 	page = &(*pages)[*page_count - 1];
 	memset(page, 0, sizeof(*page));
 	page->id = blob->id;
-	page->reserved0 = blob->map_id;
+	/*
+	 *	bits  0–15 : map_id   (uint16_t)
+	 *	bits 16–23 : geometry (uint8_t)
+	 *	bits 24–31 : free/reserved
+	 */
+
+	page->reserved0 = ((uint32_t)blob->map_id & 0xFFFF)   // lower 16 bits
+                | ((uint32_t)blob->geometry << 16);   // next 8 bits
 	page->sequence_num = *page_count - 1;
 	page->next = SPDK_INVALID_MD_PAGE;
 	*last_page = page;
@@ -7799,6 +7808,14 @@ spdk_blob_get_map_id(struct spdk_blob *blob)
 	return blob->map_id;
 }
 
+uint8_t
+spdk_blob_get_geometry(struct spdk_blob *blob)
+{
+	assert(blob != NULL);
+
+	return blob->geometry;
+}
+
 uint32_t
 spdk_blob_get_open_ref(struct spdk_blob *blob)
 {
@@ -7934,6 +7951,7 @@ blob_opts_copy(const struct spdk_blob_opts *src, struct spdk_blob_opts *dst)
 	SET_FIELD(use_extent_table);
 	SET_FIELD(esnap_id);
 	SET_FIELD(esnap_id_len);
+	SET_FIELD(geometry);
 
 	dst->opts_size = src->opts_size;
 
@@ -8078,6 +8096,7 @@ bs_create_blob(struct spdk_blob_store *bs,
 	}
 
 	blob->map_id = map_id;
+	blob->geometry = opts_local.geometry;
 	blob->use_extent_table = opts_local.use_extent_table;
 	if (blob->use_extent_table) {
 		blob->invalid_flags |= SPDK_BLOB_EXTENT_TABLE;
@@ -8651,6 +8670,7 @@ bs_snapshot_origblob_open_cpl(void *cb_arg, struct spdk_blob *_blob, int bserrno
 	opts.thin_provision = true;
 	opts.num_clusters = spdk_blob_get_num_clusters(_blob);
 	opts.use_extent_table = _blob->use_extent_table;
+	opts.geometry = _blob->geometry;
 
 	/* If there are any xattrs specified for snapshot, set them now */
 	if (ctx->xattrs) {
@@ -8834,6 +8854,7 @@ bs_clone_origblob_open_cpl(void *cb_arg, struct spdk_blob *_blob, int bserrno)
 	opts.thin_provision = true;
 	opts.num_clusters = spdk_blob_get_num_clusters(_blob);
 	opts.use_extent_table = _blob->use_extent_table;
+	opts.geometry = _blob->geometry;
 	if (ctx->xattrs) {
 		memcpy(&opts.xattrs, ctx->xattrs, sizeof(*ctx->xattrs));
 	}

@@ -128,7 +128,7 @@ def bdev_lvol_set_lvs_read_only(client, uuid=None, lvs_name=None, read_only=Fals
         params['lvs_name'] = lvs_name
     return client.call('bdev_lvol_set_lvs_read_only', params)
 
-def bdev_lvol_create(client, lvol_name, size_in_mib, thin_provision=False, uuid=None, lvs_name=None, clear_method=None, lvol_priority_class=0):
+def bdev_lvol_create(client, lvol_name, size_in_mib, thin_provision=False, uuid=None, lvs_name=None, clear_method=None, lvol_priority_class=0, ndcs=0, npcs=0):
     """Create a logical volume on a logical volume store.
 
     Args:
@@ -152,8 +152,12 @@ def bdev_lvol_create(client, lvol_name, size_in_mib, thin_provision=False, uuid=
     max_priority_class = 2**(nbits_priority_class) - 1
     if not (lvol_priority_class >= min_priority_class and lvol_priority_class <= max_priority_class):
         raise ValueError("lvol_priority_class must be in the range [{}, {}]".format(min_priority_class, max_priority_class))
+    if not (ndcs >= 0 and ndcs <= 4):
+        raise ValueError("ndcs must be in the range [0, 4]")
+    if not (npcs >= 0 and npcs <= 4):
+        raise ValueError("npcs must be in the range [0, 4]")
 
-    params = {'lvol_name': lvol_name, 'size_in_mib': size_in_mib}
+    params = {'lvol_name': lvol_name, 'size_in_mib': size_in_mib, 'ndcs': ndcs, 'npcs': npcs}
     if thin_provision:
         params['thin_provision'] = thin_provision
     if uuid:

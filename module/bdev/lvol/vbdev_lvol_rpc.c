@@ -316,6 +316,9 @@ struct rpc_bdev_lvol_create {
 	char *lvs_name;
 	char *lvol_name;
 	int32_t lvol_priority_class;
+	int8_t ndcs;
+	int8_t npcs;
+	int32_t lvol_priority_class;
 	uint64_t size_in_mib;
 	bool thin_provision;
 	char *clear_method;
@@ -335,6 +338,8 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_create_decoders[] = {
 	{"lvs_name", offsetof(struct rpc_bdev_lvol_create, lvs_name), spdk_json_decode_string, true},
 	{"lvol_name", offsetof(struct rpc_bdev_lvol_create, lvol_name), spdk_json_decode_string},
 	{"lvol_priority_class", offsetof(struct rpc_bdev_lvol_create, lvol_priority_class), spdk_json_decode_int32, true},
+	{"ndcs", offsetof(struct rpc_bdev_lvol_create, ndcs), spdk_json_decode_int8, true},
+	{"npcs", offsetof(struct rpc_bdev_lvol_create, npcs), spdk_json_decode_int8, true},
 	{"size_in_mib", offsetof(struct rpc_bdev_lvol_create, size_in_mib), spdk_json_decode_uint64},
 	{"thin_provision", offsetof(struct rpc_bdev_lvol_create, thin_provision), spdk_json_decode_bool, true},
 	{"clear_method", offsetof(struct rpc_bdev_lvol_create, clear_method), spdk_json_decode_string, true},
@@ -366,7 +371,7 @@ rpc_bdev_lvol_create(struct spdk_jsonrpc_request *request,
 {
 	struct rpc_bdev_lvol_create req = {};
 	enum lvol_clear_method clear_method;
-	int rc = 0;
+	int rc = 0, geometry = 0;
 	struct spdk_lvol_store *lvs = NULL;
 
 	SPDK_INFOLOG(lvol_rpc, "Creating blob\n");
@@ -401,6 +406,11 @@ rpc_bdev_lvol_create(struct spdk_jsonrpc_request *request,
 		clear_method = LVOL_CLEAR_WITH_DEFAULT;
 	}
 
+	if (req.ndcs != 0 || req.npcs != 0) {
+		SPDK_NOTICELOG("lvol geometry is [%d, %d]", req.ndcs, req.npcs);
+		geometry = spdk_lvol_store_set_geometry(lvs, req.ndcs, req.npcs);
+	}
+
 	if (!(req.lvol_priority_class >= MIN_PRIORITY_CLASS && req.lvol_priority_class <= MAX_PRIORITY_CLASS)) {
 		SPDK_ERRLOG("lvol priority class is not within the allowed range of [%d, %d]", MIN_PRIORITY_CLASS, MAX_PRIORITY_CLASS);
 		spdk_jsonrpc_send_error_response(request, -EINVAL, spdk_strerror(EINVAL));
@@ -408,7 +418,7 @@ rpc_bdev_lvol_create(struct spdk_jsonrpc_request *request,
 	}
 
 	rc = vbdev_lvol_create(lvs, req.lvol_name, req.size_in_mib * 1024 * 1024,
-			       req.thin_provision, clear_method, req.lvol_priority_class, rpc_bdev_lvol_create_cb, request);
+			       req.thin_provision, clear_method, req.lvol_priority_class, geometry, rpc_bdev_lvol_create_cb, request);
 	if (rc < 0) {
 		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
 		goto cleanup;

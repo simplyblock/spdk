@@ -1277,8 +1277,8 @@ lvs_verify_lvol_name(struct spdk_lvol_store *lvs, const char *name)
 }
 
 int
-spdk_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz,
-		 bool thin_provision, enum lvol_clear_method clear_method, spdk_lvol_op_with_handle_complete cb_fn,
+spdk_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz, bool thin_provision,
+		 enum lvol_clear_method clear_method, uint8_t geometry, spdk_lvol_op_with_handle_complete cb_fn,
 		 void *cb_arg)
 {
 	struct spdk_lvol_with_handle_req *req;
@@ -1319,6 +1319,7 @@ spdk_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz,
 	spdk_blob_opts_init(&opts, sizeof(opts));
 	opts.thin_provision = thin_provision;
 	opts.num_clusters = spdk_divide_round_up(sz, spdk_bs_get_cluster_size(bs));
+	opts.geometry = geometry;
 	opts.clear_method = lvol->clear_method;
 	opts.xattrs.count = SPDK_COUNTOF(xattr_names);
 	opts.xattrs.names = xattr_names;

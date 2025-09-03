@@ -116,6 +116,7 @@ struct spdk_blob {
 
 	spdk_blob_id	id;
 	uint16_t	map_id;
+	uint8_t		geometry;
 	spdk_blob_id	parent_id;
 
 	enum spdk_blob_state		state;
