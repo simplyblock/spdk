@@ -11,6 +11,7 @@
 #include "spdk/env.h"
 #include "spdk/queue.h"
 #include "spdk/thread.h"
+#include "spdk_internal/thread.h"
 #include "spdk/bit_array.h"
 #include "spdk/bit_pool.h"
 #include "spdk/likely.h"
@@ -567,6 +568,10 @@ spdk_bs_drain_queued_io(struct spdk_io_channel_iter *i)
 	struct spdk_bs_channel *ch = spdk_io_channel_get_ctx(_ch);
 
 	if (ch->set_redirect_ch && ch->redirect_ch) {
+		while (1 < spdk_io_channel_get_ref_count(ch->redirect_ch)) {
+			// SPDK_NOTICELOG("3 Hublvol channel %p ref count %d.\n", ch->redirect_ch, spdk_io_channel_get_ref_count(ch->redirect_ch));
+			spdk_put_io_channel(ch->redirect_ch);
+		}
 		spdk_put_io_channel(ch->redirect_ch);
 		ch->set_redirect_ch = false;
 		ch->redirect_ch = NULL;
