@@ -16,7 +16,7 @@ RUN pip install requests
 
 RUN cd spdk && git submodule update --init --depth 1
 
-RUN cd spdk && scripts/pkgdep.sh --rdma --pmem
+RUN cd spdk && scripts/pkgdep.sh --rdma --pmem --uring
 
 RUN mkdir /tmp/pmem
 

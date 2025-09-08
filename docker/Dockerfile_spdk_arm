@@ -16,7 +16,7 @@ RUN pip install requests
 
 RUN cd spdk && git submodule update --init --depth 1
 
-RUN cd spdk && scripts/pkgdep.sh --rdma --pmem
+RUN cd spdk && scripts/pkgdep.sh --rdma --pmem --uring
 
 RUN mkdir /tmp/pmem
 RUN sed -i "s/^#define SPDK_JSONRPC_RECV_BUF_SIZE.*/#define SPDK_JSONRPC_RECV_BUF_SIZE\t(2 * 1024 * 1024)/" /root/spdk/lib/jsonrpc/jsonrpc_internal.h
