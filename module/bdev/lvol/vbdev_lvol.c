@@ -1948,7 +1948,7 @@ vbdev_lvs_dump(struct spdk_lvol_store *lvs, const char *file, spdk_lvol_op_with_
 int
 vbdev_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz,
 		  bool thin_provision, enum lvol_clear_method clear_method, int8_t lvol_priority_class,
-		  int8_t geometry, spdk_lvol_op_with_handle_complete cb_fn,
+		  uint8_t geometry, spdk_lvol_op_with_handle_complete cb_fn,
 		  void *cb_arg)
 {
 	struct spdk_lvol_with_handle_req *req;
@@ -1962,7 +1962,7 @@ vbdev_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz,
 	req->cb_fn = cb_fn;
 	req->cb_arg = cb_arg;
 
-	rc = spdk_lvol_create(lvs, name, sz, thin_provision, clear_method, geometry
+	rc = spdk_lvol_create(lvs, name, sz, thin_provision, clear_method, geometry,
 			      _vbdev_lvol_create_cb, req);
 	if (rc != 0) {
 		free(req);

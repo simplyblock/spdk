@@ -7962,7 +7962,7 @@ blob_opts_copy(const struct spdk_blob_opts *src, struct spdk_blob_opts *dst)
 
 	/* You should not remove this statement, but need to update the assert statement
 	 * if you add a new field, and also add a corresponding SET_FIELD statement */
-	SPDK_STATIC_ASSERT(sizeof(struct spdk_blob_opts) == 80, "Incorrect size");
+	SPDK_STATIC_ASSERT(sizeof(struct spdk_blob_opts) == 88, "Incorrect size");
 
 #undef FIELD_OK
 #undef SET_FIELD

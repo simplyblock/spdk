@@ -37,7 +37,7 @@ void vbdev_lvs_unload(struct spdk_lvol_store *lvs, spdk_lvs_op_complete cb_fn, v
 
 int vbdev_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz,
 		      bool thin_provisioned, enum lvol_clear_method clear_method,
-			  int8_t lvol_priority_class,
+			  int8_t lvol_priority_class, uint8_t geometry,
 		      spdk_lvol_op_with_handle_complete cb_fn,
 		      void *cb_arg);
 

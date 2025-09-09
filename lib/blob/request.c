@@ -93,6 +93,7 @@ bs_sequence_start(struct spdk_io_channel *_channel, struct spdk_bs_cpl *cpl,
 	set->back_channel = back_channel;
 
 	set->priority_class = channel->bs->priority_class;
+	set->geometry = 0; // default geometry
 	set->cb_args.cb_fn = bs_sequence_completion;
 	set->cb_args.cb_arg = set;
 	set->cb_args.channel = channel->dev_channel;
@@ -133,6 +134,7 @@ bs_sequence_start_blob(struct spdk_io_channel *_channel, struct spdk_bs_cpl *cpl
 	spdk_bs_sequence_t *seq = bs_sequence_start(_channel, cpl, esnap_ch);
 	if (seq) {
 		seq->priority_class = blob->priority_class; // set here if blobstore priority is different from this specific blob's priority
+		seq->geometry = blob->geometry;
 	}
 	return seq;
 }

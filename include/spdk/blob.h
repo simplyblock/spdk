@@ -683,7 +683,7 @@ struct spdk_blob_opts {
 	uint64_t esnap_id_len;
 	uint8_t geometry; /* Geometry info for lvol */
 };
-SPDK_STATIC_ASSERT(sizeof(struct spdk_blob_opts) == 80, "Incorrect size");
+SPDK_STATIC_ASSERT(sizeof(struct spdk_blob_opts) == 88, "Incorrect size");
 
 /**
  * Initialize a spdk_blob_opts structure to the default blob option values.
