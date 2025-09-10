@@ -3265,33 +3265,39 @@ static int
 spdk_wait_for_redirected_io_cleanup(void *arg)
 {
 	struct spdk_lvol_store *lvs = arg;
-	struct spdk_hublvol_channels *hub_ch_list, *hublvol_ch = NULL;
+    struct spdk_hublvol_channels *hub_ch_list = NULL;
+    struct spdk_hublvol_channels *hublvol_ch = NULL;
 	int len = 0;
 
 	if (__atomic_load_n(&lvs->hub_dev.redirected_io_count, __ATOMIC_SEQ_CST) == 0) {
 		SPDK_NOTICELOG("All redirected I/Os completed. Proceeding to cleanup.\n");
+		TAILQ_FOREACH(hublvol_ch, &lvs->hublvol_channels, entry) {
+			len++;
+		}
+
+		if (len == 0) {
+            /* Nothing to drain — call completion directly */
+            spdk_trigger_failover_cpl(lvs, 0);
+            return -1;
+        }
+		
+		hub_ch_list = calloc(len, sizeof(*hub_ch_list));
+		if (!hub_ch_list) {
+			SPDK_ERRLOG("Cannot allocate memory for hub_ch_list.\n");
+            return SPDK_POLLER_BUSY;
+		}
+
 		spdk_poller_unregister(&lvs->hub_dev.cleanup_poller);
 		lvs->hub_dev.cleanup_poller = NULL;
 		spdk_poller_unregister(&lvs->redirect_poller);
 		lvs->redirect_poller = NULL;
 
+		/* fill */
+		size_t idx = 0;
 		TAILQ_FOREACH(hublvol_ch, &lvs->hublvol_channels, entry) {
-			len++;
-		}
-
-		if (len > 0) {
-			hub_ch_list = calloc(len, sizeof(*hub_ch_list));
-			if (!hub_ch_list) {
-				SPDK_ERRLOG("Cannot allocate memory for hub_ch_list.\n");
-				return -1;
-			}
-			/* fill */
-			size_t idx = 0;
-			TAILQ_FOREACH(hublvol_ch, &lvs->hublvol_channels, entry) {
-				hub_ch_list[idx].ch = hublvol_ch->ch;
-				hub_ch_list[idx].thread = hublvol_ch->thread;
-				idx++;
-			}
+			hub_ch_list[idx].ch = hublvol_ch->ch;
+			hub_ch_list[idx].thread = hublvol_ch->thread;
+			idx++;
 		}
 
 		spdk_bs_drain_channel_queued(lvs->blobstore, hub_ch_list, len, spdk_trigger_failover_cpl, lvs);
