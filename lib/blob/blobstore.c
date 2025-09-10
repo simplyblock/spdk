@@ -558,7 +558,8 @@ blob_freeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg
 struct drain_io_ctx {
 	void *cb_arg;
 	spdk_drain_op_cpl	cb_fn;
-	spdk_drain_op_submit_handle	submit_cb;
+	struct spdk_hublvol_channels *ch_list;
+	int count;
 };
 
 static void
@@ -566,17 +567,38 @@ spdk_bs_drain_queued_io(struct spdk_io_channel_iter *i)
 {
 	struct spdk_io_channel *_ch = spdk_io_channel_iter_get_channel(i);
 	struct spdk_bs_channel *ch = spdk_io_channel_get_ctx(_ch);
+	struct drain_io_ctx *ctx = spdk_io_channel_iter_get_ctx(i);
+   	struct spdk_thread *cur_thread = spdk_get_thread();
 
-	if (ch->set_redirect_ch && ch->redirect_ch) {
-		while (1 < spdk_io_channel_get_ref_count(ch->redirect_ch)) {
-			// SPDK_NOTICELOG("3 Hublvol channel %p ref count %d.\n", ch->redirect_ch, spdk_io_channel_get_ref_count(ch->redirect_ch));
-			spdk_put_io_channel(ch->redirect_ch);
-		}
-		spdk_put_io_channel(ch->redirect_ch);
-		ch->set_redirect_ch = false;
-		ch->redirect_ch = NULL;
-		ch->redirect_desc = NULL;
-	}
+    /* iterate over captured list */
+    for (int idx = 0; idx < ctx->count; idx++) {
+        struct spdk_hublvol_channels *hub = &ctx->ch_list[idx];
+
+        if (hub == NULL || hub->ch == NULL) {
+            continue;
+        }
+
+        /* only operate on channels that belong to this thread */
+        if (hub->thread != cur_thread) {
+            continue;
+        }
+
+        /* reduce refcount until zero (with safety limit) */
+        int safety = 0;
+        while (spdk_io_channel_get_ref_count(hub->ch) > 1) {
+            spdk_put_io_channel(hub->ch);
+            if (++safety > 1024) {
+                SPDK_WARNLOG("Too many spdk_put_io_channel iterations for ch %p, breaking.\n", hub->ch);
+                break;
+            }
+        }
+		spdk_put_io_channel(hub->ch);
+		hub->ch = NULL;
+    }
+
+	ch->set_redirect_ch = false;
+	ch->redirect_ch = NULL;
+	ch->redirect_desc = NULL;
 	spdk_for_each_channel_continue(i, 0);
 }
 
@@ -584,12 +606,21 @@ static void
 spdk_bs_drain_cpl(struct spdk_io_channel_iter *i, int status)
 {
 	struct drain_io_ctx *ctx = spdk_io_channel_iter_get_ctx(i);
+    /* free the captured list (it was allocated in the caller) */
+    if (ctx->ch_list) {
+        free(ctx->ch_list);
+    }
+
 	ctx->cb_fn(ctx->cb_arg, 0);
 	free(ctx);
 }
 
 void
-spdk_bs_drain_channel_queued(struct spdk_blob_store *bs, spdk_drain_op_submit_handle submit_cb, spdk_drain_op_cpl cb_fn, void *cb_arg)
+spdk_bs_drain_channel_queued(struct spdk_blob_store *bs,
+                             struct spdk_hublvol_channels *ch_list,
+                             int count,
+                             spdk_drain_op_cpl cb_fn,
+                             void *cb_arg)
 {
 	struct drain_io_ctx *ctx;
 
@@ -599,7 +630,8 @@ spdk_bs_drain_channel_queued(struct spdk_blob_store *bs, spdk_drain_op_submit_ha
 		return;
 	}
 
-	ctx->submit_cb = submit_cb;
+	ctx->ch_list = ch_list;
+	ctx->count = count;
 	ctx->cb_fn = cb_fn;
 	ctx->cb_arg = cb_arg;
 

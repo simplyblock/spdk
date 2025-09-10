@@ -36,6 +36,7 @@
 #include "spdk/stdinc.h"
 #include "spdk/assert.h"
 #include "spdk/priority_class.h"
+#include "spdk/queue.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -67,6 +68,12 @@ enum bs_clear_method {
 	BS_CLEAR_WITH_UNMAP,
 	BS_CLEAR_WITH_WRITE_ZEROES,
 	BS_CLEAR_WITH_NONE,
+};
+
+struct spdk_hublvol_channels {
+	struct spdk_io_channel *ch;
+	struct spdk_thread	*thread;
+	TAILQ_ENTRY(spdk_hublvol_channels)	entry;
 };
 
 struct spdk_blob_store;
@@ -1088,8 +1095,8 @@ void spdk_bs_free_io_channel(struct spdk_io_channel *channel);
 
 struct spdk_io_channel	*spdk_bs_get_hub_channel(struct spdk_io_channel *ch);
 bool spdk_bs_set_hub_channel(struct spdk_io_channel *ch, struct spdk_io_channel *hub_ch, void *desc);
-void spdk_bs_drain_channel_queued(struct spdk_blob_store *bs, spdk_drain_op_submit_handle submit_cb,
-						 spdk_drain_op_cpl cb_fn, void *cb_arg);
+void spdk_bs_drain_channel_queued(struct spdk_blob_store *bs, struct spdk_hublvol_channels *ch_list,
+                             int count, spdk_drain_op_cpl cb_fn, void *cb_arg);
 
 /**
  * Write data to a blob.

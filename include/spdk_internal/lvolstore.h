@@ -146,6 +146,7 @@ struct spdk_lvol_store {
 	TAILQ_HEAD(, spdk_lvol)		pending_update_lvols;
 	TAILQ_HEAD(, spdk_pending_iorsp)   pending_iorsp;
 	TAILQ_HEAD(, spdk_lvol)		pending_delete_requests;
+	TAILQ_HEAD(, spdk_hublvol_channels)	hublvol_channels;
 	bool is_deletion_in_progress;
 	bool				queue_failed_rsp;
 	bool				load_esnaps;
@@ -212,6 +213,7 @@ struct spdk_lvol {
 struct lvol_store_bdev *vbdev_lvol_store_first(void);
 struct lvol_store_bdev *vbdev_lvol_store_next(struct lvol_store_bdev *prev);
 void spdk_change_redirect_state(struct spdk_lvol_store *lvs, bool disconnected);
+void spdk_lvs_store_hublvol_channel(struct spdk_lvol_store *lvs, struct spdk_io_channel *ch);
 void spdk_trigger_failover(struct spdk_lvol_store *lvs);
 void spdk_lvol_resize(struct spdk_lvol *lvol, uint64_t sz, spdk_lvol_op_complete cb_fn,
 		      void *cb_arg);
