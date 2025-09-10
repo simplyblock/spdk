@@ -52,6 +52,7 @@ DEFINE_STUB_V(spdk_lvs_grow_live, (struct spdk_lvol_store *lvs,
 DEFINE_STUB_V(spdk_change_redirect_state, (struct spdk_lvol_store *lvs, bool disconnect));
 DEFINE_STUB_V(spdk_lvs_check_active_process, (struct spdk_lvol_store *lvs, struct spdk_lvol *lvol, uint8_t type));
 DEFINE_STUB_V(spdk_sub_stat_ext, (struct spdk_io_channel *ch));
+DEFINE_STUB_V(spdk_lvs_store_hublvol_channel, (struct spdk_lvol_store *lvs, struct spdk_io_channel *ch));
 DEFINE_STUB_V(spdk_add_stat_ext, (struct spdk_io_channel *ch));
 DEFINE_STUB(spdk_bdev_get_memory_domains, int, (struct spdk_bdev *bdev,
 		struct spdk_memory_domain **domains, int array_size), 0);

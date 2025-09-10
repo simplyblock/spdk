@@ -1412,7 +1412,8 @@ vbdev_redirect_request_to_hublvol(struct spdk_lvol *lvol, struct spdk_io_channel
 		if (!hub_ch) {
 			hub_ch = spdk_bdev_get_io_channel(hub_dev->desc);
 			// SPDK_NOTICELOG("1 Hublvol channel %p ref count %d.\n", hub_ch, spdk_io_channel_get_ref_count(hub_ch));
-			if (spdk_io_channel_get_ref_count(hub_ch) < 2) {
+			if (hub_ch && spdk_io_channel_get_ref_count(hub_ch) == 1) {
+				spdk_lvs_store_hublvol_channel(lvs, hub_ch);
 				hub_ch = spdk_bdev_get_io_channel(hub_dev->desc);
 			}
 			// SPDK_NOTICELOG("2 Hublvol channel %p ref count %d.\n", hub_ch, spdk_io_channel_get_ref_count(hub_ch));

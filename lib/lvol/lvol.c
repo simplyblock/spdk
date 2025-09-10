@@ -79,6 +79,7 @@ lvs_alloc(void)
 	TAILQ_INIT(&lvs->pending_update_lvols);
 	TAILQ_INIT(&lvs->pending_iorsp);
 	TAILQ_INIT(&lvs->pending_delete_requests);
+	TAILQ_INIT(&lvs->hublvol_channels);
 	lvs->is_deletion_in_progress = false;
 	lvs->queue_failed_rsp = false;
 
@@ -2996,6 +2997,34 @@ block_port(int port) {
 	}
 }
 
+void
+spdk_lvs_store_hublvol_channel(struct spdk_lvol_store *lvs, struct spdk_io_channel *channel)
+{
+    struct spdk_hublvol_channels *hublvol_ch;
+
+    pthread_mutex_lock(&g_lvol_stores_mutex);
+
+    TAILQ_FOREACH(hublvol_ch, &lvs->hublvol_channels, entry) {
+        if (hublvol_ch->ch == channel) {
+            pthread_mutex_unlock(&g_lvol_stores_mutex);
+            return;
+        }
+    }
+
+    hublvol_ch = calloc(1, sizeof(*hublvol_ch));
+    if (!hublvol_ch) {
+        SPDK_ERRLOG("Cannot allocate memory for hublvol_ch.\n");
+        pthread_mutex_unlock(&g_lvol_stores_mutex);
+        return;
+    }
+
+    hublvol_ch->ch = channel;
+    hublvol_ch->thread = spdk_get_thread();
+    TAILQ_INSERT_TAIL(&lvs->hublvol_channels, hublvol_ch, entry);
+
+    pthread_mutex_unlock(&g_lvol_stores_mutex);
+}
+
 bool
 spdk_lvs_queued_rsp(struct spdk_lvol_store *lvs, struct spdk_bdev_io *bdev_io)
 {
@@ -3208,12 +3237,19 @@ static void
 spdk_delayed_close_hub_bdev(void *arg)
 {
 	struct spdk_lvol_store *lvs = arg;
+	struct spdk_hublvol_channels *hublvol_ch, *tmp;
 	if (lvs->hub_dev.desc) {
 		spdk_bdev_close(lvs->hub_dev.desc);
 		lvs->hub_dev.desc = NULL;
 	}
 
 	pthread_mutex_lock(&g_lvol_stores_mutex);
+	TAILQ_FOREACH_SAFE(hublvol_ch, &lvs->hublvol_channels, entry, tmp) {
+		if (hublvol_ch) {
+			TAILQ_REMOVE(&lvs->hublvol_channels, hublvol_ch, entry);
+			free(hublvol_ch);
+		}
+	}
 	lvs->hub_dev.drain_in_action = false;
 	lvs->hub_dev.dev_in_remove = false;
 	pthread_mutex_unlock(&g_lvol_stores_mutex);	
@@ -3230,6 +3266,8 @@ static int
 spdk_wait_for_redirected_io_cleanup(void *arg)
 {
 	struct spdk_lvol_store *lvs = arg;
+	struct spdk_hublvol_channels *hub_ch_list, *hublvol_ch = NULL;
+	int len = 0;
 
 	if (__atomic_load_n(&lvs->hub_dev.redirected_io_count, __ATOMIC_SEQ_CST) == 0) {
 		SPDK_NOTICELOG("All redirected I/Os completed. Proceeding to cleanup.\n");
@@ -3237,7 +3275,27 @@ spdk_wait_for_redirected_io_cleanup(void *arg)
 		lvs->hub_dev.cleanup_poller = NULL;
 		spdk_poller_unregister(&lvs->redirect_poller);
 		lvs->redirect_poller = NULL;
-		spdk_bs_drain_channel_queued(lvs->blobstore, lvs->hub_dev.submit_cb, spdk_trigger_failover_cpl, lvs);
+
+		TAILQ_FOREACH(hublvol_ch, &lvs->hublvol_channels, entry) {
+			len++;
+		}
+
+		if (len > 0) {
+			hub_ch_list = calloc(len, sizeof(*hub_ch_list));
+			if (!hub_ch_list) {
+				SPDK_ERRLOG("Cannot allocate memory for hub_ch_list.\n");
+				return -1;
+			}
+			/* fill */
+			size_t idx = 0;
+			TAILQ_FOREACH(hublvol_ch, &lvs->hublvol_channels, entry) {
+				hub_ch_list[idx].ch = hublvol_ch->ch;
+				hub_ch_list[idx].thread = hublvol_ch->thread;
+				idx++;
+			}
+		}
+
+		spdk_bs_drain_channel_queued(lvs->blobstore, hub_ch_list, len, spdk_trigger_failover_cpl, lvs);
 		return -1;
 	}
 
