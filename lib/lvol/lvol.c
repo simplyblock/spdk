@@ -3276,22 +3276,25 @@ spdk_wait_for_redirected_io_cleanup(void *arg)
 			len++;
 		}
 
-		if (len == 0) {
-            /* Nothing to drain — call completion directly */
-            spdk_trigger_failover_cpl(lvs, 0);
-            return -1;
-        }
-		
-		hub_ch_list = calloc(len, sizeof(*hub_ch_list));
-		if (!hub_ch_list) {
-			SPDK_ERRLOG("Cannot allocate memory for hub_ch_list.\n");
-            return SPDK_POLLER_BUSY;
+		if (len > 0) {
+			hub_ch_list = calloc(len, sizeof(*hub_ch_list));
+			if (!hub_ch_list) {
+				SPDK_ERRLOG("Cannot allocate memory for hub_ch_list.\n");
+				return SPDK_POLLER_BUSY;
+			}
 		}
 
 		spdk_poller_unregister(&lvs->hub_dev.cleanup_poller);
 		lvs->hub_dev.cleanup_poller = NULL;
 		spdk_poller_unregister(&lvs->redirect_poller);
 		lvs->redirect_poller = NULL;
+
+		if (len == 0) {
+            /* Nothing to drain — call completion directly */
+			SPDK_NOTICELOG("hublvol channels: Nothing to drain — call completion directly.\n");
+            spdk_trigger_failover_cpl(lvs, 0);
+            return -1;
+        }
 
 		/* fill */
 		size_t idx = 0;
