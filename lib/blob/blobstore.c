@@ -1957,7 +1957,7 @@ blob_load_read_extents_partial(spdk_bs_sequence_t *seq, struct spdk_blob_load_ct
 	uint64_t				lba;
 
 	ctx->next_idx_page = 0;
-	batch = bs_sequence_to_batch(seq, blob_load_cpl_extents_cpl, ctx);
+	batch = bs_sequence_to_batch(seq, 0, blob_load_cpl_extents_cpl, ctx);
 
 	for (i = ctx->next_extent_page; i < blob->active.num_extent_pages; i++) {
 		if (blob->active.extent_pages[i] != 0) {
@@ -2428,7 +2428,7 @@ blob_persist_clear_extents(spdk_bs_sequence_t *seq, struct spdk_blob_persist_ctx
 	uint64_t                        lba_count;
 	spdk_bs_batch_t                 *batch;
 
-	batch = bs_sequence_to_batch(seq, blob_persist_clear_extents_cpl, ctx);
+	batch = bs_sequence_to_batch(seq, 0, blob_persist_clear_extents_cpl, ctx);
 	lba_count = bs_byte_to_lba(bs, SPDK_BS_PAGE_SIZE);
 
 	/* Clear all extent_pages that were truncated */
@@ -2510,7 +2510,7 @@ blob_persist_clear_clusters(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		return;
 	}
 
-	batch = bs_sequence_to_batch(seq, blob_persist_clear_clusters_cpl, ctx);
+	batch = bs_sequence_to_batch(seq, blob->geometry, blob_persist_clear_clusters_cpl, ctx);
 
 	/* Clear all clusters that were truncated */
 	lba = 0;
@@ -2591,7 +2591,7 @@ blob_persist_zero_pages_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	spdk_spin_unlock(&bs->used_lock);
 	if (delete_blob) {
 		//sync md and blobids bit array
-		batch = bs_sequence_to_batch(seq, blob_persist_clear_clusters, ctx);
+		batch = bs_sequence_to_batch(seq, 0, blob_persist_clear_clusters, ctx);
 
 		uint32_t page_num;
 		len = 0;
@@ -2622,7 +2622,7 @@ blob_persist_zero_pages(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		return;
 	}
 
-	batch = bs_sequence_to_batch(seq, blob_persist_zero_pages_cpl, ctx);
+	batch = bs_sequence_to_batch(seq, 0, blob_persist_zero_pages_cpl, ctx);
 
 	lba_count = bs_byte_to_lba(bs, SPDK_BS_PAGE_SIZE);
 
@@ -2771,7 +2771,7 @@ blob_persist_write_page_chain(spdk_bs_sequence_t *seq, struct spdk_blob_persist_
 
 	lba_count = bs_byte_to_lba(bs, sizeof(*page));
 
-	batch = bs_sequence_to_batch(seq, blob_persist_write_page_root, ctx);
+	batch = bs_sequence_to_batch(seq, 0, blob_persist_write_page_root, ctx);
 
 	/* This starts at 1. The root page is not written until
 	 * all of the others are finished
@@ -6210,7 +6210,7 @@ bs_load_replay_extent_pages(struct spdk_bs_load_ctx *ctx)
 		return;
 	}
 
-	batch = bs_sequence_to_batch(ctx->seq, bs_load_replay_extent_page_cpl, ctx);
+	batch = bs_sequence_to_batch(ctx->seq, 0, bs_load_replay_extent_page_cpl, ctx);
 
 	for (i = 0; i < ctx->num_extent_pages; i++) {
 		page = ctx->extent_page_num[i];
@@ -6964,7 +6964,7 @@ bs_dump_read_md_page(spdk_bs_sequence_t *seq, void *cb_arg)
 	spdk_bs_batch_t			*batch;
 	size_t				i;
 
-	batch = bs_sequence_to_batch(seq, bs_dump_read_md_page_cpl, ctx);
+	batch = bs_sequence_to_batch(seq, 0, bs_dump_read_md_page_cpl, ctx);
 	ctx->idx_dump = 0;
 	i = ctx->cur_page;
 	for (i = 0; ctx->idx_dump < 4096 && i < ctx->super->md_len; i++) {
@@ -7442,7 +7442,7 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 		return;
 	}
 
-	batch = bs_sequence_to_batch(seq, bs_init_trim_cpl, ctx);
+	batch = bs_sequence_to_batch(seq, 0, bs_init_trim_cpl, ctx);
 
 	/* Clear metadata space */
 	bs->w_io++;
@@ -11443,7 +11443,7 @@ blob_clear_clusters_async(spdk_bs_sequence_t *seq, struct spdk_blob	*blob)
 	uint64_t			lba;
 	uint64_t			lba_count;
 
-	batch = bs_sequence_to_batch(seq, blob_clear_clusters_async_cpl, blob);
+	batch = bs_sequence_to_batch(seq, blob->geometry, blob_clear_clusters_async_cpl, blob);
 
 	/* Clear all clusters that were truncated */
 	lba = 0;
@@ -11665,7 +11665,7 @@ bs_cleanup_allocated_clusters(struct cleanup_bs_ctx *ctx)
 	uint64_t			lba;
 	uint64_t			lba_count;
 
-	batch = bs_sequence_to_batch(ctx->seq, bs_release_allocated_clusters, ctx);
+	batch = bs_sequence_to_batch(ctx->seq, 0, bs_release_allocated_clusters, ctx);
 	batch->u.batch.is_unmap = true;	
 	/* Clear all clusters that were truncated */
 	lba = 0;
@@ -12236,7 +12236,7 @@ blob_free_cluster_clear_ep_cb(void *arg, int bserrno)
 		return;
 	}
 
-	batch = bs_sequence_to_batch(seq, blob_write_zero_extent_page_cpl, ctx);
+	batch = bs_sequence_to_batch(seq, 0, blob_write_zero_extent_page_cpl, ctx);
 	uint64_t lba_count = bs_byte_to_lba(bs, SPDK_BS_PAGE_SIZE);
 	uint64_t lba = bs_md_page_to_lba(blob->bs,  ctx->extent_page);
 	bs->w_io++;
@@ -14066,7 +14066,7 @@ bs_update_replay_extent_pages(struct spdk_bs_update_ctx *ctx)
 		return;
 	}
 
-	batch = bs_sequence_to_batch(ctx->seq, bs_update_replay_extent_page_cpl, ctx);
+	batch = bs_sequence_to_batch(ctx->seq, 0, bs_update_replay_extent_page_cpl, ctx);
 
 	for (i = 0; i < ctx->num_extent_pages; i++) {
 		page = ctx->extent_page_num[i];

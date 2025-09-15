@@ -120,7 +120,8 @@ struct spdk_bs_request_set {
 			spdk_bs_sequence_cpl	cb_fn;
 			void			*cb_arg;
 			/* unmap io number inflight */
-			bool			is_unmap;		
+			bool			is_unmap;
+			uint8_t			geometry;
 			TAILQ_HEAD(unmap_io_queue, limit) unmap_queue;
 		} batch;
 
@@ -207,7 +208,7 @@ void bs_batch_write_zeroes_dev(spdk_bs_batch_t *batch,
 
 void bs_batch_close(spdk_bs_batch_t *batch);
 
-spdk_bs_batch_t *bs_sequence_to_batch(spdk_bs_sequence_t *seq,
+spdk_bs_batch_t *bs_sequence_to_batch(spdk_bs_sequence_t *seq, uint8_t geometry,
 				      spdk_bs_sequence_cpl cb_fn,
 				      void *cb_arg);
 
