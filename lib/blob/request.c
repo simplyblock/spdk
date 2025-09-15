@@ -153,6 +153,7 @@ bs_sequence_read_bs_dev(spdk_bs_sequence_t *seq, struct spdk_bs_dev *bs_dev,
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
 	bs_dev->priority_class = set->priority_class;
+	bs_dev->geometry = set->geometry;
 
 	bs_dev->read(bs_dev, back_channel, payload, lba, lba_count, &set->cb_args);
 }
@@ -171,6 +172,7 @@ bs_sequence_read_dev(spdk_bs_sequence_t *seq, void *payload,
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
 	channel->dev->priority_class = set->priority_class;
+	channel->dev->geometry = set->geometry;
 
 	channel->dev->read(channel->dev, channel->dev_channel, payload, lba, lba_count, &set->cb_args);
 }
@@ -189,6 +191,7 @@ bs_sequence_write_dev(spdk_bs_sequence_t *seq, void *payload,
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
 	channel->dev->priority_class = set->priority_class;
+	channel->dev->geometry = set->geometry;
 
 	channel->dev->write(channel->dev, channel->dev_channel, payload, lba, lba_count,
 			    &set->cb_args);
@@ -209,6 +212,7 @@ bs_sequence_readv_bs_dev(spdk_bs_sequence_t *seq, struct spdk_bs_dev *bs_dev,
 	set->u.sequence.cb_arg = cb_arg;
 
 	bs_dev->priority_class = set->priority_class;
+	bs_dev->geometry = set->geometry;
 	if (set->ext_io_opts) {
 		assert(bs_dev->readv_ext);
 		bs_dev->readv_ext(bs_dev, back_channel, iov, iovcnt, lba, lba_count,
@@ -231,6 +235,7 @@ bs_sequence_readv_dev(spdk_bs_sequence_t *seq, struct iovec *iov, int iovcnt,
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
 	channel->dev->priority_class = set->priority_class;
+	channel->dev->geometry = set->geometry;
 	
 	if (set->ext_io_opts) {
 		assert(channel->dev->readv_ext);
@@ -255,6 +260,7 @@ bs_sequence_writev_dev(spdk_bs_sequence_t *seq, struct iovec *iov, int iovcnt,
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
 	channel->dev->priority_class = set->priority_class;
+	channel->dev->geometry = set->geometry;
 
 	if (set->ext_io_opts) {
 		assert(channel->dev->writev_ext);
@@ -280,6 +286,7 @@ bs_sequence_write_zeroes_dev(spdk_bs_sequence_t *seq,
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
 	channel->dev->priority_class = set->priority_class;
+	channel->dev->geometry = set->geometry;
 
 	channel->dev->write_zeroes(channel->dev, channel->dev_channel, lba, lba_count,
 				   &set->cb_args);
@@ -298,6 +305,7 @@ bs_sequence_copy_dev(spdk_bs_sequence_t *seq, uint64_t dst_lba, uint64_t src_lba
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
 	channel->dev->priority_class = set->priority_class;
+	channel->dev->geometry = set->geometry;
 
 	channel->dev->copy(channel->dev, channel->dev_channel, dst_lba, src_lba, lba_count, &set->cb_args);
 }
@@ -337,6 +345,7 @@ bs_batch_completion(struct spdk_io_channel *_channel,
 			assert(ctx != NULL);
 			TAILQ_REMOVE(&set->u.batch.unmap_queue, ctx, entries); // Remove it from the queue.			
 			channel->dev->priority_class = set->priority_class;
+			channel->dev->geometry = set->geometry;
 			if (spdk_likely(channel->bs->is_leader)) {
 				channel->dev->unmap(channel->dev, channel->dev_channel, ctx->lba, ctx->lba_count,
 						&set->cb_args);
@@ -391,6 +400,7 @@ bs_batch_open(struct spdk_io_channel *_channel, struct spdk_bs_cpl *cpl, struct 
 	set->u.batch.batch_closed = 0;
 
 	set->priority_class = blob->priority_class;
+	set->geometry = blob->geometry;
 	set->cb_args.cb_fn = bs_batch_completion;
 	set->cb_args.cb_arg = set;
 	set->cb_args.channel = channel->dev_channel;
@@ -425,6 +435,7 @@ bs_batch_read_dev(spdk_bs_batch_t *batch, void *payload,
 
 	set->u.batch.outstanding_ops++;
 	channel->dev->priority_class = batch->priority_class;
+	channel->dev->geometry = batch->geometry;
 	channel->dev->read(channel->dev, channel->dev_channel, payload, lba, lba_count, &set->cb_args);
 }
 
@@ -439,6 +450,7 @@ bs_batch_write_dev(spdk_bs_batch_t *batch, void *payload,
 
 	set->u.batch.outstanding_ops++;
 	channel->dev->priority_class = batch->priority_class;
+	channel->dev->geometry = batch->geometry;
 	channel->dev->write(channel->dev, channel->dev_channel, payload, lba, lba_count,
 			    &set->cb_args);
 }
@@ -468,6 +480,7 @@ bs_batch_unmap_dev(spdk_bs_batch_t *batch,
 out:
 	set->u.batch.outstanding_ops++;	
 	channel->dev->priority_class = batch->priority_class;
+	channel->dev->geometry = batch->geometry;
 	if (spdk_likely(channel->bs->is_leader)) {
 		channel->dev->unmap(channel->dev, channel->dev_channel, lba, lba_count,
 					&set->cb_args);
@@ -488,6 +501,7 @@ bs_batch_write_zeroes_dev(spdk_bs_batch_t *batch,
 
 	set->u.batch.outstanding_ops++;
 	channel->dev->priority_class = batch->priority_class;
+	channel->dev->geometry = batch->geometry;
 	if (spdk_likely(channel->bs->is_leader)) {
 		channel->dev->write_zeroes(channel->dev, channel->dev_channel, lba, lba_count,
 				   	&set->cb_args);

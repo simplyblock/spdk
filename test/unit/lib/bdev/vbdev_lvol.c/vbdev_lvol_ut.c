@@ -72,6 +72,7 @@ DEFINE_STUB(spdk_bs_set_hub_channel, bool, (struct spdk_io_channel *ch, struct s
 DEFINE_STUB(spdk_blob_get_num_allocated_clusters, uint64_t, (struct spdk_blob *blob), 0);
 DEFINE_STUB(spdk_blob_get_id, uint64_t, (struct spdk_blob *blob), 0);
 DEFINE_STUB(spdk_blob_get_map_id, uint16_t, (struct spdk_blob *blob), 0);
+DEFINE_STUB(spdk_blob_get_geometry, uint8_t, (struct spdk_blob *blob), 0);
 DEFINE_STUB(spdk_blob_get_open_ref, uint32_t, (struct spdk_blob *blob), 0);
 DEFINE_STUB(spdk_lvol_copy_blob, int, (struct spdk_lvol *lvol), 0);
 DEFINE_STUB(spdk_bdev_writev_blocks_ext, int,

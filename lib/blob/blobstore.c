@@ -299,7 +299,7 @@ spdk_blob_open_opts_init(struct spdk_blob_open_opts *opts, size_t opts_size)
 	SET_FIELD(clear_method, BLOB_CLEAR_WITH_DEFAULT);
 
 #undef FIELD_OK
-#undef SET_FILED
+#undef SET_FIELD
 }
 
 static struct spdk_blob *
@@ -328,7 +328,8 @@ blob_alloc(struct spdk_blob_store *bs, spdk_blob_id id)
 	}
 
 	blob->active.pages[0] = bs_blobid_to_page(id);
-
+	blob->geometry = 0;
+	blob->map_id = 0;
 	TAILQ_INIT(&blob->xattrs);
 	TAILQ_INIT(&blob->xattrs_internal);
 	TAILQ_INIT(&blob->pending_persists);

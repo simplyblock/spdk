@@ -216,6 +216,7 @@ struct spdk_bs_dev {
 	void (*destroy)(struct spdk_bs_dev *dev);
 
 	int priority_class;
+	uint8_t geometry;
 
 	void (*read)(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
 		     uint64_t lba, uint32_t lba_count,
@@ -565,6 +566,15 @@ spdk_blob_id spdk_blob_get_id(struct spdk_blob *blob);
  * \return map id.
  */
 uint16_t spdk_blob_get_map_id(struct spdk_blob *blob);
+
+/**
+ * Get the geometry of the blob.
+ *
+ * \param blob Blob struct to query.
+ *
+ * \return geometry.
+ */
+uint8_t spdk_blob_get_geometry(struct spdk_blob *blob);
 
 /**
  * Get the blob open ref.

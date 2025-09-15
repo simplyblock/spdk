@@ -2117,6 +2117,7 @@ rpc_dump_lvol(struct spdk_json_write_ctx *w, struct spdk_lvol *lvol)
 				     spdk_blob_get_num_allocated_clusters(lvol->blob));
 	spdk_json_write_named_uint64(w, "blobid", spdk_blob_get_id(lvol->blob));
 	spdk_json_write_named_uint64(w, "map_id", lvol->map_id);
+	spdk_json_write_named_uint8(w, "geometry", spdk_blob_get_geometry(lvol->blob));
 	spdk_json_write_named_uint32(w, "open_ref", spdk_blob_get_open_ref(lvol->blob));
 	spdk_json_write_named_object_begin(w, "lvs");
 	spdk_json_write_named_string(w, "name", lvs->name);

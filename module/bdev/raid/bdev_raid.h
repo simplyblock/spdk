@@ -126,7 +126,8 @@ struct raid_bdev_io {
 	/* The raid bdev associated with this IO */
 	struct raid_bdev *raid_bdev;
 
-	int8_t priority_class; /* priority class of the parent SPDK blob and lvol who submitted this I/O request */
+	uint8_t priority_class; /* priority class of the parent SPDK blob and lvol who submitted this I/O request */
+	uint8_t geometry; /* geometry of the parent SPDK blob and lvol who submitted this I/O request */
 	uint64_t offset_blocks;
 	uint64_t num_blocks;
 	struct iovec *iovs;
@@ -420,9 +421,10 @@ static inline int
 raid_bdev_readv_blocks_ext(struct raid_base_bdev_info *base_info, struct spdk_io_channel *ch,
 			   struct iovec *iov, int iovcnt, uint64_t offset_blocks,
 			   uint64_t num_blocks, spdk_bdev_io_completion_cb cb, void *cb_arg,
-			   struct spdk_bdev_ext_io_opts *opts, int8_t priority_class)
+			   struct spdk_bdev_ext_io_opts *opts, uint8_t priority_class,
+			   uint8_t geometry)
 {
-	const uint64_t priority_lba = ((uint64_t)priority_class << PRIORITY_CLASS_BITS_POS) | (base_info->data_offset + offset_blocks);
+	const uint64_t priority_lba = ((uint64_t)priority_class << PRIORITY_CLASS_BITS_POS) | ((uint64_t)geometry << GEOMETRY_BITS_POS) | (base_info->data_offset + offset_blocks);
 
 	return spdk_bdev_readv_blocks_ext(base_info->desc, ch, iov, iovcnt,
 					  priority_lba, num_blocks, cb, cb_arg, opts);
@@ -435,7 +437,7 @@ static inline int
 raid_bdev_writev_blocks_ext(struct raid_base_bdev_info *base_info, struct spdk_io_channel *ch,
 			    struct iovec *iov, int iovcnt, uint64_t offset_blocks,
 			    uint64_t num_blocks, spdk_bdev_io_completion_cb cb, void *cb_arg,
-			    struct spdk_bdev_ext_io_opts *opts, int8_t priority_class)
+			    struct spdk_bdev_ext_io_opts *opts, int8_t priority_class, uint8_t geometry)
 {
 	int rc;
 	uint64_t remapped_offset_blocks = base_info->data_offset + offset_blocks;
@@ -449,7 +451,7 @@ raid_bdev_writev_blocks_ext(struct raid_base_bdev_info *base_info, struct spdk_i
 		}
 	}
 
-	const uint64_t priority_lba = ((uint64_t)priority_class << PRIORITY_CLASS_BITS_POS) | remapped_offset_blocks;
+	const uint64_t priority_lba = ((uint64_t)priority_class << PRIORITY_CLASS_BITS_POS) | ((uint64_t)geometry << GEOMETRY_BITS_POS) | remapped_offset_blocks;
 
 	return spdk_bdev_writev_blocks_ext(base_info->desc, ch, iov, iovcnt,
 					   priority_lba, num_blocks, cb, cb_arg, opts);
@@ -464,7 +466,8 @@ raid_bdev_unmap_blocks(struct raid_base_bdev_info *base_info, struct spdk_io_cha
 		       spdk_bdev_io_completion_cb cb, void *cb_arg)
 {
 	const int priority_class = ((struct raid_bdev_io*)cb_arg)->priority_class;
-	const uint64_t priority_lba = ((uint64_t)priority_class << PRIORITY_CLASS_BITS_POS) | (base_info->data_offset + offset_blocks);
+	const uint8_t geometry = ((struct raid_bdev_io*)cb_arg)->geometry;
+	const uint64_t priority_lba = ((uint64_t)priority_class << PRIORITY_CLASS_BITS_POS) | ((uint64_t)geometry << GEOMETRY_BITS_POS) | (base_info->data_offset + offset_blocks);
 
 	return spdk_bdev_unmap_blocks(base_info->desc, ch, priority_lba,
 				      num_blocks, cb, cb_arg);
@@ -479,7 +482,8 @@ raid_bdev_flush_blocks(struct raid_base_bdev_info *base_info, struct spdk_io_cha
 		       spdk_bdev_io_completion_cb cb, void *cb_arg)
 {
 	const int priority_class = ((struct raid_bdev_io*)cb_arg)->priority_class;
-	const uint64_t priority_lba = ((uint64_t)priority_class << PRIORITY_CLASS_BITS_POS) | (base_info->data_offset + offset_blocks);
+	const uint8_t geometry = ((struct raid_bdev_io*)cb_arg)->geometry;
+	const uint64_t priority_lba = ((uint64_t)priority_class << PRIORITY_CLASS_BITS_POS) | ((uint64_t)geometry << GEOMETRY_BITS_POS) | (base_info->data_offset + offset_blocks);
 
 	return spdk_bdev_flush_blocks(base_info->desc, ch, priority_lba,
 				      num_blocks, cb, cb_arg);
