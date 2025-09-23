@@ -14,6 +14,7 @@
 #include "spdk/cpuset.h"
 #include "spdk_internal/thread.h"
 #include "spdk/nvmf.h"
+#include "spdk/cpuset.h"
 
 /* Default blob channel opts for lvol */
 #define SPDK_LVOL_BLOB_OPTS_CHANNEL_OPS 12000
