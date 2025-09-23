@@ -132,6 +132,88 @@ struct spdk_redirect_dev {
 	bool drain_in_action;
 };
 
+enum xfer_status {
+	XFER_NONE = 0,
+	XFER_IN_PROGRESS,
+	XFER_DONE,
+	XFER_FAILED,
+};
+
+struct spdk_transfer_dev {
+	struct spdk_bdev_desc	*desc;
+	char bdev_name[SPDK_LVOL_NAME_MAX];
+	struct spdk_thread		*thread;
+	struct spdk_poller *cleanup_poller;
+	uint64_t transfered_io_count;
+	enum hublvol_state	state;
+	uint64_t out_standing_io;
+	bool reused;
+	bool dev_in_remove;
+	bool drain_in_action;
+	bool pg[20];
+	struct spdk_lvol_store	*lvs;
+	TAILQ_ENTRY(spdk_transfer_dev)	entry;
+};
+
+struct remote_lvol_info {
+	bool status; // true - connected, false - disconnected
+	struct spdk_bdev_desc	*desc;
+	char *bdev_name;
+	bool reused;
+	struct spdk_io_channel	*channel;
+	struct spdk_lvs_poll_group *group;
+	struct spdk_poller *cleanup_poller;
+	uint64_t outstanding_io;
+	struct spdk_ring *free_ring;     /* tasks available for this snapshot */
+    struct spdk_ring *ready_ring;    /* tasks ready to send to remote lvol */
+	TAILQ_ENTRY(remote_lvol_info)	entry;
+};
+
+struct spdk_lvs_poll_group {
+	TAILQ_HEAD(, remote_lvol_info)	rmt_lvols;
+	// struct spdk_lvs_poll_group	*next;
+	struct spdk_thread	*thread;
+	struct spdk_thread	*md_thread;
+	struct spdk_poller 	*xfer_poller;
+	const char *thread_name;
+	int id;
+	TAILQ_ENTRY(spdk_lvs_poll_group)	entry;
+};
+
+struct remove_event {
+	struct spdk_lvs_poll_group *lpg;
+	struct spdk_transfer_dev *tdev;
+	struct remote_lvol_info *rmt_lvol;
+	char *bdev_name;
+};
+
+struct spdk_lvs_xfer_req {
+	int status;
+	enum xfer_type   type;
+	uint64_t offset;
+	uint64_t len;
+	void *payload;
+	struct remote_lvol_info *rmt_lvol;
+	struct spdk_lvs_xfer *xfer;
+	TAILQ_ENTRY(spdk_lvs_xfer_req)	entry;
+};
+
+struct spdk_lvs_xfer {	
+	struct spdk_lvol		*lvol;
+	struct spdk_lvs_xfer_req *reqs;
+	void *pdus;
+	struct spdk_ring *free_ring;     /* tasks available for this snapshot */
+    struct spdk_ring *ready_ring;    /* tasks ready to send to remote lvol */
+	enum xfer_type   type;
+	int	cluster_batch;
+	uint64_t outstanding_io;
+	uint64_t current_offset;
+	uint64_t timeout;
+	struct spdk_poller 	*tmo_poller;
+	char bdev_name[SPDK_LVOL_NAME_MAX];
+	TAILQ_ENTRY(spdk_lvs_xfer)	entry;
+};
+
 struct spdk_lvol_store {
 	struct spdk_bs_dev		*bs_dev;
 	struct spdk_blob_store		*blobstore;
@@ -139,6 +221,7 @@ struct spdk_lvol_store {
 	spdk_blob_id			super_blob_id;
 	struct spdk_uuid		uuid;
 	int				lvol_count;
+	uint8_t				id;
 	int				lvols_opened;
 	TAILQ_HEAD(, spdk_lvol)		lvols;
 	TAILQ_HEAD(, spdk_lvol)		pending_lvols;
@@ -147,6 +230,7 @@ struct spdk_lvol_store {
 	TAILQ_HEAD(, spdk_pending_iorsp)   pending_iorsp;
 	TAILQ_HEAD(, spdk_lvol)		pending_delete_requests;
 	TAILQ_HEAD(, spdk_hublvol_channels)	hublvol_channels;
+	TAILQ_HEAD(, spdk_transfer_dev)	transfer_devs;
 	bool is_deletion_in_progress;
 	bool				queue_failed_rsp;
 	bool				load_esnaps;
@@ -174,7 +258,7 @@ struct spdk_lvol_store {
 	struct spdk_poller *hublvol_poller;
 	uint64_t			total_io;
 	uint64_t			current_io;
-	struct spdk_lvs_redirect lvol_map;	
+	struct spdk_lvs_redirect lvol_map;
 	struct spdk_redirect_dev hub_dev;
 	char	remote_bdev[SPDK_LVOL_NAME_MAX];
 };
@@ -208,6 +292,10 @@ struct spdk_lvol {
 	struct spdk_lvs_degraded_lvol_set *degraded_set;
 	TAILQ_ENTRY(spdk_lvol)		degraded_link;
 	TAILQ_HEAD(, spdk_pending_iorsp)   redirected_io;
+
+	enum xfer_status transfer_status;
+	uint64_t last_offset;
+	uint64_t current_offset;
 };
 
 struct lvol_store_bdev *vbdev_lvol_store_first(void);

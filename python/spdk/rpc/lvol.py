@@ -169,6 +169,26 @@ def bdev_lvol_create(client, lvol_name, size_in_mib, thin_provision=False, uuid=
     params['lvol_priority_class'] = lvol_priority_class
     return client.call('bdev_lvol_create', params)
 
+def bdev_lvol_trnasfer(client, name=None, offset=0, cluster_batch=16, gateway=None, operation=None):
+    """Replicate a logical volume on a logical volume store.
+
+    Args:
+        name: Name of the logical volume to replicate (required)
+        offset: Starting offset to replicate (default: 0)
+        cluster_batch: elements count in the queue between pollers
+        gateway: Name of the gateway to use for transfer (required)
+        operation: action type to be useed for transfer (required)
+    """
+    if not name:
+        raise ValueError("Name must be specified")
+    if not gateway:
+        raise ValueError("Gateway must be specified")
+    if not operation:
+        raise ValueError("Operation must be specified")
+    
+    params = {'name': name, 'offset': offset, 'cluster_batch': cluster_batch, 'gateway': gateway, 'operation': operation}
+    return client.call('bdev_lvol_trnasfer', params)
+
 def bdev_lvol_create_hublvol(client, uuid=None, lvs_name=None):
     """Create a logical volume on a logical volume store.
 
@@ -605,6 +625,21 @@ def bdev_lvol_set_lvs_opts(client, uuid=None, lvs_name=None, groupid=0, subsyste
     if lvs_name:
         params['lvs_name'] = lvs_name
     return client.call('bdev_lvol_set_lvs_opts', params)
+
+def bdev_lvol_create_poller_group(client, cpu_mask=None):
+    """create poller group for lvolstores.
+
+    Args:
+        cpu_mask: mask of cpu cores to create thread for poller group in case of replicate and migrate
+        
+    Either uuid or lvs_name may be specified, but not both.
+    If both uuid and lvs_name are omitted, information about all logical volume stores is returned.
+    """
+    if not cpu_mask:
+        raise ValueError("cpu mask must be specified")
+     
+    params = {'mask': cpu_mask}    
+    return client.call('bdev_lvol_create_poller_group', params)
 
 def bdev_lvol_connect_hublvol(client, uuid=None, lvs_name=None, remote_bdev=''):
     """Connect to the hub lvol.

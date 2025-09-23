@@ -4359,6 +4359,18 @@ spdk_bs_get_hub_channel(struct spdk_io_channel *ch)
 }
 
 bool
+spdk_blob_get_offset_allocate(struct spdk_blob *blob, uint64_t offset) {
+	return bs_io_unit_is_allocated(blob, offset);
+}
+
+bool
+spdk_blob_check_offset_valid(struct spdk_blob *blob, uint64_t offset, uint64_t length) {
+	if (offset + length > bs_cluster_to_lba(blob->bs, blob->active.num_clusters)) 
+		return false;
+	return true;
+}
+
+bool
 spdk_bs_set_hub_channel(struct spdk_io_channel *ch, struct spdk_io_channel *hub_ch, void *desc)
 {
 	struct spdk_bs_channel *bs_channel = spdk_io_channel_get_ctx(ch);
@@ -14730,6 +14742,45 @@ spdk_blob_is_degraded(const struct spdk_blob *blob)
 	}
 
 	return blob->back_bs_dev->is_degraded(blob->back_bs_dev);
+}
+
+static void
+spdk_xfer_read_cluster_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno) {
+	bs_sequence_finish(seq, bserrno);
+}
+
+int
+spdk_read_cluster_data_xfer(struct spdk_blob *blob, void *buf, uint64_t lba, uint64_t lba_len, enum xfer_type type, 
+					spdk_blob_op_complete cb_fn, void *cb_arg) {
+	struct spdk_blob_store	*bs = blob->bs;
+	struct spdk_bs_cpl	cpl;
+	spdk_bs_sequence_t			*seq;
+	spdk_bs_batch_t             *batch;
+
+	cpl.type = SPDK_BS_CPL_TYPE_BLOB_BASIC;
+	cpl.u.blob_basic.cb_fn = cb_fn;
+	cpl.u.blob_basic.cb_arg = cb_arg;
+
+	seq = bs_sequence_start_bs(blob->bs->md_channel, &cpl);
+	if (!seq) {
+		SPDK_NOTICELOG("FAILED on get seq 2 op blob: %" PRIu64 " \n", blob->id);
+		return -ENOMEM;
+	}
+
+	batch = bs_sequence_to_batch(seq, blob->geometry, spdk_xfer_read_cluster_cpl, NULL);
+	bs->r_io++;	
+	if (type == XFER_MIGRATIE_SNAPSHOT) {
+		uint64_t m = 1;
+		uint64_t mlba = m << 51 | lba;
+		bs_batch_read_dev(batch, buf, mlba, bs_byte_to_lba(bs, SPDK_BS_PAGE_SIZE));
+	} else {
+		// byte to lba = block cnt -> block_cnt in 4k * page per cluster = bs_io_unit_to_back_dev_lba(blob, lba_len)		
+		bs_batch_read_dev(batch, buf, lba, bs_io_unit_to_back_dev_lba(blob, lba_len));
+	}
+
+	bs_batch_close(batch);
+
+	return 0;
 }
 
 void

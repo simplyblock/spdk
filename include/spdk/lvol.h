@@ -23,6 +23,7 @@ extern "C" {
 struct spdk_bs_dev;
 struct spdk_lvol_store;
 struct spdk_lvol;
+struct spdk_lvs_xfer;
 
 enum lvol_clear_method {
 	LVOL_CLEAR_WITH_DEFAULT = BLOB_CLEAR_WITH_DEFAULT,
@@ -326,6 +327,11 @@ void spdk_lvs_set_read_only(struct spdk_lvol_store *lvs, bool status);
 void spdk_lvs_set_failed_on_update(struct spdk_lvol_store *lvs, bool state);
 int spdk_lvs_IO_redirect(void * cb_arg);
 int spdk_lvs_IO_hublvol(void *cb_arg);
+
+int spdk_lvs_poll_group_options(char *mask);
+struct spdk_transfer_dev *spdk_open_rmt_bdev(const char *name, struct spdk_lvol_store *lvs);
+int spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, 
+			uint32_t cluster_batch, enum xfer_type type, struct spdk_transfer_dev *tdev);
 /**
  * Get the lvol that has a particular UUID.
  *
