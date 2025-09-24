@@ -3,8 +3,8 @@
 
 
 #define NBITS_PRIORITY_CLASS 3
-#define NBITS_GEOMETRY      4
-#define NBITS_USED          7
+#define NBITS_GEOMETRY      5
+#define NBITS_USED          8
 
 /* shift priority class value left by this to get the OR-mask or shift right by this after applying the priority 
 class mask PRIORITY_CLASS_MASK to get the priority class as an integer
