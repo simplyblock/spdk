@@ -14989,6 +14989,7 @@ spdk_read_cluster_data_xfer(struct spdk_blob *blob, void *buf, uint64_t offset, 
 	return 0;
 }
 
+
 void
 spdk_blob_set_io_priority_class(struct spdk_blob* blob, int priority_class)
 {
