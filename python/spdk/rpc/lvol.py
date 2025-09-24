@@ -169,7 +169,7 @@ def bdev_lvol_create(client, lvol_name, size_in_mib, thin_provision=False, uuid=
     params['lvol_priority_class'] = lvol_priority_class
     return client.call('bdev_lvol_create', params)
 
-def bdev_lvol_trnasfer(client, name=None, offset=0, cluster_batch=16, gateway=None, operation=None):
+def bdev_lvol_transfer(client, lvol_name=None, offset=0, cluster_batch=16, gateway=None, operation=None):
     """Replicate a logical volume on a logical volume store.
 
     Args:
@@ -179,15 +179,15 @@ def bdev_lvol_trnasfer(client, name=None, offset=0, cluster_batch=16, gateway=No
         gateway: Name of the gateway to use for transfer (required)
         operation: action type to be useed for transfer (required)
     """
-    if not name:
-        raise ValueError("Name must be specified")
+    if not lvol_name:
+        raise ValueError("lvol_name must be specified")
     if not gateway:
         raise ValueError("Gateway must be specified")
     if not operation:
         raise ValueError("Operation must be specified")
     
-    params = {'name': name, 'offset': offset, 'cluster_batch': cluster_batch, 'gateway': gateway, 'operation': operation}
-    return client.call('bdev_lvol_trnasfer', params)
+    params = {'lvol_name': lvol_name, 'offset': offset, 'cluster_batch': cluster_batch, 'gateway': gateway, 'operation': operation}
+    return client.call('bdev_lvol_transfer', params)
 
 def bdev_lvol_create_hublvol(client, uuid=None, lvs_name=None):
     """Create a logical volume on a logical volume store.
@@ -638,7 +638,7 @@ def bdev_lvol_create_poller_group(client, cpu_mask=None):
     if not cpu_mask:
         raise ValueError("cpu mask must be specified")
      
-    params = {'mask': cpu_mask}    
+    params = {'cpu_mask': cpu_mask}    
     return client.call('bdev_lvol_create_poller_group', params)
 
 def bdev_lvol_connect_hublvol(client, uuid=None, lvs_name=None, remote_bdev=''):

@@ -419,8 +419,8 @@ void spdk_bs_set_read_only(struct spdk_blob_store *bs, bool state);
 
 bool spdk_blob_get_offset_allocate(struct spdk_blob *blob, uint64_t offset);
 bool spdk_blob_check_offset_valid(struct spdk_blob *blob, uint64_t offset, uint64_t length);
-int spdk_read_cluster_data_xfer(struct spdk_blob *blob, void *buf, uint64_t lba, 
-			uint64_t lba_len, enum xfer_type type, spdk_blob_op_complete cb_fn, void *cb_arg);
+int spdk_read_cluster_data_xfer(struct spdk_blob *blob, void *buf, uint64_t offset, 
+			uint64_t length, enum xfer_type type, spdk_blob_op_complete cb_fn, void *cb_arg);
 /**
  * update a blobstore according to bit array synced.
  * Can be used on loaded blobstore, even with opened blobs.

@@ -2953,42 +2953,42 @@ cleanup:
 SPDK_RPC_REGISTER("bdev_lvol_set_priority_class", rpc_bdev_lvol_set_priority_class,
 		  SPDK_RPC_RUNTIME)
 
-struct rpc_bdev_lvol_trnasfer {
+struct rpc_bdev_lvol_transfer {
 	char *lvol_name;
 	uint64_t offset;
 	uint32_t cluster_batch;
-	char *bdev_name;
+	char *gateway;
 	char *operation;
 };
 
 static void 
-free_rpc_bdev_lvol_trnasfer(struct rpc_bdev_lvol_trnasfer *req) {
+free_rpc_bdev_lvol_transfer(struct rpc_bdev_lvol_transfer *req) {
 	free(req->lvol_name);
-	free(req->bdev_name);
+	free(req->gateway);
 	free(req->operation);
 }
 
-static const struct spdk_json_object_decoder rpc_bdev_lvol_trnasfer_decoders[] = {
-	{"lvol_name", offsetof(struct rpc_bdev_lvol_trnasfer, lvol_name), spdk_json_decode_string},
-	{"offset", offsetof(struct rpc_bdev_lvol_trnasfer, offset), spdk_json_decode_uint64},
-	{"cluster_batch", offsetof(struct rpc_bdev_lvol_trnasfer, cluster_batch), spdk_json_decode_uint32, true},
-	{"bdev_name", offsetof(struct rpc_bdev_lvol_trnasfer, bdev_name), spdk_json_decode_string},	
-	{"operation", offsetof(struct rpc_bdev_lvol_trnasfer, operation), spdk_json_decode_string},
+static const struct spdk_json_object_decoder rpc_bdev_lvol_transfer_decoders[] = {
+	{"lvol_name", offsetof(struct rpc_bdev_lvol_transfer, lvol_name), spdk_json_decode_string},
+	{"offset", offsetof(struct rpc_bdev_lvol_transfer, offset), spdk_json_decode_uint64},
+	{"cluster_batch", offsetof(struct rpc_bdev_lvol_transfer, cluster_batch), spdk_json_decode_uint32, true},
+	{"gateway", offsetof(struct rpc_bdev_lvol_transfer, gateway), spdk_json_decode_string},	
+	{"operation", offsetof(struct rpc_bdev_lvol_transfer, operation), spdk_json_decode_string},
 };
 
 static void 
-rpc_bdev_lvol_trnasfer(struct spdk_jsonrpc_request *request,
+rpc_bdev_lvol_transfer(struct spdk_jsonrpc_request *request,
 			      const struct spdk_json_val *params) 
 {
-	struct rpc_bdev_lvol_trnasfer req = {};
+	struct rpc_bdev_lvol_transfer req = {};
 	struct spdk_lvol *lvol;
 	struct spdk_bdev *lvol_bdev;
 	struct spdk_transfer_dev *tdev;
-	enum xfer_type type;
+	enum xfer_type type = XFER_TYPE_NONE;
 	int rc = 0;
 
-	if (spdk_json_decode_object(params, rpc_bdev_lvol_trnasfer_decoders,
-				    SPDK_COUNTOF(rpc_bdev_lvol_trnasfer_decoders),
+	if (spdk_json_decode_object(params, rpc_bdev_lvol_transfer_decoders,
+				    SPDK_COUNTOF(rpc_bdev_lvol_transfer_decoders),
 				    &req)) {
 		SPDK_INFOLOG(lvol_rpc, "spdk_json_decode_object failed\n");
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
@@ -2996,7 +2996,7 @@ rpc_bdev_lvol_trnasfer(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 	
-	if (!req.lvol_name || !req.bdev_name) {
+	if (!req.lvol_name || !req.gateway) {
 		SPDK_ERRLOG("lvol name and bdev name must be specified");
 		spdk_jsonrpc_send_error_response(request, -EINVAL, spdk_strerror(EINVAL));
 		goto cleanup;
@@ -3016,9 +3016,9 @@ rpc_bdev_lvol_trnasfer(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
-	tdev = spdk_open_rmt_bdev(req.bdev_name, lvol->lvol_store);
+	tdev = spdk_open_rmt_bdev(req.gateway, lvol->lvol_store);
 	if (tdev == NULL) {
-		SPDK_ERRLOG("bdev '%s' open failed\n", req.bdev_name);
+		SPDK_ERRLOG("bdev '%s' open failed\n", req.gateway);
 		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(-ENODEV));
 		goto cleanup;
 	}
@@ -3028,13 +3028,16 @@ rpc_bdev_lvol_trnasfer(struct spdk_jsonrpc_request *request,
 			type = XFER_REPLICATE_SNAPSHOT;
 		} else if (!strcasecmp(req.operation, "migrate")) {
 			type = XFER_MIGRATIE_SNAPSHOT;
+		} else {
+			SPDK_ERRLOG("Invalid operation '%s' for transfer.\n", req.operation);
+			spdk_jsonrpc_send_error_response(request, -EINVAL, spdk_strerror(-EINVAL));
+			goto cleanup;
 		}
 	} else {
-		SPDK_ERRLOG("Invalid operation '%s' for transfer.\n", req.operation);
+		SPDK_ERRLOG("Operation mode for transfer is NULL.\n");
 		spdk_jsonrpc_send_error_response(request, -EINVAL, spdk_strerror(-EINVAL));
 		goto cleanup;
 	}
-
 	SPDK_NOTICELOG("Transfering lvol %s in %s mode.\n", req.lvol_name, req.operation);
 
 	rc = spdk_lvol_transfer(lvol, req.offset, req.cluster_batch, type, tdev);
@@ -3046,10 +3049,10 @@ rpc_bdev_lvol_trnasfer(struct spdk_jsonrpc_request *request,
 	spdk_jsonrpc_send_bool_response(request, true);
 	return;
 cleanup:
-	free_rpc_bdev_lvol_trnasfer(&req);
+	free_rpc_bdev_lvol_transfer(&req);
 }
 
-SPDK_RPC_REGISTER("bdev_lvol_trnasfer", rpc_bdev_lvol_trnasfer, SPDK_RPC_RUNTIME)	
+SPDK_RPC_REGISTER("bdev_lvol_transfer", rpc_bdev_lvol_transfer, SPDK_RPC_RUNTIME)	
 	  
 // static void
 // dummy_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev, void *ctx)

@@ -193,6 +193,8 @@ struct spdk_lvs_xfer_req {
 	uint64_t offset;
 	uint64_t len;
 	void *payload;
+	int fragments_outstanding;
+	int aggregated_status;
 	struct remote_lvol_info *rmt_lvol;
 	struct spdk_lvs_xfer *xfer;
 	TAILQ_ENTRY(spdk_lvs_xfer_req)	entry;

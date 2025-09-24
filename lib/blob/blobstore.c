@@ -14750,12 +14750,13 @@ spdk_xfer_read_cluster_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno) {
 }
 
 int
-spdk_read_cluster_data_xfer(struct spdk_blob *blob, void *buf, uint64_t lba, uint64_t lba_len, enum xfer_type type, 
+spdk_read_cluster_data_xfer(struct spdk_blob *blob, void *buf, uint64_t offset, uint64_t length, enum xfer_type type, 
 					spdk_blob_op_complete cb_fn, void *cb_arg) {
 	struct spdk_blob_store	*bs = blob->bs;
 	struct spdk_bs_cpl	cpl;
 	spdk_bs_sequence_t			*seq;
 	spdk_bs_batch_t             *batch;
+	uint64_t lba, lba_count;
 
 	cpl.type = SPDK_BS_CPL_TYPE_BLOB_BASIC;
 	cpl.u.blob_basic.cb_fn = cb_fn;
@@ -14774,14 +14775,20 @@ spdk_read_cluster_data_xfer(struct spdk_blob *blob, void *buf, uint64_t lba, uin
 		uint64_t mlba = m << 51 | lba;
 		bs_batch_read_dev(batch, buf, mlba, bs_byte_to_lba(bs, SPDK_BS_PAGE_SIZE));
 	} else {
-		// byte to lba = block cnt -> block_cnt in 4k * page per cluster = bs_io_unit_to_back_dev_lba(blob, lba_len)		
-		bs_batch_read_dev(batch, buf, lba, bs_io_unit_to_back_dev_lba(blob, lba_len));
+		// byte to lba = block cnt -> block_cnt in 4k * page per cluster = bs_io_unit_to_back_dev_lba(blob, lba_len)
+		bool is_allocated = blob_calculate_lba_and_lba_count(blob, offset, length, &lba, &lba_count);
+		assert(is_allocated);
+		// for (int i = 0; i < spdk_bs_get_cluster_size(bs); i++) {
+			bs_batch_read_dev(batch, buf, lba, lba_count);
+			// bs_batch_read_dev(batch, buf + (i * SPDK_BS_PAGE_SIZE) , lba + i, bs_byte_to_lba(bs, SPDK_BS_PAGE_SIZE));
+		// }
 	}
 
 	bs_batch_close(batch);
 
 	return 0;
 }
+
 
 void
 spdk_blob_set_io_priority_class(struct spdk_blob* blob, int priority_class)

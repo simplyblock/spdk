@@ -2190,21 +2190,21 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('-g', '--gateway', help='HubLvol gateway name (if applicable)')
     p.set_defaults(func=bdev_lvol_migration_op)
     
-    def bdev_lvol_trnasfer(args):
-        print_json(rpc.lvol.bdev_lvol_trnasfer(args.client,
-                                             name=args.name,
+    def bdev_lvol_transfer(args):
+        print_json(rpc.lvol.bdev_lvol_transfer(args.client,
+                                             lvol_name=args.lvol_name,
                                              offset=args.offset,
                                              cluster_batch=args.cluster_batch,
                                              gateway=args.gateway,
                                              operation=args.operation))
 
-    p = subparsers.add_parser('bdev_lvol_trnasfer', help='Transfer an lvol between nodes via an lvol bdev as gateway')
-    p.add_argument('-n', '--name', help='lvol bdev name', required=True)
+    p = subparsers.add_parser('bdev_lvol_transfer', help='Transfer an lvol between nodes via an lvol bdev as gateway')
+    p.add_argument('-n', '--lvol_name', help='lvol bdev name', required=True)
     p.add_argument('-o', '--offset', help='Starting lvol offset to transfer: default 0', type=int)
     p.add_argument('-b', '--cluster-batch', help='Transfering lvol with batch reqs: default 16 clusters', type=int)
     p.add_argument('-g', '--gateway', help='Target lvol bdev name', required=True)
-    p.add_argument('-o', '--operation', help=("Operation to perform. Valid values: 'migrate' (metadata only), 'replicate' (metadata + data)"), choices=['migrate', 'replicate'], required=True)
-    p.set_defaults(func=bdev_lvol_trnasfer)
+    p.add_argument('-O', '--operation', help=("Operation to perform. Valid values: 'migrate' (metadata only), 'replicate' (metadata + data)"), choices=['migrate', 'replicate'], required=True)
+    p.set_defaults(func=bdev_lvol_transfer)
 
     def bdev_lvol_create_hublvol(args):
         print_json(rpc.lvol.bdev_lvol_create_hublvol(args.client,
@@ -2485,10 +2485,10 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     
     def bdev_lvol_create_poller_group(args):
         print_dict(rpc.lvol.bdev_lvol_create_poller_group(args.client,
-                                                   cpu_mask=args.poll_groups_mask))
+                                                   cpu_mask=args.cpu_mask))
 
     p = subparsers.add_parser('bdev_lvol_create_poller_group', help='Set cpu mask for lvolstore poller groups')
-    p.add_argument('-m', '--cpu-mask', help='Set cpu mask for NVMf poll groups', type=str)
+    p.add_argument('-m', '--cpu-mask', help='Set cpu mask for NVMf poll groups')
     p.set_defaults(func=bdev_lvol_create_poller_group)
     
     def bdev_lvol_connect_hublvol(args):

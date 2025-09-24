@@ -89,6 +89,7 @@ lvs_alloc(void)
 	TAILQ_INIT(&lvs->pending_iorsp);
 	TAILQ_INIT(&lvs->pending_delete_requests);
 	TAILQ_INIT(&lvs->hublvol_channels);
+	TAILQ_INIT(&lvs->transfer_devs);
 	lvs->is_deletion_in_progress = false;
 	lvs->queue_failed_rsp = false;
 
@@ -3523,34 +3524,126 @@ spdk_change_rmt_lvol_state(struct spdk_lvol_store *lvs, struct spdk_transfer_dev
 	}
 }
 
+// static void
+// write_complete_cb(struct spdk_bdev_io *bdev_io, bool success, void *arg)
+// {
+//     struct spdk_lvs_xfer_req *req = arg;
+// 	struct remote_lvol_info *rmt_lvol = req->rmt_lvol;
+// 	rmt_lvol->outstanding_io--;
+// 	if (!success) {
+// 		SPDK_ERRLOG("Remote write I/O failed at offset: %" PRIu64 " len: %" PRIu64 "\n",
+// 				req->offset, req->len);
+// 		// we should destory the channel here we should check the cnt;
+// 		rmt_lvol->status = false;
+
+// 	}
+
+// 	/* complete local IO */
+// 	req->status = success ? 0 : -EIO;
+
+// 	if (!rmt_lvol->status) {
+// 		req->status = -EIO;
+// 	}
+
+//     spdk_bdev_free_io(bdev_io);
+
+//     /* recycle task */
+// 	SPDK_NOTICELOG("2- Remote write I/O offset: %" PRIu64 " len: %" PRIu64 "\n", req->offset, req->len);
+// 	if (spdk_ring_enqueue(rmt_lvol->free_ring, (void **)&req, 1, NULL) != 1) {
+//         SPDK_ERRLOG("free_ring full while recycling req\n");
+// 		assert(false);
+// 	}
+// }
+
 static void
-write_complete_cb(struct spdk_bdev_io *bdev_io, bool success, void *arg)
+fragment_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
-    struct spdk_lvs_xfer_req *req = arg;
-	struct remote_lvol_info *rmt_lvol = req->rmt_lvol;
-	rmt_lvol->outstanding_io--;
-	if (!success) {
-		SPDK_ERRLOG("Remote write I/O failed at offset: %" PRIu64 " len: %" PRIu64 "\n",
-				req->offset, req->len);
-		// we should destory the channel here we should check the cnt;
-		rmt_lvol->status = false;
+    struct spdk_lvs_xfer_req *req = cb_arg;
+    struct remote_lvol_info *rmt_lvol = req->rmt_lvol;
 
-	}
-
-	/* complete local IO */
-	req->status = success ? 0 : -EIO;
-
-	if (!rmt_lvol->status) {
-		req->status = -EIO;
-	}
+    if (!success) {
+        /* set aggregated status once (first error) */
+        req->aggregated_status = -EIO;
+    }
 
     spdk_bdev_free_io(bdev_io);
 
-    /* recycle task */
-	if (spdk_ring_enqueue(rmt_lvol->free_ring, (void **)&req, 1, NULL) != 1) {
-        SPDK_ERRLOG("free_ring full while recycling req\n");
-		assert(false);
-	}
+    /* decrement outstanding fragments */
+    req->fragments_outstanding--;
+	// SPDK_NOTICELOG("2- Remote write I/O offset: %" PRIu64 " len: %" PRIu64 " frag: %d t %p\n", req->offset, req->len, req->fragments_outstanding, spdk_get_thread());
+
+    /* if this was the last fragment, do final work and recycle req */
+    if (req->fragments_outstanding == 0) {
+		// SPDK_NOTICELOG("3- Remote write I/O offset: %" PRIu64 " len: %" PRIu64 " frag: %d t %p\n", req->offset, req->len, req->fragments_outstanding, spdk_get_thread());
+        /* final aggregated status */
+        int st = req->aggregated_status;
+        if (st != 0) {
+            req->status = st;
+            rmt_lvol->status = false; /* mark remote as unhealthy if desired */
+        } else {
+            req->status = 0;
+        }
+
+        /* decrement remote outstanding counter for original req if you maintain one */
+        rmt_lvol->outstanding_io--;
+
+        /* clear in_flight and recycle to free_ring */
+        // req->in_flight = false;
+        req->fragments_outstanding = 0;        
+		if (spdk_ring_enqueue(rmt_lvol->free_ring, (void **)&req, 1, NULL) != 1) {
+        	SPDK_ERRLOG("free_ring full while recycling req\n");
+			assert(false);
+		}
+    }
+}
+
+static int
+submit_req_fragments(struct spdk_lvs_xfer_req *req, struct remote_lvol_info *rmt)
+{
+    struct spdk_bdev_desc *desc = rmt->desc;
+    struct spdk_io_channel *ch = rmt->channel;
+    uint32_t blocklen = spdk_bdev_get_block_size(spdk_bdev_desc_get_bdev(desc));
+    uint64_t max_bytes = 16 * 0x1000;
+    uint32_t max_blocks = max_bytes / blocklen;
+    if (max_blocks == 0) {
+        max_blocks = 1;
+    }
+
+    uint32_t remaining = req->len;
+    uint64_t lba = req->offset;
+    uint8_t *payload = (uint8_t *)req->payload;
+    req->fragments_outstanding = 0;
+    req->aggregated_status = 0;
+
+    while (remaining > 0) {
+        uint32_t frag_blocks = (remaining > max_blocks) ? max_blocks : remaining;
+        uint8_t *frag_payload = payload + ( (req->len - remaining) * blocklen );
+
+        /* increment fragments counter before submit */
+        req->fragments_outstanding++;
+		// SPDK_NOTICELOG("1- Remote write I/O offset: %" PRIu64 " len: %" PRIu64 " frag: %d t %p\n", req->offset, req->len, req->fragments_outstanding, spdk_get_thread());
+        int rc = spdk_bdev_write_blocks(desc, ch,
+                                        frag_payload,
+                                        lba,
+                                        frag_blocks,
+                                        fragment_write_cb,
+                                        req);
+        if (rc != 0) {
+            /* synchronous failure - decrement fragments counter and record error */
+            req->fragments_outstanding--;
+            req->aggregated_status = -EIO;
+            /* handle rc: may want to abort remaining fragments -> but we'll
+             * record failure and let outstanding fragments finish or cancel */
+            SPDK_ERRLOG("sync write submit failed rc=%d lba=%"PRIu64" blocks=%u\n", rc, lba, frag_blocks);
+            return rc;
+        }
+
+        /* advance */
+        remaining -= frag_blocks;
+        lba += frag_blocks;
+    }
+
+    return 0;
 }
 
 static int
@@ -3573,17 +3666,21 @@ helper_xfer_poller(void *arg)
 		count++;
 		rmt_lvol->outstanding_io++;
 		req->rmt_lvol = rmt_lvol;
-		int rc = spdk_bdev_write_blocks(rmt_lvol->desc, rmt_lvol->channel,
-                                        req->payload, req->offset, req->len,
-                                        write_complete_cb, req);
+		// SPDK_NOTICELOG("1- Remote write I/O offset: %" PRIu64 " len: %" PRIu64 "\n", req->offset, req->len);
+		int rc = submit_req_fragments(req, rmt_lvol);
+		// int rc = spdk_bdev_write_blocks(rmt_lvol->desc, rmt_lvol->channel,
+        //                                 req->payload, req->offset, 1,
+        //                                 write_complete_cb, req);
 		if (rc != 0) {
-            /* synchronous failure: decrement outstanding and recycle req */            
-			rmt_lvol->outstanding_io--;
-            req->status = -EIO;
-            if (spdk_ring_enqueue(rmt_lvol->free_ring, (void **)&req, 1, NULL) != 1) {
-                SPDK_ERRLOG("free_ring full while handling write submit failure\n");
-                assert(false);
-            }
+            /* synchronous failure: decrement outstanding and recycle req */
+			if (req->fragments_outstanding == 0) {           
+				rmt_lvol->outstanding_io--;
+				req->status = -EIO;
+				if (spdk_ring_enqueue(rmt_lvol->free_ring, (void **)&req, 1, NULL) != 1) {
+                	SPDK_ERRLOG("free_ring full while handling write submit failure\n");
+                	assert(false);
+            	}
+			}             
         }
 	}
 	
@@ -3739,7 +3836,7 @@ md_xfer_poller(void *cb_arg)
 		} else {
 			req->len = 1;
 		}
-
+		// SPDK_NOTICELOG("cluster read lba %" PRIu64 " len %" PRIu64 " t %p .\n", req->offset, req->len , spdk_get_thread());
 		memset(req->payload, 0, page_size * req->len);
 		xfer->current_offset += page_per_cluster;
 
@@ -3795,7 +3892,7 @@ spdk_lvs_create_poll_group(void *ctx)
 	lpg->xfer_poller = NULL;
 	const char *suffix = strrchr(lpg->thread_name, '_'); // find last '_'        
 	lpg->id =  atoi(suffix + 1);
-	SPDK_NOTICELOG("Create new thread %s for lvolstore with id %d.\n", lpg->thread_name, lpg->id);
+	// SPDK_NOTICELOG("Create new thread %s for lvolstore with id %d t %p md %p.\n", lpg->thread_name, lpg->id, spdk_get_thread(), g_lvs_md_thread);
 	spdk_thread_send_msg(g_lvs_md_thread, spdk_lvs_create_poll_group_done, lpg);
 }
 
@@ -3808,7 +3905,7 @@ spdk_lvs_create_poll_groups(struct spdk_lvol_store *lvs)
 
 	g_lvs_md_thread = spdk_get_thread();
 	assert(g_lvs_md_thread != NULL);
-
+	// SPDK_NOTICELOG("Create new thread t %p md %p.\n", spdk_get_thread(), g_lvs_md_thread);
 	SPDK_ENV_FOREACH_CORE(cpu) {
 		if (g_helper_set && !spdk_cpuset_get_cpu(g_helper_set, cpu)) {
 			continue;
@@ -3978,10 +4075,17 @@ spdk_lvs_add_rmt_bdev_to_poll_group(void *arg) {
 	return;
 }
 
+static void
+spdk_create_poller(void *arg) {
+	struct spdk_lvs_poll_group *lpg = arg;
+	pg_xfer_poller[lpg->id] = spdk_poller_register(helper_xfer_poller, lpg, 200);
+}
+
 int
 spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_batch, enum xfer_type type, 
 				struct spdk_transfer_dev *tdev) {
 	struct spdk_lvs_xfer *xfer, *ctx;
+	struct spdk_lvs_xfer_req *req;
 	struct spdk_lvol_store *lvs = lvol->lvol_store;
 	struct spdk_lvs_poll_group *lpg;
 	// int rc = 0;
@@ -4038,7 +4142,8 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
 	}
 	
 	if (type == XFER_REPLICATE_SNAPSHOT) {
-		s_elements_payload = spdk_bs_get_cluster_size(lvs->blobstore) / spdk_bs_get_page_size(lvs->blobstore);
+		// s_elements_payload = spdk_bs_get_cluster_size(lvs->blobstore) / spdk_bs_get_page_size(lvs->blobstore);
+		s_elements_payload = spdk_bs_get_cluster_size(lvs->blobstore);
 	} else {
 		s_elements_payload = spdk_bs_get_page_size(lvs->blobstore);
 	}
@@ -4058,7 +4163,12 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
         ctx->reqs[i].len = s_elements_payload;
         // ctx->reqs[i].remote_desc = remote_desc;
 		ctx->reqs[i].xfer = ctx;
-        spdk_ring_enqueue(ctx->free_ring, (void **)&ctx->reqs[i], 1, NULL);
+		ctx->reqs[i].type = ctx->type;
+		req = &ctx->reqs[i];
+        int rc = spdk_ring_enqueue(ctx->free_ring, (void **)&req, 1, NULL);
+		if (rc != 1) {
+			assert(false);
+		}
     }
 
 	// insert tdev to all helper cores and open channels	
@@ -4079,11 +4189,13 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
 		rmt_lvol->reused = tdev->reused;
 		spdk_thread_send_msg(lpg->thread, spdk_lvs_add_rmt_bdev_to_poll_group, rmt_lvol);
 	}
-
+	ctx->timeout = spdk_get_ticks();
 	TAILQ_INSERT_TAIL(&g_lvs_xfer_tasks, ctx, entry);
 
+
 	TAILQ_FOREACH(lpg, &g_lvs_poll_groups, entry) {
-		pg_xfer_poller[lpg->id] = spdk_poller_register(helper_xfer_poller, lpg, 200);
+		spdk_thread_send_msg(lpg->thread, spdk_create_poller, lpg);
+		// pg_xfer_poller[lpg->id] = spdk_poller_register(helper_xfer_poller, lpg, 200);
 	}
 
 	if (!xfer_md_poller) {
