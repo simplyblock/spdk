@@ -9915,6 +9915,14 @@ struct spdk_blob_unfreeze_ctx {
 	int rc;
 };
 
+struct spdk_make_chain_ctx {
+	spdk_blob_op_complete   cb_fn;
+	void *cb_arg;
+	struct spdk_blob *origblob;
+	struct spdk_blob *clone;
+	int rc;
+};
+
 struct spdk_update_ctx {
 	spdk_blob_op_complete cb_fn;
 	void *cb_arg;
@@ -10367,6 +10375,126 @@ spdk_bs_update_clone(struct spdk_blob *clone)
 {
 	// TODO check the add result and response proprely
 	bs_blob_list_add(clone);	
+}
+
+static void
+spdk_bs_convert_blob_cb(void *cb_arg, int bserrno)
+{
+	struct spdk_make_chain_ctx *ctx = cb_arg;
+	if (bserrno != 0) {		
+		ctx->rc = bserrno;
+		SPDK_ERRLOG("Update blob to make chain failed, ctx->rc=%d\n", ctx->rc);		
+	}
+	ctx->cb_fn(ctx->cb_arg, ctx->rc);
+	free(ctx);
+}
+
+void
+spdk_bs_chain_snapshot_clone(struct spdk_blob *origblob, struct spdk_blob *clone, bool leader, bool update_in_progress,
+			    spdk_blob_op_complete cb_fn,
+	     		void *cb_arg)
+{
+	struct spdk_blob_store *bs = origblob->bs;
+	struct spdk_make_chain_ctx *ctx;
+	struct spdk_blob_list *snapshot_entry = NULL;
+	struct spdk_blob_list *blob = NULL;
+
+	if (update_in_progress) {
+		cb_fn(cb_arg, -EBUSY);
+		return;
+	}
+	
+	TAILQ_FOREACH(snapshot_entry, &bs->snapshots, link) {
+		if (snapshot_entry->id == origblob->id) {			
+			TAILQ_FOREACH(blob, &snapshot_entry->clones, link) {
+				if (clone->id == blob->id) {
+					cb_fn(cb_arg, -EEXIST);
+					return;
+				}
+			}
+		}
+	}
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+	ctx->clone = clone;
+	ctx->origblob = origblob;
+	ctx->cb_arg = cb_arg;
+	ctx->cb_fn = cb_fn;
+
+	/* Set internal xattr for snapshot id */
+	int bserrno = blob_set_xattr(clone, BLOB_SNAPSHOT, &origblob->id, sizeof(spdk_blob_id), true);
+	if (bserrno != 0) {
+		free(ctx);
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+
+	if (clone->back_bs_dev) {
+		blob_back_bs_destroy(clone);
+	}
+
+	/* Create new back_bs_dev for snapshot */
+	clone->back_bs_dev = bs_create_blob_bs_dev(origblob);
+	if (clone->back_bs_dev == NULL) {
+		free(ctx);
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+
+	bs_blob_list_remove(clone);
+	// check here if we call this twice we will endup with extra open ref
+	clone->parent_id = origblob->id;
+	origblob->open_ref++;
+	/* set clone blob as thin provisioned */
+	blob_set_thin_provision(clone);
+	bs_blob_list_add(clone);
+	if (!leader) {
+		clone->state = SPDK_BLOB_STATE_CLEAN;
+		free(ctx);
+		cb_fn(cb_arg, 0);
+		return;
+	} else {
+		/* sync clone metadata */
+		spdk_blob_sync_md(clone, spdk_bs_convert_blob_cb, ctx);
+		return;
+	}
+}
+
+void
+spdk_bs_convert_blob(struct spdk_blob *origblob, bool leader, bool update_in_progress,
+			    spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_make_chain_ctx *ctx;
+
+	if (update_in_progress) {
+		cb_fn(cb_arg, -EBUSY);
+		return;
+	}	
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+	ctx->origblob = origblob;
+	ctx->cb_arg = cb_arg;
+	ctx->cb_fn = cb_fn;
+
+	bs_blob_list_add(origblob);
+
+	spdk_blob_set_read_only(origblob);
+	if (!leader) {
+			origblob->state = SPDK_BLOB_STATE_CLEAN;
+			free(ctx);
+			cb_fn(cb_arg, 0);
+			return;
+	}
+	/* sync snapshot metadata */
+	spdk_blob_sync_md(origblob, spdk_bs_convert_blob_cb, ctx);
 }
 
 void
@@ -14788,7 +14916,6 @@ spdk_read_cluster_data_xfer(struct spdk_blob *blob, void *buf, uint64_t offset, 
 
 	return 0;
 }
-
 
 void
 spdk_blob_set_io_priority_class(struct spdk_blob* blob, int priority_class)

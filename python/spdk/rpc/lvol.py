@@ -189,6 +189,54 @@ def bdev_lvol_transfer(client, lvol_name=None, offset=0, cluster_batch=16, gatew
     params = {'lvol_name': lvol_name, 'offset': offset, 'cluster_batch': cluster_batch, 'gateway': gateway, 'operation': operation}
     return client.call('bdev_lvol_transfer', params)
 
+def bdev_lvol_transfer_stat(client, lvol_name=None):
+    """Capture a snapshot transfer stat.
+
+    Args:
+        lvol_name: logical volume to get the transfer stat        
+
+    Returns:
+        Name of created logical volume snapshot.
+    """
+    if not lvol_name:
+        raise ValueError("lvol_name must be specified")
+    
+    params = { 'lvol_name': lvol_name }
+    return client.call('bdev_lvol_transfer_stat', params)
+
+def bdev_lvol_convert(client, lvol_name=None):
+    """convert lvol to snapshot.
+
+    Args:
+        lvol_name: logical volume to convert to snapshot        
+
+    Returns:
+        True or False.
+    """
+    if not lvol_name:
+        raise ValueError("lvol_name must be specified")
+    
+    params = { 'lvol_name': lvol_name }
+    return client.call('bdev_lvol_convert', params)
+
+def bdev_lvol_add_clone(client, lvol_name=None, child_name=None):
+    """add lvol as clone to snapshot.
+
+    Args:
+        lvol_name: logical volume to be parent
+        child_name: logical volume to be clone
+
+    Returns:
+        True or False.
+    """
+    if not lvol_name:
+        raise ValueError("lvol_name must be specified")
+    if not child_name:
+        raise ValueError("child_name must be specified")
+    
+    params = { 'lvol_name': lvol_name, 'child_name': child_name }
+    return client.call('bdev_lvol_add_clone', params)
+
 def bdev_lvol_create_hublvol(client, uuid=None, lvs_name=None):
     """Create a logical volume on a logical volume store.
 

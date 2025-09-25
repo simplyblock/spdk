@@ -2205,6 +2205,32 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('-g', '--gateway', help='Target lvol bdev name', required=True)
     p.add_argument('-O', '--operation', help=("Operation to perform. Valid values: 'migrate' (metadata only), 'replicate' (metadata + data)"), choices=['migrate', 'replicate'], required=True)
     p.set_defaults(func=bdev_lvol_transfer)
+    
+    def bdev_lvol_transfer_stat(args):
+        print_json(rpc.lvol.bdev_lvol_transfer_stat(args.client,
+                                               lvol_name=args.lvol_name))
+
+    p = subparsers.add_parser('bdev_lvol_transfer_stat', help='Get a snapshot transfer stat')
+    p.add_argument('lvol_name', help='lvol bdev name')
+    p.set_defaults(func=bdev_lvol_transfer_stat)
+    
+    def bdev_lvol_add_clone(args):
+        print_json(rpc.lvol.bdev_lvol_add_clone(args.client,
+                                                lvol_name=args.lvol_name,
+                                                child_name=args.child_name))
+
+    p = subparsers.add_parser('bdev_lvol_add_clone', help='Add lvol as clone to snapshot.')
+    p.add_argument('lvol_name', help='lvol bdev name')
+    p.add_argument('child_name', help='lvol bdev name')
+    p.set_defaults(func=bdev_lvol_add_clone)
+    
+    def bdev_lvol_convert(args):
+        print_json(rpc.lvol.bdev_lvol_convert(args.client,
+                                               lvol_name=args.lvol_name))
+
+    p = subparsers.add_parser('bdev_lvol_convert', help='Convert lvol to snapshot')
+    p.add_argument('lvol_name', help='lvol bdev name')
+    p.set_defaults(func=bdev_lvol_convert)
 
     def bdev_lvol_create_hublvol(args):
         print_json(rpc.lvol.bdev_lvol_create_hublvol(args.client,

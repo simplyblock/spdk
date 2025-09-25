@@ -332,6 +332,9 @@ int spdk_lvs_poll_group_options(char *mask);
 struct spdk_transfer_dev *spdk_open_rmt_bdev(const char *name, struct spdk_lvol_store *lvs);
 int spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, 
 			uint32_t cluster_batch, enum xfer_type type, struct spdk_transfer_dev *tdev);
+void spdk_lvol_chain(struct spdk_lvol *origlvol, struct spdk_lvol *clone,
+		 spdk_lvol_op_complete cb_fn, void *cb_arg);
+void spdk_lvol_convert(struct spdk_lvol *origlvol, spdk_lvol_op_complete cb_fn, void *cb_arg);
 /**
  * Get the lvol that has a particular UUID.
  *
