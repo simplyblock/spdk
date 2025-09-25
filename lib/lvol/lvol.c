@@ -1765,6 +1765,54 @@ spdk_lvol_resize(struct spdk_lvol *lvol, uint64_t sz,
 	spdk_blob_resize(blob, new_clusters, lvol_blob_resize_cb, req);
 }
 
+static void
+spdk_lvol_chain_cb(void *cb_arg, int bserrno)
+{
+	struct spdk_lvol_req *req = cb_arg;
+	req->cb_fn(req->cb_arg, bserrno);
+	free(req);
+	return;
+}
+
+void
+spdk_lvol_chain(struct spdk_lvol *origlvol, struct spdk_lvol *clone,
+		 spdk_lvol_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_lvol_store *lvs = origlvol->lvol_store;
+	struct spdk_lvol_req *req;
+
+	req = calloc(1, sizeof(*req));
+	if (!req) {
+		SPDK_ERRLOG("Cannot alloc memory for lvol request pointer\n");
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+	req->lvol = NULL;
+
+	spdk_bs_chain_snapshot_clone(origlvol->blob, clone->blob, lvs->leader, lvs->update_in_progress, spdk_lvol_chain_cb, req);
+}
+
+void
+spdk_lvol_convert(struct spdk_lvol *origlvol, spdk_lvol_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_lvol_store *lvs = origlvol->lvol_store;
+	struct spdk_lvol_req *req;
+
+	req = calloc(1, sizeof(*req));
+	if (!req) {
+		SPDK_ERRLOG("Cannot alloc memory for lvol request pointer\n");
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+	req->lvol = NULL;
+
+	spdk_bs_convert_blob(origlvol->blob, lvs->leader, lvs->update_in_progress, spdk_lvol_chain_cb, req);
+}
+
 void
 spdk_lvol_resize_register(struct spdk_lvol *lvol, uint64_t sz,
 		 spdk_lvol_op_complete cb_fn, void *cb_arg)
@@ -3445,6 +3493,7 @@ spdk_wait_for_pg_io_cleanup_poller(void *arg) {
 	if (rmt_lvol->outstanding_io > 0) {
 		return SPDK_POLLER_BUSY;
 	}
+	SPDK_NOTICELOG("destroy channel lvol in poller: 3.\n");
 	spdk_poller_unregister(&rmt_lvol->cleanup_poller);
 	rmt_lvol->cleanup_poller = NULL;
 	spdk_put_io_channel(rmt_lvol->channel);
@@ -3461,7 +3510,7 @@ spdk_wait_for_pg_io_cleanup(void *arg) {
 	struct remove_event *ctx = arg;
 	struct spdk_lvs_poll_group *lpg = ctx->lpg;
 	struct spdk_transfer_dev *tdev = ctx->tdev;
-
+	// SPDK_NOTICELOG("destroy lvol in poller: 1.\n");
 	TAILQ_FOREACH_SAFE(rmt_lvol , &lpg->rmt_lvols, entry, tmp) {
 		if (strcmp(rmt_lvol->bdev_name, tdev->bdev_name) != 0) {
 			continue;
@@ -3469,12 +3518,14 @@ spdk_wait_for_pg_io_cleanup(void *arg) {
 		rmt_lvol->status = false;
 		if (rmt_lvol->outstanding_io > 0) {
 			SPDK_NOTICELOG("Waiting for %lu I/Os to finish for pg %s.\n", rmt_lvol->outstanding_io, lpg->thread_name);
+			ctx->rmt_lvol = rmt_lvol;
 			rmt_lvol->cleanup_poller = spdk_poller_register(
 				spdk_wait_for_pg_io_cleanup_poller, ctx, 200000);
 			return;
 		} else {
+			SPDK_NOTICELOG("destroy channel lvol in poller: 2.\n");
 			spdk_put_io_channel(rmt_lvol->channel);
-			tdev->pg[lpg->id] = true;
+			tdev->pg[lpg->id] = false;
 			TAILQ_REMOVE(&lpg->rmt_lvols, rmt_lvol, entry);
 			free(rmt_lvol);
 			free(ctx);
@@ -3487,12 +3538,13 @@ spdk_wait_for_tdev_io_cleanup(void *arg)
 {
 	struct spdk_transfer_dev *tdev = arg;
 	struct spdk_lvol_store *lvs = tdev->lvs;
-
+	// SPDK_NOTICELOG("destroy lvol in md thread: 5.\n");
 	for (uint32_t i = 0; i < g_lvs_num_pgs; i++) {
 		if(tdev->pg[i]) {
 			return SPDK_POLLER_BUSY;
 		}
 	}
+	SPDK_NOTICELOG("destroy desc lvol in poller.\n");
 	spdk_poller_unregister(&tdev->cleanup_poller);
 	tdev->cleanup_poller = NULL;
 	TAILQ_REMOVE(&lvs->transfer_devs, tdev, entry);
@@ -3563,6 +3615,7 @@ fragment_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 
     if (!success) {
         /* set aggregated status once (first error) */
+		 SPDK_ERRLOG("Remote write I/O offset: %" PRIu64 " len: %" PRIu64 " frag: %d failed.\n", req->offset, req->len, req->fragments_outstanding);
         req->aggregated_status = -EIO;
     }
 
@@ -3589,7 +3642,7 @@ fragment_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 
         /* clear in_flight and recycle to free_ring */
         // req->in_flight = false;
-        req->fragments_outstanding = 0;        
+        req->fragments_outstanding = 0;
 		if (spdk_ring_enqueue(rmt_lvol->free_ring, (void **)&req, 1, NULL) != 1) {
         	SPDK_ERRLOG("free_ring full while recycling req\n");
 			assert(false);
@@ -3655,8 +3708,6 @@ helper_xfer_poller(void *arg)
 	int count = 0;
 	TAILQ_FOREACH(rmt_lvol, &lpg->rmt_lvols, entry) {
 		if (rmt_lvol->desc == NULL || rmt_lvol->channel == NULL || !rmt_lvol->status) {
-			// req->status = -EIO;
-			// spdk_ring_enqueue(rmt_lvol->free_ring, (void **)&req, 1, NULL);
 			continue;
 		}
 
@@ -3721,13 +3772,14 @@ spdk_mark_rmt_pg(void *arg) {
 		if (strcmp(rmt_lvol->bdev_name, ctx->bdev_name) != 0) {
 			continue;
 		}
-		rmt_lvol->status = false;		
+		rmt_lvol->status = false;
 	}
 }
 
 static int
 destroy_xfer_task_tmo(void *arg) {
 	struct spdk_lvs_xfer *xfer = arg;
+	SPDK_NOTICELOG("Destroy Transfer lvol %s task.\n", xfer->lvol->name);
 	spdk_poller_unregister(&xfer->tmo_poller);
 	xfer->tmo_poller = NULL;
 	spdk_dma_free(xfer->pdus);
@@ -3744,9 +3796,9 @@ destroy_xfer_task(struct spdk_lvs_xfer *xfer) {
 	struct remove_event *ctx;
 
 	TAILQ_REMOVE(&g_lvs_xfer_tasks, xfer, entry);
-
+	SPDK_NOTICELOG("Transfer lvol %s task: %" PRIu64 " status %d finished.\n", xfer->lvol->name, xfer->lvol->last_offset, xfer->lvol->transfer_status);
 	if (xfer->lvol->transfer_status != XFER_DONE) {
-		SPDK_ERRLOG("Transfer lvol %s: %" PRIu64 " failed.\n", xfer->lvol->name, xfer->lvol->last_offset);
+		xfer->lvol->transfer_status = XFER_FAILED;
 	}
 
 	// send msg to the lpg to NULL thier rings pointers in the rmt
@@ -3773,7 +3825,7 @@ md_xfer_poller(void *cb_arg)
 	uint64_t timeout_ticks = spdk_get_ticks_hz() * 60;
 	TAILQ_FOREACH_SAFE(xfer, &g_lvs_xfer_tasks, entry, tmp) {
     	if (spdk_ring_dequeue(xfer->free_ring, (void **)&req, 1) == 0) {
-			if (current_time - xfer->timeout > timeout_ticks * 2) {
+			if (current_time - xfer->timeout > timeout_ticks) {
 				destroy_xfer_task(xfer);
 			}
         	continue;
@@ -3892,7 +3944,7 @@ spdk_lvs_create_poll_group(void *ctx)
 	lpg->xfer_poller = NULL;
 	const char *suffix = strrchr(lpg->thread_name, '_'); // find last '_'        
 	lpg->id =  atoi(suffix + 1);
-	// SPDK_NOTICELOG("Create new thread %s for lvolstore with id %d t %p md %p.\n", lpg->thread_name, lpg->id, spdk_get_thread(), g_lvs_md_thread);
+	SPDK_NOTICELOG("Create new thread %s for lvolstore with id %d t %p md %p.\n", lpg->thread_name, lpg->id, spdk_get_thread(), g_lvs_md_thread);
 	spdk_thread_send_msg(g_lvs_md_thread, spdk_lvs_create_poll_group_done, lpg);
 }
 
@@ -3905,7 +3957,7 @@ spdk_lvs_create_poll_groups(struct spdk_lvol_store *lvs)
 
 	g_lvs_md_thread = spdk_get_thread();
 	assert(g_lvs_md_thread != NULL);
-	// SPDK_NOTICELOG("Create new thread t %p md %p.\n", spdk_get_thread(), g_lvs_md_thread);
+	SPDK_NOTICELOG("Create new thread t %p md %p.\n", spdk_get_thread(), g_lvs_md_thread);
 	SPDK_ENV_FOREACH_CORE(cpu) {
 		if (g_helper_set && !spdk_cpuset_get_cpu(g_helper_set, cpu)) {
 			continue;
@@ -3940,7 +3992,6 @@ spdk_lvs_is_subset_of_env_core_mask(const struct spdk_cpuset *set)
 int
 spdk_lvs_poll_group_options(char *mask)
 {
-	// SPDK_NOTICELOG("Set groupid %" PRIu64 " and port %" PRIu64 " to the lvolstore .\n", groupid, port);
 	int ret = 0;
 	if (!(g_helper_set = spdk_cpuset_alloc())) {
 		SPDK_ERRLOG("Unable to allocate a poll groups mask object in lvs_decode_poll_groups_mask.\n");
@@ -4058,6 +4109,7 @@ spdk_lvs_add_rmt_bdev_to_poll_group(void *arg) {
 			}			
 			tmp->free_ring = rmt_lvol->free_ring;
 			tmp->ready_ring = rmt_lvol->ready_ring;
+			tmp->status = true;
 		}
 		free(rmt_lvol);
 		return;
@@ -4078,6 +4130,10 @@ spdk_lvs_add_rmt_bdev_to_poll_group(void *arg) {
 static void
 spdk_create_poller(void *arg) {
 	struct spdk_lvs_poll_group *lpg = arg;
+	if (pg_xfer_poller[lpg->id]) {
+		SPDK_NOTICELOG("The lpg id: %d poller for transfer task already exists.\n", lpg->id);
+		return;
+	}	
 	pg_xfer_poller[lpg->id] = spdk_poller_register(helper_xfer_poller, lpg, 200);
 }
 
@@ -4113,6 +4169,7 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
 		return -ENOMEM;
 	}
 	ctx->lvol = lvol;
+	lvol->last_offset = offset;
 	ctx->current_offset = offset;
 	ctx->cluster_batch = cluster_batch;
 	ctx->type = type;
@@ -4175,9 +4232,12 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
 	TAILQ_FOREACH(lpg, &g_lvs_poll_groups, entry) {
 		struct remote_lvol_info *rmt_lvol = calloc(1, sizeof(*rmt_lvol));
 		if (!rmt_lvol) {
-			SPDK_ERRLOG("Cannot allocate memory for remote lvol info.\n");
-			// spdk_bdev_close(tdev->desc);
-			// free(tdev);
+			SPDK_ERRLOG("Cannot allocate memory for remote lvol info.\n");			
+			spdk_dma_free(xfer->pdus);
+			free(ctx->reqs);
+			spdk_ring_free(ctx->free_ring);
+			spdk_ring_free(ctx->ready_ring);
+			free(ctx);
 			return -ENOMEM;
 		}
 		tdev->pg[lpg->id] = true;
@@ -4190,6 +4250,7 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
 		spdk_thread_send_msg(lpg->thread, spdk_lvs_add_rmt_bdev_to_poll_group, rmt_lvol);
 	}
 	ctx->timeout = spdk_get_ticks();
+	lvol->transfer_status = XFER_IN_PROGRESS;
 	TAILQ_INSERT_TAIL(&g_lvs_xfer_tasks, ctx, entry);
 
 
@@ -4202,7 +4263,6 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
 		xfer_md_poller = spdk_poller_register(md_xfer_poller, NULL, 1000);
 	}
 
-	lvol->transfer_status = XFER_IN_PROGRESS;
 	tdev->reused = false;
 	return 0;
 }
