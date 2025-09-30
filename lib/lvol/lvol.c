@@ -3339,6 +3339,29 @@ spdk_lvs_hub_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bde
 	}
 }
 
+static void
+find_thread_fn(void *arg)
+{
+    struct spdk_lvol_store *lvs = arg;
+    struct spdk_thread *t = spdk_get_thread();
+    const char *name = spdk_thread_get_name(t);	
+	// SPDK_NOTICELOG("target thread name is: %s\n", name);
+    if (strncmp(name, "nvmf_tgt_poll_group_", 20) == 0) {
+		SPDK_NOTICELOG("Found target thread: %s\n", name);
+		// Found the target thread, store it in the context
+		struct spdk_io_channel *channel = spdk_bdev_get_io_channel(lvs->hub_dev.desc);
+		if (channel) {
+			spdk_lvs_store_hublvol_channel(lvs, channel);
+		}
+    }
+}
+
+static void
+find_thread_complete(void *arg)
+{
+	return;
+}
+
 void
 spdk_lvs_open_hub_bdev(void *cb_arg) {
 	struct spdk_lvol_store *lvs = cb_arg;
@@ -3370,6 +3393,8 @@ spdk_lvs_open_hub_bdev(void *cb_arg) {
 			lvs->hub_dev.desc = NULL;
 			goto err;
 		}
+
+    	spdk_for_each_thread(find_thread_fn, lvs, find_thread_complete);
 
 		pthread_mutex_lock(&g_lvol_stores_mutex);
 		lvs->skip_redirecting = false;
