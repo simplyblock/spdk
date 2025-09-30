@@ -1412,12 +1412,7 @@ vbdev_redirect_request_to_hublvol(struct spdk_lvol *lvol, struct spdk_io_channel
 		hub_ch = spdk_bs_get_hub_channel(ch);
 		if (!hub_ch) {
 			hub_ch = spdk_bdev_get_io_channel(hub_dev->desc);
-			// SPDK_NOTICELOG("1 Hublvol channel %p ref count %d.\n", hub_ch, spdk_io_channel_get_ref_count(hub_ch));
-			if (hub_ch && spdk_io_channel_get_ref_count(hub_ch) == 1) {
-				spdk_lvs_store_hublvol_channel(lvs, hub_ch);
-				hub_ch = spdk_bdev_get_io_channel(hub_dev->desc);
-			}
-			// SPDK_NOTICELOG("2 Hublvol channel %p ref count %d.\n", hub_ch, spdk_io_channel_get_ref_count(hub_ch));
+			SPDK_NOTICELOG("1 Hublvol channel %p ref count %d.\n", hub_ch, spdk_io_channel_get_ref_count(hub_ch));
 			if (!hub_ch || !spdk_bs_set_hub_channel(ch, hub_ch, hub_dev->desc)) {
 				SPDK_NOTICELOG("Hublvol state is in connected mode but we lost the desc due to internal error."
 							"we try to connect now but we will not wait and the failover will started.\n");
