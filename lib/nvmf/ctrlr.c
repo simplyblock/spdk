@@ -177,7 +177,7 @@ nvmf_ctrlr_keep_alive_poll(void *ctx)
 		/* set the Controller Fatal Status bit to '1' */
 		if (ctrlr->vcprop.csts.bits.cfs == 0) {
 			nvmf_ctrlr_set_fatal_status(ctrlr);
-
+			SPDK_NOTICELOG("Starting iterate on qpairs due to keep alive timeout.\n");
 			/*
 			 * disconnect qpairs, terminate Transport connection
 			 * destroy ctrlr, break the host to controller association
@@ -316,10 +316,10 @@ nvmf_ctrlr_add_qpair(struct spdk_nvmf_qpair *qpair,
 				 ctrlr->hostnqn);
 	nvmf_qpair_set_ctrlr(qpair, ctrlr);
 	spdk_bit_array_set(ctrlr->qpair_mask, qpair->qid);
-	if (strstr(ctrlr->subsys->subnqn, "vm") != NULL) {
+	// if (strstr(ctrlr->subsys->subnqn, "vm") != NULL) {
 		SPDK_NOTICELOG("established qpair %p (cntlid:%u, qid:%u) on subsystem %s\n",
 				     qpair, ctrlr->cntlid, qpair->qid, ctrlr->subsys->subnqn);
-	}
+	// }
 	
 	SPDK_DEBUGLOG(nvmf, "qpair_mask set, qid %u\n", qpair->qid);
 

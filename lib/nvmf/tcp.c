@@ -1539,10 +1539,10 @@ nvmf_tcp_handle_connect(struct spdk_nvmf_tcp_port *port, struct spdk_sock *sock)
 		return;
 	}
 
-	if (tqpair->target_port >= 9030 && tqpair->target_port <= 9090) {
+	// if (tqpair->target_port >= 9030 && tqpair->target_port <= 9090) {
 		SPDK_NOTICELOG("New connection accepted sp %d cp %d\n",
 		      tqpair->target_port, tqpair->initiator_port);
-	}
+	// }
 	
 	spdk_nvmf_tgt_new_qpair(port->transport->tgt, &tqpair->qpair);
 }
@@ -3205,11 +3205,12 @@ nvmf_tcp_dump_delay_req_status(struct spdk_nvmf_tcp_req *tcp_req, struct spdk_nv
 
 static void 
 check_time(struct spdk_nvmf_tcp_req *tcp_req, struct spdk_nvmf_tcp_qpair *tqpair) {
-	if (!tcp_req->loged && tcp_req->time && tqpair->qpair.qid != 0 &&(tqpair->target_port >= 9030 && tqpair->target_port <= 9090)) {
+	if (!tcp_req->loged && tcp_req->time && tqpair->qpair.qid != 0 /*&&(tqpair->target_port >= 9030 && tqpair->target_port <= 9090)*/) {
 		uint64_t current = spdk_get_ticks();
 		uint64_t ticks_hz = spdk_get_ticks_hz();
 		// Check if more than 28 ticks have passed since tcp_req->time
-		if ((current - tcp_req->time) > ticks_hz / 2 && (tcp_req->cmd.opc != SPDK_NVME_OPC_ASYNC_EVENT_REQUEST)) {
+		// if ((current - tcp_req->time) > ticks_hz / 2 && (tcp_req->cmd.opc != SPDK_NVME_OPC_ASYNC_EVENT_REQUEST)) {
+		if ((current - tcp_req->time) > ticks_hz ) {
 			char *uuid = spdk_nvmf_request_nqn(&tcp_req->req, 0);
 			uuid = (uuid) ? uuid : ""; // Handle NULL UUID
 			double duration_us = ((double)(current - tcp_req->time) * 1000.0) / (double)ticks_hz;
