@@ -1258,16 +1258,17 @@ _nvmf_ctrlr_free_from_qpair(void *ctx)
 	uint32_t count;
 
 	spdk_bit_array_clear(ctrlr->qpair_mask, qpair_ctx->qid);
-	if (strstr(ctrlr->subsys->subnqn, "vm") != NULL) {
-		SPDK_NOTICELOG("destroy qpair %p (cntlid:%u, qid:%u) on subsystem %s\n",
+	// if (strstr(ctrlr->subsys->subnqn, "vm") != NULL) {
+	SPDK_NOTICELOG("destroy qpair %p (cntlid:%u, qid:%u) on subsystem %s\n",
 				     qpair_ctx->qpair, ctrlr->cntlid, qpair_ctx->qid, ctrlr->subsys->subnqn);
-	}
+	// }
 
 	SPDK_DEBUGLOG(nvmf, "qpair_mask cleared, qid %u\n", qpair_ctx->qid);
 	count = spdk_bit_array_count_set(ctrlr->qpair_mask);
 	if (count == 0) {
 		assert(!ctrlr->in_destruct);
 		SPDK_DEBUGLOG(nvmf, "Last qpair %u, destroy ctrlr 0x%hx\n", qpair_ctx->qid, ctrlr->cntlid);
+		SPDK_NOTICELOG("Last qpair %u, destroy ctrlr 0x%hx\n", qpair_ctx->qid, ctrlr->cntlid);
 		ctrlr->in_destruct = true;
 		spdk_thread_send_msg(ctrlr->subsys->thread, _nvmf_ctrlr_destruct, ctrlr);
 	}
@@ -1399,7 +1400,7 @@ spdk_nvmf_qpair_disconnect(struct spdk_nvmf_qpair *qpair)
 {
 	struct spdk_nvmf_poll_group *group = qpair->group;
 	struct nvmf_qpair_disconnect_ctx *qpair_ctx;
-
+	SPDK_NOTICELOG("trying disconnect qpair id : %d, outstanding : %d.\n", qpair->qid, TAILQ_EMPTY(&qpair->outstanding) ? 0 : 1);
 	if (__atomic_test_and_set(&qpair->disconnect_started, __ATOMIC_RELAXED)) {
 		return -EINPROGRESS;
 	}
