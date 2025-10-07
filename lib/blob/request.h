@@ -107,6 +107,7 @@ struct spdk_bs_request_set {
 
 	int priority_class;
 	uint8_t geometry;
+	struct spdk_blob_store	*bs;
 
 	union {
 		struct {

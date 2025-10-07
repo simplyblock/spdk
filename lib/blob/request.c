@@ -14,6 +14,24 @@
 
 #include "spdk/log.h"
 
+static void
+check_geometry(struct spdk_blob_store *bs, uint8_t geometry, uint64_t lba)
+{
+	uint64_t num_md_lba;
+	num_md_lba = bs_page_to_lba(bs, bs->md_start + bs->md_len);
+
+	if (num_md_lba < lba && geometry == 0) {
+		SPDK_ERRLOG("1- Invalid geometry %u, exceeds metadata size %lu, lba %lu\n",
+			    geometry, num_md_lba, lba);
+	}
+
+	if (num_md_lba > lba && geometry != 0) {
+		SPDK_ERRLOG("2- Invalid geometry %u, metadata size %lu, lba %lu\n",
+			    geometry, num_md_lba, lba);
+	}
+	return;
+}
+
 void
 bs_call_cpl(struct spdk_bs_cpl *cpl, int bserrno)
 {
@@ -154,7 +172,7 @@ bs_sequence_read_bs_dev(spdk_bs_sequence_t *seq, struct spdk_bs_dev *bs_dev,
 	set->u.sequence.cb_arg = cb_arg;
 	bs_dev->priority_class = set->priority_class;
 	bs_dev->geometry = set->geometry;
-
+	check_geometry(set->bs, bs_dev->geometry, lba);
 	bs_dev->read(bs_dev, back_channel, payload, lba, lba_count, &set->cb_args);
 }
 
@@ -173,7 +191,7 @@ bs_sequence_read_dev(spdk_bs_sequence_t *seq, void *payload,
 	set->u.sequence.cb_arg = cb_arg;
 	channel->dev->priority_class = set->priority_class;
 	channel->dev->geometry = set->geometry;
-
+	check_geometry(set->bs, channel->dev->geometry, lba);
 	channel->dev->read(channel->dev, channel->dev_channel, payload, lba, lba_count, &set->cb_args);
 }
 
@@ -193,6 +211,7 @@ bs_sequence_write_dev(spdk_bs_sequence_t *seq, void *payload,
 	channel->dev->priority_class = set->priority_class;
 	channel->dev->geometry = set->geometry;
 
+	check_geometry(set->bs, channel->dev->geometry, lba);
 	channel->dev->write(channel->dev, channel->dev_channel, payload, lba, lba_count,
 			    &set->cb_args);
 }
@@ -213,6 +232,7 @@ bs_sequence_readv_bs_dev(spdk_bs_sequence_t *seq, struct spdk_bs_dev *bs_dev,
 
 	bs_dev->priority_class = set->priority_class;
 	bs_dev->geometry = set->geometry;
+	check_geometry(set->bs, bs_dev->geometry, lba);
 	if (set->ext_io_opts) {
 		assert(bs_dev->readv_ext);
 		bs_dev->readv_ext(bs_dev, back_channel, iov, iovcnt, lba, lba_count,
@@ -236,7 +256,7 @@ bs_sequence_readv_dev(spdk_bs_sequence_t *seq, struct iovec *iov, int iovcnt,
 	set->u.sequence.cb_arg = cb_arg;
 	channel->dev->priority_class = set->priority_class;
 	channel->dev->geometry = set->geometry;
-	
+	check_geometry(set->bs, channel->dev->geometry, lba);
 	if (set->ext_io_opts) {
 		assert(channel->dev->readv_ext);
 		channel->dev->readv_ext(channel->dev, channel->dev_channel, iov, iovcnt, lba, lba_count,
@@ -261,7 +281,7 @@ bs_sequence_writev_dev(spdk_bs_sequence_t *seq, struct iovec *iov, int iovcnt,
 	set->u.sequence.cb_arg = cb_arg;
 	channel->dev->priority_class = set->priority_class;
 	channel->dev->geometry = set->geometry;
-
+    check_geometry(set->bs, channel->dev->geometry, lba);
 	if (set->ext_io_opts) {
 		assert(channel->dev->writev_ext);
 		channel->dev->writev_ext(channel->dev, channel->dev_channel, iov, iovcnt, lba, lba_count,
@@ -287,7 +307,7 @@ bs_sequence_write_zeroes_dev(spdk_bs_sequence_t *seq,
 	set->u.sequence.cb_arg = cb_arg;
 	channel->dev->priority_class = set->priority_class;
 	channel->dev->geometry = set->geometry;
-
+ 	check_geometry(set->bs, channel->dev->geometry, lba);
 	channel->dev->write_zeroes(channel->dev, channel->dev_channel, lba, lba_count,
 				   &set->cb_args);
 }
@@ -306,7 +326,7 @@ bs_sequence_copy_dev(spdk_bs_sequence_t *seq, uint64_t dst_lba, uint64_t src_lba
 	set->u.sequence.cb_arg = cb_arg;
 	channel->dev->priority_class = set->priority_class;
 	channel->dev->geometry = set->geometry;
-
+ 	check_geometry(set->bs, channel->dev->geometry, src_lba);
 	channel->dev->copy(channel->dev, channel->dev_channel, dst_lba, src_lba, lba_count, &set->cb_args);
 }
 
@@ -351,7 +371,7 @@ bs_batch_completion(struct spdk_io_channel *_channel,
 			} else {
 				channel->dev->geometry = set->geometry;
 			}
-					
+			check_geometry(set->bs, channel->dev->geometry, ctx->lba);	
 			if (spdk_likely(channel->bs->is_leader)) {
 				channel->dev->unmap(channel->dev, channel->dev_channel, ctx->lba, ctx->lba_count,
 						&set->cb_args);
@@ -432,6 +452,7 @@ bs_batch_read_bs_dev(spdk_bs_batch_t *batch, struct spdk_bs_dev *bs_dev,
 	} else {
 		bs_dev->geometry = batch->geometry;
 	}
+	check_geometry(set->bs, bs_dev->geometry, lba);
 	bs_dev->read(bs_dev, back_channel, payload, lba, lba_count, &set->cb_args);
 }
 
@@ -453,6 +474,7 @@ bs_batch_read_dev(spdk_bs_batch_t *batch, void *payload,
 	} else {
 		channel->dev->geometry = batch->geometry;
 	}
+	check_geometry(set->bs, channel->dev->geometry, lba);
 	channel->dev->read(channel->dev, channel->dev_channel, payload, lba, lba_count, &set->cb_args);
 }
 
@@ -472,6 +494,7 @@ bs_batch_write_dev(spdk_bs_batch_t *batch, void *payload,
 	} else {
 		channel->dev->geometry = batch->geometry;
 	}
+	check_geometry(set->bs, channel->dev->geometry, lba);
 	channel->dev->write(channel->dev, channel->dev_channel, payload, lba, lba_count,
 			    &set->cb_args);
 }
@@ -506,6 +529,7 @@ out:
 	} else {
 		channel->dev->geometry = batch->geometry;
 	}
+	check_geometry(set->bs, channel->dev->geometry, lba);
 	if (spdk_likely(channel->bs->is_leader)) {
 		channel->dev->unmap(channel->dev, channel->dev_channel, lba, lba_count,
 					&set->cb_args);
@@ -532,7 +556,7 @@ bs_batch_write_zeroes_dev(spdk_bs_batch_t *batch,
 	} else {
 		channel->dev->geometry = batch->geometry;
 	}
-	
+	check_geometry(set->bs, channel->dev->geometry, lba);
 	if (spdk_likely(channel->bs->is_leader)) {
 		channel->dev->write_zeroes(channel->dev, channel->dev_channel, lba, lba_count,
 				   	&set->cb_args);

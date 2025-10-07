@@ -4283,6 +4283,7 @@ bs_channel_create(void *io_device, void *ctx_buf)
 	TAILQ_INIT(&channel->reqs);
 
 	for (i = 0; i < max_ops; i++) {
+		channel->req_mem[i].bs = bs;
 		TAILQ_INSERT_TAIL(&channel->reqs, &channel->req_mem[i], link);
 	}
 
