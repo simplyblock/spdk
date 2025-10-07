@@ -8318,6 +8318,7 @@ bdev_destroy_cb(void *io_device)
 	cb_arg = bdev->internal.unregister_ctx;
 
 	spdk_spin_destroy(&bdev->internal.spinlock);
+	fprintf(stderr, "Bdev %s destructed\n", bdev->name);	
 	free(bdev->internal.qos);
 	bdev_free_io_stat(bdev->internal.stat);
 	spdk_trace_unregister_owner(bdev->internal.trace_id);
@@ -8413,7 +8414,7 @@ static void
 bdev_unregister(struct spdk_bdev *bdev, void *_ctx, int status)
 {
 	int rc;
-
+	fprintf(stderr, "Unregistering bdev %s\n", bdev->name);
 	spdk_spin_lock(&g_bdev_mgr.spinlock);
 	spdk_spin_lock(&bdev->internal.spinlock);
 	/*
@@ -8438,6 +8439,7 @@ spdk_bdev_unregister(struct spdk_bdev *bdev, spdk_bdev_unregister_cb cb_fn, void
 	struct spdk_thread	*thread;
 
 	SPDK_DEBUGLOG(bdev, "Removing bdev %s from list\n", bdev->name);
+	fprintf(stderr, "Removing bdev %s from list\n", bdev->name);
 
 	thread = spdk_get_thread();
 	if (!thread) {
@@ -8479,7 +8481,7 @@ spdk_bdev_unregister_by_name(const char *bdev_name, struct spdk_bdev_module *mod
 	struct spdk_bdev_desc *desc;
 	struct spdk_bdev *bdev;
 	int rc;
-
+	fprintf(stderr, "Unregistering bdev by name: %s\n", bdev_name);
 	rc = spdk_bdev_open_ext(bdev_name, false, _tmp_bdev_event_cb, NULL, &desc);
 	if (rc != 0) {
 		SPDK_ERRLOG("Failed to open bdev with name: %s\n", bdev_name);
@@ -8515,6 +8517,7 @@ bdev_start_qos(struct spdk_bdev *bdev)
 			return -ENOMEM;
 		}
 		ctx->bdev = bdev;
+		fprintf(stderr, "Starting QoS for bdev\n");
 		spdk_bdev_for_each_channel(bdev, bdev_enable_qos_msg, ctx, bdev_enable_qos_done);
 	}
 
@@ -10011,11 +10014,14 @@ bdev_set_qos_limit_done(struct set_qos_limit_ctx *ctx, int status)
 	ctx->bdev->internal.qos_mod_in_progress = false;
 	spdk_spin_unlock(&ctx->bdev->internal.spinlock);
 
-	SPDK_NOTICELOG("Set QoS limit done for %s\n", ctx->bdev->name);
+	SPDK_NOTICELOG("Set QoS limit done for %s total_bdevs=%d nc=%d is_remove=%d\n", ctx->bdev->name, ctx->total_bdev_to_process, ctx->bdev_node_cout, ctx->is_remove_requets);
 	if(ctx->internal_request == true)
 	{
+		fprintf(stderr, "DBG_QOS bdev_set_qos_limit_done internal_request\n");
 		if(ctx->total_bdev_to_process > ctx->bdev_node_cout) {
+			fprintf(stderr, "DBG_QOS bdev_set_qos_limit_done next_bdev nc=%d\n", ctx->bdev_node_cout);
 			if(ctx->is_remove_requets == true) {
+				fprintf(stderr, "DBG_QOS bdev_set_qos_limit_done remove_bdev=%s\n", ctx->qos_bdev_node->bdev_name);
 				remove_bdev_from_group(ctx->qos_bdev_node->bdev_name);
 				next_qos_bdev_node = find_existing_bdev(ctx->qos_pool_id_object, ctx->remove_bdev_names[ctx->bdev_node_cout]);
 				// Copy the limits in the transient variable.
@@ -10027,6 +10033,7 @@ bdev_set_qos_limit_done(struct set_qos_limit_ctx *ctx, int status)
 					limits[i] = 0;
 				}
 			} else {
+				fprintf(stderr, "DBG_QOS bdev_set_qos_limit_done select next_qos_bdev_node\n");
 				next_qos_bdev_node = TAILQ_NEXT(ctx->qos_bdev_node, link);
 				// Copy the limits in the transient variable.
 				for (uint64_t i = 0; i < SPDK_BDEV_QOS_NUM_RATE_LIMIT_TYPES; i++) {
@@ -10035,11 +10042,13 @@ bdev_set_qos_limit_done(struct set_qos_limit_ctx *ctx, int status)
 			}
 			// This case is not possible.
 			if(next_qos_bdev_node == NULL) {
+				fprintf(stderr, "DBG_QOS bdev_set_qos_limit_done next_qos_bdev_node is NULL\n");
 				ctx->cb_fn(ctx->cb_arg, 0);
 				free(ctx);
 				ctx = NULL;
 				return;
 			}
+			fprintf(stderr, "DBG_QOS bdev_set_qos_limit_done next_qos_bdev_node=%s\n", next_qos_bdev_node->bdev_name);
 			rc = spdk_bdev_open_ext(next_qos_bdev_node->bdev_name, false, dummy_bdev_event_cb, NULL, &desc);
 				if (rc != 0) {
 					SPDK_ERRLOG("Failed to open bdev '%s': %d\n", next_qos_bdev_node->bdev_name, rc);
@@ -10048,25 +10057,32 @@ bdev_set_qos_limit_done(struct set_qos_limit_ctx *ctx, int status)
 					ctx = NULL;
 					return;
 				}
-			
+			fprintf(stderr, "DBG_QOS bdev_set_qos_limit_done calling spdk_bdev_set_qos_rate_limits_ex for %s\n", next_qos_bdev_node->bdev_name);
 			spdk_bdev_set_qos_rate_limits_ex(spdk_bdev_desc_get_bdev(desc), limits, ctx->bdev_pool_id, ctx->qos_pool_id_object, 
 			next_qos_bdev_node, ++ctx->bdev_node_cout, ctx->total_bdev_to_process ,ctx->is_remove_requets, tmp_remove_bdev_names, ctx->cb_fn, ctx->cb_arg);
+			fprintf(stderr, "DBG_QOS bdev_set_qos_limit_done after calling spdk_bdev_set_qos_rate_limits_ex for %s\n", next_qos_bdev_node->bdev_name);
 			spdk_bdev_close(desc);
 			
 			if(ctx->is_remove_requets) {
+				fprintf(stderr, "DBG_QOS bdev_set_qos_limit_done free remove_bdev_names\n");
 				for(uint64_t i = 0 ; i < ctx->total_bdev_to_process; i++) {
+					fprintf(stderr, "DBG_QOS bdev_set_qos_limit_done free remove_bdev_names[%d]=%s\n", i, ctx->remove_bdev_names[i]);
 					if(ctx->remove_bdev_names[i] != NULL) {
 						free(ctx->remove_bdev_names[i]);
 					}
 				}
+				fprintf(stderr, "DBG_QOS bdev_set_qos_limit_done free tmp_remove_bdev_names\n");
 				for (uint64_t i = 0; i < ctx->total_bdev_to_process; i++) {
 					free(tmp_remove_bdev_names[i]);
 				}
 			}
+			fprintf(stderr, "DBG_QOS bdev_set_qos_limit_done return after processing next bdev\n");	
 			free(ctx);
 		} else {
 			// End of the the nodes
+			fprintf(stderr, "DBG_QOS bdev_set_qos_limit_done end of the nodes\n");
 			if(ctx->is_remove_requets) {
+				fprintf(stderr, "DBG_QOS bdev_set_qos_limit_done final remove_bdev=%s\n", ctx->qos_bdev_node->bdev_name);
 				remove_bdev_from_group(ctx->qos_bdev_node->bdev_name);
 				for(uint64_t i = 0 ; i < ctx->total_bdev_to_process; i++) {
 					if(ctx->remove_bdev_names[i] != NULL) {
@@ -10076,24 +10092,31 @@ bdev_set_qos_limit_done(struct set_qos_limit_ctx *ctx, int status)
 			}
 			ctx->cb_fn(ctx->cb_arg,0);
 			free(ctx);
+			fprintf(stderr, "DBG_QOS bdev_set_qos_limit_done return after processing all bdevs\n");
 		}
 	} else {
+		fprintf(stderr, "DBG_QOS bdev_set_qos_limit_done external_request\n");
 		if(ctx->is_remove_requets) {
+			fprintf(stderr, "DBG_QOS bdev_set_qos_limit_done external_request remove_bdev\n");
 				for(uint64_t i = 0 ; i < ctx->total_bdev_to_process; i++) {
 					if(ctx->remove_bdev_names[i] != NULL) {
+						fprintf(stderr, "DBG_QOS bdev_set_qos_limit_done free external_request remove_bdev=%s\n", ctx->remove_bdev_names[i]);
 						free(ctx->remove_bdev_names[i]);
 					}
 				}
 			}
 		ctx->cb_fn(ctx->cb_arg,0);
 		free(ctx);
+		fprintf(stderr, "DBG_QOS bdev_set_qos_limit_done return after processing external_request3\n");
 	}
+	fprintf(stderr, "DBG_QOS bdev_set_qos_limit_done exit\n");
 	return;
 }
 
 static void
 bdev_disable_qos_done(void *cb_arg)
 {
+	fprintf(stderr, "bdev_disable_qos_done***************\n");
 	struct set_qos_limit_ctx *ctx = cb_arg;
 	struct spdk_bdev *bdev = ctx->bdev;
 	struct spdk_bdev_qos *qos;
@@ -10120,7 +10143,7 @@ bdev_disable_qos_done(void *cb_arg)
 
 	free(qos);
 	qos = NULL;
-
+	fprintf(stderr, "DBG_QOS bdev_disable_qos_done\n");
 	bdev_set_qos_limit_done(ctx, 0);
 }
 
@@ -10169,7 +10192,7 @@ bdev_update_qos_rate_limit_msg(void *cb_arg)
 	spdk_spin_lock(&bdev->internal.spinlock);
 	bdev_qos_update_max_quota_per_timeslice(bdev->internal.qos);
 	spdk_spin_unlock(&bdev->internal.spinlock);
-
+	fprintf(stderr, "DBG_QOS bdev_update_qos_rate_limit_msg\n");
 	bdev_set_qos_limit_done(ctx, 0);
 }
 
@@ -10189,7 +10212,7 @@ static void
 bdev_enable_qos_done(struct spdk_bdev *bdev, void *_ctx, int status)
 {
 	struct set_qos_limit_ctx *ctx = _ctx;
-
+	fprintf(stderr, "DBG_QOS bdev_enable_qos_done\n");
 	bdev_set_qos_limit_done(ctx, status);
 }
 
@@ -10297,6 +10320,7 @@ spdk_bdev_set_qos_rate_limits(struct spdk_bdev *bdev, uint64_t *limits,
 			if (!bdev->internal.qos) {
 				spdk_spin_unlock(&bdev->internal.spinlock);
 				SPDK_ERRLOG("Unable to allocate memory for QoS tracking\n");
+				fprintf(stderr, "DBG_QOS Unable to allocate memory for QoS tracking\n");
 				bdev_set_qos_limit_done(ctx, -ENOMEM);
 				return;
 			}
@@ -10304,6 +10328,7 @@ spdk_bdev_set_qos_rate_limits(struct spdk_bdev *bdev, uint64_t *limits,
 			if (!bdev->internal.qos->rate_limits) {
 				spdk_spin_unlock(&bdev->internal.spinlock);
 				SPDK_ERRLOG("Unable to allocate memory for QoS tracking\n");
+				fprintf(stderr, "DBG_QOS Unable to allocate memory for QoS tracking2\n");
 				bdev_set_qos_limit_done(ctx, -ENOMEM);
 				return;
 			}
@@ -10312,7 +10337,7 @@ spdk_bdev_set_qos_rate_limits(struct spdk_bdev *bdev, uint64_t *limits,
 		if (bdev->internal.qos->thread == NULL) {
 			/* Enabling */
 			bdev_set_qos_rate_limits(bdev, limits);
-
+			fprintf(stderr, "DBG_QOS spdk_bdev_set_qos_rate_limits bdev_enable_qos_msg\n");
 			spdk_bdev_for_each_channel(bdev, bdev_enable_qos_msg, ctx,
 						   bdev_enable_qos_done);
 		} else {
@@ -10327,10 +10352,12 @@ spdk_bdev_set_qos_rate_limits(struct spdk_bdev *bdev, uint64_t *limits,
 			bdev_set_qos_rate_limits(bdev, limits);
 
 			/* Disabling */
+			fprintf(stderr, "DBG_QOS spdk_bdev_set_qos_rate_limits bdev_disable_qos_msg\n");
 			spdk_bdev_for_each_channel(bdev, bdev_disable_qos_msg, ctx,
 						   bdev_disable_qos_msg_done);
 		} else {
 			spdk_spin_unlock(&bdev->internal.spinlock);
+			fprintf(stderr, "DBG_QOS 3\n");
 			bdev_set_qos_limit_done(ctx, 0);
 			return;
 		}
@@ -10411,7 +10438,7 @@ spdk_bdev_set_qos_rate_limits_ex(struct spdk_bdev *bdev, uint64_t *limits, uint6
 	bool set_limits = false;
 	struct spdk_bdev_qos_limit *tmp_rate_limits;
 
-
+	fprintf(stderr, "DBG_QOS spdk_bdev_set_qos_rate_limits_ex\n");
 	struct spdk_bdev_qos_pool_id_mapping * qos_pool_id_object_l = qos_pool_id_object;
 	
 	SPDK_NOTICELOG("Setting the QoS limits for bdev %s group id %" PRIu64 "\n",bdev->name, bdev_pool_id);
@@ -10543,7 +10570,7 @@ spdk_bdev_set_qos_rate_limits_ex(struct spdk_bdev *bdev, uint64_t *limits, uint6
 				SPDK_NOTICELOG("Setting the limits for group %" PRIu64 "\n", bdev_pool_id);
 				bdev_set_qos_rate_limits(bdev, limits);
 			}
-
+			fprintf(stderr, "DBG_QOS spdk_bdev_set_qos_rate_limits_ex bdev_enable_qos_msg\n");
 			spdk_bdev_for_each_channel(bdev, bdev_enable_qos_msg, ctx,
 						   bdev_enable_qos_done);
 		} else {
@@ -10580,10 +10607,12 @@ spdk_bdev_set_qos_rate_limits_ex(struct spdk_bdev *bdev, uint64_t *limits, uint6
 			bdev_set_qos_rate_limits(bdev, limits);
 
 			/* Disabling */
+			fprintf(stderr, "DBG_QOS spdk_bdev_set_qos_rate_limits_ex bdev_disable_qos_msg\n");
 			spdk_bdev_for_each_channel(bdev, bdev_disable_qos_msg, ctx,
 						   bdev_disable_qos_msg_done);
 		} else {
 			spdk_spin_unlock(&bdev->internal.spinlock);
+			fprintf(stderr, "DBG_QOS bdev_set_qos_limit_done spdk_bdev_set_qos_rate_limits_ex\n");
 			bdev_set_qos_limit_done(ctx, 0);
 			return;
 		}
