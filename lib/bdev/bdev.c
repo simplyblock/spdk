@@ -10105,7 +10105,11 @@ bdev_set_qos_limit_done(struct set_qos_limit_ctx *ctx, int status)
 					}
 				}
 			}
-		ctx->cb_fn(ctx->cb_arg,0);
+		fprintf(stderr, "DBG_QOS bdev_set_qos_limit_done calling cb_fn\n");
+		if (ctx->cb_fn) {
+			ctx->cb_fn(ctx->cb_arg, status);
+		}
+		fprintf(stderr, "DBG_QOS bdev_set_qos_limit_done after calling cb_fn\n");
 		free(ctx);
 		fprintf(stderr, "DBG_QOS bdev_set_qos_limit_done return after processing external_request3\n");
 	}
