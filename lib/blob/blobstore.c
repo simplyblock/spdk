@@ -2368,6 +2368,9 @@ persist_bs_write_used_blobids_batch(spdk_bs_sequence_t *batch, struct spdk_blob_
 			spdk_bit_array_store_mask_one_page(bs->used_blobids,
 							page, first_bit_inpage, last_bit_inpage);
 			lba = bs_page_to_lba(bs, bs->used_blobid_mask_start + pageidx);
+			if (pageidx > bs->md_len) {
+				SPDK_ERRLOG("4- Invalid geometry %u, idx %lu, lba %lu\n",0, pageidx, lba);
+			}
 			bs->w_io++;
 			bs_batch_write_dev(batch, page, lba, bs_byte_to_lba(bs, SPDK_BS_PAGE_SIZE));
 		}
@@ -2715,6 +2718,9 @@ persist_bs_write_used_blobids(spdk_bs_sequence_t *seq, void *arg, int bserrno)
 	spdk_bit_array_store_mask_one_page(bs->used_blobids,
 	 				ctx->bit_page, first_bit_inpage, last_bit_inpage);
 	lba = bs_page_to_lba(bs, bs->used_blobid_mask_start + pageidx);
+	if (pageidx > bs->md_len) {
+		SPDK_ERRLOG("3- Invalid geometry %u, idx %lu, lba %lu\n",0, pageidx, lba);
+	}
 	bs->w_io++;
 	bs_sequence_write_dev(seq, ctx->bit_page, lba, 
 					bs_byte_to_lba(bs, SPDK_BS_PAGE_SIZE),
@@ -6975,12 +6981,11 @@ bs_dump_read_md_page(spdk_bs_sequence_t *seq, void *cb_arg)
 
 	struct spdk_blob_store		*bs = ctx->bs;
 	spdk_bs_batch_t			*batch;
-	size_t				i;
+	size_t				i = 0;
 
 	batch = bs_sequence_to_batch(seq, 0, bs_dump_read_md_page_cpl, ctx);
 	ctx->idx_dump = 0;
-	i = ctx->cur_page;
-	for (i = 0; ctx->idx_dump < 4096 && i < ctx->super->md_len; i++) {
+	for (i = ctx->cur_page; ctx->idx_dump < 4096 && i < ctx->super->md_len; i++) {
 		assert(ctx->cur_page < ctx->super->md_len);
 		lba = bs_page_to_lba(bs, ctx->super->md_start + i);
 		ctx->bs->r_io++;
