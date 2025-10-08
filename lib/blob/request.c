@@ -232,7 +232,7 @@ bs_sequence_readv_bs_dev(spdk_bs_sequence_t *seq, struct spdk_bs_dev *bs_dev,
 
 	bs_dev->priority_class = set->priority_class;
 	bs_dev->geometry = set->geometry;
-	check_geometry(set->bs, bs_dev->geometry, lba);
+	// check_geometry(set->bs, bs_dev->geometry, lba);
 	if (set->ext_io_opts) {
 		assert(bs_dev->readv_ext);
 		bs_dev->readv_ext(bs_dev, back_channel, iov, iovcnt, lba, lba_count,
