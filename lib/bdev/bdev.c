@@ -4759,7 +4759,7 @@ bdev_qos_destroy(struct spdk_bdev *bdev)
 	bdev->internal.qos = new_qos;
 
 	if (old_qos->thread == NULL) {
-		delete_rate_limit(bdev->name, old_qos);
+		//delete_rate_limit(bdev->name, old_qos);
 		remove_bdev_from_group(bdev->name);
 		free(old_qos);
 		old_qos = NULL;
@@ -8284,7 +8284,7 @@ bdev_register(struct spdk_bdev *bdev)
 		spdk_io_device_unregister(__bdev_to_io_dev(bdev), NULL);
 		bdev_free_io_stat(bdev->internal.stat);
 		spdk_spin_destroy(&bdev->internal.spinlock);
-		delete_rate_limit(bdev->name, bdev->internal.qos);
+		//delete_rate_limit(bdev->name, bdev->internal.qos);
 		remove_bdev_from_group(bdev->name);
 		free(bdev_name);
 		bdev->internal.qos = NULL;
@@ -9847,11 +9847,14 @@ static void remove_bdev_from_group(char *bdev_names) {
 					if(qos_pool_id_object->rate_limits != NULL) {
 						SPDK_NOTICELOG("Cleaning the rate limit\n");
 						free(qos_pool_id_object->rate_limits);
+						SPDK_NOTICELOG("Cleaning the rate limit done\n");
 						qos_pool_id_object->rate_limits = NULL;
 					}
 					TAILQ_REMOVE(&g_qos_bdev_group_list, qos_pool_id_object, link);
 					if(qos_pool_id_object) {
+						SPDK_NOTICELOG("Cleaning the group mapping\n");
 						free(qos_pool_id_object);
+						SPDK_NOTICELOG("Cleaning the group mapping done\n");
 						qos_pool_id_object = NULL;
 					}
 				}
