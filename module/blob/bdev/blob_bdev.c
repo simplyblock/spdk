@@ -114,7 +114,7 @@ bdev_blob_read(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *p
 	int rc;
 
 	const uint64_t priority_lba = (((uint64_t)(dev->priority_class)) << PRIORITY_CLASS_BITS_POS) | 
-												((uint64_t)dev->geometry << GEOMETRY_BITS_POS) | lba;
+											((uint64_t)cb_args->geometry << GEOMETRY_BITS_POS) | lba;
 	rc = spdk_bdev_read_blocks(__get_desc(dev), channel, payload, priority_lba,
 				   lba_count, bdev_blob_io_complete, cb_args);
 	if (rc == -ENOMEM) {
@@ -132,7 +132,7 @@ bdev_blob_write(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *
 	int rc;
 
 	const uint64_t priority_lba = (((uint64_t)(dev->priority_class)) << PRIORITY_CLASS_BITS_POS) | 
-												((uint64_t)dev->geometry << GEOMETRY_BITS_POS) | lba;
+											((uint64_t)cb_args->geometry << GEOMETRY_BITS_POS) | lba;
 	rc = spdk_bdev_write_blocks(__get_desc(dev), channel, payload, priority_lba,
 				    lba_count, bdev_blob_io_complete, cb_args);
 	if (rc == -ENOMEM) {
@@ -151,7 +151,7 @@ bdev_blob_readv(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	int rc;
 
 	const uint64_t priority_lba = (((uint64_t)(dev->priority_class)) << PRIORITY_CLASS_BITS_POS) |
-													((uint64_t)dev->geometry << GEOMETRY_BITS_POS) | lba;
+												((uint64_t)cb_args->geometry << GEOMETRY_BITS_POS) | lba;
 	rc = spdk_bdev_readv_blocks(__get_desc(dev), channel, iov, iovcnt, priority_lba,
 				    lba_count, bdev_blob_io_complete, cb_args);
 	if (rc == -ENOMEM) {
@@ -170,7 +170,7 @@ bdev_blob_writev(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	int rc;
 
 	const uint64_t priority_lba = (((uint64_t)(dev->priority_class)) << PRIORITY_CLASS_BITS_POS) |
-												((uint64_t)dev->geometry << GEOMETRY_BITS_POS) | lba;
+											((uint64_t)cb_args->geometry << GEOMETRY_BITS_POS) | lba;
 	rc = spdk_bdev_writev_blocks(__get_desc(dev), channel, iov, iovcnt, priority_lba,
 				     lba_count, bdev_blob_io_complete, cb_args);
 	if (rc == -ENOMEM) {
@@ -201,7 +201,7 @@ bdev_blob_readv_ext(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 
 	blob_ext_io_opts_to_bdev_opts(&bdev_io_opts, io_opts);
 	const uint64_t priority_lba = (((uint64_t)(dev->priority_class)) << PRIORITY_CLASS_BITS_POS) |
-												((uint64_t)dev->geometry << GEOMETRY_BITS_POS) | lba;
+											((uint64_t)cb_args->geometry << GEOMETRY_BITS_POS) | lba;
 	rc = spdk_bdev_readv_blocks_ext(__get_desc(dev), channel, iov, iovcnt, priority_lba, lba_count,
 					bdev_blob_io_complete, cb_args, &bdev_io_opts);
 	if (rc == -ENOMEM) {
@@ -223,7 +223,7 @@ bdev_blob_writev_ext(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 
 	blob_ext_io_opts_to_bdev_opts(&bdev_io_opts, io_opts);
 	const uint64_t priority_lba = (((uint64_t)(dev->priority_class)) << PRIORITY_CLASS_BITS_POS) |
-												((uint64_t)dev->geometry << GEOMETRY_BITS_POS) | lba;
+											((uint64_t)cb_args->geometry << GEOMETRY_BITS_POS) | lba;
 	rc = spdk_bdev_writev_blocks_ext(__get_desc(dev), channel, iov, iovcnt, priority_lba, lba_count,
 					 bdev_blob_io_complete, cb_args, &bdev_io_opts);
 	if (rc == -ENOMEM) {
@@ -241,7 +241,7 @@ bdev_blob_write_zeroes(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	int rc;
 
 	const uint64_t priority_lba = (((uint64_t)(dev->priority_class)) << PRIORITY_CLASS_BITS_POS) |
-												((uint64_t)dev->geometry << GEOMETRY_BITS_POS) | lba;
+											((uint64_t)cb_args->geometry << GEOMETRY_BITS_POS) | lba;
 	rc = spdk_bdev_write_zeroes_blocks(__get_desc(dev), channel, priority_lba,
 					   lba_count, bdev_blob_io_complete, cb_args);
 	if (rc == -ENOMEM) {
@@ -261,7 +261,7 @@ bdev_blob_unmap(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, uint64
 
 	if (spdk_bdev_io_type_supported(blob_bdev->bdev, SPDK_BDEV_IO_TYPE_UNMAP)) {
 		const uint64_t priority_lba = (((uint64_t)(dev->priority_class)) << PRIORITY_CLASS_BITS_POS) |
-													((uint64_t)dev->geometry << GEOMETRY_BITS_POS) | lba;
+												((uint64_t)cb_args->geometry << GEOMETRY_BITS_POS) | lba;
 		rc = spdk_bdev_unmap_blocks(__get_desc(dev), channel, priority_lba, lba_count,
 					    bdev_blob_io_complete, cb_args);
 		if (rc == -ENOMEM) {
@@ -288,7 +288,7 @@ bdev_blob_copy(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	int rc;
 	// offset_blocks field of bdev_io of spdk_bdev_copy_blocks() is in fact the destination LBA
 	const uint64_t priority_dst_lba = (((uint64_t)(dev->priority_class)) << PRIORITY_CLASS_BITS_POS) |
-														((uint64_t)dev->geometry << GEOMETRY_BITS_POS) | dst_lba;
+													((uint64_t)cb_args->geometry << GEOMETRY_BITS_POS) | dst_lba;
 	rc = spdk_bdev_copy_blocks(__get_desc(dev), channel,
 				   priority_dst_lba, src_lba, lba_count,
 				   bdev_blob_io_complete, cb_args);

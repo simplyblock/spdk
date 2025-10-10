@@ -183,6 +183,7 @@ struct spdk_bs_dev_cb_args {
 	spdk_bs_dev_cpl		cb_fn;
 	struct spdk_io_channel	*channel;
 	void			*cb_arg;
+	uint8_t			geometry;
 };
 
 /**

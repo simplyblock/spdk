@@ -110,6 +110,7 @@ bs_sequence_start(struct spdk_io_channel *_channel, struct spdk_bs_cpl *cpl,
 	set->channel = channel;
 	set->back_channel = back_channel;
 
+	// set->bs = channel->bs;
 	set->priority_class = channel->bs->priority_class;
 	set->geometry = 0; // default geometry
 	set->cb_args.cb_fn = bs_sequence_completion;
@@ -171,8 +172,8 @@ bs_sequence_read_bs_dev(spdk_bs_sequence_t *seq, struct spdk_bs_dev *bs_dev,
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
 	bs_dev->priority_class = set->priority_class;
-	bs_dev->geometry = set->geometry;
-	check_geometry(set->bs, bs_dev->geometry, lba);
+	set->cb_args.geometry = set->geometry;
+	check_geometry(set->bs, set->cb_args.geometry, lba);
 	bs_dev->read(bs_dev, back_channel, payload, lba, lba_count, &set->cb_args);
 }
 
@@ -190,8 +191,8 @@ bs_sequence_read_dev(spdk_bs_sequence_t *seq, void *payload,
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
 	channel->dev->priority_class = set->priority_class;
-	channel->dev->geometry = set->geometry;
-	check_geometry(set->bs, channel->dev->geometry, lba);
+	set->cb_args.geometry = set->geometry;
+	check_geometry(set->bs, set->cb_args.geometry, lba);
 	channel->dev->read(channel->dev, channel->dev_channel, payload, lba, lba_count, &set->cb_args);
 }
 
@@ -209,9 +210,9 @@ bs_sequence_write_dev(spdk_bs_sequence_t *seq, void *payload,
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
 	channel->dev->priority_class = set->priority_class;
-	channel->dev->geometry = set->geometry;
+	set->cb_args.geometry = set->geometry;
 
-	check_geometry(set->bs, channel->dev->geometry, lba);
+	check_geometry(set->bs, set->cb_args.geometry, lba);
 	channel->dev->write(channel->dev, channel->dev_channel, payload, lba, lba_count,
 			    &set->cb_args);
 }
@@ -231,8 +232,8 @@ bs_sequence_readv_bs_dev(spdk_bs_sequence_t *seq, struct spdk_bs_dev *bs_dev,
 	set->u.sequence.cb_arg = cb_arg;
 
 	bs_dev->priority_class = set->priority_class;
-	bs_dev->geometry = set->geometry;
-	// check_geometry(set->bs, bs_dev->geometry, lba);
+	set->cb_args.geometry = set->geometry;
+	// check_geometry(set->bs, set->cb_args.geometry, lba);
 	if (set->ext_io_opts) {
 		assert(bs_dev->readv_ext);
 		bs_dev->readv_ext(bs_dev, back_channel, iov, iovcnt, lba, lba_count,
@@ -255,8 +256,8 @@ bs_sequence_readv_dev(spdk_bs_sequence_t *seq, struct iovec *iov, int iovcnt,
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
 	channel->dev->priority_class = set->priority_class;
-	channel->dev->geometry = set->geometry;
-	check_geometry(set->bs, channel->dev->geometry, lba);
+	set->cb_args.geometry = set->geometry;
+	check_geometry(set->bs, set->cb_args.geometry, lba);
 	if (set->ext_io_opts) {
 		assert(channel->dev->readv_ext);
 		channel->dev->readv_ext(channel->dev, channel->dev_channel, iov, iovcnt, lba, lba_count,
@@ -280,8 +281,8 @@ bs_sequence_writev_dev(spdk_bs_sequence_t *seq, struct iovec *iov, int iovcnt,
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
 	channel->dev->priority_class = set->priority_class;
-	channel->dev->geometry = set->geometry;
-    check_geometry(set->bs, channel->dev->geometry, lba);
+	set->cb_args.geometry = set->geometry;
+	check_geometry(set->bs, set->cb_args.geometry, lba);
 	if (set->ext_io_opts) {
 		assert(channel->dev->writev_ext);
 		channel->dev->writev_ext(channel->dev, channel->dev_channel, iov, iovcnt, lba, lba_count,
@@ -306,8 +307,8 @@ bs_sequence_write_zeroes_dev(spdk_bs_sequence_t *seq,
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
 	channel->dev->priority_class = set->priority_class;
-	channel->dev->geometry = set->geometry;
- 	check_geometry(set->bs, channel->dev->geometry, lba);
+	set->cb_args.geometry = set->geometry;
+ 	check_geometry(set->bs, set->cb_args.geometry, lba);
 	channel->dev->write_zeroes(channel->dev, channel->dev_channel, lba, lba_count,
 				   &set->cb_args);
 }
@@ -325,8 +326,8 @@ bs_sequence_copy_dev(spdk_bs_sequence_t *seq, uint64_t dst_lba, uint64_t src_lba
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
 	channel->dev->priority_class = set->priority_class;
-	channel->dev->geometry = set->geometry;
- 	check_geometry(set->bs, channel->dev->geometry, src_lba);
+	set->cb_args.geometry = set->geometry;
+ 	check_geometry(set->bs, set->cb_args.geometry, src_lba);
 	channel->dev->copy(channel->dev, channel->dev_channel, dst_lba, src_lba, lba_count, &set->cb_args);
 }
 
@@ -366,8 +367,8 @@ bs_batch_completion(struct spdk_io_channel *_channel,
 			TAILQ_REMOVE(&set->u.batch.unmap_queue, ctx, entries); // Remove it from the queue.			
 			channel->dev->priority_class = set->priority_class;
 
-			channel->dev->geometry = set->u.batch.geometry;
-			check_geometry(set->bs, channel->dev->geometry, ctx->lba); 
+			set->cb_args.geometry = set->u.batch.geometry;
+			check_geometry(set->bs, set->cb_args.geometry, ctx->lba); 
 			if (spdk_likely(channel->bs->is_leader)) {
 				channel->dev->unmap(channel->dev, channel->dev_channel, ctx->lba, ctx->lba_count,
 						&set->cb_args);
@@ -416,6 +417,7 @@ bs_batch_open(struct spdk_io_channel *_channel, struct spdk_bs_cpl *cpl, struct 
 	set->channel = channel;
 	set->back_channel = back_channel;
 
+	// set->bs = blob->bs;
 	set->u.batch.cb_fn = NULL;
 	set->u.batch.cb_arg = NULL;
 	set->u.batch.outstanding_ops = 0;
@@ -443,8 +445,8 @@ bs_batch_read_bs_dev(spdk_bs_batch_t *batch, struct spdk_bs_dev *bs_dev,
 
 	set->u.batch.outstanding_ops++;
 	bs_dev->priority_class = set->priority_class;
-	bs_dev->geometry = set->u.batch.geometry;
-	check_geometry(set->bs, bs_dev->geometry, lba);
+	set->cb_args.geometry = set->u.batch.geometry;
+	check_geometry(set->bs, set->cb_args.geometry, lba);
 	bs_dev->read(bs_dev, back_channel, payload, lba, lba_count, &set->cb_args);
 }
 
@@ -461,8 +463,8 @@ bs_batch_read_dev(spdk_bs_batch_t *batch, void *payload,
 	set->u.batch.outstanding_ops++;
 	channel->dev->priority_class = batch->priority_class;
 	
-	channel->dev->geometry = set->u.batch.geometry;
-	check_geometry(set->bs, channel->dev->geometry, lba);
+	set->cb_args.geometry = set->u.batch.geometry;
+	check_geometry(set->bs, set->cb_args.geometry, lba);
 	channel->dev->read(channel->dev, channel->dev_channel, payload, lba, lba_count, &set->cb_args);
 }
 
@@ -477,8 +479,8 @@ bs_batch_write_dev(spdk_bs_batch_t *batch, void *payload,
 
 	set->u.batch.outstanding_ops++;
 	channel->dev->priority_class = batch->priority_class;	
-	channel->dev->geometry = set->u.batch.geometry;
-	check_geometry(set->bs, channel->dev->geometry, lba);
+	set->cb_args.geometry = set->u.batch.geometry;
+	check_geometry(set->bs, set->cb_args.geometry, lba);
 	channel->dev->write(channel->dev, channel->dev_channel, payload, lba, lba_count,
 			    &set->cb_args);
 }
@@ -508,8 +510,8 @@ bs_batch_unmap_dev(spdk_bs_batch_t *batch,
 out:
 	set->u.batch.outstanding_ops++;	
 	channel->dev->priority_class = batch->priority_class;
-	channel->dev->geometry = set->u.batch.geometry;
-	check_geometry(set->bs, channel->dev->geometry, lba);
+	set->cb_args.geometry = set->u.batch.geometry;
+	check_geometry(set->bs, set->cb_args.geometry, lba);
 	if (spdk_likely(channel->bs->is_leader)) {
 		channel->dev->unmap(channel->dev, channel->dev_channel, lba, lba_count,
 					&set->cb_args);
@@ -531,8 +533,8 @@ bs_batch_write_zeroes_dev(spdk_bs_batch_t *batch,
 	set->u.batch.outstanding_ops++;
 	channel->dev->priority_class = batch->priority_class;
 
-	channel->dev->geometry = set->u.batch.geometry;
-	check_geometry(set->bs, channel->dev->geometry, lba);
+	set->cb_args.geometry = set->u.batch.geometry;
+	check_geometry(set->bs, set->cb_args.geometry, lba);
 	if (spdk_likely(channel->bs->is_leader)) {
 		channel->dev->write_zeroes(channel->dev, channel->dev_channel, lba, lba_count,
 				   	&set->cb_args);
@@ -573,6 +575,7 @@ bs_sequence_to_batch(spdk_bs_sequence_t *seq, uint8_t geometry, spdk_bs_sequence
 	TAILQ_INIT(&set->u.batch.unmap_queue);
 
 	set->cb_args.cb_fn = bs_batch_completion;
+	set->geometry = geometry;
 
 	return set;
 }
@@ -597,6 +600,7 @@ bs_user_op_alloc(struct spdk_io_channel *_channel, struct spdk_bs_cpl *cpl,
 	set->cpl = *cpl;
 	set->channel = channel;
 	set->back_channel = NULL;
+	// set->bs = channel->bs;
 	set->ext_io_opts = NULL;
 
 	args = &set->u.user_op;
