@@ -201,6 +201,13 @@ struct spdk_blob_ext_io_opts {
 } __attribute__((packed));
 SPDK_STATIC_ASSERT(sizeof(struct spdk_blob_ext_io_opts) == 32, "Incorrect size");
 
+struct spdk_bs_io_opts {
+	/** Priority class for IOs submitted on this channel */
+	uint8_t priority;
+	/** Geometry ID for IOs submitted on this channel */
+	uint8_t geometry;
+} __attribute__((packed));
+
 struct spdk_bs_dev {
 	/* Create a new channel which is a software construct that is used
 	 * to submit I/O. */
@@ -215,49 +222,46 @@ struct spdk_bs_dev {
 	 */
 	void (*destroy)(struct spdk_bs_dev *dev);
 
-	int priority_class;
-	uint8_t geometry;
-
 	void (*read)(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
 		     uint64_t lba, uint32_t lba_count,
-		     struct spdk_bs_dev_cb_args *cb_args);
+		     struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts);
 
 	void (*write)(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
 		      uint64_t lba, uint32_t lba_count,
-		      struct spdk_bs_dev_cb_args *cb_args);
+		      struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts);
 
 	void (*readv)(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		      struct iovec *iov, int iovcnt,
 		      uint64_t lba, uint32_t lba_count,
-		      struct spdk_bs_dev_cb_args *cb_args);
+		      struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts);
 
 	void (*writev)(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		       struct iovec *iov, int iovcnt,
 		       uint64_t lba, uint32_t lba_count,
-		       struct spdk_bs_dev_cb_args *cb_args);
+		       struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts);
 
 	void (*readv_ext)(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 			  struct iovec *iov, int iovcnt,
 			  uint64_t lba, uint32_t lba_count,
 			  struct spdk_bs_dev_cb_args *cb_args,
-			  struct spdk_blob_ext_io_opts *ext_io_opts);
+			  struct spdk_blob_ext_io_opts *ext_io_opts, struct spdk_bs_io_opts *bs_io_opts);
 
 	void (*writev_ext)(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 			   struct iovec *iov, int iovcnt,
 			   uint64_t lba, uint32_t lba_count,
 			   struct spdk_bs_dev_cb_args *cb_args,
-			   struct spdk_blob_ext_io_opts *ext_io_opts);
+			   struct spdk_blob_ext_io_opts *ext_io_opts, struct spdk_bs_io_opts *bs_io_opts);
 
 	void (*flush)(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		      struct spdk_bs_dev_cb_args *cb_args);
 
 	void (*write_zeroes)(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 			     uint64_t lba, uint64_t lba_count,
-			     struct spdk_bs_dev_cb_args *cb_args);
+			     struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts);
 
 	void (*unmap)(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		      uint64_t lba, uint64_t lba_count,
-		      struct spdk_bs_dev_cb_args *cb_args);
+		      struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts);
 
 	struct spdk_bdev *(*get_base_bdev)(struct spdk_bs_dev *dev);
 
@@ -278,7 +282,7 @@ struct spdk_bs_dev {
 
 	void (*copy)(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		     uint64_t dst_lba, uint64_t src_lba, uint64_t lba_count,
-		     struct spdk_bs_dev_cb_args *cb_args);
+		     struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts);
 
 	bool (*is_degraded)(struct spdk_bs_dev *dev);
 

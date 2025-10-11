@@ -13,7 +13,7 @@
 static void
 blob_bs_dev_write(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
 		  uint64_t lba, uint32_t lba_count,
-		  struct spdk_bs_dev_cb_args *cb_args)
+		  struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts)
 {
 	cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, -EPERM);
 	assert(false);
@@ -23,7 +23,7 @@ static void
 blob_bs_dev_writev(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		   struct iovec *iov, int iovcnt,
 		   uint64_t lba, uint32_t lba_count,
-		   struct spdk_bs_dev_cb_args *cb_args)
+		   struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts)
 {
 	cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, -EPERM);
 	assert(false);
@@ -34,7 +34,7 @@ blob_bs_dev_writev_ext(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		       struct iovec *iov, int iovcnt,
 		       uint64_t lba, uint32_t lba_count,
 		       struct spdk_bs_dev_cb_args *cb_args,
-		       struct spdk_blob_ext_io_opts *ext_opts)
+		       struct spdk_blob_ext_io_opts *ext_opts, struct spdk_bs_io_opts *bs_io_opts)
 {
 	cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, -EPERM);
 	assert(false);
@@ -43,7 +43,7 @@ blob_bs_dev_writev_ext(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 static void
 blob_bs_dev_write_zeroes(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 			 uint64_t lba, uint64_t lba_count,
-			 struct spdk_bs_dev_cb_args *cb_args)
+			 struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts)
 {
 	cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, -EPERM);
 	assert(false);
@@ -52,7 +52,7 @@ blob_bs_dev_write_zeroes(struct spdk_bs_dev *dev, struct spdk_io_channel *channe
 static void
 blob_bs_dev_unmap(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		  uint64_t lba, uint64_t lba_count,
-		  struct spdk_bs_dev_cb_args *cb_args)
+		  struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts)
 {
 	cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, -EPERM);
 	assert(false);
@@ -123,7 +123,7 @@ zero_trailing_bytes(struct spdk_blob_bs_dev *b, struct iovec *iov, int iovcnt,
 
 static inline void
 blob_bs_dev_read(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
-		 uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
+		 uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts)
 {
 	struct spdk_blob_bs_dev *b = (struct spdk_blob_bs_dev *)dev;
 	struct iovec iov;
@@ -132,7 +132,7 @@ blob_bs_dev_read(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void 
 	iov.iov_len = lba_count * b->bs_dev.blocklen;
 	/* The backing blob may be smaller than this blob, so zero any trailing bytes. */
 	zero_trailing_bytes(b, &iov, 1, lba, &lba_count);
-	b->blob->priority_class = dev->priority_class;
+	// b->blob->priority_class = dev->priority_class;
 
 	if (lba_count == 0) {
 		blob_bs_dev_read_cpl(cb_args, 0);
@@ -146,13 +146,14 @@ blob_bs_dev_read(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void 
 static inline void
 blob_bs_dev_readv(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		  struct iovec *iov, int iovcnt,
-		  uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
+		  uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args,
+		  struct spdk_bs_io_opts *bs_io_opts)
 {
 	struct spdk_blob_bs_dev *b = (struct spdk_blob_bs_dev *)dev;
 
 	/* The backing blob may be smaller than this blob, so zero any trailing bytes. */
 	zero_trailing_bytes(b, iov, iovcnt, lba, &lba_count);
-	b->blob->priority_class = dev->priority_class;
+	// b->blob->priority_class = dev->priority_class;
 
 	if (lba_count == 0) {
 		blob_bs_dev_read_cpl(cb_args, 0);
@@ -167,13 +168,13 @@ static inline void
 blob_bs_dev_readv_ext(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		      struct iovec *iov, int iovcnt,
 		      uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args,
-		      struct spdk_blob_ext_io_opts *ext_opts)
+		      struct spdk_blob_ext_io_opts *ext_opts, struct spdk_bs_io_opts *bs_io_opts)
 {
 	struct spdk_blob_bs_dev *b = (struct spdk_blob_bs_dev *)dev;
 
 	/* The backing blob may be smaller than this blob, so zero any trailing bytes. */
 	zero_trailing_bytes(b, iov, iovcnt, lba, &lba_count);
-	b->blob->priority_class = dev->priority_class;
+	// b->blob->priority_class = dev->priority_class;
 
 	if (lba_count == 0) {
 		blob_bs_dev_read_cpl(cb_args, 0);

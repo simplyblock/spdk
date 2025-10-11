@@ -9330,6 +9330,7 @@ bs_shallow_copy_blob_read_cpl(void *cb_arg, int bserrno)
 	struct shallow_copy_ctx *ctx = cb_arg;
 	struct spdk_bs_dev *ext_dev = ctx->ext_dev;
 	struct spdk_blob *_blob = ctx->blob;
+	struct spdk_bs_io_opts bs_io_opts = {0};
 
 	if (bserrno != 0) {
 		SPDK_ERRLOG("blob 0x%" PRIx64 " shallow copy, blob read error %d\n", ctx->blob->id, bserrno);
@@ -9346,7 +9347,7 @@ bs_shallow_copy_blob_read_cpl(void *cb_arg, int bserrno)
 	ext_dev->write(ext_dev, ctx->ext_channel, ctx->read_buff,
 		       bs_cluster_to_lba(_blob->bs, ctx->cluster),
 		       bs_dev_byte_to_lba(_blob->bs->dev, _blob->bs->cluster_sz),
-		       &ctx->ext_args);
+		       &ctx->ext_args, &bs_io_opts);
 }
 
 static void

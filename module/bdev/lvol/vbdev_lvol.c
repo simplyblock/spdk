@@ -2649,7 +2649,7 @@ vbdev_lvol_get_from_bdev(struct spdk_bdev *bdev)
 
 static void
 bs_dev_degraded_read(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
-		     uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
+		     uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts)
 {
 	assert(false);
 	cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, -EIO);
@@ -2658,7 +2658,7 @@ bs_dev_degraded_read(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, v
 static void
 bs_dev_degraded_readv(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		      struct iovec *iov, int iovcnt, uint64_t lba, uint32_t lba_count,
-		      struct spdk_bs_dev_cb_args *cb_args)
+		      struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts)
 {
 	assert(false);
 	cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, -EIO);
@@ -2668,7 +2668,7 @@ static void
 bs_dev_degraded_readv_ext(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 			  struct iovec *iov, int iovcnt, uint64_t lba, uint32_t lba_count,
 			  struct spdk_bs_dev_cb_args *cb_args,
-			  struct spdk_blob_ext_io_opts *io_opts)
+			  struct spdk_blob_ext_io_opts *io_opts, struct spdk_bs_io_opts *bs_io_opts)
 {
 	assert(false);
 	cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, -EIO);

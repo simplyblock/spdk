@@ -164,16 +164,17 @@ bs_sequence_read_bs_dev(spdk_bs_sequence_t *seq, struct spdk_bs_dev *bs_dev,
 {
 	struct spdk_bs_request_set	*set = (struct spdk_bs_request_set *)seq;
 	struct spdk_io_channel		*back_channel = set->back_channel;
+	struct spdk_bs_io_opts bs_io_opts = {0};
 
 	SPDK_DEBUGLOG(blob_rw, "Reading %" PRIu32 " blocks from LBA %" PRIu64 "\n", lba_count,
 		      lba);
 
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
-	bs_dev->priority_class = set->priority_class;
-	bs_dev->geometry = set->geometry;
-	check_geometry(set->bs, bs_dev->geometry, lba);
-	bs_dev->read(bs_dev, back_channel, payload, lba, lba_count, &set->cb_args);
+	bs_io_opts.priority = set->priority_class;
+	bs_io_opts.geometry = set->geometry;
+	check_geometry(set->bs, bs_io_opts.geometry, lba);
+	bs_dev->read(bs_dev, back_channel, payload, lba, lba_count, &set->cb_args, &bs_io_opts);
 }
 
 void
@@ -183,16 +184,17 @@ bs_sequence_read_dev(spdk_bs_sequence_t *seq, void *payload,
 {
 	struct spdk_bs_request_set      *set = (struct spdk_bs_request_set *)seq;
 	struct spdk_bs_channel       *channel = set->channel;
+	struct spdk_bs_io_opts		bs_io_opts = {0};
 
 	SPDK_DEBUGLOG(blob_rw, "Reading %" PRIu32 " blocks from LBA %" PRIu64 "\n", lba_count,
 		      lba);
 
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
-	channel->dev->priority_class = set->priority_class;
-	channel->dev->geometry = set->geometry;
-	check_geometry(set->bs, channel->dev->geometry, lba);
-	channel->dev->read(channel->dev, channel->dev_channel, payload, lba, lba_count, &set->cb_args);
+	bs_io_opts.priority = set->priority_class;
+	bs_io_opts.geometry = set->geometry;
+	check_geometry(set->bs, bs_io_opts.geometry, lba);
+	channel->dev->read(channel->dev, channel->dev_channel, payload, lba, lba_count, &set->cb_args, &bs_io_opts);
 }
 
 void
@@ -202,18 +204,19 @@ bs_sequence_write_dev(spdk_bs_sequence_t *seq, void *payload,
 {
 	struct spdk_bs_request_set      *set = (struct spdk_bs_request_set *)seq;
 	struct spdk_bs_channel       *channel = set->channel;
+	struct spdk_bs_io_opts 			bs_io_opts = {0};
 
 	SPDK_DEBUGLOG(blob_rw, "Writing %" PRIu32 " blocks from LBA %" PRIu64 "\n", lba_count,
 		      lba);
 
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
-	channel->dev->priority_class = set->priority_class;
-	channel->dev->geometry = set->geometry;
+	bs_io_opts.priority = set->priority_class;
+	bs_io_opts.geometry = set->geometry;
 
-	check_geometry(set->bs, channel->dev->geometry, lba);
+	check_geometry(set->bs, bs_io_opts.geometry, lba);
 	channel->dev->write(channel->dev, channel->dev_channel, payload, lba, lba_count,
-			    &set->cb_args);
+			    &set->cb_args, &bs_io_opts);
 }
 
 void
@@ -223,6 +226,7 @@ bs_sequence_readv_bs_dev(spdk_bs_sequence_t *seq, struct spdk_bs_dev *bs_dev,
 {
 	struct spdk_bs_request_set      *set = (struct spdk_bs_request_set *)seq;
 	struct spdk_io_channel		*back_channel = set->back_channel;
+	struct spdk_bs_io_opts			bs_io_opts = {0};
 
 	SPDK_DEBUGLOG(blob_rw, "Reading %" PRIu32 " blocks from LBA %" PRIu64 "\n", lba_count,
 		      lba);
@@ -230,15 +234,15 @@ bs_sequence_readv_bs_dev(spdk_bs_sequence_t *seq, struct spdk_bs_dev *bs_dev,
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
 
-	bs_dev->priority_class = set->priority_class;
-	bs_dev->geometry = set->geometry;
-	// check_geometry(set->bs, bs_dev->geometry, lba);
+	bs_io_opts.priority = set->priority_class;
+	bs_io_opts.geometry = set->geometry;
+	// check_geometry(set->bs, bs_io_opts.geometry, lba);
 	if (set->ext_io_opts) {
 		assert(bs_dev->readv_ext);
 		bs_dev->readv_ext(bs_dev, back_channel, iov, iovcnt, lba, lba_count,
-				  &set->cb_args, set->ext_io_opts);
+				  &set->cb_args, set->ext_io_opts, &bs_io_opts);
 	} else {
-		bs_dev->readv(bs_dev, back_channel, iov, iovcnt, lba, lba_count, &set->cb_args);
+		bs_dev->readv(bs_dev, back_channel, iov, iovcnt, lba, lba_count, &set->cb_args, &bs_io_opts);
 	}
 }
 
@@ -248,21 +252,22 @@ bs_sequence_readv_dev(spdk_bs_sequence_t *seq, struct iovec *iov, int iovcnt,
 {
 	struct spdk_bs_request_set      *set = (struct spdk_bs_request_set *)seq;
 	struct spdk_bs_channel       *channel = set->channel;
+	struct spdk_bs_io_opts   		bs_io_opts = {0};
 
 	SPDK_DEBUGLOG(blob_rw, "Reading %" PRIu32 " blocks from LBA %" PRIu64 "\n", lba_count,
 		      lba);
 
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
-	channel->dev->priority_class = set->priority_class;
-	channel->dev->geometry = set->geometry;
-	check_geometry(set->bs, channel->dev->geometry, lba);
+	bs_io_opts.priority = set->priority_class;
+	bs_io_opts.geometry = set->geometry;
+	check_geometry(set->bs, bs_io_opts.geometry, lba);
 	if (set->ext_io_opts) {
 		assert(channel->dev->readv_ext);
 		channel->dev->readv_ext(channel->dev, channel->dev_channel, iov, iovcnt, lba, lba_count,
-					&set->cb_args, set->ext_io_opts);
+					&set->cb_args, set->ext_io_opts, &bs_io_opts);
 	} else {
-		channel->dev->readv(channel->dev, channel->dev_channel, iov, iovcnt, lba, lba_count, &set->cb_args);
+		channel->dev->readv(channel->dev, channel->dev_channel, iov, iovcnt, lba, lba_count, &set->cb_args, &bs_io_opts);
 	}
 }
 
@@ -273,22 +278,23 @@ bs_sequence_writev_dev(spdk_bs_sequence_t *seq, struct iovec *iov, int iovcnt,
 {
 	struct spdk_bs_request_set      *set = (struct spdk_bs_request_set *)seq;
 	struct spdk_bs_channel       *channel = set->channel;
+	struct spdk_bs_io_opts			bs_io_opts = {0};
 
 	SPDK_DEBUGLOG(blob_rw, "Writing %" PRIu32 " blocks from LBA %" PRIu64 "\n", lba_count,
 		      lba);
 
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
-	channel->dev->priority_class = set->priority_class;
-	channel->dev->geometry = set->geometry;
-    check_geometry(set->bs, channel->dev->geometry, lba);
+	bs_io_opts.priority = set->priority_class;
+	bs_io_opts.geometry = set->geometry;
+	check_geometry(set->bs, bs_io_opts.geometry, lba);
 	if (set->ext_io_opts) {
 		assert(channel->dev->writev_ext);
 		channel->dev->writev_ext(channel->dev, channel->dev_channel, iov, iovcnt, lba, lba_count,
-					 &set->cb_args, set->ext_io_opts);
+					 &set->cb_args, set->ext_io_opts, &bs_io_opts);
 	} else {
 		channel->dev->writev(channel->dev, channel->dev_channel, iov, iovcnt, lba, lba_count,
-				     &set->cb_args);
+				     &set->cb_args, &bs_io_opts);
 	}
 }
 
@@ -298,18 +304,19 @@ bs_sequence_write_zeroes_dev(spdk_bs_sequence_t *seq,
 			     spdk_bs_sequence_cpl cb_fn, void *cb_arg)
 {
 	struct spdk_bs_request_set      *set = (struct spdk_bs_request_set *)seq;
-	struct spdk_bs_channel       *channel = set->channel;
+	struct spdk_bs_channel       	*channel = set->channel;
+	struct spdk_bs_io_opts 		  	bs_io_opts = {0};
 
 	SPDK_DEBUGLOG(blob_rw, "writing zeroes to %" PRIu64 " blocks at LBA %" PRIu64 "\n",
 		      lba_count, lba);
 
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
-	channel->dev->priority_class = set->priority_class;
-	channel->dev->geometry = set->geometry;
- 	check_geometry(set->bs, channel->dev->geometry, lba);
+	bs_io_opts.priority = set->priority_class;
+	bs_io_opts.geometry = set->geometry;
+	check_geometry(set->bs, bs_io_opts.geometry, lba);
 	channel->dev->write_zeroes(channel->dev, channel->dev_channel, lba, lba_count,
-				   &set->cb_args);
+				   &set->cb_args, &bs_io_opts);
 }
 
 void
@@ -318,16 +325,17 @@ bs_sequence_copy_dev(spdk_bs_sequence_t *seq, uint64_t dst_lba, uint64_t src_lba
 {
 	struct spdk_bs_request_set *set = (struct spdk_bs_request_set *)seq;
 	struct spdk_bs_channel     *channel = set->channel;
+	struct spdk_bs_io_opts 		bs_io_opts = {0};
 
 	SPDK_DEBUGLOG(blob_rw, "Copying %" PRIu64 " blocks from LBA %" PRIu64 " to LBA %" PRIu64 "\n",
 		      lba_count, src_lba, dst_lba);
 
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
-	channel->dev->priority_class = set->priority_class;
-	channel->dev->geometry = set->geometry;
- 	check_geometry(set->bs, channel->dev->geometry, src_lba);
-	channel->dev->copy(channel->dev, channel->dev_channel, dst_lba, src_lba, lba_count, &set->cb_args);
+	bs_io_opts.priority = set->priority_class;
+	bs_io_opts.geometry = set->geometry;
+ 	check_geometry(set->bs, bs_io_opts.geometry, src_lba);
+	channel->dev->copy(channel->dev, channel->dev_channel, dst_lba, src_lba, lba_count, &set->cb_args, &bs_io_opts);
 }
 
 void
@@ -353,6 +361,7 @@ bs_batch_completion(struct spdk_io_channel *_channel,
 {
 	struct spdk_bs_request_set	*set = cb_arg;	
 	struct spdk_bs_channel		*channel = set->channel;
+	struct spdk_bs_io_opts		bs_io_opts = {0};
 	struct limit *ctx;
 	set->u.batch.outstanding_ops--;
 	if (bserrno != 0) {		
@@ -363,18 +372,18 @@ bs_batch_completion(struct spdk_io_channel *_channel,
 		if (!TAILQ_EMPTY(&set->u.batch.unmap_queue)) {        
 			ctx = TAILQ_FIRST(&set->u.batch.unmap_queue);
 			assert(ctx != NULL);
-			TAILQ_REMOVE(&set->u.batch.unmap_queue, ctx, entries); // Remove it from the queue.			
-			channel->dev->priority_class = set->priority_class;
+			TAILQ_REMOVE(&set->u.batch.unmap_queue, ctx, entries); // Remove it from the queue.
+			bs_io_opts.priority = set->priority_class;
 
 			if (set->u.batch.geometry != 0) {
-				channel->dev->geometry = set->u.batch.geometry;
+				bs_io_opts.geometry = set->u.batch.geometry;
 			} else {
-				channel->dev->geometry = set->geometry;
+				bs_io_opts.geometry = set->geometry;
 			}
-			check_geometry(set->bs, channel->dev->geometry, ctx->lba);	
+			check_geometry(set->bs, bs_io_opts.geometry, ctx->lba);
 			if (spdk_likely(channel->bs->is_leader)) {
 				channel->dev->unmap(channel->dev, channel->dev_channel, ctx->lba, ctx->lba_count,
-						&set->cb_args);
+						&set->cb_args, &bs_io_opts);
 			} else {
 				SPDK_NOTICELOG("The unmap IO return with EIO error due to leader.\n");
 				bs_batch_completion(_channel, set->cb_args.cb_arg, -EIO);
@@ -441,19 +450,19 @@ bs_batch_read_bs_dev(spdk_bs_batch_t *batch, struct spdk_bs_dev *bs_dev,
 {
 	struct spdk_bs_request_set	*set = (struct spdk_bs_request_set *)batch;
 	struct spdk_io_channel		*back_channel = set->back_channel;
-
+	struct spdk_bs_io_opts bs_io_opts = {0};
 	SPDK_DEBUGLOG(blob_rw, "Reading %" PRIu32 " blocks from LBA %" PRIu64 "\n", lba_count,
 		      lba);
 
 	set->u.batch.outstanding_ops++;
-	bs_dev->priority_class = set->priority_class;
+	bs_io_opts.priority = set->priority_class;
 	if (set->u.batch.geometry != 0) {
-		bs_dev->geometry = set->u.batch.geometry;
+		bs_io_opts.geometry = set->u.batch.geometry;
 	} else {
-		bs_dev->geometry = batch->geometry;
+		bs_io_opts.geometry = batch->geometry;
 	}
-	check_geometry(set->bs, bs_dev->geometry, lba);
-	bs_dev->read(bs_dev, back_channel, payload, lba, lba_count, &set->cb_args);
+	check_geometry(set->bs, bs_io_opts.geometry, lba);
+	bs_dev->read(bs_dev, back_channel, payload, lba, lba_count, &set->cb_args, &bs_io_opts);
 }
 
 void
@@ -462,20 +471,21 @@ bs_batch_read_dev(spdk_bs_batch_t *batch, void *payload,
 {
 	struct spdk_bs_request_set	*set = (struct spdk_bs_request_set *)batch;
 	struct spdk_bs_channel		*channel = set->channel;
+	struct spdk_bs_io_opts		bs_io_opts = {0};
 
 	SPDK_DEBUGLOG(blob_rw, "Reading %" PRIu32 " blocks from LBA %" PRIu64 "\n", lba_count,
 		      lba);
 
 	set->u.batch.outstanding_ops++;
-	channel->dev->priority_class = batch->priority_class;
-	
+	bs_io_opts.priority = batch->priority_class;
+
 	if (set->u.batch.geometry != 0) {
-		channel->dev->geometry = set->u.batch.geometry;
+		bs_io_opts.geometry = set->u.batch.geometry;
 	} else {
-		channel->dev->geometry = batch->geometry;
+		bs_io_opts.geometry = batch->geometry;
 	}
-	check_geometry(set->bs, channel->dev->geometry, lba);
-	channel->dev->read(channel->dev, channel->dev_channel, payload, lba, lba_count, &set->cb_args);
+	check_geometry(set->bs, bs_io_opts.geometry, lba);
+	channel->dev->read(channel->dev, channel->dev_channel, payload, lba, lba_count, &set->cb_args, &bs_io_opts);
 }
 
 void
@@ -484,19 +494,19 @@ bs_batch_write_dev(spdk_bs_batch_t *batch, void *payload,
 {
 	struct spdk_bs_request_set	*set = (struct spdk_bs_request_set *)batch;
 	struct spdk_bs_channel		*channel = set->channel;
-
+	struct spdk_bs_io_opts 		bs_io_opts = {0};
 	SPDK_DEBUGLOG(blob_rw, "Writing %" PRIu32 " blocks to LBA %" PRIu64 "\n", lba_count, lba);
 
 	set->u.batch.outstanding_ops++;
-	channel->dev->priority_class = batch->priority_class;	
+	bs_io_opts.priority = batch->priority_class;
 	if (set->u.batch.geometry != 0) {
-		channel->dev->geometry = set->u.batch.geometry;
+		bs_io_opts.geometry = set->u.batch.geometry;
 	} else {
-		channel->dev->geometry = batch->geometry;
+		bs_io_opts.geometry = batch->geometry;
 	}
-	check_geometry(set->bs, channel->dev->geometry, lba);
+	check_geometry(set->bs, bs_io_opts.geometry, lba);
 	channel->dev->write(channel->dev, channel->dev_channel, payload, lba, lba_count,
-			    &set->cb_args);
+			    &set->cb_args, &bs_io_opts);
 }
 
 void
@@ -505,6 +515,7 @@ bs_batch_unmap_dev(spdk_bs_batch_t *batch,
 {
 	struct spdk_bs_request_set	*set = (struct spdk_bs_request_set *)batch;
 	struct spdk_bs_channel		*channel = set->channel;
+	struct spdk_bs_io_opts		bs_io_opts = {0};
 	struct limit *ctx = NULL;
 
 	SPDK_DEBUGLOG(blob_rw, "Unmapping %" PRIu64 " blocks at LBA %" PRIu64 "\n", lba_count,
@@ -523,16 +534,16 @@ bs_batch_unmap_dev(spdk_bs_batch_t *batch,
 	}
 out:
 	set->u.batch.outstanding_ops++;	
-	channel->dev->priority_class = batch->priority_class;
+	bs_io_opts.priority = batch->priority_class;
 	if (set->u.batch.geometry != 0) {
-		channel->dev->geometry = set->u.batch.geometry;
+		bs_io_opts.geometry = set->u.batch.geometry;
 	} else {
-		channel->dev->geometry = batch->geometry;
+		bs_io_opts.geometry = batch->geometry;
 	}
-	check_geometry(set->bs, channel->dev->geometry, lba);
+	check_geometry(set->bs, bs_io_opts.geometry, lba);
 	if (spdk_likely(channel->bs->is_leader)) {
 		channel->dev->unmap(channel->dev, channel->dev_channel, lba, lba_count,
-					&set->cb_args);
+					&set->cb_args, &bs_io_opts);
 	} else {
 		SPDK_NOTICELOG("The unmap IO return with EIO error due to leader 1.\n");
 		bs_batch_completion(set->cb_args.channel, set->cb_args.cb_arg, -EIO);
@@ -545,21 +556,21 @@ bs_batch_write_zeroes_dev(spdk_bs_batch_t *batch,
 {
 	struct spdk_bs_request_set	*set = (struct spdk_bs_request_set *)batch;
 	struct spdk_bs_channel		*channel = set->channel;
-
+	struct spdk_bs_io_opts		bs_io_opts = {0};
 	SPDK_DEBUGLOG(blob_rw, "Zeroing %" PRIu64 " blocks at LBA %" PRIu64 "\n", lba_count, lba);
 
 	set->u.batch.outstanding_ops++;
-	channel->dev->priority_class = batch->priority_class;
+	bs_io_opts.priority = batch->priority_class;
 
 	if (set->u.batch.geometry != 0) {
-		channel->dev->geometry = set->u.batch.geometry;
+		bs_io_opts.geometry = set->u.batch.geometry;
 	} else {
-		channel->dev->geometry = batch->geometry;
+		bs_io_opts.geometry = batch->geometry;
 	}
-	check_geometry(set->bs, channel->dev->geometry, lba);
+	check_geometry(set->bs, bs_io_opts.geometry, lba);
 	if (spdk_likely(channel->bs->is_leader)) {
 		channel->dev->write_zeroes(channel->dev, channel->dev_channel, lba, lba_count,
-				   	&set->cb_args);
+				   	&set->cb_args, &bs_io_opts);
 	} else {
 		SPDK_NOTICELOG("The write zero IO return with EIO error due to leader.\n");
 		bs_batch_completion(set->cb_args.channel, set->cb_args.cb_arg, -EIO);

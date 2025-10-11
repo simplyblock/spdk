@@ -9644,7 +9644,8 @@ blob_shallow_copy(void)
 	ext_args.cb_fn = bs_dev_io_complete_cb;
 	for (offset = 0; offset < 4 * io_units_per_cluster; offset++) {
 		memset(buf2, 0xff, DEV_BUFFER_BLOCKLEN);
-		ext_dev->write(ext_dev, bdev_ch, buf2, offset, 1, &ext_args);
+		struct spdk_bs_io_opts bs_io_opts = {0};
+		ext_dev->write(ext_dev, bdev_ch, buf2, offset, 1, &ext_args, &bs_io_opts);
 		poll_threads();
 		CU_ASSERT(g_bserrno == 0);
 	}
@@ -9665,28 +9666,32 @@ blob_shallow_copy(void)
 	/* Clusters 2 and 4 should not have been touched */
 	for (offset = 0; offset < io_units_per_cluster; offset++) {
 		memset(buf1, offset, DEV_BUFFER_BLOCKLEN);
-		ext_dev->read(ext_dev, bdev_ch, buf2, offset, 1, &ext_args);
+		struct spdk_bs_io_opts bs_io_opts = {0};
+		ext_dev->read(ext_dev, bdev_ch, buf2, offset, 1, &ext_args, &bs_io_opts);
 		poll_threads();
 		CU_ASSERT(g_bserrno == 0);
 		CU_ASSERT(memcmp(buf1, buf2, DEV_BUFFER_BLOCKLEN) == 0);
 	}
 	for (offset = io_units_per_cluster; offset < 2 * io_units_per_cluster; offset++) {
 		memset(buf1, 0xff, DEV_BUFFER_BLOCKLEN);
-		ext_dev->read(ext_dev, bdev_ch, buf2, offset, 1, &ext_args);
+		struct spdk_bs_io_opts bs_io_opts = {0};
+		ext_dev->read(ext_dev, bdev_ch, buf2, offset, 1, &ext_args, &bs_io_opts);
 		poll_threads();
 		CU_ASSERT(g_bserrno == 0);
 		CU_ASSERT(memcmp(buf1, buf2, DEV_BUFFER_BLOCKLEN) == 0);
 	}
 	for (offset = 2 * io_units_per_cluster; offset < 3 * io_units_per_cluster; offset++) {
 		memset(buf1, offset, DEV_BUFFER_BLOCKLEN);
-		ext_dev->read(ext_dev, bdev_ch, buf2, offset, 1, &ext_args);
+		struct spdk_bs_io_opts bs_io_opts = {0};
+		ext_dev->read(ext_dev, bdev_ch, buf2, offset, 1, &ext_args, &bs_io_opts);
 		poll_threads();
 		CU_ASSERT(g_bserrno == 0);
 		CU_ASSERT(memcmp(buf1, buf2, DEV_BUFFER_BLOCKLEN) == 0);
 	}
 	for (offset = 3 * io_units_per_cluster; offset < 4 * io_units_per_cluster; offset++) {
 		memset(buf1, 0xff, DEV_BUFFER_BLOCKLEN);
-		ext_dev->read(ext_dev, bdev_ch, buf2, offset, 1, &ext_args);
+		struct spdk_bs_io_opts bs_io_opts = {0};
+		ext_dev->read(ext_dev, bdev_ch, buf2, offset, 1, &ext_args, &bs_io_opts);
 		poll_threads();
 		CU_ASSERT(g_bserrno == 0);
 		CU_ASSERT(memcmp(buf1, buf2, DEV_BUFFER_BLOCKLEN) == 0);
