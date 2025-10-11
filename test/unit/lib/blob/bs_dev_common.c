@@ -120,7 +120,7 @@ dev_complete(void *arg)
 static void
 dev_read(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
 	 uint64_t lba, uint32_t lba_count,
-	 struct spdk_bs_dev_cb_args *cb_args)
+	 struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts)
 {
 	uint64_t offset, length;
 
@@ -154,7 +154,7 @@ dev_read(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload
 static void
 dev_write(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
 	  uint64_t lba, uint32_t lba_count,
-	  struct spdk_bs_dev_cb_args *cb_args)
+	  struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts)
 {
 	uint64_t offset, length;
 
@@ -199,7 +199,7 @@ static void
 dev_readv(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	  struct iovec *iov, int iovcnt,
 	  uint64_t lba, uint32_t lba_count,
-	  struct spdk_bs_dev_cb_args *cb_args)
+	  struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts)
 {
 	uint64_t offset, length;
 	int i;
@@ -239,18 +239,19 @@ dev_readv_ext(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	      struct iovec *iov, int iovcnt,
 	      uint64_t lba, uint32_t lba_count,
 	      struct spdk_bs_dev_cb_args *cb_args,
-	      struct spdk_blob_ext_io_opts *io_opts)
+	      struct spdk_blob_ext_io_opts *io_opts, struct spdk_bs_io_opts *bs_io_opts)
 {
 	g_dev_readv_ext_called = true;
 	g_blob_ext_io_opts = *io_opts;
-	dev_readv(dev, channel, iov, iovcnt, lba, lba_count, cb_args);
+	dev_readv(dev, channel, iov, iovcnt, lba, lba_count, cb_args, bs_io_opts);
 }
 
 static void
 dev_writev(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	   struct iovec *iov, int iovcnt,
 	   uint64_t lba, uint32_t lba_count,
-	   struct spdk_bs_dev_cb_args *cb_args)
+	   struct spdk_bs_dev_cb_args *cb_args,
+	   struct spdk_bs_io_opts *bs_io_opts)
 {
 	uint64_t offset, length;
 	int i;
@@ -290,11 +291,11 @@ dev_writev_ext(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	       struct iovec *iov, int iovcnt,
 	       uint64_t lba, uint32_t lba_count,
 	       struct spdk_bs_dev_cb_args *cb_args,
-	       struct spdk_blob_ext_io_opts *io_opts)
+	       struct spdk_blob_ext_io_opts *io_opts, struct spdk_bs_io_opts *bs_io_opts)
 {
 	g_dev_writev_ext_called = true;
 	g_blob_ext_io_opts = *io_opts;
-	dev_writev(dev, channel, iov, iovcnt, lba, lba_count, cb_args);
+	dev_writev(dev, channel, iov, iovcnt, lba, lba_count, cb_args, bs_io_opts);
 }
 
 static void
@@ -322,7 +323,7 @@ dev_flush(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 static void
 dev_unmap(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	  uint64_t lba, uint64_t lba_count,
-	  struct spdk_bs_dev_cb_args *cb_args)
+	  struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts)
 {
 	uint64_t offset, length;
 
@@ -352,7 +353,7 @@ dev_unmap(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 static void
 dev_write_zeroes(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		 uint64_t lba, uint64_t lba_count,
-		 struct spdk_bs_dev_cb_args *cb_args)
+		 struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts)
 {
 	uint64_t offset, length;
 
@@ -389,7 +390,7 @@ dev_translate_lba(struct spdk_bs_dev *dev, uint64_t lba, uint64_t *base_lba)
 
 static void
 dev_copy(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, uint64_t dst_lba,
-	 uint64_t src_lba, uint64_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
+	 uint64_t src_lba, uint64_t lba_count, struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts)
 {
 	void *dst = &g_dev_buffer[dst_lba * dev->blocklen];
 	const void *src = &g_dev_buffer[src_lba * dev->blocklen];

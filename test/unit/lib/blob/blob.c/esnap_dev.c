@@ -157,7 +157,7 @@ ut_esnap_content_is_correct(void *buf, uint32_t buf_sz, uint32_t id,
 
 static void
 ut_esnap_read(struct spdk_bs_dev *bs_dev, struct spdk_io_channel *channel, void *payload,
-	      uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
+	      uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts)
 {
 	struct ut_esnap_dev	*ut_dev = (struct ut_esnap_dev *)bs_dev;
 	struct ut_esnap_channel	*ut_ch = spdk_io_channel_get_ctx(channel);
@@ -185,7 +185,7 @@ ut_esnap_read(struct spdk_bs_dev *bs_dev, struct spdk_io_channel *channel, void 
 static void
 ut_esnap_readv(struct spdk_bs_dev *bs_dev, struct spdk_io_channel *channel,
 	       struct iovec *iov, int iovcnt, uint64_t lba, uint32_t lba_count,
-	       struct spdk_bs_dev_cb_args *cb_args)
+	       struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts)
 {
 	struct ut_esnap_channel	*ut_ch = spdk_io_channel_get_ctx(channel);
 
@@ -198,13 +198,13 @@ ut_esnap_readv(struct spdk_bs_dev *bs_dev, struct spdk_io_channel *channel,
 		cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, -ENOTSUP);
 		return;
 	}
-	ut_esnap_read(bs_dev, channel, iov->iov_base, lba, lba_count, cb_args);
+	ut_esnap_read(bs_dev, channel, iov->iov_base, lba, lba_count, cb_args, bs_io_opts);
 }
 
 static void
 ut_esnap_readv_ext(struct spdk_bs_dev *bs_dev, struct spdk_io_channel *channel,
 		   struct iovec *iov, int iovcnt, uint64_t lba, uint32_t lba_count,
-		   struct spdk_bs_dev_cb_args *cb_args, struct spdk_blob_ext_io_opts *io_opts)
+		   struct spdk_bs_dev_cb_args *cb_args, struct spdk_blob_ext_io_opts *io_opts, struct spdk_bs_io_opts *bs_io_opts)
 {
 	struct ut_esnap_channel	*ut_ch = spdk_io_channel_get_ctx(channel);
 

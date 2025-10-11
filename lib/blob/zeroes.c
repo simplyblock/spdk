@@ -18,7 +18,8 @@ zeroes_destroy(struct spdk_bs_dev *bs_dev)
 
 static void
 zeroes_read(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
-	    uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
+	    uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args,
+	    struct spdk_bs_io_opts *bs_io_opts)
 {
 	memset(payload, 0, dev->blocklen * lba_count);
 	cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, 0);
@@ -27,7 +28,7 @@ zeroes_read(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payl
 static void
 zeroes_write(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
 	     uint64_t lba, uint32_t lba_count,
-	     struct spdk_bs_dev_cb_args *cb_args)
+	     struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts)
 {
 	cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, -EPERM);
 	assert(false);
@@ -36,7 +37,8 @@ zeroes_write(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *pay
 static void
 zeroes_readv(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	     struct iovec *iov, int iovcnt,
-	     uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
+	     uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args,
+	     struct spdk_bs_io_opts *bs_io_opts)
 {
 	int i;
 
@@ -51,7 +53,7 @@ static void
 zeroes_writev(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	      struct iovec *iov, int iovcnt,
 	      uint64_t lba, uint32_t lba_count,
-	      struct spdk_bs_dev_cb_args *cb_args)
+	      struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts)
 {
 	cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, -EPERM);
 	assert(false);
@@ -69,7 +71,7 @@ static void
 zeroes_readv_ext(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		 struct iovec *iov, int iovcnt,
 		 uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args,
-		 struct spdk_blob_ext_io_opts *ext_io_opts)
+		 struct spdk_blob_ext_io_opts *ext_io_opts, struct spdk_bs_io_opts *bs_io_opts)
 {
 	int i, rc;
 
@@ -94,7 +96,7 @@ zeroes_writev_ext(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		  struct iovec *iov, int iovcnt,
 		  uint64_t lba, uint32_t lba_count,
 		  struct spdk_bs_dev_cb_args *cb_args,
-		  struct spdk_blob_ext_io_opts *ext_io_opts)
+		  struct spdk_blob_ext_io_opts *ext_io_opts, struct spdk_bs_io_opts *bs_io_opts)
 {
 	cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, -EPERM);
 	assert(false);
@@ -103,7 +105,7 @@ zeroes_writev_ext(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 static void
 zeroes_write_zeroes(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		    uint64_t lba, uint64_t lba_count,
-		    struct spdk_bs_dev_cb_args *cb_args)
+		    struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts)
 {
 	cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, -EPERM);
 	assert(false);
@@ -112,7 +114,7 @@ zeroes_write_zeroes(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 static void
 zeroes_unmap(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	     uint64_t lba, uint64_t lba_count,
-	     struct spdk_bs_dev_cb_args *cb_args)
+	     struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts)
 {
 	cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, -EPERM);
 	assert(false);
