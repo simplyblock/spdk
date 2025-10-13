@@ -2518,12 +2518,18 @@ blob_persist_clear_clusters(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	/* Clear all clusters that were truncated */
 	lba = 0;
 	lba_count = 0;
+	uint64_t num_md_lba = bs_page_to_lba(bs, bs->md_start + bs->md_len);
+
 	for (i = blob->active.num_clusters; i < blob->active.cluster_array_size; i++) {
 		uint64_t next_lba = blob->active.clusters[i];
 		uint64_t next_lba_count = bs_cluster_to_lba(bs, 1);
 
 		if (next_lba > 0 && (lba + lba_count) == next_lba && lba_count < 2048) {
 			/* This cluster is contiguous with the previous one. */
+			if (num_md_lba > next_lba) {
+				SPDK_ERRLOG("Invalid lba for cluster data, exceeds metadata size %lu, lba %lu\n", blob->id, next_lba);
+				continue;
+			}
 			lba_count += next_lba_count;
 			continue;
 		} else if (next_lba == 0) {
@@ -2531,6 +2537,10 @@ blob_persist_clear_clusters(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		}
 
 		/* This cluster is not contiguous with the previous one. */
+		if (num_md_lba > next_lba) {
+			SPDK_ERRLOG("Invalid lba for cluster data, exceeds metadata size %lu, lba %lu\n", blob->id, next_lba);
+			continue;
+		}
 
 		/* If a run of LBAs previously existing, clear them now */
 		if (lba_count > 0) {
@@ -3016,6 +3026,9 @@ blob_persist_generate_new_md(struct spdk_blob_persist_ctx *ctx)
 	}
 
 	assert(blob->active.num_pages >= 1);
+	if (blob->active.num_pages == 0 || !blob->active.pages) {
+		SPDK_ERRLOG("Invalid num pages or pages for blob %lu\n", blob->id);
+	}
 
 	/* Resize the cache of page indices */
 	tmp = realloc(blob->active.pages, blob->active.num_pages * sizeof(*blob->active.pages));
@@ -11455,16 +11468,28 @@ blob_clear_clusters_async(spdk_bs_sequence_t *seq, struct spdk_blob	*blob)
 	/* Clear all clusters that were truncated */
 	lba = 0;
 	lba_count = 0;
+
+	uint64_t num_md_lba = bs_page_to_lba(bs, bs->md_start + bs->md_len);
+
 	for (i = 0; i < blob->active.cluster_array_size; i++) {
 		uint64_t next_lba = blob->active.clusters[i];
 		uint64_t next_lba_count = bs_cluster_to_lba(bs, 1);
 
 		if (next_lba > 0 && (lba + lba_count) == next_lba && lba_count < 2048) {
+			if (num_md_lba > lba) {
+				SPDK_ERRLOG("Invalid lba for cluster data, exceeds metadata size %lu, lba %lu\n", num_md_lba, lba);
+			}
 			/* This cluster is contiguous with the previous one. */
 			lba_count += next_lba_count;
 			continue;
 		} else if (next_lba == 0) {
 			continue;
+		}
+
+
+
+		if (num_md_lba > next_lba) {
+			SPDK_ERRLOG("Invalid lba for cluster data, exceeds metadata size %lu, lba %lu\n", num_md_lba, next_lba);
 		}
 
 		/* This cluster is not contiguous with the previous one. */
@@ -13758,6 +13783,13 @@ bs_update_cur_md_page_valid(struct spdk_bs_update_ctx *ctx)
 
 	crc = blob_md_page_calc_crc(page);
 	if (crc != page->crc) {
+		if (is_page_all_zero((void *)page, sizeof(*page))) {
+			SPDK_ERRLOG("Metadata page is all zero.\n");
+		} else {
+			print_packet_format((void *)page, sizeof(*page), 20);
+		}
+		SPDK_ERRLOG("Metadata page %d crc mismatch for blob.\n",
+			    ctx->cur_page);
 		return false;
 	}
 
@@ -14233,6 +14265,9 @@ bs_update_only_used_blobid_pages_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int 
 			    "mask->length=%" PRIu32 " super->md_len=%" PRIu32 "\n",
 			    ctx->mask->length, ctx->super->md_len);
 		assert(false);
+		spdk_free(ctx->mask);
+		bs_update_live_done(ctx, -ENOTCONN);
+		return;
 	}
 
 	rc = spdk_bit_array_resize(&ctx->synnced_used_blobid_pages, ctx->mask->length);
