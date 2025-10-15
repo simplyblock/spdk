@@ -11584,6 +11584,7 @@ spdk_bs_delete_blob_async(struct spdk_blob_store *bs, struct spdk_blob *blob,
 
 	rc = blob_get_xattr_value(blob, SNAPSHOT_PENDING_REMOVAL, &value, &len, true);
 	if (rc == 0) {
+		SPDK_NOTICELOG("1- Deleting clusters for blob with clone 0x%" PRIx64 "\n", blob->id);
 		clone = blob_lookup(bs, *(spdk_blob_id *)value);
 		if (clone) {
 			if (clone->parent_id == blob->id) {
@@ -11613,6 +11614,7 @@ spdk_bs_delete_blob_async(struct spdk_blob_store *bs, struct spdk_blob *blob,
 	blob->locked_operation_in_progress = true;
 
 	if (update_clone || ctx->corrupted_mode) {
+		SPDK_NOTICELOG("2- Deleting clusters for blob with clone 0x%" PRIx64 "\n", blob->id);
 		ctx->page = spdk_zmalloc(SPDK_BS_PAGE_SIZE, 0, NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
 		if (!ctx->page) {
 			delete_blob_cleanup_finish(ctx, -ENOMEM);

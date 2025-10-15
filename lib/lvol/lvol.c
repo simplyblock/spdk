@@ -3348,10 +3348,10 @@ find_thread_fn(void *arg)
     const char *name = spdk_thread_get_name(t);	
 	// SPDK_NOTICELOG("target thread name is: %s\n", name);
     if (strncmp(name, "nvmf_tgt_poll_group_", 20) == 0) {
-		SPDK_NOTICELOG("Found target thread: %s\n", name);
 		// Found the target thread, store it in the context
 		struct spdk_io_channel *channel = spdk_bdev_get_io_channel(lvs->hub_dev.desc);
 		if (channel) {
+			SPDK_NOTICELOG("Found target thread: %s channel %p\n", name, channel);
 			spdk_lvs_store_hublvol_channel(lvs, channel);
 		}
     }
