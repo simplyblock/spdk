@@ -3370,10 +3370,11 @@ cleanup:
 
 SPDK_RPC_REGISTER("bdev_lvol_trnasfer", rpc_bdev_lvol_trnasfer, SPDK_RPC_RUNTIME)	
 	  
-// static void
-// dummy_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev, void *ctx)
-// {
-// }
+
+static void
+dummy_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev, void *ctx)
+{
+}
 
 struct rpc_vbdev_lvol_set_qos_limit {
 	uint64_t	bdev_group_id;
