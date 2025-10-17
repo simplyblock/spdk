@@ -3628,7 +3628,11 @@ nvme_rdma_ctrlr_get_memory_domains(const struct spdk_nvme_ctrlr *ctrlr,
 				   struct spdk_memory_domain **domains, int array_size)
 {
 	struct nvme_rdma_qpair *rqpair = nvme_rdma_qpair(ctrlr->adminq);
-
+	
+	if(!rqpair || !rqpair->rdma_qp || !rqpair->rdma_qp->domain) {
+		SPDK_WARNLOG("RDMA QP or domain not available\n");
+		return 0;
+	}
 	if (domains && array_size > 0) {
 		domains[0] = rqpair->rdma_qp->domain;
 	}
