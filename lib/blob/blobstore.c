@@ -1006,14 +1006,14 @@ blob_parse_page(const struct spdk_blob_md_page *page, struct spdk_blob *blob)
 
 			if (desc_extent->length <= sizeof(desc_extent->start_cluster_idx) ||
 			    (cluster_idx_length % sizeof(desc_extent->cluster_idx[0]) != 0)) {
-				SPDK_ERRLOG("Extenet page not correct length. \n");	
+				SPDK_ERRLOG("Extent page not correct length.\n");
 				return -EINVAL;
 			}
 
 			for (i = 0; i < cluster_idx_length / sizeof(desc_extent->cluster_idx[0]); i++) {
 				if (desc_extent->cluster_idx[i] != 0) {
 					if (!spdk_bit_pool_is_allocated(blob->bs->used_clusters, desc_extent->cluster_idx[i])) {
-						SPDK_ERRLOG("Extenet metadata page not vaild for cluster %" PRIx32 "\n",
+						SPDK_ERRLOG("Extent metadata page not valid for cluster %" PRIx32 "\n",
 						 		desc_extent->cluster_idx[i]);
 						return -EINVAL;
 					}
@@ -1022,7 +1022,13 @@ blob_parse_page(const struct spdk_blob_md_page *page, struct spdk_blob *blob)
 			}
 
 			if (cluster_count == 0) {
-				SPDK_ERRLOG("Extenet metadata page zero cluster count. \n");
+				SPDK_ERRLOG("Extent metadata page zero cluster count. \n");
+				return -EINVAL;
+			}
+
+			// remember to comment this line
+			if ((cluster_count % SPDK_EXTENTS_PER_EP) != 0) {
+				SPDK_ERRLOG("Extent metadata page cluster count not multiple of extent size.\n");
 				return -EINVAL;
 			}
 
@@ -1030,18 +1036,9 @@ blob_parse_page(const struct spdk_blob_md_page *page, struct spdk_blob *blob)
 			 * current size of a blob.
 			 * If changed to batch reading, this check shall be removed. */
 			if (desc_extent->start_cluster_idx != blob->active.num_clusters) {
-				SPDK_ERRLOG("Extenet metadata page not match cluster count. \n");
+				SPDK_ERRLOG("Extent metadata page not match cluster count. \n");
 				return -EINVAL;
 			}
-
-			// tmp = realloc(blob->active.clusters,
-			// 	      (cluster_count + blob->active.num_clusters) * sizeof(*blob->active.clusters));
-			// if (tmp == NULL) {
-			// 	SPDK_ERRLOG("Cannot allocate buffer for extent page 6.\n");
-			// 	return -ENOMEM;
-			// }
-			// blob->active.clusters = tmp;
-			// blob->active.cluster_array_size = (cluster_count + blob->active.num_clusters);
 
 			for (i = 0; i < cluster_idx_length / sizeof(desc_extent->cluster_idx[0]); i++) {
 				if (desc_extent->cluster_idx[i] != 0) {
@@ -1055,6 +1052,17 @@ blob_parse_page(const struct spdk_blob_md_page *page, struct spdk_blob *blob)
 					return -EINVAL;
 				}
 			}
+
+			if (desc_extent->start_cluster_idx + cluster_count != blob->active.num_clusters) {
+				SPDK_ERRLOG("Extent metadata page: start_cluster_idx + cluster_count not match active.num_clusters.\n");
+				return -EINVAL;
+			}
+
+			if (blob->remaining_clusters_in_et < cluster_count) {
+				SPDK_ERRLOG("Extent metadata page: remaining_clusters_in_et less than cluster_count.\n");
+				return -EINVAL;
+			}
+
 			assert(desc_extent->start_cluster_idx + cluster_count == blob->active.num_clusters);
 			assert(blob->remaining_clusters_in_et >= cluster_count);
 			blob->remaining_clusters_in_et -= cluster_count;
@@ -6889,10 +6897,14 @@ bs_dump_print_md_page(struct spdk_bs_load_ctx *ctx, struct spdk_blob_md_page *pa
 		} else if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_EXTENT_PAGE) {
 			struct spdk_blob_md_descriptor_extent_page	*desc_extent;
 			unsigned int					i, j=0;
+			size_t						cluster_idx_length;
 
 			desc_extent = (struct spdk_blob_md_descriptor_extent_page *)desc;
 
-			for (i = 0; i < desc_extent->length / sizeof(desc_extent->cluster_idx[0]); i++) {
+			desc_extent = (struct spdk_blob_md_descriptor_extent_page *)desc;
+			cluster_idx_length = desc_extent->length - sizeof(desc_extent->start_cluster_idx);
+
+			for (i = 0; i < cluster_idx_length / sizeof(desc_extent->cluster_idx[0]); i++) {
 				if (desc_extent->cluster_idx[i] != 0) {
 					fprintf(ctx->fp, "Allocated Extent - Start: %" PRIu32,
 						desc_extent->cluster_idx[i]);
@@ -6969,8 +6981,7 @@ bs_dump_read_md_page(spdk_bs_sequence_t *seq, void *cb_arg)
 
 	batch = bs_sequence_to_batch(seq, bs_dump_read_md_page_cpl, ctx);
 	ctx->idx_dump = 0;
-	i = ctx->cur_page;
-	for (i = 0; ctx->idx_dump < 4096 && i < ctx->super->md_len; i++) {
+	for (i = ctx->cur_page; ctx->idx_dump < 4096 && i < ctx->super->md_len; i++) {
 		assert(ctx->cur_page < ctx->super->md_len);
 		lba = bs_page_to_lba(bs, ctx->super->md_start + i);
 		ctx->bs->r_io++;
@@ -8223,7 +8234,7 @@ bs_create_blob(struct spdk_blob_store *bs,
 			goto error;
 		}
 	}
-
+	opts_local.num_clusters = ((opts_local.num_clusters + SPDK_EXTENTS_PER_EP - 1) / SPDK_EXTENTS_PER_EP) * SPDK_EXTENTS_PER_EP;
 	rc = blob_resize(blob, opts_local.num_clusters);
 	if (rc < 0) {
 		goto error;
@@ -10055,7 +10066,7 @@ spdk_blob_resize(struct spdk_blob *blob, uint64_t sz, spdk_blob_op_complete cb_f
 	struct spdk_bs_resize_ctx *ctx;
 
 	blob_verify_md_op(blob);
-
+	sz = ((sz + SPDK_EXTENTS_PER_EP - 1) / SPDK_EXTENTS_PER_EP) * SPDK_EXTENTS_PER_EP;
 	SPDK_DEBUGLOG(blob, "Resizing blob 0x%" PRIx64 " to %" PRIu64 " clusters\n", blob->id, sz);
 
 	if (blob->md_ro) {
@@ -10092,6 +10103,7 @@ spdk_blob_resize_register(struct spdk_blob *blob, uint64_t sz)
 {	
 	blob_verify_md_op(blob);
 
+	sz = ((sz + SPDK_EXTENTS_PER_EP - 1) / SPDK_EXTENTS_PER_EP) * SPDK_EXTENTS_PER_EP;
 	SPDK_NOTICELOG("Resizing blob 0x%" PRIx64 " to %" PRIu64 " clusters on secondary.\n", blob->id, sz);
 
 	if (blob->md_ro) {
