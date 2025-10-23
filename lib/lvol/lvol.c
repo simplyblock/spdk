@@ -2488,6 +2488,12 @@ spdk_lvol_update_on_failover(struct spdk_lvol_store *lvs, struct spdk_lvol *lvol
 {
 	bool update = false;
 	pthread_mutex_lock(&g_lvol_stores_mutex);
+
+	if (lvs->secondary && !lvs->skip_redirecting) {
+		pthread_mutex_unlock(&g_lvol_stores_mutex);
+		return;
+	}
+
 	if (!lvol->update_in_progress) {
 		assert(lvol->leader == false);
 		lvol->update_in_progress = true;
@@ -2988,12 +2994,14 @@ static void
 block_port(int port) {
     // Construct the iptables command dynamically based on the input port    
 	if (port != 0) {
-		char command[500];
+		char command[700];
 		// snprintf(command, sizeof(command), "sudo iptables -A INPUT -p tcp --dport %d -j DROP && sudo iptables -A OUTPUT -p tcp --dport %d -j DROP", port, port);
 		snprintf(command, sizeof(command),
-    		"sudo iptables -C INPUT -p tcp --dport %d -j DROP 2>/dev/null || sudo iptables -A INPUT -p tcp --dport %d -j DROP; "
-    		"sudo iptables -C OUTPUT -p tcp --dport %d -j DROP 2>/dev/null || sudo iptables -A OUTPUT -p tcp --dport %d -j DROP",
-    		port, port, port, port);
+    		"sudo iptables -C INPUT -p tcp --dport %d -j DROP 2>/dev/null || sudo iptables -A INPUT -p tcp --dport %d -j DROP;"
+    		"sudo iptables -C OUTPUT -p tcp --dport %d -j DROP 2>/dev/null || sudo iptables -A OUTPUT -p tcp --dport %d -j DROP;"
+			"sudo iptables -C INPUT -p udp --dport %d -j DROP 2>/dev/null || sudo iptables -A INPUT -p udp --dport %d -j DROP;"
+			"sudo iptables -C OUTPUT -p udp --dport %d -j DROP 2>/dev/null || sudo iptables -A OUTPUT -p udp --dport %d -j DROP;",
+    		port, port, port, port, port, port, port, port);
 
 		// Execute the command
 		int result = system(command);
@@ -3223,8 +3231,8 @@ spdk_lvs_IO_redirect(void *cb_arg)
 	struct spdk_lvol_store *lvs = cb_arg;
 	if (lvs->secondary) {
 		uint64_t current = lvs->current_io > lvs->total_io ? lvs->current_io - lvs->total_io : lvs->total_io - lvs->current_io;
-		SPDK_NOTICELOG("IO redirect CNT: t[%" PRIu64 "] c[%" PRIu64 "] f[%" PRIu64 "] \n",
-				lvs->total_io, current, lvs->hub_dev.redirected_io_count);
+		SPDK_NOTICELOG("IO redirect CNT: t[%" PRIu64 "] c[%" PRIu64 "] f[%" PRIu64 "] tc[%" PRIu64 "]\n",
+				lvs->total_io, current, lvs->hub_dev.redirected_io_count, lvs->current_io_t);
 		lvs->total_io += current;
 	}
 	return 0;
@@ -3236,7 +3244,8 @@ spdk_lvs_IO_hublvol(void *cb_arg)
 	struct spdk_lvol_store *lvs = cb_arg;
 	if (lvs->primary) {
 		uint64_t current = lvs->current_io > lvs->total_io ? lvs->current_io - lvs->total_io : lvs->total_io - lvs->current_io;
-		SPDK_NOTICELOG("IO hublvol CNT: t[%" PRIu64 "] c[%" PRIu64 "] \n", lvs->total_io, current);
+		SPDK_NOTICELOG("IO hublvol CNT: t[%" PRIu64 "] c[%" PRIu64 "] tc[%" PRIu64 "]\n",
+			 lvs->total_io, current, lvs->current_io_t);
 		lvs->total_io += current;
 	}
 	return 0;
@@ -3492,6 +3501,11 @@ spdk_lvs_check_active_process(struct spdk_lvol_store *lvs, struct spdk_lvol *lvo
 	struct spdk_lvs_req *req;
 
 	pthread_mutex_lock(&g_lvol_stores_mutex);
+
+	if (lvs->secondary && !lvs->skip_redirecting) {
+		pthread_mutex_unlock(&g_lvol_stores_mutex);
+		return;
+	}
 
 	if (!lvs->update_in_progress && lvs->retry_on_update <= 3) {
 		req = calloc(1, sizeof(*req));
