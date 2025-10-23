@@ -10011,7 +10011,7 @@ bdev_set_qos_limit_done(struct set_qos_limit_ctx *ctx, int status)
 	ctx->bdev->internal.qos_mod_in_progress = false;
 	spdk_spin_unlock(&ctx->bdev->internal.spinlock);
 
-	SPDK_NOTICELOG("Set QoS limit done for %s total_bdevs=%d nc=%d is_remove=%d\n", ctx->bdev->name, ctx->total_bdev_to_process, ctx->bdev_node_cout, ctx->is_remove_requets);
+	SPDK_NOTICELOG("Set QoS limit done for %s total_bdevs=%" PRIu64 " nc=%" PRIu64 " is_remove=%d\n", ctx->bdev->name, ctx->total_bdev_to_process, ctx->bdev_node_cout, ctx->is_remove_requets);
 	if(ctx->internal_request == true)
 	{
 		if(ctx->total_bdev_to_process > ctx->bdev_node_cout) {
