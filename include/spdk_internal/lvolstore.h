@@ -174,6 +174,7 @@ struct spdk_lvol_store {
 	struct spdk_poller *hublvol_poller;
 	uint64_t			total_io;
 	uint64_t			current_io;
+	uint64_t			current_io_t;
 	struct spdk_lvs_redirect lvol_map;	
 	struct spdk_redirect_dev hub_dev;
 	char	remote_bdev[SPDK_LVOL_NAME_MAX];
