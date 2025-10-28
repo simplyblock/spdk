@@ -1047,6 +1047,7 @@ raid_bdev_io_init(struct raid_bdev_io *raid_io, struct raid_bdev_io_channel *rai
 	raid_io->raid_ch = raid_ch;
 	raid_io->base_bdev_io_remaining = 0;
 	raid_io->base_bdev_io_submitted = 0;
+	raid_io->used_bits = (struct raid_io_used_bits){0};
 	raid_io->completion_cb = NULL;
 	raid_io->split.offset = RAID_OFFSET_BLOCKS_INVALID;
 
@@ -1073,9 +1074,12 @@ raid_bdev_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_i
 			  bdev_io->u.bdev.offset_blocks & MASK_OUT_USED_BITS, bdev_io->u.bdev.num_blocks,
 			  bdev_io->u.bdev.iovs, bdev_io->u.bdev.iovcnt, bdev_io->u.bdev.md_buf,
 			  bdev_io->u.bdev.memory_domain, bdev_io->u.bdev.memory_domain_ctx);
-	raid_io->priority_class = (bdev_io->u.bdev.offset_blocks & PRIORITY_CLASS_MASK) >> PRIORITY_CLASS_BITS_POS;
-	raid_io->geometry = (bdev_io->u.bdev.offset_blocks & GEOMETRY_MASK) >> GEOMETRY_BITS_POS;
-	if (raid_io->priority_class) { raid_io->raid_bdev->supports_priority_class = 1; }
+
+	raid_io->used_bits.priority_class = (bdev_io->u.bdev.offset_blocks & PRIORITY_CLASS_MASK) >> PRIORITY_CLASS_BITS_POS;
+	raid_io->used_bits.geometry = (bdev_io->u.bdev.offset_blocks & GEOMETRY_MASK) >> GEOMETRY_BITS_POS;
+	raid_io->used_bits.special_io = (bdev_io->u.bdev.offset_blocks & SPECIAL_IO_MASK) >> SPECIAL_IO_BITS_POS;
+
+	if (raid_io->used_bits.priority_class) { raid_io->raid_bdev->supports_priority_class = 1; }
 	spdk_trace_record(TRACE_BDEV_RAID_IO_START, 0, 0, (uintptr_t)raid_io, (uintptr_t)bdev_io);
 
 	switch (bdev_io->type) {

@@ -73,7 +73,7 @@ enum bs_clear_method {
 enum xfer_type {
 	XFER_TYPE_NONE = 0,
 	XFER_REPLICATE_SNAPSHOT,
-	XFER_MIGRATIE_SNAPSHOT,	
+	XFER_MIGRATE_SNAPSHOT,
 };
 
 struct spdk_hublvol_channels {
@@ -212,6 +212,8 @@ struct spdk_bs_io_opts {
 	uint8_t priority;
 	/** Geometry ID for IOs submitted on this channel */
 	uint8_t geometry;
+	/** Special IO flag for IOs submitted on this channel */
+	uint8_t special_io;
 } __attribute__((packed));
 
 struct spdk_bs_dev {
@@ -430,6 +432,8 @@ void spdk_bs_chain_snapshot_clone(struct spdk_blob *origblob, struct spdk_blob *
 			    spdk_blob_op_complete cb_fn, void *cb_arg);
 void spdk_bs_convert_blob(struct spdk_blob *origblob, bool leader, bool update_in_progress,
 			    spdk_blob_op_complete cb_fn, void *cb_arg);
+void spdk_bs_set_migration_flag_blob(struct spdk_blob *blob);
+bool spdk_bs_get_migration_flag_blob(struct spdk_blob *blob);
 /**
  * update a blobstore according to bit array synced.
  * Can be used on loaded blobstore, even with opened blobs.

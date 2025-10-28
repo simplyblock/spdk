@@ -169,6 +169,28 @@ def bdev_lvol_create(client, lvol_name, size_in_mib, thin_provision=False, uuid=
     params['lvol_priority_class'] = lvol_priority_class
     return client.call('bdev_lvol_create', params)
 
+def bdev_lvol_final_migration(client, lvol_name=None, lvol_id=0, snapshot_name=None, cluster_batch=16, gateway=None):
+    """Replicate a logical volume on a logical volume store.
+
+    Args:
+        name: Name of the logical volume to replicate (required)
+        offset: Starting offset to replicate (default: 0)
+        cluster_batch: elements count in the queue between pollers
+        gateway: Name of the gateway to use for transfer (required)
+        operation: action type to be useed for transfer (required)
+    """
+    if not lvol_name:
+        raise ValueError("lvol_name must be specified")
+    if not gateway:
+        raise ValueError("Gateway must be specified")
+    if not snapshot_name:
+        raise ValueError("Snapshot name must be specified")
+    if lvol_id <= 0:
+        raise ValueError("lvol_id must be specified")
+
+    params = {'lvol_name': lvol_name, 'lvol_id': lvol_id, 'snapshot_name': snapshot_name, 'cluster_batch': cluster_batch, 'gateway': gateway}
+    return client.call('bdev_lvol_transfer', params)
+
 def bdev_lvol_transfer(client, lvol_name=None, offset=0, cluster_batch=16, gateway=None, operation=None):
     """Replicate a logical volume on a logical volume store.
 
@@ -218,6 +240,21 @@ def bdev_lvol_convert(client, lvol_name=None):
     
     params = { 'lvol_name': lvol_name }
     return client.call('bdev_lvol_convert', params)
+
+def bdev_lvol_set_migration_flag(client, lvol_name=None):
+    """Set migration flag for a logical volume.
+
+    Args:
+        lvol_name: logical volume to set migration flag
+
+    Returns:
+        True or False.
+    """
+    if not lvol_name:
+        raise ValueError("lvol_name must be specified")
+
+    params = { 'lvol_name': lvol_name }
+    return client.call('bdev_lvol_set_migration_flag', params)
 
 def bdev_lvol_add_clone(client, lvol_name=None, child_name=None):
     """add lvol as clone to snapshot.

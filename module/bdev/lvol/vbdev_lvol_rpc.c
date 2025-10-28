@@ -2953,6 +2953,125 @@ cleanup:
 SPDK_RPC_REGISTER("bdev_lvol_set_priority_class", rpc_bdev_lvol_set_priority_class,
 		  SPDK_RPC_RUNTIME)
 
+struct rpc_bdev_lvol_final_migration {
+	char *lvol_name;
+	uint32_t lvol_id;
+	uint32_t cluster_batch;
+	char *gateway;
+	char *snapshot_name;
+};
+
+static void 
+free_rpc_bdev_lvol_final_migration(struct rpc_bdev_lvol_final_migration *req) {
+	free(req->lvol_name);
+	free(req->gateway);
+	free(req->snapshot_name);
+}
+
+static const struct spdk_json_object_decoder rpc_bdev_lvol_final_migration_decoders[] = {
+	{"lvol_name", offsetof(struct rpc_bdev_lvol_final_migration, lvol_name), spdk_json_decode_string},
+	{"lvol_id", offsetof(struct rpc_bdev_lvol_final_migration, lvol_id), spdk_json_decode_uint32},
+	{"cluster_batch", offsetof(struct rpc_bdev_lvol_final_migration, cluster_batch), spdk_json_decode_uint32, true},
+	{"gateway", offsetof(struct rpc_bdev_lvol_final_migration, gateway), spdk_json_decode_string},
+	{"snapshot_name", offsetof(struct rpc_bdev_lvol_final_migration, snapshot_name), spdk_json_decode_string},
+};
+
+static void
+rpc_bdev_lvol_final_migration_cb(void *cb_arg, struct spdk_lvol *lvol, int lvolerrno)
+{
+	struct spdk_json_write_ctx *w;
+	struct spdk_jsonrpc_request *request = cb_arg;
+
+	w = spdk_jsonrpc_begin_result(request);
+	spdk_json_write_object_begin(w);
+	if (lvol->transfer_status == XFER_DONE) {
+		spdk_json_write_named_string(w, "transfer_state", "Done");
+	} else {
+		spdk_json_write_named_string(w, "transfer_state", "Failed");
+	}
+	spdk_json_write_named_uint64(w, "offset", lvol->last_offset);
+	spdk_json_write_object_end(w);	
+	spdk_jsonrpc_end_result(request, w);
+	return;
+}
+
+
+static void 
+rpc_bdev_lvol_final_migration(struct spdk_jsonrpc_request *request,
+			      const struct spdk_json_val *params) 
+{
+	struct rpc_bdev_lvol_final_migration req = {};
+	struct spdk_lvol *lvol;
+	struct spdk_bdev *lvol_bdev;
+	struct spdk_transfer_dev *tdev;
+	enum xfer_type type = XFER_TYPE_NONE;
+	int rc = 0;
+
+	if (spdk_json_decode_object(params, rpc_bdev_lvol_final_migration_decoders,
+				    SPDK_COUNTOF(rpc_bdev_lvol_final_migration_decoders),
+				    &req)) {
+		SPDK_INFOLOG(lvol_rpc, "spdk_json_decode_object failed\n");
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "spdk_json_decode_object failed");
+		goto cleanup;
+	}
+	
+	if (!req.lvol_name || !req.gateway) {
+		SPDK_ERRLOG("lvol name and bdev name must be specified");
+		spdk_jsonrpc_send_error_response(request, -EINVAL, spdk_strerror(EINVAL));
+		goto cleanup;
+	}
+
+	if (req.snapshot_name == NULL) {
+		SPDK_ERRLOG("Invalid snapshot name for transfer '%s' final migration.\n", req.lvol_name);
+		spdk_jsonrpc_send_error_response(request, -EINVAL, spdk_strerror(-EINVAL));
+		goto cleanup;
+	}
+
+	if (req.lvol_id <= 0 || req.lvol_id > 0xFFFF) {
+		SPDK_ERRLOG("Invalid lvol ID '%d' for transfer.\n", req.lvol_id);
+		spdk_jsonrpc_send_error_response(request, -EINVAL, spdk_strerror(-EINVAL));
+		goto cleanup;
+	}
+
+	lvol_bdev = spdk_bdev_get_by_name(req.lvol_name);
+	if (lvol_bdev == NULL) {
+		SPDK_ERRLOG("lvol bdev '%s' does not exist\n", req.lvol_name);
+		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
+		goto cleanup;
+	}
+
+	lvol = vbdev_lvol_get_from_bdev(lvol_bdev);
+	if (lvol == NULL) {
+		SPDK_ERRLOG("lvol does not exist\n");
+		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
+		goto cleanup;
+	}
+
+	tdev = spdk_open_rmt_bdev(req.gateway, lvol->lvol_store);
+	if (tdev == NULL) {
+		SPDK_ERRLOG("bdev '%s' open failed\n", req.gateway);
+		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(-ENODEV));
+		goto cleanup;
+	}
+
+	type = XFER_MIGRATE_SNAPSHOT;
+	SPDK_NOTICELOG("Transfering lvol %s in final migrate mode.\n", req.lvol_name);
+
+	rc = spdk_lvol_transfer(lvol, 0, req.cluster_batch, type, tdev, req.snapshot_name, req.lvol_id,
+		 											rpc_bdev_lvol_final_migration_cb, request);
+	if (rc < 0) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 spdk_strerror(-rc));
+		goto cleanup;
+	}
+
+cleanup:
+	free_rpc_bdev_lvol_final_migration(&req);
+}
+
+SPDK_RPC_REGISTER("bdev_lvol_final_migration", rpc_bdev_lvol_final_migration, SPDK_RPC_RUNTIME)
+
 struct rpc_bdev_lvol_transfer {
 	char *lvol_name;
 	uint64_t offset;
@@ -3027,7 +3146,7 @@ rpc_bdev_lvol_transfer(struct spdk_jsonrpc_request *request,
 		if (!strcasecmp(req.operation, "replicate")) {
 			type = XFER_REPLICATE_SNAPSHOT;
 		} else if (!strcasecmp(req.operation, "migrate")) {
-			type = XFER_MIGRATIE_SNAPSHOT;
+			type = XFER_MIGRATE_SNAPSHOT;
 		} else {
 			SPDK_ERRLOG("Invalid operation '%s' for transfer.\n", req.operation);
 			spdk_jsonrpc_send_error_response(request, -EINVAL, spdk_strerror(-EINVAL));
@@ -3040,14 +3159,14 @@ rpc_bdev_lvol_transfer(struct spdk_jsonrpc_request *request,
 	}
 	SPDK_NOTICELOG("Transfering lvol %s in %s mode.\n", req.lvol_name, req.operation);
 
-	rc = spdk_lvol_transfer(lvol, req.offset, req.cluster_batch, type, tdev);
+	rc = spdk_lvol_transfer(lvol, req.offset, req.cluster_batch, type, tdev, NULL, 0, NULL, NULL);	
 	if (rc < 0) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 spdk_strerror(-rc));
 		goto cleanup;
 	}
 	spdk_jsonrpc_send_bool_response(request, true);
-	return;
+
 cleanup:
 	free_rpc_bdev_lvol_transfer(&req);
 }
@@ -3122,6 +3241,60 @@ cleanup:
 }
 
 SPDK_RPC_REGISTER("bdev_lvol_transfer_stat", rpc_bdev_lvol_transfer_stat, SPDK_RPC_RUNTIME)
+
+struct rpc_bdev_lvol_set_migration_flag {
+	char *lvol_name;
+};
+
+static void
+free_rpc_bdev_lvol_set_migration_flag(struct rpc_bdev_lvol_set_migration_flag *req)
+{
+	free(req->lvol_name);
+}
+
+static const struct spdk_json_object_decoder rpc_bdev_lvol_set_migration_flag_decoders[] = {
+	{"lvol_name", offsetof(struct rpc_bdev_lvol_set_migration_flag, lvol_name), spdk_json_decode_string},
+};
+
+static void
+rpc_bdev_lvol_set_migration_flag(struct spdk_jsonrpc_request *request,
+		       const struct spdk_json_val *params)
+{
+	struct rpc_bdev_lvol_set_migration_flag req = {};
+	struct spdk_bdev *bdev;
+	struct spdk_lvol *lvol;
+
+	if (spdk_json_decode_object(params, rpc_bdev_lvol_set_migration_flag_decoders,
+				    SPDK_COUNTOF(rpc_bdev_lvol_set_migration_flag_decoders),
+				    &req)) {
+		SPDK_INFOLOG(lvol_rpc, "spdk_json_decode_object failed\n");
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "spdk_json_decode_object failed");
+		goto cleanup;
+	}
+
+	bdev = spdk_bdev_get_by_name(req.lvol_name);
+	if (bdev == NULL) {
+		SPDK_INFOLOG(lvol_rpc, "bdev '%s' does not exist\n", req.lvol_name);
+		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
+		goto cleanup;
+	}
+
+	lvol = vbdev_lvol_get_from_bdev(bdev);
+	if (lvol == NULL) {
+		SPDK_ERRLOG("lvol does not exist\n");
+		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
+		goto cleanup;
+	}
+	SPDK_NOTICELOG("Set migration flag for lvol '%s'\n", req.lvol_name);
+	spdk_lvol_set_migration_flag(lvol);
+	spdk_jsonrpc_send_bool_response(request, true);
+
+cleanup:
+	free_rpc_bdev_lvol_set_migration_flag(&req);
+}
+
+SPDK_RPC_REGISTER("bdev_lvol_set_migration_flag", rpc_bdev_lvol_set_migration_flag, SPDK_RPC_RUNTIME)
 
 struct rpc_bdev_lvol_convert {
 	char *lvol_name;

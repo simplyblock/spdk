@@ -100,6 +100,7 @@ bdev_blob_queue_io(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, voi
 	ctx->ext_io_opts = ext_io_opts;
 	ctx->bs_io_opts.priority = bs_io_opts->priority;
 	ctx->bs_io_opts.geometry = bs_io_opts->geometry;
+	ctx->bs_io_opts.special_io = bs_io_opts->special_io;
 
 	rc = spdk_bdev_queue_io_wait(bdev, channel, &ctx->bdev_io_wait);
 	if (rc != 0) {
@@ -117,7 +118,8 @@ bdev_blob_read(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *p
 	int rc;
 
 	const uint64_t priority_lba = (((uint64_t)(bs_io_opts->priority)) << PRIORITY_CLASS_BITS_POS) |
-												((uint64_t)bs_io_opts->geometry << GEOMETRY_BITS_POS) | lba;
+											((uint64_t)bs_io_opts->geometry << GEOMETRY_BITS_POS) |
+											((uint64_t)bs_io_opts->special_io << SPECIAL_IO_BITS_POS) | lba;
 	// if (lba > (115 + 1228800) && bs_io_opts->geometry == 0) {
 	// 	SPDK_NOTICELOG("bdev_blob_read: lba=%lu, priority=%u, geometry=%u\n", lba, bs_io_opts->priority, bs_io_opts->geometry);
 	// }
@@ -138,7 +140,8 @@ bdev_blob_write(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *
 	int rc;
 
 	const uint64_t priority_lba = (((uint64_t)(bs_io_opts->priority)) << PRIORITY_CLASS_BITS_POS) | 
-												((uint64_t)bs_io_opts->geometry << GEOMETRY_BITS_POS) | lba;
+											((uint64_t)bs_io_opts->geometry << GEOMETRY_BITS_POS) |
+											((uint64_t)bs_io_opts->special_io << SPECIAL_IO_BITS_POS) | lba;
 	// if (lba > (115 + 1228800) && bs_io_opts->geometry == 0) {
 	// 	SPDK_NOTICELOG("bdev_blob_read: lba=%lu, priority=%u, geometry=%u\n", lba, bs_io_opts->priority, bs_io_opts->geometry);
 	// }												
@@ -160,7 +163,8 @@ bdev_blob_readv(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	int rc;
 
 	const uint64_t priority_lba = (((uint64_t)(bs_io_opts->priority)) << PRIORITY_CLASS_BITS_POS) |
-													((uint64_t)bs_io_opts->geometry << GEOMETRY_BITS_POS) | lba;
+											((uint64_t)bs_io_opts->geometry << GEOMETRY_BITS_POS) |
+											((uint64_t)bs_io_opts->special_io << SPECIAL_IO_BITS_POS) | lba;
 	// if (lba > (115 + 1228800) && bs_io_opts->geometry == 0) {
 	// 	SPDK_NOTICELOG("bdev_blob_read: lba=%lu, priority=%u, geometry=%u\n", lba, bs_io_opts->priority, bs_io_opts->geometry);
 	// }
@@ -182,7 +186,8 @@ bdev_blob_writev(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	int rc;
 
 	const uint64_t priority_lba = (((uint64_t)(bs_io_opts->priority)) << PRIORITY_CLASS_BITS_POS) |
-												((uint64_t)bs_io_opts->geometry << GEOMETRY_BITS_POS) | lba;
+											((uint64_t)bs_io_opts->geometry << GEOMETRY_BITS_POS) |
+											((uint64_t)bs_io_opts->special_io << SPECIAL_IO_BITS_POS) | lba;
 	// if (lba > (115 + 1228800) && bs_io_opts->geometry == 0) {
 	// 	SPDK_NOTICELOG("bdev_blob_read: lba=%lu, priority=%u, geometry=%u\n", lba, bs_io_opts->priority, bs_io_opts->geometry);
 	// }
@@ -216,7 +221,8 @@ bdev_blob_readv_ext(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 
 	blob_ext_io_opts_to_bdev_opts(&bdev_io_opts, io_opts);
 	const uint64_t priority_lba = (((uint64_t)(bs_io_opts->priority)) << PRIORITY_CLASS_BITS_POS) |
-												((uint64_t)bs_io_opts->geometry << GEOMETRY_BITS_POS) | lba;
+												((uint64_t)bs_io_opts->geometry << GEOMETRY_BITS_POS) |
+												((uint64_t)bs_io_opts->special_io << SPECIAL_IO_BITS_POS) | lba;
 	// if (lba > (115 + 1228800) && bs_io_opts->geometry == 0) {
 	// 	SPDK_NOTICELOG("bdev_blob_read: lba=%lu, priority=%u, geometry=%u\n", lba, bs_io_opts->priority, bs_io_opts->geometry);
 	// }
@@ -241,7 +247,8 @@ bdev_blob_writev_ext(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 
 	blob_ext_io_opts_to_bdev_opts(&bdev_io_opts, io_opts);
 	const uint64_t priority_lba = (((uint64_t)(bs_io_opts->priority)) << PRIORITY_CLASS_BITS_POS) |
-												((uint64_t)bs_io_opts->geometry << GEOMETRY_BITS_POS) | lba;
+												((uint64_t)bs_io_opts->geometry << GEOMETRY_BITS_POS) |
+												((uint64_t)bs_io_opts->special_io << SPECIAL_IO_BITS_POS) | lba;
 	// if (lba > (115 + 1228800) && bs_io_opts->geometry == 0) {
 	// 	SPDK_NOTICELOG("bdev_blob_read: lba=%lu, priority=%u, geometry=%u\n", lba, bs_io_opts->priority, bs_io_opts->geometry);
 	// }
@@ -262,7 +269,8 @@ bdev_blob_write_zeroes(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	int rc;
 
 	const uint64_t priority_lba = (((uint64_t)(bs_io_opts->priority)) << PRIORITY_CLASS_BITS_POS) |
-												((uint64_t)bs_io_opts->geometry << GEOMETRY_BITS_POS) | lba;
+												((uint64_t)bs_io_opts->geometry << GEOMETRY_BITS_POS) |
+												((uint64_t)bs_io_opts->special_io << SPECIAL_IO_BITS_POS) | lba;
 	// if (lba > (115 + 1228800) && bs_io_opts->geometry == 0) {
 	// 	SPDK_NOTICELOG("bdev_blob_read: lba=%lu, priority=%u, geometry=%u\n", lba, bs_io_opts->priority, bs_io_opts->geometry);
 	// }
@@ -285,7 +293,8 @@ bdev_blob_unmap(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, uint64
 
 	if (spdk_bdev_io_type_supported(blob_bdev->bdev, SPDK_BDEV_IO_TYPE_UNMAP)) {
 		const uint64_t priority_lba = (((uint64_t)(bs_io_opts->priority)) << PRIORITY_CLASS_BITS_POS) |
-													((uint64_t)bs_io_opts->geometry << GEOMETRY_BITS_POS) | lba;
+												((uint64_t)bs_io_opts->geometry << GEOMETRY_BITS_POS) |
+												((uint64_t)bs_io_opts->special_io << SPECIAL_IO_BITS_POS) | lba;
 	// if (lba > (115 + 1228800) && bs_io_opts->geometry == 0) {
 	// 	SPDK_NOTICELOG("bdev_blob_read: lba=%lu, priority=%u, geometry=%u\n", lba, bs_io_opts->priority, bs_io_opts->geometry);
 	// }

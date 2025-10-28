@@ -1206,6 +1206,125 @@ hublvol_read(struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct spdk_bde
 			       num_pages, lvol_op_comp, bdev_io, &lvol_io->ext_io_opts);
 }
 
+struct vbdev_lvol_migration_ctx {
+	struct spdk_lvol *lvol;
+	struct spdk_lvol *snapshot;
+	struct spdk_thread *thread;
+	struct spdk_bdev_io *bdev_io;
+	int rc;
+};
+
+static void
+handle_snapshot_post_migration_cpl(void *cbarg) {
+	struct vbdev_lvol_migration_ctx *ctx = cbarg;
+	// Done processing special signal
+	if (ctx->rc != 0) {
+		SPDK_ERRLOG("Snapshot post migration handling failed with rc %d.\n", ctx->rc);
+		lvol_op_comp(ctx->bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		free(ctx);
+		return;
+	}
+	lvol_op_comp(ctx->bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+	free(ctx);
+}
+
+static void
+handle_snapshot_post_migration_add_clone_cpl(void *cb_arg, int lvolerrno)
+{
+	struct vbdev_lvol_migration_ctx *ctx = cb_arg;
+
+	if (lvolerrno != 0) {
+		SPDK_ERRLOG("Failed to add lvol %s as clone to the snapshot after migration.\n", ctx->lvol->name);
+		ctx->rc = lvolerrno;
+	}
+
+	ctx->lvol->migration_flag = false;
+	spdk_thread_send_msg(ctx->thread, handle_snapshot_post_migration_cpl, ctx);
+}
+
+static void
+handle_snapshot_post_migration(void *cbarg)
+{
+	struct vbdev_lvol_migration_ctx *ctx = cbarg;
+	struct spdk_lvol *lvol = ctx->lvol;
+	struct spdk_lvol *snapshot = ctx->snapshot;
+
+	if (snapshot != NULL) {
+		spdk_lvol_chain(snapshot, lvol, handle_snapshot_post_migration_add_clone_cpl, ctx);
+		return;
+	}
+
+	lvol->migration_flag = false;
+	spdk_thread_send_msg(ctx->thread, handle_snapshot_post_migration_cpl, ctx);
+}
+
+static bool
+process_migration_write_request(struct spdk_bdev_io *bdev_io, struct spdk_lvol *lvol)
+{
+    struct iovec *iov;
+	struct spdk_lvol *snapshot = NULL;
+	struct spdk_bdev *bdev = NULL;
+	struct vbdev_lvol_migration_ctx *ctx = NULL;
+	bool find_signal = false;
+    int i;
+    char buf[512];  // small temporary buffer for signal parsing
+
+    // Iterate through all iovs in the write I/O
+    for (i = 0; i < bdev_io->u.bdev.iovcnt; i++) {
+        iov = &bdev_io->u.bdev.iovs[i];
+
+        // Copy a small part for inspection (don't need the full data)
+        size_t copy_len = iov->iov_len < sizeof(buf) - 1 ? iov->iov_len : sizeof(buf) - 1;
+        memcpy(buf, iov->iov_base, copy_len);
+        buf[copy_len] = '\0';
+
+        // Check if this I/O carries the migration signal
+        if (strncmp(buf, "migration_completed:", 20) == 0) {
+			find_signal = true;
+            const char *snapshot_name = buf + 20;
+
+            SPDK_NOTICELOG("Migration complete signal received. Snapshot: %s\n", snapshot_name);
+			ctx = calloc(1, sizeof(*ctx));
+			if (ctx == NULL) {
+				SPDK_ERRLOG("Failed to allocate memory for migration context\n");
+				lvol_op_comp(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+				return true;
+			}
+			ctx->lvol = lvol;
+			ctx->bdev_io = bdev_io;
+			ctx->thread = spdk_get_thread();
+            // Handle according to snapshot name
+            if (strcmp(snapshot_name, "none") != 0) {
+				bdev = spdk_bdev_get_by_name(snapshot_name);
+				if (bdev == NULL) {
+					SPDK_ERRLOG("bdev '%s' does not exist\n", snapshot_name);
+					free(ctx);
+					lvol_op_comp(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+					return true;
+				}
+
+				snapshot = vbdev_lvol_get_from_bdev(bdev);
+				if (snapshot == NULL) {
+					SPDK_ERRLOG("snapshot '%s' does not exist\n", snapshot_name);
+					free(ctx);
+					lvol_op_comp(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+					return true;
+				}
+            }
+			ctx->snapshot = snapshot;
+			break;
+		}
+	}
+
+	if (find_signal) {
+		// Add lvol as clone to the snapshot
+		// using thread for hublvol bcs the hub lvol opend in md thread
+		spdk_thread_send_msg(lvol->lvol_store->hub_dev.thread, handle_snapshot_post_migration, ctx);
+		return true;
+	}
+	return false;
+}
+
 static void
 lvol_write(struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 {
@@ -1237,6 +1356,19 @@ hublvol_write(struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct spdk_bd
 	lvol_io->ext_io_opts.size = sizeof(lvol_io->ext_io_opts);
 	lvol_io->ext_io_opts.memory_domain = bdev_io->u.bdev.memory_domain;
 	lvol_io->ext_io_opts.memory_domain_ctx = bdev_io->u.bdev.memory_domain_ctx;
+
+	if (lvol->migration_flag && start_page == 0 && num_pages == 1) {
+		//check if the migrate is completed signal recieved
+		// we should extract snapshot name and add this lvol as clone to it
+		// mark migrate process completed
+		// from this point we can expect real IO from clients
+		
+		SPDK_NOTICELOG("Migration completed for lvol %s blob id %" PRIu64 "\n",
+			       lvol->name, lvol->blob_id);
+		if (process_migration_write_request(bdev_io, lvol)) {
+			return;
+		}
+	}
 
 	spdk_blob_io_writev_ext(blob, ch, bdev_io->u.bdev.iovs, bdev_io->u.bdev.iovcnt, start_page,
 				num_pages, lvol_op_comp, bdev_io, &lvol_io->ext_io_opts);
@@ -1509,6 +1641,195 @@ vbdev_redirect_request_to_hublvol(struct spdk_lvol *lvol, struct spdk_io_channel
 }
 
 static void
+_pt_complete_io_after_migrate(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct ctx_redirect_req *ctx = cb_arg;
+	struct spdk_bdev_io *orig_io = ctx->bdev_io;
+	struct spdk_lvol *lvol = orig_io->bdev->ctxt;
+	struct spdk_transfer_dev *tdev = lvol->tdev;
+	struct vbdev_lvol_io *io_ctx = (struct vbdev_lvol_io *)orig_io->driver_ctx;
+	int status = success ? SPDK_BDEV_IO_STATUS_SUCCESS : SPDK_BDEV_IO_STATUS_FAILED;
+
+	/* Complete the original IO and then free the one that we created here*/
+	__atomic_sub_fetch(&tdev->redirected_io_count, 1, __ATOMIC_SEQ_CST);
+	if (!io_ctx->redirect_in_progress) {
+		SPDK_ERRLOG("Double completion or use-after-complete for IO %p\n", orig_io);
+		free(ctx);
+		return;
+	}
+
+	io_ctx->redirect_in_progress = false;  // Clear flag
+
+	if (status == SPDK_BDEV_IO_STATUS_SUCCESS) {
+		spdk_bdev_io_complete(orig_io, status);
+		spdk_bdev_free_io(bdev_io);
+		free(ctx);
+		return;
+	}
+
+	// Failure path: trigger failover and resend original IO
+	if (!lvol->redirect_failed) {
+		SPDK_ERRLOG("FAILED IO on hub bdev. Starting failover.\n");
+		spdk_lvol_rediret_io_change_state(lvol);
+	}
+	SPDK_ERRLOG("FAILED IO on hub bdev. redirected after migration.\n");
+	spdk_bdev_io_complete(orig_io, status);
+	spdk_bdev_free_io(bdev_io);  // Still safe here
+	free(ctx);
+}
+
+static void
+redirect_after_migrate_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io, bool success)
+{
+	struct spdk_lvol *lvol = bdev_io->bdev->ctxt;	
+	struct spdk_transfer_dev *tdev = lvol->tdev;
+	struct spdk_bdev_ext_io_opts bdev_io_opts;
+	struct spdk_io_channel *hub_ch;
+	struct ctx_redirect_req *ctx;
+	
+	uint64_t offset = 0;
+	COMBINE_OFFSET(offset, lvol->redirect_map_id, bdev_io->u.bdev.offset_blocks);
+
+	if (!success) {
+		SPDK_NOTICELOG("FAILED getbuf redirect blob: %" PRIu64 " blocks at LBA: %" PRIu64 " blocks CNT %" PRIu64 " and the type is %d \n",
+		 			lvol->blob_id, bdev_io->u.bdev.offset_blocks, bdev_io->u.bdev.num_blocks, bdev_io->type);
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		return;
+	}
+
+	if (tdev->state != HUBLVOL_CONNECTED) {
+		SPDK_ERRLOG("ERROR on bdev_io submission! hubdev is not connected. start failover.\n");
+		spdk_lvol_rediret_io_change_state(lvol);
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		return;
+	}
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		SPDK_NOTICELOG("FAILED IO - Cannot allocate ctx for redirect IO. \n");
+		spdk_lvol_rediret_io_change_state(lvol);
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		return;
+	}
+	ctx->bdev_io = bdev_io;
+	ctx->ch = ch;
+
+	struct vbdev_lvol_io *lvol_io = (struct vbdev_lvol_io *)bdev_io->driver_ctx;
+	lvol_io->ext_io_opts.size = sizeof(lvol_io->ext_io_opts);
+	lvol_io->ext_io_opts.memory_domain = bdev_io->u.bdev.memory_domain;
+	lvol_io->ext_io_opts.memory_domain_ctx = bdev_io->u.bdev.memory_domain_ctx;
+	blob_ext_io_opts_to_bdev_opts(&bdev_io_opts, &lvol_io->ext_io_opts);
+
+	hub_ch = spdk_tdev_get_hub_channel(tdev, spdk_get_thread());
+
+	__atomic_add_fetch(&tdev->redirected_io_count, 1, __ATOMIC_SEQ_CST);
+
+	int rc = spdk_bdev_readv_blocks_ext(tdev->desc, hub_ch, bdev_io->u.bdev.iovs, bdev_io->u.bdev.iovcnt, offset,
+			       bdev_io->u.bdev.num_blocks, _pt_complete_io_after_migrate, ctx, &bdev_io_opts);
+	if (rc != 0) {
+		__atomic_sub_fetch(&tdev->redirected_io_count, 1, __ATOMIC_SEQ_CST);
+		SPDK_ERRLOG("ERROR on bdev_io submission!\n");
+		spdk_lvol_rediret_io_change_state(lvol);
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		return;
+		free(ctx);
+	}
+}
+
+static void
+vbdev_redirect_after_migrate(struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io) {	
+	struct vbdev_lvol_io *lvol_io = (struct vbdev_lvol_io *)bdev_io->driver_ctx;
+	struct spdk_transfer_dev *tdev = lvol->tdev;
+	struct spdk_io_channel *hub_ch;
+	struct ctx_redirect_req *ctx = NULL;
+	struct spdk_bdev_ext_io_opts bdev_io_opts;
+	int rc = 0;
+	uint64_t offset = 0;
+	COMBINE_OFFSET(offset, lvol->redirect_map_id, bdev_io->u.bdev.offset_blocks);
+
+	if (tdev->state == HUBLVOL_CONNECTED) {
+		//TODO check the state for channel
+		if (tdev->desc == NULL) {
+			SPDK_ERRLOG("Hublvol desc is NULL. should not be.\n");
+			spdk_lvol_rediret_io_change_state(lvol);
+			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+			return;
+		}
+
+		hub_ch = spdk_tdev_get_hub_channel(tdev, spdk_get_thread());
+		if (!hub_ch) {		
+			SPDK_NOTICELOG("Hublvol channel for redirec after migration is NULL.\n");
+			spdk_lvol_rediret_io_change_state(lvol);
+			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+			return;
+		}
+		//TODO if we can not create ch from hub bdev
+	} else {
+		SPDK_NOTICELOG("Hublvol is not connected. we try to connect now but we will not wait and the failover will started.\n");
+		spdk_lvol_rediret_io_change_state(lvol);
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		return;
+	}
+
+	if (bdev_io->type != SPDK_BDEV_IO_TYPE_READ) {
+		ctx = calloc(1, sizeof(*ctx));
+		if (!ctx) {
+			SPDK_NOTICELOG("FAILED IO - Cannot allocate ctx for redirect IO. \n");
+			spdk_lvol_rediret_io_change_state(lvol);
+			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+			return;
+		}
+		__atomic_add_fetch(&tdev->redirected_io_count, 1, __ATOMIC_SEQ_CST);
+		ctx->bdev_io = bdev_io;
+		ctx->ch = ch;
+	}
+
+	lvol_io->redirect_in_progress = true;	
+	switch (bdev_io->type) {
+	case SPDK_BDEV_IO_TYPE_READ:
+		spdk_bdev_io_get_buf(bdev_io, redirect_after_migrate_get_buf_cb,
+				     bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen);
+		break;
+	case SPDK_BDEV_IO_TYPE_WRITE:
+		lvol_io->ext_io_opts.size = sizeof(lvol_io->ext_io_opts);
+		lvol_io->ext_io_opts.memory_domain = bdev_io->u.bdev.memory_domain;
+		lvol_io->ext_io_opts.memory_domain_ctx = bdev_io->u.bdev.memory_domain_ctx;
+		blob_ext_io_opts_to_bdev_opts(&bdev_io_opts, &lvol_io->ext_io_opts);
+		rc = spdk_bdev_writev_blocks_ext(tdev->desc, hub_ch, bdev_io->u.bdev.iovs,
+						 bdev_io->u.bdev.iovcnt, offset, bdev_io->u.bdev.num_blocks,
+						  _pt_complete_io_after_migrate, ctx, &bdev_io_opts);
+		break;
+	case SPDK_BDEV_IO_TYPE_WRITE_ZEROES:
+		rc = spdk_bdev_write_zeroes_blocks(tdev->desc, hub_ch, offset,
+						   bdev_io->u.bdev.num_blocks,
+						   _pt_complete_io_after_migrate, ctx);
+		break;
+	case SPDK_BDEV_IO_TYPE_UNMAP:
+		rc = spdk_bdev_unmap_blocks(tdev->desc, hub_ch, offset,
+					    bdev_io->u.bdev.num_blocks,
+					    _pt_complete_io_after_migrate, ctx);
+		break;
+	default:
+		SPDK_INFOLOG(vbdev_lvol, "lvol: unsupported I/O type %d\n", bdev_io->type);
+		spdk_lvol_rediret_io_change_state(lvol);
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		return;
+	}
+
+	if (rc != 0) {
+		__atomic_sub_fetch(&tdev->redirected_io_count, 1, __ATOMIC_SEQ_CST);
+		SPDK_ERRLOG("ERROR on bdev_io submission!\n");
+		spdk_lvol_rediret_io_change_state(lvol);
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);		
+		if (ctx) {
+			free(ctx);
+		}
+	}
+	return;
+}
+
+
+static void
 vbdev_hublvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io) {
 	struct spdk_lvol *lvol = bdev_io->bdev->ctxt;
 	struct spdk_lvol_store *lvs = lvol->lvol_store;
@@ -1596,11 +1917,41 @@ vbdev_hublvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bd
 }
 
 static void
+vbdev_lvol_dequeue_io(void *cb_arg)
+{
+	struct spdk_migrate_io *migrate_io = cb_arg;
+	vbdev_lvol_submit_request(migrate_io->ch, migrate_io->bdev_io);
+	free(migrate_io);
+}
+
+static void
 vbdev_lvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 {
 	struct spdk_lvol *lvol = bdev_io->bdev->ctxt;
 	struct spdk_lvol_store *lvs = lvol->lvol_store;
 	bool io_type = check_IO_type(bdev_io->type);
+
+	if (lvol->freezed) {
+		if (io_type) {
+			if (!spdk_lvol_freeze_io(lvol, ch, bdev_io, vbdev_lvol_dequeue_io)) {
+				SPDK_NOTICELOG("FAILED IO - freezed blob: %" PRIu64 "  Lba: %" PRIu64 "  Cnt %" PRIu64 "  t %d \n",
+			 				lvol->blob_id, bdev_io->u.bdev.offset_blocks, bdev_io->u.bdev.num_blocks, bdev_io->type);
+				spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+			}
+			return;
+		}
+	}
+
+	if (lvol->redirect_after_migration) {		
+		if (io_type) {
+			if (lvol->redirect_failed) {
+				spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+				return;
+			}
+			vbdev_redirect_after_migrate(lvol, ch, bdev_io);
+			return;
+		}
+	}
 
 	// spdk_add_stat_ext(ch);
 	if (lvs->secondary && (!lvs->leader && !lvs->update_in_progress) && !lvs->skip_redirecting ) {

@@ -112,6 +112,7 @@ bs_sequence_start(struct spdk_io_channel *_channel, struct spdk_bs_cpl *cpl,
 
 	set->priority_class = channel->bs->priority_class;
 	set->geometry = 0; // default geometry
+	set->special_io = 0; //default special io
 	set->cb_args.cb_fn = bs_sequence_completion;
 	set->cb_args.cb_arg = set;
 	set->cb_args.channel = channel->dev_channel;
@@ -153,6 +154,36 @@ bs_sequence_start_blob(struct spdk_io_channel *_channel, struct spdk_bs_cpl *cpl
 	if (seq) {
 		seq->priority_class = blob->priority_class; // set here if blobstore priority is different from this specific blob's priority
 		seq->geometry = blob->geometry;
+	}
+	return seq;
+}
+
+spdk_bs_sequence_t *
+bs_sequence_start_blob_s(struct spdk_io_channel *_channel, struct spdk_bs_cpl *cpl,
+		       uint8_t special_io, struct spdk_blob *blob)
+{
+	struct spdk_io_channel	*esnap_ch = _channel;
+
+	if (spdk_blob_is_esnap_clone(blob)) {
+		esnap_ch = blob_esnap_get_io_channel(_channel, blob);
+		if (esnap_ch == NULL) {
+			/*
+			 * The most likely reason we are here is because of some logic error
+			 * elsewhere that caused channel allocations to fail. We could get here due
+			 * to being out of memory as well. If we are out of memory, the process is
+			 * this will be just one of many problems that this process will be having.
+			 * Killing it off debug builds now due to logic errors is the right thing to
+			 * do and killing it off due to ENOMEM is no big loss.
+			 */
+			assert(false);
+			return NULL;
+		}
+	}
+	spdk_bs_sequence_t *seq = bs_sequence_start(_channel, cpl, esnap_ch);
+	if (seq) {
+		seq->priority_class = blob->priority_class; // set here if blobstore priority is different from this specific blob's priority
+		seq->geometry = blob->geometry;
+		seq->special_io = special_io;
 	}
 	return seq;
 }
@@ -287,6 +318,7 @@ bs_sequence_writev_dev(spdk_bs_sequence_t *seq, struct iovec *iov, int iovcnt,
 	set->u.sequence.cb_arg = cb_arg;
 	bs_io_opts.priority = set->priority_class;
 	bs_io_opts.geometry = set->geometry;
+	bs_io_opts.special_io = set->special_io;
 	check_geometry(set->bs, bs_io_opts.geometry, lba);
 	if (set->ext_io_opts) {
 		assert(channel->dev->writev_ext);
@@ -364,12 +396,12 @@ bs_batch_completion(struct spdk_io_channel *_channel,
 	struct spdk_bs_io_opts		bs_io_opts = {0};
 	struct limit *ctx;
 	set->u.batch.outstanding_ops--;
-	if (bserrno != 0) {		
+	if (bserrno != 0) {
 		set->bserrno = bserrno;
 	}
 
 	if (set->u.batch.is_unmap) {
-		if (!TAILQ_EMPTY(&set->u.batch.unmap_queue)) {        
+		if (!TAILQ_EMPTY(&set->u.batch.unmap_queue)) {
 			ctx = TAILQ_FIRST(&set->u.batch.unmap_queue);
 			assert(ctx != NULL);
 			TAILQ_REMOVE(&set->u.batch.unmap_queue, ctx, entries); // Remove it from the queue.
@@ -380,6 +412,9 @@ bs_batch_completion(struct spdk_io_channel *_channel,
 			} else {
 				bs_io_opts.geometry = set->geometry;
 			}
+
+			bs_io_opts.special_io = set->u.batch.special_io;
+
 			check_geometry(set->bs, bs_io_opts.geometry, ctx->lba);
 			if (spdk_likely(channel->bs->is_leader)) {
 				channel->dev->unmap(channel->dev, channel->dev_channel, ctx->lba, ctx->lba_count,
@@ -434,9 +469,54 @@ bs_batch_open(struct spdk_io_channel *_channel, struct spdk_bs_cpl *cpl, struct 
 	set->u.batch.outstanding_ops = 0;
 	set->u.batch.batch_closed = 0;
 	set->u.batch.geometry = blob->geometry;
+	set->u.batch.special_io = 0; // default special io
 
 	set->priority_class = blob->priority_class;
 	set->geometry = blob->geometry;
+	set->cb_args.cb_fn = bs_batch_completion;
+	set->cb_args.cb_arg = set;
+	set->cb_args.channel = channel->dev_channel;
+
+	return (spdk_bs_batch_t *)set;
+}
+
+spdk_bs_batch_t *
+bs_batch_open_s(struct spdk_io_channel *_channel, struct spdk_bs_cpl *cpl, uint8_t special_io, struct spdk_blob *blob)
+{
+	struct spdk_bs_channel		*channel;
+	struct spdk_bs_request_set	*set;
+	struct spdk_io_channel		*back_channel = _channel;
+
+	if (spdk_blob_is_esnap_clone(blob)) {
+		back_channel = blob_esnap_get_io_channel(_channel, blob);
+		if (back_channel == NULL) {
+			return NULL;
+		}
+	}
+
+	channel = spdk_io_channel_get_ctx(_channel);
+	assert(channel != NULL);
+	set = TAILQ_FIRST(&channel->reqs);
+	if (!set) {
+		return NULL;
+	}
+	TAILQ_REMOVE(&channel->reqs, set, link);
+
+	set->cpl = *cpl;
+	set->bserrno = 0;
+	set->channel = channel;
+	set->back_channel = back_channel;
+
+	set->u.batch.cb_fn = NULL;
+	set->u.batch.cb_arg = NULL;
+	set->u.batch.outstanding_ops = 0;
+	set->u.batch.batch_closed = 0;
+	set->u.batch.geometry = blob->geometry;
+	set->u.batch.special_io = special_io;
+
+	set->priority_class = blob->priority_class;
+	set->geometry = blob->geometry;
+	set->special_io = 0;
 	set->cb_args.cb_fn = bs_batch_completion;
 	set->cb_args.cb_arg = set;
 	set->cb_args.channel = channel->dev_channel;
@@ -484,6 +564,9 @@ bs_batch_read_dev(spdk_bs_batch_t *batch, void *payload,
 	} else {
 		bs_io_opts.geometry = batch->geometry;
 	}
+
+	bs_io_opts.special_io = set->u.batch.special_io;
+
 	check_geometry(set->bs, bs_io_opts.geometry, lba);
 	channel->dev->read(channel->dev, channel->dev_channel, payload, lba, lba_count, &set->cb_args, &bs_io_opts);
 }
@@ -504,6 +587,9 @@ bs_batch_write_dev(spdk_bs_batch_t *batch, void *payload,
 	} else {
 		bs_io_opts.geometry = batch->geometry;
 	}
+
+	bs_io_opts.special_io = set->u.batch.special_io;
+
 	check_geometry(set->bs, bs_io_opts.geometry, lba);
 	channel->dev->write(channel->dev, channel->dev_channel, payload, lba, lba_count,
 			    &set->cb_args, &bs_io_opts);
@@ -540,6 +626,9 @@ out:
 	} else {
 		bs_io_opts.geometry = batch->geometry;
 	}
+
+	bs_io_opts.special_io = set->u.batch.special_io;
+
 	check_geometry(set->bs, bs_io_opts.geometry, lba);
 	if (spdk_likely(channel->bs->is_leader)) {
 		channel->dev->unmap(channel->dev, channel->dev_channel, lba, lba_count,
@@ -567,6 +656,9 @@ bs_batch_write_zeroes_dev(spdk_bs_batch_t *batch,
 	} else {
 		bs_io_opts.geometry = batch->geometry;
 	}
+
+	bs_io_opts.special_io = set->u.batch.special_io;
+
 	check_geometry(set->bs, bs_io_opts.geometry, lba);
 	if (spdk_likely(channel->bs->is_leader)) {
 		channel->dev->write_zeroes(channel->dev, channel->dev_channel, lba, lba_count,
@@ -601,6 +693,26 @@ bs_sequence_to_batch(spdk_bs_sequence_t *seq, uint8_t geometry, spdk_bs_sequence
 
 	set->u.batch.cb_fn = cb_fn;
 	set->u.batch.geometry = geometry;
+	set->u.batch.special_io = 0; // default special io
+	set->u.batch.cb_arg = cb_arg;
+	set->u.batch.outstanding_ops = 0;
+	set->u.batch.batch_closed = 0;
+	set->u.batch.is_unmap = false;
+	TAILQ_INIT(&set->u.batch.unmap_queue);
+
+	set->cb_args.cb_fn = bs_batch_completion;
+
+	return set;
+}
+
+spdk_bs_batch_t *
+bs_sequence_to_batch_s(spdk_bs_sequence_t *seq, uint8_t geometry, uint8_t special_io, spdk_bs_sequence_cpl cb_fn, void *cb_arg)
+{
+	struct spdk_bs_request_set *set = (struct spdk_bs_request_set *)seq;
+
+	set->u.batch.cb_fn = cb_fn;
+	set->u.batch.geometry = geometry;
+	set->u.batch.special_io = special_io;
 	set->u.batch.cb_arg = cb_arg;
 	set->u.batch.outstanding_ops = 0;
 	set->u.batch.batch_closed = 0;

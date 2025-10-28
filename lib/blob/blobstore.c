@@ -2521,7 +2521,8 @@ blob_persist_clear_clusters(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		return;
 	}
 
-	batch = bs_sequence_to_batch(seq, blob->geometry, blob_persist_clear_clusters_cpl, ctx);
+	uint8_t special_io = blob->migration_flag ? 1 : 0;
+	batch = bs_sequence_to_batch_s(seq, blob->geometry, special_io, blob_persist_clear_clusters_cpl, ctx);
 
 	/* Clear all clusters that were truncated */
 	lba = 0;
@@ -3861,7 +3862,8 @@ blob_request_submit_op_single(struct spdk_io_channel *_ch, struct spdk_blob *blo
 				return;
 			}
 
-			batch = bs_batch_open(_ch, &cpl, blob);
+			uint8_t special_io = (blob->migration_flag & (op_type == SPDK_BLOB_WRITE)) ? 1 : 0;
+			batch = bs_batch_open_s(_ch, &cpl, special_io, blob);
 			if (!batch) {
 				cb_fn(cb_arg, -ENOMEM);
 				return;
@@ -4203,8 +4205,8 @@ blob_request_submit_rw_iov(struct spdk_blob *blob, struct spdk_io_channel *_chan
 		} else {
 			if (is_allocated) {
 				spdk_bs_sequence_t *seq;
-
-				seq = bs_sequence_start_blob(_channel, &cpl, blob);
+				uint8_t special_io = blob->migration_flag ? 1 : 0;
+				seq = bs_sequence_start_blob_s(_channel, &cpl, special_io, blob);
 				if (!seq) {
 					SPDK_NOTICELOG("FAILED on get seq op blob: %" PRIu64 " blocks at LBA: %" PRIu64 " \n",blob->id, offset);
 					cb_fn(cb_arg, -ENOMEM);
@@ -10432,11 +10434,13 @@ spdk_bs_chain_snapshot_clone(struct spdk_blob *origblob, struct spdk_blob *clone
 	struct spdk_blob_list *snapshot_entry = NULL;
 	struct spdk_blob_list *blob = NULL;
 
+	clone->migration_flag = false;
+
 	if (update_in_progress) {
 		cb_fn(cb_arg, -EBUSY);
 		return;
 	}
-	
+
 	TAILQ_FOREACH(snapshot_entry, &bs->snapshots, link) {
 		if (snapshot_entry->id == origblob->id) {			
 			TAILQ_FOREACH(blob, &snapshot_entry->clones, link) {
@@ -10508,6 +10512,7 @@ spdk_bs_convert_blob(struct spdk_blob *origblob, bool leader, bool update_in_pro
 		return;
 	}	
 
+	origblob->migration_flag = false;
 	ctx = calloc(1, sizeof(*ctx));
 	if (!ctx) {
 		cb_fn(cb_arg, -ENOMEM);
@@ -10528,6 +10533,18 @@ spdk_bs_convert_blob(struct spdk_blob *origblob, bool leader, bool update_in_pro
 	}
 	/* sync snapshot metadata */
 	spdk_blob_sync_md(origblob, spdk_bs_convert_blob_cb, ctx);
+}
+
+void
+spdk_bs_set_migration_flag_blob(struct spdk_blob *blob)
+{
+	blob->migration_flag = true;
+}
+
+bool
+spdk_bs_get_migration_flag_blob(struct spdk_blob *blob)
+{
+	return blob->migration_flag;
 }
 
 void
@@ -11616,7 +11633,8 @@ blob_clear_clusters_async(spdk_bs_sequence_t *seq, struct spdk_blob	*blob)
 	uint64_t			lba;
 	uint64_t			lba_count;
 
-	batch = bs_sequence_to_batch(seq, blob->geometry, blob_clear_clusters_async_cpl, blob);
+	uint8_t special_io = blob->migration_flag ? 1 : 0;
+	batch = bs_sequence_to_batch_s(seq, blob->geometry, special_io, blob_clear_clusters_async_cpl, blob);
 
 	/* Clear all clusters that were truncated */
 	lba = 0;
@@ -14942,6 +14960,7 @@ spdk_read_cluster_data_xfer(struct spdk_blob *blob, void *buf, uint64_t offset, 
 	spdk_bs_sequence_t			*seq;
 	spdk_bs_batch_t             *batch;
 	uint64_t lba, lba_count;
+	uint8_t special_io = (type == XFER_MIGRATE_SNAPSHOT) ? 1 : 0;
 
 	cpl.type = SPDK_BS_CPL_TYPE_BLOB_BASIC;
 	cpl.u.blob_basic.cb_fn = cb_fn;
@@ -14953,20 +14972,16 @@ spdk_read_cluster_data_xfer(struct spdk_blob *blob, void *buf, uint64_t offset, 
 		return -ENOMEM;
 	}
 
-	batch = bs_sequence_to_batch(seq, blob->geometry, spdk_xfer_read_cluster_cpl, NULL);
-	bs->r_io++;	
-	if (type == XFER_MIGRATIE_SNAPSHOT) {
-		uint64_t m = 1;
-		uint64_t mlba = m << 51 | lba;
-		bs_batch_read_dev(batch, buf, mlba, bs_byte_to_lba(bs, SPDK_BS_PAGE_SIZE));
+	batch = bs_sequence_to_batch_s(seq, blob->geometry, special_io, spdk_xfer_read_cluster_cpl, NULL);
+	bs->r_io++;
+	if (type == XFER_MIGRATE_SNAPSHOT) {
+		blob_calculate_lba_and_lba_count(blob, offset, length, &lba, &lba_count);
+		bs_batch_read_dev(batch, buf, lba, 8 * bs_byte_to_lba(bs, SPDK_BS_PAGE_SIZE));
 	} else {
 		// byte to lba = block cnt -> block_cnt in 4k * page per cluster = bs_io_unit_to_back_dev_lba(blob, lba_len)
 		bool is_allocated = blob_calculate_lba_and_lba_count(blob, offset, length, &lba, &lba_count);
 		assert(is_allocated);
-		// for (int i = 0; i < spdk_bs_get_cluster_size(bs); i++) {
-			bs_batch_read_dev(batch, buf, lba, lba_count);
-			// bs_batch_read_dev(batch, buf + (i * SPDK_BS_PAGE_SIZE) , lba + i, bs_byte_to_lba(bs, SPDK_BS_PAGE_SIZE));
-		// }
+		bs_batch_read_dev(batch, buf, lba, lba_count);
 	}
 
 	bs_batch_close(batch);

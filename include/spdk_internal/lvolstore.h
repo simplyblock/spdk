@@ -110,6 +110,14 @@ struct spdk_pending_iorsp {
 	TAILQ_ENTRY(spdk_pending_iorsp)	entry;
 };
 
+struct spdk_migrate_io {
+	struct spdk_bdev_io *bdev_io;
+	struct spdk_io_channel *ch;
+	struct spdk_thread	*thread;
+	spdk_lvol_op_migrate_complete cb_fn;
+	TAILQ_ENTRY(spdk_migrate_io)	entry;
+};
+
 struct spdk_redirect_request {
 	struct spdk_bdev_io *bdev_io;
 	struct spdk_io_channel *ch;
@@ -144,13 +152,16 @@ struct spdk_transfer_dev {
 	char bdev_name[SPDK_LVOL_NAME_MAX];
 	struct spdk_thread		*thread;
 	struct spdk_poller *cleanup_poller;
-	uint64_t transfered_io_count;
+	// uint64_t transfered_io_count;
 	enum hublvol_state	state;
-	uint64_t out_standing_io;
+	// uint64_t out_standing_io;
+	uint64_t redirected_io_count;
 	bool reused;
 	bool dev_in_remove;
 	bool drain_in_action;
 	bool pg[20];
+	struct spdk_hublvol_channels *current_channel;
+	TAILQ_HEAD(, spdk_hublvol_channels)	redirect_channels;
 	struct spdk_lvol_store	*lvs;
 	TAILQ_ENTRY(spdk_transfer_dev)	entry;
 };
@@ -213,6 +224,11 @@ struct spdk_lvs_xfer {
 	uint64_t timeout;
 	struct spdk_poller 	*tmo_poller;
 	char bdev_name[SPDK_LVOL_NAME_MAX];
+	char snapshot_name[SPDK_LVOL_NAME_MAX];
+	spdk_lvol_op_with_handle_complete	cb_fn;
+	void *cb_arg;
+	bool final_migration;
+	bool signal_sent;
 	TAILQ_ENTRY(spdk_lvs_xfer)	entry;
 };
 
@@ -278,6 +294,7 @@ struct spdk_lvol {
 	
 	bool				failed_on_update;
 	bool				deletion_failed;
+	bool				migration_flag;
 	int					failed_rc;
 	uint8_t				deletion_status; // 0 - not started, 1 - started, 2 - completed
 	char				unique_id[SPDK_LVOL_UNIQUE_ID_MAX];
@@ -294,7 +311,13 @@ struct spdk_lvol {
 	TAILQ_ENTRY(spdk_lvol)		entry_to_delete;
 	struct spdk_lvs_degraded_lvol_set *degraded_set;
 	TAILQ_ENTRY(spdk_lvol)		degraded_link;
-	TAILQ_HEAD(, spdk_pending_iorsp)   redirected_io;
+	// TAILQ_HEAD(, spdk_pending_iorsp)   redirected_io;
+	TAILQ_HEAD(, spdk_migrate_io)   redirect_migrate_io;
+	struct spdk_transfer_dev *tdev;
+	uint16_t		redirect_map_id;
+	bool			redirect_failed;
+	bool			freezed;
+	bool			redirect_after_migration;
 
 	enum xfer_status transfer_status;
 	uint64_t last_offset;
