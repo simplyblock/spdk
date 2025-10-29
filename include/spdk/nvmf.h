@@ -27,6 +27,8 @@ extern "C" {
 
 #define SPDK_TLS_PSK_MAX_LEN		200
 
+#define MAX_NUM_BLOCKED_PORTS 4
+
 struct spdk_nvmf_tgt;
 struct spdk_nvmf_subsystem;
 struct spdk_nvmf_ctrlr;
@@ -1590,6 +1592,11 @@ void spdk_nvmf_set_custom_ns_reservation_ops(const struct spdk_nvmf_ns_reservati
  *                the discovery log page change notice.
  */
 void spdk_nvmf_send_discovery_log_notice(struct spdk_nvmf_tgt *tgt, const char *hostnqn);
+
+bool spdk_nvmf_port_block(uint16_t port);
+bool spdk_nvmf_port_unblock(uint16_t port);
+void spdk_nvmf_get_blocked_ports(uint16_t *ports, int *num_ports);
+bool spdk_nvmf_check_port_permission(uint16_t port);
 
 #ifdef __cplusplus
 }
