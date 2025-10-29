@@ -24,6 +24,9 @@ SPDK_LOG_REGISTER_COMPONENT(nvmf)
 
 static TAILQ_HEAD(, spdk_nvmf_tgt) g_nvmf_tgts = TAILQ_HEAD_INITIALIZER(g_nvmf_tgts);
 
+static uint16_t g_nvmf_blocked_ports[MAX_NUM_BLOCKED_PORTS] = {0};
+static uint16_t g_nvmf_num_blocked_ports = 0;
+
 typedef void (*nvmf_qpair_disconnect_cpl)(void *ctx, int status);
 
 /* supplied to a single call to nvmf_qpair_disconnect */
@@ -1944,4 +1947,80 @@ spdk_nvmf_poll_group_dump_stat(struct spdk_nvmf_poll_group *group, struct spdk_j
 
 	spdk_json_write_array_end(w);
 	spdk_json_write_object_end(w);
+}
+
+bool 
+spdk_nvmf_port_block(uint16_t port)
+{
+	if(g_nvmf_num_blocked_ports < MAX_NUM_BLOCKED_PORTS && port > 0)
+	{
+		for(int i = 0; i < MAX_NUM_BLOCKED_PORTS; i++)
+		{
+			if(port == g_nvmf_blocked_ports[i]) 
+			{ 
+				SPDK_NOTICELOG("nvmf port %u is already blocked.\n", port);
+				return  true; 
+			}
+		}
+		for(int i = 0; i < MAX_NUM_BLOCKED_PORTS; i++)
+		{
+			if(!g_nvmf_blocked_ports[i]) 
+			{
+				g_nvmf_blocked_ports[i] = port;
+				g_nvmf_num_blocked_ports++;
+				SPDK_NOTICELOG("nvmf port %u is blocked successfully.\n", port);
+				return true;
+			}
+		}
+		return true;
+	}
+	SPDK_NOTICELOG("Failed to block nvmf port %u. Maximum number of blocked ports reached.\n", port);
+	return false;
+}
+
+bool 
+spdk_nvmf_port_unblock(uint16_t port)
+{
+	if(g_nvmf_num_blocked_ports > 0 && port > 0)
+	{
+		for(int i = 0; i < MAX_NUM_BLOCKED_PORTS; i++)
+		{
+			if(port == g_nvmf_blocked_ports[i]) 
+			{ 
+				g_nvmf_blocked_ports[i] = 0;
+				g_nvmf_num_blocked_ports--;
+				SPDK_NOTICELOG("nvmf port %u is unblocked successfully.\n", port);
+				return  true; 
+			}
+		}
+	}
+	return true;
+}
+
+void
+spdk_nvmf_get_blocked_ports(uint16_t *ports, int *num_ports)
+{
+	*num_ports = g_nvmf_num_blocked_ports;
+	int index = 0;
+	for(int i = 0; i < MAX_NUM_BLOCKED_PORTS; i++)
+	{
+		if(g_nvmf_blocked_ports[i])
+		{
+			ports[index++] = g_nvmf_blocked_ports[i];
+		}
+	}
+	return;
+}
+
+bool 
+spdk_nvmf_check_port_permission(uint16_t port)
+{
+	if(g_nvmf_num_blocked_ports > 0)
+	{
+		for(int i = 0; i < MAX_NUM_BLOCKED_PORTS; i++)
+		{
+			if(port == g_nvmf_blocked_ports[i]) { return  false; }
+		}
+	}
+	return true;
 }
