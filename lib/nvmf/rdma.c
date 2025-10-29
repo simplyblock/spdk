@@ -1305,6 +1305,14 @@ nvmf_rdma_connect(struct spdk_nvmf_transport *transport, struct rdma_cm_event *e
 		      event->id->verbs->device->name, event->id->verbs->device->dev_name);
 
 	port = event->listen_id->context;
+	struct sockaddr_in *sin = (struct sockaddr_in *)&port->id->route.addr.src_addr;
+	uint16_t port_num = ntohs(sin->sin_port);
+	if(!spdk_nvmf_check_port_permission(port_num))
+	{
+		fprintf(stderr, "nvmf_rdma_connect: Connection rejected due to port permission check failure.port=%d\n", port_num);
+		nvmf_rdma_event_reject(event->id, 0);
+		return -1;
+	}
 	SPDK_DEBUGLOG(rdma, "Listen Id was %p with verbs %p. ListenAddr: %p\n",
 		      event->listen_id, event->listen_id->verbs, port);
 
@@ -4704,11 +4712,18 @@ nvmf_rdma_poller_poll(struct spdk_nvmf_rdma_transport *rtransport,
 	for (i = 0; i < reaped; i++) {
 
 		rdma_wr = (struct spdk_nvmf_rdma_wr *)wc[i].wr_id;
-
+		struct sockaddr_in *sin;
+		uint16_t dst_port = 0;
 		switch (rdma_wr->type) {
 		case RDMA_WR_TYPE_SEND:
 			rdma_req = SPDK_CONTAINEROF(rdma_wr, struct spdk_nvmf_rdma_request, rsp_wr);
 			rqpair = SPDK_CONTAINEROF(rdma_req->req.qpair, struct spdk_nvmf_rdma_qpair, qpair);
+			sin = (struct sockaddr_in *)&rqpair->cm_id->route.addr.src_addr;
+			dst_port = ntohs(sin->sin_port);
+			if(!spdk_nvmf_check_port_permission(dst_port)){
+				spdk_nvmf_qpair_disconnect(&rqpair->qpair);
+				break;
+			}
 
 			if (spdk_likely(!wc[i].status)) {
 				count++;
@@ -4748,6 +4763,14 @@ nvmf_rdma_poller_poll(struct spdk_nvmf_rdma_transport *rtransport,
 			rqpair = rdma_recv->qpair;
 
 			assert(rqpair != NULL);
+
+			sin = (struct sockaddr_in *)&rqpair->cm_id->route.addr.src_addr;
+			dst_port = ntohs(sin->sin_port);
+			if(!spdk_nvmf_check_port_permission(dst_port)){
+				spdk_nvmf_qpair_disconnect(&rqpair->qpair);
+				break;
+			}
+			
 			if (spdk_likely(!wc[i].status)) {
 				assert(wc[i].opcode == IBV_WC_RECV);
 				if (rqpair->current_recv_depth >= rqpair->max_queue_depth) {
@@ -4766,7 +4789,12 @@ nvmf_rdma_poller_poll(struct spdk_nvmf_rdma_transport *rtransport,
 		case RDMA_WR_TYPE_DATA:
 			rdma_req = SPDK_CONTAINEROF(rdma_wr, struct spdk_nvmf_rdma_request, data_wr);
 			rqpair = SPDK_CONTAINEROF(rdma_req->req.qpair, struct spdk_nvmf_rdma_qpair, qpair);
-
+			sin = (struct sockaddr_in *)&rqpair->cm_id->route.addr.src_addr;
+			dst_port = ntohs(sin->sin_port);
+			if(!spdk_nvmf_check_port_permission(dst_port)){
+				spdk_nvmf_qpair_disconnect(&rqpair->qpair);
+				break;
+			}
 			assert(rdma_req->num_outstanding_data_wr > 0);
 
 			rqpair->current_send_depth--;
