@@ -30,4 +30,4 @@ RUN /root/spdk/docker/crypto.sh
 
 RUN cd spdk && ./configure --with-crypto --with-rdma --disable-tests --disable-unit-tests --disable-examples --with-ocf --with-fuse --with-nvme-cuse --target-arch=armv8-a
 
-RUN cd spdk && make --no-builtin-rules
+RUN cd spdk && make CONFIG_DEBUG=y CONFIG_STRIP=n --no-builtin-rules
