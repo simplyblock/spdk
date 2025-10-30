@@ -22,7 +22,6 @@ build/
 ut_coverage/
 tags
 cscope.out
-dpdk-*
 CUnit-Memory-Dump.xml
 include/spdk/config.h
 include/spdk/version.h

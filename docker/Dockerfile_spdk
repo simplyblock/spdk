@@ -29,4 +29,4 @@ RUN sed -i "s/^#define SPDK_BDEV_QOS_TIMESLICE_IN_USEC.*/#define SPDK_BDEV_QOS_T
 RUN cd spdk && ./configure --with-crypto --with-rdma --disable-tests --disable-unit-tests --disable-examples --with-ocf --with-fuse\
      --with-nvme-cuse --target-arch=nehalem
 
-RUN cd spdk && make --no-builtin-rules -j16
+RUN cd spdk && make CONFIG_DEBUG=y CONFIG_STRIP=n --no-builtin-rules -j16
