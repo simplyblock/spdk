@@ -144,7 +144,6 @@ void
 spdk_subsystem_init_next(int rc)
 {
 	assert(spdk_thread_is_app_thread(NULL));
-
 	/* The initialization is interrupted by the spdk_subsystem_fini, so just return */
 	if (g_subsystems_init_interrupted) {
 		return;
@@ -155,7 +154,8 @@ spdk_subsystem_init_next(int rc)
 		g_subsystem_start_fn(rc, g_subsystem_start_arg);
 		return;
 	}
-
+	if(g_next_subsystem && g_next_subsystem->name)
+	{fprintf(stderr, "DBG_SUBSYSTEM subsystem initialized %s rc=%d\n", g_next_subsystem->name, rc);}
 	if (!g_next_subsystem) {
 		g_next_subsystem = TAILQ_FIRST(&g_subsystems);
 	} else {
@@ -169,6 +169,8 @@ spdk_subsystem_init_next(int rc)
 	}
 
 	if (g_next_subsystem->init) {
+		if(g_next_subsystem && g_next_subsystem->name)
+			{fprintf(stderr, "DBG_SUBSYSTEM Init next subsystem %s\n", g_next_subsystem->name);}
 		g_next_subsystem->init();
 	} else {
 		spdk_subsystem_init_next(0);

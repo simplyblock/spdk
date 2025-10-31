@@ -262,6 +262,7 @@ heap_alloc(struct malloc_heap *heap, const char *type __rte_unused, size_t size,
 	}
 	if(size > 10000000){
 		fprintf(stderr, "DBG_heap_alloc elem=%p elem_payload=%p size=%zu 0x%lx align=%zu bound=%zu alloc_count=%ld\n", elem, elem ? (void *)(&elem[1]) : NULL, size, size, align, bound, heap->alloc_count);
+		fprintf(stderr, "Backtrace:\n");
 		dump_trace();
 		fprintf(stderr, "-------------------------------\n");
 	}

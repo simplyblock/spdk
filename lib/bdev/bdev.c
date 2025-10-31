@@ -2424,6 +2424,8 @@ spdk_bdev_initialize(spdk_bdev_init_cb cb_fn, void *cb_arg)
 		return;
 	}
 
+	fprintf(stderr, "Initializing bdev subsystem spdk_mempool_create mempool=%s bdev_io_pool_size=%ld spdk_bdev_io_size=%d bdev_module_max_ctx_size=%d totol_elem_size=%d\n",
+	mempool_name, g_bdev_opts.bdev_io_pool_size, sizeof(struct spdk_bdev_io), bdev_module_get_max_ctx_size(), sizeof(struct spdk_bdev_io) + bdev_module_get_max_ctx_size());
 	g_bdev_mgr.bdev_io_pool = spdk_mempool_create(mempool_name,
 				  g_bdev_opts.bdev_io_pool_size,
 				  sizeof(struct spdk_bdev_io) +
