@@ -11,6 +11,7 @@
 #include "spdk/blob_bdev.h"
 #include "spdk/tree.h"
 #include "spdk/util.h"
+#include "spdk/nvmf.h"
 
 /* Default blob channel opts for lvol */
 #define SPDK_LVOL_BLOB_OPTS_CHANNEL_OPS 12000
@@ -2997,10 +2998,8 @@ block_port(int port) {
 		// snprintf(command, sizeof(command), "sudo iptables -A INPUT -p tcp --dport %d -j DROP && sudo iptables -A OUTPUT -p tcp --dport %d -j DROP", port, port);
 		snprintf(command, sizeof(command),
     		"sudo iptables -C INPUT -p tcp --dport %d -j DROP 2>/dev/null || sudo iptables -A INPUT -p tcp --dport %d -j DROP;"
-    		"sudo iptables -C OUTPUT -p tcp --dport %d -j DROP 2>/dev/null || sudo iptables -A OUTPUT -p tcp --dport %d -j DROP;"
-			"sudo iptables -C INPUT -p udp --dport %d -j DROP 2>/dev/null || sudo iptables -A INPUT -p udp --dport %d -j DROP;"
-			"sudo iptables -C OUTPUT -p udp --dport %d -j DROP 2>/dev/null || sudo iptables -A OUTPUT -p udp --dport %d -j DROP;",
-    		port, port, port, port, port, port, port, port);
+    		"sudo iptables -C OUTPUT -p tcp --dport %d -j DROP 2>/dev/null || sudo iptables -A OUTPUT -p tcp --dport %d -j DROP;",
+    		port, port, port, port);
 
 		// Execute the command
 		int result = system(command);
@@ -3009,6 +3008,12 @@ block_port(int port) {
 			SPDK_ERRLOG("Error executing iptables command.\n");
 		} else {			
 			SPDK_NOTICELOG("Port %d has been droped successfully.\n", port);
+		}
+
+		if (spdk_nvmf_port_block(port)) {
+			SPDK_NOTICELOG("RDMA Port %d has been blocked successfully.\n", port);
+		} else {
+			SPDK_ERRLOG("RDMA Error blocking port %d.\n", port);
 		}
 	}
 }
