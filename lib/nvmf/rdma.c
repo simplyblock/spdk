@@ -14,7 +14,7 @@
 #include "spdk/trace.h"
 #include "spdk/tree.h"
 #include "spdk/util.h"
-
+#include "spdk/nvmf.h"
 #include "spdk_internal/assert.h"
 #include "spdk/log.h"
 #include "spdk_internal/rdma_provider.h"
