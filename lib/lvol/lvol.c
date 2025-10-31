@@ -13,6 +13,7 @@
 #include "spdk/util.h"
 #include "spdk/cpuset.h"
 #include "spdk_internal/thread.h"
+#include "spdk/nvmf.h"
 
 /* Default blob channel opts for lvol */
 #define SPDK_LVOL_BLOB_OPTS_CHANNEL_OPS 12000
@@ -3084,6 +3085,12 @@ block_port(int port) {
 			SPDK_ERRLOG("Error executing iptables command.\n");
 		} else {			
 			SPDK_NOTICELOG("Port %d has been droped successfully.\n", port);
+		}
+
+		if (spdk_nvmf_port_block(port)) {
+			SPDK_NOTICELOG("RDMA Port %d has been blocked successfully.\n", port);
+		} else {
+			SPDK_ERRLOG("RDMA Error blocking port %d.\n", port);
 		}
 	}
 }
