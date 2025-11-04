@@ -3261,7 +3261,7 @@ rpc_nvmf_port_block(struct spdk_jsonrpc_request *request,
 	}
 
 	if(req.port > 0)
-	{ rc = spdk_nvmf_port_block(req.port); }
+	{ rc = spdk_nvmf_port_block(req.port, false); }
 
 	spdk_jsonrpc_send_bool_response(request, true);
 }

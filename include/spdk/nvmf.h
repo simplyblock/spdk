@@ -57,6 +57,11 @@ enum spdk_nvmf_tgt_discovery_filter {
 	SPDK_NVMF_TGT_DISCOVERY_MATCH_TRANSPORT_SVCID = 1u << 2u
 };
 
+struct spdk_nvmf_rdma_rules {
+	uint16_t port;
+	bool is_reject;
+};
+
 struct spdk_nvmf_target_opts {
 	size_t		size;
 	char		name[NVMF_TGT_NAME_MAX_LENGTH];
@@ -1593,10 +1598,10 @@ void spdk_nvmf_set_custom_ns_reservation_ops(const struct spdk_nvmf_ns_reservati
  */
 void spdk_nvmf_send_discovery_log_notice(struct spdk_nvmf_tgt *tgt, const char *hostnqn);
 
-bool spdk_nvmf_port_block(uint16_t port);
+bool spdk_nvmf_port_block(uint16_t port, bool is_reject);
 bool spdk_nvmf_port_unblock(uint16_t port);
 void spdk_nvmf_get_blocked_ports(uint16_t *ports, int *num_ports);
-bool spdk_nvmf_check_port_permission(uint16_t port);
+bool spdk_nvmf_check_port_permission(uint16_t port, bool *is_reject);
 
 #ifdef __cplusplus
 }
