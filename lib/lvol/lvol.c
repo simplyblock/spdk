@@ -3011,7 +3011,7 @@ block_port(int port) {
 			SPDK_NOTICELOG("Port %d has been droped successfully.\n", port);
 		}
 
-		if (spdk_nvmf_port_block(port)) {
+		if (spdk_nvmf_port_block(port, false)) {
 			SPDK_NOTICELOG("RDMA Port %d has been blocked successfully.\n", port);
 		} else {
 			SPDK_ERRLOG("RDMA Error blocking port %d.\n", port);
