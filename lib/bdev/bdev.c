@@ -479,7 +479,7 @@ static void claim_reset(struct spdk_bdev *bdev);
 static void bdev_ch_retry_io(struct spdk_bdev_channel *bdev_ch);
 
 static void remove_bdev_from_group(char *bdev_names);
-static void delete_rate_limit(char *bdev_names, struct spdk_bdev_qos *qos);
+// static void delete_rate_limit(char *bdev_names, struct spdk_bdev_qos *qos);
 static bool is_bdev_exist_in_pool(char *bdev_names);
 static struct qos_bdev_list_node * find_existing_bdev(struct spdk_bdev_qos_pool_id_mapping *qos_pool_id_object, char *bdev_names);
 static int check_bdev_names_in_group(struct spdk_bdev_qos_pool_id_mapping *qos_pool_id_object, size_t num_lvols,char **bdev_names);
@@ -9793,27 +9793,27 @@ static bool is_bdev_exist_in_pool(char *bdev_names) {
 	return false;
 }
 
-static void delete_rate_limit(char *bdev_names, struct spdk_bdev_qos *qos) {
+// static void delete_rate_limit(char *bdev_names, struct spdk_bdev_qos *qos) {
 
-	struct spdk_bdev_qos_pool_id_mapping *qos_pool_id_object = NULL;
-	struct qos_bdev_list_node *bdev_node = NULL;
+// 	struct spdk_bdev_qos_pool_id_mapping *qos_pool_id_object = NULL;
+// 	struct qos_bdev_list_node *bdev_node = NULL;
 
-	TAILQ_FOREACH(qos_pool_id_object, &g_qos_bdev_group_list, link) {
-		TAILQ_FOREACH(bdev_node, &qos_pool_id_object->bdev_list, link) {
-        	if (strcmp(bdev_node->bdev_name, bdev_names) == 0) {
-            	return;
-        	}
-    	}
-	}
-	if(qos) {
-		if(qos->rate_limits != NULL) {
-			free(qos->rate_limits);
-			qos->rate_limits = NULL;
-		}
-	}
+// 	TAILQ_FOREACH(qos_pool_id_object, &g_qos_bdev_group_list, link) {
+// 		TAILQ_FOREACH(bdev_node, &qos_pool_id_object->bdev_list, link) {
+//         	if (strcmp(bdev_node->bdev_name, bdev_names) == 0) {
+//             	return;
+//         	}
+//     	}
+// 	}
+// 	if(qos) {
+// 		if(qos->rate_limits != NULL) {
+// 			free(qos->rate_limits);
+// 			qos->rate_limits = NULL;
+// 		}
+// 	}
 	
-	return;
-}
+// 	return;
+// }
 
 
 static void remove_bdev_from_group(char *bdev_names) {
