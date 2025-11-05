@@ -1027,10 +1027,10 @@ blob_parse_page(const struct spdk_blob_md_page *page, struct spdk_blob *blob)
 			}
 
 			// remember to comment this line
-			if ((cluster_count % SPDK_EXTENTS_PER_EP) != 0) {
-				SPDK_ERRLOG("Extent metadata page cluster count not multiple of extent size.\n");
-				return -EINVAL;
-			}
+			// if ((cluster_count % SPDK_EXTENTS_PER_EP) != 0) {
+			// 	SPDK_ERRLOG("Extent metadata page cluster count not multiple of extent size.\n");
+			// 	return -EINVAL;
+			// }
 
 			/* When reading extent pages sequentially starting cluster idx should match
 			 * current size of a blob.
