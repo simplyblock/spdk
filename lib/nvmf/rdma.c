@@ -4849,9 +4849,16 @@ nvmf_rdma_poller_poll(struct spdk_nvmf_rdma_transport *rtransport,
 			if (!spdk_nvmf_check_port_permission(dst_port, &is_reject) && !is_reject) {
 				if (rqpair->blocked_count + rqpair->current_recv_depth >= rqpair->max_queue_depth) {
 					SPDK_ERRLOG("Blocked queue full for qpair %p (port %u): dropping request %p\n",
-					             rqpair, dst_port, rdma_req);
+					             rqpair, dst_port, rdma_recv);
 					/* Optionally free request or handle error; here we drop to avoid OOM */
 					/* free_rdma_request(rdma_req); */ /* implement cleanup if needed */
+					struct ibv_recv_wr *bad_wr;
+					rdma_recv->wr.next = NULL;
+					spdk_rdma_provider_srq_queue_recv_wrs(rpoller->srq, &rdma_recv->wr);
+					rc = spdk_rdma_provider_srq_flush_recv_wrs(rpoller->srq, &bad_wr);
+					if (rc) {
+						SPDK_ERRLOG("Failed to re-post recv WR to SRQ, err %d\n", rc);
+					}
 					continue;
 				}
 
