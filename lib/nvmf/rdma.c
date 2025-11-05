@@ -14,7 +14,7 @@
 #include "spdk/trace.h"
 #include "spdk/tree.h"
 #include "spdk/util.h"
-
+#include "spdk/nvmf.h"
 #include "spdk_internal/assert.h"
 #include "spdk/log.h"
 #include "spdk_internal/rdma_provider.h"
@@ -221,6 +221,8 @@ struct spdk_nvmf_rdma_recv {
 	uint64_t				receive_tsc;
 
 	STAILQ_ENTRY(spdk_nvmf_rdma_recv)	link;
+	TAILQ_ENTRY(spdk_nvmf_rdma_recv)  entry;
+
 };
 
 struct spdk_nvmf_rdma_request_data {
@@ -388,6 +390,11 @@ struct spdk_nvmf_rdma_qpair {
 
 	/* Indicate that nvmf_rdma_close_qpair is called */
 	bool					to_close;
+
+	bool blocked;
+    uint32_t blocked_count;
+    /* queued requests (recv completions that arrived while blocked) */
+    TAILQ_HEAD(, spdk_nvmf_rdma_recv) blocked_reqs;
 };
 
 struct spdk_nvmf_rdma_poller_stat {
@@ -431,6 +438,7 @@ struct spdk_nvmf_rdma_poller {
 	STAILQ_HEAD(, spdk_nvmf_rdma_qpair)	qpairs_pending_send;
 
 	TAILQ_ENTRY(spdk_nvmf_rdma_poller)	link;
+	int blocked_reqs_count;
 };
 
 struct spdk_nvmf_rdma_poll_group_stat {
@@ -1305,6 +1313,15 @@ nvmf_rdma_connect(struct spdk_nvmf_transport *transport, struct rdma_cm_event *e
 		      event->id->verbs->device->name, event->id->verbs->device->dev_name);
 
 	port = event->listen_id->context;
+	struct sockaddr_in *sin = (struct sockaddr_in *)&port->id->route.addr.src_addr;
+	uint16_t port_num = ntohs(sin->sin_port);
+	bool is_reject = false;
+	if (!spdk_nvmf_check_port_permission(port_num, &is_reject)) {
+		fprintf(stderr, "nvmf_rdma_connect: Connection rejected due to port permission check failure.port=%d\n", port_num);
+		nvmf_rdma_event_reject(event->id, 0);
+		return -1;
+	}
+
 	SPDK_DEBUGLOG(rdma, "Listen Id was %p with verbs %p. ListenAddr: %p\n",
 		      event->listen_id, event->listen_id->verbs, port);
 
@@ -1383,6 +1400,9 @@ nvmf_rdma_connect(struct spdk_nvmf_transport *transport, struct rdma_cm_event *e
 	rqpair->qpair.qid = private_data->qid;
 	rqpair->qpair.numa.id_valid = 1;
 	rqpair->qpair.numa.id = spdk_rdma_cm_id_get_numa_id(rqpair->cm_id);
+	TAILQ_INIT(&rqpair->blocked_reqs);
+	rqpair->blocked = false;
+	rqpair->blocked_count = 0;
 
 	event->id->context = &rqpair->qpair;
 
@@ -4039,6 +4059,7 @@ nvmf_rdma_poller_create(struct spdk_nvmf_rdma_transport *rtransport,
 
 	poller->device = device;
 	poller->group = rgroup;
+	poller->blocked_reqs_count = 0;
 	*out_poller = poller;
 
 	RB_INIT(&poller->qpairs);
@@ -4662,6 +4683,54 @@ nvmf_rdma_log_wc_status(struct spdk_nvmf_rdma_qpair *rqpair, struct ibv_wc *wc)
 	}
 }
 
+static void
+nvmf_rdma_qpair_unblock_and_reinject(struct spdk_nvmf_rdma_transport *rtransport, struct spdk_nvmf_rdma_poller *rpoller)
+{
+
+	struct spdk_nvmf_rdma_qpair	*rqpair, *tmp_rqpair;
+	struct spdk_nvmf_rdma_recv	*rdma_recv;
+	struct sockaddr_in *sin;
+	uint16_t dst_port = 0;
+	bool is_reject = false;
+	RB_FOREACH_SAFE(rqpair, qpairs_tree, &rpoller->qpairs, tmp_rqpair) {
+		sin = (struct sockaddr_in *)&rqpair->cm_id->route.addr.src_addr;
+		dst_port = ntohs(sin->sin_port);
+		/* Skip qpairs still blocked */
+		if (!spdk_nvmf_check_port_permission(dst_port, &is_reject)) {
+			continue;
+		}
+
+		rqpair->blocked = false;
+		while (!TAILQ_EMPTY(&rqpair->blocked_reqs)) {
+			/* rdma_recv->qpair will be invalid if using an SRQ.  In that case we have to get the qpair from the wc. */
+
+			rdma_recv = TAILQ_FIRST(&rqpair->blocked_reqs);
+			TAILQ_REMOVE(&rqpair->blocked_reqs, rdma_recv, entry);
+			rqpair->blocked_count--;
+			rpoller->blocked_reqs_count--;
+
+			if (rqpair->current_recv_depth >= rqpair->max_queue_depth) {
+				spdk_nvmf_qpair_disconnect(&rqpair->qpair);
+				break;
+			}
+
+			rdma_recv->wr.next = NULL;
+			rqpair->current_recv_depth++;
+			rdma_recv->receive_tsc = spdk_get_ticks();
+			rpoller->stat.requests++;
+			STAILQ_INSERT_HEAD(&rqpair->resources->incoming_queue, rdma_recv, link);
+			rqpair->qpair.queue_depth++;
+
+			nvmf_rdma_qpair_process_pending(rtransport, rqpair, false);
+
+			if (spdk_unlikely(!spdk_nvmf_qpair_is_active(&rqpair->qpair))) {
+				nvmf_rdma_destroy_drained_qpair(rqpair);
+				break;
+			}
+		}
+	}
+}
+
 static int
 nvmf_rdma_poller_poll(struct spdk_nvmf_rdma_transport *rtransport,
 		      struct spdk_nvmf_rdma_poller *rpoller)
@@ -4688,6 +4757,11 @@ nvmf_rdma_poller_poll(struct spdk_nvmf_rdma_transport *rtransport,
 		return 0;
 	}
 
+	/* Periodically check for unblocked ports and reinject pending RECVs */
+    if (spdk_unlikely(rpoller->blocked_reqs_count > 0)) {
+        nvmf_rdma_qpair_unblock_and_reinject(rtransport, rpoller);
+    }
+
 	/* Poll for completing operations. */
 	reaped = ibv_poll_cq(rpoller->cq, 32, wc);
 	if (spdk_unlikely(reaped < 0)) {
@@ -4704,11 +4778,19 @@ nvmf_rdma_poller_poll(struct spdk_nvmf_rdma_transport *rtransport,
 	for (i = 0; i < reaped; i++) {
 
 		rdma_wr = (struct spdk_nvmf_rdma_wr *)wc[i].wr_id;
-
+		struct sockaddr_in *sin;
+		uint16_t dst_port = 0;
+		bool is_reject = false;
 		switch (rdma_wr->type) {
 		case RDMA_WR_TYPE_SEND:
 			rdma_req = SPDK_CONTAINEROF(rdma_wr, struct spdk_nvmf_rdma_request, rsp_wr);
 			rqpair = SPDK_CONTAINEROF(rdma_req->req.qpair, struct spdk_nvmf_rdma_qpair, qpair);
+			sin = (struct sockaddr_in *)&rqpair->cm_id->route.addr.src_addr;
+			dst_port = ntohs(sin->sin_port);
+			if (!spdk_nvmf_check_port_permission(dst_port, &is_reject) && is_reject) {
+				spdk_nvmf_qpair_disconnect(&rqpair->qpair);
+				break;
+			}
 
 			if (spdk_likely(!wc[i].status)) {
 				count++;
@@ -4748,12 +4830,45 @@ nvmf_rdma_poller_poll(struct spdk_nvmf_rdma_transport *rtransport,
 			rqpair = rdma_recv->qpair;
 
 			assert(rqpair != NULL);
+
+			sin = (struct sockaddr_in *)&rqpair->cm_id->route.addr.src_addr;
+			dst_port = ntohs(sin->sin_port);
+			if (!spdk_nvmf_check_port_permission(dst_port, &is_reject) && is_reject) {
+				spdk_nvmf_qpair_disconnect(&rqpair->qpair);
+				break;
+			}
+			
 			if (spdk_likely(!wc[i].status)) {
 				assert(wc[i].opcode == IBV_WC_RECV);
 				if (rqpair->current_recv_depth >= rqpair->max_queue_depth) {
 					spdk_nvmf_qpair_disconnect(&rqpair->qpair);
 					break;
 				}
+			}
+
+			if (!spdk_nvmf_check_port_permission(dst_port, &is_reject) && !is_reject) {
+				if (rqpair->blocked_count + rqpair->current_recv_depth >= rqpair->max_queue_depth) {
+					SPDK_ERRLOG("Blocked queue full for qpair %p (port %u): dropping request %p\n",
+					             rqpair, dst_port, rdma_recv);
+					/* Optionally free request or handle error; here we drop to avoid OOM */
+					/* free_rdma_request(rdma_req); */ /* implement cleanup if needed */
+					struct ibv_recv_wr *bad_wr;
+					rdma_recv->wr.next = NULL;
+					spdk_rdma_provider_srq_queue_recv_wrs(rpoller->srq, &rdma_recv->wr);
+					rc = spdk_rdma_provider_srq_flush_recv_wrs(rpoller->srq, &bad_wr);
+					if (rc) {
+						SPDK_ERRLOG("Failed to re-post recv WR to SRQ, err %d\n", rc);
+					}
+					continue;
+				}
+
+				TAILQ_INSERT_TAIL(&rqpair->blocked_reqs, rdma_recv, entry);
+				rqpair->blocked_count++;
+				rpoller->blocked_reqs_count++;
+				SPDK_DEBUGLOG(nvmf, "Queued recv req %p on blocked qpair %p (count %u)\n",
+				              rdma_recv, rqpair, rqpair->blocked_count);
+				/* Do not process the request now and do not repost its recv WR */
+				continue;
 			}
 
 			rdma_recv->wr.next = NULL;
@@ -4766,7 +4881,12 @@ nvmf_rdma_poller_poll(struct spdk_nvmf_rdma_transport *rtransport,
 		case RDMA_WR_TYPE_DATA:
 			rdma_req = SPDK_CONTAINEROF(rdma_wr, struct spdk_nvmf_rdma_request, data_wr);
 			rqpair = SPDK_CONTAINEROF(rdma_req->req.qpair, struct spdk_nvmf_rdma_qpair, qpair);
-
+			sin = (struct sockaddr_in *)&rqpair->cm_id->route.addr.src_addr;
+			dst_port = ntohs(sin->sin_port);
+			if (!spdk_nvmf_check_port_permission(dst_port, &is_reject) && is_reject) {
+				spdk_nvmf_qpair_disconnect(&rqpair->qpair);
+				break;
+			}
 			assert(rdma_req->num_outstanding_data_wr > 0);
 
 			rqpair->current_send_depth--;
