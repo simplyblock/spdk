@@ -79,6 +79,7 @@ DEFINE_STUB(spdk_blob_get_map_id, uint16_t, (struct spdk_blob *blob), 0);
 DEFINE_STUB(spdk_blob_get_geometry, uint8_t, (struct spdk_blob *blob), 0);
 DEFINE_STUB(spdk_blob_get_open_ref, uint32_t, (struct spdk_blob *blob), 0);
 DEFINE_STUB(spdk_lvol_copy_blob, int, (struct spdk_lvol *lvol), 0);
+DEFINE_STUB(spdk_bs_get_md_thread, struct spdk_thread *, (struct spdk_blob_store *bs), NULL);
 DEFINE_STUB(spdk_bdev_writev_blocks_ext, int,
 	    (struct spdk_bdev_desc *desc, struct spdk_io_channel *ch, struct iovec *iov, int iovcnt,
 	     uint64_t offset_blocks, uint64_t num_blocks, spdk_bdev_io_completion_cb cb,

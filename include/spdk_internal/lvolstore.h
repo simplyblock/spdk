@@ -199,7 +199,7 @@ struct remove_event {
 };
 
 struct spdk_lvs_xfer_req {
-	int status;
+	enum xfer_req_status status;
 	enum xfer_type   type;
 	uint64_t offset;
 	uint64_t len;
@@ -225,6 +225,7 @@ struct spdk_lvs_xfer {
 	struct spdk_poller 	*tmo_poller;
 	char bdev_name[SPDK_LVOL_NAME_MAX];
 	char snapshot_name[SPDK_LVOL_NAME_MAX];
+	int len;
 	spdk_lvol_op_with_handle_complete	cb_fn;
 	void *cb_arg;
 	bool final_migration;

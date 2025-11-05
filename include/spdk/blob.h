@@ -76,6 +76,13 @@ enum xfer_type {
 	XFER_MIGRATE_SNAPSHOT,
 };
 
+enum xfer_req_status {
+	XFER_REQ_STATUS_NONE = 0,
+	XFER_REQ_STATUS_READY,
+	XFER_REQ_STATUS_DONE,
+	XFER_REQ_STATUS_FAILED,
+};
+
 struct spdk_hublvol_channels {
 	struct spdk_io_channel *ch;
 	struct spdk_thread	*thread;
@@ -599,6 +606,15 @@ uint16_t spdk_blob_get_map_id(struct spdk_blob *blob);
  * \return geometry.
  */
 uint8_t spdk_blob_get_geometry(struct spdk_blob *blob);
+
+/**
+ * Get the bs md thread.
+ *
+ * \param bs Blobstore struct to query.
+ *
+ * \return md thread.
+ */
+struct spdk_thread * spdk_bs_get_md_thread(struct spdk_blob_store *bs);
 
 /**
  * Get the blob open ref.

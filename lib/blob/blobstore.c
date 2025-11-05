@@ -7952,6 +7952,14 @@ spdk_blob_get_geometry(struct spdk_blob *blob)
 	return blob->geometry;
 }
 
+struct spdk_thread	*
+spdk_bs_get_md_thread(struct spdk_blob_store *bs)
+{
+	assert(bs != NULL);
+
+	return bs->md_thread;
+}
+
 uint32_t
 spdk_blob_get_open_ref(struct spdk_blob *blob)
 {
@@ -14988,7 +14996,6 @@ spdk_read_cluster_data_xfer(struct spdk_blob *blob, void *buf, uint64_t offset, 
 
 	return 0;
 }
-
 
 void
 spdk_blob_set_io_priority_class(struct spdk_blob* blob, int priority_class)

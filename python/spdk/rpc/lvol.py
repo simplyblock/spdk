@@ -189,7 +189,7 @@ def bdev_lvol_final_migration(client, lvol_name=None, lvol_id=0, snapshot_name=N
         raise ValueError("lvol_id must be specified")
 
     params = {'lvol_name': lvol_name, 'lvol_id': lvol_id, 'snapshot_name': snapshot_name, 'cluster_batch': cluster_batch, 'gateway': gateway}
-    return client.call('bdev_lvol_transfer', params)
+    return client.call('bdev_lvol_final_migration', params)
 
 def bdev_lvol_transfer(client, lvol_name=None, offset=0, cluster_batch=16, gateway=None, operation=None):
     """Replicate a logical volume on a logical volume store.

@@ -1319,7 +1319,8 @@ process_migration_write_request(struct spdk_bdev_io *bdev_io, struct spdk_lvol *
 	if (find_signal) {
 		// Add lvol as clone to the snapshot
 		// using thread for hublvol bcs the hub lvol opend in md thread
-		spdk_thread_send_msg(lvol->lvol_store->hub_dev.thread, handle_snapshot_post_migration, ctx);
+		struct spdk_thread *thread = spdk_bs_get_md_thread(lvol->lvol_store->blobstore);
+		spdk_thread_send_msg(thread, handle_snapshot_post_migration, ctx);
 		return true;
 	}
 	return false;
@@ -1942,7 +1943,7 @@ vbdev_lvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_
 		}
 	}
 
-	if (lvol->redirect_after_migration) {		
+	if (lvol->redirect_after_migration) {
 		if (io_type) {
 			if (lvol->redirect_failed) {
 				spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
