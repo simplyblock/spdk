@@ -10381,10 +10381,10 @@ spdk_bs_update_snapshot_clone(struct spdk_blob_store *bs, struct spdk_blob *orig
 		tmpblob.parent_id = newblob->id;
 		bs_blob_list_add(newblob);
 		bs_blob_list_add(&tmpblob);
-		newblob->open_ref=2;
+		newblob->open_ref = 2;
 		return;
 	}
-	newblob->open_ref=1;
+	newblob->open_ref = 1;
 	bs_blob_list_remove(origblob);
 	origblob->parent_id = newblob->id;
 	bs_blob_list_add(newblob);
@@ -10405,7 +10405,7 @@ spdk_bs_update_snapshot_clone_live(struct spdk_blob *origblob, struct spdk_blob 
 	blob_set_xattr(origblob, BLOB_SNAPSHOT, &newblob->id, sizeof(spdk_blob_id), true);
 	origblob->state = SPDK_BLOB_STATE_CLEAN;
 	origblob->back_bs_dev = bs_create_blob_bs_dev(newblob);
-	newblob->open_ref=2;
+	newblob->open_ref = 2;
 	SPDK_NOTICELOG("Updating origblob after register snap "
                "origblob 0x%" PRIx64 " 0x%" PRIx32 " "
                "newblob 0x%" PRIx64 " 0x%" PRIx32 " \n",
@@ -10474,7 +10474,7 @@ spdk_bs_chain_snapshot_clone(struct spdk_blob *origblob, struct spdk_blob *clone
 	int bserrno = blob_set_xattr(clone, BLOB_SNAPSHOT, &origblob->id, sizeof(spdk_blob_id), true);
 	if (bserrno != 0) {
 		free(ctx);
-		cb_fn(cb_arg, -ENOMEM);
+		cb_fn(cb_arg, bserrno);
 		return;
 	}
 

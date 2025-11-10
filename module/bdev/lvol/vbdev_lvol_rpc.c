@@ -3296,6 +3296,12 @@ cleanup:
 
 SPDK_RPC_REGISTER("bdev_lvol_set_migration_flag", rpc_bdev_lvol_set_migration_flag, SPDK_RPC_RUNTIME)
 
+struct rpc_transfer_with_handle_req  {
+	struct spdk_jsonrpc_request *request;
+	struct spdk_lvol_store *lvs;
+	struct spdk_lvol *lvol;
+};
+
 struct rpc_bdev_lvol_convert {
 	char *lvol_name;
 };
@@ -3328,12 +3334,28 @@ invalid:
 }
 
 static void
+rpc_transfer_snapshot_update_cb(void *cb_arg, int lvolerrno) {
+	struct rpc_transfer_with_handle_req *ctx = cb_arg;
+	struct spdk_lvol *lvol = ctx->lvol;	
+
+	if (lvolerrno != 0) {
+		spdk_jsonrpc_send_error_response(ctx->request, lvolerrno, spdk_strerror(-lvolerrno));
+		free(ctx);
+		return;
+	}
+
+	spdk_lvol_convert(lvol, rpc_bdev_lvol_convert_cb, ctx->request);
+	return;
+}
+
+static void
 rpc_bdev_lvol_convert(struct spdk_jsonrpc_request *request,
 		       const struct spdk_json_val *params)
 {
 	struct rpc_bdev_lvol_convert req = {};
 	struct spdk_bdev *bdev;
 	struct spdk_lvol *lvol;
+	struct rpc_transfer_with_handle_req *ctx;
 
 	if (spdk_json_decode_object(params, rpc_bdev_lvol_convert_decoders,
 				    SPDK_COUNTOF(rpc_bdev_lvol_convert_decoders),
@@ -3358,7 +3380,26 @@ rpc_bdev_lvol_convert(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
-	spdk_lvol_convert(lvol, rpc_bdev_lvol_convert_cb, request);
+	struct spdk_lvol_store *lvs = lvol->lvol_store;
+	if (lvs->leader) {
+		spdk_lvol_convert(lvol, rpc_bdev_lvol_convert_cb, request);
+	} else if (lvs->update_in_progress) {
+		SPDK_ERRLOG("lvolstore update in progress in failover state.\n");
+		spdk_jsonrpc_send_error_response(request, -EBUSY, spdk_strerror(EBUSY));
+		goto cleanup;
+	} else if (!lvs->leader) {
+		ctx = calloc(1, sizeof(struct rpc_transfer_with_handle_req));
+		if (ctx == NULL) {
+			SPDK_ERRLOG("Cannot allocate context for lvol register.'\n");
+			spdk_jsonrpc_send_error_response(request, -ENOMEM, spdk_strerror(ENOMEM));
+			goto cleanup;
+		}
+
+		ctx->request = request;
+		ctx->lvs = lvs;
+		ctx->lvol = lvol;
+		spdk_lvs_update_live(lvol->lvol_store, lvol->blob_id, rpc_transfer_snapshot_update_cb, ctx);
+	}
 	
 cleanup:
 	free_rpc_bdev_lvol_convert(&req);
@@ -3444,9 +3485,16 @@ rpc_bdev_lvol_add_clone(struct spdk_jsonrpc_request *request,
 		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
 		goto cleanup;
 	}
-	
-	spdk_lvol_chain(lvol, clone, rpc_bdev_lvol_add_clone_cb, request);
-	
+
+	struct spdk_lvol_store *lvs = clone->lvol_store;
+	if (lvs->update_in_progress) {
+		SPDK_ERRLOG("lvolstore update in progress in failover state.\n");
+		spdk_jsonrpc_send_error_response(request, -EBUSY, spdk_strerror(EBUSY));
+		goto cleanup;
+	} else {
+		spdk_lvol_chain(lvol, clone, rpc_bdev_lvol_add_clone_cb, request);
+	}
+
 cleanup:
 	free_rpc_bdev_lvol_add_clone(&req);
 }

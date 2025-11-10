@@ -1829,7 +1829,7 @@ spdk_lvol_convert(struct spdk_lvol *origlvol, spdk_lvol_op_complete cb_fn, void 
 {
 	struct spdk_lvol_store *lvs = origlvol->lvol_store;
 	struct spdk_lvol_req *req;
-
+	bool update = false;
 	req = calloc(1, sizeof(*req));
 	if (!req) {
 		SPDK_ERRLOG("Cannot alloc memory for lvol request pointer\n");
@@ -1840,7 +1840,34 @@ spdk_lvol_convert(struct spdk_lvol *origlvol, spdk_lvol_op_complete cb_fn, void 
 	req->cb_arg = cb_arg;
 	req->lvol = origlvol;
 
-	spdk_bs_convert_blob(origlvol->blob, lvs->leader, lvs->update_in_progress, spdk_lvol_convert_cb, req);
+	if (!lvs->leader) {
+		pthread_mutex_lock(&g_lvol_stores_mutex);
+		if (!origlvol->leader && !origlvol->update_in_progress) {
+			origlvol->update_in_progress = true;
+			origlvol->failed_on_update = false;
+			blob_freeze_on_failover(origlvol->blob);
+			update = true;
+		}
+		pthread_mutex_unlock(&g_lvol_stores_mutex);
+		// if we are not leader and update is not in progress, we need to update the blob
+		if (update) {
+			spdk_blob_update_on_failover(origlvol->blob, cb_fn, cb_arg);
+			return;
+		} else {
+			// otherwise just return success
+			if (origlvol->leader) {
+				cb_fn(cb_arg, 0);
+				free(req);
+				return;
+			}
+			SPDK_ERRLOG("Cannot update lvol %s while not leader and update in progress.\n", origlvol->name);
+			cb_fn(cb_arg, -EAGAIN);
+			free(req);
+			return;
+		}
+	} else {
+		spdk_bs_convert_blob(origlvol->blob, lvs->leader, lvs->update_in_progress, spdk_lvol_convert_cb, req);
+	}
 }
 
 void
