@@ -469,6 +469,54 @@ spdk_bit_pool_allocate_bit(struct spdk_bit_pool *pool)
 	return bit_index;
 }
 
+/* Allocate `count` contiguous clear bits.
+ * Returns the starting bit index, or UINT32_MAX on failure.
+ */
+uint32_t
+spdk_bit_pool_allocate_contiguous_bits(struct spdk_bit_pool *pool, uint32_t count)
+{
+    uint32_t start, i;
+
+    if (count == 0) {
+        return UINT32_MAX;
+    }
+
+    /* Start searching from lowest_free_bit */
+    start = pool->lowest_free_bit;
+
+    while (start != UINT32_MAX) {
+        bool ok = true;
+
+        /* Check if we have `count` clear bits starting at `start` */
+        for (i = 0; i < count; i++) {
+            if (spdk_bit_array_get(pool->array, start + i)) {
+                ok = false;
+                break;
+            }
+        }
+
+        if (ok) {
+            /* Mark them as allocated */
+            for (i = 0; i < count; i++) {
+                spdk_bit_array_set(pool->array, start + i);
+            }
+
+            /* Update lowest_free_bit hint */
+            pool->lowest_free_bit = spdk_bit_array_find_first_clear(pool->array,
+                                                                    start + count);
+            pool->free_count -= count;
+            return start;
+        }
+
+        /* Move start to the next clear bit after the conflicting one */
+        start = spdk_bit_array_find_first_clear(pool->array, start + i + 1);
+    }
+
+    return UINT32_MAX;
+}
+
+
+
 uint32_t
 spdk_bit_pool_allocate_specific_bit(struct spdk_bit_pool *pool, uint32_t bit_index)
 {

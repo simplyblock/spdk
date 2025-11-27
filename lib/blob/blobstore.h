@@ -26,6 +26,7 @@
 #define SPDK_BLOB_OPTS_MAX_MD_OPS 32
 #define SPDK_BLOB_OPTS_DEFAULT_CHANNEL_OPS 12000
 #define SPDK_BLOB_BLOBID_HIGH_BIT (1ULL << 32)
+#define BLOB_NDCS(geometry)   (((geometry & 0x3) + 1))
 
 struct spdk_xattr {
 	uint32_t	index;
@@ -188,10 +189,10 @@ struct spdk_blob_store {
 
 	struct spdk_bit_array		*used_md_pages;		/* Protected by used_lock */
 	struct spdk_bit_pool		*used_clusters;		/* Protected by used_lock */
+	struct spdk_bit_pool		*reserved_clusters;		/* Protected by used_lock */
 	struct spdk_bit_array		*used_blobids;
 	struct spdk_bit_array		*open_blobids;
-	struct spdk_bit_array		*map_blobids;
-	uint32_t 	blob_counter;
+	struct spdk_bit_array		*map_blobids;	
 
 	struct spdk_spinlock		used_lock;
 

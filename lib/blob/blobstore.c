@@ -130,21 +130,26 @@ bs_release_md_page(struct spdk_blob_store *bs, uint32_t page)
 }
 
 static uint32_t
-bs_claim_cluster(struct spdk_blob_store *bs)
+bs_claim_cluster(struct spdk_blob_store *bs, int ndcs, int index)
 {
 	uint32_t cluster_num;
 
 	assert(spdk_spin_held(&bs->used_lock));
-
-	cluster_num = spdk_bit_pool_allocate_bit(bs->used_clusters);
+	// cluster_num = spdk_bit_pool_allocate_bit(bs->reserved_clusters, ndcs);
+	
+	cluster_num = spdk_bit_pool_allocate_contiguous_bits(bs->reserved_clusters, ndcs);
+	
 	if (cluster_num == UINT32_MAX) {
 		return UINT32_MAX;
 	}
 
-	SPDK_DEBUGLOG(blob, "Claiming cluster %u\n", cluster_num);
-	bs->num_free_clusters--;
+	spdk_bit_pool_allocate_specific_bit(bs->used_clusters, cluster_num + index);
 
-	return cluster_num;
+	SPDK_DEBUGLOG(blob, "Claiming cluster %u and total cluster reservation %d.\n", cluster_num, ndcs);
+	bs->num_free_clusters -= ndcs;
+	bs->num_free_clusters --;
+
+	return cluster_num + index;
 }
 
 static void
@@ -179,6 +184,121 @@ blob_insert_cluster(struct spdk_blob *blob, uint32_t cluster_num, uint64_t clust
 }
 
 static int
+bs_is_reserved_cluster(struct spdk_blob *blob, uint32_t cluster_num, uint64_t *cluster) {
+	uint32_t *extent_page = 0;
+	uint64_t cluster_lba = 0, start_cluster_num = 0;
+
+	assert(spdk_spin_held(&blob->bs->used_lock));
+
+	start_cluster_num = cluster_num % BLOB_NDCS(blob->geometry);
+
+	extent_page = bs_cluster_to_extent_page(blob, cluster_num);
+	if (*extent_page == 0) {
+		SPDK_DEBUGLOG(blob, "There is no reserved cluster %" PRIu64 " for blob 0x%" PRIx64 "\n", *cluster,
+		      blob->id);
+		*cluster = 0;
+		return 0;
+	}
+
+
+	for (int  i = 0; i < BLOB_NDCS(blob->geometry); i++) {
+		if (blob->active.clusters[start_cluster_num + i] != 0) {
+			cluster_lba = blob->active.clusters[start_cluster_num + i];
+			*cluster = bs_lba_to_cluster(blob->bs, cluster_lba);
+			if (start_cluster_num + i > cluster_num) {
+				*cluster -= (start_cluster_num + i - cluster_num);
+			} else {
+				*cluster += (cluster_num - start_cluster_num + i);
+			}
+			spdk_bit_pool_allocate_specific_bit(bs->used_clusters, *cluster);
+
+			SPDK_DEBUGLOG(blob, "Claiming cluster %u and total cluster reservation %d.\n", cluster_num, ndcs);
+			bs->num_free_clusters --;
+
+			return 0;
+		}
+	}
+
+	cluster_lba = blob->active.clusters[cluster_num];
+	if (*extent_page == 0) {
+			/* Extent page shall never occupy md_page so start the search from 1 */
+			if (*lowest_free_md_page == 0) {
+				*lowest_free_md_page = 1;
+			}
+			/* No extent_page is allocated for the cluster */
+			*lowest_free_md_page = spdk_bit_array_find_first_clear(blob->bs->used_md_pages,
+					       *lowest_free_md_page);
+			if (*lowest_free_md_page == UINT32_MAX) {
+				/* No more free md pages. Cannot satisfy the request */
+				bs_release_cluster(blob->bs, *cluster);
+				return -ENOSPC;
+			}
+			bs_claim_md_page(blob->bs, *lowest_free_md_page);
+	}
+
+	*cluster = 0;
+	return 0;
+
+
+	*cluster = bs_claim_cluster(blob->bs, BLOB_NDCS(blob->geometry), cluster_num % BLOB_NDCS(blob->geometry));
+	if (*cluster == UINT32_MAX) {
+		/* No more free clusters. Cannot satisfy the request */
+		return -ENOSPC;
+	}
+
+	SPDK_DEBUGLOG(blob, "Claiming reserved cluster %" PRIu64 " for blob 0x%" PRIx64 "\n", *cluster,
+		      blob->id);
+
+	return 0;
+}
+
+static int
+bs_allocate_reserved_cluster(struct spdk_blob *blob, uint32_t cluster_num,
+		    uint64_t *cluster, uint32_t *lowest_free_md_page, bool update_map)
+{
+	uint32_t *extent_page = 0;
+
+	assert(spdk_spin_held(&blob->bs->used_lock));
+
+	*cluster = bs_claim_cluster(blob->bs, BLOB_NDCS(blob->geometry), cluster_num % BLOB_NDCS(blob->geometry));
+	if (*cluster == UINT32_MAX) {
+		/* No more free clusters. Cannot satisfy the request */
+		return -ENOSPC;
+	}
+
+	if (blob->use_extent_table) {
+		extent_page = bs_cluster_to_extent_page(blob, cluster_num);
+		if (*extent_page == 0) {
+			/* Extent page shall never occupy md_page so start the search from 1 */
+			if (*lowest_free_md_page == 0) {
+				*lowest_free_md_page = 1;
+			}
+			/* No extent_page is allocated for the cluster */
+			*lowest_free_md_page = spdk_bit_array_find_first_clear(blob->bs->used_md_pages,
+					       *lowest_free_md_page);
+			if (*lowest_free_md_page == UINT32_MAX) {
+				/* No more free md pages. Cannot satisfy the request */
+				bs_release_cluster(blob->bs, *cluster);
+				return -ENOSPC;
+			}
+			bs_claim_md_page(blob->bs, *lowest_free_md_page);
+		}
+	}
+
+	SPDK_DEBUGLOG(blob, "Claiming cluster %" PRIu64 " for blob 0x%" PRIx64 "\n", *cluster,
+		      blob->id);
+
+	if (update_map) {
+		blob_insert_cluster(blob, cluster_num, *cluster);
+		if (blob->use_extent_table && *extent_page == 0) {
+			*extent_page = *lowest_free_md_page;
+		}
+	}
+
+	return 0;
+}
+
+static int
 bs_allocate_cluster(struct spdk_blob *blob, uint32_t cluster_num,
 		    uint64_t *cluster, uint32_t *lowest_free_md_page, bool update_map)
 {
@@ -186,7 +306,7 @@ bs_allocate_cluster(struct spdk_blob *blob, uint32_t cluster_num,
 
 	assert(spdk_spin_held(&blob->bs->used_lock));
 
-	*cluster = bs_claim_cluster(blob->bs);
+	*cluster = bs_claim_cluster(blob->bs, BLOB_NDCS(blob->geometry), cluster_num % BLOB_NDCS(blob->geometry));
 	if (*cluster == UINT32_MAX) {
 		/* No more free clusters. Cannot satisfy the request */
 		return -ENOSPC;
@@ -4633,6 +4753,7 @@ struct spdk_bs_load_ctx {
 	uint32_t			*extent_page_num;
 	struct spdk_blob_md_page	*extent_pages;
 	struct spdk_bit_array		*used_clusters;
+	struct spdk_bit_array		*reserved_clusters;
 	struct spdk_bit_array		*used_blobid_pages;
 
 	spdk_bs_sequence_t			*seq;
@@ -4811,6 +4932,15 @@ bs_alloc(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts, struct spdk_blob_st
 		return -ENOMEM;
 	}
 
+	ctx->reserved_clusters = spdk_bit_array_create(bs->total_clusters);
+	if (!ctx->reserved_clusters) {
+		spdk_free(ctx->super);
+		spdk_bit_array_free(&ctx->used_clusters);
+		free(ctx);
+		free(bs);
+		return -ENOMEM;
+	}
+
 	bs->pages_per_cluster = bs->cluster_sz / SPDK_BS_PAGE_SIZE;
 	if (spdk_u32_is_pow2(bs->pages_per_cluster)) {
 		bs->pages_per_cluster_shift = spdk_u32log2(bs->pages_per_cluster);
@@ -4842,6 +4972,7 @@ bs_alloc(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts, struct spdk_blob_st
 		spdk_bit_array_free(&bs->used_blobids);
 		spdk_bit_array_free(&bs->used_md_pages);
 		spdk_bit_array_free(&ctx->used_clusters);
+		spdk_bit_array_free(&ctx->reserved_clusters);
 		spdk_free(ctx->super);
 		free(ctx);
 		free(bs);
@@ -7267,6 +7398,7 @@ bs_init_persist_super_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	struct spdk_bs_load_ctx *ctx = cb_arg;
 
 	ctx->bs->used_clusters = spdk_bit_pool_create_from_array(ctx->used_clusters);
+	ctx->bs->reserved_clusters = spdk_bit_pool_create_from_array(ctx->reserved_clusters);
 	spdk_free(ctx->super);
 	free(ctx);
 
@@ -7347,6 +7479,8 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	rc = spdk_bit_array_resize(&bs->used_md_pages, bs->md_len);
 	if (rc < 0) {
 		spdk_free(ctx->super);
+		spdk_bit_array_free(&ctx->used_clusters);
+		spdk_bit_array_free(&ctx->reserved_clusters);
 		free(ctx);
 		bs_free(bs);
 		cb_fn(cb_arg, NULL, -ENOMEM);
@@ -7356,6 +7490,8 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	rc = spdk_bit_array_resize(&bs->used_blobids, bs->md_len);
 	if (rc < 0) {
 		spdk_free(ctx->super);
+		spdk_bit_array_free(&ctx->used_clusters);
+		spdk_bit_array_free(&ctx->reserved_clusters);
 		free(ctx);
 		bs_free(bs);
 		cb_fn(cb_arg, NULL, -ENOMEM);
@@ -7365,6 +7501,8 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	rc = spdk_bit_array_resize(&bs->open_blobids, bs->md_len);
 	if (rc < 0) {
 		spdk_free(ctx->super);
+		spdk_bit_array_free(&ctx->used_clusters);
+		spdk_bit_array_free(&ctx->reserved_clusters);
 		free(ctx);
 		bs_free(bs);
 		cb_fn(cb_arg, NULL, -ENOMEM);
@@ -7374,6 +7512,8 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	rc = spdk_bit_array_resize(&bs->map_blobids, SPDK_BS_MAX_BLOB_COUNT);
 	if (rc < 0) {
 		spdk_free(ctx->super);
+		spdk_bit_array_free(&ctx->used_clusters);
+		spdk_bit_array_free(&ctx->reserved_clusters);
 		free(ctx);
 		bs_free(bs);
 		cb_fn(cb_arg, NULL, -ENOMEM);
@@ -7451,6 +7591,7 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 			    "or increase cluster size.\n");
 		spdk_free(ctx->super);
 		spdk_bit_array_free(&ctx->used_clusters);
+		spdk_bit_array_free(&ctx->reserved_clusters);
 		free(ctx);
 		bs_free(bs);
 		cb_fn(cb_arg, NULL, -ENOMEM);
@@ -7459,6 +7600,7 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	/* Claim all of the clusters used by the metadata */
 	for (i = 0; i < num_md_clusters; i++) {
 		spdk_bit_array_set(ctx->used_clusters, i);
+		spdk_bit_array_set(ctx->reserved_clusters, i);
 	}
 
 	bs->num_free_clusters -= num_md_clusters;
