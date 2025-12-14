@@ -7459,8 +7459,8 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	batch = bs_sequence_to_batch(seq, bs_init_trim_cpl, ctx);
 
 	/* Clear metadata space */
-	bs->w_io++;
-	bs_batch_write_zeroes_dev(batch, 0, num_md_lba);
+	// bs->w_io++;
+	// bs_batch_write_zeroes_dev(batch, 0, num_md_lba);
 
 	lba = num_md_lba;
 	lba_count = ctx->bs->dev->blockcnt - lba;
