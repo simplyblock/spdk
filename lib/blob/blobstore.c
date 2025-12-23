@@ -14998,6 +14998,18 @@ spdk_read_cluster_data_xfer(struct spdk_blob *blob, void *buf, uint64_t offset, 
 }
 
 void
+prepare_s3_clusters(struct spdk_blob* blob, uint64_t *clusters, uint32_t num_clusters)
+{
+	uint64_t i;
+	/* Copy child snapshot map to base snapshot map (only unallocated clusters in the target snapshot) */
+	for (i = 0; i < blob->active.num_clusters && i < num_clusters; i++) {
+		if (blob->active.clusters[i] != 0 && clusters[i] == 0) {
+			clusters[i] = blob->active.clusters[i];
+		}
+	}
+}
+
+void
 spdk_blob_set_io_priority_class(struct spdk_blob* blob, int priority_class)
 {
 	blob->priority_class = priority_class;

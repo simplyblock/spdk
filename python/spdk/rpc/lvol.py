@@ -169,6 +169,124 @@ def bdev_lvol_create(client, lvol_name, size_in_mib, thin_provision=False, uuid=
     params['lvol_priority_class'] = lvol_priority_class
     return client.call('bdev_lvol_create', params)
 
+def bdev_lvol_s3_backup(client, s3_id=0, snapshot_names=None, cluster_batch=16):
+    """
+    Trigger an S3 backup operation for one or more lvol snapshots.
+
+    This RPC initiates a backup of the specified lvol snapshots to S3.
+    The snapshots are processed sequentially and data is transferred
+    in batches of clusters.
+
+    Args:
+        s3_id (int): Identifier of the S3 target used for the backup (required).
+        snapshot_names (list[str]): List of snapshot lvol names to back up (required).
+        cluster_batch (int): Number of cluster transfer requests processed
+            concurrently in the internal transfer queue (default: 16).
+
+    Returns:
+        RPC response object from the SPDK target.
+
+    Raises:
+        ValueError: If snapshot_names is not provided or s3_id is invalid.
+    """
+    if not snapshot_names:
+        raise ValueError("snapshots names must be specified")
+    if s3_id <= 0:
+        raise ValueError("s3_id must be specified")
+
+    params = {'s3_id': s3_id, 'snapshot_names': snapshot_names, 'cluster_batch': cluster_batch}
+    return client.call('bdev_lvol_s3_backup', params)
+
+def bdev_lvol_s3_merge(client, s3_id=0, old_s3_id=None, cluster_batch=16):
+    """
+    Trigger an S3 merge operation between two S3 backups.
+
+    This RPC initiates a merge process where data from an existing
+    S3 backup (old_s3_id) is merged into a new or current S3 backup
+    (s3_id). The merge is performed incrementally using cluster-based
+    transfers.
+
+    Args:
+        client: RPC client instance.
+        s3_id (int): Identifier of the destination S3 backup (required).
+        old_s3_id (int): Identifier of the source S3 backup to merge from (required).
+        cluster_batch (int): Number of cluster transfer requests processed
+            concurrently in the internal transfer queue (default: 16).
+
+    Returns:
+        RPC response object from the SPDK target.
+
+    Raises:
+        ValueError: If s3_id or old_s3_id is not provided or invalid.
+    """
+    if s3_id <= 0 or old_s3_id <= 0:
+        raise ValueError("s3_id must be specified")
+
+    params = {'s3_id': s3_id, 'old_s3_id': old_s3_id, 'cluster_batch': cluster_batch}
+    return client.call('bdev_lvol_s3_merge', params)
+
+def bdev_lvol_s3_recovery(client, lvol_name=None, s3_ids=0, cluster_batch=16):
+    """
+    Recover an lvol from one or more S3 backups.
+
+    This RPC initiates a recovery process that restores the specified
+    logical volume from a sequence of S3 backups. The S3 backups are
+    applied in order, and data is restored incrementally using
+    cluster-based transfers.
+
+    Args:
+        client: RPC client instance.
+        lvol_name (str): Name of the logical volume to be recovered (required).
+        s3_ids (list[int]): Ordered list of S3 backup identifiers used
+            for recovery (required).
+        cluster_batch (int): Number of cluster transfer requests processed
+            concurrently in the internal transfer queue (default: 16).
+
+    Returns:
+        RPC response object from the SPDK target.
+
+    Raises:
+        ValueError: If lvol_name or s3_ids is not provided or invalid.
+    """
+    if not lvol_name:
+        raise ValueError("lvol_name must be specified")
+    if not s3_ids:
+        raise ValueError("s3_ids must be specified")
+
+    params = {'lvol_name': lvol_name, 's3_ids': s3_ids, 'cluster_batch': cluster_batch}
+    return client.call('bdev_lvol_s3_recovery', params)
+
+def bdev_lvol_s3_bdev(client, s3_bdev=None, uuid=None, lvs_name=None,):
+    """
+    Recover an lvol from one or more S3 backups.
+
+    This RPC initiates a recovery process that restores the specified
+    logical volume from a sequence of S3 backups. The S3 backups are
+    applied in order, and data is restored incrementally using
+    cluster-based transfers.
+
+    Args:
+        client: RPC client instance.
+        lvol_name (str): Name of the logical volume to be recovered (required).
+        s3_ids (list[int]): Ordered list of S3 backup identifiers used
+            for recovery (required).
+        cluster_batch (int): Number of cluster transfer requests processed
+            concurrently in the internal transfer queue (default: 16).
+
+    Returns:
+        RPC response object from the SPDK target.
+
+    Raises:
+        ValueError: If lvol_name or s3_ids is not provided or invalid.
+    """
+    if (uuid and lvs_name) or (not uuid and not lvs_name):
+        raise ValueError("Either uuid or lvs_name must be specified, but not both")
+    if not s3_bdev:
+        raise ValueError("s3_bdev must be specified")
+
+    params = {'s3_bdev': s3_bdev, 'uuid': uuid, 'lvs_name': lvs_name}
+    return client.call('bdev_lvol_s3_bdev', params)
+
 def bdev_lvol_final_migration(client, lvol_name=None, lvol_id=0, snapshot_name=None, cluster_batch=16, gateway=None):
     """Replicate a logical volume on a logical volume store.
 

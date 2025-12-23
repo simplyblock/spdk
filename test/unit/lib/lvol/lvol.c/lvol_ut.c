@@ -44,7 +44,32 @@ DEFINE_STUB_V(spdk_blob_unfreeze_cleanup,
 DEFINE_STUB_V(blob_freeze_on_failover, (struct spdk_blob *blob));
 DEFINE_STUB_V(spdk_snapshot_freeze_blob, (struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg));
 DEFINE_STUB(spdk_bs_delete_blob_non_leader, int ,(struct spdk_blob_store *bs, struct spdk_blob *blob), 0);
+DEFINE_STUB_V(spdk_bdev_free_io, (struct spdk_bdev_io *g_bdev_io));
+DEFINE_STUB_V(spdk_blob_io_read, (struct spdk_blob *blob, struct spdk_io_channel *channel,
+		   void *payload, uint64_t offset, uint64_t length,
+		   spdk_blob_op_complete cb_fn, void *cb_arg));
+DEFINE_STUB_V(spdk_blob_io_write, (struct spdk_blob *blob, struct spdk_io_channel *channel,
+		   void *payload, uint64_t offset, uint64_t length,
+		   spdk_blob_op_complete cb_fn, void *cb_arg));
+DEFINE_STUB_V(prepare_s3_clusters, (struct spdk_blob* blob, uint64_t *clusters, uint32_t num_clusters));
+DEFINE_STUB(spdk_bdev_write_blocks, int,
+	    (struct spdk_bdev_desc *desc, struct spdk_io_channel *ch, void *buf, uint64_t offset_blocks,
+	     uint64_t num_blocks, spdk_bdev_io_completion_cb cb, void *cb_arg), 0);
+DEFINE_STUB(spdk_bdev_unmap_blocks, int,
+	    (struct spdk_bdev_desc *desc, struct spdk_io_channel *ch, uint64_t offset_blocks,
+	     uint64_t num_blocks, spdk_bdev_io_completion_cb cb, void *cb_arg), 0);
+DEFINE_STUB(spdk_bdev_read_blocks, int,
+		(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
+			void *buf, uint64_t offset_blocks, uint64_t num_blocks,
+			spdk_bdev_io_completion_cb cb, void *cb_arg), 0);
+DEFINE_STUB(spdk_blob_get_geometry, uint8_t, (struct spdk_blob *blob), 0);
+DEFINE_STUB(spdk_bs_get_page_size, uint64_t, (struct spdk_blob_store *bs), 0);
 
+
+DEFINE_STUB(spdk_blob_get_offset_allocate, bool, (struct spdk_blob *blob, uint64_t offset), true);
+DEFINE_STUB(spdk_blob_check_offset_valid, bool, (struct spdk_blob *blob, uint64_t offset, uint64_t length), true);
+DEFINE_STUB(spdk_read_cluster_data_xfer, int, (struct spdk_blob *blob, void *buf, uint64_t offset, 
+			uint64_t length, enum xfer_type type, spdk_blob_op_complete cb_fn, void *cb_arg), 0);
 
 const char *uuid = "828d9766-ae50-11e7-bd8d-001e67edf350";
 
@@ -97,6 +122,25 @@ struct ut_cb_res {
 	void *data;
 	int err;
 };
+
+struct spdk_bdev_desc {
+	struct spdk_bdev *bdev;
+};
+
+struct spdk_bdev *
+spdk_bdev_desc_get_bdev(struct spdk_bdev_desc *desc)
+{
+	return desc->bdev;
+}
+
+struct spdk_io_channel *
+spdk_bdev_get_io_channel(struct spdk_bdev_desc *desc)
+{
+	if (desc != NULL) {
+		return (struct spdk_io_channel *)0x1;
+	}
+	return NULL;
+}
 
 void
 spdk_bs_inflate_blob(struct spdk_blob_store *bs, struct spdk_io_channel *channel,

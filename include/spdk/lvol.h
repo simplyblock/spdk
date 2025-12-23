@@ -335,10 +335,16 @@ int spdk_lvs_IO_redirect(void * cb_arg);
 int spdk_lvs_IO_hublvol(void *cb_arg);
 
 int spdk_lvs_poll_group_options(char *mask);
-struct spdk_transfer_dev *spdk_open_rmt_bdev(const char *name, struct spdk_lvol_store *lvs);
+struct spdk_transfer_dev *spdk_open_rmt_bdev(const char *name, struct spdk_lvol_store *lvs, bool is_s3);
 int spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_batch,
 				enum xfer_type type, struct spdk_transfer_dev *tdev, const char *snapshot_name,
 				uint32_t lvol_id, spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
+int spdk_lvol_s3_backup(struct spdk_lvol *lvol, uint32_t cluster_batch,
+				struct spdk_lvol **chain_snapshots, int num_snapshots, uint32_t s3_id);
+int spdk_lvol_s3_merge(struct spdk_lvol *lvol, uint32_t s3_id,
+				uint32_t old_s3_id, uint32_t cluster_batch);
+int spdk_lvol_s3_recovery(struct spdk_lvol *lvol, uint32_t cluster_batch,
+				uint32_t *chain_s3_ids, uint32_t num_s3_ids);
 void spdk_lvol_chain(struct spdk_lvol *origlvol, struct spdk_lvol *clone,
 		 spdk_lvol_op_complete cb_fn, void *cb_arg);
 void spdk_lvol_convert(struct spdk_lvol *origlvol, spdk_lvol_op_complete cb_fn, void *cb_arg);

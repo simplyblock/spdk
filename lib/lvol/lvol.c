@@ -3738,42 +3738,160 @@ spdk_change_rmt_lvol_state(struct spdk_lvol_store *lvs, struct spdk_transfer_dev
 	}
 }
 
-// static void
-// write_complete_cb(struct spdk_bdev_io *bdev_io, bool success, void *arg)
-// {
-//     struct spdk_lvs_xfer_req *req = arg;
-// 	struct remote_lvol_info *rmt_lvol = req->rmt_lvol;
-// 	rmt_lvol->outstanding_io--;
-// 	if (!success) {
-// 		SPDK_ERRLOG("Remote write I/O failed at offset: %" PRIu64 " len: %" PRIu64 "\n",
-// 				req->offset, req->len);
-// 		// we should destory the channel here we should check the cnt;
-// 		rmt_lvol->status = false;
+static void
+set_req_status_and_queued(struct spdk_lvs_xfer_req *req, enum xfer_req_status status)
+{
+	struct remote_lvol_info *rmt = req->rmt_lvol;
+	rmt->outstanding_io--;
+	req->status = status;
+	if (spdk_ring_enqueue(rmt->free_ring, (void **)&req, 1, NULL) != 1) {
+		SPDK_ERRLOG("free_ring full while handling write submit failure\n");
+		assert(false);
+	}
+}
 
-// 	}
+static void
+complete_op_cb(struct spdk_bdev_io *bdev_io, bool success, void *arg)
+{
+	struct spdk_lvs_xfer_req *req = arg;
+	struct remote_lvol_info *rmt_lvol = req->rmt_lvol;
 
-// 	/* complete local IO */
-// 	req->status = success ? 0 : -EIO;
+	if (!success) {
+		SPDK_ERRLOG("Remote write I/O failed at offset: %" PRIu64 " len: %" PRIu64 "\n",
+				req->offset, req->len);
+		// we should destory the channel here we should check the cnt;
+		rmt_lvol->status = false;
 
-// 	if (!rmt_lvol->status) {
-// 		req->status = -EIO;
-// 	}
+	}
 
-//     spdk_bdev_free_io(bdev_io);
+	/* complete local IO */
+	req->status = success ? XFER_REQ_STATUS_DONE : XFER_REQ_STATUS_FAILED;
 
-//     /* recycle task */
-// 	SPDK_NOTICELOG("2- Remote write I/O offset: %" PRIu64 " len: %" PRIu64 "\n", req->offset, req->len);
-// 	if (spdk_ring_enqueue(rmt_lvol->free_ring, (void **)&req, 1, NULL) != 1) {
-//         SPDK_ERRLOG("free_ring full while recycling req\n");
-// 		assert(false);
-// 	}
-// }
+	if (!rmt_lvol->status) {
+		req->status = XFER_REQ_STATUS_FAILED;
+	}
+
+    spdk_bdev_free_io(bdev_io);
+
+	/* recycle task */
+	SPDK_NOTICELOG("2- Remote write I/O offset: %" PRIu64 " len: %" PRIu64 "\n", req->offset, req->len);
+	set_req_status_and_queued(req, req->status);
+}
+
+static int submit_rw_reqs_remote(struct spdk_lvs_xfer_req *req);
+static int submit_rw_reqs_local(struct spdk_lvs_xfer_req *req);
+
+static void
+remote_op_comp(struct spdk_bdev_io *bdev_io, bool success, void *arg)
+{
+	struct spdk_lvs_xfer_req *req = arg;
+
+	spdk_bdev_free_io(bdev_io);
+
+	if (!success) {
+		SPDK_ERRLOG("Remote read I/O failed at offset: %" PRIu64 " len: %" PRIu64 "\n",
+				req->offset, req->len);
+		set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
+		return;
+	}
+	
+	assert(req->action == REQ_ACTION_COPY_RECOVER);
+	submit_rw_reqs_local(req);
+
+}
+
+static int
+submit_rw_reqs_remote(struct spdk_lvs_xfer_req *req)
+{
+	struct remote_lvol_info *rmt = req->rmt_lvol;
+	struct spdk_io_channel *s3_ch = rmt->channel;
+	// struct spdk_io_channel *md_ch = rmt->group->lpg_md_channel;
+	// struct spdk_lvs_xfer *xfer = req->xfer;
+	int rc = 0;
+
+	switch (req->action)
+	{
+		case REQ_ACTION_COPY_BACKUP:
+			// read from local and write to remote
+			rc = spdk_bdev_write_blocks(rmt->desc, s3_ch, req->payload, 
+									req->s3_offset, req->len, complete_op_cb, req);
+			if (rc != 0) {
+				/* synchronous failure: decrement outstanding and recycle req */
+				set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
+			}
+			break;
+		case REQ_ACTION_COPY_RECOVER:
+			rc = spdk_bdev_read_blocks(rmt->desc, s3_ch, req->payload, 
+									req->s3_offset, req->len, remote_op_comp, req);
+			if (rc != 0) {
+				/* synchronous failure: decrement outstanding and recycle req */
+				set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
+			}
+			break;
+		default:
+			rc = -EINVAL;
+			break;
+	}
+	return rc;
+}
+
+static void
+local_op_comp(void *cb_arg, int bserrno)
+{
+	struct spdk_lvs_xfer_req *req = cb_arg;
+
+	if (bserrno != 0) {		
+		SPDK_ERRLOG("Local I/O failed at offset: %" PRIu64 " len: %" PRIu64 "\n",
+				req->offset, req->len);
+		set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
+		return;
+	}
+	
+	switch (req->action)
+	{
+		case REQ_ACTION_COPY_BACKUP:
+			// read from local and write to remote
+			submit_rw_reqs_remote(req);
+			break;
+		case REQ_ACTION_COPY_RECOVER:
+			// read from remote and write to local
+			set_req_status_and_queued(req, XFER_REQ_STATUS_DONE);
+			break;
+		default:
+			break;
+	}
+
+}
+
+static int
+submit_rw_reqs_local(struct spdk_lvs_xfer_req *req)
+{
+	struct remote_lvol_info *rmt = req->rmt_lvol;
+	struct spdk_io_channel *md_ch = rmt->group->lpg_md_channel;
+	struct spdk_lvs_xfer *xfer = req->xfer;
+
+	switch (req->action)
+	{
+		case REQ_ACTION_COPY_BACKUP:
+			// read from local and write to remote
+			spdk_blob_io_read(xfer->lvol->blob, md_ch, req->payload, req->offset,
+								req->len, local_op_comp, req);
+			break;
+		case REQ_ACTION_COPY_RECOVER:
+			// read from remote and write to local
+			spdk_blob_io_write(xfer->lvol->blob, md_ch, req->payload, req->offset,
+								req->len, local_op_comp, req);
+			break;
+		default:
+			break;
+	}
+	return 0;
+}
 
 static void
 fragment_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
-    struct spdk_lvs_xfer_req *req = cb_arg;
-    struct remote_lvol_info *rmt_lvol = req->rmt_lvol;
+	struct spdk_lvs_xfer_req *req = cb_arg;
 
     if (!success) {
         /* set aggregated status once (first error) */
@@ -3791,25 +3909,15 @@ fragment_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
     if (req->fragments_outstanding == 0) {
 		// SPDK_NOTICELOG("3- Remote write I/O offset: %" PRIu64 " len: %" PRIu64 " frag: %d t %p\n", req->offset, req->len, req->fragments_outstanding, spdk_get_thread());
         /* final aggregated status */
-        int st = req->aggregated_status;
-        if (st != 0) {
-            req->status = XFER_REQ_STATUS_FAILED;
-            rmt_lvol->status = false; /* mark remote as unhealthy if desired */
-        } else {
-            req->status = XFER_REQ_STATUS_DONE;
-        }
-
-        /* decrement remote outstanding counter for original req if you maintain one */
-        rmt_lvol->outstanding_io--;
-
-        /* clear in_flight and recycle to free_ring */
-        // req->in_flight = false;
-        req->fragments_outstanding = 0;
-		if (spdk_ring_enqueue(rmt_lvol->free_ring, (void **)&req, 1, NULL) != 1) {
-        	SPDK_ERRLOG("free_ring full while recycling req\n");
-			assert(false);
+		int st = req->aggregated_status;
+		if (st != 0) {
+			req->status = XFER_REQ_STATUS_FAILED;
+		} else {
+			req->status = XFER_REQ_STATUS_DONE;
 		}
-    }
+
+		set_req_status_and_queued(req,  req->status);
+	}
 }
 
 static int
@@ -3860,10 +3968,10 @@ submit_req_fragments(struct spdk_lvs_xfer_req *req, struct remote_lvol_info *rmt
 static int
 helper_xfer_poller(void *arg)
 {
-    struct spdk_lvs_poll_group *lpg = arg;
+	struct spdk_lvs_poll_group *lpg = arg;
 	struct remote_lvol_info *rmt_lvol;
 	struct spdk_lvs_xfer_req *req;
-	int count = 0;
+	int count = 0, rc = 0;
 	TAILQ_FOREACH(rmt_lvol, &lpg->rmt_lvols, entry) {
 		if (rmt_lvol->desc == NULL || rmt_lvol->channel == NULL || !rmt_lvol->status) {
 			continue;
@@ -3872,27 +3980,69 @@ helper_xfer_poller(void *arg)
 		if (spdk_ring_dequeue(rmt_lvol->ready_ring, (void **)&req, 1) == 0) {
 			continue;
 		}
+
 		count++;
 		rmt_lvol->outstanding_io++;
 		req->rmt_lvol = rmt_lvol;
-		// SPDK_NOTICELOG("1- Remote write I/O offset: %" PRIu64 " len: %" PRIu64 "\n", req->offset, req->len);
-		int rc = submit_req_fragments(req, rmt_lvol);
-		// int rc = spdk_bdev_write_blocks(rmt_lvol->desc, rmt_lvol->channel,
-        //                                 req->payload, req->offset, 1,
-        //                                 write_complete_cb, req);
-		if (rc != 0) {
-            /* synchronous failure: decrement outstanding and recycle req */
-			if (req->fragments_outstanding == 0) {
-				rmt_lvol->outstanding_io--;
-				req->status = XFER_REQ_STATUS_FAILED;
-				if (spdk_ring_enqueue(rmt_lvol->free_ring, (void **)&req, 1, NULL) != 1) {
-                	SPDK_ERRLOG("free_ring full while handling write submit failure\n");
-                	assert(false);
-            	}
-			}             
-        }
+
+		switch (rmt_lvol->type) {
+			case XFER_MIGRATE_SNAPSHOT:
+				rc = spdk_bdev_write_blocks(rmt_lvol->desc, rmt_lvol->channel, req->payload,
+					 						req->offset, req->len, complete_op_cb, req);
+				if (rc != 0) {
+					/* synchronous failure: decrement outstanding and recycle req */
+					set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
+				}
+				break;				
+			case XFER_REPLICATE_SNAPSHOT:
+				//TODO read and write with the helper core 
+				// SPDK_NOTICELOG("1- Remote write I/O offset: %" PRIu64 " len: %" PRIu64 "\n", req->offset, req->len);
+				rc = submit_req_fragments(req, rmt_lvol);
+				if (rc != 0) {
+					/* synchronous failure: decrement outstanding and recycle req */
+					if (req->fragments_outstanding == 0) {
+						set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
+					}
+				}
+				break;
+			case XFER_S3_BACKUP:
+			case XFER_S3_MERGE:
+			case XFER_S3_RECOVER:
+				switch (req->action) {
+					case REQ_ACTION_READ:
+						rc = spdk_bdev_write_blocks(rmt_lvol->desc, rmt_lvol->channel,
+											req->payload, req->s3_offset, req->len, complete_op_cb, req);
+						break;
+					case REQ_ACTION_WRITE:
+					case REQ_ACTION_SWAP:
+						rc = spdk_bdev_read_blocks(rmt_lvol->desc, rmt_lvol->channel,
+											req->payload, req->s3_offset, req->len, complete_op_cb, req);
+						break;
+					case REQ_ACTION_UNMAP:
+						rc = spdk_bdev_unmap_blocks(rmt_lvol->desc, rmt_lvol->channel,
+											req->s3_offset, req->len, complete_op_cb, req);
+						break;
+					case REQ_ACTION_COPY_BACKUP:
+						rc = submit_rw_reqs_local(req);
+						break;
+					case REQ_ACTION_COPY_RECOVER:
+						rc = submit_rw_reqs_remote(req);
+						break;
+					default:
+						break;
+				}
+
+				if (rc != 0) {
+					/* synchronous failure: decrement outstanding and recycle req */
+					set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
+				}
+				break;
+			default:
+				SPDK_ERRLOG("Unknown transfer type %d\n", rmt_lvol->type);
+				set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
+				break;
+		}
 	}
-	
     return count ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
 }
 
@@ -3960,18 +4110,18 @@ static void
 spdk_migration_open_channel_on_threads(void *arg)
 {
 	struct spdk_lvol *lvol = arg;
-    struct spdk_transfer_dev *tdev = lvol->tdev;
-    struct spdk_thread *t = spdk_get_thread();
-    const char *name = spdk_thread_get_name(t);	
+	struct spdk_transfer_dev *tdev = lvol->tdev;
+	struct spdk_thread *t = spdk_get_thread();
+	const char *name = spdk_thread_get_name(t);	
 	// SPDK_NOTICELOG("target thread name is: %s\n", name);
-    if (strncmp(name, "nvmf_tgt_poll_group_", 20) == 0) {
+	if (strncmp(name, "nvmf_tgt_poll_group_", 20) == 0) {
 		// Found the target thread, store it in the context
 		struct spdk_io_channel *channel = spdk_bdev_get_io_channel(tdev->desc);
 		if (channel) {
 			SPDK_NOTICELOG("Found target thread: %s channel %p\n", name, channel);
 			spdk_tdev_store_hublvol_channel(tdev, channel);
 		}
-    }
+	}
 }
 
 void
@@ -4059,6 +4209,8 @@ spdk_mark_rmt_pg(void *arg) {
 		}
 		rmt_lvol->status = false;
 	}
+
+	free(ctx);
 }
 
 static int
@@ -4345,16 +4497,871 @@ xfer_migration(struct spdk_lvs_xfer *xfer) {
 }
 
 static int
+xfer_fill_queue(struct spdk_lvs_xfer *xfer, int initial) {
+
+	for (int i = 0; i < xfer->cluster_batch; i++) {
+		struct spdk_lvs_xfer_req *req;
+		if (spdk_ring_dequeue(xfer->free_ring, (void **)&req, 1) == 0) {
+			break;
+		}
+	}
+
+	for (int i = 0; i < initial; i++) {
+		struct spdk_lvs_xfer_req *req = &xfer->reqs[i];
+		req->action = REQ_ACTION_NONE;
+		req->status = XFER_REQ_STATUS_NONE;
+		if (spdk_ring_enqueue(xfer->free_ring, (void **)&req, 1, NULL) != 1) {
+			break;
+		}
+	}
+
+	xfer->idx = 0;
+	xfer->success_cnt = 0;
+	xfer->timeout = spdk_get_ticks();
+	return 0;
+}
+
+static int
+xfer_s3_check(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req **preq, uint32_t count, enum xfer_state next_state, int initial) {
+	uint64_t current_time = spdk_get_ticks();
+	uint64_t timeout_ticks = spdk_get_ticks_hz() * 8;
+
+	if (xfer->success_cnt != 0 && count == xfer->success_cnt) {
+		xfer->state = next_state;
+		xfer_fill_queue(xfer, initial);
+		return -1;
+	}
+
+	if (xfer->lvol->transfer_status == XFER_FAILED) {
+		xfer->state = XFER_STATE_FAILED;
+		return -1;
+	}
+
+	if (spdk_ring_dequeue(xfer->free_ring, (void **)preq, 1) == 0) {
+		if (current_time - xfer->timeout > timeout_ticks) {// in timeout consider outstanding io
+			if (xfer->outstanding_io == 0) {
+				xfer->lvol->transfer_status = XFER_FAILED;
+				xfer->state = XFER_STATE_FAILED;
+			} else {
+				// print current outstanding io timeout error
+				SPDK_ERRLOG("S3 transfer timeout with outstanding io %u\n", xfer->outstanding_io);
+			}
+		}
+		return -1;
+	}
+
+	xfer->timeout = current_time;
+	struct spdk_lvs_xfer_req *req = *preq;
+	if ((req->status == XFER_REQ_STATUS_FAILED || req->status == XFER_REQ_STATUS_DONE) && xfer->outstanding_io > 0) {
+		xfer->outstanding_io--;
+	}
+
+	if (req->status == XFER_REQ_STATUS_FAILED) {
+		xfer->lvol->transfer_status = XFER_FAILED;
+		xfer->state = XFER_STATE_FAILED;
+		return -1;
+	}
+
+	if (req->status == XFER_REQ_STATUS_DONE) {
+		xfer->success_cnt++;
+	}
+
+	req->status = XFER_REQ_STATUS_NONE; // I can have function to reset req
+	req->action = REQ_ACTION_NONE;
+	req->len = 0;
+	return 0;
+}
+
+struct cls_entry{
+	uint32_t index;
+	uint64_t s3_id;
+};
+
+static int
+xfer_s3_backup(struct spdk_lvs_xfer *xfer) {
+	struct spdk_lvs_xfer_req *req;
+	uint64_t page_size;
+	uint64_t page_per_cluster;
+	bool is_allocate = false;
+	int count = 0;
+	int rc = 0;
+
+	page_size = spdk_bs_get_page_size(xfer->lvol->lvol_store->blobstore);
+	page_per_cluster = spdk_bs_get_cluster_size(xfer->lvol->lvol_store->blobstore) / page_size;
+
+	switch (xfer->state)
+	{
+		case XFER_STATE_NONE:
+			if (xfer->idx < xfer->chain_count) {
+				struct spdk_lvol *lvol = xfer->chain[xfer->idx];
+				prepare_s3_clusters(lvol->blob, xfer->clusters, xfer->num_clusters);
+				xfer->idx++;
+				return 0;
+			}
+			xfer->state = XFER_STATE_TRANSFER_CLUSTERS;
+			xfer_fill_queue(xfer, xfer->cluster_batch);
+			break;
+
+		case XFER_STATE_TRANSFER_CLUSTERS:
+			is_allocate = false;
+			rc = xfer_s3_check(xfer, &req, xfer->idx, XFER_STATE_TRANSFER_MD_DATA, xfer->cluster_batch);
+			if (rc != 0) {
+				return 0;
+			}
+			
+			// prepare req
+			memset(req->payload, 0, page_size * page_per_cluster);
+			if (xfer->idx < xfer->num_clusters) {
+				for (uint32_t i = xfer->idx; i < xfer->num_clusters; i++) {
+					if (xfer->clusters[i] == 0) {
+						continue;
+					}
+
+					is_allocate = true;					
+					// 0 + id + 0 + index
+					req->s3_offset = s3_pack_offset(i, xfer->s3_id, false /* mid flag */, false /* MSB flag */);
+					req->offset = i * page_per_cluster;
+					req->len = page_size * page_per_cluster; // 2MB
+					req->action = REQ_ACTION_COPY_BACKUP;
+					req->status = XFER_REQ_STATUS_READY;
+
+					/* enqueue for transfer; if ready_ring is full, return req to free_ring or retry */
+					if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
+						SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
+						assert(false);
+					}
+
+					xfer->outstanding_io++;
+					xfer->idx++;
+					count++;
+					return count;
+				}
+
+				if (!is_allocate) {
+					if (xfer->idx == 0) {
+						// no clusters to send
+						xfer->state = XFER_STATE_TRANSFER_MD_DATA;
+						xfer_fill_queue(xfer, xfer->cluster_batch);
+						return 0;
+					}
+				}
+			}
+			break;
+
+		case XFER_STATE_TRANSFER_MD_DATA:
+			is_allocate = false;
+			rc = xfer_s3_check(xfer, &req, xfer->num_extent_pages, XFER_STATE_TRANSFER_ROOT_MD, 1);
+			if (rc != 0) {
+				return 0;
+			}
+
+			memset(req->payload, 0, page_size * page_per_cluster);
+			uint32_t *idx_out = (uint32_t *)req->payload;
+			uint32_t max_idx = (page_size * page_per_cluster) / sizeof(uint32_t);
+			// prepare req
+			if (xfer->idx < xfer->num_clusters) {
+				for (uint32_t i = xfer->idx; i < xfer->num_clusters; i++) {
+					xfer->idx++;
+					if (xfer->clusters[i] == 0) {
+						continue;
+					}
+
+					is_allocate = true;
+					idx_out[req->len++] = (uint32_t)i;
+
+					if (req->len == max_idx) {
+						break;
+					}
+				}
+
+				if (!is_allocate) {
+					if (xfer->num_extent_pages == 0) {
+						// no more md to send
+						xfer->state = XFER_STATE_TRANSFER_ROOT_MD;
+						xfer_fill_queue(xfer, 1);
+						return 0;
+					}
+					break;
+				}
+
+				xfer->num_extent_pages++;
+				// 0 + id + 1 + index
+				req->s3_offset = s3_pack_offset(xfer->num_extent_pages, xfer->s3_id, true /* mid flag */, false);
+				req->len = page_per_cluster; // 2MB
+				req->action = REQ_ACTION_WRITE;
+				req->status = XFER_REQ_STATUS_READY;
+				xfer->outstanding_io++;
+				
+				/* enqueue for transfer; if ready_ring is full, return req to free_ring or retry */
+				if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
+					SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
+					assert(false);
+				}				
+				count++;
+			}
+			break;
+		case XFER_STATE_TRANSFER_ROOT_MD:
+			rc = xfer_s3_check(xfer, &req, xfer->idx, XFER_STATE_DONE, 0);
+			if (rc != 0) {
+				return 0;
+			}
+
+			if (xfer->idx == 1 ) {
+				// all done
+				break;
+			}
+			xfer->idx++;
+			// prepare req
+			uint8_t *p = req->payload;
+
+			memcpy(p, &xfer->num_extent_pages, sizeof(uint32_t));
+			p += sizeof(uint32_t);
+
+			memcpy(p, &xfer->num_clusters, sizeof(uint32_t));
+			p += sizeof(uint32_t);
+			uint32_t geometry = spdk_blob_get_geometry(xfer->lvol->blob);
+			memcpy(p, &geometry, sizeof(uint32_t));
+			p += sizeof(uint32_t);
+
+			memcpy(p, &xfer->s3_id, sizeof(uint32_t));
+			p += sizeof(uint32_t);
+
+			memset(p, 0, SPDK_LVOL_NAME_MAX);
+			strncpy((char *)p, xfer->lvol->name, SPDK_LVOL_NAME_MAX);
+			p += SPDK_LVOL_NAME_MAX;
+
+			memset(p, 0, SPDK_UUID_STRING_LEN);
+			memcpy(p, xfer->lvol->uuid_str, SPDK_UUID_STRING_LEN);
+			p += SPDK_UUID_STRING_LEN;
+
+			// 0 + id + 1 + 0
+			req->s3_offset = s3_pack_offset(0, xfer->s3_id, true /* mid flag */, false);
+			req->len = page_per_cluster; // 2MB
+			req->action = REQ_ACTION_WRITE;
+			req->status = XFER_REQ_STATUS_READY;
+			xfer->outstanding_io++;
+
+			/* enqueue for transfer; if ready_ring is full, return req to free_ring or retry */
+			if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
+				SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
+				assert(false);
+			}
+			count++;
+			break;
+
+		case XFER_STATE_DONE:
+			xfer->lvol->transfer_status = XFER_DONE;
+			destroy_xfer_task(xfer);
+			return 0;
+
+		case XFER_STATE_FAILED:
+			// should not come here
+			SPDK_ERRLOG("S3 transfer task failed: -----\n");
+			if (xfer->outstanding_io != 0) {
+				//wait until all io done or timeout
+				SPDK_ERRLOG("S3 transfer task failed: ----- but still have outstanding io %u\n", xfer->outstanding_io);
+			}
+			destroy_xfer_task(xfer);
+			return 0;
+	
+	default:
+		break;
+	}
+	return count;
+}
+
+static int
+xfer_s3_merge(struct spdk_lvs_xfer *xfer) {
+	struct spdk_lvs_xfer_req *req;
+	uint64_t page_size;
+	uint64_t page_per_cluster;
+	int count = 0;
+	int rc = 0;
+
+	page_size = spdk_bs_get_page_size(xfer->lvol->lvol_store->blobstore);
+	page_per_cluster = spdk_bs_get_cluster_size(xfer->lvol->lvol_store->blobstore) / page_size;
+
+	switch (xfer->state)
+	{
+		case XFER_STATE_NONE:
+			xfer->state = XFER_STATE_READ_ROOT_MD;
+			xfer_fill_queue(xfer, 1);
+			break;
+		case XFER_STATE_READ_ROOT_MD:
+			rc = xfer_s3_check(xfer, &req, xfer->idx, XFER_STATE_READ_EXTENT_MD, xfer->cluster_batch);
+			if (rc != 0) {
+				return 0;
+			}
+
+			if (xfer->idx == 1 ) {
+				// all done
+				// parse root md
+				uint8_t *p = req->payload;
+				memcpy(&xfer->num_extent_pages, p, sizeof(uint32_t));
+				p += sizeof(uint32_t);
+
+				memcpy(&xfer->num_clusters, p, sizeof(uint32_t));
+				p += sizeof(uint32_t);
+
+				// allocate clusters array and the old clusters array
+				xfer->clusters = calloc(xfer->num_clusters, sizeof(uint32_t));
+				if (xfer->clusters == NULL) {
+					SPDK_ERRLOG("Failed to allocate clusters array for merge S3\n");
+					xfer->lvol->transfer_status = XFER_FAILED;
+					xfer->state = XFER_STATE_FAILED;
+					return 0;
+				}
+				
+				SPDK_NOTICELOG("Merge S3 Root MD: extent pages %u clusters %u s3 id %u\n",
+								xfer->num_extent_pages, xfer->num_clusters, xfer->s3_id);
+
+				if (xfer->num_extent_pages == 0) {
+					// no extent md to read
+					xfer->state = XFER_STATE_READ_ROOT_MD_2;
+					xfer_fill_queue(xfer, 1);
+					return 0;
+				}
+
+				xfer->state = XFER_STATE_READ_EXTENT_MD;
+				xfer_fill_queue(xfer, xfer->cluster_batch);
+				return 0;
+			}
+
+			req->s3_offset = s3_pack_offset(0, xfer->s3_id, true /* mid flag */, false);
+			req->len = page_per_cluster; // 2MB
+			req->action = REQ_ACTION_READ;
+			req->status = XFER_REQ_STATUS_READY;
+
+			/* enqueue for transfer; if ready_ring is full, return req to free_ring or retry */
+			if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
+				SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
+				assert(false);
+			}
+
+			xfer->outstanding_io++;
+			xfer->idx++;
+			count++;
+			break;
+		case XFER_STATE_READ_EXTENT_MD:
+			rc = xfer_s3_check(xfer, &req, xfer->num_extent_pages, XFER_STATE_READ_ROOT_MD_2, 1);
+			if (rc != 0) {
+				return 0;
+			}
+
+			if (xfer->idx != 0) {
+				// read done, parse extent md
+				uint32_t *idx_in = (uint32_t *)req->payload;
+				uint32_t entries = req->len / sizeof(uint32_t);
+				for (uint32_t j = 0; j < entries; j++) {
+					if (idx_in[j] == 0) {
+						break;
+					}
+
+					if (!(idx_in[j] < xfer->num_clusters)) {
+						break;
+					}
+
+					xfer->clusters[idx_in[j]] = s3_pack_offset(idx_in[j], xfer->s3_id, false /* mid flag */, false /* MSB flag */);
+				}
+			}
+
+			if (xfer->idx < xfer->num_extent_pages) {
+				// prepare req
+				req->s3_offset = s3_pack_offset(xfer->idx + 1, xfer->s3_id, true /* mid flag */, false);
+				req->len = page_per_cluster; // 2MB
+				req->action = REQ_ACTION_READ;
+				req->status = XFER_REQ_STATUS_READY;
+
+				/* enqueue for transfer; if ready_ring is full, return req to free_ring or retry */
+				if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
+					SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
+					assert(false);
+				}
+
+				xfer->outstanding_io++;
+				xfer->idx++;
+				count++;
+				return count;
+			}
+			break;
+
+		case XFER_STATE_READ_ROOT_MD_2:
+			rc = xfer_s3_check(xfer, &req, xfer->idx, XFER_STATE_READ_EXTENT_MD_2, xfer->cluster_batch);
+			if (rc != 0) {
+				return 0;
+			}
+
+			if (xfer->idx == 1 ) {
+				// parse root md
+				uint8_t *p = req->payload;
+				memcpy(&xfer->old_num_extent_pages, p, sizeof(uint32_t));
+				p += sizeof(uint32_t);
+				memcpy(&xfer->old_num_clusters, p, sizeof(uint32_t));
+				p += sizeof(uint32_t);
+
+				xfer->old_clusters = calloc(xfer->old_num_clusters, sizeof(uint32_t));
+				if (xfer->old_clusters == NULL) {
+					SPDK_ERRLOG("Failed to allocate old clusters array for merge S3\n");
+					free(xfer->clusters);
+					xfer->lvol->transfer_status = XFER_FAILED;
+					xfer->state = XFER_STATE_FAILED;
+					return 0;
+				}
+
+				if (xfer->old_num_extent_pages == 0) {
+					// no extent md to read
+					xfer->state = XFER_STATE_DONE;
+					xfer_fill_queue(xfer, 0);
+					return 0;
+				}
+
+				xfer->state = XFER_STATE_READ_EXTENT_MD_2;
+				xfer_fill_queue(xfer, xfer->cluster_batch);
+				return 0;
+			}
+
+			req->s3_offset = s3_pack_offset(0, xfer->old_s3_id, true /* mid flag */, false);
+			req->len = page_per_cluster; // 2MB
+			req->action = REQ_ACTION_READ;
+			req->status = XFER_REQ_STATUS_READY;
+
+			/* enqueue for transfer; if ready_ring is full, return req to free_ring or retry */
+			if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
+				SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
+				assert(false);
+			}
+
+			xfer->outstanding_io++;
+			xfer->idx++;
+			count++;
+			break;
+
+		case XFER_STATE_READ_EXTENT_MD_2:
+			rc = xfer_s3_check(xfer, &req, xfer->old_num_extent_pages, XFER_STATE_SWAP_CLUSTERS, xfer->cluster_batch);
+			if (rc != 0) {
+				return 0;
+			}
+
+			if (xfer->idx != 0) {
+				// read done, parse extent md
+				uint32_t *idx_in = (uint32_t *)req->payload;
+				uint32_t entries = req->len / sizeof(uint32_t);
+				for (uint32_t j = 0; j < entries; j++) {
+					if (idx_in[j] == 0) {
+						break;
+					}
+
+					if (!(idx_in[j] < xfer->old_num_clusters)) {
+						break;
+					}
+
+					xfer->old_clusters[idx_in[j]] = s3_pack_offset(idx_in[j], xfer->old_s3_id, false /* mid flag */, false /* MSB flag */);
+				}
+			}
+
+			if (xfer->idx < xfer->old_num_extent_pages) {
+				// prepare req
+				req->s3_offset = s3_pack_offset(xfer->idx + 1, xfer->old_s3_id, true /* mid flag */, false);
+				req->len = page_per_cluster; // 2MB it should be page_size * page_per_cluster
+				req->action = REQ_ACTION_READ;
+				req->status = XFER_REQ_STATUS_READY;
+
+				/* enqueue for transfer; if ready_ring is full, return req to free_ring or retry */
+				if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
+					SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
+					assert(false);
+				}
+
+				xfer->outstanding_io++;
+				xfer->idx++;
+				count++;
+				return count;
+			}
+			break;
+		case XFER_STATE_SWAP_CLUSTERS:
+			rc = xfer_s3_check(xfer, &req, xfer->idx, XFER_STATE_TRANSFER_MD_DATA, xfer->cluster_batch);
+			if (rc != 0) {
+				return 0;
+			}
+
+			// swap clusters arrays
+			for (uint32_t i = xfer->hold_idx; i < xfer->num_clusters && i < xfer->old_num_clusters; i++) {
+				xfer->hold_idx++;
+				// need to swap
+				if (xfer->clusters[i] == 0 && xfer->old_clusters[i] != 0) {
+					xfer->clusters[i] = xfer->old_clusters[i];
+					if (!xfer->persist_swap) {
+						xfer->persist_swap = true;
+						xfer->num_extent_pages = 0;
+					}
+
+					// prepare req
+					req->s3_offset = s3_pack_offset(i, xfer->s3_id, false /* mid flag */, true);
+					uint8_t *p = req->payload;
+					memcpy(p, &xfer->old_clusters[i], sizeof(uint64_t));
+					p += sizeof(uint64_t);
+					// add state swap string
+					const char *swap_str = "SWAP";
+					memcpy(p, swap_str, strlen(swap_str));
+					req->len = page_per_cluster; // 2MB
+					req->action = REQ_ACTION_SWAP;
+					req->status = XFER_REQ_STATUS_READY;
+
+					/* enqueue for transfer; if ready_ring is full, return req to free_ring or retry */
+					if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
+						SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
+						assert(false);
+					}
+					xfer->outstanding_io++;
+					xfer->idx++;
+					count++;
+					return count;
+				}
+			}
+
+			if (!xfer->persist_swap) {
+				xfer->hold_idx = 0;
+				// no need to persist the swapped clusters
+				SPDK_NOTICELOG("No persist swapped clusters to S3 id %u\n", xfer->s3_id);
+				xfer->state = XFER_STATE_DONE;
+				xfer_fill_queue(xfer, 0);
+				return 0;
+			}
+			break;
+
+		case XFER_STATE_TRANSFER_MD_DATA:
+			bool is_allocate = false;
+			rc = xfer_s3_check(xfer, &req, xfer->num_extent_pages, XFER_STATE_TRANSFER_ROOT_MD, 1);
+			if (rc != 0) {
+				return 0;
+			}
+
+			memset(req->payload, 0, page_size * page_per_cluster);
+			uint32_t *idx_out = (uint32_t *)req->payload;
+			uint32_t max_idx = (page_size * page_per_cluster) / sizeof(uint32_t);
+			// prepare req
+			if (xfer->idx < xfer->num_clusters) {
+				for (uint32_t i = xfer->idx; i < xfer->num_clusters; i++) {
+					xfer->idx++;
+					if (xfer->clusters[i] == 0) {
+						continue;
+					}
+
+					is_allocate = true;
+					idx_out[req->len++] = (uint32_t)i;
+
+					if (req->len == max_idx) {
+						break;
+					}
+				}
+
+				if (!is_allocate) {
+					if (xfer->num_extent_pages == 0) {
+						// no more md to send
+						xfer->state = XFER_STATE_TRANSFER_ROOT_MD;
+						xfer_fill_queue(xfer, 1);
+						return 0;
+					}
+					break;
+				}
+
+				xfer->num_extent_pages++;
+				// 0 + id + 1 + index
+				req->s3_offset = s3_pack_offset(xfer->num_extent_pages, xfer->s3_id, true /* mid flag */, false);
+				req->len = page_per_cluster; // 2MB
+				req->action = REQ_ACTION_WRITE;
+				req->status = XFER_REQ_STATUS_READY;
+				xfer->outstanding_io++;
+				
+				/* enqueue for transfer; if ready_ring is full, return req to free_ring or retry */
+				if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
+					SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
+					assert(false);
+				}				
+				count++;
+			}
+			break;
+		case XFER_STATE_TRANSFER_ROOT_MD:
+			rc = xfer_s3_check(xfer, &req, xfer->idx, XFER_STATE_DONE, 0);
+			if (rc != 0) {
+				return 0;
+			}
+
+			if (xfer->idx == 1 ) {
+				// all done
+				break;
+			}
+			xfer->idx++;
+			// prepare req
+			uint8_t *p = req->payload;
+
+			memcpy(p, &xfer->num_extent_pages, sizeof(uint32_t));
+			p += sizeof(uint32_t);
+
+			memcpy(p, &xfer->num_clusters, sizeof(uint32_t));
+			p += sizeof(uint32_t);
+			uint32_t geometry = spdk_blob_get_geometry(xfer->lvol->blob);
+			memcpy(p, &geometry, sizeof(uint32_t));
+			p += sizeof(uint32_t);
+
+			memcpy(p, &xfer->s3_id, sizeof(uint32_t));
+			p += sizeof(uint32_t);
+
+			memset(p, 0, SPDK_LVOL_NAME_MAX);
+			strncpy((char *)p, xfer->lvol->name, SPDK_LVOL_NAME_MAX);
+			p += SPDK_LVOL_NAME_MAX;
+
+			memset(p, 0, SPDK_UUID_STRING_LEN);
+			memcpy(p, xfer->lvol->uuid_str, SPDK_UUID_STRING_LEN);
+			p += SPDK_UUID_STRING_LEN;
+
+			// 0 + id + 1 + 0
+			req->s3_offset = s3_pack_offset(0, xfer->s3_id, true /* mid flag */, false);
+			req->len = page_per_cluster; // 2MB
+			req->action = REQ_ACTION_WRITE;
+			req->status = XFER_REQ_STATUS_READY;
+			xfer->outstanding_io++;
+
+			/* enqueue for transfer; if ready_ring is full, return req to free_ring or retry */
+			if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
+				SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
+				assert(false);
+			}
+			count++;
+			break;
+		case XFER_STATE_DONE:
+			xfer->lvol->transfer_status = XFER_DONE;
+			//TODO we can start delete old s3 data here
+			// we have old_s3_id and old_num_clusters and old_num_extent_pages
+			// but for safety we can do it outside
+			destroy_xfer_task(xfer);			
+			return 0;
+
+		case XFER_STATE_FAILED:
+			// should not come here
+			SPDK_ERRLOG("S3 transfer task failed: -----\n");
+			if (xfer->outstanding_io != 0) {
+				//wait until all io done or timeout
+				SPDK_ERRLOG("S3 transfer task failed: ----- but still have outstanding io %d\n", xfer->outstanding_io);
+			}
+			destroy_xfer_task(xfer);
+			return 0;
+
+	default:
+		break;
+	}
+	return count;
+}
+
+static int
+xfer_s3_recovery(struct spdk_lvs_xfer *xfer) {
+	struct spdk_lvs_xfer_req *req;
+	uint64_t page_size;
+	uint64_t page_per_cluster;
+	int count = 0;
+	int rc = 0;
+
+	page_size = spdk_bs_get_page_size(xfer->lvol->lvol_store->blobstore);
+	page_per_cluster = spdk_bs_get_cluster_size(xfer->lvol->lvol_store->blobstore) / page_size;
+
+	switch (xfer->state)
+	{
+		case XFER_STATE_NONE:
+			xfer->state = XFER_STATE_READ_ROOT_MD;
+			xfer_fill_queue(xfer, 1);
+			break;
+		case XFER_STATE_NEXT_S3_ID:
+			if (xfer->hold_idx < xfer->chain_count) {
+				xfer->state = XFER_STATE_READ_ROOT_MD;
+				xfer->hold_idx++;
+				xfer_fill_queue(xfer, 1);
+				return 0;
+			}
+			xfer->state = XFER_STATE_RECOVER_CLUSTERS;
+			xfer->hold_idx = 0;
+			xfer_fill_queue(xfer, xfer->cluster_batch);
+			break;
+		case XFER_STATE_READ_ROOT_MD:
+			rc = xfer_s3_check(xfer, &req, xfer->idx, XFER_STATE_READ_EXTENT_MD, xfer->cluster_batch);
+			if (rc != 0) {
+				return 0;
+			}
+
+			if (xfer->idx == 1) {
+				// all done
+				// parse root md
+				uint8_t *p = req->payload;
+				memcpy(&xfer->num_extent_pages, p, sizeof(uint32_t));
+				p += sizeof(uint32_t);
+
+				memcpy(&xfer->old_num_clusters, p, sizeof(uint32_t));
+				p += sizeof(uint32_t);
+				
+				SPDK_NOTICELOG("Merge S3 Root MD: extent pages %u clusters %u s3 id %u\n",
+								xfer->num_extent_pages, xfer->num_clusters, xfer->s3_id);
+
+				if (xfer->num_extent_pages == 0) {
+					// no extent md to read
+					xfer->state = XFER_STATE_NEXT_S3_ID;
+					xfer_fill_queue(xfer, 0);
+					return 0;
+				}
+
+				xfer->state = XFER_STATE_READ_EXTENT_MD;
+				xfer_fill_queue(xfer, xfer->cluster_batch);
+				return 0;
+			}
+
+			req->offset = s3_pack_offset(0, xfer->chain_s3_ids[xfer->hold_idx], true /* mid flag */, false);
+			req->len = page_per_cluster; // 2MB
+			req->action = REQ_ACTION_READ;
+			req->status = XFER_REQ_STATUS_READY;
+
+			/* enqueue for transfer; if ready_ring is full, return req to free_ring or retry */
+			if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
+				SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
+				assert(false);
+			}
+
+			xfer->outstanding_io++;
+			xfer->idx++;
+			count++;
+			break;
+		case XFER_STATE_READ_EXTENT_MD:
+			rc = xfer_s3_check(xfer, &req, xfer->num_extent_pages, XFER_STATE_NEXT_S3_ID, 1);
+			if (rc != 0) {
+				return 0;
+			}
+
+			if (xfer->idx != 0) {
+				// read done, parse extent md
+				uint32_t *idx_in = (uint32_t *)req->payload;
+				uint32_t entries = req->len / sizeof(uint32_t);
+				for (uint32_t j = 0; j < entries; j++) {
+					if (idx_in[j] == 0) {
+						break;
+					}
+
+					if (!((idx_in[j] < xfer->old_num_clusters) && (idx_in[j] < xfer->num_clusters))) {
+						break;
+					}
+
+					if (xfer->clusters[idx_in[j]] != 0) {
+						continue;
+					}
+
+					xfer->clusters[idx_in[j]] = s3_pack_offset(idx_in[j], xfer->chain_s3_ids[xfer->hold_idx], false /* mid flag */, false /* MSB flag */);
+				}
+			}
+
+			if (xfer->idx < xfer->num_extent_pages) {
+				// prepare req
+				req->s3_offset = s3_pack_offset(xfer->idx + 1, xfer->chain_s3_ids[xfer->hold_idx], true /* mid flag */, false);
+				req->len = page_size * page_per_cluster; // 2MB
+				req->action = REQ_ACTION_READ;
+				req->status = XFER_REQ_STATUS_READY;
+
+				/* enqueue for transfer; if ready_ring is full, return req to free_ring or retry */
+				if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
+					SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
+					assert(false);
+				}
+
+				xfer->outstanding_io++;
+				xfer->idx++;
+				count++;
+				return count;
+			}
+			break;
+		case XFER_STATE_RECOVER_CLUSTERS:
+			rc = xfer_s3_check(xfer, &req, xfer->idx, XFER_STATE_TRANSFER_MD_DATA, xfer->cluster_batch);
+			if (rc != 0) {
+				return 0;
+			}
+
+			// recover clusters arrays
+			for (uint32_t i = xfer->hold_idx; i < xfer->num_clusters && i < xfer->old_num_clusters; i++) {
+				xfer->hold_idx++;
+				// need to recover
+				if (xfer->clusters[i] != 0) {
+					// prepare req
+					req->s3_offset = xfer->clusters[i];
+					req->offset = i * page_per_cluster;
+					req->len = page_per_cluster; // 2MB
+					req->action = REQ_ACTION_COPY_RECOVER;
+					req->status = XFER_REQ_STATUS_READY;
+
+					/* enqueue for transfer; if ready_ring is full, return req to free_ring or retry */
+					if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
+						SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
+						assert(false);
+					}
+					xfer->outstanding_io++;
+					xfer->idx++;
+					count++;
+					return count;
+				}
+			}
+
+			if (!xfer->persist_swap) {
+				xfer->hold_idx = 0;
+				// no need to persist the swapped clusters
+				SPDK_NOTICELOG("No persist swapped clusters to S3 id %u\n", xfer->s3_id);
+				xfer->state = XFER_STATE_DONE;
+				xfer_fill_queue(xfer, 0);
+				return 0;
+			}
+			break;
+		case XFER_STATE_DONE:
+			xfer->lvol->transfer_status = XFER_DONE;
+			//TODO we can start delete old s3 data here
+			// we have old_s3_id and old_num_clusters and old_num_extent_pages
+			// but for safety we can do it outside
+			destroy_xfer_task(xfer);			
+			return 0;
+
+		case XFER_STATE_FAILED:
+			// should not come here
+			SPDK_ERRLOG("S3 transfer task failed: -----\n");
+			if (xfer->outstanding_io != 0) {
+				//wait until all io done or timeout
+				SPDK_ERRLOG("S3 transfer task failed: ----- but still have outstanding io %d\n", xfer->outstanding_io);
+			}
+			destroy_xfer_task(xfer);
+			return 0;
+
+	default:
+		break;
+	}
+	return count;
+}
+
+
+static int
 md_xfer_poller(void *cb_arg)
 {
 	struct spdk_lvs_xfer *xfer, *tmp;
 	int count = 0;
 	TAILQ_FOREACH_SAFE(xfer, &g_lvs_xfer_tasks, entry, tmp) {
-
-		if (xfer->type == XFER_REPLICATE_SNAPSHOT) {
-			count += xfer_replication(xfer);
-		} else {
-			count += xfer_migration(xfer);			
+		switch (xfer->type)
+		{
+			case XFER_REPLICATE_SNAPSHOT:
+				count += xfer_replication(xfer);
+				break;
+			case XFER_MIGRATE_SNAPSHOT:
+				count += xfer_migration(xfer);
+				break;
+			case XFER_S3_BACKUP:
+				count += xfer_s3_backup(xfer);
+				break;
+			case XFER_S3_MERGE:
+				count += xfer_s3_merge(xfer);
+				break;
+			case XFER_S3_RECOVER:
+				count += xfer_s3_recovery(xfer);
+				break;
+			default:
+				break;
 		}
 	}
     return count ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
@@ -4381,7 +5388,7 @@ static void
 spdk_lvs_create_poll_group(void *ctx)
 {
 	struct spdk_lvs_poll_group *lpg;
-
+	struct spdk_lvol_store *lvs = ctx;
 	lpg = calloc(1, sizeof(*lpg));
 	if (!lpg) {
 		SPDK_ERRLOG("Not enough memory to allocate poll groups in lvs.\n");
@@ -4393,6 +5400,12 @@ spdk_lvs_create_poll_group(void *ctx)
 	lpg->thread_name = spdk_thread_get_name(lpg->thread);
 	TAILQ_INIT(&lpg->rmt_lvols);
 	lpg->md_thread = g_lvs_md_thread;
+	lpg->lvs = lvs;
+	lpg->lpg_md_channel = spdk_bs_alloc_io_channel(lvs->blobstore);
+	if (!lpg->lpg_md_channel) {
+		SPDK_ERRLOG("Failed to get IO channel.\n");
+		return;
+	}
 	lpg->xfer_poller = NULL;
 	const char *suffix = strrchr(lpg->thread_name, '_'); // find last '_'        
 	lpg->id =  atoi(suffix + 1);
@@ -4468,7 +5481,23 @@ spdk_lvs_poll_group_options(char *mask)
 		return -EINVAL;
 	}
 
-	spdk_lvs_create_poll_groups(NULL);
+
+	struct spdk_lvol_store *lvs, *tmp;
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+		TAILQ_FOREACH(tmp, &g_lvol_stores, link) {
+			if (tmp->primary == true) {
+				lvs = tmp;
+				break;
+			}
+		}
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+	
+	if (!lvs) {
+		SPDK_ERRLOG("No primary lvol store found to create poll groups.\n");
+		return -EINVAL;
+	}
+
+	spdk_lvs_create_poll_groups(lvs);
 	return 0;
 }
 
@@ -4489,7 +5518,7 @@ spdk_lvs_rmt_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bde
 }
 
 static struct spdk_transfer_dev *
-spdk_check_rmt_bdev(const char *name)
+spdk_check_rmt_bdev(const char *name, bool is_s3)
 {
 	struct spdk_lvol_store *lvs_iter;
 	struct spdk_transfer_dev *tdev;
@@ -4497,11 +5526,15 @@ spdk_check_rmt_bdev(const char *name)
 	pthread_mutex_lock(&g_lvol_stores_mutex);
 	TAILQ_FOREACH(lvs_iter, &g_lvol_stores, link) {
 		TAILQ_FOREACH(tdev, &lvs_iter->transfer_devs, entry) {
-			if (strcmp(tdev->bdev_name, name) != 0) {
-				continue;
+			if (is_s3 && tdev->is_s3) {
+				bdev_found = true;
+				break;
 			}
-			bdev_found = true;
-			break;			
+
+			if (name && strcmp(tdev->bdev_name, name) == 0) {
+				bdev_found = true;
+				break;
+			}
 		}
 
 		if (bdev_found) {
@@ -4516,12 +5549,12 @@ spdk_check_rmt_bdev(const char *name)
 }
 
 struct spdk_transfer_dev *
-spdk_open_rmt_bdev(const char *name, struct spdk_lvol_store *lvs)
+spdk_open_rmt_bdev(const char *name, struct spdk_lvol_store *lvs, bool is_s3)
 {
 	struct spdk_transfer_dev *tdev;
 	int rc = 0;
 
-	tdev = spdk_check_rmt_bdev(name);
+	tdev = spdk_check_rmt_bdev(name, false);
 	if (tdev) {
 		SPDK_NOTICELOG("The remote bdev already opened.\n");
 		tdev->reused = true;
@@ -4535,6 +5568,7 @@ spdk_open_rmt_bdev(const char *name, struct spdk_lvol_store *lvs)
 	}
 
 	snprintf(tdev->bdev_name, sizeof(tdev->bdev_name), "%s", name);
+	tdev->is_s3 = is_s3;
 	tdev->lvs = lvs;
 	tdev->reused = false;
 	tdev->thread = spdk_get_thread();
@@ -4746,6 +5780,214 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
 
 	tdev->reused = false;
 	return 0;
+}
+
+static int
+spdk_lvol_create_backup_task(struct spdk_lvs_xfer *task, struct spdk_transfer_dev *tdev) {
+
+	struct spdk_lvs_xfer_req *req;
+	struct spdk_lvs_poll_group *lpg;
+	int s_elements_payload = 0;
+
+	s_elements_payload = spdk_bs_get_cluster_size(tdev->lvs->blobstore);
+
+	task->free_ring  = spdk_ring_create(SPDK_RING_TYPE_MP_MC, task->cluster_batch, SPDK_ENV_SOCKET_ID_ANY);
+	if (!task->free_ring) {
+		SPDK_ERRLOG("Unable to allocate rings on transfer task for lvol %d\n", task->s3_id);
+		goto error;
+	}
+
+    task->ready_ring = spdk_ring_create(SPDK_RING_TYPE_MP_MC, task->cluster_batch, SPDK_ENV_SOCKET_ID_ANY);
+	if (!task->ready_ring) {
+		SPDK_ERRLOG("Unable to allocate rings on transfer task for lvol %d\n", task->s3_id);
+		goto error;
+	}
+
+	task->reqs = calloc(task->cluster_batch, sizeof(*task->reqs));
+	if (!task->reqs) {
+		SPDK_ERRLOG("Unable to allocate reqs on xfer task for lvol %d\n", task->s3_id);		
+		goto error;
+	}
+
+	task->pdus = spdk_dma_zmalloc(task->cluster_batch * s_elements_payload, 0x1000, NULL);
+	if (!task->pdus) {
+		SPDK_ERRLOG("Unable to allocate pdu pool on transfer task for lvol %d.\n", task->s3_id);
+		goto error;
+	}
+
+	for (int i = 0; i < task->cluster_batch; i++) {
+        task->reqs[i].payload =  task->pdus + (i * s_elements_payload);
+        task->reqs[i].len = s_elements_payload;
+        // task->reqs[i].remote_desc = remote_desc;
+		task->reqs[i].xfer = task;
+		task->reqs[i].type = task->type;
+		req = &task->reqs[i];
+		req->status = XFER_REQ_STATUS_NONE;
+    }
+
+	// insert tdev to all helper cores and open channels	
+	TAILQ_FOREACH(lpg, &g_lvs_poll_groups, entry) {
+		struct remote_lvol_info *rmt_lvol = calloc(1, sizeof(*rmt_lvol));
+		if (!rmt_lvol) {
+			SPDK_ERRLOG("Cannot allocate memory for remote lvol info.\n");			
+			goto error;
+		}
+		tdev->pg[lpg->id] = true;
+		rmt_lvol->bdev_name = tdev->bdev_name;
+		rmt_lvol->desc = tdev->desc;
+		rmt_lvol->free_ring = task->free_ring;
+		rmt_lvol->ready_ring = task->ready_ring;
+		rmt_lvol->group = lpg;
+		spdk_thread_send_msg(lpg->thread, spdk_lvs_add_rmt_bdev_to_poll_group, rmt_lvol);
+	}
+	
+	SPDK_NOTICELOG("Transfer task %d %s task: status %d start.\n", task->s3_id,
+		 			"backup to s3", task->lvol->transfer_status);
+
+	TAILQ_FOREACH(lpg, &g_lvs_poll_groups, entry) {
+		spdk_thread_send_msg(lpg->thread, spdk_create_poller, lpg);
+	}
+
+	if (!xfer_md_poller) {
+		xfer_md_poller = spdk_poller_register(md_xfer_poller, NULL, 1000);
+	}
+
+	TAILQ_INSERT_TAIL(&g_lvs_xfer_tasks, task, entry);
+	return 0;
+
+error:
+	spdk_dma_free(task->pdus);
+	free(task->reqs);
+	spdk_ring_free(task->free_ring);
+	spdk_ring_free(task->ready_ring);
+	free(task->chain);
+	free(task->clusters);
+	free(task);
+	return -ENOMEM;
+}
+
+int
+spdk_lvol_s3_backup(struct spdk_lvol *lvol, uint32_t cluster_batch,
+				struct spdk_lvol **chain_snapshots, int num_snapshots, uint32_t s3_id) {
+	struct spdk_transfer_dev *tdev;
+	struct spdk_lvs_xfer *xfer, *task;
+
+	TAILQ_FOREACH(xfer, &g_lvs_xfer_tasks, entry) {
+		if (xfer->lvol == lvol) {
+			SPDK_NOTICELOG("The same transfer task already exists.\n");
+			return -EEXIST;
+		}
+	}
+
+	tdev = spdk_check_rmt_bdev(NULL, true);
+	if (!tdev) {
+		SPDK_ERRLOG("Cannot find S3 transfer device.\n");
+		return -EINVAL;
+	}
+
+	task = calloc(1, sizeof(*task));
+	if (!task) {
+		SPDK_ERRLOG("Cannot allocate memory for transfer structure task.\n");
+		return -ENOMEM;
+	}
+	task->lvol = lvol;
+	task->cluster_batch = cluster_batch;
+	task->type = XFER_S3_BACKUP;
+	task->state = XFER_STATE_NONE;
+	task->chain = chain_snapshots;
+	task->chain_count = num_snapshots;
+	task->s3_id = s3_id;
+	task->timeout = spdk_get_ticks();
+
+	task->num_clusters = spdk_blob_get_num_clusters(lvol->blob);
+	task->clusters = calloc(task->num_clusters, sizeof(uint64_t));
+	if (!task->clusters) {
+		SPDK_ERRLOG("Cannot allocate memory for transfer clusters array.\n");
+		free(task->chain);
+		free(task);
+		return -ENOMEM;
+	}
+
+	return spdk_lvol_create_backup_task(task, tdev);
+}
+
+int
+spdk_lvol_s3_merge(struct spdk_lvol *lvol, uint32_t s3_id, uint32_t old_s3_id, uint32_t cluster_batch) {
+	struct spdk_transfer_dev *tdev;
+	struct spdk_lvs_xfer *xfer, *task;
+
+	TAILQ_FOREACH(xfer, &g_lvs_xfer_tasks, entry) {
+		if (xfer->s3_id == s3_id && xfer->old_s3_id == old_s3_id) {
+			SPDK_NOTICELOG("The same transfer task already exists.\n");
+			return -EEXIST;
+		}
+	}
+	tdev = spdk_check_rmt_bdev(NULL, true);
+	if (!tdev) {
+		SPDK_ERRLOG("Cannot find S3 transfer device.\n");
+		return -EINVAL;
+	}
+
+	task = calloc(1, sizeof(*task));
+	if (!task) {
+		SPDK_ERRLOG("Cannot allocate memory for transfer structure task.\n");
+		return -ENOMEM;
+	}
+
+	task->cluster_batch = cluster_batch;
+	task->type = XFER_S3_MERGE;
+	task->state = XFER_STATE_NONE;
+
+	task->s3_id = s3_id;
+	task->old_s3_id = old_s3_id;
+	task->timeout = spdk_get_ticks();
+
+	return spdk_lvol_create_backup_task(task, tdev);
+}
+
+int
+spdk_lvol_s3_recovery(struct spdk_lvol *lvol, uint32_t cluster_batch,
+				uint32_t *chain_s3_ids, uint32_t num_s3_ids) {
+	struct spdk_transfer_dev *tdev;
+	struct spdk_lvs_xfer *xfer, *task;
+
+	TAILQ_FOREACH(xfer, &g_lvs_xfer_tasks, entry) {
+		if (xfer->lvol == lvol) {
+			SPDK_NOTICELOG("The same transfer task already exists.\n");
+			return -EEXIST;
+		}
+	}
+
+	tdev = spdk_check_rmt_bdev(NULL, true);
+	if (!tdev) {
+		SPDK_ERRLOG("Cannot find S3 transfer device.\n");
+		return -EINVAL;
+	}
+
+	task = calloc(1, sizeof(*task));
+	if (!task) {
+		SPDK_ERRLOG("Cannot allocate memory for transfer structure task.\n");
+		return -ENOMEM;
+	}
+	task->lvol = lvol;
+	task->cluster_batch = cluster_batch;
+	task->type = XFER_S3_RECOVER;
+	task->state = XFER_STATE_NONE;
+	task->chain_s3_ids = chain_s3_ids;
+	task->chain_s3_count = num_s3_ids;
+
+	task->timeout = spdk_get_ticks();
+
+	task->num_clusters = spdk_blob_get_num_clusters(lvol->blob);
+	task->clusters = calloc(task->num_clusters, sizeof(uint64_t));
+	if (!task->clusters) {
+		SPDK_ERRLOG("Cannot allocate memory for transfer clusters array.\n");
+		free(task->chain);
+		free(task);
+		return -ENOMEM;
+	}
+
+	return spdk_lvol_create_backup_task(task, tdev);
 }
 
 void

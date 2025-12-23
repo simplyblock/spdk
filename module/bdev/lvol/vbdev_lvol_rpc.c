@@ -2953,6 +2953,350 @@ cleanup:
 SPDK_RPC_REGISTER("bdev_lvol_set_priority_class", rpc_bdev_lvol_set_priority_class,
 		  SPDK_RPC_RUNTIME)
 
+struct rpc_bdev_lvol_s3_backup_snapshots {
+	/* Number of snapshot chain names */
+	size_t           num;
+
+	/* List of snapshot chain names */
+	char             *names[RPC_MAX_LVOL_VBDEV];
+};
+
+struct rpc_bdev_lvol_s3_backup {
+	uint64_t offset;
+	uint32_t cluster_batch;
+	uint32_t s3_id;	
+	struct rpc_bdev_lvol_s3_backup_snapshots snapshot_names;
+	uint32_t snapshot_cnt;
+};
+
+/*
+ * Decoder function for RPC bdev_lvol_s3_backup to decode snapshot names list
+ */
+static int
+decode_snapshot_names(const struct spdk_json_val *val, void *out)
+{
+	struct rpc_bdev_lvol_s3_backup_snapshots *names = out;
+	return spdk_json_decode_array(val, spdk_json_decode_string, names->names,
+				      RPC_MAX_LVOL_VBDEV, &names->num, sizeof(char *));
+}
+
+static void 
+free_rpc_bdev_lvol_s3_backup(struct rpc_bdev_lvol_s3_backup *req) {
+	for (size_t i = 0; i < req->snapshot_names.num; i++) {
+		free(req->snapshot_names.names[i]);
+	}
+}
+
+static const struct spdk_json_object_decoder rpc_bdev_lvol_s3_backup_decoders[] = {
+	{"offset", offsetof(struct rpc_bdev_lvol_s3_backup, offset), spdk_json_decode_uint64},
+	{"cluster_batch", offsetof(struct rpc_bdev_lvol_s3_backup, cluster_batch), spdk_json_decode_uint32, true},
+	{"s3_id", offsetof(struct rpc_bdev_lvol_s3_backup, s3_id), spdk_json_decode_uint32},
+	{"snapshot_names", offsetof(struct rpc_bdev_lvol_s3_backup, snapshot_names), decode_snapshot_names},
+	{"snapshot_cnt", offsetof(struct rpc_bdev_lvol_s3_backup, snapshot_cnt), spdk_json_decode_uint32},
+};
+
+static void 
+rpc_bdev_lvol_s3_backup(struct spdk_jsonrpc_request *request,
+			      const struct spdk_json_val *params) 
+{
+	struct rpc_bdev_lvol_s3_backup req = {};
+	struct spdk_lvol *snapshot, **snapshot_chain;
+	struct spdk_bdev *lvol_bdev;
+	int rc = 0;
+
+	if (spdk_json_decode_object(params, rpc_bdev_lvol_s3_backup_decoders,
+				    SPDK_COUNTOF(rpc_bdev_lvol_s3_backup_decoders),
+				    &req)) {
+		SPDK_INFOLOG(lvol_rpc, "spdk_json_decode_object failed\n");
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "spdk_json_decode_object failed");
+		goto cleanup;
+	}
+	
+	if (req.s3_id == 0) {
+		SPDK_ERRLOG("s3_id must be specified");
+		spdk_jsonrpc_send_error_response(request, -EINVAL, spdk_strerror(EINVAL));
+		goto cleanup;
+	}
+
+	snapshot_chain = calloc(req.snapshot_names.num, sizeof(struct spdk_lvol *));
+	if (!snapshot_chain) {
+		spdk_jsonrpc_send_error_response(request,
+			SPDK_JSONRPC_ERROR_INVALID_PARAMS, "Cannot allocate memory for snapshot chain");
+		goto cleanup;
+	}
+
+	for (size_t i = 0; i < req.snapshot_names.num; i++) {
+		SPDK_NOTICELOG("name[%zu]=%s\n", i, req.snapshot_names.names[i]);
+		lvol_bdev = spdk_bdev_get_by_name(req.snapshot_names.names[i]);
+		if (lvol_bdev == NULL) {
+			SPDK_ERRLOG("lvol bdev '%s' does not exist\n", req.snapshot_names.names[i]);
+			spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
+			goto cleanup;
+		}
+
+		snapshot = vbdev_lvol_get_from_bdev(lvol_bdev);
+		if (snapshot == NULL) {
+			SPDK_ERRLOG("snapshot %s does not exist\n", req.snapshot_names.names[i]);
+			spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
+			goto cleanup;
+		}
+		snapshot_chain[i] = snapshot;
+	}
+
+	SPDK_NOTICELOG("Backing up lvol %s to S3 id %u.\n", snapshot_chain[0]->name,  req.s3_id);
+
+	rc = spdk_lvol_s3_backup(snapshot_chain[0], req.cluster_batch, snapshot_chain, req.snapshot_names.num, req.s3_id);
+	if (rc < 0) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 spdk_strerror(-rc));
+		goto cleanup;
+	}
+	spdk_jsonrpc_send_bool_response(request, true);
+
+cleanup:
+	free_rpc_bdev_lvol_s3_backup(&req);
+}
+
+SPDK_RPC_REGISTER("bdev_lvol_s3_backup", rpc_bdev_lvol_s3_backup, SPDK_RPC_RUNTIME)
+
+struct rpc_bdev_lvol_s3_merge {
+	char *lvol_name;
+	uint32_t old_s3_id;
+	uint32_t s3_id;
+	uint32_t cluster_batch;
+};
+
+static void 
+free_rpc_bdev_lvol_s3_merge(struct rpc_bdev_lvol_s3_merge *req) {
+	free(req->lvol_name);
+}
+
+static const struct spdk_json_object_decoder rpc_bdev_lvol_s3_merge_decoders[] = {
+	{"lvol_name", offsetof(struct rpc_bdev_lvol_s3_merge, lvol_name), spdk_json_decode_string},
+	{"old_s3_id", offsetof(struct rpc_bdev_lvol_s3_merge, old_s3_id), spdk_json_decode_uint32},
+	{"cluster_batch", offsetof(struct rpc_bdev_lvol_s3_merge, cluster_batch), spdk_json_decode_uint32},
+	{"s3_id", offsetof(struct rpc_bdev_lvol_s3_merge, s3_id), spdk_json_decode_uint32},
+};
+
+static void 
+rpc_bdev_lvol_s3_merge(struct spdk_jsonrpc_request *request,
+			      const struct spdk_json_val *params) 
+{
+	struct rpc_bdev_lvol_s3_merge req = {};
+	// struct spdk_lvol *lvol;
+	// struct spdk_bdev *lvol_bdev;
+	int rc = 0;
+
+	if (spdk_json_decode_object(params, rpc_bdev_lvol_s3_merge_decoders,
+				    SPDK_COUNTOF(rpc_bdev_lvol_s3_merge_decoders),
+				    &req)) {
+		SPDK_INFOLOG(lvol_rpc, "spdk_json_decode_object failed\n");
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "spdk_json_decode_object failed");
+		goto cleanup;
+	}
+
+	if (req.old_s3_id == 0 || req.s3_id == 0) {
+		SPDK_ERRLOG("old_s3_id and s3_id must be specified");
+		spdk_jsonrpc_send_error_response(request, -EINVAL, spdk_strerror(EINVAL));
+		goto cleanup;
+	}
+
+	// lvol_bdev = spdk_bdev_get_by_name(req.lvol_name);
+	// if (lvol_bdev == NULL) {
+	// 	SPDK_ERRLOG("lvol bdev '%s' does not exist\n", req.lvol_name);
+	// 	spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
+	// 	goto cleanup;
+	// }
+
+	// lvol = vbdev_lvol_get_from_bdev(lvol_bdev);
+	// if (lvol == NULL) {
+	// 	SPDK_ERRLOG("lvol does not exist\n");
+	// 	spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
+	// 	goto cleanup;
+	// }
+
+	SPDK_NOTICELOG("Backing up lvol %s to S3 id %u.\n", req.lvol_name,  req.s3_id);
+
+	rc = spdk_lvol_s3_merge(NULL, req.s3_id, req.old_s3_id, req.cluster_batch);
+	if (rc < 0) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 spdk_strerror(-rc));
+		goto cleanup;
+	}
+	spdk_jsonrpc_send_bool_response(request, true);
+
+cleanup:
+	free_rpc_bdev_lvol_s3_merge(&req);
+}
+
+SPDK_RPC_REGISTER("bdev_lvol_s3_merge", rpc_bdev_lvol_s3_merge, SPDK_RPC_RUNTIME)
+
+struct rpc_bdev_lvol_recovery_s3_ids {
+	/* Number of s3 ids */
+	size_t           num;
+
+	/* List of s3 ids */
+	uint32_t         ids[RPC_MAX_LVOL_VBDEV];
+};
+
+struct rpc_bdev_lvol_s3_recovery {
+	char *lvol_name;
+	uint32_t cluster_batch;
+	struct rpc_bdev_lvol_recovery_s3_ids s3_ids;  /* JSON array */
+};
+
+/*
+ * Decoder function for RPC bdev_lvol_s3_recovery to decode s3 ids list
+ */
+static int
+decode_s3_ids(const struct spdk_json_val *val, void *out)
+{
+	struct rpc_bdev_lvol_recovery_s3_ids *s3_ids = out;
+	return spdk_json_decode_array(val, spdk_json_decode_uint32, s3_ids->ids,
+				      RPC_MAX_LVOL_VBDEV, &s3_ids->num, sizeof(char *));
+}
+
+static void 
+free_rpc_bdev_lvol_s3_recovery(struct rpc_bdev_lvol_s3_recovery *req) {
+	free(req->lvol_name);	
+}
+
+static const struct spdk_json_object_decoder rpc_bdev_lvol_s3_recovery_decoders[] = {
+	{"lvol_name", offsetof(struct rpc_bdev_lvol_s3_recovery, lvol_name), spdk_json_decode_string},
+	{"cluster_batch", offsetof(struct rpc_bdev_lvol_s3_recovery, cluster_batch), spdk_json_decode_uint32},
+	{"s3_ids", offsetof(struct rpc_bdev_lvol_s3_recovery, s3_ids), decode_s3_ids},
+};
+
+static void 
+rpc_bdev_lvol_s3_recovery(struct spdk_jsonrpc_request *request,
+			      const struct spdk_json_val *params) 
+{
+	struct rpc_bdev_lvol_s3_recovery req = {};
+	struct spdk_lvol *lvol;
+	struct spdk_bdev *lvol_bdev;
+	uint32_t *s3_ids_chain = NULL;
+	int rc = 0;
+
+	if (spdk_json_decode_object(params, rpc_bdev_lvol_s3_recovery_decoders,
+				    SPDK_COUNTOF(rpc_bdev_lvol_s3_recovery_decoders),
+				    &req)) {
+		SPDK_INFOLOG(lvol_rpc, "spdk_json_decode_object failed\n");
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "spdk_json_decode_object failed");
+		goto cleanup;
+	}
+
+	if (req.lvol_name) {
+		SPDK_ERRLOG("lvol_name and s3_id must be specified");
+		spdk_jsonrpc_send_error_response(request, -EINVAL, spdk_strerror(EINVAL));
+		goto cleanup;
+	}
+
+	lvol_bdev = spdk_bdev_get_by_name(req.lvol_name);
+	if (lvol_bdev == NULL) {
+		SPDK_ERRLOG("lvol bdev '%s' does not exist\n", req.lvol_name);
+		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
+		goto cleanup;
+	}
+
+	lvol = vbdev_lvol_get_from_bdev(lvol_bdev);
+	if (lvol == NULL) {
+		SPDK_ERRLOG("lvol does not exist\n");
+		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
+		goto cleanup;
+	}
+
+	s3_ids_chain = calloc(req.s3_ids.num, sizeof(uint32_t));
+	if (!s3_ids_chain) {
+		spdk_jsonrpc_send_error_response(request,
+			SPDK_JSONRPC_ERROR_INVALID_PARAMS, "Cannot allocate memory for s3 ids chain");
+		goto cleanup;
+	}
+
+	for (size_t i = 0; i < req.s3_ids.num; i++) {
+		s3_ids_chain[i] = req.s3_ids.ids[i];
+		// SPDK_NOTICELOG("s3_id[%zu]=%u\n", i, s3_ids_chain[i]);
+	}
+
+	SPDK_NOTICELOG("Recovering lvol %s from S3.\n", req.lvol_name);
+
+	rc = spdk_lvol_s3_recovery(lvol, req.cluster_batch, s3_ids_chain, req.s3_ids.num);
+	if (rc < 0) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 spdk_strerror(-rc));
+		goto cleanup;
+	}
+	spdk_jsonrpc_send_bool_response(request, true);
+
+cleanup:
+	free_rpc_bdev_lvol_s3_recovery(&req);
+}
+
+SPDK_RPC_REGISTER("bdev_lvol_s3_recovery", rpc_bdev_lvol_s3_recovery, SPDK_RPC_RUNTIME)
+
+struct rpc_bdev_lvol_s3_bdev {
+	char *s3_bdev;
+	char *uuid;
+	char *lvs_name;
+};
+
+static void 
+free_rpc_bdev_lvol_s3_bdev(struct rpc_bdev_lvol_s3_bdev *req) {
+	free(req->s3_bdev);
+	free(req->uuid);
+	free(req->lvs_name);
+}
+
+static const struct spdk_json_object_decoder rpc_bdev_lvol_s3_bdev_decoders[] = {
+	{"s3_bdev", offsetof(struct rpc_bdev_lvol_s3_bdev, s3_bdev), spdk_json_decode_string},
+	{"uuid", offsetof(struct rpc_bdev_lvol_s3_bdev, uuid), spdk_json_decode_string, true},
+	{"lvs_name", offsetof(struct rpc_bdev_lvol_s3_bdev, lvs_name), spdk_json_decode_string, true},
+};
+
+static void 
+rpc_bdev_lvol_s3_bdev(struct spdk_jsonrpc_request *request,
+			      const struct spdk_json_val *params) 
+{
+	struct rpc_bdev_lvol_s3_bdev req = {};
+	struct spdk_transfer_dev *tdev;
+	struct spdk_lvol_store *lvs = NULL;
+	int rc = 0;
+
+	if (spdk_json_decode_object(params, rpc_bdev_lvol_s3_bdev_decoders,
+				    SPDK_COUNTOF(rpc_bdev_lvol_s3_bdev_decoders),
+				    &req)) {
+		SPDK_INFOLOG(lvol_rpc, "spdk_json_decode_object failed\n");
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "spdk_json_decode_object failed");
+		goto cleanup;
+	}
+	
+	if (!req.s3_bdev) {
+		SPDK_ERRLOG("s3 bdev name must be specified");
+		spdk_jsonrpc_send_error_response(request, -EINVAL, spdk_strerror(EINVAL));
+		goto cleanup;
+	}
+
+	rc = vbdev_get_lvol_store_by_uuid_xor_name(req.uuid, req.lvs_name, &lvs);
+	if (rc != 0) {
+		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
+		goto cleanup;
+	}
+
+	tdev = spdk_open_rmt_bdev(req.s3_bdev, lvs, true);
+	if (tdev == NULL) {
+		SPDK_ERRLOG("bdev '%s' open failed\n", req.s3_bdev);
+		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(-ENODEV));
+		goto cleanup;
+	}
+	spdk_jsonrpc_send_bool_response(request, true);
+cleanup:
+	free_rpc_bdev_lvol_s3_bdev(&req);
+}
+SPDK_RPC_REGISTER("bdev_lvol_s3_bdev", rpc_bdev_lvol_s3_bdev, SPDK_RPC_RUNTIME)
+
 struct rpc_bdev_lvol_final_migration {
 	char *lvol_name;
 	uint32_t lvol_id;
@@ -3048,7 +3392,7 @@ rpc_bdev_lvol_final_migration(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
-	tdev = spdk_open_rmt_bdev(req.gateway, lvol->lvol_store);
+	tdev = spdk_open_rmt_bdev(req.gateway, lvol->lvol_store, false);
 	if (tdev == NULL) {
 		SPDK_ERRLOG("bdev '%s' open failed\n", req.gateway);
 		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(-ENODEV));
@@ -3135,7 +3479,7 @@ rpc_bdev_lvol_transfer(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
-	tdev = spdk_open_rmt_bdev(req.gateway, lvol->lvol_store);
+	tdev = spdk_open_rmt_bdev(req.gateway, lvol->lvol_store, false);
 	if (tdev == NULL) {
 		SPDK_ERRLOG("bdev '%s' open failed\n", req.gateway);
 		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(-ENODEV));

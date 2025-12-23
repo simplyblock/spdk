@@ -74,6 +74,36 @@ enum xfer_type {
 	XFER_TYPE_NONE = 0,
 	XFER_REPLICATE_SNAPSHOT,
 	XFER_MIGRATE_SNAPSHOT,
+	XFER_S3_BACKUP,
+	XFER_S3_RECOVER,
+	XFER_S3_MERGE,
+};
+
+enum xfer_state {
+	XFER_STATE_NONE = 0,
+	XFER_STATE_PREPARE,
+	XFER_STATE_TRANSFER_CLUSTERS,
+	XFER_STATE_TRANSFER_MD_DATA,
+	XFER_STATE_READ_EXTENT_MD,
+	XFER_STATE_READ_EXTENT_MD_2,
+	XFER_STATE_TRANSFER_ROOT_MD,
+	XFER_STATE_READ_ROOT_MD,
+	XFER_STATE_READ_ROOT_MD_2,
+	XFER_STATE_SWAP_CLUSTERS,
+	XFER_STATE_NEXT_S3_ID,
+	XFER_STATE_RECOVER_CLUSTERS,
+	XFER_STATE_DONE,
+	XFER_STATE_FAILED,
+};
+
+enum req_action {
+	REQ_ACTION_NONE = 0,
+	REQ_ACTION_READ, 			// read from s3
+	REQ_ACTION_WRITE,			// write to s3
+	REQ_ACTION_UNMAP,			// unmap in s3 level
+	REQ_ACTION_COPY_RECOVER,	// read from s3 and write in blob level
+	REQ_ACTION_COPY_BACKUP,		// read from blob and write in s3 level
+	REQ_ACTION_SWAP,			// copy in s3 level
 };
 
 enum xfer_req_status {
@@ -429,7 +459,7 @@ void spdk_blob_update_failed_cleanup(struct spdk_blob *blob,
 
 void spdk_bs_set_leader(struct spdk_blob_store *bs, bool state);
 void spdk_bs_set_read_only(struct spdk_blob_store *bs, bool state);
-
+void prepare_s3_clusters(struct spdk_blob* blob, uint64_t *clusters, uint32_t num_clusters);
 bool spdk_blob_get_offset_allocate(struct spdk_blob *blob, uint64_t offset);
 bool spdk_blob_check_offset_valid(struct spdk_blob *blob, uint64_t offset, uint64_t length);
 int spdk_read_cluster_data_xfer(struct spdk_blob *blob, void *buf, uint64_t offset, 

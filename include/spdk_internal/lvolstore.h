@@ -149,6 +149,7 @@ enum xfer_status {
 
 struct spdk_transfer_dev {
 	struct spdk_bdev_desc	*desc;
+	bool is_s3;
 	char bdev_name[SPDK_LVOL_NAME_MAX];
 	struct spdk_thread		*thread;
 	struct spdk_poller *cleanup_poller;
@@ -168,6 +169,7 @@ struct spdk_transfer_dev {
 
 struct remote_lvol_info {
 	bool status; // true - connected, false - disconnected
+	enum xfer_type   type;
 	struct spdk_bdev_desc	*desc;
 	char *bdev_name;
 	bool reused;
@@ -182,6 +184,8 @@ struct remote_lvol_info {
 
 struct spdk_lvs_poll_group {
 	TAILQ_HEAD(, remote_lvol_info)	rmt_lvols;
+	struct spdk_lvol_store	*lvs;
+	struct spdk_io_channel	*lpg_md_channel;
 	// struct spdk_lvs_poll_group	*next;
 	struct spdk_thread	*thread;
 	struct spdk_thread	*md_thread;
@@ -201,7 +205,9 @@ struct remove_event {
 struct spdk_lvs_xfer_req {
 	enum xfer_req_status status;
 	enum xfer_type   type;
+	enum req_action action;
 	uint64_t offset;
+	uint64_t s3_offset;
 	uint64_t len;
 	void *payload;
 	int fragments_outstanding;
@@ -211,7 +217,7 @@ struct spdk_lvs_xfer_req {
 	TAILQ_ENTRY(spdk_lvs_xfer_req)	entry;
 };
 
-struct spdk_lvs_xfer {	
+struct spdk_lvs_xfer {
 	struct spdk_lvol		*lvol;
 	struct spdk_lvs_xfer_req *reqs;
 	void *pdus;
@@ -219,7 +225,7 @@ struct spdk_lvs_xfer {
     struct spdk_ring *ready_ring;    /* tasks ready to send to remote lvol */
 	enum xfer_type   type;
 	int	cluster_batch;
-	uint64_t outstanding_io;
+	uint32_t outstanding_io;
 	uint64_t current_offset;
 	uint64_t timeout;
 	struct spdk_poller 	*tmo_poller;
@@ -231,6 +237,25 @@ struct spdk_lvs_xfer {
 	bool final_migration;
 	bool signal_sent;
 	TAILQ_ENTRY(spdk_lvs_xfer)	entry;
+
+	//related to s3 backup 
+	enum xfer_state   state;
+	struct spdk_lvol  **chain;	
+	uint32_t chain_count;
+	uint32_t *chain_s3_ids;
+	uint32_t chain_s3_count;
+	uint64_t *clusters;
+	uint64_t *old_clusters;
+	uint32_t old_num_clusters;
+	uint32_t num_clusters;
+	uint32_t num_extent_pages;
+	uint32_t old_num_extent_pages;
+	uint32_t hold_idx;
+	uint32_t idx;
+	uint32_t s3_id;
+	uint32_t old_s3_id;
+	uint32_t success_cnt;
+	bool persist_swap;
 };
 
 struct spdk_lvol_store {
@@ -348,5 +373,59 @@ int spdk_lvs_esnap_missing_add(struct spdk_lvol_store *lvs, struct spdk_lvol *lv
 void spdk_lvs_esnap_missing_remove(struct spdk_lvol *lvol);
 bool spdk_lvs_notify_hotplug(const void *esnap_id, uint32_t id_len,
 			     spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
+
+#define S3_INDEX_BITS     32
+#define S3_MID_FLAG_BIT   32
+#define S3_ID_BITS        30
+#define S3_ID_SHIFT       33
+#define S3_MSB_FLAG_BIT   63
+
+#define S3_INDEX_MASK    ((1ULL << S3_INDEX_BITS) - 1ULL)
+#define S3_ID_MASK        ((1ULL << S3_ID_BITS) - 1ULL)
+
+static inline uint64_t
+s3_pack_offset(uint32_t num_extent_pages,
+               uint32_t s3_id,
+               bool mid_flag,
+               bool msb_flag)
+{
+    uint64_t v = 0;
+
+    /* bits 0..31: num_extent_pages */
+    v |= (uint64_t)(num_extent_pages & S3_INDEX_MASK);
+
+    /* bit 32: mid flag */
+    if (mid_flag) {
+        v |= (1ULL << S3_MID_FLAG_BIT);
+    }
+
+    /* bits 33..62: s3_id (30 bits) */
+    v |= ((uint64_t)(s3_id & S3_ID_MASK) << S3_ID_SHIFT);
+
+    /* bit 63: MSB flag */
+    if (msb_flag) {
+        v |= (1ULL << S3_MSB_FLAG_BIT);
+    }
+
+    return v;
+}
+
+static inline uint32_t
+s3_unpack_num_index(uint64_t v)
+{
+    return (uint32_t)(v & S3_INDEX_MASK);
+}
+
+// static inline bool
+// s3_unpack_mid_flag(uint64_t v)
+// {
+//     return ((v >> S3_MID_FLAG_BIT) & 1ULL) != 0;
+// }
+
+static inline uint32_t
+s3_unpack_s3_id(uint64_t v)
+{
+    return (uint32_t)((v >> S3_ID_SHIFT) & S3_ID_MASK);
+}
 
 #endif /* SPDK_INTERNAL_LVOLSTORE_H */
