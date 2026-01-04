@@ -8078,6 +8078,7 @@ spdk_bs_copy_blob(struct spdk_blob_store *bs,
 	tmp_blob->open_ref = blob->open_ref;
 	tmp_blob->parent_id = blob->parent_id;	
 	tmp_blob->back_bs_dev = blob->back_bs_dev;
+	tmp_blob->map_id = blob->map_id;
 	free(tmp_blob->active.pages);
 
 	// TODO no need for allocate buf for clean pages
