@@ -3320,7 +3320,10 @@ blob_allocate_and_copy_cluster_cpl(void *cb_arg, int bserrno)
 		}
 	}
 
-	spdk_free(ctx->buf);
+	if (ctx->buf != NULL) {
+		__atomic_sub_fetch(&ctx->blob->bs->COW_io_stats, 1, __ATOMIC_SEQ_CST);
+		spdk_free(ctx->buf);
+	}
 	free(ctx);
 }
 
@@ -3424,7 +3427,11 @@ blob_write_copy_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	}
 
 	cluster_number = bs_page_to_cluster(ctx->blob->bs, ctx->page);
-
+	if (ctx->buf != NULL) {
+		__atomic_sub_fetch(&ctx->blob->bs->COW_io_stats, 1, __ATOMIC_SEQ_CST);
+		spdk_free(ctx->buf);
+		ctx->buf = NULL;
+	}
 	blob_insert_cluster_on_md_thread(ctx->blob, cluster_number, ctx->new_cluster,
 					 ctx->new_extent_page, ctx->new_cluster_page, true, blob_insert_cluster_cpl, ctx);
 }
@@ -3576,6 +3583,8 @@ bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 		if (can_copy) {
 			blob_copy(ctx, op, copy_src_lba);
 		} else {
+			__atomic_add_fetch(&blob->bs->COW_io_stats, 1, __ATOMIC_SEQ_CST);
+			__atomic_add_fetch(&blob->bs->total_COW_io_stats, 1, __ATOMIC_SEQ_CST);
 			/* Read cluster from backing device */
 			bs_sequence_read_bs_dev(ctx->seq, blob->back_bs_dev, ctx->buf,
 						bs_dev_page_to_lba(blob->back_bs_dev, cluster_start_page),
@@ -4691,8 +4700,9 @@ spdk_bs_monitoring_poller(void *cb_arg) {
 		bs->total += ccm_io;
 		bs->total_r += bs->r_io;
 		bs->total_w += bs->w_io;
-		SPDK_NOTICELOG("LSTAT [%" PRIu64 "]  [%" PRIu64 "]  [%" PRIu64 "]  [%" PRIu64 "]  [%" PRIu64 "]  [%" PRIu64 "]\n",
-							bs->total, bs->total_r, bs->total_w, ccm_io, bs->r_io, bs->w_io);		
+		SPDK_NOTICELOG("LSTAT [%" PRIu64 "]  [%" PRIu64 "]  [%" PRIu64 "]  [%" PRIu64 "]  [%" PRIu64 "]  [%" PRIu64 "] COW c[%" PRIu32 "] t[%" PRIu64 "]\n",
+							bs->total, bs->total_r, bs->total_w, ccm_io, bs->r_io, bs->w_io,
+							bs->COW_io_stats, bs->total_COW_io_stats);
 		bs->w_io = 0;
 		bs->r_io = 0;
 		// if (bs->channel_stat_counter % 3 == 0) {

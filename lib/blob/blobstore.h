@@ -224,6 +224,8 @@ struct spdk_blob_store {
 	uint64_t			w_io;
 	uint64_t 			avg_total;
 	uint64_t			channel_stat_counter;
+	uint32_t 			COW_io_stats;
+	uint64_t 			total_COW_io_stats;
 	struct spdk_poller		*poller;
 
 
