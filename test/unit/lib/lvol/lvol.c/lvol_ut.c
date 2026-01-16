@@ -58,6 +58,11 @@ DEFINE_STUB(spdk_bdev_write_blocks, int,
 DEFINE_STUB(spdk_bdev_unmap_blocks, int,
 	    (struct spdk_bdev_desc *desc, struct spdk_io_channel *ch, uint64_t offset_blocks,
 	     uint64_t num_blocks, spdk_bdev_io_completion_cb cb, void *cb_arg), 0);
+
+DEFINE_STUB(spdk_bdev_copy_blocks, int,
+	    (struct spdk_bdev_desc *desc, struct spdk_io_channel *ch, uint64_t dst_offset_blocks, uint64_t src_offset_blocks,
+	     uint64_t num_blocks, spdk_bdev_io_completion_cb cb, void *cb_arg), 0);
+
 DEFINE_STUB(spdk_bdev_read_blocks, int,
 		(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 			void *buf, uint64_t offset_blocks, uint64_t num_blocks,

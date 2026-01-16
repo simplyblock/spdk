@@ -6271,6 +6271,7 @@ bs_load_replay_md_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
 	struct spdk_bs_load_ctx *ctx = cb_arg;
 	uint32_t page_num;
+	uint16_t map_id;
 	struct spdk_blob_md_page *page;
 
 	if (bserrno != 0) {
@@ -6289,7 +6290,8 @@ bs_load_replay_md_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 			if (page->sequence_num == 0) {
 				SPDK_NOTICELOG("Recover: blob 0x%" PRIx32 "\n", page_num);
 				spdk_bit_array_set(ctx->bs->used_blobids, page_num);
-				spdk_bit_array_set(ctx->bs->map_blobids, page->reserved0);
+				map_id = (uint16_t)(page->reserved0 & 0xFFFF);
+				spdk_bit_array_set(ctx->bs->map_blobids, map_id);
 			}
 			if (bs_load_replay_md_parse_page(ctx, page)) {
 				SPDK_INFOLOG(blob, "Recover: blob 0x%" PRIx32 " failed\n", page_num);
@@ -8039,7 +8041,9 @@ bs_create_blob_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	if (bserrno != 0) {
 		spdk_spin_lock(&blob->bs->used_lock);
 		spdk_bit_array_clear(blob->bs->used_blobids, page_idx);
-		spdk_bit_array_clear(blob->bs->map_blobids, blob->map_id);
+		if (blob->map_id) {
+			spdk_bit_array_clear(blob->bs->map_blobids, blob->map_id);
+		}
 		bs_release_md_page(blob->bs, page_idx);
 		spdk_spin_unlock(&blob->bs->used_lock);
 	}
@@ -8126,6 +8130,8 @@ spdk_bs_copy_blob(struct spdk_blob_store *bs,
 	tmp_blob->open_ref = blob->open_ref;
 	tmp_blob->parent_id = blob->parent_id;	
 	tmp_blob->back_bs_dev = blob->back_bs_dev;
+	tmp_blob->map_id = blob->map_id;
+	tmp_blob->geometry = blob->geometry;
 	free(tmp_blob->active.pages);
 
 	// TODO no need for allocate buf for clean pages
@@ -8310,7 +8316,9 @@ error:
 	}
 	spdk_spin_lock(&bs->used_lock);
 	spdk_bit_array_clear(bs->used_blobids, page_idx);
-	spdk_bit_array_clear(bs->map_blobids, map_id);
+	if (blob->map_id) {
+		spdk_bit_array_clear(bs->map_blobids, map_id);
+	}
 	bs_release_md_page(bs, page_idx);
 	spdk_spin_unlock(&bs->used_lock);
 	cb_fn(cb_arg, 0, rc);

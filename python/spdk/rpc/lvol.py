@@ -197,7 +197,7 @@ def bdev_lvol_s3_backup(client, s3_id=0, snapshot_names=None, cluster_batch=16):
     params = {'s3_id': s3_id, 'snapshot_names': snapshot_names, 'cluster_batch': cluster_batch}
     return client.call('bdev_lvol_s3_backup', params)
 
-def bdev_lvol_s3_merge(client, s3_id=0, old_s3_id=None, cluster_batch=16):
+def bdev_lvol_s3_merge(client, uuid=None, lvs_name=None, s3_id=0, old_s3_id=0, cluster_batch=16):
     """
     Trigger an S3 merge operation between two S3 backups.
 
@@ -219,10 +219,18 @@ def bdev_lvol_s3_merge(client, s3_id=0, old_s3_id=None, cluster_batch=16):
     Raises:
         ValueError: If s3_id or old_s3_id is not provided or invalid.
     """
+    if (uuid and lvs_name) or (not uuid and not lvs_name):
+        raise ValueError("Either uuid or lvs_name must be specified, but not both")
     if s3_id <= 0 or old_s3_id <= 0:
         raise ValueError("s3_id must be specified")
 
     params = {'s3_id': s3_id, 'old_s3_id': old_s3_id, 'cluster_batch': cluster_batch}
+
+    if uuid is not None:
+        params['uuid'] = uuid
+    if lvs_name is not None:
+        params['lvs_name'] = lvs_name
+
     return client.call('bdev_lvol_s3_merge', params)
 
 def bdev_lvol_s3_recovery(client, lvol_name=None, s3_ids=0, cluster_batch=16):
@@ -256,7 +264,7 @@ def bdev_lvol_s3_recovery(client, lvol_name=None, s3_ids=0, cluster_batch=16):
     params = {'lvol_name': lvol_name, 's3_ids': s3_ids, 'cluster_batch': cluster_batch}
     return client.call('bdev_lvol_s3_recovery', params)
 
-def bdev_lvol_s3_bdev(client, s3_bdev=None, uuid=None, lvs_name=None,):
+def bdev_lvol_s3_bdev(client, bdev=None, uuid=None, lvs_name=None):
     """
     Recover an lvol from one or more S3 backups.
 
@@ -281,10 +289,14 @@ def bdev_lvol_s3_bdev(client, s3_bdev=None, uuid=None, lvs_name=None,):
     """
     if (uuid and lvs_name) or (not uuid and not lvs_name):
         raise ValueError("Either uuid or lvs_name must be specified, but not both")
-    if not s3_bdev:
+    if not bdev:
         raise ValueError("s3_bdev must be specified")
 
-    params = {'s3_bdev': s3_bdev, 'uuid': uuid, 'lvs_name': lvs_name}
+    params = {'s3_bdev': bdev}
+    if uuid is not None:
+        params['uuid'] = uuid
+    if lvs_name is not None:
+        params['lvs_name'] = lvs_name
     return client.call('bdev_lvol_s3_bdev', params)
 
 def bdev_lvol_final_migration(client, lvol_name=None, lvol_id=0, snapshot_name=None, cluster_batch=16, gateway=None):

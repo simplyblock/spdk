@@ -2962,11 +2962,10 @@ struct rpc_bdev_lvol_s3_backup_snapshots {
 };
 
 struct rpc_bdev_lvol_s3_backup {
-	uint64_t offset;
+	// uint64_t offset;
 	uint32_t cluster_batch;
 	uint32_t s3_id;	
 	struct rpc_bdev_lvol_s3_backup_snapshots snapshot_names;
-	uint32_t snapshot_cnt;
 };
 
 /*
@@ -2988,11 +2987,10 @@ free_rpc_bdev_lvol_s3_backup(struct rpc_bdev_lvol_s3_backup *req) {
 }
 
 static const struct spdk_json_object_decoder rpc_bdev_lvol_s3_backup_decoders[] = {
-	{"offset", offsetof(struct rpc_bdev_lvol_s3_backup, offset), spdk_json_decode_uint64},
+	// {"offset", offsetof(struct rpc_bdev_lvol_s3_backup, offset), spdk_json_decode_uint64},
 	{"cluster_batch", offsetof(struct rpc_bdev_lvol_s3_backup, cluster_batch), spdk_json_decode_uint32, true},
 	{"s3_id", offsetof(struct rpc_bdev_lvol_s3_backup, s3_id), spdk_json_decode_uint32},
 	{"snapshot_names", offsetof(struct rpc_bdev_lvol_s3_backup, snapshot_names), decode_snapshot_names},
-	{"snapshot_cnt", offsetof(struct rpc_bdev_lvol_s3_backup, snapshot_cnt), spdk_json_decode_uint32},
 };
 
 static void 
@@ -3061,7 +3059,8 @@ cleanup:
 SPDK_RPC_REGISTER("bdev_lvol_s3_backup", rpc_bdev_lvol_s3_backup, SPDK_RPC_RUNTIME)
 
 struct rpc_bdev_lvol_s3_merge {
-	char *lvol_name;
+	char *uuid;
+	char *lvs_name;
 	uint32_t old_s3_id;
 	uint32_t s3_id;
 	uint32_t cluster_batch;
@@ -3069,11 +3068,13 @@ struct rpc_bdev_lvol_s3_merge {
 
 static void 
 free_rpc_bdev_lvol_s3_merge(struct rpc_bdev_lvol_s3_merge *req) {
-	free(req->lvol_name);
+	free(req->uuid);
+	free(req->lvs_name);
 }
 
 static const struct spdk_json_object_decoder rpc_bdev_lvol_s3_merge_decoders[] = {
-	{"lvol_name", offsetof(struct rpc_bdev_lvol_s3_merge, lvol_name), spdk_json_decode_string},
+	{"uuid", offsetof(struct rpc_bdev_lvol_s3_merge, uuid), spdk_json_decode_string, true},
+	{"lvs_name", offsetof(struct rpc_bdev_lvol_s3_merge, lvs_name), spdk_json_decode_string, true},
 	{"old_s3_id", offsetof(struct rpc_bdev_lvol_s3_merge, old_s3_id), spdk_json_decode_uint32},
 	{"cluster_batch", offsetof(struct rpc_bdev_lvol_s3_merge, cluster_batch), spdk_json_decode_uint32},
 	{"s3_id", offsetof(struct rpc_bdev_lvol_s3_merge, s3_id), spdk_json_decode_uint32},
@@ -3084,8 +3085,7 @@ rpc_bdev_lvol_s3_merge(struct spdk_jsonrpc_request *request,
 			      const struct spdk_json_val *params) 
 {
 	struct rpc_bdev_lvol_s3_merge req = {};
-	// struct spdk_lvol *lvol;
-	// struct spdk_bdev *lvol_bdev;
+	struct spdk_lvol_store *lvs = NULL;
 	int rc = 0;
 
 	if (spdk_json_decode_object(params, rpc_bdev_lvol_s3_merge_decoders,
@@ -3103,23 +3103,16 @@ rpc_bdev_lvol_s3_merge(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
-	// lvol_bdev = spdk_bdev_get_by_name(req.lvol_name);
-	// if (lvol_bdev == NULL) {
-	// 	SPDK_ERRLOG("lvol bdev '%s' does not exist\n", req.lvol_name);
-	// 	spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
-	// 	goto cleanup;
-	// }
+	rc = vbdev_get_lvol_store_by_uuid_xor_name(req.uuid, req.lvs_name, &lvs);
+	if (rc != 0) {
+		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
+		goto cleanup;
+	}
 
-	// lvol = vbdev_lvol_get_from_bdev(lvol_bdev);
-	// if (lvol == NULL) {
-	// 	SPDK_ERRLOG("lvol does not exist\n");
-	// 	spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
-	// 	goto cleanup;
-	// }
+	// SPDK_NOTICELOG("Backing up lvol %s to S3 id %u.\n", req.lvol_name,  req.s3_id);
+	SPDK_NOTICELOG("Backing up s3 id %u to S3 id %u.\n", req.old_s3_id,  req.s3_id);
 
-	SPDK_NOTICELOG("Backing up lvol %s to S3 id %u.\n", req.lvol_name,  req.s3_id);
-
-	rc = spdk_lvol_s3_merge(NULL, req.s3_id, req.old_s3_id, req.cluster_batch);
+	rc = spdk_lvol_s3_merge(lvs, req.s3_id, req.old_s3_id, req.cluster_batch);
 	if (rc < 0) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 spdk_strerror(-rc));

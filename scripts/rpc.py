@@ -2175,23 +2175,26 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
             snapshots.append(u)
         print_json(rpc.lvol.bdev_lvol_s3_backup(args.client,
                                              s3_id=args.s3_id,
-                                             snapshots=snapshots,
+                                             snapshot_names=snapshots,
                                              cluster_batch=args.cluster_batch))
 
     p = subparsers.add_parser('bdev_lvol_s3_backup', help='Back up one or more lvol snapshots to S3')
-    p.add_argument('-i', '--s3_id', help='Destination S3 backup ID', type=int)
+    p.add_argument('-i', '--s3-id', help='Destination S3 backup ID', type=int)
     p.add_argument('-b', '--cluster-batch', help='Number of cluster requests queued per poller iteration (default: 16)', type=int)
     p.add_argument('-s', '--snapshots', help='snapshots name, whitespace separated list in quotes', required=True)
     p.set_defaults(func=bdev_lvol_s3_backup)
     
     def bdev_lvol_s3_merge(args):
         print_json(rpc.lvol.bdev_lvol_s3_merge(args.client,
+                                             uuid=args.uuid,
+                                             lvs_name=args.lvs_name,
                                              s3_id=args.s3_id,
                                              old_s3_id=args.old_s3_id,
                                              cluster_batch=args.cluster_batch))
 
     p = subparsers.add_parser('bdev_lvol_s3_merge', help='Merge data from one S3 backup ID into another')
-    # p.add_argument('-n', '--lvol_name', help='lvol bdev name', required=True)
+    p.add_argument('-u', '--uuid', help='lvol store UUID')
+    p.add_argument('-l', '--lvs-name', help='lvol store name')
     p.add_argument('-i', '--s3_id', help='Destination S3 backup ID', type=int)
     p.add_argument('-o', '--old_s3_id', help='Source S3 backup ID', type=int)    
     p.add_argument('-b', '--cluster-batch', help='Number of cluster requests queued per poller iteration (default: 16)', type=int)
@@ -2216,8 +2219,8 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
 
     def bdev_lvol_s3_bdev(args):
         print_json(rpc.lvol.bdev_lvol_s3_bdev(args.client,
-                                             lvs_name=args.lvs_name,
                                              uuid=args.uuid,
+                                             lvs_name=args.lvs_name,
                                              bdev=args.bdev))
 
     p = subparsers.add_parser('bdev_lvol_s3_bdev', help='Configure/attach an S3 gateway bdev for backup operations')

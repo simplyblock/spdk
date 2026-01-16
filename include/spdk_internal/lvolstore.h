@@ -174,18 +174,25 @@ struct remote_lvol_info {
 	char *bdev_name;
 	bool reused;
 	struct spdk_io_channel	*channel;
+	struct spdk_io_channel	*md_channel;
 	struct spdk_lvs_poll_group *group;
 	struct spdk_poller *cleanup_poller;
+	uint32_t s3_id;
 	uint64_t outstanding_io;
 	struct spdk_ring *free_ring;     /* tasks available for this snapshot */
     struct spdk_ring *ready_ring;    /* tasks ready to send to remote lvol */
 	TAILQ_ENTRY(remote_lvol_info)	entry;
 };
 
+struct lvolstore_info {
+	struct spdk_lvol_store	*lvs;
+	struct spdk_io_channel	*md_channel;
+};
+
 struct spdk_lvs_poll_group {
 	TAILQ_HEAD(, remote_lvol_info)	rmt_lvols;
-	struct spdk_lvol_store	*lvs;
-	struct spdk_io_channel	*lpg_md_channel;
+	struct lvolstore_info lvs_info[4];
+	int lvs_cnt;
 	// struct spdk_lvs_poll_group	*next;
 	struct spdk_thread	*thread;
 	struct spdk_thread	*md_thread;
@@ -200,6 +207,7 @@ struct remove_event {
 	struct spdk_transfer_dev *tdev;
 	struct remote_lvol_info *rmt_lvol;
 	char *bdev_name;
+	uint32_t s3_id;
 };
 
 struct spdk_lvs_xfer_req {
@@ -238,23 +246,31 @@ struct spdk_lvs_xfer {
 	bool signal_sent;
 	TAILQ_ENTRY(spdk_lvs_xfer)	entry;
 
+	uint64_t page_size;
+	uint64_t page_per_cluster;
+
 	//related to s3 backup 
 	enum xfer_state   state;
-	struct spdk_lvol  **chain;	
-	uint32_t chain_count;
+
+	struct spdk_lvol  **chain;
 	uint32_t *chain_s3_ids;
-	uint32_t chain_s3_count;
+	uint32_t chain_count;
+
 	uint64_t *clusters;
+	uint32_t num_clusters;
+
 	uint64_t *old_clusters;
 	uint32_t old_num_clusters;
-	uint32_t num_clusters;
+
 	uint32_t num_extent_pages;
 	uint32_t old_num_extent_pages;
-	uint32_t hold_idx;
-	uint32_t idx;
+
 	uint32_t s3_id;
 	uint32_t old_s3_id;
 	uint32_t success_cnt;
+
+	uint32_t hold_idx;
+	uint32_t idx;
 	bool persist_swap;
 };
 
@@ -426,6 +442,46 @@ static inline uint32_t
 s3_unpack_s3_id(uint64_t v)
 {
     return (uint32_t)((v >> S3_ID_SHIFT) & S3_ID_MASK);
+}
+
+
+static inline const char *
+xfer_type_to_string(enum xfer_type type)
+{
+    switch (type) {
+    case XFER_TYPE_NONE:
+        return "none";
+    case XFER_REPLICATE_SNAPSHOT:
+        return "replicate_snapshot";
+    case XFER_MIGRATE_SNAPSHOT:
+        return "migrate_snapshot";
+    case XFER_S3_BACKUP:
+        return "s3_backup";
+    case XFER_S3_RECOVER:
+        return "s3_recover";
+    case XFER_S3_MERGE:
+        return "s3_merge";
+    default:
+        return "unknown";
+    }
+}
+
+
+static inline const char *
+xfer_result_type_to_string(enum xfer_status type)
+{
+    switch (type) {
+    case XFER_NONE:
+        return "None";
+    case XFER_IN_PROGRESS:
+        return "In progress";
+    case XFER_DONE:
+        return "Done";
+    case XFER_FAILED:
+        return "Failed";
+    default:
+        return "unknown";
+    }
 }
 
 #endif /* SPDK_INTERNAL_LVOLSTORE_H */
