@@ -989,6 +989,7 @@ struct spdk_bdev_io_internal_fields {
 
 	/** Current tsc at submit time. Used to calculate latency at completion. */
 	uint64_t submit_tsc;
+	uint64_t send_msg_tsc;
 
 	/** Entry to the list io_submitted of struct spdk_bdev_channel */
 	TAILQ_ENTRY(spdk_bdev_io) ch_link;
@@ -1116,7 +1117,7 @@ struct spdk_bdev_io {
 		struct spdk_bdev_io_zone_mgmt_params zone_mgmt;
 	} u;
 
-	uint8_t reserved3[40];
+	uint8_t reserved3[32];
 
 	/**
 	 *  Fields that are used internally by the bdev subsystem.  Bdev modules
@@ -1409,7 +1410,8 @@ struct spdk_io_channel *spdk_bdev_io_get_io_channel(struct spdk_bdev_io *bdev_io
  * \return The submit_tsc of the specified bdev I/O.
  */
 uint64_t spdk_bdev_io_get_submit_tsc(struct spdk_bdev_io *bdev_io);
-
+uint64_t spdk_bdev_io_get_send_msg_tsc(struct spdk_bdev_io *bdev_io);
+uint64_t spdk_bdev_io_set_send_msg_tsc(struct spdk_bdev_io *bdev_io);
 /**
  * Query if metadata is hidden from the bdev I/O.
  *

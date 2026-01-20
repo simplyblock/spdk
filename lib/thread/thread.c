@@ -113,6 +113,18 @@ struct spdk_thread_post_poller_handler {
 
 struct spdk_thread {
 	uint64_t			tsc_last;
+	uint64_t			tsc_log;
+	bool				log_enable;
+	double				tms_dequeue_avg;
+	uint64_t			count_dequeue;
+	double				tms_dequeue_avg_3s;
+	double				tms_dequeue_max;
+	uint64_t			count_dequeue_3s;
+	uint64_t			queue_size_avg_3s;
+	uint64_t			queue_size_max;
+	uint64_t 			queue_size_avg;
+	uint64_t			nthread_poll_3s;
+	uint64_t			nthread_poll_total;
 	struct spdk_thread_stats	stats;
 	/*
 	 * Contains pollers actively running on this thread.  Pollers
@@ -293,6 +305,7 @@ io_channel_cmp(struct spdk_io_channel *ch1, struct spdk_io_channel *ch2)
 RB_GENERATE_STATIC(io_channel_tree, spdk_io_channel, node, io_channel_cmp);
 
 struct spdk_msg {
+	uint64_t		enqueue_tsc;
 	spdk_msg_fn		fn;
 	void			*arg;
 
@@ -540,7 +553,21 @@ spdk_thread_create(const char *name, const struct spdk_cpuset *cpumask)
 	thread->msg_cache_count = 0;
 
 	thread->tsc_last = spdk_get_ticks();
-
+	thread->tsc_log = spdk_get_ticks();
+	thread->log_enable = false;
+	thread->tms_dequeue_avg = 0.0;
+	thread->count_dequeue = 0;
+	thread->tms_dequeue_avg_3s = 0.0;
+	thread->tms_dequeue_max = 0.0;
+	thread->count_dequeue_3s = 0;
+	thread->queue_size_avg_3s = 0;
+	thread->queue_size_max = 0;
+	thread->queue_size_avg = 0;
+	thread->nthread_poll_3s = 0;
+	thread->nthread_poll_total = 0;
+	if(strstr(name, "distrib_worker")) {
+		thread->log_enable = true;
+	}
 	/* Monotonic increasing ID is set to each created poller beginning at 1. Once the
 	 * ID exceeds UINT64_MAX a warning message is logged
 	 */
@@ -872,10 +899,56 @@ msg_queue_run_batch(struct spdk_thread *thread, uint32_t max_msgs)
 	if (count == 0) {
 		return 0;
 	}
-
+	if(thread->log_enable)
+	{
+		int cnt = spdk_ring_count(thread->messages);
+		thread->queue_size_avg_3s += cnt;
+		thread->queue_size_avg += cnt;
+		if(cnt > thread->queue_size_max)
+		{
+			thread->queue_size_max = cnt;
+		}
+		thread->nthread_poll_3s++;
+		thread->nthread_poll_total++;
+	}
 	for (i = 0; i < count; i++) {
 		struct spdk_msg *msg = messages[i];
-
+		if(thread->log_enable)
+		{
+			uint64_t ticks_hz = spdk_get_ticks_hz();
+			uint64_t ticks = spdk_get_ticks();
+			double dt_dequeue = (double)(ticks - msg->enqueue_tsc) / (double)(ticks_hz);
+			thread->tms_dequeue_avg += dt_dequeue;
+			thread->tms_dequeue_avg_3s += dt_dequeue;
+			thread->count_dequeue++;
+			thread->count_dequeue_3s++;
+			if(dt_dequeue > thread->tms_dequeue_max)
+			{
+				thread->tms_dequeue_max = dt_dequeue;
+			}
+			double dt_log = (double)(ticks - thread->tsc_log) / (double)(ticks_hz);
+			if(dt_log > 3)
+			{
+				fprintf(stderr, "THREAD_PERF %s dequeue_count(ToTAL=%ld 3S=%ld) tms_dequeue(AVG= %-10.6f AVG_3S=%-10.6f MAX=%-10.6f) "
+					"ring_count(AVG=%ld AVG_3S=%ld MAX=%ld) thread_poll(ToTAL=%ld 3s=%ld)\n",
+					thread->name,
+					thread->count_dequeue,
+					thread->count_dequeue_3s,
+					thread->tms_dequeue_avg / thread->count_dequeue,
+					thread->tms_dequeue_avg_3s / thread->count_dequeue_3s,
+					thread->tms_dequeue_max,
+					thread->queue_size_avg / thread->nthread_poll_total,
+					thread->queue_size_avg_3s / thread->nthread_poll_3s,
+					thread->queue_size_max,
+					thread->nthread_poll_total,
+					thread->nthread_poll_3s);
+				thread->tsc_log = ticks;
+				thread->tms_dequeue_avg_3s = 0.0;
+				thread->count_dequeue_3s = 0;
+				thread->queue_size_avg_3s = 0;
+				thread->nthread_poll_3s = 0;
+			}
+		}
 		assert(msg != NULL);
 
 		SPDK_DTRACE_PROBE2(msg_exec, msg->fn, msg->arg);
@@ -1435,7 +1508,12 @@ spdk_thread_send_msg(const struct spdk_thread *thread, spdk_msg_fn fn, void *ctx
 
 	msg->fn = fn;
 	msg->arg = ctx;
-
+	msg->enqueue_tsc = spdk_get_ticks();
+	// if(local_thread != NULL)
+	// {
+	// 	fprintf(stderr, "local thread=%s thread %s enqueue msg tms_enqueue=%ld count=%d\n",
+	// 	local_thread->name, thread->name, msg->enqueue_tsc, spdk_ring_count(thread->messages));
+	// }
 	rc = spdk_ring_enqueue(thread->messages, (void **)&msg, 1, NULL);
 	if (rc != 1) {
 		SPDK_ERRLOG("msg could not be enqueued\n");
