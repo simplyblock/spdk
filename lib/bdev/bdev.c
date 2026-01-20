@@ -4123,6 +4123,19 @@ spdk_bdev_io_get_submit_tsc(struct spdk_bdev_io *bdev_io)
 	return bdev_io->internal.submit_tsc;
 }
 
+uint64_t
+spdk_bdev_io_get_send_msg_tsc(struct spdk_bdev_io *bdev_io)
+{
+	return bdev_io->internal.send_msg_tsc;
+}
+
+uint64_t
+spdk_bdev_io_set_send_msg_tsc(struct spdk_bdev_io *bdev_io)
+{
+	bdev_io->internal.send_msg_tsc = spdk_get_ticks();
+}
+
+
 bool
 spdk_bdev_io_hide_metadata(struct spdk_bdev_io *bdev_io)
 {
