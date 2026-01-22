@@ -51,6 +51,9 @@
 
 const struct spdk_nvmf_transport_ops spdk_nvmf_transport_tcp;
 static bool g_tls_log = false;
+// static uint32_t	g_pollers_state[256][TCP_REQUEST_NUM_STATES] = {0};
+// static uint32_t	g_total_state[TCP_REQUEST_NUM_STATES] = {0};
+// static uint64_t time_total_state = 0;
 
 /* spdk nvmf related structure */
 enum spdk_nvmf_tcp_req_state {
@@ -359,6 +362,7 @@ struct spdk_nvmf_tcp_poll_group {
 	struct spdk_io_channel			*accel_channel;
 	struct spdk_nvmf_tcp_control_msg_list	*control_msg_list;
 	TAILQ_ENTRY(spdk_nvmf_tcp_poll_group)	link;
+	uint64_t 			timestamp;
 };
 
 struct spdk_nvmf_tcp_port {
@@ -1728,6 +1732,7 @@ nvmf_tcp_poll_group_create(struct spdk_nvmf_transport *transport,
 		}
 	}
 
+	tgroup->timestamp = spdk_get_ticks();
 	return &tgroup->group;
 
 cleanup:
@@ -2818,6 +2823,8 @@ nvmf_tcp_req_parse_sgl(struct spdk_nvmf_tcp_req *tcp_req,
 			/* No available buffers. Queue this request up. */
 			SPDK_DEBUGLOG(nvmf_tcp, "No available large data buffers. Queueing request %p\n",
 				      tcp_req);
+			SPDK_ERRLOG("No available large data buffers. Queueing request %p\n",
+				      tcp_req);
 			return;
 		}
 		tcp_req->tps.time_per_state[tcp_req->state] = spdk_get_ticks() - tcp_req->tps.time_per_state[tcp_req->state];
@@ -3837,6 +3844,42 @@ nvmf_tcp_close_qpair(struct spdk_nvmf_qpair *qpair,
 	nvmf_tcp_qpair_destroy(tqpair);
 }
 
+// static void
+// print_global_tcp_state(void)
+// {
+//     uint32_t total[TCP_REQUEST_NUM_STATES] = {0};
+// 	uint32_t diff[TCP_REQUEST_NUM_STATES] = {0};
+
+//     for (uint32_t core = 0; core < 256; core++) {
+//         for (int i = 0; i < TCP_REQUEST_NUM_STATES; i++) {
+//             total[i] += g_pollers_state[core][i];
+//         }
+//     }
+
+//     for (int i = 0; i < TCP_REQUEST_NUM_STATES; i++) {
+// 		if (total[i] != 0) {
+// 			if (total[i] > g_total_state[i]) {
+// 				diff[i] = total[i] - g_total_state[i];
+// 			} else {
+// 				diff[i] = g_total_state[i] - total[i];
+// 			}
+// 		}
+// 		g_total_state[i] = total[i];
+//     }
+
+//     char buf[512];
+//     int off = 0;
+
+//     off += snprintf(buf + off, sizeof(buf) - off, "NVMF GLOBAL CNT: ");
+//     for (int i = 1; i < TCP_REQUEST_NUM_STATES; i++) {
+//         off += snprintf(buf + off, sizeof(buf) - off,
+//                         "[%d]=%u ", i, diff[i]);
+//     }
+
+//     SPDK_NOTICELOG("%s\n", buf);
+// }
+
+
 static int
 nvmf_tcp_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 {
@@ -3848,6 +3891,35 @@ nvmf_tcp_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 	if (spdk_unlikely(TAILQ_EMPTY(&tgroup->qpairs))) {
 		return 0;
 	}
+
+
+	if (spdk_get_ticks() - tgroup->timestamp > spdk_get_ticks_hz()) {
+		struct spdk_nvmf_tcp_qpair *tqpair;
+		uint32_t	state_per_poller[TCP_REQUEST_NUM_STATES] = {0};
+		tgroup->timestamp = spdk_get_ticks();
+		// uint32_t core_id = spdk_env_get_current_core();
+		TAILQ_FOREACH(tqpair, &tgroup->qpairs, link) {
+			if (tqpair) {
+				for (int i = 0; i < TCP_REQUEST_NUM_STATES; i++) {
+					state_per_poller[i] += tqpair->state_cntr[i];
+					// total_state[core_id][i] += tqpair->state_cntr[i];
+				}						
+			}
+		}
+		char buf[255]; // Adjust the size as necessary
+		int offset = 0;
+		struct spdk_thread *t = spdk_get_thread();
+    	const char *name = spdk_thread_get_name(t);
+		uint32_t core_id = spdk_env_get_current_core();
+		offset += snprintf(buf + offset, sizeof(buf) - offset, "NVMF C[%u]: %s:", core_id, name);
+		for (int i = 1; i < TCP_REQUEST_NUM_STATES; i++) {
+			offset += snprintf(buf + offset, sizeof(buf) - offset, "[%d]=%u ", i, state_per_poller[i]);
+		}
+
+		// Print the entire string in one line
+		SPDK_NOTICELOG("%s \n", buf);
+	}
+
 
 	num_events = spdk_sock_group_poll(tgroup->sock_group);
 	if (spdk_unlikely(num_events < 0)) {
