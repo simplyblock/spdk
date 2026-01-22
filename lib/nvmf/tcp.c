@@ -3893,7 +3893,7 @@ nvmf_tcp_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 	}
 
 
-	if (spdk_get_ticks() - tgroup->timestamp > spdk_get_ticks_hz()) {
+	if (spdk_get_ticks() - tgroup->timestamp > spdk_get_ticks_hz() * 3) {
 		struct spdk_nvmf_tcp_qpair *tqpair;
 		uint32_t	state_per_poller[TCP_REQUEST_NUM_STATES] = {0};
 		tgroup->timestamp = spdk_get_ticks();
