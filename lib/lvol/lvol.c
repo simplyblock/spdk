@@ -3265,12 +3265,12 @@ spdk_lvs_conflict_signal(void *arg, int errorno) {
 	req->poller = spdk_poller_register(spdk_lvs_unfreeze_on_conflict_poller, req, 50000); // Delay of 50ms
 }
 
-void
+int
 spdk_lvs_change_leader_state(uint64_t groupid)
 {
 	struct spdk_lvol_store *lvs;
 	struct spdk_lvol *lvol;
-
+	int rc = 0;
 	SPDK_NOTICELOG("Attempting to change leadership state internally groupid %" PRIu64 ".\n", groupid);
 	pthread_mutex_lock(&g_lvol_stores_mutex);
 	TAILQ_FOREACH(lvs, &g_lvol_stores, link) {
@@ -3300,10 +3300,11 @@ spdk_lvs_change_leader_state(uint64_t groupid)
 				spdk_lvs_dequeu_rsp(lvs);
 			}
 			SPDK_NOTICELOG("Leadership state changed internally to false. Timeout has been set.\n");
+			rc = 1;
 		}
 	}
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
-	return;
+	return rc;
 }
 
 void

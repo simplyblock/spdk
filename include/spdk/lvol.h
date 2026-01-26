@@ -321,7 +321,7 @@ void lvol_update_on_failover(struct spdk_lvol_store *lvs, struct spdk_lvol *lvol
 void spdk_lvs_update_on_failover(struct spdk_lvol_store *lvs);
 void spdk_lvs_check_active_process(struct spdk_lvol_store *lvs, struct spdk_lvol *lvol, uint8_t type);
 bool spdk_lvs_nonleader_timeout(struct spdk_lvol_store *lvs);
-void spdk_lvs_change_leader_state(uint64_t groupid);
+int spdk_lvs_change_leader_state(uint64_t groupid);
 void spdk_abort_node(void);
 bool spdk_lvs_trigger_leadership_switch(uint64_t *groupid);
 bool spdk_lvs_queued_rsp(struct spdk_lvol_store *lvs, struct spdk_bdev_io *bdev_io);
