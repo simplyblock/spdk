@@ -341,6 +341,12 @@ struct spdk_nvmf_tcp_qpair {
 	TAILQ_ENTRY(spdk_nvmf_tcp_qpair)	link;
 	bool					pending_flush;
 	uint64_t 				time;
+	double 					avg_time_interval;
+	double 					max_time_interval;
+	double 					max_time;
+	uint64_t				sample_count;
+	uint8_t 				qpair_type;
+
 };
 
 struct spdk_nvmf_tcp_control_msg {
@@ -1547,6 +1553,13 @@ nvmf_tcp_handle_connect(struct spdk_nvmf_tcp_port *port, struct spdk_sock *sock)
 		SPDK_NOTICELOG("New connection accepted sp %d cp %d\n",
 		      tqpair->target_port, tqpair->initiator_port);
 	// }
+	if (tqpair->target_port >= 9030 && tqpair->target_port < 9060) {
+		tqpair->qpair_type = 2;
+	} else if (tqpair->target_port >= 9060 && tqpair->target_port <= 9090) {
+		tqpair->qpair_type = 1;
+	} else if (tqpair->target_port >= 9100) {
+		tqpair->qpair_type = 0;
+	}
 	
 	spdk_nvmf_tgt_new_qpair(port->transport->tgt, &tqpair->qpair);
 }
@@ -3221,6 +3234,17 @@ check_time(struct spdk_nvmf_tcp_req *tcp_req, struct spdk_nvmf_tcp_qpair *tqpair
 			char *uuid = spdk_nvmf_request_nqn(&tcp_req->req, 0);
 			uuid = (uuid) ? uuid : ""; // Handle NULL UUID
 			double duration_us = ((double)(current - tcp_req->time) * 1000.0) / (double)ticks_hz;
+
+			tqpair->avg_time_interval += duration_us;
+			tqpair->sample_count += duration_us;
+
+			if (tqpair->max_time_interval < duration_us) {
+				tqpair->max_time_interval = duration_us;
+			}
+
+			if (tqpair->max_time < duration_us) {
+				tqpair->max_time = duration_us;
+			}
 			// Log relevant information
 			SPDK_NOTICELOG("delay-qpair %p ttag %d (QID %d) cp %d sp %d, state %d, time %.2f (ms), nqn %s\n",
 				tqpair, tcp_req->ttag, tqpair->qpair.qid, tqpair->initiator_port,
@@ -3895,29 +3919,63 @@ nvmf_tcp_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 
 	if (spdk_get_ticks() - tgroup->timestamp > spdk_get_ticks_hz() * 3) {
 		struct spdk_nvmf_tcp_qpair *tqpair;
-		uint32_t	state_per_poller[TCP_REQUEST_NUM_STATES] = {0};
+		uint32_t	state_per_poller[3][TCP_REQUEST_NUM_STATES] = {0};
+		double max_time_interval[3] = {0};
+		double max_time[3] = {0};
+		double avg_time_interval[3] = {0};
 		tgroup->timestamp = spdk_get_ticks();
+		int cnt[3] = {0};
 		// uint32_t core_id = spdk_env_get_current_core();
 		TAILQ_FOREACH(tqpair, &tgroup->qpairs, link) {
 			if (tqpair) {
 				for (int i = 0; i < TCP_REQUEST_NUM_STATES; i++) {
-					state_per_poller[i] += tqpair->state_cntr[i];
+					state_per_poller[tqpair->qpair_type][i] += tqpair->state_cntr[i];
 					// total_state[core_id][i] += tqpair->state_cntr[i];
-				}						
+				}
+
+				if (tqpair->sample_count > 0) {
+					tqpair->avg_time_interval /= tqpair->sample_count;
+					tqpair->sample_count = 0;
+					tqpair->avg_time_interval = 0;
+					cnt[tqpair->qpair_type]++;
+					avg_time_interval[tqpair->qpair_type] += tqpair->avg_time_interval;
+				}
+
+				if (tqpair->max_time_interval > max_time_interval[tqpair->qpair_type]) {
+					max_time_interval[tqpair->qpair_type] = tqpair->max_time_interval;
+					tqpair->max_time_interval = 0;
+				}
+				if (tqpair->max_time > max_time[tqpair->qpair_type]) {
+					max_time[tqpair->qpair_type] = tqpair->max_time;
+				}
 			}
 		}
-		char buf[255]; // Adjust the size as necessary
+
+		for (int j = 0; j < 3; j++) {
+			if (cnt[j] != 0) {
+				avg_time_interval[j] /= cnt[j];
+			}
+		}
+
+		char buf[300]; // Adjust the size as necessary
 		int offset = 0;
 		struct spdk_thread *t = spdk_get_thread();
     	const char *name = spdk_thread_get_name(t);
 		uint32_t core_id = spdk_env_get_current_core();
-		offset += snprintf(buf + offset, sizeof(buf) - offset, "NVMF C[%u]: %s:", core_id, name);
-		for (int i = 1; i < TCP_REQUEST_NUM_STATES; i++) {
-			offset += snprintf(buf + offset, sizeof(buf) - offset, "[%d]=%u ", i, state_per_poller[i]);
-		}
+		for (int j = 0; j < 3; j++) {
+			offset += snprintf(buf + offset, sizeof(buf) - offset, "TCP[%u]C[%u]:%s:", j, core_id, name);
+			offset += snprintf(buf + offset, sizeof(buf) - offset, "AV[%d]=%.3f ", j, (double)(avg_time_interval[j]));
+			offset += snprintf(buf + offset, sizeof(buf) - offset, "MI[%d]=%.3f ", j, (double)(max_time_interval[j]));
+			offset += snprintf(buf + offset, sizeof(buf) - offset, "M[%d]=%.3f ", j, (double)(max_time[j]));
+			for (int i = 1; i < TCP_REQUEST_NUM_STATES; i++) {
+				offset += snprintf(buf + offset, sizeof(buf) - offset, "[%d]=%u ", i, state_per_poller[j][i]);
+			}
 
-		// Print the entire string in one line
-		SPDK_NOTICELOG("%s \n", buf);
+			// Print the entire string in one line
+			SPDK_NOTICELOG("%s \n", buf);
+			offset = 0;
+			memset(buf, 0, sizeof(buf));
+		}
 	}
 
 
