@@ -3246,17 +3246,6 @@ check_time(struct spdk_nvmf_tcp_req *tcp_req, struct spdk_nvmf_tcp_qpair *tqpair
 			char *uuid = spdk_nvmf_request_nqn(&tcp_req->req, 0);
 			uuid = (uuid) ? uuid : ""; // Handle NULL UUID
 			double duration_us = ((double)(current - tcp_req->time) * 1000.0) / (double)ticks_hz;
-
-			tqpair->avg_time_interval += duration_us;
-			tqpair->sample_count += duration_us;
-
-			if (tqpair->max_time_interval < duration_us) {
-				tqpair->max_time_interval = duration_us;
-			}
-
-			if (tqpair->max_time < duration_us) {
-				tqpair->max_time = duration_us;
-			}
 			// Log relevant information
 			SPDK_NOTICELOG("delay-qpair %p ttag %d (QID %d) cp %d sp %d, state %d, time %.2f (ms), nqn %s\n",
 				tqpair, tcp_req->ttag, tqpair->qpair.qid, tqpair->initiator_port,
@@ -3948,9 +3937,9 @@ nvmf_tcp_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 				if (tqpair->sample_count > 0) {
 					tqpair->avg_time_interval /= tqpair->sample_count;
 					tqpair->sample_count = 0;
-					tqpair->avg_time_interval = 0;
-					cnt[tqpair->qpair_type]++;
 					avg_time_interval[tqpair->qpair_type] += tqpair->avg_time_interval;
+					cnt[tqpair->qpair_type]++;
+					tqpair->avg_time_interval = 0;
 				}
 
 				if (tqpair->max_time_interval > max_time_interval[tqpair->qpair_type]) {
@@ -3979,9 +3968,11 @@ nvmf_tcp_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 			offset += snprintf(buf + offset, sizeof(buf) - offset, "AV[%d]=%.3f ", j, (double)(avg_time_interval[j]));
 			offset += snprintf(buf + offset, sizeof(buf) - offset, "MI[%d]=%.3f ", j, (double)(max_time_interval[j]));
 			offset += snprintf(buf + offset, sizeof(buf) - offset, "M[%d]=%.3f ", j, (double)(max_time[j]));
+			uint32_t inflight = 0;
 			for (int i = 1; i < TCP_REQUEST_NUM_STATES; i++) {
-				offset += snprintf(buf + offset, sizeof(buf) - offset, "[%d]=%u ", i, state_per_poller[j][i]);
+				inflight += state_per_poller[j][i];
 			}
+			offset += snprintf(buf + offset, sizeof(buf) - offset, "INFLIGHT[%d]=%u ", j, inflight);
 
 			// Print the entire string in one line
 			SPDK_NOTICELOG("%s \n", buf);

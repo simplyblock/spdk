@@ -5157,9 +5157,11 @@ nvmf_rdma_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 			offset += snprintf(buf + offset, sizeof(buf) - offset, "AV[%d]=%.3f ", j, (double)(stat.avg_time_interval[j] * 1000.0) / ticks_hz);
 			offset += snprintf(buf + offset, sizeof(buf) - offset, "MI[%d]=%.3f ", j, (double)(stat.max_time_interval[j] * 1000.0) / ticks_hz);
 			offset += snprintf(buf + offset, sizeof(buf) - offset, "M[%d]=%.3f ", j, (double)(stat.max_time[j] * 1000.0) / ticks_hz);
+			uint32_t inflight = 0;
 			for (int i = 1; i < RDMA_REQUEST_NUM_STATES; i++) {
-				offset += snprintf(buf + offset, sizeof(buf) - offset, "[%d]=%u ", i, stat.state[j][i]);
+				inflight += stat.state[j][i];
 			}
+			offset += snprintf(buf + offset, sizeof(buf) - offset, "INFLIGHT[%d]=%u ", j, inflight);
 			// Print the entire string in one line
 			SPDK_NOTICELOG("%s \n", buf);
 			offset = 0;
