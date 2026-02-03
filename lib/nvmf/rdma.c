@@ -5112,7 +5112,7 @@ nvmf_rdma_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 	rgroup = SPDK_CONTAINEROF(group, struct spdk_nvmf_rdma_poll_group, group);
 
 	if (spdk_get_ticks() - rgroup->timestamp > spdk_get_ticks_hz() * 4) {
-		struct spdk_nvmf_rdma_poller_stat	stat;
+		struct spdk_nvmf_rdma_poller_stat	stat = {0};
 		uint64_t ticks_hz = spdk_get_ticks_hz();
 		rgroup->timestamp = spdk_get_ticks();
 		int cnt[3] = {0};
