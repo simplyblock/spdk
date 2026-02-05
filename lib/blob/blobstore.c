@@ -7240,6 +7240,40 @@ spdk_bs_dumpv2(struct spdk_blob_store *bs, FILE *fp, spdk_bs_op_complete cb_fn, 
 
 /* END spdk_bs_dump */
 
+/* Start spdk_bs_dump_tree */
+
+int
+spdk_bs_dump_tree(struct spdk_blob *blob, uint64_t *ids, int *id_count)
+{
+	struct spdk_blob *tmp = NULL;
+	*id_count = 0;
+	spdk_blob_id parent_id;
+	if (blob->open_ref == 1) {
+		parent_id = blob->parent_id;
+		while (parent_id != SPDK_BLOBID_INVALID) {
+			if (*id_count >= 1000) {
+				break;
+			}
+
+			ids[*id_count] = parent_id;
+			(*id_count)++;
+
+			tmp = blob_lookup(blob->bs, parent_id);
+			if (!tmp) {
+				SPDK_ERRLOG("Failed to lookup parent blob id %" PRIu64 ", clone blob id %" PRIu64 "\n", parent_id, blob->id);
+				break;
+			}
+
+			parent_id = tmp->parent_id;
+		}
+		return 0;
+	} else {
+		return -EINVAL;
+	}
+}
+
+/* End spdk_bs_dump_tree */
+
 /* START spdk_bs_init */
 
 static void

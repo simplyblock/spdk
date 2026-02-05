@@ -1973,6 +1973,33 @@ vbdev_lvs_dump(struct spdk_lvol_store *lvs, const char *file, spdk_lvol_op_with_
 	return 0;
 }
 
+void
+vbdev_lvs_dump_tree(struct spdk_lvol_store *lvs, const char *file, spdk_lvol_op_complete cb_fn,
+		  void *cb_arg)
+{
+	// struct spdk_lvol_with_handle_req *req;
+	FILE *fp = NULL;
+
+	fp = fopen(file, "w");  // Open the file in write mode
+
+	if (fp == NULL) {
+		SPDK_ERRLOG("Error opening file for writing\n");
+		cb_fn(cb_arg, -1);
+		// return -1;
+	}
+
+	if (lvs == NULL) {
+		SPDK_ERRLOG("lvol store does not exist\n");
+		cb_fn(cb_arg, -EINVAL);
+		fclose(fp);
+		// return -EINVAL;
+	}
+	lvs_print_lvols_info(lvs, fp);
+	fclose(fp);
+	cb_fn(cb_arg, 0);
+	// return 0;
+}
+
 int
 vbdev_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz,
 		  bool thin_provision, enum lvol_clear_method clear_method, int8_t lvol_priority_class,

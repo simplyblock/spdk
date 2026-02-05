@@ -1278,6 +1278,58 @@ lvs_verify_lvol_name(struct spdk_lvol_store *lvs, const char *name)
 	return 0;
 }
 
+void
+lvs_print_lvols_info(struct spdk_lvol_store *lvs, FILE *fp)
+{
+	struct spdk_lvol *tmp, *base_lvol;
+	uint64_t blobids[1000];
+	int lvol_count;
+	int rc = 0;
+	TAILQ_FOREACH(tmp, &lvs->lvols, link) {
+		memset(blobids, 0, sizeof(blobids));
+		lvol_count = 0;
+		rc = spdk_bs_dump_tree(tmp->blob, blobids, &lvol_count);
+		if (rc < 0) {			
+			fprintf(fp, "-------------------------\n");
+			fprintf(fp,"Lvol info as in chain\n");
+			fprintf(fp, "Name: %s\n", tmp->name);
+			fprintf(fp, "UUID: %s\n", tmp->uuid_str);
+			fprintf(fp, "Blobid: %" PRIu64 "\n", tmp->blob_id);
+			fprintf(fp, "Ref: %d\n", spdk_blob_get_open_ref(tmp->blob));
+			fprintf(fp, "\n");
+			continue;
+		}
+
+		if (lvol_count > 0) {
+			fprintf(fp, "-------------------------\n");
+			fprintf(fp,"Lvol info as clone\n");
+			fprintf(fp, "Name: %s\n", tmp->name);
+			fprintf(fp, "UUID: %s\n", tmp->uuid_str);
+			fprintf(fp, "Blobid: %" PRIu64 "\n", tmp->blob_id);
+			fprintf(fp, "Ref: %d\n", spdk_blob_get_open_ref(tmp->blob));
+			fprintf(fp, "Blob chain: ");
+			for (int i = 0; i < lvol_count; i++) {
+				TAILQ_FOREACH(base_lvol, &lvs->lvols, link) {
+					if (base_lvol->blob_id == blobids[i]) {
+						fprintf(fp, "(UUID: %s, blobid: %" PRIu64 ", Ref: %d , Name: %s) \n", base_lvol->uuid_str, base_lvol->blob_id, spdk_blob_get_open_ref(base_lvol->blob), base_lvol->name);
+						break;
+					}
+				}
+			}
+			fprintf(fp, "\n");
+
+		} else {
+			fprintf(fp, "-------------------------\n");
+			fprintf(fp, "Lvol info as base lvol\n");
+			fprintf(fp, "Name: %s\n", tmp->name);
+			fprintf(fp, "UUID: %s\n", tmp->uuid_str);
+			fprintf(fp, "Blobid: %" PRIu64 "\n", tmp->blob_id);
+			fprintf(fp, "Ref: %d\n", spdk_blob_get_open_ref(tmp->blob));
+			fprintf(fp, "\n");
+		}
+	}
+}
+
 int
 spdk_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz,
 		 bool thin_provision, enum lvol_clear_method clear_method, spdk_lvol_op_with_handle_complete cb_fn,
