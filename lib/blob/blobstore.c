@@ -1654,7 +1654,7 @@ blob_load_snapshot_cpl(void *cb_arg, struct spdk_blob *snapshot, int bserrno)
 		blob->parent_id = SPDK_BLOBID_INVALID;
 		blob->back_bs_dev = NULL;
 		blob_remove_xattr(blob, BLOB_SNAPSHOT, true);
-
+		bserrno = 0;
 		SPDK_ERRLOG("Snapshot fail\n");
 	}
 
