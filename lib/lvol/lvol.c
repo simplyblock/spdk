@@ -2342,6 +2342,45 @@ spdk_lvs_grow_live(struct spdk_lvol_store *lvs, spdk_lvs_op_complete cb_fn, void
 }
 
 static void
+lvs_apply_cb(void *cb_arg, int lvolerrno)
+{
+	struct spdk_lvs_req *req = (struct spdk_lvs_req *)cb_arg;
+
+	if (req->cb_fn) {
+		req->cb_fn(req->cb_arg, lvolerrno);
+	}
+	free(req);
+	return;
+}
+
+void
+spdk_lvs_apply(struct spdk_lvol_store *lvs, spdk_lvs_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_lvs_req *req;
+
+	req = calloc(1, sizeof(*req));
+	if (req == NULL) {
+		SPDK_ERRLOG("Cannot alloc memory for request structure\n");
+		if (cb_fn) {
+			cb_fn(cb_arg, -ENOMEM);
+		}
+		return;
+	}
+
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+	req->lvol_store = lvs;
+	assert(lvs->leader == true);
+	if (!lvs->leader) {
+		SPDK_ERRLOG("lvolstore %s: cannot apply: due to  not in leadership state.\n", lvs->name);
+		cb_fn(cb_arg, ERR_LEADERSHIP_CHANGED);
+		free(req);
+		return;
+	}
+	spdk_bs_apply(lvs->blobstore, lvs_apply_cb, req);
+}
+
+static void
 lvs_update_live_cb(void *cb_arg, int lvolerrno)
 {
 	struct spdk_lvs_req *req = (struct spdk_lvs_req *)cb_arg;

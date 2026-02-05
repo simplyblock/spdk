@@ -392,6 +392,7 @@ void spdk_bs_grow_live(struct spdk_blob_store *bs,
  */
 void spdk_bs_update_live(struct spdk_blob_store *bs, bool failover, uint64_t id,
 		       spdk_bs_op_complete cb_fn, void *cb_arg);
+void spdk_bs_apply(struct spdk_blob_store *bs, spdk_blob_op_complete cb_fn, void *cb_arg);
 
 void spdk_blob_failover_unfreaze(struct spdk_blob *blob, 
 				spdk_blob_op_complete cb_fn, void *cb_arg);
