@@ -3189,6 +3189,9 @@ nvmf_ns_reservation_register(struct spdk_nvmf_ns *ns,
 	SPDK_DEBUGLOG(nvmf, "REGISTER: RREGA %u, IEKEY %u, CPTPL %u, "
 		      "NRKEY 0x%"PRIx64", NRKEY 0x%"PRIx64"\n",
 		      rrega, iekey, cptpl, key.crkey, key.nrkey);
+	SPDK_NOTICELOG("REGISTER: NSID %u, RREGA %u, IEKEY %u, CPTPL %u, "
+		       "NRKEY 0x%"PRIx64", NRKEY 0x%"PRIx64", nqn:%s, host:%s\n",
+		       ns->nsid, rrega, iekey, cptpl, key.crkey, key.nrkey, ctrlr->subsys->subnqn, ctrlr->hostnqn);
 
 	if (cptpl == SPDK_NVME_RESERVE_PTPL_CLEAR_POWER_ON) {
 		/* True to OFF state, and need to be updated in the configuration file */
@@ -3198,6 +3201,7 @@ nvmf_ns_reservation_register(struct spdk_nvmf_ns *ns,
 		}
 	} else if (cptpl == SPDK_NVME_RESERVE_PTPL_PERSIST_POWER_LOSS) {
 		if (!nvmf_ns_is_ptpl_capable(ns)) {
+			SPDK_NOTICELOG("Namespace %u doesn't support PTPL, can't set PTPL_PERSIST_POWER_LOSS\n", ns->nsid);
 			status = SPDK_NVME_SC_INVALID_FIELD;
 			goto exit;
 		} else if (ns->ptpl_activated == 0) {
@@ -3220,6 +3224,7 @@ nvmf_ns_reservation_register(struct spdk_nvmf_ns *ns,
 			}
 			rc = nvmf_ns_reservation_add_registrant(ns, ctrlr, key.nrkey);
 			if (rc < 0) {
+				SPDK_NOTICELOG("1- Failed to add registrant for host %s\n", ctrlr->hostnqn);
 				status = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 				goto exit;
 			}
@@ -3281,6 +3286,7 @@ nvmf_ns_reservation_register(struct spdk_nvmf_ns *ns,
 			/* new registrant */
 			rc = nvmf_ns_reservation_add_registrant(ns, ctrlr, key.nrkey);
 			if (rc < 0) {
+				SPDK_NOTICELOG("2-Failed to add registrant for host %s\n", ctrlr->hostnqn);
 				status = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 				goto exit;
 			}
@@ -3293,6 +3299,7 @@ nvmf_ns_reservation_register(struct spdk_nvmf_ns *ns,
 		update_sgroup = true;
 		break;
 	default:
+		SPDK_NOTICELOG("Invalid RREGA value %u\n", rrega);
 		status = SPDK_NVME_SC_INVALID_FIELD;
 		goto exit;
 	}
@@ -3339,6 +3346,10 @@ nvmf_ns_reservation_acquire(struct spdk_nvmf_ns *ns,
 	SPDK_DEBUGLOG(nvmf, "ACQUIRE: RACQA %u, IEKEY %u, RTYPE %u, "
 		      "NRKEY 0x%"PRIx64", PRKEY 0x%"PRIx64"\n",
 		      racqa, iekey, rtype, key.crkey, key.prkey);
+	SPDK_NOTICELOG("ACQUIRE: NSID %u, RACQA %u, IEKEY %u, RTYPE %u, "
+		       "NRKEY 0x%"PRIx64", PRKEY 0x%"PRIx64", nqn:%s, host:%s\n",
+		       ns->nsid, racqa, iekey, rtype, key.crkey, key.prkey, ctrlr->subsys->subnqn,
+		       ctrlr->hostnqn);
 
 	if (iekey || rtype > SPDK_NVME_RESERVE_EXCLUSIVE_ACCESS_ALL_REGS) {
 		SPDK_ERRLOG("Ignore existing key field set to 1\n");
@@ -3426,6 +3437,7 @@ nvmf_ns_reservation_acquire(struct spdk_nvmf_ns *ns,
 		}
 		break;
 	default:
+		SPDK_NOTICELOG("Invalid RACQA value %u\n", racqa);
 		status = SPDK_NVME_SC_INVALID_FIELD;
 		update_sgroup = false;
 		break;
@@ -3497,6 +3509,10 @@ nvmf_ns_reservation_release(struct spdk_nvmf_ns *ns,
 
 	SPDK_DEBUGLOG(nvmf, "RELEASE: RRELA %u, IEKEY %u, RTYPE %u, "
 		      "CRKEY 0x%"PRIx64"\n",  rrela, iekey, rtype, crkey);
+	SPDK_NOTICELOG("RELEASE: NSID %u, RRELA %u, IEKEY %u, RTYPE %u, "
+		       "CRKEY 0x%"PRIx64", nqn:%s, host:%s\n",
+		       ns->nsid, rrela, iekey, rtype, crkey, ctrlr->subsys->subnqn,
+		       ctrlr->hostnqn);
 
 	if (iekey) {
 		SPDK_ERRLOG("Ignore existing key field set to 1\n");
@@ -3522,6 +3538,8 @@ nvmf_ns_reservation_release(struct spdk_nvmf_ns *ns,
 	case SPDK_NVME_RESERVE_RELEASE:
 		if (!ns->holder) {
 			SPDK_DEBUGLOG(nvmf, "RELEASE: no holder\n");
+			SPDK_NOTICELOG("RELEASE: NSID %u, no holder, nqn:%s, host:%s\n",
+				       ns->nsid, ctrlr->subsys->subnqn, ctrlr->hostnqn);
 			update_sgroup = false;
 			goto exit;
 		}
@@ -3558,6 +3576,7 @@ nvmf_ns_reservation_release(struct spdk_nvmf_ns *ns,
 		}
 		break;
 	default:
+		SPDK_NOTICELOG("Invalid RRELA value %u\n", rrela);
 		status = SPDK_NVME_SC_INVALID_FIELD;
 		update_sgroup = false;
 		goto exit;
@@ -3600,6 +3619,7 @@ nvmf_ns_reservation_report(struct spdk_nvmf_ns *ns,
 	transfer_len = (cmd->cdw10 + 1) * sizeof(uint32_t);
 
 	if (transfer_len < sizeof(struct spdk_nvme_reservation_status_extended_data)) {
+		SPDK_ERRLOG("Transfer length too small for Reservation Status data structure\n");
 		status = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 		goto exit;
 	}
@@ -3697,6 +3717,7 @@ nvmf_ns_reservation_request(void *ctx)
 	if (update_sgroup) {
 		if (ns->ptpl_activated || cmd->opc == SPDK_NVME_OPC_RESERVATION_REGISTER) {
 			if (nvmf_ns_update_reservation_info(ns) != 0) {
+				SPDK_NOTICELOG("Failed to update reservation info for nsid %u\n", nsid);
 				req->rsp->nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 			}
 		}

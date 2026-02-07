@@ -4578,6 +4578,8 @@ nvmf_ctrlr_process_io_cmd(struct spdk_nvmf_request *req)
 	if (nvmf_ns_reservation_request_check(ns_info, ctrlr, req)) {
 		SPDK_DEBUGLOG(nvmf, "Reservation Conflict for nsid %u, opcode %u\n",
 			      cmd->nsid, cmd->opc);
+		SPDK_ERRLOG("Reservation Conflict for nsid %u, opcode %u, nqn:%s\n",
+			       cmd->nsid, cmd->opc, ctrlr->subsys->subnqn);
 		return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
 	}
 
@@ -4638,7 +4640,9 @@ nvmf_ctrlr_process_io_cmd(struct spdk_nvmf_request *req)
 		case SPDK_NVME_OPC_RESERVATION_ACQUIRE:
 		case SPDK_NVME_OPC_RESERVATION_RELEASE:
 		case SPDK_NVME_OPC_RESERVATION_REPORT:
+			SPDK_NOTICELOG("1- Received reservation command opcode 0x%x\n", cmd->opc);
 			if (spdk_unlikely(!ctrlr->cdata.oncs.reservations)) {
+				SPDK_NOTICELOG("2- Controller does not support reservations, rejecting command\n");
 				goto invalid_opcode;
 			}
 			spdk_thread_send_msg(ctrlr->subsys->thread, nvmf_ns_reservation_request, req);
