@@ -3232,7 +3232,7 @@ check_time(struct spdk_nvmf_tcp_req *tcp_req, struct spdk_nvmf_tcp_qpair *tqpair
 		double duration_us = ((double)(current - tcp_req->time) * 1000.0) / (double)ticks_hz;
 
 		tqpair->avg_time_interval += duration_us;
-		tqpair->sample_count += duration_us;
+		tqpair->sample_count += 1;
 
 		if (tqpair->max_time_interval < duration_us) {
 			tqpair->max_time_interval = duration_us;
@@ -3245,7 +3245,6 @@ check_time(struct spdk_nvmf_tcp_req *tcp_req, struct spdk_nvmf_tcp_qpair *tqpair
 		if ((current - tcp_req->time) > ticks_hz ) {
 			char *uuid = spdk_nvmf_request_nqn(&tcp_req->req, 0);
 			uuid = (uuid) ? uuid : ""; // Handle NULL UUID
-			double duration_us = ((double)(current - tcp_req->time) * 1000.0) / (double)ticks_hz;
 			// Log relevant information
 			SPDK_NOTICELOG("delay-qpair %p ttag %d (QID %d) cp %d sp %d, state %d, time %.2f (ms), nqn %s\n",
 				tqpair, tcp_req->ttag, tqpair->qpair.qid, tqpair->initiator_port,
@@ -3929,7 +3928,7 @@ nvmf_tcp_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 		// uint32_t core_id = spdk_env_get_current_core();
 		TAILQ_FOREACH(tqpair, &tgroup->qpairs, link) {
 			if (tqpair) {
-				for (int i = 0; i < TCP_REQUEST_NUM_STATES; i++) {
+				for (int i = 1; i < TCP_REQUEST_NUM_STATES; i++) {
 					state_per_poller[tqpair->qpair_type][i] += tqpair->state_cntr[i];
 					// total_state[core_id][i] += tqpair->state_cntr[i];
 				}
@@ -3958,7 +3957,7 @@ nvmf_tcp_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 			}
 		}
 
-		char buf[300]; // Adjust the size as necessary
+		char buf[350]; // Adjust the size as necessary
 		int offset = 0;
 		struct spdk_thread *t = spdk_get_thread();
     	const char *name = spdk_thread_get_name(t);
@@ -3969,11 +3968,14 @@ nvmf_tcp_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 			offset += snprintf(buf + offset, sizeof(buf) - offset, "MI[%d]=%.3f ", j, (double)(max_time_interval[j]));
 			offset += snprintf(buf + offset, sizeof(buf) - offset, "M[%d]=%.3f ", j, (double)(max_time[j]));
 			uint32_t inflight = 0;
+			uint32_t inflight_real = 0;
 			for (int i = 1; i < TCP_REQUEST_NUM_STATES; i++) {
 				inflight += state_per_poller[j][i];
+				if ( i == TCP_REQUEST_STATE_EXECUTING) {
+					inflight_real = state_per_poller[j][i];
+				}
 			}
-			offset += snprintf(buf + offset, sizeof(buf) - offset, "INFLIGHT[%d]=%u ", j, inflight);
-
+			offset += snprintf(buf + offset, sizeof(buf) - offset, "INFLIGHT[%d]=%u EXECUTING[%d]=%u ", j, inflight, j, inflight_real);
 			// Print the entire string in one line
 			SPDK_NOTICELOG("%s \n", buf);
 			offset = 0;
