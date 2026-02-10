@@ -31,7 +31,7 @@
 #include <execinfo.h>
 #endif
 
-#define SPDK_MSG_BATCH_SIZE		8
+#define SPDK_MSG_BATCH_SIZE		100
 #define SPDK_MAX_DEVICE_NAME_LEN	256
 #define SPDK_THREAD_EXIT_TIMEOUT_SEC	5
 #define SPDK_MAX_POLLER_NAME_LEN	256
