@@ -277,12 +277,12 @@ def bdev_lvs_dump(client, file, uuid=None, lvs_name=None):
         params['lvs_name'] = lvs_name    
     return client.call('bdev_lvs_dump', params)
 
-def bdev_lvs_dump_tree(client, file, uuid=None, lvs_name=None):
+def bdev_lvs_dump_tree(client, uuid=None, lvs_name=None):
     """Create a logical volume on a logical volume store."""
     if (uuid and lvs_name) or (not uuid and not lvs_name):
         raise ValueError("Either uuid or lvs_name must be specified, but not both")
 
-    params = {'file': file}
+    params = {}
     if uuid:
         params['uuid'] = uuid
     if lvs_name:

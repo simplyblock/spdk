@@ -1279,55 +1279,151 @@ lvs_verify_lvol_name(struct spdk_lvol_store *lvs, const char *name)
 }
 
 void
-lvs_print_lvols_info(struct spdk_lvol_store *lvs, FILE *fp)
+lvs_print_lvols_info(struct spdk_lvol_store *lvs, struct spdk_json_write_ctx *w)
 {
 	struct spdk_lvol *tmp, *base_lvol;
 	uint64_t blobids[1000];
-	int lvol_count;
+	int lvol_count, child_count;
+	uint64_t parent;
 	int rc = 0;
+	int type = 0;
+	bool has_clones = false, is_snapshot = false;
+
+	/* Result root */
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_array_begin(w, "lvols");
+
 	TAILQ_FOREACH(tmp, &lvs->lvols, link) {
 		memset(blobids, 0, sizeof(blobids));
 		lvol_count = 0;
-		rc = spdk_bs_dump_tree(tmp->blob, blobids, &lvol_count);
-		if (rc < 0) {			
-			fprintf(fp, "-------------------------\n");
-			fprintf(fp,"Lvol info as in chain\n");
-			fprintf(fp, "Name: %s\n", tmp->name);
-			fprintf(fp, "UUID: %s\n", tmp->uuid_str);
-			fprintf(fp, "Blobid: %" PRIu64 "\n", tmp->blob_id);
-			fprintf(fp, "Ref: %d\n", spdk_blob_get_open_ref(tmp->blob));
-			fprintf(fp, "\n");
-			continue;
+		parent = 0;
+		child_count = 0;
+		has_clones = false;
+		is_snapshot = false;
+		type = 0;
+		spdk_json_write_object_begin(w);
+		/* Common fields */
+		if (strncmp(tmp->name, "CLN_", 4) == 0) {
+			type = 1;
+			spdk_json_write_named_string(w, "Mtype", "clone");
+		} else if (strncmp(tmp->name, "LVOL", 4) == 0) {
+			type = 2;
+			spdk_json_write_named_string(w, "Mtype", "lvol");
+		} else if (strncmp(tmp->name, "SNAP", 4) == 0) {
+			type = 3;
+			spdk_json_write_named_string(w, "Mtype", "snapshot");
+		} else {
+			spdk_json_write_named_string(w, "Mtype", "Unknown");
+			spdk_json_write_named_string(w, "Stype", "Unknown");
+			spdk_json_write_named_string(w, "error", "Unknown lvol type");
 		}
+		spdk_json_write_named_string(w, "name", tmp->name);
+		spdk_json_write_named_string(w, "uuid", tmp->uuid_str);
+		spdk_json_write_named_uint64(w, "blobid", tmp->blob_id);
+		spdk_json_write_named_int32(w, "ref", spdk_blob_get_open_ref(tmp->blob));
 
-		if (lvol_count > 0) {
-			fprintf(fp, "-------------------------\n");
-			fprintf(fp,"Lvol info as clone\n");
-			fprintf(fp, "Name: %s\n", tmp->name);
-			fprintf(fp, "UUID: %s\n", tmp->uuid_str);
-			fprintf(fp, "Blobid: %" PRIu64 "\n", tmp->blob_id);
-			fprintf(fp, "Ref: %d\n", spdk_blob_get_open_ref(tmp->blob));
-			fprintf(fp, "Blob chain: ");
-			for (int i = 0; i < lvol_count; i++) {
+		rc = spdk_bs_dump_tree(tmp->blob, blobids, &lvol_count, &parent, &child_count, &is_snapshot, &has_clones);
+		if (rc < 0) {
+			/* "snapshot-with-clones" path */
+			spdk_json_write_named_string(w, "Ltype", "snapshot");
+			if (type == 3 /* SNAP */) {
+				spdk_json_write_named_string(w, "Stype", "snapshot");
+			} else if (type == 1 || type == 2) {
+				spdk_json_write_named_string(w, "Stype", "clone/lvol");
+				spdk_json_write_named_string(w, "error", "something wrong");
+			}
+			if (parent != 0) {
 				TAILQ_FOREACH(base_lvol, &lvs->lvols, link) {
-					if (base_lvol->blob_id == blobids[i]) {
-						fprintf(fp, "(UUID: %s, blobid: %" PRIu64 ", Ref: %d , Name: %s) \n", base_lvol->uuid_str, base_lvol->blob_id, spdk_blob_get_open_ref(base_lvol->blob), base_lvol->name);
+					if (base_lvol->blob_id == parent) {
+						spdk_json_write_named_uint64(w, "parent_blobid", parent);
+						spdk_json_write_named_string(w, "parent_uuid", base_lvol->uuid_str);
+						spdk_json_write_named_string(w, "parent_name", base_lvol->name);
 						break;
 					}
 				}
 			}
-			fprintf(fp, "\n");
 
-		} else {
-			fprintf(fp, "-------------------------\n");
-			fprintf(fp, "Lvol info as base lvol\n");
-			fprintf(fp, "Name: %s\n", tmp->name);
-			fprintf(fp, "UUID: %s\n", tmp->uuid_str);
-			fprintf(fp, "Blobid: %" PRIu64 "\n", tmp->blob_id);
-			fprintf(fp, "Ref: %d\n", spdk_blob_get_open_ref(tmp->blob));
-			fprintf(fp, "\n");
+			if (child_count > 0) {
+				spdk_json_write_named_array_begin(w, "children");				
+				for (int i = 0; i < child_count; i++) {
+					bool found = false;
+					TAILQ_FOREACH(base_lvol, &lvs->lvols, link) {
+						if (base_lvol->blob_id == blobids[i]) {
+							spdk_json_write_object_begin(w);
+							spdk_json_write_named_string(w, "uuid", base_lvol->uuid_str);
+							spdk_json_write_named_uint64(w, "blobid", base_lvol->blob_id);
+							spdk_json_write_named_int32(w, "ref", spdk_blob_get_open_ref(base_lvol->blob));
+							spdk_json_write_named_string(w, "name", base_lvol->name);
+							spdk_json_write_object_end(w);
+							found = true;
+							break;
+						}
+					}
+					if (!found) {
+						spdk_json_write_object_begin(w);
+						spdk_json_write_named_uint64(w, "blobid", blobids[i]);
+						spdk_json_write_named_bool(w, "missing", true);
+						spdk_json_write_object_end(w);
+					}
+				}
+				spdk_json_write_array_end(w);
+			}
+			spdk_json_write_object_end(w);
+			continue;
 		}
+
+		if (lvol_count > 0) {
+			/* Clone path */
+			if (is_snapshot) {
+				spdk_json_write_named_string(w, "Ltype", "snapshot without clones");
+			} else {
+				spdk_json_write_named_string(w, "Ltype", "clone/lvol");
+			}
+
+			if (type == 3 /* SNAP */) {
+				spdk_json_write_named_string(w, "Stype", "snapshot");
+			} else if (type == 1 || type == 2) {
+				spdk_json_write_named_string(w, "Stype", "clone/lvol");
+			}
+			spdk_json_write_named_array_begin(w, "blob_chain");
+			for (int i = 0; i < lvol_count; i++) {
+				bool found = false;
+				TAILQ_FOREACH(base_lvol, &lvs->lvols, link) {
+					if (base_lvol->blob_id == blobids[i]) {
+						spdk_json_write_object_begin(w);
+						spdk_json_write_named_string(w, "uuid", base_lvol->uuid_str);
+						spdk_json_write_named_uint64(w, "blobid", base_lvol->blob_id);
+						spdk_json_write_named_int32(w, "ref", spdk_blob_get_open_ref(base_lvol->blob));
+						spdk_json_write_named_string(w, "name", base_lvol->name);
+						spdk_json_write_object_end(w);
+						found = true;
+						break;
+					}
+				}
+				if (!found) {
+					spdk_json_write_object_begin(w);
+					spdk_json_write_named_uint64(w, "blobid", blobids[i]);
+					spdk_json_write_named_bool(w, "missing", true);
+					spdk_json_write_object_end(w);
+				}
+			}
+			spdk_json_write_array_end(w);
+		} else {
+			if (is_snapshot) {
+				spdk_json_write_named_string(w, "Ltype", "snapshot without clones and parent");
+			} else {
+				spdk_json_write_named_string(w, "Ltype", "clone/lvol");
+			}
+			if (type == 3 /* SNAP */) {
+				spdk_json_write_named_string(w, "Stype", "snapshot");
+			} else if (type == 1 || type == 2) {
+				spdk_json_write_named_string(w, "Stype", "clone/lvol");
+			}
+		}
+		spdk_json_write_object_end(w);
 	}
+	spdk_json_write_array_end(w);
+	spdk_json_write_object_end(w);
 }
 
 int

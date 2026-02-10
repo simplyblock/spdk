@@ -7241,14 +7241,27 @@ spdk_bs_dumpv2(struct spdk_blob_store *bs, FILE *fp, spdk_bs_op_complete cb_fn, 
 /* END spdk_bs_dump */
 
 /* Start spdk_bs_dump_tree */
-
 int
-spdk_bs_dump_tree(struct spdk_blob *blob, uint64_t *ids, int *id_count)
+spdk_bs_dump_tree(struct spdk_blob *blob, uint64_t *ids, int *id_count, uint64_t *tparent_id, int *child_count, bool *tsnapshot, bool *thas_clone)
 {
 	struct spdk_blob *tmp = NULL;
+	struct spdk_blob_list *snapshot_entry, *clone_entry;
+	bool has_clone = false;
+	bool is_snapshot = false;
+	*tparent_id = 0;
 	*id_count = 0;
+	*child_count = 0;
+	snapshot_entry = bs_get_snapshot_entry(blob->bs, blob->id);
+	if (snapshot_entry != NULL) {
+		is_snapshot = true;
+		if (snapshot_entry->clone_count >= 1) {
+			has_clone = true;
+		}
+	}
+	*tsnapshot = is_snapshot;
+	*thas_clone = has_clone;
 	spdk_blob_id parent_id;
-	if (blob->open_ref == 1) {
+	if (!has_clone) {
 		parent_id = blob->parent_id;
 		while (parent_id != SPDK_BLOBID_INVALID) {
 			if (*id_count >= 1000) {
@@ -7268,10 +7281,23 @@ spdk_bs_dump_tree(struct spdk_blob *blob, uint64_t *ids, int *id_count)
 		}
 		return 0;
 	} else {
+		if ((blob->parent_id != SPDK_BLOBID_INVALID)) {
+			*tparent_id = blob->parent_id;
+		}
+		
+		if (is_snapshot && has_clone) {
+			TAILQ_FOREACH(clone_entry, &snapshot_entry->clones, link) {
+					if (*child_count >= 1000) {
+						break;
+					}
+					ids[*child_count] = clone_entry->id;
+					(*child_count)++;
+
+			}
+		}
 		return -EINVAL;
 	}
 }
-
 /* End spdk_bs_dump_tree */
 
 /* START spdk_bs_init */
