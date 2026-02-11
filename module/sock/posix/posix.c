@@ -1214,7 +1214,7 @@ _posix_sock_accept(struct spdk_sock *_sock, bool enable_ssl)
 #endif
 
 
-	if (sock->base.impl_opts.bind_to_device) {
+	if (sock->base.impl_opts.bind_to_device[0] != '\0') {
 #if defined(__linux__)
 			SPDK_NOTICELOG("bind socket to device %s\n", sock->base.impl_opts.bind_to_device);
 			rc = setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, sock->base.impl_opts.bind_to_device, strlen(sock->base.impl_opts.bind_to_device) + 1);

@@ -47,7 +47,8 @@ def sock_impl_set_options(client,
     params = {}
 
     params['impl_name'] = impl_name
-    params['bind_to_device'] = bind_to_device
+    if bind_to_device is not None:
+        params['bind_to_device'] = bind_to_device
     if recv_buf_size is not None:
         params['recv_buf_size'] = recv_buf_size
     if send_buf_size is not None:
