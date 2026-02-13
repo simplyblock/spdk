@@ -103,7 +103,8 @@ static struct spdk_sock_impl_opts g_posix_impl_opts = {
 	.psk_identity = NULL,
 	.get_key = NULL,
 	.get_key_ctx = NULL,
-	.tls_cipher_suites = NULL
+	.tls_cipher_suites = NULL,
+	.bind_to_device = {0}
 };
 
 static struct spdk_sock_impl_opts g_ssl_impl_opts = {
@@ -118,7 +119,8 @@ static struct spdk_sock_impl_opts g_ssl_impl_opts = {
 	.tls_version = 0,
 	.enable_ktls = false,
 	.psk_key = NULL,
-	.psk_identity = NULL
+	.psk_identity = NULL,
+	.bind_to_device = {0}
 };
 
 static struct spdk_sock_map g_map = {
@@ -164,6 +166,10 @@ posix_sock_copy_impl_opts(struct spdk_sock_impl_opts *dest, const struct spdk_so
 	SET_FIELD(get_key);
 	SET_FIELD(get_key_ctx);
 	SET_FIELD(tls_cipher_suites);
+	if (FIELD_OK(bind_to_device) && src->bind_to_device[0] != '\0') {
+		strncpy(dest->bind_to_device, src->bind_to_device, sizeof(dest->bind_to_device) - 1);
+		dest->bind_to_device[sizeof(dest->bind_to_device) - 1] = '\0';
+	}	
 
 #undef SET_FIELD
 #undef FIELD_OK
@@ -1206,6 +1212,21 @@ _posix_sock_accept(struct spdk_sock *_sock, bool enable_ssl)
 		}
 	}
 #endif
+
+	if (sock->base.impl_opts.bind_to_device[0] != '\0') {
+#if defined(__linux__)
+			SPDK_NOTICELOG("bind socket to device %s\n", sock->base.impl_opts.bind_to_device);
+			rc = setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, sock->base.impl_opts.bind_to_device, strlen(sock->base.impl_opts.bind_to_device) + 1);
+			if (rc < 0) {
+				SPDK_ERRLOG("Failed to bind socket to device, errno %d\n", errno);
+				close(fd);
+				return NULL;
+			}
+#else
+		SPDK_WARNLOG("SO_BINDTODEVICE is not supported.\n");
+#endif
+	}
+
 
 	new_sock = posix_sock_alloc(fd, &sock->base.impl_opts);
 	if (new_sock == NULL) {

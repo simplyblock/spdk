@@ -3944,6 +3944,7 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     def sock_impl_set_options(args):
         rpc.sock.sock_impl_set_options(args.client,
                                        impl_name=args.impl,
+                                       bind_to_device=args.bind_to_device,
                                        recv_buf_size=args.recv_buf_size,
                                        send_buf_size=args.send_buf_size,
                                        enable_recv_pipe=args.enable_recv_pipe,
@@ -3957,6 +3958,7 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
 
     p = subparsers.add_parser('sock_impl_set_options', help="""Set options of socket layer implementation""")
     p.add_argument('-i', '--impl', help='Socket implementation name, e.g. posix', required=True)
+    p.add_argument('-b', '--bind-to-device', help='Bind socket to device name')
     p.add_argument('-r', '--recv-buf-size', help='Size of receive buffer on socket in bytes', type=int)
     p.add_argument('-s', '--send-buf-size', help='Size of send buffer on socket in bytes', type=int)
     p.add_argument('-p', '--enable-placement-id', help='Option for placement-id. 0:disable,1:incoming_napi,2:incoming_cpu', type=int)
