@@ -1278,6 +1278,154 @@ lvs_verify_lvol_name(struct spdk_lvol_store *lvs, const char *name)
 	return 0;
 }
 
+void
+lvs_print_lvols_info(struct spdk_lvol_store *lvs, struct spdk_json_write_ctx *w)
+{
+	struct spdk_lvol *tmp, *base_lvol;
+	uint64_t blobids[1000];
+	int lvol_count, child_count;
+	uint64_t parent;
+	int rc = 0;
+	int type = 0;
+	bool has_clones = false, is_snapshot = false;
+
+	/* Result root */
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_array_begin(w, "lvols");
+
+	TAILQ_FOREACH(tmp, &lvs->lvols, link) {
+		memset(blobids, 0, sizeof(blobids));
+		lvol_count = 0;
+		parent = 0;
+		child_count = 0;
+		has_clones = false;
+		is_snapshot = false;
+		type = 0;
+		spdk_json_write_object_begin(w);
+		/* Common fields */
+		if (strncmp(tmp->name, "CLN_", 4) == 0) {
+			type = 1;
+			spdk_json_write_named_string(w, "Mtype", "clone");
+		} else if (strncmp(tmp->name, "LVOL", 4) == 0) {
+			type = 2;
+			spdk_json_write_named_string(w, "Mtype", "lvol");
+		} else if (strncmp(tmp->name, "SNAP", 4) == 0) {
+			type = 3;
+			spdk_json_write_named_string(w, "Mtype", "snapshot");
+		} else {
+			spdk_json_write_named_string(w, "Mtype", "Unknown");
+			spdk_json_write_named_string(w, "Stype", "Unknown");
+			spdk_json_write_named_string(w, "error", "Unknown lvol type");
+		}
+		spdk_json_write_named_string(w, "name", tmp->name);
+		spdk_json_write_named_string(w, "uuid", tmp->uuid_str);
+		spdk_json_write_named_uint64(w, "blobid", tmp->blob_id);
+		spdk_json_write_named_int32(w, "ref", spdk_blob_get_open_ref(tmp->blob));
+
+		rc = spdk_bs_dump_tree(tmp->blob, blobids, &lvol_count, &parent, &child_count, &is_snapshot, &has_clones);
+		if (rc < 0) {
+			/* "snapshot-with-clones" path */
+			spdk_json_write_named_string(w, "Ltype", "snapshot");
+			if (type == 3 /* SNAP */) {
+				spdk_json_write_named_string(w, "Stype", "snapshot");
+			} else if (type == 1 || type == 2) {
+				spdk_json_write_named_string(w, "Stype", "clone/lvol");
+				spdk_json_write_named_string(w, "error", "something wrong");
+			}
+			if (parent != 0) {
+				TAILQ_FOREACH(base_lvol, &lvs->lvols, link) {
+					if (base_lvol->blob_id == parent) {
+						spdk_json_write_named_uint64(w, "parent_blobid", parent);
+						spdk_json_write_named_string(w, "parent_uuid", base_lvol->uuid_str);
+						spdk_json_write_named_string(w, "parent_name", base_lvol->name);
+						break;
+					}
+				}
+			}
+
+			if (child_count > 0) {
+				spdk_json_write_named_array_begin(w, "children");				
+				for (int i = 0; i < child_count; i++) {
+					bool found = false;
+					TAILQ_FOREACH(base_lvol, &lvs->lvols, link) {
+						if (base_lvol->blob_id == blobids[i]) {
+							spdk_json_write_object_begin(w);
+							spdk_json_write_named_string(w, "uuid", base_lvol->uuid_str);
+							spdk_json_write_named_uint64(w, "blobid", base_lvol->blob_id);
+							spdk_json_write_named_int32(w, "ref", spdk_blob_get_open_ref(base_lvol->blob));
+							spdk_json_write_named_string(w, "name", base_lvol->name);
+							spdk_json_write_object_end(w);
+							found = true;
+							break;
+						}
+					}
+					if (!found) {
+						spdk_json_write_object_begin(w);
+						spdk_json_write_named_uint64(w, "blobid", blobids[i]);
+						spdk_json_write_named_bool(w, "missing", true);
+						spdk_json_write_object_end(w);
+					}
+				}
+				spdk_json_write_array_end(w);
+			}
+			spdk_json_write_object_end(w);
+			continue;
+		}
+
+		if (lvol_count > 0) {
+			/* Clone path */
+			if (is_snapshot) {
+				spdk_json_write_named_string(w, "Ltype", "snapshot without clones");
+			} else {
+				spdk_json_write_named_string(w, "Ltype", "clone/lvol");
+			}
+
+			if (type == 3 /* SNAP */) {
+				spdk_json_write_named_string(w, "Stype", "snapshot");
+			} else if (type == 1 || type == 2) {
+				spdk_json_write_named_string(w, "Stype", "clone/lvol");
+			}
+			spdk_json_write_named_array_begin(w, "blob_chain");
+			for (int i = 0; i < lvol_count; i++) {
+				bool found = false;
+				TAILQ_FOREACH(base_lvol, &lvs->lvols, link) {
+					if (base_lvol->blob_id == blobids[i]) {
+						spdk_json_write_object_begin(w);
+						spdk_json_write_named_string(w, "uuid", base_lvol->uuid_str);
+						spdk_json_write_named_uint64(w, "blobid", base_lvol->blob_id);
+						spdk_json_write_named_int32(w, "ref", spdk_blob_get_open_ref(base_lvol->blob));
+						spdk_json_write_named_string(w, "name", base_lvol->name);
+						spdk_json_write_object_end(w);
+						found = true;
+						break;
+					}
+				}
+				if (!found) {
+					spdk_json_write_object_begin(w);
+					spdk_json_write_named_uint64(w, "blobid", blobids[i]);
+					spdk_json_write_named_bool(w, "missing", true);
+					spdk_json_write_object_end(w);
+				}
+			}
+			spdk_json_write_array_end(w);
+		} else {
+			if (is_snapshot) {
+				spdk_json_write_named_string(w, "Ltype", "snapshot without clones and parent");
+			} else {
+				spdk_json_write_named_string(w, "Ltype", "clone/lvol");
+			}
+			if (type == 3 /* SNAP */) {
+				spdk_json_write_named_string(w, "Stype", "snapshot");
+			} else if (type == 1 || type == 2) {
+				spdk_json_write_named_string(w, "Stype", "clone/lvol");
+			}
+		}
+		spdk_json_write_object_end(w);
+	}
+	spdk_json_write_array_end(w);
+	spdk_json_write_object_end(w);
+}
+
 int
 spdk_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz,
 		 bool thin_provision, enum lvol_clear_method clear_method, spdk_lvol_op_with_handle_complete cb_fn,
@@ -2339,6 +2487,45 @@ spdk_lvs_grow_live(struct spdk_lvol_store *lvs, spdk_lvs_op_complete cb_fn, void
 	req->lvol_store = lvs;
 
 	spdk_bs_grow_live(lvs->blobstore, lvs_grow_live_cb, req);
+}
+
+static void
+lvs_apply_cb(void *cb_arg, int lvolerrno)
+{
+	struct spdk_lvs_req *req = (struct spdk_lvs_req *)cb_arg;
+
+	if (req->cb_fn) {
+		req->cb_fn(req->cb_arg, lvolerrno);
+	}
+	free(req);
+	return;
+}
+
+void
+spdk_lvs_apply(struct spdk_lvol_store *lvs, spdk_lvs_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_lvs_req *req;
+
+	req = calloc(1, sizeof(*req));
+	if (req == NULL) {
+		SPDK_ERRLOG("Cannot alloc memory for request structure\n");
+		if (cb_fn) {
+			cb_fn(cb_arg, -ENOMEM);
+		}
+		return;
+	}
+
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+	req->lvol_store = lvs;
+	assert(lvs->leader == true);
+	if (!lvs->leader) {
+		SPDK_ERRLOG("lvolstore %s: cannot apply: due to  not in leadership state.\n", lvs->name);
+		cb_fn(cb_arg, ERR_LEADERSHIP_CHANGED);
+		free(req);
+		return;
+	}
+	spdk_bs_apply(lvs->blobstore, lvs_apply_cb, req);
 }
 
 static void

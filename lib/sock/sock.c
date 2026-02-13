@@ -451,6 +451,7 @@ spdk_sock_posix_fd_create(struct addrinfo *res, struct spdk_sock_opts *opts,
 #else
 		SPDK_WARNLOG("TCP_USER_TIMEOUT is not supported.\n");
 #endif
+	}
 
 	if (impl_opts->bind_to_device[0] != '\0') {
 #if defined(__linux__)
@@ -463,8 +464,6 @@ spdk_sock_posix_fd_create(struct addrinfo *res, struct spdk_sock_opts *opts,
 #else
 		SPDK_WARNLOG("SO_BINDTODEVICE is not supported.\n");
 #endif
-	}
-
 	}
 
 	return fd;

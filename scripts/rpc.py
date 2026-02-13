@@ -2105,6 +2105,17 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('-l', '--lvs-name', help='lvol store name')
     p.set_defaults(func=bdev_lvol_update_lvstore)
     
+    def bdev_lvol_apply_lvstore(args):
+        print_dict(rpc.lvol.bdev_lvol_apply_lvstore(args.client,
+                                                   uuid=args.uuid,
+                                                   lvs_name=args.lvs_name))
+
+    p = subparsers.add_parser('bdev_lvol_apply_lvstore',
+                              help='Apply the lvstore on the secondary node')
+    p.add_argument('-u', '--uuid', help='lvol store UUID')
+    p.add_argument('-l', '--lvs-name', help='lvol store name')
+    p.set_defaults(func=bdev_lvol_apply_lvstore)
+    
     def bdev_lvol_set_leader_all(args):
         print_dict(rpc.lvol.bdev_lvol_set_leader_all(args.client,
                                                    uuid=args.uuid,
@@ -2219,6 +2230,16 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('-l', '--lvs-name', help='lvol store name')
     p.add_argument('-f', '--file', help='file path for dump data')
     p.set_defaults(func=bdev_lvs_dump)
+    
+    def bdev_lvs_dump_tree(args):
+        print_json(rpc.lvol.bdev_lvs_dump_tree(args.client,
+                                            uuid=args.uuid,
+                                            lvs_name=args.lvs_name))
+
+    p = subparsers.add_parser('bdev_lvs_dump_tree', help='dump tree data from blobstore')
+    p.add_argument('-u', '--uuid', help='lvol store UUID')
+    p.add_argument('-l', '--lvs-name', help='lvol store name')    
+    p.set_defaults(func=bdev_lvs_dump_tree)
 
     def bdev_lvol_set_priority_class(args):
         print_json(rpc.lvol.bdev_lvol_set_priority_class(args.client,
