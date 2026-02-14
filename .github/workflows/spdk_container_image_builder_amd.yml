@@ -48,12 +48,24 @@ jobs:
 
     - name: Push the docker image
       run: docker image push 565979732541.dkr.ecr.us-east-1.amazonaws.com/spdk-core:$BRANCH_NAME-amd64
+
+    - name: Install jq
+      run: sudo apt-get update && sudo apt-get install -y jq
+
     - name: Create the manifest
       run: |
-        docker manifest create simplyblock/spdk-core:$BRANCH_NAME-latest simplyblock/spdk-core:$BRANCH_NAME-arm64 simplyblock/spdk-core:$BRANCH_NAME-amd64
-        docker manifest create 565979732541.dkr.ecr.us-east-1.amazonaws.com/spdk-core:$BRANCH_NAME-latest 565979732541.dkr.ecr.us-east-1.amazonaws.com/spdk-core:$BRANCH_NAME-arm64 565979732541.dkr.ecr.us-east-1.amazonaws.com/spdk-core:$BRANCH_NAME-amd64
-        docker manifest annotate simplyblock/spdk-core:$BRANCH_NAME-latest simplyblock/spdk-core:$BRANCH_NAME-arm64 --arch arm64
-        docker manifest annotate simplyblock/spdk-core:$BRANCH_NAME-latest simplyblock/spdk-core:$BRANCH_NAME-amd64 --arch amd64
-        docker manifest annotate 565979732541.dkr.ecr.us-east-1.amazonaws.com/spdk-core:$BRANCH_NAME-latest 565979732541.dkr.ecr.us-east-1.amazonaws.com/spdk-core:$BRANCH_NAME-arm64 --arch arm64
-        docker manifest annotate 565979732541.dkr.ecr.us-east-1.amazonaws.com/spdk-core:$BRANCH_NAME-latest 565979732541.dkr.ecr.us-east-1.amazonaws.com/spdk-core:$BRANCH_NAME-amd64 --arch amd64
+        need_ref() { j="$(docker manifest inspect "$1" 2>/dev/null)"; echo "$j" | jq -e '.manifests' >/dev/null 2>&1 && echo "${1%:*}@$(echo "$j" | jq -r --arg a "$2" '.manifests[]|select(.platform.architecture==$a)|.digest' | head -n1)" || echo "$1"; }
+
+        DH_ARM="$(need_ref simplyblock/spdk-core:$BRANCH_NAME-arm64 arm64)"
+        DH_AMD="$(need_ref simplyblock/spdk-core:$BRANCH_NAME-amd64 amd64)"
+        ECR_ARM="$(need_ref 565979732541.dkr.ecr.us-east-1.amazonaws.com/spdk-core:$BRANCH_NAME-arm64 arm64)"
+        ECR_AMD="$(need_ref 565979732541.dkr.ecr.us-east-1.amazonaws.com/spdk-core:$BRANCH_NAME-amd64 amd64)"
+
+        docker manifest create simplyblock/spdk-core:$BRANCH_NAME-latest "$DH_ARM" "$DH_AMD"
+        docker manifest create 565979732541.dkr.ecr.us-east-1.amazonaws.com/spdk-core:$BRANCH_NAME-latest "$ECR_ARM" "$ECR_AMD
+        docker manifest annotate simplyblock/spdk-core:$BRANCH_NAME-latest "$DH_ARM" --arch arm64
+        docker manifest annotate simplyblock/spdk-core:$BRANCH_NAME-latest "$DH_AMD" --arch amd64
+        docker manifest annotate 565979732541.dkr.ecr.us-east-1.amazonaws.com/spdk-core:$BRANCH_NAME-latest "$ECR_ARM" --arch arm64
+        docker manifest annotate 565979732541.dkr.ecr.us-east-1.amazonaws.com/spdk-core:$BRANCH_NAME-latest "$ECR_AMD" --arch amd64
         docker manifest push simplyblock/spdk-core:$BRANCH_NAME-latest
+        docker manifest push 565979732541.dkr.ecr.us-east-1.amazonaws.com/spdk-core:$BRANCH_NAME-latest
