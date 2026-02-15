@@ -10,6 +10,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     steps:
     - name: Checkout the triggered branch
       uses: actions/checkout@v3
@@ -54,7 +55,8 @@ jobs:
 
     - name: Create the manifest
       run: |
-        need_ref() { j="$(docker manifest inspect "$1" 2>/dev/null)"; echo "$j" | jq -e '.manifests' >/dev/null 2>&1 && echo "${1%:*}@$(echo "$j" | jq -r --arg a "$2" '.manifests[]|select(.platform.architecture==$a)|.digest' | head -n1)" || echo "$1"; }
+        set -euo pipefail
+        need_ref() { j="$(docker manifest inspect "$1" 2>/dev/null || true)"; echo "$j" | jq -e '.manifests' >/dev/null 2>&1 && d="$(echo "$j" | jq -r --arg a "$2" '.manifests[]|select(.platform.architecture==$a)|.digest' | head -n1)" && [ -n "$d" ] && echo "${1%:*}@$d" || echo "$1"; }
 
         DH_ARM="$(need_ref simplyblock/spdk-core:$BRANCH_NAME-arm64 arm64)"
         DH_AMD="$(need_ref simplyblock/spdk-core:$BRANCH_NAME-amd64 amd64)"
@@ -62,7 +64,7 @@ jobs:
         ECR_AMD="$(need_ref 565979732541.dkr.ecr.us-east-1.amazonaws.com/spdk-core:$BRANCH_NAME-amd64 amd64)"
 
         docker manifest create simplyblock/spdk-core:$BRANCH_NAME-latest "$DH_ARM" "$DH_AMD"
-        docker manifest create 565979732541.dkr.ecr.us-east-1.amazonaws.com/spdk-core:$BRANCH_NAME-latest "$ECR_ARM" "$ECR_AMD
+        docker manifest create 565979732541.dkr.ecr.us-east-1.amazonaws.com/spdk-core:$BRANCH_NAME-latest "$ECR_ARM" "$ECR_AMD"
         docker manifest annotate simplyblock/spdk-core:$BRANCH_NAME-latest "$DH_ARM" --arch arm64
         docker manifest annotate simplyblock/spdk-core:$BRANCH_NAME-latest "$DH_AMD" --arch amd64
         docker manifest annotate 565979732541.dkr.ecr.us-east-1.amazonaws.com/spdk-core:$BRANCH_NAME-latest "$ECR_ARM" --arch arm64
