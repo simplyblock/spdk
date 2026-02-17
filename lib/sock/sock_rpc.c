@@ -65,6 +65,7 @@ SPDK_RPC_REGISTER("sock_impl_get_options", rpc_sock_impl_get_options,
 struct spdk_rpc_sock_impl_set_opts {
 	char *impl_name;
 	struct spdk_sock_impl_opts sock_opts;
+	char *bind_to_device;
 };
 
 static const struct spdk_json_object_decoder rpc_sock_impl_set_opts_decoders[] = {
@@ -111,6 +112,10 @@ static const struct spdk_json_object_decoder rpc_sock_impl_set_opts_decoders[] =
 	{
 		"enable_ktls", offsetof(struct spdk_rpc_sock_impl_set_opts, sock_opts.enable_ktls),
 		spdk_json_decode_bool, true
+	},
+	{
+		"bind_to_device", offsetof(struct spdk_rpc_sock_impl_set_opts, bind_to_device),
+		spdk_json_decode_string, true
 	}
 };
 
@@ -121,7 +126,7 @@ rpc_sock_impl_set_options(struct spdk_jsonrpc_request *request,
 	struct spdk_rpc_sock_impl_set_opts opts = {};
 	size_t len;
 	int rc;
-
+	opts.sock_opts.bind_to_device[0] = '\0';
 	/* Get type */
 	if (spdk_json_decode_object(params, rpc_sock_impl_set_opts_decoders,
 				    SPDK_COUNTOF(rpc_sock_impl_set_opts_decoders), &opts)) {
@@ -133,9 +138,18 @@ rpc_sock_impl_set_options(struct spdk_jsonrpc_request *request,
 
 	/* Retrieve default opts for requested socket implementation */
 	len = sizeof(opts.sock_opts);
+
+	if (opts.bind_to_device == NULL) {
+		opts.sock_opts.bind_to_device[0] = '\0';
+	} else {
+		strncpy(opts.sock_opts.bind_to_device, opts.bind_to_device, sizeof(opts.sock_opts.bind_to_device) - 1);
+		opts.sock_opts.bind_to_device[sizeof(opts.sock_opts.bind_to_device) - 1] = '\0';
+	}
+
 	rc = spdk_sock_impl_get_opts(opts.impl_name, &opts.sock_opts, &len);
 	if (rc) {
 		free(opts.impl_name);
+		free(opts.bind_to_device);
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 "Invalid parameters");
 		return;
@@ -150,9 +164,17 @@ rpc_sock_impl_set_options(struct spdk_jsonrpc_request *request,
 		return;
 	}
 
+	if (opts.bind_to_device == NULL) {
+		opts.sock_opts.bind_to_device[0] = '\0';
+	} else {
+		strncpy(opts.sock_opts.bind_to_device, opts.bind_to_device, sizeof(opts.sock_opts.bind_to_device) - 1);
+		opts.sock_opts.bind_to_device[sizeof(opts.sock_opts.bind_to_device) - 1] = '\0';
+	}
+
 	rc = spdk_sock_impl_set_opts(opts.impl_name, &opts.sock_opts, sizeof(opts.sock_opts));
 	if (rc != 0) {
 		free(opts.impl_name);
+		free(opts.bind_to_device);
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 "Invalid parameters");
 		return;
@@ -160,6 +182,7 @@ rpc_sock_impl_set_options(struct spdk_jsonrpc_request *request,
 
 	spdk_jsonrpc_send_bool_response(request, true);
 	free(opts.impl_name);
+	free(opts.bind_to_device);
 }
 SPDK_RPC_REGISTER("sock_impl_set_options", rpc_sock_impl_set_options, SPDK_RPC_STARTUP)
 

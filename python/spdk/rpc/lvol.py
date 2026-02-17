@@ -74,6 +74,22 @@ def bdev_lvol_update_lvstore(client, uuid=None, lvs_name=None):
         params['lvs_name'] = lvs_name
     return client.call('bdev_lvol_update_lvstore', params)
 
+def bdev_lvol_apply_lvstore(client, uuid=None, lvs_name=None):
+    """Apply the logical volume store to fill the underlying bdev
+
+    Args:
+        uuid: UUID of logical volume store to apply (optional)
+        lvs_name: name of logical volume store to apply (optional)
+    """
+    if (uuid and lvs_name):
+        raise ValueError("Exactly one of uuid or lvs_name may be specified")
+    params = {}
+    if uuid:
+        params['uuid'] = uuid
+    if lvs_name:
+        params['lvs_name'] = lvs_name
+    return client.call('bdev_lvol_apply_lvstore', params)
+
 def bdev_lvol_set_leader_all(client, uuid=None, lvs_name=None, lvs_leadership=False, bs_nonleadership=False):
     """Change state of the leadership
 
@@ -499,6 +515,18 @@ def bdev_lvs_dump(client, file, uuid=None, lvs_name=None):
     if lvs_name:
         params['lvs_name'] = lvs_name    
     return client.call('bdev_lvs_dump', params)
+
+def bdev_lvs_dump_tree(client, uuid=None, lvs_name=None):
+    """Create a logical volume on a logical volume store."""
+    if (uuid and lvs_name) or (not uuid and not lvs_name):
+        raise ValueError("Either uuid or lvs_name must be specified, but not both")
+
+    params = {}
+    if uuid:
+        params['uuid'] = uuid
+    if lvs_name:
+        params['lvs_name'] = lvs_name    
+    return client.call('bdev_lvs_dump_tree', params)
 
 def bdev_lvol_set_priority_class(client, lvol_name, lvol_priority_class):
     """Set the I/O priority class of a logical volume.
