@@ -1914,6 +1914,8 @@ blob_load_cpl_extents_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		return;
 	}
 
+	uint64_t tmp_num_clusters = 0;
+	uint64_t tmp_remaining_clusters = 0;
 	for (i = ctx->next_extent_page; i < blob->active.num_extent_pages; i++) {
 		ctx->next_extent_page++;
 		if (blob->active.extent_pages[i] != 0) {
@@ -1939,12 +1941,21 @@ blob_load_cpl_extents_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 				return;
 			}
 
+			tmp_num_clusters = blob->active.num_clusters;
+			tmp_remaining_clusters = blob->remaining_clusters_in_et;
 			bserrno = blob_parse_extent_page(page, blob);
 			if (bserrno) {
 				SPDK_ERRLOG("Parse extenet metadata page %d failed for blobid 0x%" PRIx64 "\n",
 					ctx->next_extent_page, blob->id);
 				blob_load_final(ctx, bserrno);
 				return;
+			}
+
+			if (i + 1 < blob->active.num_extent_pages) {
+				if ((blob->active.num_clusters - tmp_num_clusters != SPDK_EXTENTS_PER_EP) && (tmp_remaining_clusters > SPDK_EXTENTS_PER_EP)) {
+					blob->active.num_clusters += SPDK_EXTENTS_PER_EP - (blob->active.num_clusters - tmp_num_clusters);
+					blob->remaining_clusters_in_et -= SPDK_EXTENTS_PER_EP - (blob->active.num_clusters - tmp_num_clusters);
+				}
 			}
 		} else {
 			/* Thin provisioned blobs can point to unallocated extent pages.
@@ -8358,7 +8369,7 @@ bs_create_blob(struct spdk_blob_store *bs,
 			goto error;
 		}
 	}
-	opts_local.num_clusters = ((opts_local.num_clusters + SPDK_EXTENTS_PER_EP - 1) / SPDK_EXTENTS_PER_EP) * SPDK_EXTENTS_PER_EP;
+
 	rc = blob_resize(blob, opts_local.num_clusters);
 	if (rc < 0) {
 		goto error;
@@ -10203,7 +10214,7 @@ spdk_blob_resize(struct spdk_blob *blob, uint64_t sz, spdk_blob_op_complete cb_f
 	struct spdk_bs_resize_ctx *ctx;
 
 	blob_verify_md_op(blob);
-	sz = ((sz + SPDK_EXTENTS_PER_EP - 1) / SPDK_EXTENTS_PER_EP) * SPDK_EXTENTS_PER_EP;
+
 	SPDK_DEBUGLOG(blob, "Resizing blob 0x%" PRIx64 " to %" PRIu64 " clusters\n", blob->id, sz);
 
 	if (blob->md_ro) {
@@ -10240,7 +10251,6 @@ spdk_blob_resize_register(struct spdk_blob *blob, uint64_t sz)
 {	
 	blob_verify_md_op(blob);
 
-	sz = ((sz + SPDK_EXTENTS_PER_EP - 1) / SPDK_EXTENTS_PER_EP) * SPDK_EXTENTS_PER_EP;
 	SPDK_NOTICELOG("Resizing blob 0x%" PRIx64 " to %" PRIu64 " clusters on secondary.\n", blob->id, sz);
 
 	if (blob->md_ro) {
