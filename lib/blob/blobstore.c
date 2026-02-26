@@ -1953,8 +1953,8 @@ blob_load_cpl_extents_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 
 			if (i + 1 < blob->active.num_extent_pages) {
 				if ((blob->active.num_clusters - tmp_num_clusters != SPDK_EXTENTS_PER_EP) && (tmp_remaining_clusters > SPDK_EXTENTS_PER_EP)) {
-					blob->active.num_clusters += SPDK_EXTENTS_PER_EP - (blob->active.num_clusters - tmp_num_clusters);
 					blob->remaining_clusters_in_et -= SPDK_EXTENTS_PER_EP - (blob->active.num_clusters - tmp_num_clusters);
+					blob->active.num_clusters += SPDK_EXTENTS_PER_EP - (blob->active.num_clusters - tmp_num_clusters);					
 				}
 			}
 		} else {
