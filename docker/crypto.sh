@@ -47,6 +47,21 @@ sed -i 's/^\tadr\s\+sha1key_adr, KEY_3$/\tadrp    sha1key_adr, KEY_3\
 sed -i 's/^\tadr\s\+md5key_adr,MD5_CONST_KEYS$/\tadrp    md5key_adr,MD5_CONST_KEYS\
 \tadd     md5key_adr, md5key_adr, :lo12:MD5_CONST_KEYS/' /root/spdk/isa-l-crypto/md5_mb/aarch64/md5_mb_sve.S
 
+sed -i 's/^\tadr\s\+key_adr,KEY_0$/\tadrp    key_adr,KEY_0\
+\tadd     key_adr,key_adr,:lo12:KEY_0/' /root/spdk/isa-l-crypto/mh_sha1/aarch64/mh_sha1_block_ce.S
+
+sed -i 's/^\tadr\s\+key_adr,KEY_1$/\tadrp    key_adr,KEY_1\
+\tadd     key_adr,key_adr,:lo12:KEY_1/' /root/spdk/isa-l-crypto/mh_sha1/aarch64/mh_sha1_block_ce.S
+
+sed -i 's/^\tadr\s\+key_adr,KEY_2$/\tadrp    key_adr,KEY_2\
+\tadd     key_adr,key_adr,:lo12:KEY_2/' /root/spdk/isa-l-crypto/mh_sha1/aarch64/mh_sha1_block_ce.S
+
+sed -i 's/^\tadr\s\+key_adr,KEY_3$/\tadrp    key_adr,KEY_3\
+\tadd     key_adr,key_adr,:lo12:KEY_3/' /root/spdk/isa-l-crypto/mh_sha1/aarch64/mh_sha1_block_ce.S
+
+sed -i 's/^\tadr\s\+sha1key_adr, SHA1KEY$/\tadrp    sha1key_adr, SHA1KEY\
+\tadd     sha1key_adr, sha1key_adr, :lo12:SHA1KEY/' /root/spdk/isa-l-crypto/mh_sha1/aarch64/mh_sha1_block_sve.S
+
 sed -i 's/^\tadr\s\+sha1key_adr, KEY_0$/\tadrp    sha1key_adr, KEY_0\
 \tadd     sha1key_adr, sha1key_adr, :lo12:KEY_0/' /root/spdk/isa-l-crypto/mh_sha1/aarch64/sha1_asimd_common.S
 
@@ -58,3 +73,57 @@ sed -i 's/^\tadr\s\+sha1key_adr, KEY_2$/\tadrp    sha1key_adr, KEY_2\
 
 sed -i 's/^\tadr\s\+sha1key_adr, KEY_3$/\tadrp    sha1key_adr, KEY_3\
 \tadd     sha1key_adr, sha1key_adr, :lo12:KEY_3/' /root/spdk/isa-l-crypto/mh_sha1/aarch64/sha1_asimd_common.S
+
+sed -i 's/^\tadr\s\+mur_c1, C1$/\tadrp    mur_c1, C1\
+\tadd     mur_c1, mur_c1, :lo12:C1/' /root/spdk/isa-l-crypto/mh_sha1_murmur3_x64_128/aarch64/mh_sha1_murmur3_block_ce.S
+
+sed -i 's/^\tadr\s\+mur_c2, C2$/\tadrp    mur_c2, C2\
+\tadd     mur_c2, mur_c2, :lo12:C2/' /root/spdk/isa-l-crypto/mh_sha1_murmur3_x64_128/aarch64/mh_sha1_murmur3_block_ce.S
+
+sed -i 's/^\tadr\s\+tmp0_adr, N1$/\tadrp    tmp0_adr, N1\
+\tadd     tmp0_adr, tmp0_adr, :lo12:N1/' /root/spdk/isa-l-crypto/mh_sha1_murmur3_x64_128/aarch64/mh_sha1_murmur3_block_ce.S
+
+sed -i 's/^\tadr\s\+tmp0_adr, N2$/\tadrp    tmp0_adr, N2\
+\tadd     tmp0_adr, tmp0_adr, :lo12:N2/' /root/spdk/isa-l-crypto/mh_sha1_murmur3_x64_128/aarch64/mh_sha1_murmur3_block_ce.S
+
+sed -i 's/^\tadr\s\+key_adr,KEY_0$/\tadrp    key_adr,KEY_0\
+\tadd     key_adr,key_adr,:lo12:KEY_0/' /root/spdk/isa-l-crypto/mh_sha1_murmur3_x64_128/aarch64/mh_sha1_murmur3_block_ce.S
+
+sed -i 's/^\tadr\s\+key_adr,KEY_1$/\tadrp    key_adr,KEY_1\
+\tadd     key_adr,key_adr,:lo12:KEY_1/' /root/spdk/isa-l-crypto/mh_sha1_murmur3_x64_128/aarch64/mh_sha1_murmur3_block_ce.S
+
+sed -i 's/^\tadr\s\+key_adr,KEY_2$/\tadrp    key_adr,KEY_2\
+\tadd     key_adr,key_adr,:lo12:KEY_2/' /root/spdk/isa-l-crypto/mh_sha1_murmur3_x64_128/aarch64/mh_sha1_murmur3_block_ce.S
+
+sed -i 's/^\tadr\s\+key_adr,KEY_3$/\tadrp    key_adr,KEY_3\
+\tadd     key_adr,key_adr,:lo12:KEY_3/' /root/spdk/isa-l-crypto/mh_sha1_murmur3_x64_128/aarch64/mh_sha1_murmur3_block_ce.S
+
+sed -i 's/^\tadr\s\+sha1key_adr, KEY_0$/\tadrp    sha1key_adr, KEY_0\
+\tadd     sha1key_adr, sha1key_adr, :lo12:KEY_0/' /root/spdk/isa-l-crypto/sha1_mb/aarch64/sha1_aarch64_x1.S
+
+sed -i 's/^\tadr\s\+sha1key_adr, KEY_1$/\tadrp    sha1key_adr, KEY_1\
+\tadd     sha1key_adr, sha1key_adr, :lo12:KEY_1/' /root/spdk/isa-l-crypto/sha1_mb/aarch64/sha1_aarch64_x1.S
+
+sed -i 's/^\tadr\s\+sha1key_adr, KEY_2$/\tadrp    sha1key_adr, KEY_2\
+\tadd     sha1key_adr, sha1key_adr, :lo12:KEY_2/' /root/spdk/isa-l-crypto/sha1_mb/aarch64/sha1_aarch64_x1.S
+
+sed -i 's/^\tadr\s\+sha1key_adr, KEY_3$/\tadrp    sha1key_adr, KEY_3\
+\tadd     sha1key_adr, sha1key_adr, :lo12:KEY_3/' /root/spdk/isa-l-crypto/sha1_mb/aarch64/sha1_aarch64_x1.S
+
+sed -i 's/^\tadr\s\+sha1key_adr, KEY_0$/\tadrp    sha1key_adr, KEY_0\
+\tadd     sha1key_adr, sha1key_adr, :lo12:KEY_0/' /root/spdk/isa-l-crypto/sha1_mb/aarch64/sha1_asimd_common.S
+
+sed -i 's/^\tadr\s\+sha1key_adr, KEY_1$/\tadrp    sha1key_adr, KEY_1\
+\tadd     sha1key_adr, sha1key_adr, :lo12:KEY_1/' /root/spdk/isa-l-crypto/sha1_mb/aarch64/sha1_asimd_common.S
+
+sed -i 's/^\tadr\s\+sha1key_adr, KEY_2$/\tadrp    sha1key_adr, KEY_2\
+\tadd     sha1key_adr, sha1key_adr, :lo12:KEY_2/' /root/spdk/isa-l-crypto/sha1_mb/aarch64/sha1_asimd_common.S
+
+sed -i 's/^\tadr\s\+sha1key_adr, KEY_3$/\tadrp    sha1key_adr, KEY_3\
+\tadd     sha1key_adr, sha1key_adr, :lo12:KEY_3/' /root/spdk/isa-l-crypto/sha1_mb/aarch64/sha1_asimd_common.S
+
+sed -i 's/^\tadr\s\+tmp, KEY$/\tadrp    tmp, KEY\
+\tadd     tmp, tmp, :lo12:KEY/' /root/spdk/isa-l-crypto/sha1_mb/aarch64/sha1_mb_x1_ce.S
+
+sed -i 's/^\tadr\s\+tmp, KEY$/\tadrp    tmp, KEY\
+\tadd     tmp, tmp, :lo12:KEY/' /root/spdk/isa-l-crypto/sha1_mb/aarch64/sha1_mb_x2_ce.S
