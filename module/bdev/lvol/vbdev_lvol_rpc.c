@@ -3264,7 +3264,7 @@ decode_s3_ids(const struct spdk_json_val *val, void *out)
 {
 	struct rpc_bdev_lvol_recovery_s3_ids *s3_ids = out;
 	return spdk_json_decode_array(val, spdk_json_decode_uint32, s3_ids->ids,
-				      RPC_MAX_LVOL_VBDEV, &s3_ids->num, sizeof(char *));
+				      RPC_MAX_LVOL_VBDEV, &s3_ids->num, sizeof(uint32_t));
 }
 
 static void 
@@ -3297,8 +3297,8 @@ rpc_bdev_lvol_s3_recovery(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
-	if (req.lvol_name) {
-		SPDK_ERRLOG("lvol_name and s3_id must be specified");
+	if (!req.lvol_name) {
+		SPDK_ERRLOG("lvol_name and s3_id must be specified\n");
 		spdk_jsonrpc_send_error_response(request, -EINVAL, spdk_strerror(EINVAL));
 		goto cleanup;
 	}
