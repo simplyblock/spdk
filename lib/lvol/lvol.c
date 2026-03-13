@@ -5497,7 +5497,7 @@ xfer_s3_recovery(struct spdk_lvs_xfer *xfer) {
 				uint32_t *idx_in = (uint32_t *)req->payload;
 				uint32_t entries = (xfer->page_size * xfer->page_per_cluster) / sizeof(uint32_t);
 				for (uint32_t j = 0; j < entries; j++) {
-					if (idx_in[j] == 0) {
+					if (j != 0 && idx_in[j] == 0) {
 						break;
 					}
 
