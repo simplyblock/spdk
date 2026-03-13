@@ -5471,7 +5471,7 @@ xfer_s3_recovery(struct spdk_lvs_xfer *xfer) {
 			}
 
 			memset(req->payload, 0, xfer->page_size * xfer->page_per_cluster);
-			req->offset = s3_pack_offset(0, xfer->chain_s3_ids[xfer->hold_idx], true /* mid flag */, false);
+			req->s3_offset = s3_pack_offset(0, xfer->chain_s3_ids[xfer->hold_idx], true /* mid flag */, false);
 			req->len = xfer->page_per_cluster; // 2MB
 			req->action = REQ_ACTION_READ;
 			req->status = XFER_REQ_STATUS_READY;
