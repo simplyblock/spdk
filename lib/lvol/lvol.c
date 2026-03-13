@@ -4783,9 +4783,18 @@ xfer_s3_check(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req **preq, uint3
 				}
 				xfer->state = XFER_STATE_FAILED;
 			} else {
-				// print current outstanding io timeout error
-				SPDK_ERRLOG("S3 transfer timeout with outstanding io %u, state %d\n", xfer->outstanding_io, xfer->state);
-				assert(false);
+				xfer->s3_timeout_count++;
+				if (xfer->s3_timeout_count == 1) {
+					SPDK_ERRLOG("S3 transfer timeout with outstanding io %u, state %d\n", xfer->outstanding_io, xfer->state);
+				}
+				if (xfer->s3_timeout_count >= 3) {
+					SPDK_ERRLOG("S3 transfer failed after %u timeouts, outstanding io %u, state %d\n",
+						xfer->s3_timeout_count, xfer->outstanding_io, xfer->state);
+					if (xfer->lvol) {
+						xfer->lvol->transfer_status = XFER_FAILED;
+					}
+					xfer->state = XFER_STATE_FAILED;
+				}
 			}
 		}
 		return -1;

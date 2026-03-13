@@ -272,6 +272,7 @@ struct spdk_lvs_xfer {
 	uint32_t hold_idx;
 	uint32_t idx;
 	bool persist_swap;
+	uint32_t s3_timeout_count;
 };
 
 struct spdk_lvol_store {
