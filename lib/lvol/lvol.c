@@ -6127,6 +6127,10 @@ spdk_lvol_create_backup_task(struct spdk_lvs_xfer *task, struct spdk_transfer_de
 	SPDK_NOTICELOG("Transfer task %d %s task started.\n", task->s3_id,
 		 			xfer_type_to_string(task->type));
 
+	if (task->lvol) {
+		task->lvol->transfer_status = XFER_IN_PROGRESS;
+	}
+
 	TAILQ_FOREACH(lpg, &g_lvs_poll_groups, entry) {
 		spdk_thread_send_msg(lpg->thread, spdk_create_poller, lpg);
 	}
