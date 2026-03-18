@@ -6022,6 +6022,7 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
 		rmt_lvol->ready_ring = ctx->ready_ring;
 		rmt_lvol->group = lpg;
 		rmt_lvol->reused = tdev->reused;
+		rmt_lvol->type = ctx->type;
 		spdk_thread_send_msg(lpg->thread, spdk_lvs_add_rmt_bdev_to_poll_group, rmt_lvol);
 	}
 
