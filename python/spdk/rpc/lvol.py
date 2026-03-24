@@ -846,7 +846,7 @@ def bdev_lvol_get_lvstores(client, uuid=None, lvs_name=None):
         params['lvs_name'] = lvs_name
     return client.call('bdev_lvol_get_lvstores', params)
 
-def bdev_lvol_set_lvs_opts(client, uuid=None, lvs_name=None, groupid=0, subsystem_port=0, primary=False, secondary=False):
+def bdev_lvol_set_lvs_opts(client, uuid=None, lvs_name=None, groupid=0, subsystem_port=0, role=None):
     """Set group id for lvolstore.
 
     Args:
@@ -861,8 +861,10 @@ def bdev_lvol_set_lvs_opts(client, uuid=None, lvs_name=None, groupid=0, subsyste
         raise ValueError("Exactly one of uuid or lvs_name may be specified")
     if (not groupid):
         raise ValueError("groupid must be specified")
+    if role not in ("primary", "secondary", "tertiary"):
+        raise ValueError("role must be primary, secondary, or tertiary")
      
-    params = {'groupid': groupid, 'subsystem_port': subsystem_port, 'primary': primary, 'secondary': secondary}
+    params = {'groupid': groupid, 'subsystem_port': subsystem_port, 'role': role}
     if uuid:
         params['uuid'] = uuid
     if lvs_name:

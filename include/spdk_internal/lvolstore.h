@@ -275,6 +275,13 @@ struct spdk_lvs_xfer {
 	uint32_t s3_timeout_count;
 };
 
+typedef enum {
+    NODE_PRIMARY = 0,
+    NODE_SECONDARY,
+    NODE_TERTIARY,
+    NODE_ROLE_UNKNOWN
+} node_role_t;
+
 struct spdk_lvol_store {
 	struct spdk_bs_dev		*bs_dev;
 	struct spdk_blob_store		*blobstore;
@@ -311,9 +318,8 @@ struct spdk_lvol_store {
 	uint64_t			timeout_trigger;
 	bool 				trigger_leader_sent;
 	bool 				read_only;
-	bool 				primary;
 	bool				skip_redirecting;
-	bool 				secondary;
+	node_role_t 		node_role;
 	int 				subsystem_port;
 	struct spdk_poller *redirect_poller;
 	struct spdk_poller *hublvol_poller;

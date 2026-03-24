@@ -1035,7 +1035,7 @@ spdk_lvs_destroy(struct spdk_lvol_store *lvs, spdk_lvs_op_complete cb_fn,
 		}
 	}
 
-	if (lvs->primary) {
+	if (lvs->node_role == NODE_PRIMARY) {
 		if (lvs->hublvol_poller) {
 			spdk_poller_unregister(&lvs->hublvol_poller);
 			lvs->hublvol_poller = NULL;
@@ -2773,7 +2773,7 @@ spdk_lvol_update_on_failover(struct spdk_lvol_store *lvs, struct spdk_lvol *lvol
 	bool update = false;
 	pthread_mutex_lock(&g_lvol_stores_mutex);
 
-	if (lvs->secondary && !lvs->skip_redirecting) {
+	if (lvs->node_role != NODE_PRIMARY && !lvs->skip_redirecting) {
 		pthread_mutex_unlock(&g_lvol_stores_mutex);
 		return;
 	}
@@ -3518,10 +3518,10 @@ int
 spdk_lvs_IO_redirect(void *cb_arg)
 {
 	struct spdk_lvol_store *lvs = cb_arg;
-	if (lvs->secondary) {
+	if (lvs->node_role != NODE_PRIMARY) {
 		uint64_t current = lvs->current_io > lvs->total_io ? lvs->current_io - lvs->total_io : lvs->total_io - lvs->current_io;
-		SPDK_NOTICELOG("IO redirect CNT: t[%" PRIu64 "] c[%" PRIu64 "] f[%" PRIu64 "] tc[%" PRIu64 "]\n",
-				lvs->total_io, current, lvs->hub_dev.redirected_io_count, lvs->current_io_t);
+		SPDK_NOTICELOG("IO redirect CNT %s: t[%" PRIu64 "] c[%" PRIu64 "] f[%" PRIu64 "] tc[%" PRIu64 "]\n",
+				lvs->node_role == NODE_SECONDARY ? "SECONDARY" : "TERTIARY", lvs->total_io, current, lvs->hub_dev.redirected_io_count, lvs->current_io_t);
 		lvs->total_io += current;
 	}
 	return 0;
@@ -3531,7 +3531,7 @@ int
 spdk_lvs_IO_hublvol(void *cb_arg)
 {
 	struct spdk_lvol_store *lvs = cb_arg;
-	if (lvs->primary) {
+	if (lvs->node_role == NODE_PRIMARY) {
 		uint64_t current = lvs->current_io > lvs->total_io ? lvs->current_io - lvs->total_io : lvs->total_io - lvs->current_io;
 		SPDK_NOTICELOG("IO hublvol CNT: t[%" PRIu64 "] c[%" PRIu64 "] tc[%" PRIu64 "]\n",
 			 lvs->total_io, current, lvs->current_io_t);
@@ -3674,12 +3674,12 @@ void
 spdk_lvs_open_hub_bdev(void *cb_arg) {
 	struct spdk_lvol_store *lvs = cb_arg;
 	int rc = 0;
-	if (lvs->primary) {
-		SPDK_ERRLOG("Lvolstore %s: is on the primary nod and does not need hub bdev.\n", lvs->name);
+	if (lvs->node_role == NODE_PRIMARY) {
+		SPDK_ERRLOG("Lvolstore %s: is on the primary node and does not need hub bdev.\n", lvs->name);
 		return;
 	}
 
-	if (lvs->secondary) {
+	if (lvs->node_role != NODE_PRIMARY) {
 		pthread_mutex_lock(&g_lvol_stores_mutex);
 		if (lvs->hub_dev.state == HUBLVOL_CONNECTING_IN_PROCCESS ||
 		 	lvs->hub_dev.state == HUBLVOL_CONNECTED) {
@@ -3739,21 +3739,40 @@ spdk_change_redirect_state(struct spdk_lvol_store *lvs, bool disconnected) {
 	}
 }
 
+
+static node_role_t 
+node_role_from_string(const char *str) {
+    if (!str) return NODE_ROLE_UNKNOWN;
+
+    if (strcasecmp(str, "primary") == 0)
+        return NODE_PRIMARY;
+
+    if (strcasecmp(str, "secondary") == 0)
+        return NODE_SECONDARY;
+
+    if (strcasecmp(str, "tertiary") == 0)
+        return NODE_TERTIARY;
+
+    return NODE_ROLE_UNKNOWN;
+}
+
+
 void
-spdk_lvs_set_opts(struct spdk_lvol_store *lvs, uint64_t groupid, uint64_t port, bool primary, bool secondary)
+spdk_lvs_set_opts(struct spdk_lvol_store *lvs, uint64_t groupid, uint64_t port, char *role)
 {
 	SPDK_NOTICELOG("Set groupid %" PRIu64 " and port %" PRIu64 " to the lvolstore .\n", groupid, port);
 	pthread_mutex_lock(&g_lvol_stores_mutex);
 	lvs->groupid = groupid;
 	lvs->subsystem_port = port;
-	lvs->primary = primary;
-	if (primary) {
+	lvs->node_role = node_role_from_string(role);
+
+	if (lvs->node_role == NODE_PRIMARY) {
 		if (!lvs->hublvol_poller) {
 			lvs->hublvol_poller = spdk_poller_register(
 			spdk_lvs_IO_hublvol, lvs, 1000000);
 		}
 	}
- 	lvs->secondary = secondary;
+
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
 	return;
 }
@@ -6324,7 +6343,7 @@ spdk_lvs_check_active_process(struct spdk_lvol_store *lvs, struct spdk_lvol *lvo
 
 	pthread_mutex_lock(&g_lvol_stores_mutex);
 
-	if (lvs->secondary && !lvs->skip_redirecting) {
+	if (lvs->node_role != NODE_PRIMARY && !lvs->skip_redirecting) {
 		pthread_mutex_unlock(&g_lvol_stores_mutex);
 		return;
 	}
@@ -6420,7 +6439,7 @@ spdk_set_leader_all(struct spdk_lvol_store *t_lvs, bool lvs_leader, bool bs_nonl
 				lvol->update_in_progress = false;
 			}
 
-			if (!lvs_leader && lvs->secondary ) {
+			if (!lvs_leader && lvs->node_role != NODE_PRIMARY ) {
 				tmp_lvs = lvs;
 				if (lvs->hub_dev.state == HUBLVOL_CONNECTED) {
 					SPDK_NOTICELOG("enable redirect IO mode.\n");

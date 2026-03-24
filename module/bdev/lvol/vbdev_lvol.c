@@ -1534,7 +1534,7 @@ redirect_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io, bo
 }
 
 static void
-vbdev_redirect_request_to_hublvol(struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io) {
+vbdev_redirect_request_to_hublvol(struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io, bool is_hublvol_io) {
 	struct spdk_lvol_store *lvs = lvol->lvol_store;
 	struct vbdev_lvol_io *lvol_io = (struct vbdev_lvol_io *)bdev_io->driver_ctx;
 	struct spdk_redirect_dev *hub_dev = &lvs->hub_dev;
@@ -1543,12 +1543,17 @@ vbdev_redirect_request_to_hublvol(struct spdk_lvol *lvol, struct spdk_io_channel
 	struct spdk_bdev_ext_io_opts bdev_io_opts;
 	int rc = 0;
 	uint64_t offset = 0;
-	COMBINE_OFFSET(offset, lvol->map_id, bdev_io->u.bdev.offset_blocks);
+
+	if (is_hublvol_io) {
+		offset = bdev_io->u.bdev.offset_blocks;
+	} else {	
+		COMBINE_OFFSET(offset, lvol->map_id, bdev_io->u.bdev.offset_blocks);
+	}
 
 	if (hub_dev->state == HUBLVOL_CONNECTED) {
 		//TODO check the state for channel
 		if (hub_dev->desc == NULL) {
-			SPDK_ERRLOG("Hublvol desc is NULL. should not be.\n");			
+			SPDK_ERRLOG("Hublvol desc is NULL. should not be.\n");
 			spdk_change_redirect_state(lvs, true);
 			vbdev_lvol_submit_request(ch, bdev_io);		
 			return;
@@ -1568,7 +1573,7 @@ vbdev_redirect_request_to_hublvol(struct spdk_lvol *lvol, struct spdk_io_channel
 		}
 		//TODO if we can not create ch from hub bdev
 	} else {
-		SPDK_NOTICELOG("Hublvol is not connected. we try to connect now but we will not wait and the failover will started.\n");	
+		SPDK_NOTICELOG("Hublvol is not connected. we try to connect now but we will not wait and the failover will started.\n");
 		spdk_change_redirect_state(lvs, false);		
 		vbdev_lvol_submit_request(ch, bdev_io);
 		return;
@@ -1577,7 +1582,7 @@ vbdev_redirect_request_to_hublvol(struct spdk_lvol *lvol, struct spdk_io_channel
 	if (bdev_io->type != SPDK_BDEV_IO_TYPE_READ && !lvs->read_only) {
 		ctx = calloc(1, sizeof(*ctx));
 		if (!ctx) {
-			SPDK_NOTICELOG("FAILED IO - Cannot allocate ctx for redirect IO. \n");			
+			SPDK_NOTICELOG("FAILED IO - Cannot allocate ctx for redirect IO. \n");
 			spdk_change_redirect_state(lvs, false);
 			vbdev_lvol_submit_request(ch, bdev_io);
 			return;
@@ -1587,7 +1592,7 @@ vbdev_redirect_request_to_hublvol(struct spdk_lvol *lvol, struct spdk_io_channel
 		ctx->ch = ch;
 	}
 
-	lvol_io->redirect_in_progress = true;	
+	lvol_io->redirect_in_progress = true;
 	switch (bdev_io->type) {
 	case SPDK_BDEV_IO_TYPE_READ:
 		spdk_bdev_io_get_buf(bdev_io, redirect_get_buf_cb,
@@ -1874,7 +1879,7 @@ vbdev_hublvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bd
 			return;
 		}
 
-		if (!lvs->update_in_progress) {			
+		if (!lvs->update_in_progress) {
 			if (io_type) {
 				spdk_lvs_check_active_process(lvs, org_lvol, (uint8_t)bdev_io->type);
 			}
@@ -1955,15 +1960,24 @@ vbdev_lvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_
 	}
 
 	// spdk_add_stat_ext(ch);
-	if (lvs->secondary && (!lvs->leader && !lvs->update_in_progress) && !lvs->skip_redirecting ) {
+	if (lvs->node_role == NODE_TERTIARY && (!lvs->leader && !lvs->update_in_progress) && !lvs->skip_redirecting ) {
 		if (io_type) {
 			__atomic_add_fetch(&lvs->current_io, 1, __ATOMIC_SEQ_CST);
-			vbdev_redirect_request_to_hublvol(lvol, ch, bdev_io);
+			vbdev_redirect_request_to_hublvol(lvol, ch, bdev_io, false);
 			return;
-		}		
+		}
 	}
 
-	if (lvs->primary && lvol->hublvol) {
+	// spdk_add_stat_ext(ch);
+	if (lvs->node_role == NODE_SECONDARY && (!lvs->leader && !lvs->update_in_progress) && !lvs->skip_redirecting ) {
+		if (io_type) {
+			__atomic_add_fetch(&lvs->current_io, 1, __ATOMIC_SEQ_CST);
+			vbdev_redirect_request_to_hublvol(lvol, ch, bdev_io, lvol->hublvol);
+			return;
+		}
+	}
+
+	if (lvs->node_role != NODE_TERTIARY && lvol->hublvol) {
 		__atomic_add_fetch(&lvs->current_io, 1, __ATOMIC_SEQ_CST);
 		__atomic_add_fetch(&lvs->current_io_t, 1, __ATOMIC_SEQ_CST);
 		vbdev_hublvol_submit_request(ch, bdev_io);
@@ -1985,7 +1999,7 @@ vbdev_lvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_
 		if (!lvs->update_in_progress) {			
 			if (io_type) {
 				spdk_lvs_check_active_process(lvs, lvol, (uint8_t)bdev_io->type);
-				if (lvs->secondary && !lvs->skip_redirecting) {
+				if (lvs->node_role != NODE_PRIMARY && !lvs->skip_redirecting) {
 					SPDK_NOTICELOG("2- Lvolstore %s: we should redirecting the IO\n", lvs->name);
 					vbdev_lvol_submit_request(ch, bdev_io);
 					return;
@@ -1997,7 +2011,7 @@ vbdev_lvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_
 	if (!lvol->leader && !lvol->update_in_progress) {
 		if (io_type) {
 			spdk_lvol_update_on_failover(lvs, lvol, true);
-			if (lvs->secondary && !lvs->skip_redirecting) {
+			if (lvs->node_role != NODE_PRIMARY && !lvs->skip_redirecting) {
 				SPDK_NOTICELOG("2- Lvolstore %s: we should redirecting the IO\n", lvs->name);
 				vbdev_lvol_submit_request(ch, bdev_io);
 				return;

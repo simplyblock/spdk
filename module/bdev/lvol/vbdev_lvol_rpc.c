@@ -2008,13 +2008,17 @@ rpc_dump_lvol_store_info(struct spdk_json_write_ctx *w, struct lvol_store_bdev *
 	spdk_json_write_named_string(w, "name", lvs_bdev->lvs->name);
 	spdk_json_write_named_bool(w, "lvs leadership", lvs_bdev->lvs->leader);
 	spdk_json_write_named_bool(w, "lvs_read_only", lvs_bdev->lvs->read_only);
-	if (lvs_bdev->lvs->secondary) {
-		spdk_json_write_named_bool(w, "lvs_secondary", lvs_bdev->lvs->secondary);
+	if (lvs_bdev->lvs->node_role != NODE_PRIMARY) {
+		if (lvs_bdev->lvs->node_role == NODE_SECONDARY) {
+			spdk_json_write_named_bool(w, "lvs_secondary", true);
+		} else {
+			spdk_json_write_named_bool(w, "lvs_tertiary", true);
+		}
 		spdk_json_write_named_bool(w, "lvs_redirect", !lvs_bdev->lvs->skip_redirecting);
 		spdk_json_write_named_string(w, "remote_bdev", lvs_bdev->lvs->remote_bdev);
 		spdk_json_write_named_bool(w, "connect_state", lvs_bdev->lvs->hub_dev.state == HUBLVOL_CONNECTED);
-	} else if (lvs_bdev->lvs->primary) {
-		spdk_json_write_named_bool(w, "lvs_primary", lvs_bdev->lvs->primary);
+	} else if (lvs_bdev->lvs->node_role == NODE_PRIMARY) {
+		spdk_json_write_named_bool(w, "lvs_primary", true);
 	}
 	spdk_json_write_named_string(w, "base_bdev", spdk_bdev_get_name(lvs_bdev->bdev));
 	spdk_json_write_named_uint64(w, "total_data_clusters", spdk_bs_total_data_cluster_count(bs));
@@ -2085,8 +2089,7 @@ struct rpc_bdev_lvol_set_lvs_opts {
 	char *lvs_name;
 	uint64_t groupid;
 	uint64_t subsystem_port;
-	bool primary;
-	bool secondary;
+	char *role;
 };
 
 static void
@@ -2094,6 +2097,7 @@ free_rpc_bdev_lvol_set_lvs_opts(struct rpc_bdev_lvol_set_lvs_opts *req)
 {
 	free(req->uuid);
 	free(req->lvs_name);
+	free(req->role);
 }
 
 static const struct spdk_json_object_decoder rpc_bdev_lvol_set_lvs_opts_decoders[] = {
@@ -2101,8 +2105,7 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_set_lvs_opts_decoders
 	{"lvs_name", offsetof(struct rpc_bdev_lvol_set_lvs_opts, lvs_name), spdk_json_decode_string, true},
 	{"groupid", offsetof(struct rpc_bdev_lvol_set_lvs_opts, groupid), spdk_json_decode_uint64},
 	{"subsystem_port", offsetof(struct rpc_bdev_lvol_set_lvs_opts, subsystem_port), spdk_json_decode_uint64},
-	{"primary", offsetof(struct rpc_bdev_lvol_set_lvs_opts, primary), spdk_json_decode_bool, true},
-	{"secondary", offsetof(struct rpc_bdev_lvol_set_lvs_opts, secondary), spdk_json_decode_bool, true},
+	{"role", offsetof(struct rpc_bdev_lvol_set_lvs_opts, role), spdk_json_decode_string},
 };
 
 static void
@@ -2128,7 +2131,7 @@ rpc_bdev_lvol_set_lvs_opts(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
-	spdk_lvs_set_opts(lvs, req.groupid, req.subsystem_port, req.primary, req.secondary);
+	spdk_lvs_set_opts(lvs, req.groupid, req.subsystem_port, req.role);
 	spdk_jsonrpc_send_bool_response(request, true);
 
 cleanup:
@@ -2229,7 +2232,7 @@ rpc_bdev_lvol_connect_hublvol(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
-	if (!lvs->secondary) {
+	if (lvs->node_role == NODE_PRIMARY) {
 		SPDK_ERRLOG("Try to connect hublvol from nonsecondary node.\n");
 		spdk_jsonrpc_send_error_response(request, -EINVAL, "nonsecondary node");
 		goto cleanup;
