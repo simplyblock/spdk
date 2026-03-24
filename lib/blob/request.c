@@ -17,18 +17,18 @@
 static void
 check_geometry(struct spdk_blob_store *bs, uint8_t geometry, uint64_t lba)
 {
-	uint64_t num_md_lba;
-	num_md_lba = bs_page_to_lba(bs, bs->md_start + bs->md_len);
+	// uint64_t num_md_lba;
+	// num_md_lba = bs_page_to_lba(bs, bs->md_start + bs->md_len);
 
-	if (num_md_lba < lba && geometry == 0) {
-		SPDK_ERRLOG("1- Invalid geometry %u, exceeds metadata size %lu, lba %lu\n",
-			    geometry, num_md_lba, lba);
-	}
+	// if (num_md_lba < lba && geometry == 0) {
+	// 	SPDK_ERRLOG("1- Invalid geometry %u, exceeds metadata size %lu, lba %lu\n",
+	// 		    geometry, num_md_lba, lba);
+	// }
 
-	if (num_md_lba > lba && geometry != 0) {
-		SPDK_ERRLOG("2- Invalid geometry %u, metadata size %lu, lba %lu\n",
-			    geometry, num_md_lba, lba);
-	}
+	// if (num_md_lba > lba && geometry != 0) {
+	// 	SPDK_ERRLOG("2- Invalid geometry %u, metadata size %lu, lba %lu\n",
+	// 		    geometry, num_md_lba, lba);
+	// }
 	return;
 }
 
