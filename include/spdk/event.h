@@ -152,7 +152,7 @@ struct spdk_app_opts {
 	bool enforce_numa;
 
 	/* Hole at bytes 187-191. */
-	uint8_t reserved187[3];
+	uint8_t reserved187[4];
 
 	/**
 	 * The allocated size for the message pool used by the threading library.
@@ -198,8 +198,7 @@ struct spdk_app_opts {
 	 * If set, disable CPU claiming.
 	 */
 	bool disable_cpumask_locks;
-	uint8_t			numa_node;     /* disabled = 2, 0 = node0, 1 = node1 */
-	bool 			limit_numa;    /* whether to emit --numa-limit */
+	uint8_t			numa_node;     /* disabled = 2, 0 = node0, 1 = node1 */	
 } __attribute__((packed));
 SPDK_STATIC_ASSERT(sizeof(struct spdk_app_opts) == 253, "Incorrect size");
 

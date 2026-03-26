@@ -151,8 +151,6 @@ static const struct option g_cmdline_options[] = {
 	{"no-rpc-server",		no_argument,		NULL, NO_RPC_SERVER_OPT_IDX},
 #define ENFORCE_NUMA_OPT_IDX 274
 	{"enforce-numa",		no_argument,		NULL, ENFORCE_NUMA_OPT_IDX},
-#define LIMIT_NUMA_OPT_IDX 275
-	{"limit-numa",			no_argument,	NULL, LIMIT_NUMA_OPT_IDX},
 };
 
 static int
@@ -508,7 +506,6 @@ app_setup_env(struct spdk_app_opts *opts)
 	env_opts.no_huge = opts->no_huge;
 	env_opts.enforce_numa = opts->enforce_numa;
 	env_opts.numa_node = opts->numa_node;
-	env_opts.limit_numa = opts->limit_numa;
 	rc = spdk_env_init(&env_opts);
 	free(env_opts.pci_blocked);
 	free(env_opts.pci_allowed);
@@ -696,6 +693,7 @@ app_copy_opts(struct spdk_app_opts *opts, struct spdk_app_opts *opts_user, size_
 	SET_FIELD(json_data);
 	SET_FIELD(json_data_size);
 	SET_FIELD(disable_cpumask_locks);
+	SET_FIELD(numa_node);
 
 	/* You should not remove this statement, but need to update the assert statement
 	 * if you add a new field, and also add a corresponding SET_FIELD statement */
@@ -1307,9 +1305,6 @@ spdk_app_parse_args(int argc, char **argv, struct spdk_app_opts *opts,
 			break;
 		case ENFORCE_NUMA_OPT_IDX:
 			opts->enforce_numa = true;
-			break;
-		case LIMIT_NUMA_OPT_IDX:
-			opts->limit_numa = true;
 			break;
 		case NUMA_NODE_OPT_IDX:
 			opts->numa_node = spdk_strtol(optarg, 0);

@@ -107,7 +107,6 @@ spdk_env_opts_init(struct spdk_env_opts *opts)
 	opts->mem_channel = SPDK_ENV_DPDK_DEFAULT_MEM_CHANNEL;
 	opts->base_virtaddr = SPDK_ENV_DPDK_DEFAULT_BASE_VIRTADDR;
 	opts->numa_node = 2; /* limit numa node disabled */
-	opts->limit_numa = false;
 
 #define SET_FIELD(field, value) \
 	if (offsetof(struct spdk_env_opts, field) + sizeof(opts->field) <= opts->opts_size) { \
@@ -300,20 +299,13 @@ build_eal_cmdline(const struct spdk_env_opts *opts)
 	if (opts->mem_size >= 0) {
 		if (!no_huge && opts->numa_node != 2) {
 			char *numa_mem = NULL;
-			char *numa_limit = NULL;
 
 			switch (opts->numa_node) {
 			case 0:
-				numa_mem = _sprintf_alloc("--numa-mem=%d,0", opts->mem_size);
-				if (opts->limit_numa) {
-					numa_limit = _sprintf_alloc("--numa-limit=%d,0", opts->mem_size);
-				}
+				numa_mem = _sprintf_alloc("--socket-mem=%d,0", opts->mem_size);
 				break;
 			case 1:
-				numa_mem = _sprintf_alloc("--numa-mem=0,%d", opts->mem_size);
-				if (opts->limit_numa) {
-					numa_limit = _sprintf_alloc("--numa-limit=0,%d", opts->mem_size);
-				}
+				numa_mem = _sprintf_alloc("--socket-mem=0,%d", opts->mem_size);
 				break;
 			default:
 				fprintf(stderr, "Unsupported numa_node=%d, only 0/1 supported\n",
@@ -325,13 +317,6 @@ build_eal_cmdline(const struct spdk_env_opts *opts)
 			args = push_arg(args, &argcount, numa_mem);
 			if (args == NULL) {
 				return -1;
-			}
-
-			if (opts->limit_numa) {
-				args = push_arg(args, &argcount, numa_limit);
-				if (args == NULL) {
-					return -1;
-				}
 			}
 		} else {
 			args = push_arg(args, &argcount, _sprintf_alloc("-m %d", opts->mem_size));
@@ -657,6 +642,7 @@ env_copy_opts(struct spdk_env_opts *opts, const struct spdk_env_opts *opts_user,
 	}
 
 	SET_FIELD(enforce_numa);
+	SET_FIELD(numa_node);
 
 #undef SET_FIELD
 }
