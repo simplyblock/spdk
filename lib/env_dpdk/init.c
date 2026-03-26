@@ -297,22 +297,23 @@ build_eal_cmdline(const struct spdk_env_opts *opts)
 
 	/* set the memory size */
 	if (opts->mem_size >= 0) {
-		if (!no_huge && opts->numa_node != 2) {
+		if (!no_huge && opts->numa_node >= 0) {
 			char *numa_mem = NULL;
-
-			switch (opts->numa_node) {
-			case 0:
-				numa_mem = _sprintf_alloc("--socket-mem=%d,0", opts->mem_size);
-				break;
-			case 1:
-				numa_mem = _sprintf_alloc("--socket-mem=0,%d", opts->mem_size);
-				break;
-			default:
-				fprintf(stderr, "Unsupported numa_node=%d, only 0/1 supported\n",
-					opts->numa_node);
+			/* Build "--socket-mem=0,...,0,mem_size" with mem_size at index numa_node */
+			size_t buf_size = strlen("--socket-mem=") + (size_t)opts->numa_node * 2 + 32;
+			char *socket_mem = calloc(1, buf_size);
+			if (socket_mem == NULL) {
 				free_args(args, argcount);
 				return -1;
 			}
+			strcpy(socket_mem, "--socket-mem=");
+			for (int i = 0; i < opts->numa_node; i++) {
+				strcat(socket_mem, "0,");
+			}
+			char mem_str[32];
+			snprintf(mem_str, sizeof(mem_str), "%d", opts->mem_size);
+			strcat(socket_mem, mem_str);
+			numa_mem = socket_mem;
 
 			args = push_arg(args, &argcount, numa_mem);
 			if (args == NULL) {
