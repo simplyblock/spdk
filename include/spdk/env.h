@@ -79,7 +79,9 @@ struct spdk_env_opts {
 	size_t			opts_size;
 
 	bool			enforce_numa;
-	uint8_t			reserved2[7];
+	uint8_t			reserved2[5];
+	uint8_t			numa_node;     /* disabled = 2, 0 = node0, 1 = node1 */
+	bool 			limit_numa;    /* whether to emit --numa-limit */
 
 	/* All new fields must be added at the end of this structure. */
 };

@@ -101,6 +101,8 @@ static const struct option g_cmdline_options[] = {
 	{"rpc-socket",			required_argument,	NULL, RPC_SOCKET_OPT_IDX},
 #define MEM_SIZE_OPT_IDX	's'
 	{"mem-size",			required_argument,	NULL, MEM_SIZE_OPT_IDX},
+#define NUMA_NODE_OPT_IDX	'N'
+	{"numa-node",			required_argument,	NULL, NUMA_NODE_OPT_IDX},
 #define NO_PCI_OPT_IDX		'u'
 	{"no-pci",			no_argument,		NULL, NO_PCI_OPT_IDX},
 #define VERSION_OPT_IDX		'v'
@@ -149,6 +151,8 @@ static const struct option g_cmdline_options[] = {
 	{"no-rpc-server",		no_argument,		NULL, NO_RPC_SERVER_OPT_IDX},
 #define ENFORCE_NUMA_OPT_IDX 274
 	{"enforce-numa",		no_argument,		NULL, ENFORCE_NUMA_OPT_IDX},
+#define LIMIT_NUMA_OPT_IDX 275
+	{"limit-numa",			no_argument,	NULL, LIMIT_NUMA_OPT_IDX},
 };
 
 static int
@@ -503,7 +507,8 @@ app_setup_env(struct spdk_app_opts *opts)
 	env_opts.vf_token = opts->vf_token;
 	env_opts.no_huge = opts->no_huge;
 	env_opts.enforce_numa = opts->enforce_numa;
-
+	env_opts.numa_node = opts->numa_node;
+	env_opts.limit_numa = opts->limit_numa;
 	rc = spdk_env_init(&env_opts);
 	free(env_opts.pci_blocked);
 	free(env_opts.pci_allowed);
@@ -1302,6 +1307,16 @@ spdk_app_parse_args(int argc, char **argv, struct spdk_app_opts *opts,
 			break;
 		case ENFORCE_NUMA_OPT_IDX:
 			opts->enforce_numa = true;
+			break;
+		case LIMIT_NUMA_OPT_IDX:
+			opts->limit_numa = true;
+			break;
+		case NUMA_NODE_OPT_IDX:
+			opts->numa_node = spdk_strtol(optarg, 0);
+			if (opts->numa_node > 2) {
+				SPDK_ERRLOG("Invalid NUMA node %s\n", optarg);
+				goto out;
+			}
 			break;
 		case MEM_SIZE_OPT_IDX: {
 			uint64_t mem_size_mb;
