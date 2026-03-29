@@ -28,6 +28,7 @@
 #define SPDK_APP_DEFAULT_NUM_TRACE_ENTRIES	SPDK_DEFAULT_NUM_TRACE_ENTRIES
 
 #define SPDK_APP_DPDK_DEFAULT_MEM_SIZE		-1
+#define SPDK_APP_DPDK_DEFAULT_NUMA_NODE		-1
 #define SPDK_APP_DPDK_DEFAULT_MAIN_CORE		-1
 #define SPDK_APP_DPDK_DEFAULT_MEM_CHANNEL	-1
 #define SPDK_APP_DPDK_DEFAULT_CORE_MASK		"0x1"
@@ -101,6 +102,8 @@ static const struct option g_cmdline_options[] = {
 	{"rpc-socket",			required_argument,	NULL, RPC_SOCKET_OPT_IDX},
 #define MEM_SIZE_OPT_IDX	's'
 	{"mem-size",			required_argument,	NULL, MEM_SIZE_OPT_IDX},
+#define NUMA_NODE_OPT_IDX	'N'
+	{"numa-node",			required_argument,	NULL, NUMA_NODE_OPT_IDX},
 #define NO_PCI_OPT_IDX		'u'
 	{"no-pci",			no_argument,		NULL, NO_PCI_OPT_IDX},
 #define VERSION_OPT_IDX		'v'
@@ -312,6 +315,7 @@ spdk_app_opts_init(struct spdk_app_opts *opts, size_t opts_size)
 	SET_FIELD(enable_coredump, true);
 	SET_FIELD(shm_id, -1);
 	SET_FIELD(mem_size, SPDK_APP_DPDK_DEFAULT_MEM_SIZE);
+	SET_FIELD(numa_node, SPDK_APP_DPDK_DEFAULT_NUMA_NODE); /* limit numa node disabled */
 	SET_FIELD(main_core, SPDK_APP_DPDK_DEFAULT_MAIN_CORE);
 	SET_FIELD(mem_channel, SPDK_APP_DPDK_DEFAULT_MEM_CHANNEL);
 	SET_FIELD(base_virtaddr, SPDK_APP_DPDK_DEFAULT_BASE_VIRTADDR);
@@ -503,7 +507,7 @@ app_setup_env(struct spdk_app_opts *opts)
 	env_opts.vf_token = opts->vf_token;
 	env_opts.no_huge = opts->no_huge;
 	env_opts.enforce_numa = opts->enforce_numa;
-
+	env_opts.numa_node = opts->numa_node;
 	rc = spdk_env_init(&env_opts);
 	free(env_opts.pci_blocked);
 	free(env_opts.pci_allowed);
@@ -691,6 +695,7 @@ app_copy_opts(struct spdk_app_opts *opts, struct spdk_app_opts *opts_user, size_
 	SET_FIELD(json_data);
 	SET_FIELD(json_data_size);
 	SET_FIELD(disable_cpumask_locks);
+	SET_FIELD(numa_node);
 
 	/* You should not remove this statement, but need to update the assert statement
 	 * if you add a new field, and also add a corresponding SET_FIELD statement */
@@ -1302,6 +1307,13 @@ spdk_app_parse_args(int argc, char **argv, struct spdk_app_opts *opts,
 			break;
 		case ENFORCE_NUMA_OPT_IDX:
 			opts->enforce_numa = true;
+			break;
+		case NUMA_NODE_OPT_IDX:
+			opts->numa_node = spdk_strtol(optarg, 0);
+			if (opts->numa_node < 0) {
+				SPDK_ERRLOG("Invalid NUMA node %s\n", optarg);
+				goto out;
+			}
 			break;
 		case MEM_SIZE_OPT_IDX: {
 			uint64_t mem_size_mb;

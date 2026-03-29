@@ -79,8 +79,8 @@ struct spdk_env_opts {
 	size_t			opts_size;
 
 	bool			enforce_numa;
-	uint8_t			reserved2[7];
-
+	uint8_t			reserved2[6];
+	int8_t			numa_node;     /* disabled = 2, 0 = node0, 1 = node1 */
 	/* All new fields must be added at the end of this structure. */
 };
 SPDK_STATIC_ASSERT(sizeof(struct spdk_env_opts) == 128, "Incorrect size");
