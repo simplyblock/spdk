@@ -13,6 +13,7 @@
 
 #ifdef SPDK_CONFIG_HAVE_EVP_MAC
 #include <openssl/dh.h>
+#include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/param_build.h>
 #include <openssl/rand.h>
@@ -489,9 +490,13 @@ spdk_nvme_dhchap_generate_dhkey(enum spdk_nvmf_dhchap_dhgroup dhgroup)
 
 	ctx = EVP_PKEY_CTX_new_from_name(NULL, "DHX", NULL);
 	if (ctx == NULL) {
+		SPDK_ERRLOG("Failed to create DHX key context\n");
+		ERR_print_errors_fp(stderr);
 		goto error;
 	}
 	if (EVP_PKEY_keygen_init(ctx) != 1) {
+		SPDK_ERRLOG("Failed to init DHX keygen\n");
+		ERR_print_errors_fp(stderr);
 		goto error;
 	}
 
@@ -501,9 +506,13 @@ spdk_nvme_dhchap_generate_dhkey(enum spdk_nvmf_dhchap_dhgroup dhgroup)
 	if (EVP_PKEY_CTX_set_params(ctx, params) != 1) {
 		SPDK_ERRLOG("Failed to set dhkey's dhgroup: %s\n",
 			    spdk_nvme_dhchap_get_dhgroup_name(dhgroup));
+		ERR_print_errors_fp(stderr);
 		goto error;
 	}
 	if (EVP_PKEY_generate(ctx, &key) != 1) {
+		SPDK_ERRLOG("Failed to generate DH key for group: %s\n",
+			    spdk_nvme_dhchap_get_dhgroup_name(dhgroup));
+		ERR_print_errors_fp(stderr);
 		goto error;
 	}
 error:
