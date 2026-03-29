@@ -11475,7 +11475,7 @@ bs_delete_async_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 static void
 blob_clear_clusters_async_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
-	struct spdk_blob  *blob= cb_arg;
+	struct spdk_blob  *blob = cb_arg;
 	struct spdk_blob_store		*bs = blob->bs;
 	size_t				i;
 
@@ -11510,7 +11510,10 @@ blob_clear_clusters_async_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno
 	blob_resize(blob, 0);
 	blob->active.cluster_array_size = 0;
 	/* change snapshot to be normal lvol without clones*/
+	bool  md_ro = blob->md_ro;
+	blob->md_ro = false;
 	blob_remove_xattr(blob, SNAPSHOT_PENDING_REMOVAL, true);
+	blob->md_ro = md_ro;
 	blob_persist(seq, blob, bs_delete_async_cpl, blob);
 }
 
@@ -11648,7 +11651,10 @@ spdk_bs_delete_blob_async(struct spdk_blob_store *bs, struct spdk_blob *blob,
 		clone = blob_lookup(bs, *(spdk_blob_id *)value);
 		if (clone) {
 			if (clone->parent_id == blob->id) {
+				bool  md_ro = blob->md_ro;
+				blob->md_ro = false;
 				blob_remove_xattr(blob, SNAPSHOT_PENDING_REMOVAL, true);
+				blob->md_ro = md_ro;
 			} else {
 				ctx->corrupted_clone = clone;
 				ctx->corrupted_mode = true;

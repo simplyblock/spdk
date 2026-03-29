@@ -28,6 +28,7 @@
 #define SPDK_APP_DEFAULT_NUM_TRACE_ENTRIES	SPDK_DEFAULT_NUM_TRACE_ENTRIES
 
 #define SPDK_APP_DPDK_DEFAULT_MEM_SIZE		-1
+#define SPDK_APP_DPDK_DEFAULT_NUMA_NODE		-1
 #define SPDK_APP_DPDK_DEFAULT_MAIN_CORE		-1
 #define SPDK_APP_DPDK_DEFAULT_MEM_CHANNEL	-1
 #define SPDK_APP_DPDK_DEFAULT_CORE_MASK		"0x1"
@@ -314,6 +315,7 @@ spdk_app_opts_init(struct spdk_app_opts *opts, size_t opts_size)
 	SET_FIELD(enable_coredump, true);
 	SET_FIELD(shm_id, -1);
 	SET_FIELD(mem_size, SPDK_APP_DPDK_DEFAULT_MEM_SIZE);
+	SET_FIELD(numa_node, SPDK_APP_DPDK_DEFAULT_NUMA_NODE); /* limit numa node disabled */
 	SET_FIELD(main_core, SPDK_APP_DPDK_DEFAULT_MAIN_CORE);
 	SET_FIELD(mem_channel, SPDK_APP_DPDK_DEFAULT_MEM_CHANNEL);
 	SET_FIELD(base_virtaddr, SPDK_APP_DPDK_DEFAULT_BASE_VIRTADDR);
@@ -1308,7 +1310,7 @@ spdk_app_parse_args(int argc, char **argv, struct spdk_app_opts *opts,
 			break;
 		case NUMA_NODE_OPT_IDX:
 			opts->numa_node = spdk_strtol(optarg, 0);
-			if (opts->numa_node > 2) {
+			if (opts->numa_node < 0) {
 				SPDK_ERRLOG("Invalid NUMA node %s\n", optarg);
 				goto out;
 			}
