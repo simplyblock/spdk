@@ -227,6 +227,37 @@ bs_allocate_cluster(struct spdk_blob *blob, uint32_t cluster_num,
 	return 0;
 }
 
+node_role_t
+node_role_from_string(const char *str) {
+	if (!str) return NODE_ROLE_UNKNOWN;
+
+	if (strcasecmp(str, "primary") == 0)
+		return NODE_PRIMARY;
+
+	if (strcasecmp(str, "secondary") == 0)
+		return NODE_SECONDARY;
+
+	if (strcasecmp(str, "tertiary") == 0)
+		return NODE_TERTIARY;
+
+	return NODE_ROLE_UNKNOWN;
+}
+
+const char *
+node_role_to_string(node_role_t role) {
+	switch (role) {
+	case NODE_PRIMARY:
+		return "primary";
+	case NODE_SECONDARY:
+		return "secondary";
+	case NODE_TERTIARY:
+		return "tertiary";
+	case NODE_ROLE_UNKNOWN:
+	default:
+		return "unknown";
+	}
+}
+
 static void
 blob_xattrs_init(struct spdk_blob_xattr_opts *xattrs)
 {
@@ -4743,8 +4774,8 @@ spdk_bs_monitoring_poller(void *cb_arg) {
 		bs->total += ccm_io;
 		bs->total_r += bs->r_io;
 		bs->total_w += bs->w_io;
-		SPDK_NOTICELOG("LSTAT [%" PRIu64 "]  [%" PRIu64 "]  [%" PRIu64 "]  [%" PRIu64 "]  [%" PRIu64 "]  [%" PRIu64 "]\n",
-							bs->total, bs->total_r, bs->total_w, ccm_io, bs->r_io, bs->w_io);		
+		SPDK_NOTICELOG("LSTAT %s [%" PRIu64 "]  [%" PRIu64 "]  [%" PRIu64 "]  [%" PRIu64 "]  [%" PRIu64 "]  [%" PRIu64 "]\n",
+						node_role_to_string(bs->node_role), bs->total, bs->total_r, bs->total_w, ccm_io, bs->r_io, bs->w_io);
 		bs->w_io = 0;
 		bs->r_io = 0;
 		// if (bs->channel_stat_counter % 3 == 0) {
@@ -4838,6 +4869,7 @@ bs_alloc(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts, struct spdk_blob_st
 	}
 	bs->num_free_clusters = bs->total_clusters;
 	bs->io_unit_size = dev->blocklen;
+	bs->node_role = NODE_ROLE_UNKNOWN;
 
 	bs->max_channel_ops = opts->max_channel_ops;
 	bs->super_blob = SPDK_BLOBID_INVALID;
@@ -7952,6 +7984,12 @@ void
 spdk_bs_set_leader(struct spdk_blob_store *bs, bool state)
 {
 	bs->is_leader = state;	
+}
+
+void
+spdk_bs_set_role(struct spdk_blob_store *bs, node_role_t role)
+{
+	bs->node_role = role;
 }
 
 void
@@ -11680,7 +11718,7 @@ bs_delete_async_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 static void
 blob_clear_clusters_async_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
-	struct spdk_blob  *blob= cb_arg;
+	struct spdk_blob  *blob = cb_arg;
 	struct spdk_blob_store		*bs = blob->bs;
 	size_t				i;
 
@@ -11715,7 +11753,10 @@ blob_clear_clusters_async_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno
 	blob_resize(blob, 0);
 	blob->active.cluster_array_size = 0;
 	/* change snapshot to be normal lvol without clones*/
+	bool  md_ro = blob->md_ro;
+	blob->md_ro = false;
 	blob_remove_xattr(blob, SNAPSHOT_PENDING_REMOVAL, true);
+	blob->md_ro = md_ro;
 	blob_persist(seq, blob, bs_delete_async_cpl, blob);
 }
 
@@ -11854,7 +11895,10 @@ spdk_bs_delete_blob_async(struct spdk_blob_store *bs, struct spdk_blob *blob,
 		clone = blob_lookup(bs, *(spdk_blob_id *)value);
 		if (clone) {
 			if (clone->parent_id == blob->id) {
+				bool  md_ro = blob->md_ro;
+				blob->md_ro = false;
 				blob_remove_xattr(blob, SNAPSHOT_PENDING_REMOVAL, true);
+				blob->md_ro = md_ro;
 			} else {
 				ctx->corrupted_clone = clone;
 				ctx->corrupted_mode = true;

@@ -217,6 +217,7 @@ struct spdk_blob_store {
 	 * Only when the distrib internal force state changes, it will be set to false.
 	 */
 	bool				is_leader;
+	node_role_t 		node_role;
 	bool				read_only;
 	bool 				stop;
 	uint64_t			total;

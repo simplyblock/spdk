@@ -3477,7 +3477,7 @@ spdk_lvs_change_leader_state(uint64_t groupid)
 
 				spdk_lvs_dequeu_rsp(lvs);
 			}
-			SPDK_NOTICELOG("Leadership state changed internally to false. Timeout has been set.\n");
+			SPDK_NOTICELOG("Leadership state changed internally to false for lvs %s. Timeout has been set.\n", node_role_to_string(lvs->node_role));
 			rc = 1;
 		}
 	}
@@ -3739,32 +3739,15 @@ spdk_change_redirect_state(struct spdk_lvol_store *lvs, bool disconnected) {
 	}
 }
 
-
-static node_role_t 
-node_role_from_string(const char *str) {
-    if (!str) return NODE_ROLE_UNKNOWN;
-
-    if (strcasecmp(str, "primary") == 0)
-        return NODE_PRIMARY;
-
-    if (strcasecmp(str, "secondary") == 0)
-        return NODE_SECONDARY;
-
-    if (strcasecmp(str, "tertiary") == 0)
-        return NODE_TERTIARY;
-
-    return NODE_ROLE_UNKNOWN;
-}
-
-
 void
 spdk_lvs_set_opts(struct spdk_lvol_store *lvs, uint64_t groupid, uint64_t port, char *role)
 {
-	SPDK_NOTICELOG("Set groupid %" PRIu64 " and port %" PRIu64 " to the lvolstore .\n", groupid, port);
+	SPDK_NOTICELOG("Set groupid %" PRIu64 " and port %" PRIu64 " to the lvolstore %s.\n", groupid, port, role);
 	pthread_mutex_lock(&g_lvol_stores_mutex);
 	lvs->groupid = groupid;
 	lvs->subsystem_port = port;
 	lvs->node_role = node_role_from_string(role);
+	spdk_bs_set_role(lvs->blobstore, lvs->node_role);
 
 	if (lvs->node_role == NODE_PRIMARY) {
 		if (!lvs->hublvol_poller) {
@@ -6364,7 +6347,7 @@ spdk_lvs_check_active_process(struct spdk_lvol_store *lvs, struct spdk_lvol *lvo
 		lvs->trigger_leader_sent = false;
 		lvs->retry_on_update++;
 		spdk_bs_set_leader(lvs->blobstore, true);
-		SPDK_NOTICELOG("Lvolstore failover set poller - trigger refresh: %" PRIu64 " t %d \n", lvol->blob_id, type);
+		SPDK_NOTICELOG("Lvolstore %s failover set poller - trigger refresh: %" PRIu64 " t %d \n", node_role_to_string(lvs->node_role), lvol->blob_id, type);
 		req->poller = spdk_poller_register(spdk_lvs_update_on_failover_poller, req, 500000); // Delay of 500ms
 	}
 
@@ -6422,7 +6405,7 @@ spdk_set_leader_all(struct spdk_lvol_store *t_lvs, bool lvs_leader, bool bs_nonl
 	struct spdk_lvol_store *lvs;
 	struct spdk_lvol_store *tmp_lvs = NULL;
 	struct spdk_lvol *lvol;	
-	SPDK_NOTICELOG("Lvs_leader state changed via RPC to %s and bs_nonleader to %s.\n", 
+	SPDK_NOTICELOG("Lvs %s leader state changed via RPC to %s and bs_nonleader to %s.\n", node_role_to_string(t_lvs->node_role),
                 lvs_leader ? "true" : "false",
                 bs_nonleadership ? "true" : "false");
 

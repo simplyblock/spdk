@@ -114,6 +114,13 @@ enum xfer_req_status {
 	XFER_REQ_STATUS_FAILED,
 };
 
+typedef enum {
+    NODE_PRIMARY = 0,
+    NODE_SECONDARY,
+    NODE_TERTIARY,
+    NODE_ROLE_UNKNOWN
+} node_role_t;
+
 struct spdk_hublvol_channels {
 	struct spdk_io_channel *ch;
 	struct spdk_thread	*thread;
@@ -462,6 +469,9 @@ void spdk_blob_update_failed_cleanup(struct spdk_blob *blob,
 				 spdk_blob_op_complete cb_fn, void *cb_arg);
 
 void spdk_bs_set_leader(struct spdk_blob_store *bs, bool state);
+void spdk_bs_set_role(struct spdk_blob_store *bs, node_role_t role);
+node_role_t node_role_from_string(const char *str);
+const char *node_role_to_string(node_role_t role);
 void spdk_bs_set_read_only(struct spdk_blob_store *bs, bool state);
 void prepare_s3_clusters(struct spdk_blob* blob, uint64_t *clusters, uint32_t num_clusters);
 bool spdk_blob_get_offset_allocate(struct spdk_blob *blob, uint64_t offset);

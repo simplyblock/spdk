@@ -275,13 +275,6 @@ struct spdk_lvs_xfer {
 	uint32_t s3_timeout_count;
 };
 
-typedef enum {
-    NODE_PRIMARY = 0,
-    NODE_SECONDARY,
-    NODE_TERTIARY,
-    NODE_ROLE_UNKNOWN
-} node_role_t;
-
 struct spdk_lvol_store {
 	struct spdk_bs_dev		*bs_dev;
 	struct spdk_blob_store		*blobstore;
