@@ -14669,8 +14669,9 @@ bs_update_replay_extent_page_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bser
 			bs_update_live_done(ctx, -EILSEQ);			
 			return;
 		}
-
-		bs_dump_print_md_page_on_update(ctx, &ctx->extent_pages[i], ctx->extent_page_num[i]);
+		if (ctx->failover) {
+			bs_dump_print_md_page_on_update(ctx, &ctx->extent_pages[i], ctx->extent_page_num[i]);
+		}
 	}
 
 	spdk_free(ctx->extent_pages);
