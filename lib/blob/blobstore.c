@@ -1929,6 +1929,90 @@ static void
 blob_load_read_extents_partial(spdk_bs_sequence_t *seq, struct spdk_blob_load_ctx *ctx);
 
 static void
+bs_dump_print_md_page_on_fail(struct spdk_blob_store *bs, struct spdk_blob_md_page *page, uint32_t page_idx)
+{
+	// uint32_t page_idx = ctx->cur_page;
+	struct spdk_blob_md_descriptor *desc;
+	size_t cur_desc = 0;
+	uint32_t crc;
+
+	SPDK_NOTICELOG("=========\n");
+	SPDK_NOTICELOG("Metadata Page Index: %" PRIu32 " (0x%" PRIx32 ")\n", page_idx, page_idx);
+	SPDK_NOTICELOG("Start LBA: %" PRIu64 "\n", bs_md_page_to_lba(bs, page_idx));
+	SPDK_NOTICELOG("Blob ID: 0x%" PRIx64 "\n", page->id);
+	SPDK_NOTICELOG("Sequence: %" PRIu32 "\n", page->sequence_num);
+
+	crc = blob_md_page_calc_crc(page);
+	SPDK_NOTICELOG("CRC: 0x%" PRIx32 " (%s)\n", page->crc, crc == page->crc ? "OK" : "Mismatch");
+
+	desc = (struct spdk_blob_md_descriptor *)page->descriptors;
+	while (cur_desc < sizeof(page->descriptors)) {
+		if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_PADDING) {
+			if (desc->length == 0) {
+				/* If padding and length are 0, this terminates the page */
+				break;
+			}
+		} else if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_EXTENT_RLE) {
+			struct spdk_blob_md_descriptor_extent_rle	*desc_extent_rle;
+			unsigned int				i;
+
+			desc_extent_rle = (struct spdk_blob_md_descriptor_extent_rle *)desc;
+
+			for (i = 0; i < desc_extent_rle->length / sizeof(desc_extent_rle->extents[0]); i++) {
+				if (desc_extent_rle->extents[i].cluster_idx != 0) {
+					SPDK_NOTICELOG("Allocated Extent - Start: %" PRIu32,
+						desc_extent_rle->extents[i].cluster_idx);
+				} else {
+					SPDK_NOTICELOG("Unallocated Extent - ");
+				}
+				SPDK_NOTICELOG(" Length: %" PRIu32, desc_extent_rle->extents[i].length);				
+			}
+		} else if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_EXTENT_PAGE) {
+			struct spdk_blob_md_descriptor_extent_page	*desc_extent;
+			unsigned int					i, j=0;
+			size_t						cluster_idx_length;
+
+			desc_extent = (struct spdk_blob_md_descriptor_extent_page *)desc;
+
+			desc_extent = (struct spdk_blob_md_descriptor_extent_page *)desc;
+			cluster_idx_length = desc_extent->length - sizeof(desc_extent->start_cluster_idx);
+
+			for (i = 0; i < cluster_idx_length / sizeof(desc_extent->cluster_idx[0]); i++) {
+				if (desc_extent->cluster_idx[i] != 0) {
+					SPDK_NOTICELOG("Allocated Extent - Start: %" PRIu32,
+						desc_extent->cluster_idx[i]);
+				} else {
+					j++;
+					// SPDK_NOTICELOG("Unallocated Extent");
+				}
+				// fprintf(ctx->fp, "\n");
+			}
+			if (j > 0) {
+				SPDK_NOTICELOG("Unallocated Extent - repeated: %" PRIu32, j);
+			}
+		// } 
+		// else if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_XATTR) {
+		// 	bs_dump_print_xattr(ctx, desc);
+		// } else if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_XATTR_INTERNAL) {
+		// 	bs_dump_print_xattr(ctx, desc);
+		// } else if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_FLAGS) {
+		// 	bs_dump_print_type_flags(ctx, desc);
+		// } else if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_EXTENT_TABLE) {
+		// 	bs_dump_print_extent_table(ctx, desc);
+		} else {
+			/* Error */
+			SPDK_NOTICELOG( "Unknown descriptor type %" PRIu8 "\n", desc->type);
+		}
+		/* Advance to the next descriptor */
+		cur_desc += sizeof(*desc) + desc->length;
+		if (cur_desc + sizeof(*desc) > sizeof(page->descriptors)) {
+			break;
+		}
+		desc = (struct spdk_blob_md_descriptor *)((uintptr_t)page->descriptors + cur_desc);
+	}
+}
+
+static void
 blob_load_cpl_extents_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
 	struct spdk_blob_load_ctx	*ctx = cb_arg;
@@ -1978,6 +2062,8 @@ blob_load_cpl_extents_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 			if (bserrno) {
 				SPDK_ERRLOG("Parse extenet metadata page %d failed for blobid 0x%" PRIx64 "\n",
 					ctx->next_extent_page, blob->id);
+				//dump the extent page for debug
+				bs_dump_print_md_page_on_fail(ctx->blob->bs, page, blob->active.extent_pages[i]);
 				blob_load_final(ctx, bserrno);
 				return;
 			}
@@ -13744,11 +13830,12 @@ struct spdk_bs_update_ctx {
 
 	struct spdk_bit_array		*used_blobids;
 	uint64_t			new_blobid;
+	uint64_t			dump_blobid;
 
 	struct spdk_bit_array		*used_md_pages;
 	struct spdk_bit_array		*synnced_used_blobid_pages;
 	bool				failover;
-
+	FILE 				*fp;
 	spdk_bs_sequence_t		*seq;
 };
 
@@ -14452,6 +14539,95 @@ bs_update_replay_md_chain_cpl(struct spdk_bs_update_ctx *ctx)
 }
 
 static void
+bs_dump_print_md_page_on_update(struct spdk_bs_update_ctx *ctx, struct spdk_blob_md_page *page, uint32_t page_idx)
+{
+	// uint32_t page_idx = ctx->cur_page;
+	struct spdk_blob_md_descriptor *desc;
+	size_t cur_desc = 0;
+	uint32_t crc;
+
+	fprintf(ctx->fp, "=========\n");
+	fprintf(ctx->fp, "Metadata Page Index: %" PRIu32 " (0x%" PRIx32 ")\n", page_idx, page_idx);
+	fprintf(ctx->fp, "Start LBA: %" PRIu64 "\n", bs_md_page_to_lba(ctx->bs, page_idx));	
+	fprintf(ctx->fp, "Blob ID: 0x%" PRIx64 "\n", page->id);
+	fprintf(ctx->fp, "Sequence: %" PRIu32 "\n", page->sequence_num);
+
+	fprintf(ctx->fp, "\n");
+
+	crc = blob_md_page_calc_crc(page);
+	fprintf(ctx->fp, "CRC: 0x%" PRIx32 " (%s)\n", page->crc, crc == page->crc ? "OK" : "Mismatch");
+
+	desc = (struct spdk_blob_md_descriptor *)page->descriptors;
+	while (cur_desc < sizeof(page->descriptors)) {
+		if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_PADDING) {
+			if (desc->length == 0) {
+				/* If padding and length are 0, this terminates the page */
+				break;
+			}
+		} else if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_EXTENT_RLE) {
+			struct spdk_blob_md_descriptor_extent_rle	*desc_extent_rle;
+			unsigned int				i;
+
+			desc_extent_rle = (struct spdk_blob_md_descriptor_extent_rle *)desc;
+
+			for (i = 0; i < desc_extent_rle->length / sizeof(desc_extent_rle->extents[0]); i++) {
+				if (desc_extent_rle->extents[i].cluster_idx != 0) {
+					fprintf(ctx->fp, "Allocated Extent - Start: %" PRIu32,
+						desc_extent_rle->extents[i].cluster_idx);
+				} else {
+					fprintf(ctx->fp, "Unallocated Extent - ");
+				}
+				fprintf(ctx->fp, " Length: %" PRIu32, desc_extent_rle->extents[i].length);
+				fprintf(ctx->fp, "\n");
+			}
+		} else if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_EXTENT_PAGE) {
+			struct spdk_blob_md_descriptor_extent_page	*desc_extent;
+			unsigned int					i, j=0;
+			size_t						cluster_idx_length;
+
+			desc_extent = (struct spdk_blob_md_descriptor_extent_page *)desc;
+
+			desc_extent = (struct spdk_blob_md_descriptor_extent_page *)desc;
+			cluster_idx_length = desc_extent->length - sizeof(desc_extent->start_cluster_idx);
+
+			for (i = 0; i < cluster_idx_length / sizeof(desc_extent->cluster_idx[0]); i++) {
+				if (desc_extent->cluster_idx[i] != 0) {
+					fprintf(ctx->fp, "Allocated Extent - Start: %" PRIu32,
+						desc_extent->cluster_idx[i]);
+						fprintf(ctx->fp, "\n");
+				} else {
+					j++;
+					// fprintf(ctx->fp, "Unallocated Extent");
+				}
+				// fprintf(ctx->fp, "\n");
+			}
+			if (j > 0) {
+				fprintf(ctx->fp, "Unallocated Extent - repeated: %" PRIu32, j);			
+				fprintf(ctx->fp, "\n");
+			}
+		// } 
+		// else if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_XATTR) {
+		// 	bs_dump_print_xattr(ctx, desc);
+		// } else if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_XATTR_INTERNAL) {
+		// 	bs_dump_print_xattr(ctx, desc);
+		// } else if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_FLAGS) {
+		// 	bs_dump_print_type_flags(ctx, desc);
+		// } else if (desc->type == SPDK_MD_DESCRIPTOR_TYPE_EXTENT_TABLE) {
+		// 	bs_dump_print_extent_table(ctx, desc);
+		} else {
+			/* Error */
+			fprintf(ctx->fp, "Unknown descriptor type %" PRIu8 "\n", desc->type);
+		}
+		/* Advance to the next descriptor */
+		cur_desc += sizeof(*desc) + desc->length;
+		if (cur_desc + sizeof(*desc) > sizeof(page->descriptors)) {
+			break;
+		}
+		desc = (struct spdk_blob_md_descriptor *)((uintptr_t)page->descriptors + cur_desc);
+	}
+}
+
+static void
 bs_update_replay_extent_page_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
 	struct spdk_bs_update_ctx *ctx = cb_arg;
@@ -14460,6 +14636,10 @@ bs_update_replay_extent_page_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bser
 
 	if (bserrno != 0) {
 		SPDK_ERRLOG("Read extent md page failed 2.\n");
+		if (ctx->fp) {
+			fclose(ctx->fp);
+			ctx->fp = NULL;
+		}
 		bs_update_live_done(ctx, -ENOTCONN);
 		return;
 	}
@@ -14470,6 +14650,10 @@ bs_update_replay_extent_page_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bser
 		if (bs_load_cur_extent_page_valid(&ctx->extent_pages[i]) != true) {
 			uint64_t lba = bs_md_page_to_lba(ctx->bs, ctx->extent_page_num[i]);
 			SPDK_ERRLOG("Extent page %" PRIu64 " is not valid.\n", lba);
+			if (ctx->fp) {
+				fclose(ctx->fp);
+				ctx->fp = NULL;
+			}
 			bs_update_live_done(ctx, -EILSEQ);
 			return;
 		}
@@ -14478,9 +14662,15 @@ bs_update_replay_extent_page_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bser
 		spdk_bit_array_set(ctx->used_md_pages, page_num);
 		if (bs_update_replay_md_parse_page(ctx, &ctx->extent_pages[i])) {
 			SPDK_ERRLOG("Extent page parsing encountered an error.\n");
-			bs_update_live_done(ctx, -EILSEQ);
+			if (ctx->fp) {
+				fclose(ctx->fp);
+				ctx->fp = NULL;
+			}
+			bs_update_live_done(ctx, -EILSEQ);			
 			return;
 		}
+
+		bs_dump_print_md_page_on_update(ctx, &ctx->extent_pages[i], ctx->extent_page_num[i]);
 	}
 
 	spdk_free(ctx->extent_pages);
@@ -14488,6 +14678,10 @@ bs_update_replay_extent_page_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bser
 	ctx->extent_pages = NULL;
 	ctx->extent_page_num = NULL;
 	ctx->num_extent_pages = 0;
+	if (ctx->fp) {
+		fclose(ctx->fp);
+		ctx->fp = NULL;
+	}
 
 	bs_update_replay_md_chain_cpl(ctx);
 }
@@ -14506,6 +14700,28 @@ bs_update_replay_extent_pages(struct spdk_bs_update_ctx *ctx)
 		SPDK_ERRLOG("Could not allocate buffer for reading the extent pages.\n");
 		bs_update_live_done(ctx, -ENOMEM);
 		return;
+	}
+
+	//open file to store extent page for debug
+	if (ctx->failover) {
+		char filename[256];
+		time_t now = time(NULL);
+		struct tm *tm_info;
+		char time_buf[64];
+
+		tm_info = localtime(&now);
+		strftime(time_buf, sizeof(time_buf), "%Y%m%d_%H%M%S", tm_info);
+
+		snprintf(filename, sizeof(filename),
+			"/etc/simplyblock/extent_page_blob_0x%" PRIx64 "_%s.txt",
+			ctx->dump_blobid, time_buf);
+
+		ctx->fp = fopen(filename, "w");
+		if (ctx->fp == NULL) {
+			SPDK_ERRLOG("Could not open file to store extent page.\n");
+			bs_update_live_done(ctx, -ENOMEM);
+			return;
+		}
 	}
 
 	batch = bs_sequence_to_batch(ctx->seq, 0, bs_update_replay_extent_page_cpl, ctx);
@@ -14542,6 +14758,7 @@ bs_update_replay_md_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 			spdk_bit_array_set(ctx->used_md_pages, page_num);
 			if (page->sequence_num == 0) {
 				SPDK_NOTICELOG("Update: blob 0x%" PRIx32 "\n", page_num);
+				ctx->dump_blobid = bs_page_to_blobid(page_num);
 				spdk_bit_array_set(ctx->used_blobids, page_num);
 				// spdk_bit_array_set(ctx->bs->map_blobids, page->reserved0);
 			}
