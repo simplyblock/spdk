@@ -3509,9 +3509,28 @@ spdk_lvs_trigger_leadership_switch(uint64_t *groupid)
 				pthread_mutex_unlock(&g_lvol_stores_mutex);
 				return true;
 			}
+
+			if (lvs->special_send_signal) {
+				*groupid = lvs->groupid;
+				lvs->special_send_signal = false;
+				SPDK_NOTICELOG("send special signal Leadership change from management. group id: %" PRIu64 ". \n", lvs->groupid);
+			}
 		}
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
 	return false;
+}
+
+void
+spdk_lvs_set_signal_switch(struct spdk_lvol_store *lvs)
+{
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+		if (!lvs->update_in_progress && !lvs->leader) {
+			if (!lvs->special_send_signal) {
+				lvs->special_send_signal = true;
+				SPDK_NOTICELOG("set special signal Leadership change from management. group id: %" PRIu64 ". \n", lvs->groupid);
+			}
+		}
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
 }
 
 int

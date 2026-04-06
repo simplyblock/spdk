@@ -2590,6 +2590,16 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('-r', '--role', help='role for lvolstore node(primary, secondary, tertiary), default primary')
     p.set_defaults(func=bdev_lvol_set_lvs_opts)
     
+    def bdev_lvol_set_lvs_signal(args):
+        print_dict(rpc.lvol.bdev_lvol_set_lvs_signal(args.client,
+                                                   uuid=args.uuid,
+                                                   lvs_name=args.lvs_name))
+
+    p = subparsers.add_parser('bdev_lvol_set_lvs_signal', help='Set signal for lvolstore')
+    p.add_argument('-u', '--uuid', help='lvol store UUID')
+    p.add_argument('-l', '--lvs-name', help='lvol store name')
+    p.set_defaults(func=bdev_lvol_set_lvs_signal)
+    
     def bdev_lvol_create_poller_group(args):
         print_dict(rpc.lvol.bdev_lvol_create_poller_group(args.client,
                                                    cpu_mask=args.cpu_mask))

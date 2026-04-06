@@ -310,6 +310,7 @@ struct spdk_lvol_store {
 	uint64_t			leadership_timeout;
 	uint64_t			timeout_trigger;
 	bool 				trigger_leader_sent;
+	bool				special_send_signal;
 	bool 				read_only;
 	bool				skip_redirecting;
 	node_role_t 		node_role;
