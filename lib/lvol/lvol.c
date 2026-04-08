@@ -5561,7 +5561,7 @@ xfer_s3_recovery(struct spdk_lvs_xfer *xfer) {
 			}
 			break;
 		case XFER_STATE_RECOVER_CLUSTERS:
-			rc = xfer_s3_check(xfer, &req, xfer->idx, XFER_STATE_TRANSFER_MD_DATA, xfer->cluster_batch);
+			rc = xfer_s3_check(xfer, &req, xfer->idx, XFER_STATE_DONE, 0);
 			if (rc != 0) {
 				return 0;
 			}
