@@ -3009,6 +3009,83 @@ cleanup:
 SPDK_RPC_REGISTER("bdev_lvol_set_priority_class", rpc_bdev_lvol_set_priority_class,
 		  SPDK_RPC_RUNTIME)
 
+struct rpc_bdev_lvol_set_map_id {
+	char* lvol_name;
+};
+
+static void 
+free_rpc_bdev_lvol_set_map_id(struct rpc_bdev_lvol_set_map_id *req) {
+	free(req->lvol_name);
+}
+
+static const struct spdk_json_object_decoder rpc_bdev_lvol_set_map_id_decoders[] = {
+	{"lvol_name", offsetof(struct rpc_bdev_lvol_set_map_id, lvol_name), spdk_json_decode_string},	
+};
+
+static void
+rpc_bdev_lvol_set_map_id_cb(void *cb_arg, int lvolerrno)
+{
+	struct spdk_jsonrpc_request *request = cb_arg;
+
+	if (lvolerrno != 0) {
+		goto invalid;
+	}
+
+	spdk_jsonrpc_send_bool_response(request, true);
+	return;
+
+invalid:
+	spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+					 spdk_strerror(-lvolerrno));
+}
+
+
+static void 
+rpc_bdev_lvol_set_map_id(struct spdk_jsonrpc_request *request,
+			      const struct spdk_json_val *params) 
+{
+	struct rpc_bdev_lvol_set_map_id req = {};
+	struct spdk_lvol *lvol;
+	struct spdk_bdev *lvol_bdev;
+
+	SPDK_INFOLOG(lvol_rpc, "Set map_id of lvol\n");
+
+	if (spdk_json_decode_object(params, rpc_bdev_lvol_set_map_id_decoders,
+				    SPDK_COUNTOF(rpc_bdev_lvol_set_map_id_decoders),
+				    &req)) {
+		SPDK_INFOLOG(lvol_rpc, "spdk_json_decode_object failed\n");
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "spdk_json_decode_object failed");
+		goto cleanup;
+	}
+
+	lvol_bdev = spdk_bdev_get_by_name(req.lvol_name);
+	if (lvol_bdev == NULL) {
+		SPDK_ERRLOG("lvol bdev '%s' does not exist\n", req.lvol_name);
+		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
+		goto cleanup;
+	}
+
+	lvol = vbdev_lvol_get_from_bdev(lvol_bdev);
+	if (lvol == NULL) {
+		SPDK_ERRLOG("lvol does not exist\n");
+		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
+		goto cleanup;
+	}
+
+	if (lvol->map_id != 0) {
+		SPDK_ERRLOG("lvol '%s' have a valid map_id %d. \n", req.lvol_name, lvol->map_id);
+		spdk_jsonrpc_send_error_response(request, -EINVAL, spdk_strerror(EINVAL));
+		goto cleanup;
+	}
+
+	spdk_lvol_set_map_id(lvol, rpc_bdev_lvol_set_map_id_cb, request);	
+
+cleanup:
+	free_rpc_bdev_lvol_set_map_id(&req);
+}
+
+SPDK_RPC_REGISTER("bdev_lvol_set_map_id", rpc_bdev_lvol_set_map_id, SPDK_RPC_RUNTIME)
 
 static void
 dummy_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev, void *ctx)

@@ -12155,6 +12155,33 @@ spdk_blob_set_read_only(struct spdk_blob *blob)
 }
 /* END spdk_blob_set_read_only */
 
+/* START spdk_blob_set_map_id */
+int
+spdk_blob_set_map_id(struct spdk_blob *blob)
+{
+	uint32_t map_id;
+	struct spdk_blob_store *bs = blob->bs;
+	
+	spdk_spin_lock(&bs->used_lock);
+	map_id = spdk_bit_array_find_first_clear(bs->map_blobids, 0);
+	if (map_id == UINT32_MAX) {
+		spdk_spin_unlock(&bs->used_lock);
+		return -ENOMEM;
+	}
+
+	if (map_id == 0) {
+		spdk_spin_unlock(&bs->used_lock);
+		return -ENOMEM;
+	}
+
+	blob->map_id = map_id;
+	spdk_bit_array_set(bs->map_blobids, map_id);
+	spdk_spin_unlock(&bs->used_lock);
+	blob->state = SPDK_BLOB_STATE_DIRTY;
+	return 0;
+}
+/* END spdk_blob_set_map_id */
+
 /* START spdk_blob_sync_md */
 
 static void

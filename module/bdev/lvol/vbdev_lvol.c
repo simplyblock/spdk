@@ -1414,7 +1414,7 @@ vbdev_redirect_request_to_hublvol(struct spdk_lvol *lvol, struct spdk_io_channel
 	if (hub_dev->state == HUBLVOL_CONNECTED) {
 		//TODO check the state for channel
 		if (hub_dev->desc == NULL) {
-			SPDK_ERRLOG("Hublvol desc is NULL. should not be.\n");			
+			SPDK_ERRLOG("Hublvol desc is NULL. should not be.\n");
 			spdk_change_redirect_state(lvs, true);
 			vbdev_lvol_submit_request(ch, bdev_io);		
 			return;
@@ -1443,7 +1443,7 @@ vbdev_redirect_request_to_hublvol(struct spdk_lvol *lvol, struct spdk_io_channel
 	if (bdev_io->type != SPDK_BDEV_IO_TYPE_READ && !lvs->read_only) {
 		ctx = calloc(1, sizeof(*ctx));
 		if (!ctx) {
-			SPDK_NOTICELOG("FAILED IO - Cannot allocate ctx for redirect IO. \n");			
+			SPDK_NOTICELOG("FAILED IO - Cannot allocate ctx for redirect IO. \n");
 			spdk_change_redirect_state(lvs, false);
 			vbdev_lvol_submit_request(ch, bdev_io);
 			return;
@@ -1453,7 +1453,7 @@ vbdev_redirect_request_to_hublvol(struct spdk_lvol *lvol, struct spdk_io_channel
 		ctx->ch = ch;
 	}
 
-	lvol_io->redirect_in_progress = true;	
+	lvol_io->redirect_in_progress = true;
 	switch (bdev_io->type) {
 	case SPDK_BDEV_IO_TYPE_READ:
 		spdk_bdev_io_get_buf(bdev_io, redirect_get_buf_cb,

@@ -1992,6 +1992,41 @@ spdk_lvol_set_read_only(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, voi
 }
 
 static void
+lvol_set_map_id_cb(void *cb_arg, int lvolerrno)
+{
+	struct spdk_lvol_req *req = cb_arg;
+	struct spdk_lvol_store *lvs = req->lvol->lvol_store;
+	struct spdk_lvol *lvol = req->lvol;
+	lvol->map_id = spdk_blob_get_id(lvol->blob);
+	lvs->lvol_map.lvol[lvol->map_id] = lvol;
+	req->cb_fn(req->cb_arg, lvolerrno);
+	free(req);
+}
+
+void
+spdk_lvol_set_map_id(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_lvol_req *req;
+	int rc;
+	req = calloc(1, sizeof(*req));
+	if (!req) {
+		SPDK_ERRLOG("Cannot alloc memory for lvol request pointer\n");
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+	req->lvol = lvol;
+	rc = spdk_blob_set_map_id(lvol->blob);
+	if (rc < 0) {
+		free(req);
+		cb_fn(cb_arg, rc);
+		return;
+	}
+	spdk_blob_sync_md(lvol->blob, lvol_set_map_id_cb, req);
+}
+
+static void
 lvol_rename_cb(void *cb_arg, int lvolerrno)
 {
 	struct spdk_lvol_req *req = cb_arg;
@@ -3364,6 +3399,11 @@ spdk_lvs_change_leader_state(uint64_t groupid)
 				pthread_mutex_lock(&g_lvs_queue_mutex);
 				lvs->queue_failed_rsp = false;
 				pthread_mutex_unlock(&g_lvs_queue_mutex);
+
+				if (lvs->secondary && lvs->hub_dev.state == HUBLVOL_CONNECTED && lvs->skip_redirecting) {
+					lvs->skip_redirecting = false;
+					lvs->hub_dev.drain_in_action = false;
+				}
 
 				lvs->update_in_progress = false;
 				lvs->failed_on_update = false;

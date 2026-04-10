@@ -1061,6 +1061,15 @@ int spdk_blob_resize_register(struct spdk_blob *blob, uint64_t sz);
 int spdk_blob_set_read_only(struct spdk_blob *blob);
 
 /**
+ * Set blob map id.
+ *
+ * These changes do not take effect until spdk_blob_sync_md() is called.
+ *
+ * \param blob Blob to set.
+ */
+int spdk_blob_set_map_id(struct spdk_blob *blob);
+
+/**
  * Sync a blob.
  *
  * Make a blob persistent. This applies to open, resize, set xattr, and remove

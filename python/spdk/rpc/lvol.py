@@ -304,6 +304,18 @@ def bdev_lvol_set_priority_class(client, lvol_name, lvol_priority_class):
     params = {'lvol_name': lvol_name, 'lvol_priority_class': lvol_priority_class}
     return client.call('bdev_lvol_set_priority_class', params)
 
+def bdev_lvol_set_map_id(client, lvol_name=None):
+    """Set the map ID of a logical volume.
+
+    Args:
+        lvol_name: name of logical volume to set map ID of
+    """
+    if not lvol_name:
+        raise ValueError("lvol_name must be specified")
+
+    params = {'lvol_name': lvol_name}
+    return client.call('bdev_lvol_set_map_id', params)
+
 def bdev_lvol_snapshot(client, lvol_name, snapshot_name):
     """Capture a snapshot of the current state of a logical volume.
 
