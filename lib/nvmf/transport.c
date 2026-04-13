@@ -999,6 +999,7 @@ spdk_nvmf_request_get_buffers(struct spdk_nvmf_request *req,
 	// SPDK_NOTICELOG("get buf group %p \n", group);
 	rc = nvmf_request_get_buffers(req, group, transport, length, transport->opts.io_unit_size, false);
 	if (spdk_unlikely(rc == -ENOMEM && transport->ops->req_get_buffers_done == NULL)) {
+		SPDK_NOTICELOG("waiting for release buf,qid:%d nqn:%s \n", req->qpair->qid, req->qpair->ctrlr->subsys->subnqn);
 		spdk_nvmf_request_free_buffers(req, group, transport);
 	}
 

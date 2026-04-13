@@ -722,6 +722,7 @@ spdk_iobuf_get(struct spdk_iobuf_channel *ch, uint64_t len,
 				       spdk_max(pool->cache_size, 1)));
 		if (sz == 0) {
 			if (entry) {
+				SPDK_NOTICELOG("set entry for get buf and wait, cache_count %d\n", pool->cache_count);
 				STAILQ_INSERT_TAIL(pool->queue, entry, stailq);
 				entry->module = ch->module;
 				entry->cb_fn = cb_fn;
