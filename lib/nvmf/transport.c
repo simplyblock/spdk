@@ -933,6 +933,8 @@ nvmf_request_get_buffers(struct spdk_nvmf_request *req,
 	 */
 	num_buffers = SPDK_CEIL_DIV(length, io_unit_size);
 	if (spdk_unlikely(num_buffers > NVMF_REQ_MAX_BUFFERS)) {
+		SPDK_ERRLOG("qpair id:%d nqn:%s Request requires %u buffers, which is more than the maximum allowed (%u)\n", req->qpair->qid,
+			    req->qpair->ctrlr->subsys->subnqn, num_buffers, NVMF_REQ_MAX_BUFFERS);
 		return -EINVAL;
 	}
 
@@ -945,6 +947,7 @@ nvmf_request_get_buffers(struct spdk_nvmf_request *req,
 		buffer = spdk_iobuf_get(group->buf_cache, spdk_min(io_unit_size, length), entry,
 					nvmf_request_iobuf_get_cb);
 		if (spdk_unlikely(buffer == NULL)) {
+			spdk_iobuf_get_stats_per_channel(group->buf_cache, req->qpair->ctrlr->subsys->subnqn, req->qpair->qid);
 			req->iobuf.remaining_length = length;
 			return -ENOMEM;
 		}

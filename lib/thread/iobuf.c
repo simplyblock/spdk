@@ -745,6 +745,19 @@ spdk_iobuf_get(struct spdk_iobuf_channel *ch, uint64_t len,
 }
 
 void
+spdk_iobuf_get_stats_per_channel(struct spdk_iobuf_channel *ch, char *nqn, int qid)
+{
+	struct spdk_iobuf_node_cache *cache;
+	struct spdk_iobuf_pool_cache *small, *large;
+	cache = &ch->cache[0];
+	small = &cache->small;
+	large = &cache->large;
+	SPDK_NOTICELOG("nqn:%s qid:%d ch %p scache: cnt[%d], cache [%"PRIu64"] r[%"PRIu64"], m[%"PRIu64"], lcache: cnt [%d], cache [%"PRIu64"], retry [%"PRIu64"], main [%"PRIu64"]\n",
+		 nqn, qid, ch, small->cache_count, small->stats.cache, small->stats.retry, small->stats.main, large->cache_count, large->stats.cache, large->stats.retry, large->stats.main);
+	return;
+}
+
+void
 spdk_iobuf_put(struct spdk_iobuf_channel *ch, void *buf, uint64_t len)
 {
 	struct spdk_iobuf_entry *entry;
