@@ -1280,6 +1280,8 @@ void spdk_iobuf_entry_abort(struct spdk_iobuf_channel *ch, struct spdk_iobuf_ent
 void *spdk_iobuf_get(struct spdk_iobuf_channel *ch, uint64_t len, struct spdk_iobuf_entry *entry,
 		     spdk_iobuf_get_cb cb_fn);
 
+void spdk_iobuf_get_stats_per_channel(struct spdk_iobuf_channel *ch, char *nqn, int qid);
+
 /**
  * Release a buffer back to the iobuf pool.  If there are outstanding requests waiting for a buffer,
  * this buffer will be passed to one of them.

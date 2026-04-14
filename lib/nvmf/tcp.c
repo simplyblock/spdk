@@ -2818,6 +2818,8 @@ nvmf_tcp_req_parse_sgl(struct spdk_nvmf_tcp_req *tcp_req,
 			/* No available buffers. Queue this request up. */
 			SPDK_DEBUGLOG(nvmf_tcp, "No available large data buffers. Queueing request %p\n",
 				      tcp_req);
+			SPDK_ERRLOG("No available large data buffers. Queueing request %p , length=%d\n",
+				      tcp_req, length);
 			return;
 		}
 		tcp_req->tps.time_per_state[tcp_req->state] = spdk_get_ticks() - tcp_req->tps.time_per_state[tcp_req->state];

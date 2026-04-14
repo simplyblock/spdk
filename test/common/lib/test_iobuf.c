@@ -143,3 +143,9 @@ spdk_iobuf_put(struct spdk_iobuf_channel *ch, void *buf, uint64_t len)
 
 	free(buf);
 }
+
+void
+spdk_iobuf_get_stats_per_channel(struct spdk_iobuf_channel *ch, char *nqn, int qid)
+{
+	/* no-op for unit tests */
+}

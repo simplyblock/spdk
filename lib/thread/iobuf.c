@@ -722,6 +722,7 @@ spdk_iobuf_get(struct spdk_iobuf_channel *ch, uint64_t len,
 				       spdk_max(pool->cache_size, 1)));
 		if (sz == 0) {
 			if (entry) {
+				SPDK_NOTICELOG("set entry for get buf and wait, cache_count %d\n", pool->cache_count);
 				STAILQ_INSERT_TAIL(pool->queue, entry, stailq);
 				entry->module = ch->module;
 				entry->cb_fn = cb_fn;
@@ -742,6 +743,19 @@ spdk_iobuf_get(struct spdk_iobuf_channel *ch, uint64_t len,
 	}
 	// SPDK_NOTICELOG("get cache_count %d buf %p \n", pool->cache_count, buf);
 	return (char *)buf;
+}
+
+void
+spdk_iobuf_get_stats_per_channel(struct spdk_iobuf_channel *ch, char *nqn, int qid)
+{
+	struct spdk_iobuf_node_cache *cache;
+	struct spdk_iobuf_pool_cache *small, *large;
+	cache = &ch->cache[0];
+	small = &cache->small;
+	large = &cache->large;
+	SPDK_NOTICELOG("nqn:%s qid:%d ch %p scache: cnt[%d], cache [%"PRIu64"] r[%"PRIu64"], m[%"PRIu64"], lcache: cnt [%d], cache [%"PRIu64"], retry [%"PRIu64"], main [%"PRIu64"]\n",
+		 nqn, qid, ch, small->cache_count, small->stats.cache, small->stats.retry, small->stats.main, large->cache_count, large->stats.cache, large->stats.retry, large->stats.main);
+	return;
 }
 
 void
