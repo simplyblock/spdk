@@ -3285,9 +3285,9 @@ block_port(int port) {
     	// 	"sudo iptables -C OUTPUT -p tcp --dport %d -j DROP 2>/dev/null || sudo iptables -A OUTPUT -p tcp --dport %d -j DROP;",
     	// 	port, port, port, port);
 		snprintf(command, sizeof(command),
-    		"sudo nft add rule ip filter input tcp dport %d drop;"
-    		"sudo nft add rule ip filter output tcp dport %d drop;",
-    		port, port);
+    		"sudo nft delete rule ip filter input handle 1 2>/dev/null || sudo nft add rule ip filter input tcp dport %d drop;"
+    		"sudo nft delete rule ip filter output handle 1 2>/dev/null || sudo nft add rule ip filter output tcp dport %d drop;",
+    		port, port, port, port);
 
 		// Execute the command
 		int result = system(command);
