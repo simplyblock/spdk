@@ -12163,13 +12163,8 @@ spdk_blob_set_map_id(struct spdk_blob *blob)
 	struct spdk_blob_store *bs = blob->bs;
 	
 	spdk_spin_lock(&bs->used_lock);
-	map_id = spdk_bit_array_find_first_clear(bs->map_blobids, 0);
-	if (map_id == UINT32_MAX) {
-		spdk_spin_unlock(&bs->used_lock);
-		return -ENOMEM;
-	}
-
-	if (map_id == 0) {
+	map_id = spdk_bit_array_find_first_clear(bs->map_blobids, 1);
+	if (map_id == UINT32_MAX || map_id == 0) {
 		spdk_spin_unlock(&bs->used_lock);
 		return -ENOMEM;
 	}
