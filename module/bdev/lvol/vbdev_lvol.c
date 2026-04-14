@@ -1514,14 +1514,14 @@ vbdev_hublvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bd
 	uint64_t offset =  bdev_io->u.bdev.offset_blocks;
 	bool io_type = check_IO_type(bdev_io->type);
 	uint16_t id = EXTRACT_ID(offset);
-	// if (id == 0) {
-	// 	SPDK_ERRLOG("HUBLVOL - orglvol in none due to zero id - blob: %" PRIu64 "  "
-	// 						"Lba: %" PRIu64 "  Cnt %" PRIu64 "  t %d \n",
-	// 						lvol->blob_id, offset, bdev_io->u.bdev.num_blocks, bdev_io->type);
-	// 	__atomic_sub_fetch(&lvs->current_io_t, 1, __ATOMIC_SEQ_CST);
-	// 	spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
-	// 	return;
-	// }
+	if (id == 0) {
+		SPDK_ERRLOG("HUBLVOL - orglvol in none due to zero id - blob: %" PRIu64 "  "
+							"Lba: %" PRIu64 "  Cnt %" PRIu64 "  t %d \n",
+							lvol->blob_id, offset, bdev_io->u.bdev.num_blocks, bdev_io->type);
+		__atomic_sub_fetch(&lvs->current_io_t, 1, __ATOMIC_SEQ_CST);
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		return;
+	}
 
 	struct spdk_lvol *org_lvol = lvs->lvol_map.lvol[id];
 	offset = ADJUST_OFFSET(offset);
