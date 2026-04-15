@@ -1149,7 +1149,9 @@ lvol_create_open_cb(void *cb_arg, struct spdk_blob *blob, int lvolerrno)
 	lvol->blob = blob;
 	lvol->blob_id = spdk_blob_get_id(blob);
 	lvol->map_id = spdk_blob_get_map_id(blob);
-	lvs->lvol_map.lvol[lvol->map_id] = lvol;
+	if (!lvol->hublvol) {
+		lvs->lvol_map.lvol[lvol->map_id] = lvol;
+	}
 
 	TAILQ_INSERT_TAIL(&lvol->lvol_store->lvols, lvol, link);
 
