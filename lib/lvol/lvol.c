@@ -1999,7 +1999,7 @@ lvol_set_map_id_cb(void *cb_arg, int lvolerrno)
 	struct spdk_lvol_req *req = cb_arg;
 	struct spdk_lvol_store *lvs = req->lvol->lvol_store;
 	struct spdk_lvol *lvol = req->lvol;
-	lvol->map_id = spdk_blob_get_id(lvol->blob);
+	lvol->map_id = spdk_blob_get_map_id(lvol->blob);
 	lvs->lvol_map.lvol[lvol->map_id] = lvol;
 	req->cb_fn(req->cb_arg, lvolerrno);
 	free(req);
