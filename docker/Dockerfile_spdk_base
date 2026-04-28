@@ -6,7 +6,7 @@ USER root
 
 WORKDIR /root
 
-RUN dnf install -y git diffutils procps-ng pip kmod hostname wget pkg-config cmake nano systemd-udev
+RUN dnf install -y git diffutils procps-ng pip kmod hostname wget pkg-config cmake nano systemd-udev openldap-clients
 
 RUN yum install -y dosfstools ntfsprogs e2fsprogs ntfs-* gdb parted fio xfsprogs libasan libubsan iptables
 
