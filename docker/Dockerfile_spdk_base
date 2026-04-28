@@ -6,11 +6,9 @@ USER root
 
 WORKDIR /root
 
-RUN dnf install -y git diffutils procps-ng pip kmod hostname wget pkg-config cmake nano systemd-udev openldap-clients
-
-RUN yum install -y dosfstools ntfsprogs e2fsprogs ntfs-* gdb parted fio xfsprogs libasan libubsan iptables
-
-RUN yum install -y python3 python3-pip nvme-cli librdmacm-utils perftest numactl gdisk
+RUN dnf install -y git diffutils procps-ng pip kmod hostname wget pkg-config cmake nano systemd-udev openldap-clients  \
+    dosfstools ntfsprogs e2fsprogs ntfs-* gdb parted fio xfsprogs libasan libubsan iptables  python3 python3-pip  \
+    nvme-cli librdmacm-utils perftest numactl gdisk
 
 RUN pip3 install psutil requests flask jc pydantic grpcio-tools==1.51.3 protobuf==4.22.1
 
@@ -19,17 +17,6 @@ COPY ./ /root/spdk/
 RUN cd spdk && scripts/pkgdep.sh --rdma --pmem
 
 RUN rm -rf /root/spdk
-
-# Build OpenSSL
-RUN dnf update -y && dnf upgrade -y && \
-    dnf install -y zlib-devel make gcc perl curl \
-    libcurl-devel libuuid-devel pulseaudio-libs-devel && \
-    wget https://www.openssl.org/source/openssl-3.5.0.tar.gz && \
-    tar -xvf openssl-3.5.0.tar.gz && \
-    cd openssl-3.5.0 && \
-    ./config && make -j"$(nproc)" && make install && \
-    echo /usr/local/lib64 > /etc/ld.so.conf.d/openssl.conf && ldconfig && \
-    cd .. && rm -rf openssl-3.5.0*
 
 # Clone + build AWS SDK
 RUN git clone --recurse-submodules https://github.com/simplyblock-io/aws-sdk-cpp && \
@@ -47,3 +34,14 @@ RUN git clone --recurse-submodules https://github.com/simplyblock-io/aws-sdk-cpp
     -DBUILD_ONLY="s3;s3-crt" && \
     make -j"$(nproc)" && make install && \
     rm -rf /root/aws-sdk-cpp
+
+# Build OpenSSL
+RUN dnf update -y && dnf upgrade -y && \
+    dnf install -y zlib-devel make gcc perl curl \
+    libcurl-devel libuuid-devel pulseaudio-libs-devel && \
+    wget https://www.openssl.org/source/openssl-3.5.0.tar.gz && \
+    tar -xvf openssl-3.5.0.tar.gz && \
+    cd openssl-3.5.0 && \
+    ./config && make -j"$(nproc)" && make install && \
+    echo /usr/local/lib64 > /etc/ld.so.conf.d/openssl.conf && ldconfig && \
+    cd .. && rm -rf openssl-3.5.0* \
