@@ -1,6 +1,6 @@
 FROM fedora:37
 
-# push to "simplyblock/spdk-core-base:$TAG"
+# push to "simplyblock/spdk-core:base_image"
 
 USER root
 
@@ -8,7 +8,11 @@ WORKDIR /root
 
 RUN dnf install -y git diffutils procps-ng pip kmod hostname wget pkg-config cmake nano systemd-udev
 
-RUN pip3 install grpcio-tools==1.51.3 protobuf==4.22.1
+RUN yum install -y dosfstools ntfsprogs e2fsprogs ntfs-* gdb parted fio xfsprogs libasan libubsan iptables
+
+RUN yum install -y python3 python3-pip nvme-cli librdmacm-utils perftest numactl gdisk
+
+RUN pip3 install psutil requests flask jc pydantic grpcio-tools==1.51.3 protobuf==4.22.1
 
 COPY ./ /root/spdk/
 
