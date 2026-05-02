@@ -1218,12 +1218,15 @@ static void
 handle_snapshot_post_migration_cpl(void *cbarg) {
 	struct vbdev_lvol_migration_ctx *ctx = cbarg;
 	// Done processing special signal
+	SPDK_NOTICELOG("Snapshot post migration 7.\n");
 	if (ctx->rc != 0) {
+		SPDK_NOTICELOG("Snapshot post migration 8.\n");
 		SPDK_ERRLOG("Snapshot post migration handling failed with rc %d.\n", ctx->rc);
 		lvol_op_comp(ctx->bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 		free(ctx);
 		return;
 	}
+	SPDK_NOTICELOG("Snapshot post migration 9.\n");
 	lvol_op_comp(ctx->bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
 	free(ctx);
 }
@@ -1232,12 +1235,12 @@ static void
 handle_snapshot_post_migration_add_clone_cpl(void *cb_arg, int lvolerrno)
 {
 	struct vbdev_lvol_migration_ctx *ctx = cb_arg;
-
+	SPDK_NOTICELOG("Snapshot post migration 5.\n");
 	if (lvolerrno != 0) {
 		SPDK_ERRLOG("Failed to add lvol %s as clone to the snapshot after migration.\n", ctx->lvol->name);
 		ctx->rc = lvolerrno;
 	}
-
+	SPDK_NOTICELOG("Snapshot post migration 6.\n");
 	ctx->lvol->migration_flag = false;
 	spdk_thread_send_msg(ctx->thread, handle_snapshot_post_migration_cpl, ctx);
 }
@@ -1248,12 +1251,13 @@ handle_snapshot_post_migration(void *cbarg)
 	struct vbdev_lvol_migration_ctx *ctx = cbarg;
 	struct spdk_lvol *lvol = ctx->lvol;
 	struct spdk_lvol *snapshot = ctx->snapshot;
-
+	SPDK_NOTICELOG("Snapshot post migration 2.\n");
 	if (snapshot != NULL) {
+		SPDK_NOTICELOG("Snapshot post migration 3.\n");
 		spdk_lvol_chain(snapshot, lvol, handle_snapshot_post_migration_add_clone_cpl, ctx);
 		return;
 	}
-
+	SPDK_NOTICELOG("Snapshot post migration 4.\n");
 	lvol->migration_flag = false;
 	spdk_thread_send_msg(ctx->thread, handle_snapshot_post_migration_cpl, ctx);
 }
@@ -1317,6 +1321,7 @@ process_migration_write_request(struct spdk_bdev_io *bdev_io, struct spdk_lvol *
 	}
 
 	if (find_signal) {
+		SPDK_NOTICELOG("Snapshot post migration 1.\n");
 		// Add lvol as clone to the snapshot
 		// using thread for hublvol bcs the hub lvol opend in md thread
 		struct spdk_thread *thread = spdk_bs_get_md_thread(lvol->lvol_store->blobstore);
