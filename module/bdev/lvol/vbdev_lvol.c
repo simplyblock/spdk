@@ -1227,7 +1227,8 @@ handle_snapshot_post_migration_cpl(void *cbarg) {
 		return;
 	}
 	SPDK_NOTICELOG("Snapshot post migration 9.\n");
-	lvol_op_comp(ctx->bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+	// lvol_op_comp(ctx->bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+	lvol_op_comp(ctx->bdev_io, 0);
 	free(ctx);
 }
 
