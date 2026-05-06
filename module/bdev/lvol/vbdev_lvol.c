@@ -973,7 +973,7 @@ vbdev_lvol_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 		if (rc == -ENOMEM && count > 0) {
 			ids = malloc(sizeof(spdk_blob_id) * count);
 			if (ids == NULL) {
-				SPDK_ERRLOG("Cannot allocate memory\n");
+				SPDK_ERRLOG("Cannot allocate memory for clone IDs %" PRIu64 " of snapshot %" PRIx64 " \n", count, lvol->blob_id);
 				rc = -ENOMEM;
 				goto end;
 			}
@@ -986,7 +986,7 @@ vbdev_lvol_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 					if (name != NULL) {
 						spdk_json_write_string(w, name);
 					} else {
-						SPDK_ERRLOG("Cannot obtain clone name\n");
+						SPDK_ERRLOG("Cannot obtain clone name for snapshot %" PRIx64 " clone %" PRIx64 "\n", lvol->blob_id, ids[i]);
 					}
 
 				}

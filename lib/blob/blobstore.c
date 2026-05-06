@@ -10482,6 +10482,35 @@ bs_update_blob_on_failover(struct spdk_blob_store *bs,
 	blob_load(seq, newblob, bs_update_blob_cpl, ctx, SPDK_BLOB_UPDATE_FAILOVER);
 }
 
+static int
+spdk_blob_print_clones(struct spdk_blob_store *bs, spdk_blob_id blobid, spdk_blob_id ids)
+{
+	struct spdk_blob_list *snapshot_entry, *clone_entry;
+	bool find = false;
+	snapshot_entry = bs_get_snapshot_entry(bs, blobid);
+	if (snapshot_entry == NULL) {
+		return 0;
+	}
+
+	if (snapshot_entry->clone_count <= 0) {
+		return 0;
+	}
+
+	TAILQ_FOREACH(clone_entry, &snapshot_entry->clones, link) {
+		if (ids == clone_entry->id) {
+			find = true;
+			SPDK_NOTICELOG("Found clone 0x%" PRIx64 " for snapshot 0x%" PRIx64 " clone count:%" PRIu64 " \n", clone_entry->id, blobid, snapshot_entry->clone_count);
+			break;
+		}
+	}
+
+	if (!find) {
+		SPDK_NOTICELOG("Cannot find clone 0x%" PRIx64 " for snapshot 0x%" PRIx64 " clone count: %" PRIu64 " \n", ids, blobid, snapshot_entry->clone_count);
+	}
+
+	return 0;
+}
+
 void
 spdk_bs_update_snapshot_clone(struct spdk_blob_store *bs, struct spdk_blob *origblob,
 			 struct spdk_blob *newblob, bool leader, bool update_in_progress)
@@ -10514,6 +10543,7 @@ spdk_bs_update_snapshot_clone(struct spdk_blob_store *bs, struct spdk_blob *orig
 	origblob->parent_id = newblob->id;
 	bs_blob_list_add(newblob);
 	bs_blob_list_add(origblob);
+	spdk_blob_print_clones(bs, newblob->id, origblob->id);
 	SPDK_NOTICELOG("Check ref on register snap in secondary "
                "origblob 0x%" PRIx64 " 0x%" PRIx32 " "
                "newblob 0x%" PRIx64 " 0x%" PRIx32 " \n",
@@ -11468,7 +11498,6 @@ spdk_bs_delete_blob_non_leader(struct spdk_blob_store *bs, struct spdk_blob *blo
 			if (clone_entry) {
 				assert(snapshot_entry->clone_count == 1);
 				clone = blob_lookup(blob->bs, clone_entry->id);
-								
 			} else if (corrupted_mode) {
 				clone = removal_clone;
 			}
