@@ -325,7 +325,7 @@ int spdk_lvs_change_leader_state(uint64_t groupid);
 void spdk_abort_node(void);
 bool spdk_lvs_trigger_leadership_switch(uint64_t *groupid);
 bool spdk_lvs_queued_rsp(struct spdk_lvol_store *lvs, struct spdk_bdev_io *bdev_io);
-void spdk_lvs_set_opts(struct spdk_lvol_store *lvs, uint64_t groupid, uint64_t port, char *role);
+void spdk_lvs_set_opts(struct spdk_lvol_store *lvs, uint64_t groupid, uint64_t port, uint64_t hublvol_port, char *role);
 void spdk_lvs_set_signal_switch(struct spdk_lvol_store *lvs);
 void spdk_lvs_open_hub_bdev(void * cb_arg);
 void spdk_lvs_connect_hublvol(struct spdk_lvol_store *lvs, const char *remote_bdev);

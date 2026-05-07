@@ -315,6 +315,7 @@ struct spdk_lvol_store {
 	bool				skip_redirecting;
 	node_role_t 		node_role;
 	int 				subsystem_port;
+	int 				hublvol_port;
 	struct spdk_poller *redirect_poller;
 	struct spdk_poller *hublvol_poller;
 	uint64_t			total_io;

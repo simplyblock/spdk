@@ -2089,6 +2089,7 @@ struct rpc_bdev_lvol_set_lvs_opts {
 	char *lvs_name;
 	uint64_t groupid;
 	uint64_t subsystem_port;
+	uint64_t hublvol_port;
 	char *role;
 };
 
@@ -2105,6 +2106,7 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_set_lvs_opts_decoders
 	{"lvs_name", offsetof(struct rpc_bdev_lvol_set_lvs_opts, lvs_name), spdk_json_decode_string, true},
 	{"groupid", offsetof(struct rpc_bdev_lvol_set_lvs_opts, groupid), spdk_json_decode_uint64},
 	{"subsystem_port", offsetof(struct rpc_bdev_lvol_set_lvs_opts, subsystem_port), spdk_json_decode_uint64},
+	{"hublvol_port", offsetof(struct rpc_bdev_lvol_set_lvs_opts, hublvol_port), spdk_json_decode_uint64},
 	{"role", offsetof(struct rpc_bdev_lvol_set_lvs_opts, role), spdk_json_decode_string},
 };
 
@@ -2131,7 +2133,7 @@ rpc_bdev_lvol_set_lvs_opts(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
-	spdk_lvs_set_opts(lvs, req.groupid, req.subsystem_port, req.role);
+	spdk_lvs_set_opts(lvs, req.groupid, req.subsystem_port, req.hublvol_port, req.role);
 	spdk_jsonrpc_send_bool_response(request, true);
 
 cleanup:

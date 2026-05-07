@@ -27,7 +27,7 @@ extern "C" {
 
 #define SPDK_TLS_PSK_MAX_LEN		200
 
-#define MAX_NUM_BLOCKED_PORTS 4
+#define MAX_NUM_BLOCKED_PORTS 8
 
 struct spdk_nvmf_tgt;
 struct spdk_nvmf_subsystem;

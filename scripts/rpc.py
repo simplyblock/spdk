@@ -2579,6 +2579,7 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
                                                    lvs_name=args.lvs_name,
                                                    groupid=args.groupid,
                                                    subsystem_port=args.subsystem_port,
+                                                   hublvol_port=args.hublvol_port,
                                                    role=args.role))
 
     p = subparsers.add_parser('bdev_lvol_set_lvs_opts', help='Set options for lvolstore')
@@ -2587,6 +2588,7 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     # p.add_argument('-i', '--lvs-id', help='lvol store id in the range [0, 3], default 0', type=int)
     p.add_argument('-g', '--groupid', help='lvol store group id', type=int)
     p.add_argument('-p', '--subsystem-port', help='lvols subsystem port', type=int)
+    p.add_argument('-h', '--hublvol-port', help='lvols hublvol port', type=int)
     p.add_argument('-r', '--role', help='role for lvolstore node(primary, secondary, tertiary), default primary')
     p.set_defaults(func=bdev_lvol_set_lvs_opts)
     

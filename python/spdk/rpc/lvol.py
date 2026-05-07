@@ -846,14 +846,17 @@ def bdev_lvol_get_lvstores(client, uuid=None, lvs_name=None):
         params['lvs_name'] = lvs_name
     return client.call('bdev_lvol_get_lvstores', params)
 
-def bdev_lvol_set_lvs_opts(client, uuid=None, lvs_name=None, groupid=0, subsystem_port=0, role=None):
+def bdev_lvol_set_lvs_opts(client, uuid=None, lvs_name=None, groupid=0, subsystem_port=0, hublvol_port=0, role=None):
     """Set group id for lvolstore.
 
     Args:
         uuid: UUID of logical volume store to retrieve information about (optional)
         lvs_name: name of logical volume store to retrieve information about (optional)
         groupid: number of group id
-        
+        subsystem_port: port for subsystem
+        hublvol_port: port for hub lvol
+        role: role of the lvolstore
+
     Either uuid or lvs_name may be specified, but not both.
     If both uuid and lvs_name are omitted, information about all logical volume stores is returned.
     """
@@ -864,7 +867,7 @@ def bdev_lvol_set_lvs_opts(client, uuid=None, lvs_name=None, groupid=0, subsyste
     if role not in ("primary", "secondary", "tertiary"):
         raise ValueError("role must be primary, secondary, or tertiary")
      
-    params = {'groupid': groupid, 'subsystem_port': subsystem_port, 'role': role}
+    params = {'groupid': groupid, 'subsystem_port': subsystem_port, 'hublvol_port': hublvol_port, 'role': role}
     if uuid:
         params['uuid'] = uuid
     if lvs_name:
