@@ -15235,6 +15235,14 @@ spdk_read_cluster_data_xfer(struct spdk_blob *blob, void *buf, uint64_t offset, 
 	bs->r_io++;
 	if (type == XFER_MIGRATE_SNAPSHOT) {
 		blob_calculate_lba_and_lba_count(blob, offset, length, &lba, &lba_count);
+		uint64_t	index = 0;
+		if (blob->bs->pages_per_cluster_shift != 0) {
+			index = bs_io_unit_to_page(blob->bs, offset) >> blob->bs->pages_per_cluster_shift;
+		} else {
+			index = bs_io_unit_to_page(blob->bs, offset) / blob->bs->pages_per_cluster;
+		}
+
+		SPDK_NOTICELOG("blob %" PRIu64 " spatial read: lba=%" PRIu64 ", real_offset=%" PRIu64 ", index=%" PRIu64 "\n", blob->id, lba, offset, index);
 		bs_batch_read_dev(batch, buf, lba, 8 * bs_byte_to_lba(bs, SPDK_BS_PAGE_SIZE));
 	} else {
 		// byte to lba = block cnt -> block_cnt in 4k * page per cluster = bs_io_unit_to_back_dev_lba(blob, lba_len)
