@@ -3237,9 +3237,12 @@ SPDK_RPC_REGISTER("nvmf_stop_mdns_prr", rpc_nvmf_stop_mdns_prr, SPDK_RPC_RUNTIME
 
 struct rpc_port_rule {
 	uint32_t port;
+	bool reject;
 };
+
 static const struct spdk_json_object_decoder rpc_port_decoders[] = {
 	{"port", offsetof(struct rpc_port_rule, port), spdk_json_decode_uint32, true},
+	{"reject", offsetof(struct rpc_port_rule, reject), spdk_json_decode_bool, true},
 };
 
 static void
@@ -3249,6 +3252,7 @@ rpc_nvmf_port_block(struct spdk_jsonrpc_request *request,
 	bool rc = false;
 	struct rpc_port_rule req;
 	req.port = 0;
+	req.reject = false;
 
 	if (params) {
 		if (spdk_json_decode_object(params, rpc_port_decoders,
@@ -3266,7 +3270,7 @@ rpc_nvmf_port_block(struct spdk_jsonrpc_request *request,
 		return;
 	}
 
-	rc = spdk_nvmf_port_block(req.port, false);
+	rc = spdk_nvmf_port_block(req.port, req.reject);
 
 	spdk_jsonrpc_send_bool_response(request, rc);
 }

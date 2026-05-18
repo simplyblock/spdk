@@ -3278,22 +3278,6 @@ static void
 block_port(int port) {
     // Construct the iptables command dynamically based on the input port    
 	if (port != 0) {
-		char command[500];
-		// snprintf(command, sizeof(command), "sudo iptables -A INPUT -p tcp --dport %d -j DROP && sudo iptables -A OUTPUT -p tcp --dport %d -j DROP", port, port);
-		snprintf(command, sizeof(command),
-    		"sudo iptables -C INPUT -p tcp --dport %d -j DROP 2>/dev/null || sudo iptables -A INPUT -p tcp --dport %d -j DROP;"
-    		"sudo iptables -C OUTPUT -p tcp --dport %d -j DROP 2>/dev/null || sudo iptables -A OUTPUT -p tcp --dport %d -j DROP;",
-    		port, port, port, port);
-
-		// Execute the command
-		int result = system(command);
-
-		if (result != 0) {
-			SPDK_ERRLOG("Error executing iptables command.\n");
-		} else {			
-			SPDK_NOTICELOG("Port %d has been droped successfully.\n", port);
-		}
-
 		if (spdk_nvmf_port_block(port, false)) {
 			SPDK_NOTICELOG("RDMA Port %d has been blocked successfully.\n", port);
 		} else {
@@ -3306,24 +3290,6 @@ static void
 add_reject_hublvol_port(int port) {
     // Construct the iptables command dynamically based on the input port    
 	if (port != 0) {
-		char command[500];
-		// snprintf(command, sizeof(command), "sudo iptables -A INPUT -p tcp --dport %d -j DROP && sudo iptables -A OUTPUT -p tcp --dport %d -j DROP", port, port);
-	snprintf(command, sizeof(command),
-		"sudo iptables -C INPUT -p tcp --dport %d -j REJECT --reject-with tcp-reset 2>/dev/null || "
-		"sudo iptables -A INPUT -p tcp --dport %d -j REJECT --reject-with tcp-reset; "
-		"sudo iptables -C OUTPUT -p tcp --dport %d -j REJECT --reject-with tcp-reset 2>/dev/null || "
-		"sudo iptables -A OUTPUT -p tcp --dport %d -j REJECT --reject-with tcp-reset;",
-		port, port, port, port);
-
-		// Execute the command
-		int result = system(command);
-
-		if (result != 0) {
-			SPDK_ERRLOG("Error executing iptables command.\n");
-		} else {			
-			SPDK_NOTICELOG("Port %d for hublvol has been rejected successfully.\n", port);
-		}
-
 		if (spdk_nvmf_port_block(port, true)) {
 			SPDK_NOTICELOG("RDMA Port %d for hublvol has been rejected successfully.\n", port);
 		} else {
@@ -3336,22 +3302,6 @@ static void
 remove_reject_hublvol_port(int port) {
     // Construct the iptables command dynamically based on the input port    
 	if (port != 0) {
-		char command[500];
-		// snprintf(command, sizeof(command), "sudo iptables -A INPUT -p tcp --dport %d -j DROP && sudo iptables -A OUTPUT -p tcp --dport %d -j DROP", port, port);
-	snprintf(command, sizeof(command),
-		"sudo iptables -D INPUT -p tcp --dport %d -j REJECT --reject-with tcp-reset 2>/dev/null; "
-		"sudo iptables -D OUTPUT -p tcp --dport %d -j REJECT --reject-with tcp-reset 2>/dev/null;",
-		port, port);
-
-		// Execute the command
-		int result = system(command);
-
-		if (result != 0) {
-			SPDK_ERRLOG("Error executing iptables command.\n");
-		} else {			
-			SPDK_NOTICELOG("Port %d has been removed successfully.\n", port);
-		}
-
 		if (spdk_nvmf_port_unblock(port)) {
 			SPDK_NOTICELOG("RDMA Port %d has been removed successfully.\n", port);
 		} else {

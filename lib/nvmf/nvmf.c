@@ -1952,24 +1952,24 @@ spdk_nvmf_poll_group_dump_stat(struct spdk_nvmf_poll_group *group, struct spdk_j
 bool 
 spdk_nvmf_port_block(uint16_t port, bool is_reject)
 {
-	if(g_nvmf_num_blocked_ports < MAX_NUM_BLOCKED_PORTS && port > 0)
-	{
-		for(int i = 0; i < MAX_NUM_BLOCKED_PORTS; i++)
-		{
-			if(port == g_nvmf_blocked_ports[i].port) 
-			{ 
-				SPDK_NOTICELOG("nvmf port %u is already blocked.\n", port);
+	if (g_nvmf_num_blocked_ports < MAX_NUM_BLOCKED_PORTS && port > 0) {
+		for (int i = 0; i < MAX_NUM_BLOCKED_PORTS; i++) {
+			if (port == g_nvmf_blocked_ports[i].port) {
+				if (g_nvmf_blocked_ports[i].is_reject != is_reject) {
+					g_nvmf_blocked_ports[i].is_reject = is_reject;
+				}
+				SPDK_NOTICELOG("nvmf port %u is already %s.\n", port, g_nvmf_blocked_ports[i].is_reject ? "rejected" : "blocked");
 				return  true; 
 			}
 		}
-		for(int i = 0; i < MAX_NUM_BLOCKED_PORTS; i++)
-		{
-			if(!g_nvmf_blocked_ports[i].port) 
-			{
+
+		for (int i = 0; i < MAX_NUM_BLOCKED_PORTS; i++) {
+			if (!g_nvmf_blocked_ports[i].port) {
 				g_nvmf_blocked_ports[i].port = port;
 				g_nvmf_blocked_ports[i].is_reject = is_reject;
+				g_nvmf_blocked_ports[i].timeout = spdk_get_ticks();
 				g_nvmf_num_blocked_ports++;
-				SPDK_NOTICELOG("nvmf port %u is blocked successfully.\n", port);
+				SPDK_NOTICELOG("nvmf port %u is %s successfully.\n", port, is_reject ? "rejected" : "blocked");
 				return true;
 			}
 		}
@@ -1980,19 +1980,17 @@ spdk_nvmf_port_block(uint16_t port, bool is_reject)
 }
 
 bool 
-spdk_nvmf_port_unblock(uint16_t port)
+spdk_nvmf_port_unblock(uint16_t port) 
 {
-	if(g_nvmf_num_blocked_ports > 0 && port > 0)
-	{
-		for(int i = 0; i < MAX_NUM_BLOCKED_PORTS; i++)
-		{
-			if(port == g_nvmf_blocked_ports[i].port) 
-			{ 
+	if (g_nvmf_num_blocked_ports > 0 && port > 0) {
+		for (int i = 0; i < MAX_NUM_BLOCKED_PORTS; i++) {
+			if (port == g_nvmf_blocked_ports[i].port) {
 				g_nvmf_blocked_ports[i].port = 0;
 				g_nvmf_blocked_ports[i].is_reject = false;
+				g_nvmf_blocked_ports[i].timeout = 0;
 				g_nvmf_num_blocked_ports--;
 				SPDK_NOTICELOG("nvmf port %u is unblocked successfully.\n", port);
-				return  true; 
+				return  true;
 			}
 		}
 	}
@@ -2000,29 +1998,56 @@ spdk_nvmf_port_unblock(uint16_t port)
 }
 
 void
-spdk_nvmf_get_blocked_ports(uint16_t *ports, int *num_ports)
+spdk_nvmf_get_blocked_ports(uint16_t *ports, int *num_ports) 
 {
 	*num_ports = g_nvmf_num_blocked_ports;
 	int index = 0;
-	for(int i = 0; i < MAX_NUM_BLOCKED_PORTS; i++)
-	{
-		if(g_nvmf_blocked_ports[i].port)
-		{
+	SPDK_NOTICELOG("Get blocked nvmf ports, total blocked ports: %d\n", *num_ports);
+	for (int i = 0; i < MAX_NUM_BLOCKED_PORTS; i++) {
+		if (g_nvmf_blocked_ports[i].port) {
 			ports[index++] = g_nvmf_blocked_ports[i].port;
+			SPDK_NOTICELOG("Blocked port[%d]: %u is_reject: %s\n", index - 1, g_nvmf_blocked_ports[i].port, g_nvmf_blocked_ports[i].is_reject ? "true" : "false");
 		}
 	}
+
+	return;
+}
+
+void
+spdk_nvmf_check_port_timeout(uint64_t ack_timeout) 
+{
+	uint16_t port = 0;
+	uint64_t ack_timeout_ticks = 0, current_ticks = 0;
+	ack_timeout_ticks = ack_timeout * spdk_get_ticks_hz() / 1000;
+	if (g_nvmf_num_blocked_ports > 0) {
+		for (int i = 0; i < MAX_NUM_BLOCKED_PORTS; i++) {
+			if (g_nvmf_blocked_ports[i].port) {
+				port = g_nvmf_blocked_ports[i].port;
+				if (g_nvmf_blocked_ports[i].timeout && !g_nvmf_blocked_ports[i].is_reject) {
+					current_ticks = spdk_get_ticks();
+					if (current_ticks - g_nvmf_blocked_ports[i].timeout > ack_timeout_ticks) {
+						SPDK_NOTICELOG("Blocked nvmf port %u is automatically converted to reject mode after ack timeout.\n", port);
+						g_nvmf_blocked_ports[i].is_reject = true;
+					}
+				}
+			}
+		}
+	}
+
 	return;
 }
 
 bool 
 spdk_nvmf_check_port_permission(uint16_t port, bool *is_reject)
 {
-	if(g_nvmf_num_blocked_ports > 0)
-	{
-		for(int i = 0; i < MAX_NUM_BLOCKED_PORTS; i++)
-		{
-			if(port == g_nvmf_blocked_ports[i].port) { *is_reject = g_nvmf_blocked_ports[i].is_reject; return false; }
+	if (g_nvmf_num_blocked_ports > 0) {
+		for (int i = 0; i < MAX_NUM_BLOCKED_PORTS; i++) {
+			if (port == g_nvmf_blocked_ports[i].port) {
+				*is_reject = g_nvmf_blocked_ports[i].is_reject;
+				return false; 
+			}
 		}
 	}
+
 	return true;
 }

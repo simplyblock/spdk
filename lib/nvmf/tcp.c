@@ -268,6 +268,7 @@ struct spdk_nvmf_tcp_req  {
 
 	STAILQ_ENTRY(spdk_nvmf_tcp_req)		link;
 	TAILQ_ENTRY(spdk_nvmf_tcp_req)		state_link;
+	TAILQ_ENTRY(spdk_nvmf_tcp_req)		queued_link;
 	STAILQ_ENTRY(spdk_nvmf_tcp_req)		control_msg_link;
 };
 
@@ -286,10 +287,14 @@ struct spdk_nvmf_tcp_qpair {
 
 	/* Queues to track the requests in all states */
 	TAILQ_HEAD(, spdk_nvmf_tcp_req)		tcp_req_working_queue;
+	TAILQ_HEAD(, spdk_nvmf_tcp_req)		tcp_req_waiting_queue;
 	TAILQ_HEAD(, spdk_nvmf_tcp_req)		tcp_req_free_queue;
 	SLIST_HEAD(, nvme_tcp_pdu)		tcp_pdu_free_queue;
 	/* Number of working pdus */
 	uint32_t				tcp_pdu_working_count;
+
+	/* Number of working pdus delayed*/
+	uint32_t				tcp_pdu_waiting_count;
 
 	/* Number of requests in each state */
 	uint32_t				state_cntr[TCP_REQUEST_NUM_STATES];
@@ -338,6 +343,8 @@ struct spdk_nvmf_tcp_qpair {
 	TAILQ_ENTRY(spdk_nvmf_tcp_qpair)	link;
 	bool					pending_flush;
 	uint64_t 				time;
+	bool					rejected;
+	bool					in_rejection;
 };
 
 struct spdk_nvmf_tcp_control_msg {
@@ -572,6 +579,55 @@ nvmf_tcp_drain_state_queue(struct spdk_nvmf_tcp_qpair *tqpair,
 			nvmf_tcp_request_free(tcp_req);
 		}
 	}
+}
+
+static void
+nvmf_tcp_drain_delayed_req_queue(struct spdk_nvmf_tcp_qpair *tqpair)
+{
+	struct spdk_nvmf_tcp_req *tcp_req, *req_tmp;
+	struct spdk_nvmf_tcp_transport *ttransport;
+	bool is_reject = false;
+
+	if (!spdk_nvmf_check_port_permission(tqpair->target_port, &is_reject)) {
+		if (is_reject) {
+			tqpair->rejected = true;
+		}
+		return;
+	}
+
+	if (tqpair->state != NVMF_TCP_QPAIR_STATE_RUNNING) {
+		return;
+	}
+
+	ttransport = SPDK_CONTAINEROF(tqpair->qpair.transport, struct spdk_nvmf_tcp_transport, transport);	
+
+	TAILQ_FOREACH_SAFE(tcp_req, &tqpair->tcp_req_waiting_queue, queued_link, req_tmp) {
+		if (spdk_nvmf_request_using_zcopy(&tcp_req->req)) {
+			spdk_nvmf_request_zcopy_start(&tcp_req->req);
+		} else {
+			nvmf_tcp_req_process(ttransport, tcp_req);
+		}
+		tqpair->tcp_pdu_waiting_count--;
+		TAILQ_REMOVE(&tqpair->tcp_req_waiting_queue, tcp_req, queued_link);
+	}
+}
+
+static bool
+nvmf_tcp_queued_req(struct spdk_nvmf_tcp_qpair *tqpair, struct spdk_nvmf_tcp_req *tcp_req)
+{
+	bool is_reject = false;
+
+	if (spdk_nvmf_check_port_permission(tqpair->target_port, &is_reject)) {
+		return false;
+	}
+
+	if (is_reject) {
+		tqpair->rejected = true;
+	}
+	
+	TAILQ_INSERT_TAIL(&tqpair->tcp_req_waiting_queue, tcp_req, queued_link);
+	tqpair->tcp_pdu_waiting_count++;
+	return true;
 }
 
 static inline void
@@ -1467,9 +1523,12 @@ nvmf_tcp_qpair_init(struct spdk_nvmf_qpair *qpair)
 	/* Initialise request state queues of the qpair */
 	TAILQ_INIT(&tqpair->tcp_req_free_queue);
 	TAILQ_INIT(&tqpair->tcp_req_working_queue);
+	TAILQ_INIT(&tqpair->tcp_req_waiting_queue);
 	SLIST_INIT(&tqpair->tcp_pdu_free_queue);
 	tqpair->qpair.queue_depth = 0;
-
+	tqpair->rejected = false;
+	tqpair->in_rejection = false;
+	tqpair->tcp_pdu_waiting_count = 0;
 	tqpair->host_hdgst_enable = true;
 	tqpair->host_ddgst_enable = true;
 
@@ -1510,6 +1569,7 @@ static void
 nvmf_tcp_handle_connect(struct spdk_nvmf_tcp_port *port, struct spdk_sock *sock)
 {
 	struct spdk_nvmf_tcp_qpair *tqpair;
+	bool is_reject;
 	int rc;
 
 	SPDK_DEBUGLOG(nvmf_tcp, "New connection accepted on %s port %s\n",
@@ -1535,6 +1595,11 @@ nvmf_tcp_handle_connect(struct spdk_nvmf_tcp_port *port, struct spdk_sock *sock)
 			       &tqpair->initiator_port);
 	if (rc < 0) {
 		SPDK_ERRLOG("spdk_sock_getaddr() failed of tqpair=%p\n", tqpair);
+		nvmf_tcp_qpair_destroy(tqpair);
+		return;
+	}
+
+	if (!spdk_nvmf_check_port_permission(tqpair->target_port, &is_reject) && is_reject) {
 		nvmf_tcp_qpair_destroy(tqpair);
 		return;
 	}
@@ -1972,6 +2037,10 @@ nvmf_tcp_capsule_cmd_payload_handle(struct spdk_nvmf_tcp_transport *ttransport,
 			tcp_req->tps.state[TCP_REQUEST_STATE_READY_TO_EXECUTE] = 1;
 			tcp_req->tps.time_per_state[TCP_REQUEST_STATE_READY_TO_EXECUTE] = spdk_get_ticks();
 		}
+
+		if (nvmf_tcp_queued_req(tqpair, tcp_req)) {
+			return;
+		}
 	}
 
 	nvmf_tcp_req_process(ttransport, tcp_req);
@@ -2124,7 +2193,9 @@ nvmf_tcp_r2t_complete(void *cb_arg)
 {
 	struct spdk_nvmf_tcp_req *tcp_req = cb_arg;
 	struct spdk_nvmf_tcp_transport *ttransport;
+	struct spdk_nvmf_tcp_qpair *tqpair;
 
+	tqpair = SPDK_CONTAINEROF(tcp_req->req.qpair, struct spdk_nvmf_tcp_qpair, qpair);
 	ttransport = SPDK_CONTAINEROF(tcp_req->req.qpair->transport,
 				      struct spdk_nvmf_tcp_transport, transport);
 	tcp_req->tps.time_per_state[tcp_req->state] = spdk_get_ticks() - tcp_req->tps.time_per_state[tcp_req->state];
@@ -2140,6 +2211,11 @@ nvmf_tcp_r2t_complete(void *cb_arg)
 			tcp_req->tps.state[TCP_REQUEST_STATE_READY_TO_EXECUTE] = 1;
 			tcp_req->tps.time_per_state[TCP_REQUEST_STATE_READY_TO_EXECUTE] = spdk_get_ticks();
 		}
+
+		if (nvmf_tcp_queued_req(tqpair, tcp_req)) {
+			return;
+		}
+
 		nvmf_tcp_req_process(ttransport, tcp_req);
 	}
 }
@@ -2214,6 +2290,10 @@ nvmf_tcp_h2c_data_payload_handle(struct spdk_nvmf_tcp_transport *ttransport,
 			if (tcp_req->tps.state[TCP_REQUEST_STATE_READY_TO_EXECUTE] == 0) {
 				tcp_req->tps.state[TCP_REQUEST_STATE_READY_TO_EXECUTE] = 1;
 				tcp_req->tps.time_per_state[TCP_REQUEST_STATE_READY_TO_EXECUTE] = spdk_get_ticks();
+			}
+
+			if (nvmf_tcp_queued_req(tqpair, tcp_req)) {
+				return;
 			}
 		}
 		nvmf_tcp_req_process(ttransport, tcp_req);
@@ -3323,6 +3403,11 @@ nvmf_tcp_req_process(struct spdk_nvmf_tcp_transport *ttransport,
 					tcp_req->tps.state[TCP_REQUEST_STATE_READY_TO_EXECUTE] = 1;
 					tcp_req->tps.time_per_state[TCP_REQUEST_STATE_READY_TO_EXECUTE] = spdk_get_ticks();
 				}
+
+				if (nvmf_tcp_queued_req(tqpair, tcp_req)) {
+					return false;
+				}
+
 				break;
 			}
 
@@ -3375,6 +3460,11 @@ nvmf_tcp_req_process(struct spdk_nvmf_tcp_transport *ttransport,
 					tcp_req->tps.state[TCP_REQUEST_STATE_AWAITING_ZCOPY_START] = 1;
 					tcp_req->tps.time_per_state[TCP_REQUEST_STATE_AWAITING_ZCOPY_START] = spdk_get_ticks();
 				}
+
+				if (nvmf_tcp_queued_req(tqpair, tcp_req)) {
+					return false;
+				}
+
 				spdk_nvmf_request_zcopy_start(&tcp_req->req);
 				break;
 			}
@@ -3411,6 +3501,11 @@ nvmf_tcp_req_process(struct spdk_nvmf_tcp_transport *ttransport,
 				tcp_req->tps.state[TCP_REQUEST_STATE_READY_TO_EXECUTE] = 1;
 				tcp_req->tps.time_per_state[TCP_REQUEST_STATE_READY_TO_EXECUTE] = spdk_get_ticks();
 			}
+
+			if (nvmf_tcp_queued_req(tqpair, tcp_req)) {
+				return false;
+			}
+
 			break;
 		case TCP_REQUEST_STATE_AWAITING_ZCOPY_START:
 			spdk_trace_record(TRACE_TCP_REQUEST_STATE_AWAIT_ZCOPY_START, tqpair->qpair.trace_id, 0,
@@ -3843,6 +3938,7 @@ static int
 nvmf_tcp_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 {
 	struct spdk_nvmf_tcp_poll_group *tgroup;
+	struct spdk_nvmf_tcp_qpair *tqpair;
 	int num_events;
 
 	tgroup = SPDK_CONTAINEROF(group, struct spdk_nvmf_tcp_poll_group, group);
@@ -3850,6 +3946,25 @@ nvmf_tcp_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 	if (spdk_unlikely(TAILQ_EMPTY(&tgroup->qpairs))) {
 		return 0;
 	}
+
+	spdk_nvmf_check_port_timeout(group->transport->opts.ack_timeout);
+
+	//TODO check the time of blocking rules - check 
+	TAILQ_FOREACH(tqpair, &tgroup->qpairs, link) {
+		if (tqpair && tqpair->rejected) {
+			if (!tqpair->in_rejection) {
+				tqpair->in_rejection = true;
+				tqpair->tcp_pdu_waiting_count = 0;
+				nvmf_tcp_qpair_disconnect(tqpair);
+			}
+			continue;
+		}
+
+		if (tqpair && tqpair->tcp_pdu_waiting_count > 0) {
+			nvmf_tcp_drain_delayed_req_queue(tqpair);
+		}
+	}
+
 
 	num_events = spdk_sock_group_poll(tgroup->sock_group);
 	if (spdk_unlikely(num_events < 0)) {

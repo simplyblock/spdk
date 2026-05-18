@@ -2962,11 +2962,13 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     
     def nvmf_port_block(args):
         rpc.nvmf.nvmf_port_block(args.client,
-                                 port=args.port)
+                                 port=args.port,
+                                 reject=args.reject)
 
     p = subparsers.add_parser('nvmf_port_block',
                               help='Block a specific NVMf port')
     p.add_argument('-p', '--port', help='NVMf port ID to block', type=int, required=True)
+    p.add_argument('-r', '--reject', help='Whether to reject the port', action='store_true')
     p.set_defaults(func=nvmf_port_block)
 
     def nvmf_port_unblock(args):
