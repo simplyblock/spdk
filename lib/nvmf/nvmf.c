@@ -24,7 +24,7 @@ SPDK_LOG_REGISTER_COMPONENT(nvmf)
 
 static TAILQ_HEAD(, spdk_nvmf_tgt) g_nvmf_tgts = TAILQ_HEAD_INITIALIZER(g_nvmf_tgts);
 
-struct spdk_nvmf_rdma_rules g_nvmf_blocked_ports[MAX_NUM_BLOCKED_PORTS] = {0};
+struct spdk_nvmf_rules g_nvmf_blocked_ports[MAX_NUM_BLOCKED_PORTS] = {0};
 static uint16_t g_nvmf_num_blocked_ports = 0;
 
 typedef void (*nvmf_qpair_disconnect_cpl)(void *ctx, int status);
@@ -1985,9 +1985,9 @@ spdk_nvmf_port_unblock(uint16_t port)
 	if (g_nvmf_num_blocked_ports > 0 && port > 0) {
 		for (int i = 0; i < MAX_NUM_BLOCKED_PORTS; i++) {
 			if (port == g_nvmf_blocked_ports[i].port) {
-				g_nvmf_blocked_ports[i].port = 0;
-				g_nvmf_blocked_ports[i].is_reject = false;
 				g_nvmf_blocked_ports[i].timeout = 0;
+				g_nvmf_blocked_ports[i].is_reject = false;
+				g_nvmf_blocked_ports[i].port = 0;
 				g_nvmf_num_blocked_ports--;
 				SPDK_NOTICELOG("nvmf port %u is unblocked successfully.\n", port);
 				return  true;
@@ -1998,43 +1998,71 @@ spdk_nvmf_port_unblock(uint16_t port)
 }
 
 void
-spdk_nvmf_get_blocked_ports(uint16_t *ports, int *num_ports) 
+spdk_nvmf_get_blocked_ports(struct spdk_json_write_ctx *w)
 {
-	*num_ports = g_nvmf_num_blocked_ports;
-	int index = 0;
-	SPDK_NOTICELOG("Get blocked nvmf ports, total blocked ports: %d\n", *num_ports);
+	bool is_reject;
+
+	SPDK_NOTICELOG("Get blocked nvmf ports, total blocked ports: %d\n", g_nvmf_num_blocked_ports);
+
+	spdk_json_write_object_begin(w);
+
+	spdk_json_write_named_uint32(w, "total_blocked_ports", g_nvmf_num_blocked_ports);
+
+	spdk_json_write_named_array_begin(w, "blocked_ports");
+
 	for (int i = 0; i < MAX_NUM_BLOCKED_PORTS; i++) {
-		if (g_nvmf_blocked_ports[i].port) {
-			ports[index++] = g_nvmf_blocked_ports[i].port;
-			SPDK_NOTICELOG("Blocked port[%d]: %u is_reject: %s\n", index - 1, g_nvmf_blocked_ports[i].port, g_nvmf_blocked_ports[i].is_reject ? "true" : "false");
+		if (g_nvmf_blocked_ports[i].port == 0) {
+			continue;
 		}
+
+		is_reject = __atomic_load_n(&g_nvmf_blocked_ports[i].is_reject, __ATOMIC_SEQ_CST);
+
+		SPDK_NOTICELOG("Blocked port[%d]: %u is_reject: %s\n", i, g_nvmf_blocked_ports[i].port, is_reject ? "true" : "false");
+
+		spdk_json_write_object_begin(w);
+
+		spdk_json_write_named_uint16(w, "port", g_nvmf_blocked_ports[i].port);
+
+		spdk_json_write_named_bool(w, "is_reject", is_reject);
+
+		spdk_json_write_object_end(w);
 	}
 
-	return;
+	spdk_json_write_array_end(w);
+	spdk_json_write_object_end(w);
 }
 
-void
+int
 spdk_nvmf_check_port_timeout(uint64_t ack_timeout) 
 {
 	uint16_t port = 0;
+	bool expected = false;
 	uint64_t ack_timeout_ticks = 0, current_ticks = 0;
-	ack_timeout_ticks = ack_timeout * spdk_get_ticks_hz() / 1000;
+
 	if (g_nvmf_num_blocked_ports > 0) {
 		for (int i = 0; i < MAX_NUM_BLOCKED_PORTS; i++) {
-			if (g_nvmf_blocked_ports[i].port) {
-				port = g_nvmf_blocked_ports[i].port;
-				if (g_nvmf_blocked_ports[i].timeout && !g_nvmf_blocked_ports[i].is_reject) {
-					current_ticks = spdk_get_ticks();
-					if (current_ticks - g_nvmf_blocked_ports[i].timeout > ack_timeout_ticks) {
-						SPDK_NOTICELOG("Blocked nvmf port %u is automatically converted to reject mode after ack timeout.\n", port);
-						g_nvmf_blocked_ports[i].is_reject = true;
-					}
+			if (!g_nvmf_blocked_ports[i].port) {
+				continue;
+			}
+
+			if (g_nvmf_blocked_ports[i].is_reject) {
+				continue;
+			}
+
+			port = g_nvmf_blocked_ports[i].port;
+			current_ticks = spdk_get_ticks();
+			ack_timeout_ticks = ack_timeout * 3 * spdk_get_ticks_hz() / 1000;
+
+			if (g_nvmf_blocked_ports[i].timeout && (current_ticks - g_nvmf_blocked_ports[i].timeout > ack_timeout_ticks)) {
+				if (__atomic_compare_exchange_n(&g_nvmf_blocked_ports[i].is_reject, &expected, true, false,
+							__ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+					/* only one core enters here */
+					SPDK_NOTICELOG("Blocked nvmf port %u is automatically converted to reject mode after ack timeout.\n", port);
 				}
 			}
 		}
 	}
-
-	return;
+	return g_nvmf_num_blocked_ports;
 }
 
 bool 
