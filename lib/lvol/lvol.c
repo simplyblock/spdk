@@ -3221,8 +3221,8 @@ block_port(int port) {
 		char command[500];
 		// snprintf(command, sizeof(command), "sudo iptables -A INPUT -p tcp --dport %d -j DROP && sudo iptables -A OUTPUT -p tcp --dport %d -j DROP", port, port);
 		snprintf(command, sizeof(command),
-    		"sudo iptables -C INPUT -p tcp --dport %d -j DROP 2>/dev/null || sudo iptables -A INPUT -p tcp --dport %d -j DROP;"
-    		"sudo iptables -C OUTPUT -p tcp --dport %d -j DROP 2>/dev/null || sudo iptables -A OUTPUT -p tcp --dport %d -j DROP;",
+    		"sudo iptables-nft -C INPUT -p tcp --dport %d -j DROP 2>/dev/null || sudo iptables-nft -A INPUT -p tcp --dport %d -j DROP;"
+     		"sudo iptables-nft -C OUTPUT -p tcp --dport %d -j DROP 2>/dev/null || sudo iptables-nft -A OUTPUT -p tcp --dport %d -j DROP;",
     		port, port, port, port);
 
 		// Execute the command
