@@ -3302,6 +3302,64 @@ block_port(int port) {
 	}
 }
 
+static void
+add_reject_hublvol_port(int port) {
+    // Construct the iptables command dynamically based on the input port
+	if (port != 0) {
+		char command[500];
+		// snprintf(command, sizeof(command), "sudo iptables -A INPUT -p tcp --dport %d -j DROP && sudo iptables -A OUTPUT -p tcp --dport %d -j DROP", port, port);
+	snprintf(command, sizeof(command),
+		"sudo iptables -C INPUT -p tcp --dport %d -j REJECT --reject-with tcp-reset 2>/dev/null || "
+		"sudo iptables -A INPUT -p tcp --dport %d -j REJECT --reject-with tcp-reset; "
+		"sudo iptables -C OUTPUT -p tcp --dport %d -j REJECT --reject-with tcp-reset 2>/dev/null || "
+		"sudo iptables -A OUTPUT -p tcp --dport %d -j REJECT --reject-with tcp-reset;",
+		port, port, port, port);
+
+		// Execute the command
+		int result = system(command);
+
+		if (result != 0) {
+			SPDK_ERRLOG("Error executing iptables command.\n");
+		} else {
+			SPDK_NOTICELOG("Port %d for hublvol has been rejected successfully.\n", port);
+		}
+
+		if (spdk_nvmf_port_block(port, true)) {
+			SPDK_NOTICELOG("RDMA Port %d for hublvol has been rejected successfully.\n", port);
+		} else {
+			SPDK_ERRLOG("RDMA Error rejecting port %d.\n", port);
+		}
+	}
+}
+
+static void
+remove_reject_hublvol_port(int port) {
+    // Construct the iptables command dynamically based on the input port
+	if (port != 0) {
+		char command[500];
+		// snprintf(command, sizeof(command), "sudo iptables -A INPUT -p tcp --dport %d -j DROP && sudo iptables -A OUTPUT -p tcp --dport %d -j DROP", port, port);
+	snprintf(command, sizeof(command),
+		"sudo iptables -D INPUT -p tcp --dport %d -j REJECT --reject-with tcp-reset 2>/dev/null; "
+		"sudo iptables -D OUTPUT -p tcp --dport %d -j REJECT --reject-with tcp-reset 2>/dev/null;",
+		port, port);
+
+		// Execute the command
+		int result = system(command);
+
+		if (result != 0) {
+			SPDK_ERRLOG("Error executing iptables command.\n");
+		} else {
+			SPDK_NOTICELOG("Port %d has been removed successfully.\n", port);
+		}
+
+		if (spdk_nvmf_port_unblock(port)) {
+			SPDK_NOTICELOG("RDMA Port %d has been removed successfully.\n", port);
+		} else {
+			SPDK_ERRLOG("RDMA Error removing port %d.\n", port);
+		}
+	}
+}
+
 void
 spdk_lvs_store_hublvol_channel(struct spdk_lvol_store *lvs, struct spdk_io_channel *channel)
 {
@@ -3381,13 +3439,38 @@ spdk_lvs_dequeu_rsp(struct spdk_lvol_store *lvs)
 	}
 }
 
+static int
+spdk_lvs_remove_rules_poller(void *cb_arg)
+{
+	struct spdk_lvs_req *req = cb_arg;
+	struct spdk_lvol_store *lvs = req->lvol_store;
+	spdk_poller_unregister(&req->poller);
+	remove_reject_hublvol_port(lvs->hublvol_port);
+	free(req);
+	return -1;
+}
+
 static void
 spdk_lvs_unfreeze_on_conflict(struct spdk_lvol_store *lvs)
 {
 	struct spdk_lvol *lvol;
+	struct spdk_lvs_req *req;
 
 	pthread_mutex_lock(&g_lvol_stores_mutex);
 	block_port(lvs->subsystem_port);
+
+	if (lvs->node_role != NODE_TERTIARY && lvs->hublvol_port != 0) {
+		add_reject_hublvol_port(lvs->hublvol_port);
+		req = calloc(1, sizeof(*req));
+		if (req == NULL) {
+			SPDK_ERRLOG("Cannot alloc memory for request structure\n");
+			// in this case we should not wait for the IO inflyight
+			remove_reject_hublvol_port(lvs->hublvol_port);
+		} else {
+			req->lvol_store = lvs;
+			req->poller = spdk_poller_register(spdk_lvs_remove_rules_poller, req, 10000000); // Delay of 10s
+		}
+	}
 
 	pthread_mutex_lock(&g_lvs_queue_mutex);
 	lvs->queue_failed_rsp = false;
@@ -3420,6 +3503,7 @@ spdk_lvs_unfreeze_on_conflict_poller(void *cb_arg)
 	struct spdk_lvol_store *lvs = req->lvol_store;
 	spdk_poller_unregister(&req->poller);
 	spdk_lvs_unfreeze_on_conflict(lvs);
+	free(req);
 	return -1;
 }
 
@@ -3448,6 +3532,7 @@ spdk_lvs_change_leader_state(uint64_t groupid)
 {
 	struct spdk_lvol_store *lvs;
 	struct spdk_lvol *lvol;
+	struct spdk_lvs_req *req;
 	int rc = 0;
 	SPDK_NOTICELOG("Attempting to change leadership state internally groupid %" PRIu64 ".\n", groupid);
 	pthread_mutex_lock(&g_lvol_stores_mutex);
@@ -3457,6 +3542,19 @@ spdk_lvs_change_leader_state(uint64_t groupid)
 			if (spdk_blob_freeze_on_conflict_send_msg(lvs->blobstore,
 					spdk_lvs_conflict_signal, lvs)) {
 				block_port(lvs->subsystem_port);
+
+				if (lvs->node_role != NODE_TERTIARY && lvs->hublvol_port != 0) {
+					add_reject_hublvol_port(lvs->hublvol_port);
+					req = calloc(1, sizeof(*req));
+					if (req == NULL) {
+						SPDK_ERRLOG("Cannot alloc memory for request structure\n");
+						// in this case we should not wait for the IO inflyight
+						remove_reject_hublvol_port(lvs->hublvol_port);
+					} else {
+						req->lvol_store = lvs;
+						req->poller = spdk_poller_register(spdk_lvs_remove_rules_poller, req, 10000000); // Delay of 10s
+					}
+				}
 
 				pthread_mutex_lock(&g_lvs_queue_mutex);
 				lvs->queue_failed_rsp = false;
@@ -3759,12 +3857,13 @@ spdk_change_redirect_state(struct spdk_lvol_store *lvs, bool disconnected) {
 }
 
 void
-spdk_lvs_set_opts(struct spdk_lvol_store *lvs, uint64_t groupid, uint64_t port, char *role)
+spdk_lvs_set_opts(struct spdk_lvol_store *lvs, uint64_t groupid, uint64_t port, uint64_t hublvol_port, char *role)
 {
 	SPDK_NOTICELOG("Set groupid %" PRIu64 " and port %" PRIu64 " to the lvolstore %s.\n", groupid, port, role);
 	pthread_mutex_lock(&g_lvol_stores_mutex);
 	lvs->groupid = groupid;
 	lvs->subsystem_port = port;
+	lvs->hublvol_port = hublvol_port;
 	lvs->node_role = node_role_from_string(role);
 	spdk_bs_set_role(lvs->blobstore, lvs->node_role);
 
