@@ -10596,29 +10596,101 @@ spdk_bdev_set_qos_rate_limits_ex(struct spdk_bdev *bdev, uint64_t *limits, uint6
 	spdk_spin_unlock(&bdev->internal.spinlock);
 }
 
+struct qos_remove_bdev_ctx {
+	void (*cb_fn)(void *cb_arg, int status);
+	void *cb_arg;
+	uint64_t num_bdevs;
+	char **bdev_names;
+};
+
+static void
+free_qos_remove_bdev_ctx(struct qos_remove_bdev_ctx *ctx)
+{
+	uint64_t i;
+
+	if (ctx == NULL) {
+		return;
+	}
+
+	if (ctx->bdev_names != NULL) {
+		for (i = 0; i < ctx->num_bdevs; i++) {
+			free(ctx->bdev_names[i]);
+		}
+		free(ctx->bdev_names);
+	}
+
+	free(ctx);
+}
+
+static void
+qos_remove_bdev_done(void *cb_arg, int status)
+{
+	struct qos_remove_bdev_ctx *ctx = cb_arg;
+
+	ctx->cb_fn(ctx->cb_arg, status);
+
+	free_qos_remove_bdev_ctx(ctx);
+}
+
+static struct qos_remove_bdev_ctx *
+qos_remove_bdev_ctx_create(uint64_t num_bdevs, char **bdev_names,
+			   void (*cb_fn)(void *cb_arg, int status),
+			   void *cb_arg)
+{
+	struct qos_remove_bdev_ctx *ctx;
+	uint64_t i;
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL) {
+		return NULL;
+	}
+
+	ctx->num_bdevs = num_bdevs;
+	ctx->cb_fn = cb_fn;
+	ctx->cb_arg = cb_arg;
+
+	ctx->bdev_names = calloc(num_bdevs, sizeof(char *));
+	if (ctx->bdev_names == NULL) {
+		free(ctx);
+		return NULL;
+	}
+
+	for (i = 0; i < num_bdevs; i++) {
+		ctx->bdev_names[i] = strdup(bdev_names[i]);
+		if (ctx->bdev_names[i] == NULL) {
+			free_qos_remove_bdev_ctx(ctx);
+			return NULL;
+		}
+	}
+
+	return ctx;
+}
 
 void
-spdk_bdev_add_remove_bdev_to_pool(uint64_t bdev_pool_id, uint64_t num_bdevs, char	**bdev_names, bool is_remove_bdev_request,
-					void (*cb_fn)(void *cb_arg, int status), void *cb_arg)	{
-	struct spdk_bdev_qos_pool_id_mapping * qos_pool_id_object = NULL;
-	struct qos_bdev_list_node * qos_bdev_list_node = NULL;
+spdk_bdev_add_remove_bdev_to_pool(uint64_t bdev_pool_id, uint64_t num_bdevs,
+				  char **bdev_names, bool is_remove_bdev_request,
+				  void (*cb_fn)(void *cb_arg, int status),
+				  void *cb_arg)
+{
+	struct spdk_bdev_qos_pool_id_mapping *qos_pool_id_object = NULL;
+	struct qos_bdev_list_node *qos_bdev_list_node = NULL;
 	struct spdk_bdev_desc *desc;
+	struct qos_remove_bdev_ctx *remove_ctx;
 	int rc = 0, temp_bdev_count_in_list = 0;
-	uint64_t	limits[SPDK_BDEV_QOS_NUM_RATE_LIMIT_TYPES];
+	uint64_t limits[SPDK_BDEV_QOS_NUM_RATE_LIMIT_TYPES];
+
 	qos_pool_id_object = get_qos_already_available_for_group(bdev_pool_id);
-	// Object for the group id not yet created.
-	if(is_remove_bdev_request == false) {
-		if(qos_pool_id_object == NULL) {
+
+	if (is_remove_bdev_request == false) {
+		if (qos_pool_id_object == NULL) {
 			SPDK_NOTICELOG("Creating QoS object for group id : %" PRIu64 "\n", bdev_pool_id);
 			qos_pool_id_object = create_qos_object_for_group(bdev_pool_id);
 			add_bdev_list(qos_pool_id_object, num_bdevs, bdev_names);
 		} else {
-			if (check_bdev_exists(qos_pool_id_object, num_bdevs, bdev_names) == 0)
-			{
+			if (check_bdev_exists(qos_pool_id_object, num_bdevs, bdev_names) == 0) {
 				temp_bdev_count_in_list = qos_pool_id_object->bdev_list_size;
 				add_bdev_list(qos_pool_id_object, num_bdevs, bdev_names);
 			} else {
-				// Return error as one of the lvol is already in the group.
 				cb_fn(cb_arg, -EINVAL);
 				return;
 			}
@@ -10628,18 +10700,18 @@ spdk_bdev_add_remove_bdev_to_pool(uint64_t bdev_pool_id, uint64_t num_bdevs, cha
 			// Limits are already set so need to set the limits to newly added lvols.
 			// Iterate to the first newly added first lvol.
 			qos_bdev_list_node = find_existing_bdev(qos_pool_id_object, bdev_names[0]);
-			if(qos_bdev_list_node)
-			{
+			if (qos_bdev_list_node) {
 				rc = spdk_bdev_open_ext(qos_bdev_list_node->bdev_name, false, dummy_bdev_event_cb, NULL, &desc);
 				if (rc != 0) {
 					SPDK_ERRLOG("Failed to open bdev '%s': %d\n", qos_bdev_list_node->bdev_name, rc);
 					cb_fn(cb_arg, -EINVAL);
 					return;
 				}
-				// Copy the original values of the transient variable.
+
 				for (int i = 0; i < SPDK_BDEV_QOS_NUM_RATE_LIMIT_TYPES; i++) {
 					limits[i] = qos_pool_id_object->limits[i];
 				}
+
 				spdk_bdev_set_qos_rate_limits_ex(spdk_bdev_desc_get_bdev(desc), limits, bdev_pool_id, qos_pool_id_object, qos_bdev_list_node,
 								++temp_bdev_count_in_list, qos_pool_id_object->bdev_list_size, false, NULL, cb_fn, cb_arg);
 				spdk_bdev_close(desc);
@@ -10648,40 +10720,47 @@ spdk_bdev_add_remove_bdev_to_pool(uint64_t bdev_pool_id, uint64_t num_bdevs, cha
 			cb_fn(cb_arg, 0);
 			return;
 		}
+		return;
 	}
-	else {
-		if(qos_pool_id_object == NULL) {
-			cb_fn(cb_arg, -EINVAL);
-		} else {
-			if (check_bdev_names_in_group(qos_pool_id_object, num_bdevs, bdev_names) == 0) {
-				qos_bdev_list_node = find_existing_bdev(qos_pool_id_object, bdev_names[0]);
-				if(qos_bdev_list_node) {
-				
-					rc = spdk_bdev_open_ext(qos_bdev_list_node->bdev_name, false, dummy_bdev_event_cb, NULL, &desc);
-					if (rc != 0) {
-						SPDK_ERRLOG("Failed to open bdev '%s': %d\n", qos_bdev_list_node->bdev_name, rc);
-						cb_fn(cb_arg, -EINVAL);
-						return;
-					}
-					// disable the limits for the bdev
-					for (int i = 0; i < SPDK_BDEV_QOS_NUM_RATE_LIMIT_TYPES; i++) {
-						// Set this to 0
-						limits[i] = 0;
-					}
-					spdk_bdev_set_qos_rate_limits_ex(spdk_bdev_desc_get_bdev(desc), limits, bdev_pool_id, qos_pool_id_object, qos_bdev_list_node,
-								1, num_bdevs, is_remove_bdev_request, bdev_names, cb_fn, cb_arg);
-					spdk_bdev_close(desc);
-				}
-				else {
-					// Very unlikely
-					cb_fn(cb_arg, -EINVAL);
-				}
-			} else {
-				cb_fn(cb_arg, -EINVAL);
-			}
-		}
+
+	if (qos_pool_id_object == NULL) {
+		cb_fn(cb_arg, -EINVAL);
+		return;
 	}
-	return;
+
+	if (check_bdev_names_in_group(qos_pool_id_object, num_bdevs, bdev_names) != 0) {
+		cb_fn(cb_arg, -EINVAL);
+		return;
+	}
+
+	qos_bdev_list_node = find_existing_bdev(qos_pool_id_object, bdev_names[0]);
+	if (qos_bdev_list_node == NULL) {
+		cb_fn(cb_arg, -EINVAL);
+		return;
+	}
+
+	rc = spdk_bdev_open_ext(qos_bdev_list_node->bdev_name, false, dummy_bdev_event_cb, NULL, &desc);
+	if (rc != 0) {
+		SPDK_ERRLOG("Failed to open bdev '%s': %d\n", qos_bdev_list_node->bdev_name, rc);
+		cb_fn(cb_arg, -EINVAL);
+		return;
+	}
+
+	for (int i = 0; i < SPDK_BDEV_QOS_NUM_RATE_LIMIT_TYPES; i++) {
+		limits[i] = 0;
+	}
+
+	remove_ctx = qos_remove_bdev_ctx_create(num_bdevs, bdev_names, cb_fn, cb_arg);
+	if (remove_ctx == NULL) {
+		spdk_bdev_close(desc);
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+
+	spdk_bdev_set_qos_rate_limits_ex(spdk_bdev_desc_get_bdev(desc), limits, bdev_pool_id, qos_pool_id_object, qos_bdev_list_node,
+					 1, num_bdevs, is_remove_bdev_request, remove_ctx->bdev_names, qos_remove_bdev_done, remove_ctx);
+
+	spdk_bdev_close(desc);
 }
 
 struct spdk_bdev_histogram_ctx {
