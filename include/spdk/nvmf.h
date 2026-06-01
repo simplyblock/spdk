@@ -27,7 +27,7 @@ extern "C" {
 
 #define SPDK_TLS_PSK_MAX_LEN		200
 
-#define MAX_NUM_BLOCKED_PORTS 8
+#define MAX_NUM_BLOCKED_PORTS 14
 
 struct spdk_nvmf_tgt;
 struct spdk_nvmf_subsystem;
@@ -57,8 +57,9 @@ enum spdk_nvmf_tgt_discovery_filter {
 	SPDK_NVMF_TGT_DISCOVERY_MATCH_TRANSPORT_SVCID = 1u << 2u
 };
 
-struct spdk_nvmf_rdma_rules {
+struct spdk_nvmf_rules {
 	uint16_t port;
+	uint64_t timeout;
 	bool is_reject;
 };
 
@@ -1600,8 +1601,9 @@ void spdk_nvmf_send_discovery_log_notice(struct spdk_nvmf_tgt *tgt, const char *
 
 bool spdk_nvmf_port_block(uint16_t port, bool is_reject);
 bool spdk_nvmf_port_unblock(uint16_t port);
-void spdk_nvmf_get_blocked_ports(uint16_t *ports, int *num_ports);
+void spdk_nvmf_get_blocked_ports(struct spdk_json_write_ctx *w);
 bool spdk_nvmf_check_port_permission(uint16_t port, bool *is_reject);
+int spdk_nvmf_check_port_timeout(uint64_t ack_timeout);
 
 #ifdef __cplusplus
 }

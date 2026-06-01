@@ -20,19 +20,28 @@ def nvmf_set_max_subsystems(client,
     params['max_subsystems'] = max_subsystems
     return client.call('nvmf_set_max_subsystems', params)
 
-def nvmf_port_block(client, port=None):
+def nvmf_port_block(client, port=None, reject=False):
     """Block a specific NVMe-oF port.
 
     Args:
         port_id: The ID of the NVMe-oF port to block.
+        reject: Whether to reject the port (default: False).
 
     Returns:
         True or False
     """
-    params = {}
+    params = {'port': port, 'reject': reject}
 
-    params['port'] = port
     return client.call('nvmf_port_block', params)
+
+def nvmf_get_blocked_ports(client):
+    """Get a list of all the NVMe-oF blocked ports in this application
+
+    Returns:
+        An array of target names.
+    """
+
+    return client.call("nvmf_get_blocked_ports")
 
 def nvmf_port_unblock(client, port=None):
     """Unblock a specific NVMe-oF port.

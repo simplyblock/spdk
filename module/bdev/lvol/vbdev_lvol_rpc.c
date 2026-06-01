@@ -2581,16 +2581,50 @@ cleanup:
 }
 SPDK_RPC_REGISTER("bdev_lvol_grow_lvstore", rpc_bdev_lvol_grow_lvstore, SPDK_RPC_RUNTIME)
 
+struct rpc_bdev_lvol_update_lvstore {
+	char *uuid;
+	char *lvs_name;
+};
+
+static void
+free_rpc_bdev_lvol_update_lvstore(struct rpc_bdev_lvol_update_lvstore *req)
+{
+	free(req->uuid);
+	free(req->lvs_name);
+}
+
+static const struct spdk_json_object_decoder rpc_bdev_lvol_update_lvstore_decoders[] = {
+	{"uuid", offsetof(struct rpc_bdev_lvol_update_lvstore, uuid), spdk_json_decode_string, true},
+	{"lvs_name", offsetof(struct rpc_bdev_lvol_update_lvstore, lvs_name), spdk_json_decode_string, true},
+};
+
+static void
+rpc_bdev_lvol_update_lvstore_cb(void *cb_arg, int lvserrno)
+{
+	struct spdk_jsonrpc_request *request = cb_arg;
+
+	if (lvserrno != 0) {
+		goto invalid;
+	}
+
+	spdk_jsonrpc_send_bool_response(request, true);
+	return;
+
+invalid:
+	spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+					 spdk_strerror(-lvserrno));
+}
+
 static void
 rpc_bdev_lvol_update_lvstore(struct spdk_jsonrpc_request *request,
 			   const struct spdk_json_val *params)
 {
-	struct rpc_bdev_lvol_grow_lvstore req = {};
+	struct rpc_bdev_lvol_update_lvstore req = {};
 	struct spdk_lvol_store *lvs = NULL;
 	int rc;
 
-	if (spdk_json_decode_object(params, rpc_bdev_lvol_grow_lvstore_decoders,
-				    SPDK_COUNTOF(rpc_bdev_lvol_grow_lvstore_decoders),
+	if (spdk_json_decode_object(params, rpc_bdev_lvol_update_lvstore_decoders,
+				    SPDK_COUNTOF(rpc_bdev_lvol_update_lvstore_decoders),
 				    &req)) {
 		SPDK_INFOLOG(lvol_rpc, "spdk_json_decode_object failed\n");
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
@@ -2605,10 +2639,10 @@ rpc_bdev_lvol_update_lvstore(struct spdk_jsonrpc_request *request,
 	}
 	// spdk_bdev_update_bs_blockcnt(lvs->bs_dev);
 	//TODO we should delete this part there is no need
-	spdk_lvs_update_live(lvs, 0, rpc_bdev_lvol_grow_lvstore_cb, request);
+	spdk_lvs_update_live(lvs, 0, rpc_bdev_lvol_update_lvstore_cb, request);
 
 cleanup:
-	free_rpc_bdev_lvol_grow_lvstore(&req);
+	free_rpc_bdev_lvol_update_lvstore(&req);
 }
 SPDK_RPC_REGISTER("bdev_lvol_update_lvstore", rpc_bdev_lvol_update_lvstore, SPDK_RPC_RUNTIME)
 

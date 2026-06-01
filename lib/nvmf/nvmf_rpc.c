@@ -3237,18 +3237,22 @@ SPDK_RPC_REGISTER("nvmf_stop_mdns_prr", rpc_nvmf_stop_mdns_prr, SPDK_RPC_RUNTIME
 
 struct rpc_port_rule {
 	uint32_t port;
+	bool reject;
 };
+
 static const struct spdk_json_object_decoder rpc_port_decoders[] = {
 	{"port", offsetof(struct rpc_port_rule, port), spdk_json_decode_uint32, true},
+	{"reject", offsetof(struct rpc_port_rule, reject), spdk_json_decode_bool, true},
 };
 
 static void
 rpc_nvmf_port_block(struct spdk_jsonrpc_request *request,
-			  const struct spdk_json_val *params)
+		       const struct spdk_json_val *params)
 {
 	bool rc = false;
 	struct rpc_port_rule req;
 	req.port = 0;
+	req.reject = false;
 
 	if (params) {
 		if (spdk_json_decode_object(params, rpc_port_decoders,
@@ -3266,7 +3270,7 @@ rpc_nvmf_port_block(struct spdk_jsonrpc_request *request,
 		return;
 	}
 
-	rc = spdk_nvmf_port_block(req.port, false);
+	rc = spdk_nvmf_port_block(req.port, req.reject);
 
 	spdk_jsonrpc_send_bool_response(request, rc);
 }
@@ -3275,7 +3279,7 @@ SPDK_RPC_REGISTER("nvmf_port_block", rpc_nvmf_port_block, SPDK_RPC_RUNTIME);
 
 static void
 rpc_nvmf_port_unblock(struct spdk_jsonrpc_request *request,
-			  const struct spdk_json_val *params)
+		       const struct spdk_json_val *params)
 {
 	bool rc = false;
 	struct rpc_port_rule req;
@@ -3305,28 +3309,21 @@ rpc_nvmf_port_unblock(struct spdk_jsonrpc_request *request,
 SPDK_RPC_REGISTER("nvmf_port_unblock", rpc_nvmf_port_unblock, SPDK_RPC_RUNTIME);
 
 static void
-rpc_nvmf_get_blocked_ports(struct spdk_jsonrpc_request *request, const struct spdk_json_val *params)
+rpc_nvmf_get_blocked_ports(struct spdk_jsonrpc_request *request, 
+		       const struct spdk_json_val *params)
 {
     struct spdk_json_write_ctx *w;
 
-    uint16_t blocked_ports[MAX_NUM_BLOCKED_PORTS] = {0};
-	int num_blocked_ports = 0;
-    spdk_nvmf_get_blocked_ports(blocked_ports, &num_blocked_ports);
+	w = spdk_jsonrpc_begin_result(request);
+	if (w == NULL) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "Failed to start JSON response");
+		return;
+	}
 
-    w = spdk_jsonrpc_begin_result(request);
-    if (w == NULL) {
-        spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
-                                         "Failed to start JSON response");
-        return;
-    }
+	spdk_nvmf_get_blocked_ports(w);
 
-    spdk_json_write_array_begin(w);
-    for (int i = 0; i < num_blocked_ports; i++) {
-        spdk_json_write_int32(w, blocked_ports[i]);
-    }
-    spdk_json_write_array_end(w);
-
-    spdk_jsonrpc_end_result(request, w);
+	spdk_jsonrpc_end_result(request, w);
 }
 
 SPDK_RPC_REGISTER("nvmf_get_blocked_ports", rpc_nvmf_get_blocked_ports, SPDK_RPC_RUNTIME);
