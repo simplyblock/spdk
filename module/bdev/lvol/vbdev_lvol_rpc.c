@@ -4280,9 +4280,10 @@ static void
 rpc_vbdev_lvol_remove_from_group_complete(void *cb_arg, int status)
 {
 	struct spdk_jsonrpc_request *request = cb_arg;
+
 	if (status != 0) {
 		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
-						     "Failed to configure rate limit: %s",
+						     "Failed to remove lvol from group: %s",
 						     spdk_strerror(-status));
 		return;
 	}
@@ -4292,15 +4293,14 @@ rpc_vbdev_lvol_remove_from_group_complete(void *cb_arg, int status)
 
 static void
 rpc_vbdev_lvol_remove_from_group(struct spdk_jsonrpc_request *request,
-		       const struct spdk_json_val *params)
+				 const struct spdk_json_val *params)
 {
-	struct rpc_vbdev_lvol_remove_from_group req;
+	struct rpc_vbdev_lvol_remove_from_group req = {};
 	struct spdk_bdev_desc *desc;
-	size_t i = 0;
+	size_t i;
 	int rc;
-	char	*unique_bdev_name[RPC_MAX_LVOL_VBDEV];
-	
-	// Initilize the char array.
+	char *unique_bdev_name[RPC_MAX_LVOL_VBDEV];
+
 	for (i = 0; i < RPC_MAX_LVOL_VBDEV; i++) {
 		req.lvol_vbdev_list.names[i] = NULL;
 		unique_bdev_name[i] = NULL;
@@ -4316,20 +4316,35 @@ rpc_vbdev_lvol_remove_from_group(struct spdk_jsonrpc_request *request,
 	}
 
 	// Validate the list of lvols.
+	if (req.lvol_vbdev_list.num_lvols == 0 ||
+	    req.lvol_vbdev_list.num_lvols > RPC_MAX_LVOL_VBDEV) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "Invalid number of lvol bdevs");
+		goto cleanup;
+	}
+
 	for (i = 0; i < req.lvol_vbdev_list.num_lvols; i++) {
 		rc = spdk_bdev_open_ext(req.lvol_vbdev_list.names[i], false, dummy_bdev_event_cb, NULL, &desc);
 		if (rc != 0) {
 			SPDK_ERRLOG("Failed to open bdev '%s': %d\n", req.lvol_vbdev_list.names[i], rc);
-			spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
+			spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+							 spdk_strerror(-rc));
 			goto cleanup;
 		}
 
 		unique_bdev_name[i] = strdup(spdk_bdev_desc_get_bdev(desc)->name);
 		spdk_bdev_close(desc);
+
+		if (unique_bdev_name[i] == NULL) {
+			spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+							 "Failed to duplicate bdev name");
+			goto cleanup;
+		}
 	}
 
 	spdk_bdev_add_remove_bdev_to_pool(req.bdev_group_id, req.lvol_vbdev_list.num_lvols, unique_bdev_name, true,
-					rpc_vbdev_lvol_remove_from_group_complete,request);
+					rpc_vbdev_lvol_remove_from_group_complete, request);
+
 cleanup:
 	// Free the transient variable.
 	for (i = 0; i < req.lvol_vbdev_list.num_lvols; i++) {
