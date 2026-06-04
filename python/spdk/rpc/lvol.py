@@ -337,11 +337,12 @@ def bdev_lvol_final_migration(client, lvol_name=None, lvol_id=0, snapshot_name=N
     params = {'lvol_name': lvol_name, 'lvol_id': lvol_id, 'snapshot_name': snapshot_name, 'cluster_batch': cluster_batch, 'gateway': gateway}
     return client.call('bdev_lvol_final_migration', params)
 
-def bdev_lvol_transfer(client, lvol_name=None, offset=0, cluster_batch=16, gateway=None, operation=None):
+def bdev_lvol_transfer(client, lvol_name=None, lvol_id=0, offset=0, cluster_batch=16, gateway=None, operation=None):
     """Replicate a logical volume on a logical volume store.
 
     Args:
         name: Name of the logical volume to replicate (required)
+        lvol_id: Destination lvol map ID (optional, default 0)
         offset: Starting offset to replicate (default: 0)
         cluster_batch: elements count in the queue between pollers
         gateway: Name of the gateway to use for transfer (required)
@@ -355,6 +356,10 @@ def bdev_lvol_transfer(client, lvol_name=None, offset=0, cluster_batch=16, gatew
         raise ValueError("Operation must be specified")
     
     params = {'lvol_name': lvol_name, 'offset': offset, 'cluster_batch': cluster_batch, 'gateway': gateway, 'operation': operation}
+
+    if lvol_id > 0:
+        params['lvol_id'] = lvol_id
+
     return client.call('bdev_lvol_transfer', params)
 
 def bdev_lvol_transfer_stat(client, lvol_name=None):

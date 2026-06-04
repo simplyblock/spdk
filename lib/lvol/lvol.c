@@ -4486,7 +4486,7 @@ read_complete_cb(void *arg, int rc)
         return;
     }
 
-	if (xfer->final_migration) {
+	if (xfer->final_migration || xfer->lvol->redirect_map_id != 0) {
 		req->offset = ((uint64_t)(xfer->lvol->redirect_map_id) << 48) | req->offset;		
 	}
 
