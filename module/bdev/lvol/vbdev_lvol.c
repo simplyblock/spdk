@@ -2373,7 +2373,7 @@ vbdev_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz,
 }
 
 int
-vbdev_lvol_create_hublvol(struct spdk_lvol_store *lvs, spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg)
+vbdev_lvol_create_hublvol(struct spdk_lvol_store *lvs, const char *name, spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg)
 {
 	struct spdk_lvol_with_handle_req *req;
 	int rc;
@@ -2386,7 +2386,7 @@ vbdev_lvol_create_hublvol(struct spdk_lvol_store *lvs, spdk_lvol_op_with_handle_
 	req->cb_fn = cb_fn;
 	req->cb_arg = cb_arg;
 
-	rc = spdk_lvol_create_hublvol(lvs, _vbdev_lvol_create_cb, req);
+	rc = spdk_lvol_create_hublvol(lvs, name, _vbdev_lvol_create_cb, req);
 	if (rc != 0) {
 		free(req);
 	}

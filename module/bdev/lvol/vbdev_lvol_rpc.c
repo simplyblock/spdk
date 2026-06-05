@@ -434,6 +434,7 @@ SPDK_RPC_REGISTER("bdev_lvol_create", rpc_bdev_lvol_create, SPDK_RPC_RUNTIME)
 struct rpc_bdev_hublvol {
 	char *uuid;
 	char *lvs_name;
+	char *name;
 };
 
 static void
@@ -441,11 +442,13 @@ free_rpc_bdev_hublvol(struct rpc_bdev_hublvol *req)
 {
 	free(req->uuid);
 	free(req->lvs_name);
+	free(req->name);
 }
 
 static const struct spdk_json_object_decoder rpc_bdev_hublvol_decoders[] = {
 	{"uuid", offsetof(struct rpc_bdev_hublvol, uuid), spdk_json_decode_string, true},
 	{"lvs_name", offsetof(struct rpc_bdev_hublvol, lvs_name), spdk_json_decode_string, true},
+	{"name", offsetof(struct rpc_bdev_hublvol, name), spdk_json_decode_string, true},
 };
 
 static void
@@ -493,7 +496,15 @@ rpc_bdev_lvol_create_hublvol(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
-	rc = vbdev_lvol_create_hublvol(lvs, rpc_bdev_hublvol_create_cb, request);
+	if (req.name == NULL) {
+		req.name = strdup("hublvol");
+		if (req.name == NULL) {
+			spdk_jsonrpc_send_error_response(request, -ENOMEM, spdk_strerror(ENOMEM));
+			goto cleanup;
+		}
+	}
+
+	rc = vbdev_lvol_create_hublvol(lvs, req.name, rpc_bdev_hublvol_create_cb, request);
 	if (rc < 0) {
 		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
 		goto cleanup;
@@ -547,7 +558,15 @@ rpc_bdev_lvol_delete_hublvol(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
-	lvol = spdk_lvol_get_by_names(lvs->name, "hublvol");
+	if (req.name == NULL) {
+		req.name = strdup("hublvol");
+		if (req.name == NULL) {
+			spdk_jsonrpc_send_error_response(request, -ENOMEM, spdk_strerror(ENOMEM));
+			goto cleanup;
+		}
+	}
+
+	lvol = spdk_lvol_get_by_names(lvs->name, req.name);
 	if (!lvol) {
 		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
 		goto cleanup;

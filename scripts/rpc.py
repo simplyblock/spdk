@@ -2310,21 +2310,25 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     def bdev_lvol_create_hublvol(args):
         print_json(rpc.lvol.bdev_lvol_create_hublvol(args.client,
                                              uuid=args.uuid,
-                                             lvs_name=args.lvs_name))
+                                             lvs_name=args.lvs_name,
+                                             name=args.name))
 
     p = subparsers.add_parser('bdev_lvol_create_hublvol', help='Add a bdev with an logical volume backend')
     p.add_argument('-u', '--uuid', help='lvol store UUID')
     p.add_argument('-l', '--lvs-name', help='lvol store name')
+    p.add_argument('-n', '--name', help='lvol name')
     p.set_defaults(func=bdev_lvol_create_hublvol)
     
     def bdev_lvol_delete_hublvol(args):
         print_json(rpc.lvol.bdev_lvol_delete_hublvol(args.client,
                                              uuid=args.uuid,
-                                             lvs_name=args.lvs_name))
+                                             lvs_name=args.lvs_name,
+                                             name=args.name))
 
     p = subparsers.add_parser('bdev_lvol_delete_hublvol', help='Add a bdev with an logical volume backend')
     p.add_argument('-u', '--uuid', help='lvol store UUID')
     p.add_argument('-l', '--lvs-name', help='lvol store name')
+    p.add_argument('-n', '--name', help='lvol name')
     p.set_defaults(func=bdev_lvol_delete_hublvol)
     
     def bdev_lvol_register(args):

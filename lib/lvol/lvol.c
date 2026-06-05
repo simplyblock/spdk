@@ -1162,7 +1162,9 @@ lvol_create_open_cb(void *cb_arg, struct spdk_blob *blob, int lvolerrno)
 	lvol->blob = blob;
 	lvol->blob_id = spdk_blob_get_id(blob);
 	lvol->map_id = spdk_blob_get_map_id(blob);
-	lvs->lvol_map.lvol[lvol->map_id] = lvol;
+	if (!lvol->hublvol) {
+		lvs->lvol_map.lvol[lvol->map_id] = lvol;
+	}
 
 	TAILQ_INSERT_TAIL(&lvol->lvol_store->lvols, lvol, link);
 
@@ -1495,7 +1497,7 @@ spdk_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz, boo
 }
 
 int
-spdk_lvol_create_hublvol(struct spdk_lvol_store *lvs, spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg)
+spdk_lvol_create_hublvol(struct spdk_lvol_store *lvs, const char *name, spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg)
 {
 	struct spdk_lvol_with_handle_req *req;
 	struct spdk_lvol *lvol;
@@ -1508,7 +1510,7 @@ spdk_lvol_create_hublvol(struct spdk_lvol_store *lvs, spdk_lvol_op_with_handle_c
 		return -EINVAL;
 	}
 
-	rc = lvs_verify_lvol_name(lvs, "hublvol");
+	rc = lvs_verify_lvol_name(lvs, name);
 	if (rc < 0) {
 		return rc;
 	}
@@ -1521,7 +1523,7 @@ spdk_lvol_create_hublvol(struct spdk_lvol_store *lvs, spdk_lvol_op_with_handle_c
 	req->cb_fn = cb_fn;
 	req->cb_arg = cb_arg;
 
-	lvol = lvol_alloc(lvs, "hublvol", true, LVOL_CLEAR_WITH_DEFAULT, NULL);
+	lvol = lvol_alloc(lvs, name, true, LVOL_CLEAR_WITH_DEFAULT, NULL);
 	if (!lvol) {
 		free(req);
 		SPDK_ERRLOG("Cannot alloc memory for lvol base pointer\n");
