@@ -42,6 +42,8 @@ RUN git clone --recurse-submodules https://github.com/simplyblock-io/aws-sdk-cpp
     -DCMAKE_INSTALL_PREFIX=/usr/local/ \
     -DENABLE_TESTING=OFF \
     -DBUILD_ONLY="s3;s3-crt" && \
-    make -j"$(nproc)" && make install \
+    make -j"$(nproc)" && make install
+
+RUN dnf clean all && rm -rf /var/cache/dnf /var/cache/yum
 
 RUN rm -rf /root/aws-sdk-cpp/.git
