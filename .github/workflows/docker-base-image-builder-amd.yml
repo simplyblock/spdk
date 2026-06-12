@@ -1,6 +1,7 @@
 name: Docker Base Image Build (AMD)
 
 on:
+  workflow_dispatch:
   workflow_run:
     workflows: ["Docker Base Image Build (ARM)"]
     types:
@@ -41,18 +42,15 @@ jobs:
 
     - name: Create the manifest
       run: |
-     
         DH_ARM="simplyblock/spdk-core:base_image_arm64"
         DH_AMD="simplyblock/spdk-core:base_image_amd64"
-        ECR_ARM="565979732541.dkr.ecr.us-east-1.amazonaws.com/spdk-core:base_image_arm64"
-        ECR_AMD="565979732541.dkr.ecr.us-east-1.amazonaws.com/spdk-core:base_image_amd64"
-
+        ECR_ARM="public.ecr.aws/simply-block/spdk-core:base_image_arm64"
+        ECR_AMD="public.ecr.aws/simply-block/spdk-core:base_image_amd64"
         docker manifest create simplyblock/spdk-core:base_image "$DH_ARM" "$DH_AMD"
-        docker manifest create 565979732541.dkr.ecr.us-east-1.amazonaws.com/spdk-core:base_image "$ECR_ARM" "$ECR_AMD"
         docker manifest annotate simplyblock/spdk-core:base_image "$DH_ARM" --arch arm64
         docker manifest annotate simplyblock/spdk-core:base_image "$DH_AMD" --arch amd64
-        docker manifest annotate 565979732541.dkr.ecr.us-east-1.amazonaws.com/spdk-core:base_image "$ECR_ARM" --arch arm64
-        docker manifest annotate 565979732541.dkr.ecr.us-east-1.amazonaws.com/spdk-core:base_image "$ECR_AMD" --arch amd64
         docker manifest push simplyblock/spdk-core:base_image
-        docker manifest push 565979732541.dkr.ecr.us-east-1.amazonaws.com/spdk-core:base_image
-
+        docker manifest create public.ecr.aws/simply-block/spdk-core:base_image "$ECR_ARM" "$ECR_AMD"
+        docker manifest annotate public.ecr.aws/simply-block/spdk-core:base_image "$ECR_ARM" --arch arm64
+        docker manifest annotate public.ecr.aws/simply-block/spdk-core:base_image "$ECR_AMD" --arch amd64
+        docker manifest push public.ecr.aws/simply-block/spdk-core:base_image
