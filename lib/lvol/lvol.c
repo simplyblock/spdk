@@ -789,7 +789,7 @@ spdk_lvs_init(struct spdk_bs_dev *bs_dev, struct spdk_lvs_opts *o,
 		return -EINVAL;
 	}
 	total_clusters = bs_dev->blockcnt / (lvs_opts.cluster_sz / bs_dev->blocklen);
-
+	SPDK_NOTICELOG("  total_clusters: %u blockcnt: %lu blocklen: %u\n", total_clusters, bs_dev->blockcnt, bs_dev->blocklen);
 	lvs = lvs_alloc();
 	if (!lvs) {
 		SPDK_ERRLOG("Cannot alloc memory for lvol store base pointer\n");
