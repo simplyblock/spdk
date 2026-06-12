@@ -2,7 +2,7 @@ name: Docker Base Image Build (AMD)
 
 on:
   workflow_run:
-    workflows: ["docker-base-image-builder-arm"]
+    workflows: ["Docker Base Image Build (ARM)"]
     types:
       - completed
 

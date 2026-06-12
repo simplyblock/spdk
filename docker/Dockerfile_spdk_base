@@ -10,6 +10,12 @@ RUN dnf install -y git diffutils procps-ng pip kmod hostname wget pkg-config cma
     dosfstools ntfsprogs e2fsprogs ntfs-* gdb parted fio xfsprogs libasan libubsan iptables  python3 python3-pip  \
     nvme-cli librdmacm-utils perftest numactl gdisk
 
+COPY ./ /root/spdk/
+
+RUN cd spdk && scripts/pkgdep.sh --rdma --pmem
+
+RUN rm -rf /root/spdk
+
 
 # Build OpenSSL
 RUN dnf update -y && dnf upgrade -y && \
