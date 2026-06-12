@@ -4646,7 +4646,7 @@ bs_opts_verify(struct spdk_bs_opts *opts)
 {
 	if (opts->cluster_sz == 0 || opts->num_md_pages == 0 || opts->max_md_ops == 0 ||
 	    opts->max_channel_ops == 0) {
-		SPDK_ERRLOG("Blobstore options cannot be set to 0\n");
+		SPDK_ERRLOG("Blobstore options cannot be set to 0 %u %u %u %u\n", opts->cluster_sz, opts->num_md_pages, opts->max_md_ops, opts->max_channel_ops);
 		return -1;
 	}
 
@@ -6605,6 +6605,18 @@ bs_opts_copy(struct spdk_bs_opts *src, struct spdk_bs_opts *dst)
 	return 0;
 }
 
+static inline int
+bs_opts_print(struct spdk_bs_opts *opts)
+{
+	SPDK_NOTICELOG("blobstore options:\n");
+	SPDK_NOTICELOG("  cluster_sz: %u\n", opts->cluster_sz);
+	SPDK_NOTICELOG("  num_md_pages: %u\n", opts->num_md_pages);
+	SPDK_NOTICELOG("  max_md_ops: %u\n", opts->max_md_ops);
+	SPDK_NOTICELOG("  max_channel_ops: %u\n", opts->max_channel_ops);
+	SPDK_NOTICELOG("  clear_method: %u\n", opts->clear_method);
+	return 0;
+}
+
 void
 spdk_bs_load(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	     spdk_bs_op_with_handle_complete cb_fn, void *cb_arg)
@@ -7426,7 +7438,7 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 		cb_fn(cb_arg, NULL, -EINVAL);
 		return;
 	}
-
+	bs_opts_print(o);
 	spdk_bs_opts_init(&opts, sizeof(opts));
 	if (o) {
 		if (bs_opts_copy(o, &opts)) {

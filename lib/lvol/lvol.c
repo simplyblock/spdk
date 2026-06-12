@@ -744,6 +744,16 @@ setup_lvs_opts(struct spdk_bs_opts *bs_opts, struct spdk_lvs_opts *o, uint32_t t
 	snprintf(bs_opts->bstype.bstype, sizeof(bs_opts->bstype.bstype), "LVOLSTORE");
 }
 
+
+static void
+print_lvs_opts(struct spdk_lvs_opts *o)
+{
+	SPDK_NOTICELOG("LVS options:\n");
+	SPDK_NOTICELOG("  cluster_sz: %u\n", o->cluster_sz);
+	SPDK_NOTICELOG("  clear_method: %d\n", o->clear_method);
+	SPDK_NOTICELOG("  num_md_pages_per_cluster_ratio: %u\n", o->num_md_pages_per_cluster_ratio);
+}
+
 int
 spdk_lvs_init(struct spdk_bs_dev *bs_dev, struct spdk_lvs_opts *o,
 	      spdk_lvs_op_with_handle_complete cb_fn, void *cb_arg)
@@ -770,6 +780,8 @@ spdk_lvs_init(struct spdk_bs_dev *bs_dev, struct spdk_lvs_opts *o,
 		SPDK_ERRLOG("spdk_lvs_opts invalid\n");
 		return -EINVAL;
 	}
+	print_lvs_opts(o);
+	print_lvs_opts(&lvs_opts);
 
 	if (lvs_opts.cluster_sz < bs_dev->blocklen) {
 		SPDK_ERRLOG("Cluster size %" PRIu32 " is smaller than blocklen %" PRIu32 "\n",
