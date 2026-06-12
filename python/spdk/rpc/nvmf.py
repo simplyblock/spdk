@@ -34,6 +34,15 @@ def nvmf_port_block(client, port=None, reject=False):
 
     return client.call('nvmf_port_block', params)
 
+def nvmf_get_blocked_ports(client):
+    """Get a list of all the NVMe-oF blocked ports in this application
+
+    Returns:
+        An array of target names.
+    """
+
+    return client.call("nvmf_get_blocked_ports")
+
 def nvmf_port_unblock(client, port=None):
     """Unblock a specific NVMe-oF port.
 

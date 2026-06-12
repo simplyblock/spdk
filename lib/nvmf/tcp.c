@@ -362,6 +362,7 @@ struct spdk_nvmf_tcp_poll_group {
 	struct spdk_sock_group			*sock_group;
 
 	TAILQ_HEAD(, spdk_nvmf_tcp_qpair)	qpairs;
+	int had_blocked_port;
 
 	struct spdk_io_channel			*accel_channel;
 	struct spdk_nvmf_tcp_control_msg_list	*control_msg_list;
@@ -595,7 +596,7 @@ nvmf_tcp_drain_delayed_req_queue(struct spdk_nvmf_tcp_qpair *tqpair)
 		return;
 	}
 
-	if (tqpair->state != NVMF_TCP_QPAIR_STATE_RUNNING) {
+	if (tqpair->tcp_pdu_waiting_count <= 0) {
 		return;
 	}
 
@@ -677,6 +678,7 @@ nvmf_tcp_cleanup_all_states(struct spdk_nvmf_tcp_qpair *tqpair)
 {
 	nvmf_tcp_drain_state_queue(tqpair, TCP_REQUEST_STATE_TRANSFERRING_CONTROLLER_TO_HOST);
 	nvmf_tcp_drain_state_queue(tqpair, TCP_REQUEST_STATE_NEW);
+	nvmf_tcp_drain_state_queue(tqpair, TCP_REQUEST_STATE_READY_TO_EXECUTE);
 	nvmf_tcp_drain_state_queue(tqpair, TCP_REQUEST_STATE_EXECUTING);
 	nvmf_tcp_drain_state_queue(tqpair, TCP_REQUEST_STATE_TRANSFERRING_HOST_TO_CONTROLLER);
 	nvmf_tcp_drain_state_queue(tqpair, TCP_REQUEST_STATE_AWAITING_R2T_ACK);
@@ -3939,6 +3941,7 @@ nvmf_tcp_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 {
 	struct spdk_nvmf_tcp_poll_group *tgroup;
 	struct spdk_nvmf_tcp_qpair *tqpair;
+	int have_blocked_port = 0;
 	int num_events;
 
 	tgroup = SPDK_CONTAINEROF(group, struct spdk_nvmf_tcp_poll_group, group);
@@ -3947,24 +3950,26 @@ nvmf_tcp_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 		return 0;
 	}
 
-	spdk_nvmf_check_port_timeout(group->transport->opts.ack_timeout);
+	have_blocked_port = spdk_nvmf_check_port_timeout(group->transport->opts.ack_timeout);
 
-	//TODO check the time of blocking rules - check 
-	TAILQ_FOREACH(tqpair, &tgroup->qpairs, link) {
-		if (tqpair && tqpair->rejected) {
-			if (!tqpair->in_rejection) {
-				tqpair->in_rejection = true;
-				tqpair->tcp_pdu_waiting_count = 0;
-				nvmf_tcp_qpair_disconnect(tqpair);
+	if (spdk_unlikely(tgroup->had_blocked_port || have_blocked_port)) {
+		TAILQ_FOREACH(tqpair, &tgroup->qpairs, link) {
+			if (tqpair && tqpair->rejected) {
+				if (!tqpair->in_rejection) {
+					tqpair->in_rejection = true;
+					tqpair->tcp_pdu_waiting_count = 0;
+					nvmf_tcp_qpair_set_recv_state(tqpair, NVME_TCP_PDU_RECV_STATE_QUIESCING);
+				}
+				continue;
 			}
-			continue;
-		}
 
-		if (tqpair && tqpair->tcp_pdu_waiting_count > 0) {
-			nvmf_tcp_drain_delayed_req_queue(tqpair);
+			if (tqpair) {
+				nvmf_tcp_drain_delayed_req_queue(tqpair);
+			}
 		}
 	}
 
+	tgroup->had_blocked_port = have_blocked_port;
 
 	num_events = spdk_sock_group_poll(tgroup->sock_group);
 	if (spdk_unlikely(num_events < 0)) {
