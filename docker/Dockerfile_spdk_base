@@ -18,6 +18,18 @@ RUN cd spdk && scripts/pkgdep.sh --rdma --pmem
 
 RUN rm -rf /root/spdk
 
+
+# Build OpenSSL
+RUN dnf update -y && dnf upgrade -y && \
+    dnf install -y zlib-devel make gcc perl curl \
+    libcurl-devel libuuid-devel pulseaudio-libs-devel && \
+    wget https://www.openssl.org/source/openssl-3.5.6.tar.gz && \
+    tar -xvf openssl-3.5.6.tar.gz && \
+    cd openssl-3.5.6 && \
+    ./config && make -j"$(nproc)" && make install && \
+    echo /usr/local/lib64 > /etc/ld.so.conf.d/openssl.conf && ldconfig && \
+    cd .. && rm -rf openssl-3.5.6*
+
 # Clone + build AWS SDK
 RUN git clone --recurse-submodules https://github.com/simplyblock-io/aws-sdk-cpp && \
     touch aws-sdk-cpp/crt/aws-crt-cpp/include/aws/crt/pthread_utils.h && \
@@ -32,16 +44,5 @@ RUN git clone --recurse-submodules https://github.com/simplyblock-io/aws-sdk-cpp
     -DCMAKE_INSTALL_PREFIX=/usr/local/ \
     -DENABLE_TESTING=OFF \
     -DBUILD_ONLY="s3;s3-crt" && \
-    make -j"$(nproc)" && make install && \
-    rm -rf /root/aws-sdk-cpp
+    make -j"$(nproc)" && make install \
 
-# Build OpenSSL
-RUN dnf update -y && dnf upgrade -y && \
-    dnf install -y zlib-devel make gcc perl curl \
-    libcurl-devel libuuid-devel pulseaudio-libs-devel && \
-    wget https://www.openssl.org/source/openssl-3.5.0.tar.gz && \
-    tar -xvf openssl-3.5.0.tar.gz && \
-    cd openssl-3.5.0 && \
-    ./config && make -j"$(nproc)" && make install && \
-    echo /usr/local/lib64 > /etc/ld.so.conf.d/openssl.conf && ldconfig && \
-    cd .. && rm -rf openssl-3.5.0* \
