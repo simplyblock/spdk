@@ -23,7 +23,7 @@ RUN wget https://www.openssl.org/source/openssl-3.5.6.tar.gz && \
     cd .. && rm -rf openssl-3.5.6*
 
 # Clone + build AWS SDK
-RUN cd /root/ && git clone --recurse-submodules https://github.com/simplyblock-io/aws-sdk-cpp && \
+RUN cd /root/ && git clone --depth 1 --recurse-submodules https://github.com/simplyblock-io/aws-sdk-cpp && \
     touch aws-sdk-cpp/crt/aws-crt-cpp/include/aws/crt/pthread_utils.h && \
     cp aws-sdk-cpp/pthread_utils.txt aws-sdk-cpp/crt/aws-crt-cpp/include/aws/crt/pthread_utils.h && \
     mkdir -p aws-sdk-cpp/sdk_build && \
@@ -46,7 +46,7 @@ WORKDIR /root
 #   gdb, fio, perftest           -> debug/benchmark tools, not runtime
 #   ntfs-*  (wildcard)           -> replaced with explicit ntfs-3g + ntfsprogs
 # If any of these are actually needed in prod, add them back deliberately.
-RUN dnf install -y git diffutils procps-ng pip kmod hostname wget pkg-config cmake nano systemd-udev openldap-clients  \
+RUN dnf install -y --nodocs git diffutils procps-ng pip kmod hostname wget pkg-config cmake nano systemd-udev openldap-clients  \
     dosfstools ntfsprogs e2fsprogs ntfs-* gdb parted fio xfsprogs libasan libubsan iptables  python3 python3-pip  \
     nvme-cli librdmacm-utils perftest numactl gdisk zlib-devel make gcc perl curl \
     && dnf clean all && rm -rf /var/cache/dnf /var/cache/yum
