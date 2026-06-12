@@ -29,7 +29,7 @@ RUN dnf update -y && dnf upgrade -y && \
     cd .. && rm -rf openssl-3.5.6*
 
 # Clone + build AWS SDK
-RUN git clone --recurse-submodules https://github.com/simplyblock-io/aws-sdk-cpp && \
+RUN cd /root/ && git clone --recurse-submodules https://github.com/simplyblock-io/aws-sdk-cpp && \
     touch aws-sdk-cpp/crt/aws-crt-cpp/include/aws/crt/pthread_utils.h && \
     cp aws-sdk-cpp/pthread_utils.txt aws-sdk-cpp/crt/aws-crt-cpp/include/aws/crt/pthread_utils.h && \
     mkdir -p aws-sdk-cpp/sdk_build && \
@@ -46,4 +46,4 @@ RUN git clone --recurse-submodules https://github.com/simplyblock-io/aws-sdk-cpp
 
 RUN dnf clean all && rm -rf /var/cache/dnf /var/cache/yum
 
-RUN rm -rf /root/aws-sdk-cpp/.git
+RUN rm -rf /root/aws-sdk-cpp
