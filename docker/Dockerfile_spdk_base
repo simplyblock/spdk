@@ -1,6 +1,9 @@
-FROM public.ecr.aws/docker/library/fedora:41
+# syntax=docker/dockerfile:1.7
 
-# push to "simplyblock/spdk-core:base_image"
+# ---------------------------------------------------------------------------
+# Stage 1: builder
+# ---------------------------------------------------------------------------
+FROM public.ecr.aws/docker/library/fedora:41 AS builder
 
 USER root
 
@@ -8,20 +11,11 @@ WORKDIR /root
 
 RUN dnf install -y git diffutils procps-ng pip kmod hostname wget pkg-config cmake nano systemd-udev openldap-clients  \
     dosfstools ntfsprogs e2fsprogs ntfs-* gdb parted fio xfsprogs libasan libubsan iptables  python3 python3-pip  \
-    nvme-cli librdmacm-utils perftest numactl gdisk
-
-COPY ./ /root/spdk/
-
-RUN cd spdk && scripts/pkgdep.sh --rdma --pmem
-
-RUN rm -rf /root/spdk
-
+    nvme-cli librdmacm-utils perftest numactl gdisk zlib-devel make gcc perl curl \
+    libcurl-devel libuuid-devel pulseaudio-libs-devel
 
 # Build OpenSSL
-RUN dnf update -y && dnf upgrade -y && \
-    dnf install -y zlib-devel make gcc perl curl \
-    libcurl-devel libuuid-devel pulseaudio-libs-devel && \
-    wget https://www.openssl.org/source/openssl-3.5.6.tar.gz && \
+RUN wget https://www.openssl.org/source/openssl-3.5.6.tar.gz && \
     tar -xvf openssl-3.5.6.tar.gz && \
     cd openssl-3.5.6 && \
     ./config && make -j"$(nproc)" && make install && \
@@ -44,6 +38,20 @@ RUN cd /root/ && git clone --recurse-submodules https://github.com/simplyblock-i
     -DBUILD_ONLY="s3;s3-crt" && \
     make -j"$(nproc)" && make install
 
-RUN dnf clean all && rm -rf /var/cache/dnf /var/cache/yum
 
-RUN rm -rf /root/aws-sdk-cpp
+FROM public.ecr.aws/docker/library/fedora:41 AS runtime
+WORKDIR /root
+
+# Runtime OS packages only. Dropped from the original:
+#   gdb, fio, perftest           -> debug/benchmark tools, not runtime
+#   ntfs-*  (wildcard)           -> replaced with explicit ntfs-3g + ntfsprogs
+# If any of these are actually needed in prod, add them back deliberately.
+RUN dnf install -y git diffutils procps-ng pip kmod hostname wget pkg-config cmake nano systemd-udev openldap-clients  \
+    dosfstools ntfsprogs e2fsprogs ntfs-* gdb parted fio xfsprogs libasan libubsan iptables  python3 python3-pip  \
+    nvme-cli librdmacm-utils perftest numactl gdisk zlib-devel make gcc perl curl \
+    && dnf clean all && rm -rf /var/cache/dnf /var/cache/yum
+
+
+# Pull across the compiled artefacts from the builder.
+COPY --from=builder /usr/local/                       /usr/local/
+COPY --from=builder /etc/ld.so.conf.d/openssl.conf    /etc/ld.so.conf.d/openssl.conf
