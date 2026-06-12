@@ -1,4 +1,4 @@
-FROM fedora:41
+FROM public.ecr.aws/docker/library/fedora:41
 
 # push to "simplyblock/spdk-core:base_image"
 
