@@ -44,3 +44,4 @@ RUN git clone --recurse-submodules https://github.com/simplyblock-io/aws-sdk-cpp
     -DBUILD_ONLY="s3;s3-crt" && \
     make -j"$(nproc)" && make install \
 
+RUN rm -rf /root/aws-sdk-cpp/.git
