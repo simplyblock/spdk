@@ -15,12 +15,12 @@ RUN dnf install -y git diffutils procps-ng pip kmod hostname wget pkg-config cma
     libcurl-devel libuuid-devel pulseaudio-libs-devel
 
 # Build OpenSSL
-RUN wget https://www.openssl.org/source/openssl-3.5.6.tar.gz && \
-    tar -xvf openssl-3.5.6.tar.gz && \
-    cd openssl-3.5.6 && \
+RUN wget https://www.openssl.org/source/openssl-3.5.7.tar.gz && \
+    tar -xvf openssl-3.5.7.tar.gz && \
+    cd openssl-3.5.7 && \
     ./config && make -j"$(nproc)" && make install && \
     echo /usr/local/lib64 > /etc/ld.so.conf.d/openssl.conf && ldconfig && \
-    cd .. && rm -rf openssl-3.5.6*
+    cd .. && rm -rf openssl-3.5.7*
 
 # Clone + build AWS SDK
 RUN cd /root/ && git clone --depth 1 --recurse-submodules https://github.com/simplyblock-io/aws-sdk-cpp && \
