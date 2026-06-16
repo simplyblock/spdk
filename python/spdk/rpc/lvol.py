@@ -337,11 +337,12 @@ def bdev_lvol_final_migration(client, lvol_name=None, lvol_id=0, snapshot_name=N
     params = {'lvol_name': lvol_name, 'lvol_id': lvol_id, 'snapshot_name': snapshot_name, 'cluster_batch': cluster_batch, 'gateway': gateway}
     return client.call('bdev_lvol_final_migration', params)
 
-def bdev_lvol_transfer(client, lvol_name=None, offset=0, cluster_batch=16, gateway=None, operation=None):
+def bdev_lvol_transfer(client, lvol_name=None, lvol_id=0, offset=0, cluster_batch=16, gateway=None, operation=None):
     """Replicate a logical volume on a logical volume store.
 
     Args:
         name: Name of the logical volume to replicate (required)
+        lvol_id: Destination lvol map ID (optional, default 0)
         offset: Starting offset to replicate (default: 0)
         cluster_batch: elements count in the queue between pollers
         gateway: Name of the gateway to use for transfer (required)
@@ -355,6 +356,10 @@ def bdev_lvol_transfer(client, lvol_name=None, offset=0, cluster_batch=16, gatew
         raise ValueError("Operation must be specified")
     
     params = {'lvol_name': lvol_name, 'offset': offset, 'cluster_batch': cluster_batch, 'gateway': gateway, 'operation': operation}
+
+    if lvol_id > 0:
+        params['lvol_id'] = lvol_id
+
     return client.call('bdev_lvol_transfer', params)
 
 def bdev_lvol_transfer_stat(client, lvol_name=None):
@@ -420,12 +425,13 @@ def bdev_lvol_add_clone(client, lvol_name=None, child_name=None):
     params = { 'lvol_name': lvol_name, 'child_name': child_name }
     return client.call('bdev_lvol_add_clone', params)
 
-def bdev_lvol_create_hublvol(client, uuid=None, lvs_name=None):
+def bdev_lvol_create_hublvol(client, uuid=None, lvs_name=None, name=None):
     """Create a logical volume on a logical volume store.
 
     Args:        
         uuid: UUID of logical volume store to create logical volume on (optional)
         lvs_name: name of logical volume store to create logical volume on (optional)
+        name: name of the logical volume to create (optional)
 
     Either uuid or lvs_name must be specified, but not both.
 
@@ -440,14 +446,17 @@ def bdev_lvol_create_hublvol(client, uuid=None, lvs_name=None):
         params['uuid'] = uuid
     if lvs_name:
         params['lvs_name'] = lvs_name
+    if name:
+        params['name'] = name
     return client.call('bdev_lvol_create_hublvol', params)
 
-def bdev_lvol_delete_hublvol(client, uuid=None, lvs_name=None, ):
-    """Create a logical volume on a logical volume store.
+def bdev_lvol_delete_hublvol(client, uuid=None, lvs_name=None, name=None):
+    """Delete a logical volume on a logical volume store.
 
     Args:        
         uuid: UUID of logical volume store to create logical volume on (optional)
         lvs_name: name of logical volume store to create logical volume on (optional)
+        name: name of the logical volume to delete (optional)
 
     Either uuid or lvs_name must be specified, but not both.
 
@@ -462,6 +471,8 @@ def bdev_lvol_delete_hublvol(client, uuid=None, lvs_name=None, ):
         params['uuid'] = uuid
     if lvs_name:
         params['lvs_name'] = lvs_name
+    if name:
+        params['name'] = name
     return client.call('bdev_lvol_delete_hublvol', params)
 
 def bdev_lvol_register(client, lvol_name, registered_uuid, blobid, thin_provision=False, uuid=None, lvs_name=None, clear_method=None, lvol_priority_class=0):

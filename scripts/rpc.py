@@ -2258,6 +2258,7 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     def bdev_lvol_transfer(args):
         print_json(rpc.lvol.bdev_lvol_transfer(args.client,
                                              lvol_name=args.lvol_name,
+                                             lvol_id=args.lvol_id,
                                              offset=args.offset,
                                              cluster_batch=args.cluster_batch,
                                              gateway=args.gateway,
@@ -2265,6 +2266,7 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
 
     p = subparsers.add_parser('bdev_lvol_transfer', help='Transfer an lvol between nodes via an lvol bdev as gateway')
     p.add_argument('-n', '--lvol_name', help='lvol bdev name', required=True)
+    p.add_argument('--lvol-id', help='Destination lvol map ID', type=int)
     p.add_argument('-o', '--offset', help='Starting lvol offset to transfer: default 0', type=int)
     p.add_argument('-b', '--cluster-batch', help='Transfering lvol with batch reqs: default 16 clusters', type=int)
     p.add_argument('-g', '--gateway', help='Target lvol bdev name', required=True)
@@ -2308,21 +2310,25 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     def bdev_lvol_create_hublvol(args):
         print_json(rpc.lvol.bdev_lvol_create_hublvol(args.client,
                                              uuid=args.uuid,
-                                             lvs_name=args.lvs_name))
+                                             lvs_name=args.lvs_name,
+                                             name=args.name))
 
     p = subparsers.add_parser('bdev_lvol_create_hublvol', help='Add a bdev with an logical volume backend')
     p.add_argument('-u', '--uuid', help='lvol store UUID')
     p.add_argument('-l', '--lvs-name', help='lvol store name')
+    p.add_argument('-n', '--name', help='lvol name')
     p.set_defaults(func=bdev_lvol_create_hublvol)
     
     def bdev_lvol_delete_hublvol(args):
         print_json(rpc.lvol.bdev_lvol_delete_hublvol(args.client,
                                              uuid=args.uuid,
-                                             lvs_name=args.lvs_name))
+                                             lvs_name=args.lvs_name,
+                                             name=args.name))
 
     p = subparsers.add_parser('bdev_lvol_delete_hublvol', help='Add a bdev with an logical volume backend')
     p.add_argument('-u', '--uuid', help='lvol store UUID')
     p.add_argument('-l', '--lvs-name', help='lvol store name')
+    p.add_argument('-n', '--name', help='lvol name')
     p.set_defaults(func=bdev_lvol_delete_hublvol)
     
     def bdev_lvol_register(args):

@@ -434,6 +434,7 @@ SPDK_RPC_REGISTER("bdev_lvol_create", rpc_bdev_lvol_create, SPDK_RPC_RUNTIME)
 struct rpc_bdev_hublvol {
 	char *uuid;
 	char *lvs_name;
+	char *name;
 };
 
 static void
@@ -441,11 +442,13 @@ free_rpc_bdev_hublvol(struct rpc_bdev_hublvol *req)
 {
 	free(req->uuid);
 	free(req->lvs_name);
+	free(req->name);
 }
 
 static const struct spdk_json_object_decoder rpc_bdev_hublvol_decoders[] = {
 	{"uuid", offsetof(struct rpc_bdev_hublvol, uuid), spdk_json_decode_string, true},
 	{"lvs_name", offsetof(struct rpc_bdev_hublvol, lvs_name), spdk_json_decode_string, true},
+	{"name", offsetof(struct rpc_bdev_hublvol, name), spdk_json_decode_string, true},
 };
 
 static void
@@ -493,7 +496,15 @@ rpc_bdev_lvol_create_hublvol(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
-	rc = vbdev_lvol_create_hublvol(lvs, rpc_bdev_hublvol_create_cb, request);
+	if (req.name == NULL) {
+		req.name = strdup("hublvol");
+		if (req.name == NULL) {
+			spdk_jsonrpc_send_error_response(request, -ENOMEM, spdk_strerror(ENOMEM));
+			goto cleanup;
+		}
+	}
+
+	rc = vbdev_lvol_create_hublvol(lvs, req.name, rpc_bdev_hublvol_create_cb, request);
 	if (rc < 0) {
 		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
 		goto cleanup;
@@ -547,7 +558,15 @@ rpc_bdev_lvol_delete_hublvol(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
-	lvol = spdk_lvol_get_by_names(lvs->name, "hublvol");
+	if (req.name == NULL) {
+		req.name = strdup("hublvol");
+		if (req.name == NULL) {
+			spdk_jsonrpc_send_error_response(request, -ENOMEM, spdk_strerror(ENOMEM));
+			goto cleanup;
+		}
+	}
+
+	lvol = spdk_lvol_get_by_names(lvs->name, req.name);
 	if (!lvol) {
 		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
 		goto cleanup;
@@ -3615,6 +3634,7 @@ SPDK_RPC_REGISTER("bdev_lvol_final_migration", rpc_bdev_lvol_final_migration, SP
 
 struct rpc_bdev_lvol_transfer {
 	char *lvol_name;
+	uint32_t lvol_id;
 	uint64_t offset;
 	uint32_t cluster_batch;
 	char *gateway;
@@ -3634,6 +3654,7 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_transfer_decoders[] =
 	{"cluster_batch", offsetof(struct rpc_bdev_lvol_transfer, cluster_batch), spdk_json_decode_uint32, true},
 	{"gateway", offsetof(struct rpc_bdev_lvol_transfer, gateway), spdk_json_decode_string},	
 	{"operation", offsetof(struct rpc_bdev_lvol_transfer, operation), spdk_json_decode_string},
+	{"lvol_id", offsetof(struct rpc_bdev_lvol_transfer, lvol_id), spdk_json_decode_uint32, true},
 };
 
 static void 
@@ -3700,7 +3721,7 @@ rpc_bdev_lvol_transfer(struct spdk_jsonrpc_request *request,
 	}
 	SPDK_NOTICELOG("Transfering lvol %s in %s mode.\n", req.lvol_name, req.operation);
 
-	rc = spdk_lvol_transfer(lvol, req.offset, req.cluster_batch, type, tdev, NULL, 0, NULL, NULL);	
+	rc = spdk_lvol_transfer(lvol, req.offset, req.cluster_batch, type, tdev, NULL, req.lvol_id, NULL, NULL);
 	if (rc < 0) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 spdk_strerror(-rc));
