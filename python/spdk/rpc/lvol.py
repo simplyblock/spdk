@@ -696,7 +696,7 @@ def bdev_lvol_set_read_only(client, name):
     return client.call('bdev_lvol_set_read_only', params)
 
 
-def bdev_lvol_delete(client, name, sync=False):
+def bdev_lvol_delete(client, name, sync=False, special_delete=False):
     """Destroy a logical volume.
 
     Args:
@@ -705,6 +705,7 @@ def bdev_lvol_delete(client, name, sync=False):
     params = {
         'name': name,
         'sync': sync,
+        'special_delete': special_delete
     }
     return client.call('bdev_lvol_delete', params)
 

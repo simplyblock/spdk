@@ -1897,6 +1897,7 @@ SPDK_RPC_REGISTER("bdev_lvol_set_lvs_read_only", rpc_bdev_lvol_set_lvs_read_only
 struct rpc_bdev_lvol_delete {
 	char *name;
 	bool sync;
+	bool special_delete;
 };
 
 static void
@@ -1908,6 +1909,7 @@ free_rpc_bdev_lvol_delete(struct rpc_bdev_lvol_delete *req)
 static const struct spdk_json_object_decoder rpc_bdev_lvol_delete_decoders[] = {
 	{"name", offsetof(struct rpc_bdev_lvol_delete, name), spdk_json_decode_string},
 	{"sync", offsetof(struct rpc_bdev_lvol_delete, sync), spdk_json_decode_bool, true},
+	{"special_delete", offsetof(struct rpc_bdev_lvol_delete, special_delete), spdk_json_decode_bool, true},
 };
 
 static void
@@ -1922,8 +1924,6 @@ rpc_bdev_lvol_delete_cb(void *cb_arg, int lvolerrno)
 	return;
 
 invalid:
-	// spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
-	// 				 spdk_strerror(-lvolerrno));
 		spdk_jsonrpc_send_error_response(request, lvolerrno,
 					 spdk_strerror(-lvolerrno));
 }
@@ -1987,6 +1987,12 @@ done:
 						 "Deleting async lvol on non-leader lvs.");
 		goto cleanup;
 	}
+
+	if (req.special_delete) {
+		SPDK_NOTICELOG("Set special delete migration flag for lvol '%s'\n", req.name);
+		spdk_lvol_set_migration_flag(lvol);
+	}
+
 	vbdev_lvol_destroy(lvol, rpc_bdev_lvol_delete_cb, request, req.sync);
 
 cleanup:
@@ -2436,6 +2442,14 @@ struct rpc_bdev_lvol_get_lvol_delete_status {
 	char *name;
 };
 
+enum rpc_lvol_delete_status {
+	LVOL_DELETE_NOT_FOUND_OR_DELETED = 0,
+	LVOL_DELETE_PENDING = 1,
+	LVOL_DELETE_DONE = 2,
+	LVOL_DELETE_DONE_LEADERSHIP_CHANGED = 3,
+	LVOL_DELETE_NO_ASYNC_REQUEST = 4,
+};
+
 static void
 free_rpc_bdev_lvol_get_lvol_delete_status(struct rpc_bdev_lvol_get_lvol_delete_status *req)
 {
@@ -2447,13 +2461,14 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_get_lvol_delete_statu
 };
 
 static void
-rpc_bdev_lvol_get_lvol_delete_status(struct spdk_jsonrpc_request *request, const struct spdk_json_val *params)
+rpc_bdev_lvol_get_lvol_delete_status(struct spdk_jsonrpc_request *request,
+				     const struct spdk_json_val *params)
 {
 	struct rpc_bdev_lvol_get_lvol_delete_status req = {};
-	struct spdk_lvol *lvol;
-	char *lvs_name = NULL, *lvol_name = NULL;
+	struct spdk_lvol *lvol = NULL;
+	char *lvs_name = NULL, *lvol_name = NULL, *name_parse = NULL;
+	const char *full_name = NULL;
 	struct spdk_lvol_store *lvs = NULL;
-	int rc;
 	struct spdk_json_write_ctx *w;
 
 	if (spdk_json_decode_object(params, rpc_bdev_lvol_get_lvol_delete_status_decoders,
@@ -2465,72 +2480,57 @@ rpc_bdev_lvol_get_lvol_delete_status(struct spdk_jsonrpc_request *request, const
 		goto cleanup;
 	}
 
-	/* lvol is degraded, get lvol via lvs_name/lvol_name */
-	lvol_name = strchr(req.name, '/');
-	if (lvol_name != NULL) {
-		*lvol_name = '\0';
-		lvol_name++;
-		lvs_name = req.name;
-		lvol = spdk_lvol_get_by_names(lvs_name, lvol_name);
-		if (lvol != NULL) {
-			lvs = lvol->lvol_store;
-			goto done;
-		}
-	}
-
-	if (lvs_name == NULL) {
-		SPDK_ERRLOG("lvolstore: %s not found.\n", req.name);
-		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
+	full_name = req.name;
+	name_parse = strdup(req.name);
+	if (name_parse == NULL) {
+		spdk_jsonrpc_send_error_response(request, -ENOMEM, spdk_strerror(ENOMEM));
 		goto cleanup;
 	}
 
-	if (lvs_name) {
-		rc = vbdev_get_lvol_store_by_uuid_xor_name(NULL, lvs_name, &lvs);
-		if (rc != 0) {
-			SPDK_ERRLOG("lvolstore: %s not found.\n", lvs_name);
-			spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
-			goto cleanup;
+	lvol_name = strchr(name_parse, '/');
+	if (lvol_name != NULL) {
+		*lvol_name = '\0';
+		lvol_name++;
+		lvs_name = name_parse;
+		lvol = spdk_lvol_get_by_names(lvs_name, lvol_name);
+		if (lvol != NULL) {
+			lvs = lvol->lvol_store;
 		}
 	}
 
-	done:
-	if(lvol == NULL) {
-		SPDK_NOTICELOG("lvol: %s delete request completed successfully before.\n", req.name);
-		w = spdk_jsonrpc_begin_result(request);
-		spdk_json_write_int32(w, 0);
-		spdk_jsonrpc_end_result(request, w);
-	} else {
-		w = spdk_jsonrpc_begin_result(request);
-		if (lvol_delete_requests_contains(lvol)) {
-			if (lvol->deletion_status == 1) {
-				SPDK_NOTICELOG("lvol: %s the delete requests in progress.\n", req.name);
-				spdk_json_write_int32(w, 1);
-				spdk_jsonrpc_end_result(request, w);
-			} else if (lvol->deletion_status == 0) {
-				SPDK_NOTICELOG("lvol: %s the delete requests still waiting in queue.\n", req.name);
-				spdk_json_write_int32(w, 1);
-				spdk_jsonrpc_end_result(request, w);
-			}
-		} else if (lvol->deletion_status == 2 && lvs->leader) {
-				SPDK_NOTICELOG("lvol: %s the async delete requests done.\n", req.name);
-				spdk_json_write_int32(w, 2);
-				spdk_jsonrpc_end_result(request, w);
-		} else if (lvol->deletion_status == 2 && !lvs->leader) {
-				SPDK_NOTICELOG("lvol: %s the async delete requests done.\n", req.name);
-				spdk_json_write_int32(w, 3);
-				spdk_jsonrpc_end_result(request, w);
- 		} else if (lvol->deletion_failed) {
-			SPDK_NOTICELOG("lvol: %s delete request failed due to error.\n", req.name);
-			spdk_json_write_int32(w, lvol->failed_rc);
-			spdk_jsonrpc_end_result(request, w);
+	w = spdk_jsonrpc_begin_result(request);
+	if (lvol == NULL) {
+		SPDK_NOTICELOG("lvol: %s delete request completed successfully before.\n", full_name);
+		spdk_json_write_int32(w, LVOL_DELETE_NOT_FOUND_OR_DELETED);
+	} else if (lvol_delete_requests_contains(lvol)) {
+		if (lvol->deletion_status == 1) {
+			SPDK_NOTICELOG("lvol: %s the delete request is in progress.\n", full_name);
+		} else if (lvol->deletion_status == 0) {
+			SPDK_NOTICELOG("lvol: %s the delete request is still waiting in queue.\n", full_name);
 		} else {
-			SPDK_NOTICELOG("No delete action on lvol: %s.\n", req.name);
-			spdk_json_write_int32(w, 4);
-			spdk_jsonrpc_end_result(request, w);
+			SPDK_ERRLOG("lvol: %s has unexpected deletion_status=%d while in delete queue.\n",
+				    		full_name, lvol->deletion_status);
 		}
+		spdk_json_write_int32(w, LVOL_DELETE_PENDING);
+	} else if (lvol->deletion_status == 2) {
+		SPDK_NOTICELOG("lvol: %s the async delete request is done.\n", full_name);
+		if (lvs->leader) {
+			spdk_json_write_int32(w, LVOL_DELETE_DONE);
+		} else {
+			spdk_json_write_int32(w, LVOL_DELETE_DONE_LEADERSHIP_CHANGED);
+		}
+	} else if (lvol->deletion_failed) {
+		SPDK_NOTICELOG("lvol: %s delete request failed due to error.\n", full_name);
+		spdk_json_write_int32(w, lvol->failed_rc);
+	} else {
+		SPDK_NOTICELOG("No delete action on lvol: %s.\n", full_name);
+		spdk_json_write_int32(w, LVOL_DELETE_NO_ASYNC_REQUEST);
 	}
+
+	spdk_jsonrpc_end_result(request, w);
 
 cleanup:
+	free(name_parse);
 	free_rpc_bdev_lvol_get_lvol_delete_status(&req);
 }
 

@@ -2494,11 +2494,13 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     def bdev_lvol_delete(args):
         rpc.lvol.bdev_lvol_delete(args.client,
                                   name=args.name,
-                                  sync=args.sync)
+                                  sync=args.sync,
+                                  special_delete=args.special_delete)
 
     p = subparsers.add_parser('bdev_lvol_delete', help='Destroy a logical volume')
     p.add_argument('name', help='lvol bdev name')
     p.add_argument('-s', '--sync', action='store_true', help='sync delete ops for lvol node, default False')
+    p.add_argument('-f', '--special-delete', action='store_true', help='use special delete logic, default False')
     p.set_defaults(func=bdev_lvol_delete)
     
     def bdev_lvol_get_lvol_delete_status(args):
