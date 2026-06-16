@@ -1,4 +1,4 @@
-FROM fedora:41
+FROM public.ecr.aws/simply-block/spdk-core:base_image
 
 # push to "simplyblock/spdk-core:$TAG"
 
