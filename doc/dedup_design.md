@@ -224,6 +224,22 @@ mandate at deployment time.
 
 ## 5. On-disk format changes (SPDK blobstore)
 
+![Dedup extent types and how they map onto distrib pages](dedup_extent_types.png)
+
+The figure above summarizes the on-disk model. A snapshot's basic structure (the sparse list
+of allocated extents, chaining and fallback logic) is **unchanged**. When the dedup threshold
+is **not** reached, an extent's allocation and mapping is also unchanged — a regular extent
+still maps directly to a distrib page (2 MiB) via raid0. When the threshold **is** met, two
+new extent types come into play — the **reference extent** and the **compacted extent**
+("compaction extent" in the figure) — both of which map to underlying distrib pages exactly
+like regular extents. A snapshot cluster entry pointing at a reference extent carries, in
+addition to the extent's base address, an **offset** that selects one of the reference blocks
+inside it (§5.2). A reference extent holds arrays of 64-bit addresses — `(blob-id, extent,
+offset)` vLBAs (§4) — pointing at the start of each 256 KiB segment; **8 addresses per 2 MiB
+extent**. A compacted extent stores the 256 KiB segments themselves, gathered from different
+snapshot extents and possibly different snapshots, and those segments are reachable **only**
+via the vLBAs stored in reference extents.
+
 ### 5.1 Requirement
 
 Only **two** extent types are ever named directly by a snapshot's cluster map:
@@ -388,7 +404,10 @@ The pool itself is a flat table of extent descriptors, persisted alongside the h
 struct dedup_ref_extent_desc {
     uint64_t base_backing_lba;   /* raid0 LBA of this 2 MiB extent, in 4 KiB-block units */
     uint16_t shard;              /* which shard owns it (§8.4)                           */
-    /* the 32768-bit ref-block allocation bitmap lives in the shard, not here */
+    /* the 32768-bit ref-block allocation bitmap AND the per-ref-block refcounts (§7.4a)
+     * live in the shard, not here (a ref block is exactly 64 B on disk with no room for a
+     * refcount). The refcount counts how many live snapshots/generations point at the
+     * block; the bitmap is just `refcount > 0`. */
 };
 struct dedup_ref_extent_desc ref_pool[N_REF_EXTENTS];   /* default N_REF_EXTENTS = 200 */
 ```
@@ -770,14 +789,35 @@ to backing storage — the durability anchor for GC reconciliation, §10.1). The
 work is **decrementing the shared refcounts** and freeing slots / reference blocks / extents
 only when they reach zero. Cases for an unmap of live-lvol or snapshot cluster `c`:
 
+#### 7.4a Reference-count invariant (spec remark — load-bearing)
+
+> Both shared object kinds carry a reference count of how many live snapshots/generations
+> point into them:
+> - a **compacted segment** (256 KiB slot) — counted by `HashEntry.refcount` (§8.1);
+> - a **reference block** (and, transitively, the **reference extent** that contains it) —
+>   counted by the per-ref-block refcount kept in the shard (§5.4).
+>
+> An object **must not be removed merely because the snapshot that directly references it is
+> deleted, or because that snapshot unmaps the extent.** Either event only *decrements* the
+> count. The slot / reference block / extent is reclaimed **only when its refcount reaches
+> zero** — i.e. when no live snapshot references it any longer — because active references
+> from other snapshots may still exist. This is precisely what makes a shared extent outlive
+> any single snapshot that references it (§5.5), and why deletion is reference-counted rather
+> than chain-driven. The same multi-referrer sharing applies to **reference blocks**: an
+> unmodified extent carried forward by pointer into a new generation (§9.2a) leaves *two*
+> generations pointing at the *same* reference block, so the block's refcount is ≥ 2 and a
+> delete/unmap of either one alone must not free it.
+
 | Case | cluster `c` | action |
 |------|-------------|--------|
 | **U1** | regular, whole cluster | free the cluster, return to allocator — **unchanged** |
 | **U2** | regular, partial | punch hole within the cluster — **unchanged** |
-| **U3** | reference (type 1) | for each fully-covered 256 KiB segment, `seg_unref()` (below); partially-covered segments are left intact (still referenced) |
+| **U3a** | reference (type 1), **whole cluster** | drop this snapshot's reference to the block: `ref_block_unref()` (§7.4a), which decrements the block's refcount and, only on its last referrer, cascades `seg_unref()` per segment |
+| **U3b** | reference (type 1), **partial** | only the fully-covered 256 KiB segments are affected; partially-covered segments are left intact. If the block is **shared** (refcount ≥ 2) it must first be **COW-cloned** for this snapshot (fresh reference block, decrement the shared one) before zeroing the covered segments' vLBAs and `seg_unref()`-ing them — never mutate a block another generation still points at |
 
-`seg_unref` is where shared lifetime is resolved — note that freeing cascades only when the
-last referrer drops:
+`seg_unref` is where a **segment's** shared lifetime is resolved — freeing cascades only when
+the last referrer drops; the reference *block's* lifetime is resolved one level up by its own
+refcount (§7.4a):
 
 ```c
 /* ultra: drop one reference to a relocated segment; cascade frees on last ref */
@@ -797,17 +837,31 @@ void seg_unref(uint64_t seg_vlba) {
 }
 ```
 
-And the reference block itself is reclaimed once it points at nothing live:
+And the reference block itself is reclaimed only when the **last snapshot** referencing it
+goes away — driven by its refcount, not by scanning its segment pointers (a shared block still
+describes live segments for the *other* generations that point at it, §7.4a):
 
 ```c
-/* after unmapping the cluster that referenced this block */
+/* called once per snapshot cluster entry that stops pointing at this block —
+ * i.e. on unmap of a type-1 cluster (§7.4 U3a) or on snapshot delete (§9). */
 void ref_block_unref(uint32_t ref_ext_id, uint32_t ref_blk_ofs) {
+    if (ref_block_dec_refcount(ref_ext_id, ref_blk_ofs) > 0)
+        return;                                        /* other generations still point here */
+
+    /* last referrer gone → drop the segment refs this block held, then free the block */
     ref_block_t *rb = refcache_get(ref_ext_id, ref_blk_ofs);
     for (int s = 0; s < SEGMENTS_PER_EXTENT; s++)
-        if (rb->segment_vlba[s]) return;               /* still describes a live segment */
-    ref_extent_free_block(ref_ext_id, ref_blk_ofs);    /* 64-byte block returns to the shard */
+        if (rb->segment_vlba[s])
+            seg_unref(rb->segment_vlba[s]);            /* cascades to slot/extent free above */
+    ref_extent_free_block(ref_ext_id, ref_blk_ofs);    /* 64-byte block returns to the shard;
+                                                          a reference extent whose blocks are
+                                                          all free is released like a cext */
 }
 ```
+
+Note the ordering: a reference block drops its segment references (`seg_unref`, which in turn
+honors each segment's own refcount) **only on its own last referrer**, so a compacted segment
+is never freed while any live reference block — for any snapshot — still names it.
 
 - **Anti-fragmentation (spec §3a):** a freed slot is immediately re-fillable by future
   compaction; the extent's `slot_occupancy` is the free list.
@@ -1048,9 +1102,16 @@ new internal snapshot at the head with at most one live internal snapshot.
 1. **Freeze**: the new internal snapshot already froze current data into `new_snapshot`.
 2. **Iterate extents of `new_snapshot`:**
 
-   **a. Unmodified regular extent** (identical to the previous generation): include by
-   **pointer** into the new generation — no hashing, no data movement. (Detected via the
-   snapshot-delta / extent map; an extent untouched since last generation needs no work.)
+   **a. Unmodified extent** (identical to the previous generation): include by **pointer**
+   into the new generation — no hashing, no data movement. (Detected via the snapshot-delta /
+   extent map; an extent untouched since last generation needs no work.) Two sub-cases:
+      - **was regular (type 0)** → copy the type-0 entry forward unchanged.
+      - **was reference (type 1)** → copy the `(ref_extent_id, ref_block_ofs)` entry forward
+        and **increment that reference block's refcount** (§7.4a): the new generation now
+        shares the *same* reference block (and through it the same compacted segments) with the
+        prior generation. No segment data is re-hashed, re-copied, or re-pointed. This is the
+        step that makes a reference block refcount ≥ 2, and exactly why a later delete/unmap of
+        one generation must only decrement, never free (§7.4a).
 
    **b. Modified, was regular** → candidate for dedup:
       1. Hash all 512 blocks (8 segments × 64 blocks).
@@ -1120,14 +1181,20 @@ already exist and we reconcile against them on restart:
    unmap (`jfi_r_unmap_vuid`). So we cannot rely on the JM alone to replay individual
    compacted-slot frees.
 
-On restart, a GC pass reconciles our (lost) in-memory slot/reference bitmaps:
-- Rebuild compacted-extent slot occupancy by **scanning the extent metadata of all live
-  generations** (authoritative, recovered on examine): every type-`1` reference block's
-  segment vLBAs that resolve into a compacted extent mark those slots used; unreferenced
-  slots are free.
-- Rebuild reference-block occupancy the same way: a reference block pointed to by some live
-  cluster is used; otherwise free.
+On restart, a GC pass reconciles our (lost) in-memory bitmaps **and refcounts** (§7.4a) by
+**scanning the extent metadata of all live generations** (authoritative, recovered on examine).
+Because every refcount is exactly "how many live snapshots point in", it is fully
+reconstructible from that scan:
+- Rebuild each **reference block's refcount** = the number of live type-`1` cluster entries
+  (across all generations) that name it. A block with refcount 0 is free; a reference extent
+  whose blocks are all free is released.
+- Rebuild each **compacted-segment slot's refcount** = the number of live reference blocks
+  whose segment vLBAs resolve into that slot; mark occupied slots used, unreferenced slots
+  free, and release an all-free compacted extent.
 - A cluster entry that resolves to no live physical data is freed (virtual space only).
+
+Counting referrers (not just presence) is what lets GC correctly preserve an extent that
+multiple snapshots share and free one only when its last referrer is gone (§7.4a).
 
 This makes the in-memory bitmaps a **reconstructible cache of authoritative metadata**, not a
 source of truth — which sidesteps the "can't journal every bit" problem. Transient
