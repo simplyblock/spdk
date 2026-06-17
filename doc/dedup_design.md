@@ -908,7 +908,10 @@ lives`. It is fundamentally a **cache** — evicting an entry only forgoes a *fu
 opportunity, never correctness. The **authoritative** lifetime of a compacted segment is the
 set of reference blocks across all live generations, reconciled by GC (§10.1); the per-entry
 `refcount` is a denormalized accelerator for the resident case (so inline unmap, §7.4, can
-free immediately when the entry is present, and defer to GC when it isn't).
+free immediately when the entry is present, and defer to GC when it isn't). Because it is only
+needed to *find* duplicates during compaction, the hash pool is **maintained solely on the
+active node**; standbys carry none and materialize one from the checkpoint only on promotion
+(§10.2.2).
 
 ```cpp
 struct HashEntry {
@@ -1163,7 +1166,7 @@ idempotent), optimize to resumable later.
 
 ---
 
-## 10. Crash consistency & recovery
+## 10. Crash consistency, recovery & multi-node failover
 
 | State | Persistence | Recovery |
 |---|---|---|
@@ -1214,6 +1217,115 @@ over-counting after a crash only wastes space until GC runs; it never corrupts d
 instead of a full metadata scan. Proposed default: **metadata-scan GC first** (simpler,
 correct); add journaled slot-frees later if scan cost is too high on large clusters.
 
+### 10.2 Multi-node HA & failover (NVMe-oF multipathing)  **[load-bearing]**
+
+**Context.** lvols are exported over NVMe-oF with **secondary and tertiary nodes attached via
+multipathing (ANA)** that continue serving I/O seamlessly on fail-over. Today a standby keeps a
+warm copy of the lvstore and, on promotion, **reloads up-to-date blob metadata (the cluster /
+extent-page metadata) from disk**; in steady state, material blob changes (create / resize /
+delete) are mirrored to the standbys **via RPC**. Dedup adds substantial in-memory state — the
+hash pool, typed extents + `cluster_ref[]`, the reference-extent pool descriptors + occupancy
+bitmaps + refcounts (§7.4a), and the reference-block cache — **all of which must fit this
+fail-over model.** This section is the contract for that.
+
+**Guiding principle — same as §10.** *Every* dedup in-memory structure is either **(a)
+authoritative on disk** or **(b) reconstructible from authoritative on-disk metadata.** Nothing
+in-memory has to be *replicated between nodes* for correctness. **Fail-over is just crash
+recovery (§10/§10.1) performed on an already-warm peer** — the recovery machinery is reused
+verbatim; the only additions are steady-state RPC propagation and a freed-slot-reuse ordering
+rule (both below).
+
+#### 10.2.1 Single-writer invariant
+
+Only the **active** node runs compaction and mutates the dedup metadata: hash pool, slot
+allocators, occupancy bitmaps, refcounts, and reference/compacted-extent allocation. Secondary
+and tertiary nodes are **read-only resolvers** — they resolve type-1 reference clusters to
+serve reads (§7), but never compact, never reserve/free a slot or reference block, and never
+mutate the hash pool. There is therefore a **single writer** to the on-backing-dev dedup
+structures across the whole multipath group, exactly as there is a single writer to ordinary
+blob metadata today. (sbcli, which already chooses the active node, also gates which node is
+allowed to start compaction, §12.)
+
+#### 10.2.2 What each role needs in memory
+
+| State | Role that needs it | Source on a fresh/promoted node |
+|---|---|---|
+| `cluster_types[]` / `cluster_ref[]` / `clusters[]` (typed extents) | **read path — all nodes** | **(a)** on-disk `EXTENT_PAGE_V2`, reloaded on examine/promotion (§5.3) |
+| `ref_pool[]` descriptor base LBAs (§5.4) | **read path — all nodes** | **(b)** derived from the owning internal blob's cluster map (on disk) |
+| reference-block cache (§8.2) | read path — all nodes | cold; lazy-loaded from disk via the resolver (§7.1) |
+| compacted-segment → backing LBA (§5.5) | read path — all nodes | **(a)** internal blob's on-disk cluster map |
+| slot/reference **occupancy + refcounts** (§7.4a) | **compaction — active only** | **(b)** rebuilt by the GC metadata scan (§10.1) |
+| hash pool (§8.1) | **compaction — active only** | checkpoint on disk (§11), or cold |
+
+The key consequence: a standby can **resolve every read correctly using only on-disk +
+reconstructible state** — it needs *no* hash pool at all, because the hash pool exists solely to
+*find* duplicates during compaction, which only the active node performs. A standby therefore
+carries **no live hash pool**; it materializes one only on promotion, and even then lazily
+(§10.2.4).
+
+#### 10.2.3 Steady-state propagation to standbys
+
+The existing "material blob change → RPC to secondaries" path is **extended to the new
+dedup-driven blob-lifecycle events**, so a standby's in-memory blob table stays current without
+polling disk:
+
+- create an **internal compaction blob** (§5.5);
+- create / resize a **reference-extent blob** (§5.4);
+- create a **new generation** (compacted snapshot) and, after finalize, **delete the superseded
+  old generation / merge the dead internal snapshot** (§6.1, §9.2 finalize);
+- set / clear `SPDK_BLOB_DEDUP` on a blob (§5.2).
+
+These are all ordinary blob create/resize/delete events on internal + snapshot blobs — they
+reuse the same registration mechanism, just with more blobs in play. Applying them keeps a
+standby able to reach newly created reference/compacted extents **immediately** (not only after
+a disk reload), so a read arriving on a non-optimized path right after a new generation lands
+still resolves. On-disk metadata stays the source of truth at promotion regardless.
+
+#### 10.2.4 Fail-over / promotion sequence (node becoming active)
+
+1. **Reload blob metadata from disk** (existing behavior), now parsing `EXTENT_PAGE_V2` →
+   up-to-date `cluster_types[]` / `cluster_ref[]` / `clusters[]` for *all* blobs, including
+   internal compaction and reference-extent blobs.
+2. **Rebuild the reconstructible dedup state via the GC metadata scan (§10.1):** `ref_pool`
+   base LBAs, reference-block occupancy + refcounts, compacted-slot occupancy + refcounts.
+   Authoritative, no cross-node replication.
+3. **Load the latest valid hash-pool checkpoint (§11)**, dropping entries for generations that
+   no longer exist — or start cold. The hash pool is a **cache**; a stale/empty one only lowers
+   the *future* dedup ratio, never correctness (§8.1).
+4. The **reference-block cache starts cold** and warms lazily through the resolver (§7.1) —
+   cold-cache read amplification only, bounded by S3-FIFO admission (§8.2.1).
+5. **Discard any half-built generation** left by compaction interrupted on the failed node
+   (§6.3, §9.3); finalize-then-delete ordering guarantees the chain it reads is valid. Resume /
+   restart compaction as the new active.
+
+The node can **serve reads as soon as step 1 (and lazy reference reads) are available**; steps
+2–5 only gate *compaction*, which a freshly-promoted node need not start immediately.
+
+#### 10.2.5 Freed-slot / reference-block reuse ordering  **[load-bearing]**
+
+Because a standby may read the same backing store the active is mutating, a freed reference
+block or compacted slot must not be **reused** until every metadata entry that referenced it is
+both **(a) durably synced** and **(b) propagated to standbys**. The active therefore orders:
+
+```
+drop last reference (refcount → 0, §7.4a)
+  → sync the metadata that stopped referencing it (generation delete / unmap)
+  → propagate that change by RPC (§10.2.3)
+  → only THEN return the slot / reference block to the allocator for reuse
+```
+
+This is the same ordering crash-safety already demands (finalize-then-delete, §6.3/§9.2;
+GC reconciliation, §10.1) — the multi-node case only adds the *propagation* step. As a result a
+standby can **never** resolve a stale `cluster_ref` into a *reused* slot: it either still sees
+the old generation (whose data is still live and not yet freed), or it has already been told the
+generation is gone (and dropped the `cluster_ref`). Reuse strictly trails both fences.
+
+**[OPEN]** (a) Keep the standby reference-block cache warm by snooping the active's writebacks
+(faster promotion) vs. cold-load on promotion. Proposed default: **cold-load** (simpler; warms
+fast under S3-FIFO). (b) Force a hash-pool checkpoint just before a *planned* failover so the
+promoted node starts warmer. Proposed default: **rely on the periodic checkpoint cadence**
+(§11); correctness is unaffected either way.
+
 ---
 
 ## 11. Hash-pool persistence (spec §4)
@@ -1247,7 +1359,13 @@ Minimal RPC surface (new RPCs in `lib/lvol` + module wiring):
 - `bdev_lvol_compaction_status <lvol>` — progress, current chain, last generation, errors.
 - `bdev_lvol_set_dedup <lvol> <on|off>` — set the per-blob `SPDK_BLOB_DEDUP` opt-in flag.
 
-sbcli owns cadence policy and calls these; it holds no dedup data structures.
+sbcli owns cadence policy and calls these; it holds no dedup data structures. It also already
+selects the **active** node of a multipath group — so it additionally **gates compaction to the
+active node only** (the single-writer invariant, §10.2.1) and is the natural driver of the
+fail-over promotion sequence (§10.2.4). The dedup-driven blob-lifecycle events that must reach
+secondary/tertiary nodes (new generation, deleted generation, new internal compaction /
+reference-extent blobs, `SPDK_BLOB_DEDUP` toggles) ride the **existing** "material blob change →
+RPC to secondaries" path (§10.2.3); no new standby-replication protocol is introduced.
 
 ---
 
@@ -1268,6 +1386,10 @@ sbcli owns cadence policy and calls these; it holds no dedup data structures.
     confirmation, not a constraint to negotiate.
 12. **Journaled slot-frees** (§10.1) — metadata-scan GC only, or add a JM-journaled
     compacted-slot/reference free record for incremental GC?
+13. **Standby cache warmth** (§10.2.5) — snoop the active's reference-block writebacks to keep
+    a standby cache warm (faster promotion), or cold-load on promotion (simpler)?
+14. **Pre-failover hash-pool checkpoint** (§10.2.5) — force a checkpoint before a *planned*
+    failover, or rely on the periodic cadence (§11)? Correctness-neutral either way.
 
 Each has a proposed default so implementation can proceed without blocking.
 
@@ -1360,10 +1482,19 @@ stays shippable. Every phase ships with tests.
 - **Tests**: orchestration integration test exercising the §6.1 chain transitions end to end.
 - **Exit**: cadence-driven compaction runs unattended; chain depth stays bounded.
 
-### Phase 9 — Hardening
+### Phase 9 — Multi-node fail-over (§10.2) + hardening
+- **Fail-over**: wire dedup blob-lifecycle events into the existing standby RPC propagation
+  (§10.2.3); enforce the single-writer/compaction-gating invariant (§10.2.1); implement the
+  promotion sequence (reload metadata → GC scan → load checkpoint → cold caches, §10.2.4) and
+  the freed-slot reuse ordering fence (§10.2.5).
+- **Tests**: read on a standby resolves type-1 clusters correctly with cold caches; promote a
+  standby mid-compaction → reads stay correct, half-built generation discarded, compaction
+  resumes; inject a freed-then-reused slot race → standby never reads stale data; measure
+  promotion time (GC scan + cache warm-up).
 - Fault injection across phases (node restart mid-compaction, eviction storms, full pools),
   perf benchmarking (read amp with cold/warm reference cache), tunable sweep, soak.
-- **Exit**: meets perf goals (no read amp when cached); stable under soak + fault injection.
+- **Exit**: meets perf goals (no read amp when cached); seamless fail-over with correct reads;
+  stable under soak + fault injection.
 
 ### Dependency graph
 ```
@@ -1393,3 +1524,10 @@ P5 ─► P8 ──────────────────────�
 - **Per-chunk unmap not journaled today (§10.1)** — relying on metadata-scan GC; if scan cost
   is prohibitive on large clusters, falls back to adding a journaled slot-free record (open
   item 12). Mitigated because in-memory bitmaps are reconstructible, never authoritative.
+- **Multi-node fail-over of the larger dedup state (§10.2)** — hash pool, typed extents,
+  reference-extent descriptors/bitmaps and the reference-block cache all change the standby's
+  in-memory footprint. Mitigated structurally: every structure is on-disk-authoritative or
+  reconstructible, only the active node writes (single-writer invariant), and freed-slot reuse
+  trails both the metadata sync and its RPC propagation — so a standby never reads a reused slot
+  through a stale pointer. Promotion cost (GC scan + cold caches) is bounded and quantified in
+  P9; correctness never depends on cross-node replication.
