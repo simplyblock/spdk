@@ -187,9 +187,15 @@ Consequently **every vLBA is uniform**: regular data, relocated/compacted segmen
 `(blob, cluster, 4 KiB offset)` and all resolve through the owning blob's cluster map
 (`bs_cluster_to_lba` over `active.clusters[]`). There is no separate "compacted address
 space" and no second translation path (see §5.5 — this supersedes the earlier descriptor-table
-idea). The only specially-managed pool with a compact index is the **reference-extent pool**,
-which is *bounded* (hundreds of extents) and so is addressed by a small pool index in the
-type-1 cluster entry rather than a full vLBA (§5.2, §5.4).
+idea). The one place a non-vLBA address is used is the **reference-extent pool**: a type-1
+cluster entry names a reference *block* by a compact `(reference-extent id, in-extent block
+offset)` pair rather than a vLBA. The reason is **granularity, not boundedness** — a reference
+block is a 64-byte sub-block object (32768 per 2 MiB extent, §5.4), which a 4 KiB-granular vLBA
+cannot address; the 32-bit extent id, by contrast, scales freely. **The reference-extent pool
+itself is *not* bounded** — it grows on demand with the volume of deduplicated data, exactly
+like compacted extents. What *is* bounded is (a) how many reference extents are kept **resident
+in RAM** — a cache with eviction (§8.2) — and (b) the **number of shards** used to spread I/O
+without congestion (§8.4); each shard owns a growing set of extents (§5.2, §5.4).
 
 > The decode contract (`vLBA → backing LBA` via the owning blob's cluster map) lives in ultra
 > and is the single source of truth; SPDK treats vLBAs as opaque 64-bit values it stores and
@@ -403,8 +409,9 @@ of these reference blocks, via the `(ref_extent_id, ref_block_ofs)` pair from §
 - `ref_extent_id` selects a reference extent in the pool (its descriptor → backing LBA, below);
 - `ref_block_ofs ∈ [0, 32768)` selects the 64-byte reference block within that extent.
 
-The pool itself is a flat table of extent descriptors, persisted alongside the hash pool
-(§8/§10) and rebuilt on load:
+The pool itself is a **growing** table of extent descriptors (indexed by `ref_extent_id`),
+persisted alongside the hash pool (§8/§10) and rebuilt on load. It has **no fixed cap** — new
+reference extents are allocated on demand as more snapshot extents acquire dedup layouts:
 
 ```c
 /* ultra: the reference-extent pool. Each extent is a (shared) cluster of an internal blob,
@@ -418,8 +425,15 @@ struct dedup_ref_extent_desc {
      * refcount). The refcount counts how many live snapshots/generations point at the
      * block; the bitmap is just `refcount > 0`. */
 };
-struct dedup_ref_extent_desc ref_pool[N_REF_EXTENTS];   /* default N_REF_EXTENTS = 200 */
+/* grows on demand — NOT a fixed-size array; ref_extent_id indexes it. */
+std::vector<dedup_ref_extent_desc> ref_pool;
 ```
+
+**Note — the *descriptor* table (`ref_pool`) is small and may stay fully resident; the 2 MiB
+extent *contents* are not.** A descriptor is ~16 bytes, so even millions of reference extents
+cost only tens of MiB of descriptors — but their combined 2 MiB payloads are far too large for
+RAM at scale, which is exactly why the reference-block **cache** (§8.2) holds only a resident
+subset and evicts the rest back to the backing dev.
 
 Resolving a reference cluster to the 4 KiB device block that holds its reference block (the
 first hop of the read path, §7.1) is pure arithmetic — **no metadata page is read**:
@@ -438,13 +452,19 @@ ultra reads that 4 KiB block (or finds it in the reference-block cache, §8.2), 
 64-byte `dedup_ref_block`, then resolves each segment vLBA it needs (§5.5).
 
 - One reference extent → layouts for up to **32768** logical extents.
-- Pool of **200** reference extents (≈ 400 MiB), pseudo-randomly sharded by extent address
-  to avoid hot-spotting (§8.4). Shards grow by allocating additional reference extents on
-  demand when full.
-- Addressing capacity sanity check: 200 × 32768 × 2 MiB ≈ **12.8 TiB** of *referenced
-  logical* data per pool. **[OPEN]** the spec states "≈0.11 PB"; the arithmetic gives
-  ~0.012 PB. Likely the intended pool/extent size is larger, or 0.11 PB is a typo. Flag to
-  spec owner; the pool size is a tunable, not a correctness issue.
+- The pool is **unbounded** and grows with the deduplicated footprint. Reference extents are
+  pseudo-randomly sharded by extent address purely to **parallelize I/O without congestion**
+  (§8.4); each **shard** owns a *growing* set of reference extents and allocates another on
+  demand when its current ones are full. The **number of shards** is the bounded quantity
+  (sized for parallelism, ≈ cores), **not** the number of extents.
+- The bound that matters for RAM is the **resident** set: reference extents are held in a
+  cache with eviction (§8.2) — ideally all resident, but capped by available RAM, not by any
+  pool limit.
+- **[OPEN]** The spec mentions a ≈0.11 PB figure (§5.4). Since the pool no longer has a hard
+  cap, this is best read as a **resident-cache sizing target** (how much *referenced logical*
+  data the in-RAM reference-extent cache can reach: 0.11 PB ÷ (32768 × 2 MiB) ≈ 1750 resident
+  reference extents ≈ 3.5 GiB of cached extent payload), not a maximum. Confirm the intent with
+  the spec owner; either way it is a tunable, not a correctness constraint.
 
 ### 5.5 Compacted extent layout, and vLBA → backing-LBA translation
 
@@ -534,10 +554,13 @@ The ~200-wide open set keeps the chance of two workers colliding on one extent l
 the open set by snapshot / extent address (as the reference pool does, §8.4) reduces it
 further. The exact width (≈200) is a tunable, not a correctness property.
 
-Reference extents are managed the same way (shared clusters of internal blob(s), ~200 open,
-brief-lock slot reservation); the only difference is that the *bounded* reference pool is named
-from a snapshot entry by a compact pool index (§5.2/§5.4) rather than a full vLBA, since there
-are few reference extents.
+Reference extents are managed the same way (shared clusters of internal blob(s), a working set
+of open extents per shard, brief-lock reference-block reservation). The reference pool is
+**equally unbounded** — it grows with the deduplicated footprint (§5.4). The only real
+difference from compacted extents is *addressing*: a snapshot entry names a reference *block*
+by a compact `(ref_extent_id, ref_block_ofs)` pair (§5.2/§5.4) instead of a full vLBA — because
+a reference block is a 64-byte sub-block object a 4 KiB-granular vLBA cannot point at, **not**
+because reference extents are few.
 
 ### 5.6 Worked example — one extent, end to end
 
@@ -1048,10 +1071,17 @@ of capacity by key count. Build on the existing ultra primitives (`cppringbuf1_t
 
 ### 8.4 Reference-extent sharding (anti-congestion)
 
-`ref_shard = mix(extent_address) % n_ref_shards` where `mix` is a cheap bijective hash, so
-sequential extents scatter across reference extents instead of piling onto one. Within a
-shard, reserve the next free 64-byte reference block; grow the shard (new reference extent)
-when full.
+The **sole purpose of sharding is to parallelize I/O without congestion** — it is *not* a
+capacity bound. `ref_shard = mix(extent_address) % n_ref_shards` where `mix` is a cheap
+bijective hash, so a snapshot extent needing a reference-block slot is pseudo-randomly assigned
+to a shard, scattering sequential extents instead of piling them onto one. Within a shard,
+reserve the next free 64-byte reference block; **grow the shard by allocating another reference
+extent when its current ones are full.**
+
+- **`n_ref_shards` is the bounded quantity** — fixed, sized for parallelism (≈ cores), so
+  concurrent I/O spreads across independent shards with their own locks.
+- **The reference extents per shard are unbounded** — each shard's set grows on demand with the
+  deduplicated footprint (§5.4). Sharding caps *contention*, never *capacity*.
 
 ### 8.5 Reuse inventory — build on existing ultra primitives, don't reinvent
 
@@ -1379,7 +1409,9 @@ RPC to secondaries" path (§10.2.3); no new standby-replication protocol is intr
 6. **Worker thread model** (§9.1) — poller-on-lvs-thread vs dedicated thread.
 7. **Resume vs restart** of an interrupted run (§9.3).
 8. **Verify-before-dedup** strength (§11).
-9. **Reference-extent capacity** spec arithmetic (§5.4) — 0.11 PB vs ~0.012 PB.
+9. **Reference-extent resident-cache sizing** (§5.4) — the reference-extent pool is unbounded
+   (grows with the deduped footprint); confirm the spec's ≈0.11 PB is the *resident-cache reach*
+   target (≈1750 resident extents) and pick `n_ref_shards` (≈ cores).
 10. **Checksum/size/flags** fields actually needed in `HashEntry`.
 11. **Granularity** (§4.1) — confirm the 1:1:1 sizing (2 MiB lvs extent = distrib page =
     alceml page, with a 4 KiB distrib chunk). No special distrib config is required; this is a
