@@ -108,7 +108,8 @@ SPDK logical volumes are blobs in a blobstore (`lib/blob/blobstore.c`,
 
 ## 3. Glossary
 
-- **Extent / cluster** — a 2 MiB blob cluster.
+- **Extent / cluster** — a 2 MiB blob cluster. Cluster (spdk specific term), in this design, is 
+  equivalent to extent (industry term).
 - **Segment** — a 256 KiB contiguous range = 64 × 4 KiB blocks. Dedup granularity.
   8 segments per extent.
 - **Block** — a 4 KiB unit. Hashing granularity.
@@ -126,8 +127,7 @@ SPDK logical volumes are blobs in a blobstore (`lib/blob/blobstore.c`,
 ### 3.1 Two granularities — 4 KiB hashing vs 256 KiB dedup (load-bearing)
 
 The hashing unit and the dedup unit are **deliberately different**, and the gap between them
-is what makes the scheme effective. This distinction is fundamental, not an implementation
-detail:
+is what makes the scheme effective.
 
 - **Hashing is per 4 KiB block.** Every 4 KiB block is fingerprinted independently
   (BLAKE3-128) and its location recorded in the hash pool as a vLBA. This fine granularity is
@@ -175,11 +175,7 @@ The "blob selector" is **always a real blob page-id** (`bs_blobid_to_page`, `blo
 — there are **no reserved selector values**. A node's lvstore will never hold more than 2²⁴
 blobs, so 24 bits suffice with no truncation risk and no dense remapping table.
 
-This is deliberate and load-bearing: **compacted extents are addressed by the real blob-id of
-the (internal) blob that owns them**, not by a single reserved id. A reserved-id scheme would
-confine *every* compacted extent in the lvstore to one blob's 31-bit cluster space — a hard
-cap of 2³¹ clusters (≈ 4 PiB of compacted data per node), which is **not** acceptable. By
-using real blob-ids, compacted extents may be spread across as many internal blobs as needed,
+By using real blob-ids, compacted extents may be spread across as many internal blobs as needed,
 so the addressable compacted space is the full `2²⁴ blobs × 2³¹ clusters`. Compaction
 allocates new internal blobs for compacted extents on demand, exactly like any other blob.
 
@@ -187,15 +183,12 @@ Consequently **every vLBA is uniform**: regular data, relocated/compacted segmen
 `(blob, cluster, 4 KiB offset)` and all resolve through the owning blob's cluster map
 (`bs_cluster_to_lba` over `active.clusters[]`). There is no separate "compacted address
 space" and no second translation path (see §5.5 — this supersedes the earlier descriptor-table
-idea). The one place a non-vLBA address is used is the **reference-extent pool**: a type-1
-cluster entry names a reference *block* by a compact `(reference-extent id, in-extent block
-offset)` pair rather than a vLBA. The reason is **granularity, not boundedness** — a reference
-block is a 64-byte sub-block object (32768 per 2 MiB extent, §5.4), which a 4 KiB-granular vLBA
-cannot address; the 32-bit extent id, by contrast, scales freely. **The reference-extent pool
-itself is *not* bounded** — it grows on demand with the volume of deduplicated data, exactly
-like compacted extents. What *is* bounded is (a) how many reference extents are kept **resident
-in RAM** — a cache with eviction (§8.2) — and (b) the **number of shards** used to spread I/O
-without congestion (§8.4); each shard owns a growing set of extents (§5.2, §5.4).
+idea). 
+
+> [Important]
+>Interpretation of the vLBA has to be different for references into reference extents as those
+>are performed on a 64 bytes granularity rather than a 4K blocks granularity. The 
+>64 bits address space is sufficiently large to address all reference locations.
 
 > The decode contract (`vLBA → backing LBA` via the owning blob's cluster map) lives in ultra
 > and is the single source of truth; SPDK treats vLBAs as opaque 64-bit values it stores and
@@ -207,7 +200,8 @@ The vLBA addresses **logical blob content** (which blob, which cluster, which 4 
 The data physically lives at a **raid0 backing LBA** (what `clusters[i]` already holds today,
 `blobstore.h:48`). These are different spaces:
 
-- **vLBA** → identifies a piece of *dedup-tracked content* (hash-pool value, segment pointer).
+- **vLBA** → identifies a piece of *dedup-tracked content* (hash-pool value, segment pointer). 
+  While it can address single 4K blocks in this space, it usually points to 256KB segments. 
 - **backing LBA** → where blobstore reads/writes it on the raid0.
 
 A **regular** (type `0`) cluster has a concrete backing LBA in `clusters[]`. A **reference**
