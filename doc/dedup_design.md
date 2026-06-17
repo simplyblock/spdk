@@ -27,9 +27,11 @@ Confirmed design constraints (from spec review):
 - **Per-node / per-lvstore scope.** The hash pool, reference extents and compacted extents
   are local to a single SPDK data-plane node and its lvstore. The 64-bit address is unique
   within the node's lvstore by construction. There is **no** cross-node dedup, no shared
-  hash pool, no distributed consistency protocol.
+  hash pool, no distributed consistency protocol. However, its **important** that secondary 
+  nodes are not short of any meta-data required to seamlessly continue operation on fail-over. 
+  This also includes a relatively up-to-date version of the hash pool.   
 
-Anything marked **[OPEN]** is a decision the spec left ambiguous; each carries a proposed
+Anything marked **[OPEN]** requires a future decision; each carries a proposed
 default so implementation is not blocked, but the team should confirm.
 
 ---
@@ -70,7 +72,10 @@ SPDK logical volumes are blobs in a blobstore (`lib/blob/blobstore.c`,
   address space** — i.e. ordinary blobstore clusters, just specially typed/used. A vLBA
   resolves to a raid0 LBA, which raid0 splits across distribs, which split across alceml.
 
-We compact **snapshots, not live data.** The live lvol is never rewritten in place.
+> [!IMPORTANT]
+> We compact **snapshots, not live data.** The live lvol is never rewritten in place.
+> Compaction is thus run as an asynchronous background task. To ensure minimum compaction
+> cadence of all data, regular auto-snapshots are used. 
 
 ---
 
@@ -79,7 +84,11 @@ We compact **snapshots, not live data.** The live lvol is never rewritten in pla
 ### Goals
 1. Reduce physical footprint of snapshot data by deduplicating 256 KiB segments that recur
    within a node's lvstore, and by relocating unique segments into densely-packed
-   compacted extents.
+   compacted extents. The main target for deduplication are VMs; hundreds or thousands of
+   VMs may share significant amounts of data in their ephemeral on-disk images, leading to
+   potential storage savings of 1:100 and more. While data of on-disk images may not be 
+   perfectly aligned (can be shifted by single or multiple blocks), long contiguous ranges
+   of blocks are usually identical. 
 2. Keep dedup fully opt-in and backward compatible on disk.
 3. Run compaction asynchronously in the background, with bounded chain depth (at most one
    live internal snapshot).
