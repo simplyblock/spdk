@@ -454,11 +454,7 @@ ultra reads that 4 KiB block (or finds it in the reference-block cache, §8.2), 
 - The bound that matters for RAM is the **resident** set: reference extents are held in a
   cache with eviction (§8.2) — ideally all resident, but capped by available RAM, not by any
   pool limit.
-- **[OPEN]** The spec mentions a ≈0.11 PB figure (§5.4). Since the pool no longer has a hard
-  cap, this is best read as a **resident-cache sizing target** (how much *referenced logical*
-  data the in-RAM reference-extent cache can reach: 0.11 PB ÷ (32768 × 2 MiB) ≈ 1750 resident
-  reference extents ≈ 3.5 GiB of cached extent payload), not a maximum. Confirm the intent with
-  the spec owner; either way it is a tunable, not a correctness constraint.
+
 
 ### 5.5 Compacted extent layout, and vLBA → backing-LBA translation
 
