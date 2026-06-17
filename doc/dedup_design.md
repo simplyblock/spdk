@@ -233,7 +233,7 @@ mandate at deployment time.
 
 ## 5. On-disk format changes (SPDK blobstore)
 
-![Dedup extent types and how they map onto distrib pages](dedup_extent_types.png)
+![Dedup extent types and how they map onto distrib pages](img/dedup_extent_types.png)
 
 The figure above summarizes the on-disk model. A snapshot's basic structure (the sparse list
 of allocated extents, chaining and fallback logic) is **unchanged**. When the dedup threshold
