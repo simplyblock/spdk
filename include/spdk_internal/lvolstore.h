@@ -157,10 +157,9 @@ struct spdk_transfer_dev {
 	enum hublvol_state	state;
 	// uint64_t out_standing_io;
 	uint64_t redirected_io_count;
-	bool reused;
 	bool dev_in_remove;
 	bool drain_in_action;
-	bool pg[20];
+	int pg[20];
 	struct spdk_hublvol_channels *current_channel;
 	TAILQ_HEAD(, spdk_hublvol_channels)	redirect_channels;
 	struct spdk_lvol_store	*lvs;
@@ -170,14 +169,14 @@ struct spdk_transfer_dev {
 struct remote_lvol_info {
 	bool status; // true - connected, false - disconnected
 	enum xfer_type   type;
+	struct spdk_transfer_dev *tdev;
 	struct spdk_bdev_desc	*desc;
-	char *bdev_name;
-	bool reused;
+	// char *bdev_name;
 	struct spdk_io_channel	*channel;
 	struct spdk_io_channel	*md_channel;
 	struct spdk_lvs_poll_group *group;
 	struct spdk_poller *cleanup_poller;
-	uint32_t s3_id;
+	struct spdk_lvs_xfer *xfer_task;
 	uint64_t outstanding_io;
 	struct spdk_ring *free_ring;     /* tasks available for this snapshot */
     struct spdk_ring *ready_ring;    /* tasks ready to send to remote lvol */
@@ -202,20 +201,20 @@ struct spdk_lvs_poll_group {
 	TAILQ_ENTRY(spdk_lvs_poll_group)	entry;
 };
 
-struct remove_event {
-	struct spdk_lvs_poll_group *lpg;
-	struct spdk_transfer_dev *tdev;
-	struct remote_lvol_info *rmt_lvol;
-	char *bdev_name;
-	uint32_t s3_id;
-};
+// struct remove_event {
+// 	struct spdk_lvs_poll_group *lpg;
+// 	struct spdk_transfer_dev *tdev;
+// 	struct remote_lvol_info *rmt_lvol;
+// 	struct spdk_lvs_xfer *xfer_task;
+// 	uint32_t s3_id;
+// };
 
 struct spdk_lvs_xfer_req {
 	enum xfer_req_status status;
 	enum xfer_type   type;
 	enum req_action action;
 	uint64_t offset;
-	uint64_t s3_offset;
+	uint64_t dst_offset;
 	uint64_t len;
 	void *payload;
 	int fragments_outstanding;
@@ -237,12 +236,13 @@ struct spdk_lvs_xfer {
 	uint64_t current_offset;
 	uint64_t timeout;
 	struct spdk_poller 	*tmo_poller;
-	char bdev_name[SPDK_LVOL_NAME_MAX];
+	// char bdev_name[SPDK_LVOL_NAME_MAX];
 	char snapshot_name[SPDK_LVOL_NAME_MAX];
 	int len;
 	spdk_lvol_op_with_handle_complete	cb_fn;
 	void *cb_arg;
-	bool final_migration;
+	bool pg[20];
+	bool final_step;
 	bool signal_sent;
 	TAILQ_ENTRY(spdk_lvs_xfer)	entry;
 
@@ -272,7 +272,7 @@ struct spdk_lvs_xfer {
 	uint32_t hold_idx;
 	uint32_t idx;
 	bool persist_swap;
-	uint32_t s3_timeout_count;
+	uint32_t timeout_cnt;
 };
 
 struct spdk_lvol_store {
@@ -361,7 +361,7 @@ struct spdk_lvol {
 	uint16_t		redirect_map_id;
 	bool			redirect_failed;
 	bool			freezed;
-	bool			redirect_after_migration;
+	bool			redirect_io;
 
 	enum xfer_status transfer_status;
 	uint64_t last_offset;

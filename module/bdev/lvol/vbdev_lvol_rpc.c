@@ -3221,8 +3221,9 @@ rpc_bdev_lvol_s3_backup(struct spdk_jsonrpc_request *request,
 			      const struct spdk_json_val *params) 
 {
 	struct rpc_bdev_lvol_s3_backup req = {};
-	struct spdk_lvol *snapshot, **snapshot_chain;
+	struct spdk_lvol *snapshot;
 	struct spdk_bdev *lvol_bdev;
+	struct spdk_lvol *snapshot_chain[40];
 	int rc = 0;
 
 	if (spdk_json_decode_object(params, rpc_bdev_lvol_s3_backup_decoders,
@@ -3237,13 +3238,6 @@ rpc_bdev_lvol_s3_backup(struct spdk_jsonrpc_request *request,
 	if (req.s3_id == 0) {
 		SPDK_ERRLOG("s3_id must be specified");
 		spdk_jsonrpc_send_error_response(request, -EINVAL, spdk_strerror(EINVAL));
-		goto cleanup;
-	}
-
-	snapshot_chain = calloc(req.snapshot_names.num, sizeof(struct spdk_lvol *));
-	if (!snapshot_chain) {
-		spdk_jsonrpc_send_error_response(request,
-			SPDK_JSONRPC_ERROR_INVALID_PARAMS, "Cannot allocate memory for snapshot chain");
 		goto cleanup;
 	}
 
@@ -3392,7 +3386,7 @@ rpc_bdev_lvol_s3_recovery(struct spdk_jsonrpc_request *request,
 	struct rpc_bdev_lvol_s3_recovery req = {};
 	struct spdk_lvol *lvol;
 	struct spdk_bdev *lvol_bdev;
-	uint32_t *s3_ids_chain = NULL;
+	uint32_t s3_ids_chain[40];
 	int rc = 0;
 
 	if (spdk_json_decode_object(params, rpc_bdev_lvol_s3_recovery_decoders,
@@ -3421,13 +3415,6 @@ rpc_bdev_lvol_s3_recovery(struct spdk_jsonrpc_request *request,
 	if (lvol == NULL) {
 		SPDK_ERRLOG("lvol does not exist\n");
 		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
-		goto cleanup;
-	}
-
-	s3_ids_chain = calloc(req.s3_ids.num, sizeof(uint32_t));
-	if (!s3_ids_chain) {
-		spdk_jsonrpc_send_error_response(request,
-			SPDK_JSONRPC_ERROR_INVALID_PARAMS, "Cannot allocate memory for s3 ids chain");
 		goto cleanup;
 	}
 

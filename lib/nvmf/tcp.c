@@ -3674,6 +3674,7 @@ nvmf_tcp_req_process(struct spdk_nvmf_tcp_transport *ttransport,
 		case TCP_REQUEST_STATE_READY_TO_COMPLETE:
 			spdk_trace_record(TRACE_TCP_REQUEST_STATE_READY_TO_COMPLETE, tqpair->qpair.trace_id, 0,
 					  (uintptr_t)tcp_req);
+			//TODO: add queued req in case we have port blocking
 			if (tcp_req->tps.state[TCP_REQUEST_STATE_READY_TO_COMPLETE] == 0) {
 				tcp_req->tps.state[TCP_REQUEST_STATE_READY_TO_COMPLETE] = 1;
 				tcp_req->tps.time_per_state[TCP_REQUEST_STATE_READY_TO_COMPLETE] = spdk_get_ticks();

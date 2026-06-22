@@ -3844,49 +3844,60 @@ spdk_lvs_set_opts(struct spdk_lvol_store *lvs, uint64_t groupid, uint64_t port, 
 
 static int
 spdk_wait_for_pg_io_cleanup_poller(void *arg) {
-	struct remove_event *ctx = arg;
-	struct spdk_lvs_poll_group *lpg = ctx->lpg;
-	struct spdk_transfer_dev *tdev = ctx->tdev;
-	struct remote_lvol_info *rmt_lvol = ctx->rmt_lvol;
+	struct remote_lvol_info *rmt_lvol = arg;
+	struct spdk_lvs_poll_group *lpg = rmt_lvol->group;
+	struct spdk_transfer_dev *tdev = rmt_lvol->tdev;
+
 	if (rmt_lvol->outstanding_io > 0) {
 		return SPDK_POLLER_BUSY;
 	}
+
 	SPDK_NOTICELOG("destroy channel lvol in poller: 3.\n");
 	spdk_poller_unregister(&rmt_lvol->cleanup_poller);
 	rmt_lvol->cleanup_poller = NULL;
 	spdk_put_io_channel(rmt_lvol->channel);
-	tdev->pg[lpg->id] = false;
-	TAILQ_REMOVE(&lpg->rmt_lvols, rmt_lvol, entry);
+	rmt_lvol->channel = NULL;
+	tdev->pg[lpg->id]--;
 	free(rmt_lvol);
-	free(ctx);
 	return -1;
 }
 
 static void
 spdk_wait_for_pg_io_cleanup(void *arg) {
 	struct remote_lvol_info *rmt_lvol, *tmp;
-	struct remove_event *ctx = arg;
-	struct spdk_lvs_poll_group *lpg = ctx->lpg;
-	struct spdk_transfer_dev *tdev = ctx->tdev;
+	struct spdk_transfer_dev *tdev = arg;
+	struct spdk_lvs_poll_group *lpg = NULL;
 	// SPDK_NOTICELOG("destroy lvol in poller: 1.\n");
-	TAILQ_FOREACH_SAFE(rmt_lvol , &lpg->rmt_lvols, entry, tmp) {
-		if (strcmp(rmt_lvol->bdev_name, tdev->bdev_name) != 0) {
+
+	TAILQ_FOREACH(lpg, &g_lvs_poll_groups, entry) {
+		if (lpg->thread != spdk_get_thread()) {
 			continue;
-		}		
+		}
+		break;
+	}
+
+	if (!lpg) {
+		SPDK_ERRLOG("Cannot find the poll group for the current thread.\n");
+		return;
+	}
+
+	TAILQ_FOREACH_SAFE(rmt_lvol , &lpg->rmt_lvols, entry, tmp) {
+		if (rmt_lvol->tdev != tdev) {
+			continue;
+		}
+
 		rmt_lvol->status = false;
 		if (rmt_lvol->outstanding_io > 0) {
 			SPDK_NOTICELOG("Waiting for %lu I/Os to finish for pg %s.\n", rmt_lvol->outstanding_io, lpg->thread_name);
-			ctx->rmt_lvol = rmt_lvol;
-			rmt_lvol->cleanup_poller = spdk_poller_register(
-				spdk_wait_for_pg_io_cleanup_poller, ctx, 200000);
-			return;
-		} else {
-			SPDK_NOTICELOG("destroy channel lvol in poller: 2.\n");
-			spdk_put_io_channel(rmt_lvol->channel);
-			tdev->pg[lpg->id] = false;
 			TAILQ_REMOVE(&lpg->rmt_lvols, rmt_lvol, entry);
-			free(rmt_lvol);
-			free(ctx);
+			rmt_lvol->cleanup_poller = spdk_poller_register(
+				spdk_wait_for_pg_io_cleanup_poller, rmt_lvol, 200000);// check every 200ms			
+		} else {
+			// SPDK_NOTICELOG("destroy channel lvol in poller: 2.\n");
+			// dont remove the rmt lvol from the list here, just set the status to false, and it will be removed when the task is destroyed
+			spdk_put_io_channel(rmt_lvol->channel);
+			rmt_lvol->channel = NULL;
+			tdev->pg[lpg->id]--;
 		}
 	}
 }
@@ -3978,8 +3989,8 @@ spdk_wait_for_tdev_io_cleanup(void *arg)
 
 static void
 spdk_change_rmt_lvol_state(struct spdk_lvol_store *lvs, struct spdk_transfer_dev *tdev) {
-	struct remove_event *ctx;
 	struct spdk_lvs_poll_group *lpg;
+
 	if (!tdev->drain_in_action) {
 		tdev->drain_in_action = true;
 	}
@@ -3987,17 +3998,12 @@ spdk_change_rmt_lvol_state(struct spdk_lvol_store *lvs, struct spdk_transfer_dev
 	tdev->state = HUBLVOL_NOT_CONNECTED;
 	tdev->dev_in_remove = true;
 
-	if (tdev->dev_in_remove) {
-		if (!tdev->cleanup_poller) {
-			TAILQ_FOREACH(lpg, &g_lvs_poll_groups, entry) {
-				ctx = calloc(1, sizeof(*ctx));
-				ctx->lpg = lpg;
-				ctx->tdev = tdev;
-				spdk_thread_send_msg(lpg->thread, spdk_wait_for_pg_io_cleanup, ctx);
-			}
-			tdev->cleanup_poller = spdk_poller_register(
-				spdk_wait_for_tdev_io_cleanup, tdev, 200000);// check every 200ms
+	if (!tdev->cleanup_poller) {
+		TAILQ_FOREACH(lpg, &g_lvs_poll_groups, entry) {
+			spdk_thread_send_msg(lpg->thread, spdk_wait_for_pg_io_cleanup, tdev);
 		}
+		tdev->cleanup_poller = spdk_poller_register(
+			spdk_wait_for_tdev_io_cleanup, tdev, 200000);// check every 200ms
 	}
 }
 
@@ -4005,7 +4011,14 @@ static void
 set_req_status_and_queued(struct spdk_lvs_xfer_req *req, enum xfer_req_status status)
 {
 	struct remote_lvol_info *rmt = req->rmt_lvol;
-	rmt->outstanding_io--;
+
+	if (rmt->outstanding_io == 0) {
+		SPDK_ERRLOG("outstanding_io underflow\n");
+		assert(false);
+	} else {
+		rmt->outstanding_io--;
+	}
+
 	req->status = status;
 	if (spdk_ring_enqueue(rmt->free_ring, (void **)&req, 1, NULL) != 1) {
 		SPDK_ERRLOG("free_ring full while handling write submit failure\n");
@@ -4057,98 +4070,10 @@ remote_op_comp(struct spdk_bdev_io *bdev_io, bool success, void *arg)
 		set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
 		return;
 	}
-	
+
 	assert(req->action == REQ_ACTION_COPY_RECOVER);
 	submit_rw_reqs_local(req);
 
-}
-
-static int
-submit_rw_reqs_remote(struct spdk_lvs_xfer_req *req)
-{
-	struct remote_lvol_info *rmt = req->rmt_lvol;
-	struct spdk_io_channel *s3_ch = rmt->channel;
-	// struct spdk_io_channel *md_ch = rmt->group->lpg_md_channel;
-	// struct spdk_lvs_xfer *xfer = req->xfer;
-	int rc = 0;
-
-	switch (req->action)
-	{
-		case REQ_ACTION_COPY_BACKUP:
-			// read from local and write to remote
-			rc = spdk_bdev_write_blocks(rmt->desc, s3_ch, req->payload, 
-									req->s3_offset, req->len, complete_op_cb, req);
-			if (rc != 0) {
-				/* synchronous failure: decrement outstanding and recycle req */
-				set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
-			}
-			break;
-		case REQ_ACTION_COPY_RECOVER:
-			rc = spdk_bdev_read_blocks(rmt->desc, s3_ch, req->payload, 
-									req->s3_offset, req->len, remote_op_comp, req);
-			if (rc != 0) {
-				/* synchronous failure: decrement outstanding and recycle req */
-				set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
-			}
-			break;
-		default:
-			rc = -EINVAL;
-			break;
-	}
-	return rc;
-}
-
-static void
-local_op_comp(void *cb_arg, int bserrno)
-{
-	struct spdk_lvs_xfer_req *req = cb_arg;
-
-	if (bserrno != 0) {		
-		SPDK_ERRLOG("Local I/O failed at offset: %" PRIu64 " len: %" PRIu64 "\n",
-				req->offset, req->len);
-		set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
-		return;
-	}
-	
-	switch (req->action)
-	{
-		case REQ_ACTION_COPY_BACKUP:
-			// read from local and write to remote
-			submit_rw_reqs_remote(req);
-			break;
-		case REQ_ACTION_COPY_RECOVER:
-			// read from remote and write to local
-			set_req_status_and_queued(req, XFER_REQ_STATUS_DONE);
-			break;
-		default:
-			break;
-	}
-
-}
-
-static int
-submit_rw_reqs_local(struct spdk_lvs_xfer_req *req)
-{
-	struct remote_lvol_info *rmt = req->rmt_lvol;
-	struct spdk_io_channel *md_ch = rmt->md_channel;
-	struct spdk_lvs_xfer *xfer = req->xfer;
-
-	switch (req->action)
-	{
-		case REQ_ACTION_COPY_BACKUP:
-			// read from local and write to remote
-			spdk_blob_io_read(xfer->lvol->blob, md_ch, req->payload, req->offset,
-								req->len, local_op_comp, req);
-			break;
-		case REQ_ACTION_COPY_RECOVER:
-			// read from remote and write to local
-			spdk_blob_io_write(xfer->lvol->blob, md_ch, req->payload, req->offset,
-								req->len, local_op_comp, req);
-			break;
-		default:
-			break;
-	}
-	return 0;
 }
 
 static void
@@ -4156,22 +4081,22 @@ fragment_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
 	struct spdk_lvs_xfer_req *req = cb_arg;
 
-    if (!success) {
-        /* set aggregated status once (first error) */
-		 SPDK_ERRLOG("Remote write I/O offset: %" PRIu64 " len: %" PRIu64 " frag: %d failed.\n", req->offset, req->len, req->fragments_outstanding);
-        req->aggregated_status = -EIO;
-    }
+	if (!success) {
+		/* set aggregated status once (first error) */
+		SPDK_ERRLOG("Remote write I/O offset: %" PRIu64 " len: %" PRIu64 " frag: %d failed.\n", req->offset, req->len, req->fragments_outstanding);
+		req->aggregated_status = -EIO;
+	}
 
-    spdk_bdev_free_io(bdev_io);
+	spdk_bdev_free_io(bdev_io);
 
-    /* decrement outstanding fragments */
-    req->fragments_outstanding--;
+	/* decrement outstanding fragments */
+	req->fragments_outstanding--;
 	// SPDK_NOTICELOG("2- Remote write I/O offset: %" PRIu64 " len: %" PRIu64 " frag: %d t %p\n", req->offset, req->len, req->fragments_outstanding, spdk_get_thread());
 
-    /* if this was the last fragment, do final work and recycle req */
-    if (req->fragments_outstanding == 0) {
+	/* if this was the last fragment, do final work and recycle req */
+	if (req->fragments_outstanding == 0) {
 		// SPDK_NOTICELOG("3- Remote write I/O offset: %" PRIu64 " len: %" PRIu64 " frag: %d t %p\n", req->offset, req->len, req->fragments_outstanding, spdk_get_thread());
-        /* final aggregated status */
+		/* final aggregated status */
 		int st = req->aggregated_status;
 		if (st != 0) {
 			req->status = XFER_REQ_STATUS_FAILED;
@@ -4186,46 +4111,146 @@ fragment_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 static int
 submit_req_fragments(struct spdk_lvs_xfer_req *req, struct remote_lvol_info *rmt)
 {
-    struct spdk_bdev_desc *desc = rmt->desc;
-    struct spdk_io_channel *ch = rmt->channel;
-    uint32_t blocklen = spdk_bdev_get_block_size(spdk_bdev_desc_get_bdev(desc));
-    uint64_t max_bytes = 16 * 0x1000;
-    uint32_t max_blocks = max_bytes / blocklen;
-    if (max_blocks == 0) {
-        max_blocks = 1;
-    }
+	struct spdk_bdev_desc *desc = rmt->desc;
+	struct spdk_io_channel *ch = rmt->channel;
+	uint32_t blocklen = spdk_bdev_get_block_size(spdk_bdev_desc_get_bdev(desc));
+	uint64_t max_bytes = 16 * 0x1000;
+	uint32_t max_blocks = max_bytes / blocklen;
+	if (max_blocks == 0) {
+		max_blocks = 1;
+	}
 
-    uint32_t remaining = req->len;
-    uint64_t lba = req->offset;
-    uint8_t *payload = (uint8_t *)req->payload;
-    req->fragments_outstanding = 0;
-    req->aggregated_status = 0;
+	uint32_t remaining = req->len;
+	uint64_t lba = req->dst_offset;
+	uint8_t *payload = (uint8_t *)req->payload;
+	req->fragments_outstanding = 0;
+	req->aggregated_status = 0;
 
-    while (remaining > 0) {
-        uint32_t frag_blocks = (remaining > max_blocks) ? max_blocks : remaining;
-        uint8_t *frag_payload = payload + ( (req->len - remaining) * blocklen );
+	while (remaining > 0) {
+		uint32_t frag_blocks = (remaining > max_blocks) ? max_blocks : remaining;
+		uint8_t *frag_payload = payload + ( (req->len - remaining) * blocklen );
 
-        /* increment fragments counter before submit */
-        req->fragments_outstanding++;
+		/* increment fragments counter before submit */
+		req->fragments_outstanding++;
 		// SPDK_NOTICELOG("1- Remote write I/O offset: %" PRIu64 " len: %" PRIu64 " frag: %d t %p\n", req->offset, req->len, req->fragments_outstanding, spdk_get_thread());
-        int rc = spdk_bdev_write_blocks(desc, ch, frag_payload, lba, frag_blocks,
-                                        fragment_write_cb, req);
-        if (rc != 0) {
-            /* synchronous failure - decrement fragments counter and record error */
-            req->fragments_outstanding--;
-            req->aggregated_status = -EIO;
-            /* handle rc: may want to abort remaining fragments -> but we'll
-             * record failure and let outstanding fragments finish or cancel */
-            SPDK_ERRLOG("sync write submit failed rc=%d lba=%"PRIu64" blocks=%u\n", rc, lba, frag_blocks);
-            return rc;
-        }
+		int rc = spdk_bdev_write_blocks(desc, ch, frag_payload, lba, frag_blocks,
+										fragment_write_cb, req);
+		if (rc != 0) {
+			/* synchronous failure - decrement fragments counter and record error */
+			req->fragments_outstanding--;
+			req->aggregated_status = -EIO;
+			/* handle rc: may want to abort remaining fragments -> but we'll
+			 * record failure and let outstanding fragments finish or cancel */
+			SPDK_ERRLOG("sync write submit failed rc=%d lba=%"PRIu64" blocks=%u\n", rc, lba, frag_blocks);
+			return rc;
+		}
 
-        /* advance */
-        remaining -= frag_blocks;
-        lba += frag_blocks;
-    }
+		/* advance */
+		remaining -= frag_blocks;
+		lba += frag_blocks;
+	}
 
-    return 0;
+	return 0;
+}
+
+static int
+submit_rw_reqs_remote(struct spdk_lvs_xfer_req *req)
+{
+	struct remote_lvol_info *rmt = req->rmt_lvol;
+	struct spdk_io_channel *_ch = rmt->channel;
+	int rc = 0, rc_local = 0;
+
+	switch (req->action)
+	{
+		case REQ_ACTION_COPY_BACKUP:
+			// read from local and write to remote
+			if (req->xfer->type == XFER_REPLICATE_SNAPSHOT) {
+				rc = submit_req_fragments(req, req->rmt_lvol);
+				if (rc != 0) {
+					/* synchronous failure: decrement outstanding and recycle req */
+					if (req->fragments_outstanding == 0) {
+						set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
+					}
+				}
+			} else {
+				rc = spdk_bdev_write_blocks(rmt->desc, _ch, req->payload, 
+										req->dst_offset, req->len, complete_op_cb, req);
+				if (rc != 0) {
+					/* synchronous failure: decrement outstanding and recycle req */
+					set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
+				}
+			}
+			break;
+		case REQ_ACTION_COPY_RECOVER:
+			rc = spdk_bdev_read_blocks(rmt->desc, _ch, req->payload, 
+									req->dst_offset, req->len, remote_op_comp, req);
+			if (rc != 0) {
+				/* synchronous failure: decrement outstanding and recycle req */
+				set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
+			}
+			break;
+		default:
+			rc_local = -EINVAL;
+			break;
+	}
+	return rc_local;
+}
+
+static void
+local_op_comp(void *cb_arg, int bserrno)
+{
+	struct spdk_lvs_xfer_req *req = cb_arg;
+
+	if (bserrno != 0) {		
+		SPDK_ERRLOG("Local I/O failed at offset: %" PRIu64 " len: %" PRIu64 "\n",
+				req->offset, req->len);
+		set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
+		return;
+	}
+
+	switch (req->action)
+	{
+		case REQ_ACTION_COPY_BACKUP:
+			// read from local and write to remote
+			submit_rw_reqs_remote(req);
+			break;
+		case REQ_ACTION_COPY_RECOVER:
+			// read from remote and write to local
+			set_req_status_and_queued(req, XFER_REQ_STATUS_DONE);
+			break;
+		default:
+			SPDK_ERRLOG("Local I/O failed at offset: %" PRIu64 " len: %" PRIu64 " due to invalid action\n",
+				req->offset, req->len);
+			set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
+			break;
+	}
+
+}
+
+static int
+submit_rw_reqs_local(struct spdk_lvs_xfer_req *req)
+{
+	struct remote_lvol_info *rmt = req->rmt_lvol;
+	struct spdk_io_channel *md_ch = rmt->md_channel;
+	struct spdk_lvs_xfer *xfer = req->xfer;
+	int rc = 0;
+	switch (req->action)
+	{
+		case REQ_ACTION_COPY_BACKUP:
+			// read from local and write to remote
+			spdk_blob_io_read(xfer->lvol->blob, md_ch, req->payload, req->offset,
+								req->len, local_op_comp, req);
+			break;
+		case REQ_ACTION_COPY_RECOVER:
+			// read from remote and write to local
+			spdk_blob_io_write(xfer->lvol->blob, md_ch, req->payload, req->offset,
+								req->len, local_op_comp, req);
+			break;
+		default:
+			rc = -EINVAL;
+			break;
+	}
+	return rc;
 }
 
 static int
@@ -4234,12 +4259,9 @@ helper_xfer_poller(void *arg)
 	struct spdk_lvs_poll_group *lpg = arg;
 	struct remote_lvol_info *rmt_lvol;
 	struct spdk_lvs_xfer_req *req;
-	int count = 0, rc = 0;
+	int rc, count = 0;
 	TAILQ_FOREACH(rmt_lvol, &lpg->rmt_lvols, entry) {
-		if (rmt_lvol->desc == NULL || rmt_lvol->channel == NULL || !rmt_lvol->status) {
-			continue;
-		}
-
+		rc = 0;
 		if (spdk_ring_dequeue(rmt_lvol->ready_ring, (void **)&req, 1) == 0) {
 			continue;
 		}
@@ -4248,10 +4270,15 @@ helper_xfer_poller(void *arg)
 		rmt_lvol->outstanding_io++;
 		req->rmt_lvol = rmt_lvol;
 
+		if (rmt_lvol->desc == NULL || rmt_lvol->channel == NULL || !rmt_lvol->status) {
+			set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
+			continue;
+		}
+
 		switch (rmt_lvol->type) {
 			case XFER_MIGRATE_SNAPSHOT:
 				rc = spdk_bdev_write_blocks(rmt_lvol->desc, rmt_lvol->channel, req->payload,
-					 						req->offset, req->len, complete_op_cb, req);
+					 						req->dst_offset, req->len, complete_op_cb, req);
 				if (rc != 0) {
 					/* synchronous failure: decrement outstanding and recycle req */
 					set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
@@ -4260,12 +4287,10 @@ helper_xfer_poller(void *arg)
 			case XFER_REPLICATE_SNAPSHOT:
 				//TODO read and write with the helper core 
 				// SPDK_NOTICELOG("1- Remote write I/O offset: %" PRIu64 " len: %" PRIu64 "\n", req->offset, req->len);
-				rc = submit_req_fragments(req, rmt_lvol);
+				rc = submit_rw_reqs_local(req);
 				if (rc != 0) {
 					/* synchronous failure: decrement outstanding and recycle req */
-					if (req->fragments_outstanding == 0) {
-						set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
-					}
+					set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
 				}
 				break;
 			case XFER_S3_BACKUP:
@@ -4274,19 +4299,19 @@ helper_xfer_poller(void *arg)
 				switch (req->action) {
 					case REQ_ACTION_READ:
 						rc = spdk_bdev_read_blocks(rmt_lvol->desc, rmt_lvol->channel,
-											req->payload, req->s3_offset, req->len, complete_op_cb, req);
+											req->payload, req->dst_offset, req->len, complete_op_cb, req);
 						break;
 					case REQ_ACTION_WRITE:					
 						rc = spdk_bdev_write_blocks(rmt_lvol->desc, rmt_lvol->channel,
-											req->payload, req->s3_offset, req->len, complete_op_cb, req);
+											req->payload, req->dst_offset, req->len, complete_op_cb, req);
 						break;
 					case REQ_ACTION_SWAP:
 						rc = spdk_bdev_copy_blocks(rmt_lvol->desc, rmt_lvol->channel,
-										   req->s3_offset, req->offset, req->len, complete_op_cb, req);
+										   req->dst_offset, req->offset, req->len, complete_op_cb, req);
 						break;
 					case REQ_ACTION_UNMAP:
 						rc = spdk_bdev_unmap_blocks(rmt_lvol->desc, rmt_lvol->channel,
-											req->s3_offset, req->len, complete_op_cb, req);
+											req->dst_offset, req->len, complete_op_cb, req);
 						break;
 					case REQ_ACTION_COPY_BACKUP:
 						rc = submit_rw_reqs_local(req);
@@ -4295,6 +4320,7 @@ helper_xfer_poller(void *arg)
 						rc = submit_rw_reqs_remote(req);
 						break;
 					default:
+						rc = -EINVAL;
 						break;
 				}
 
@@ -4335,40 +4361,40 @@ spdk_lvol_freeze_io(struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct s
 void
 spdk_tdev_store_hublvol_channel(struct spdk_transfer_dev *tdev, struct spdk_io_channel *channel)
 {
-    struct spdk_hublvol_channels *hublvol_ch;
+	struct spdk_hublvol_channels *hublvol_ch;
 
-    pthread_mutex_lock(&g_lvol_stores_mutex);
+	pthread_mutex_lock(&g_lvol_stores_mutex);
 
-    TAILQ_FOREACH(hublvol_ch, &tdev->redirect_channels, entry) {
-        if (hublvol_ch->ch == channel) {
-            pthread_mutex_unlock(&g_lvol_stores_mutex);
-            return;
-        }
-    }
+	TAILQ_FOREACH(hublvol_ch, &tdev->redirect_channels, entry) {
+		if (hublvol_ch->ch == channel) {
+			pthread_mutex_unlock(&g_lvol_stores_mutex);
+			return;
+		}
+	}
 
-    hublvol_ch = calloc(1, sizeof(*hublvol_ch));
-    if (!hublvol_ch) {
-        SPDK_ERRLOG("Cannot allocate memory for hublvol_ch.\n");
-        pthread_mutex_unlock(&g_lvol_stores_mutex);
-        return;
-    }
+	hublvol_ch = calloc(1, sizeof(*hublvol_ch));
+	if (!hublvol_ch) {
+		SPDK_ERRLOG("Cannot allocate memory for hublvol_ch.\n");
+		pthread_mutex_unlock(&g_lvol_stores_mutex);
+		return;
+	}
 
-    hublvol_ch->ch = channel;
-    hublvol_ch->thread = spdk_get_thread();
-    TAILQ_INSERT_TAIL(&tdev->redirect_channels, hublvol_ch, entry);
+	hublvol_ch->ch = channel;
+	hublvol_ch->thread = spdk_get_thread();
+	TAILQ_INSERT_TAIL(&tdev->redirect_channels, hublvol_ch, entry);
 
-    pthread_mutex_unlock(&g_lvol_stores_mutex);
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
 }
 
 struct spdk_io_channel *
 spdk_tdev_get_hub_channel(struct spdk_transfer_dev *tdev, struct spdk_thread *thread) {
 	struct spdk_hublvol_channels *hublvol_ch;    
 
-    TAILQ_FOREACH(hublvol_ch, &tdev->redirect_channels, entry) {
-        if (hublvol_ch->thread == thread) {
+	TAILQ_FOREACH(hublvol_ch, &tdev->redirect_channels, entry) {
+		if (hublvol_ch->thread == thread) {
 			return hublvol_ch->ch;
-        }
-    }
+		}
+	}
 	return NULL;
 }
 
@@ -4420,10 +4446,10 @@ spdk_xfer_sync_mode(struct spdk_lvs_xfer *xfer)
 	struct spdk_lvol *lvol = xfer->lvol;
 	int rc = 0;
 	if (lvol->transfer_status == XFER_DONE) {
-		lvol->redirect_after_migration = true;
-		spdk_for_each_thread(spdk_migration_open_channel_on_threads, lvol, spdk_lvol_unfreeze_io);		
+		lvol->redirect_io = true;
+		spdk_for_each_thread(spdk_migration_open_channel_on_threads, lvol, spdk_lvol_unfreeze_io);
 	} else {
-		lvol->redirect_after_migration = false;
+		lvol->redirect_io = false;
 		spdk_lvol_unfreeze_io(lvol);
 		rc = -1;
 	}
@@ -4440,19 +4466,22 @@ read_complete_cb(void *arg, int rc)
     if (rc) {
 		SPDK_ERRLOG("in md poller Read I/O failed at offset: %" PRIu64 " len: %" PRIu64 "\n",
 				req->offset, req->len);
-        xfer->lvol->transfer_status = XFER_FAILED;
+        xfer->state = XFER_STATE_FAILED;
 		req->status = XFER_REQ_STATUS_FAILED;
-		xfer->outstanding_io--;
+		if (xfer->outstanding_io > 0) {
+			xfer->outstanding_io--;
+		}
+
+		if (xfer->idx > 0) {
+			xfer->idx--;
+		}
+		
 		if (spdk_ring_enqueue(xfer->free_ring, (void **)&req, 1, NULL) != 1) {
             SPDK_ERRLOG("free_ring full in read_complete_cb\n");
             assert(false);
         }
         return;
     }
-
-	if (xfer->final_migration || xfer->lvol->redirect_map_id != 0) {
-		req->offset = ((uint64_t)(xfer->lvol->redirect_map_id) << 48) | req->offset;		
-	}
 
 	req->status = XFER_REQ_STATUS_READY;
 
@@ -4464,49 +4493,75 @@ read_complete_cb(void *arg, int rc)
 }
 
 static void
-spdk_mark_rmt_pg(void *arg) {
-	struct remove_event *ctx = arg;
-	struct spdk_lvs_poll_group *lpg = ctx->lpg;
+spdk_delete_rmt_lvol_pg(void *arg) {
+	struct spdk_lvs_xfer *xfer = arg;
+	struct spdk_lvs_poll_group *lpg = NULL;
 	struct remote_lvol_info *rmt_lvol, *tmp;
-	if (ctx->s3_id != 0) {
-		TAILQ_FOREACH_SAFE(rmt_lvol , &lpg->rmt_lvols, entry, tmp) {
-			if (rmt_lvol->s3_id == ctx->s3_id) {				
-				SPDK_NOTICELOG("destroy channel and lvol task ---: 2.\n");
-				rmt_lvol->status = false;
-				spdk_put_io_channel(rmt_lvol->channel);				
-				TAILQ_REMOVE(&lpg->rmt_lvols, rmt_lvol, entry);
-				free(rmt_lvol);
-				break;
-			}			
+
+	TAILQ_FOREACH(lpg, &g_lvs_poll_groups, entry) {
+		if (lpg->thread != spdk_get_thread()) {
+			continue;
 		}
-	} else {
-		TAILQ_FOREACH(rmt_lvol , &lpg->rmt_lvols, entry) {
-			if (strcmp(rmt_lvol->bdev_name, ctx->bdev_name) != 0) {
-				continue;
-			}
-			rmt_lvol->status = false;
-		}
+		break;
 	}
 
-	free(ctx);
+	if (!lpg) {
+		SPDK_ERRLOG("Cannot find the poll group for the current thread.\n");
+		return;
+	}
+
+	TAILQ_FOREACH_SAFE(rmt_lvol, &lpg->rmt_lvols, entry, tmp) {
+		if (rmt_lvol->xfer_task != xfer) {
+			continue;
+		}
+
+		// if the poller is already set, it means the channel is in cleaning up progress,
+		// skip it to avoid duplicate cleanup		
+		if (rmt_lvol->cleanup_poller) {
+			continue;
+		}
+		SPDK_NOTICELOG("destroy rmt lvol and transfer task ---: 2.\n");
+
+		TAILQ_REMOVE(&lpg->rmt_lvols, rmt_lvol, entry);
+		rmt_lvol->status = false;
+
+		if (rmt_lvol->channel) {
+			spdk_put_io_channel(rmt_lvol->channel);
+		}
+		
+		free(rmt_lvol);
+		break;
+	}
+	xfer->pg[lpg->id] = false;
 }
 
 static int
 destroy_xfer_task_tmo(void *arg) {
 	struct spdk_lvs_xfer *xfer = arg;
-	if (XFER_S3_MERGE == xfer->type) {
-		SPDK_NOTICELOG("Destroy Transfer lvol %d %s task.\n", xfer->s3_id,
-		 			xfer_type_to_string(xfer->type));
-	} else {
-		SPDK_NOTICELOG("Destroy Transfer lvol %s %s task.\n", xfer->lvol->name,
-		 			xfer_type_to_string(xfer->type));
+
+	for (uint32_t i = 0; i < g_lvs_num_pgs; i++) {
+		if (xfer->pg[i]) {
+			return SPDK_POLLER_BUSY;
+		}
 	}
+
+	SPDK_NOTICELOG("Destroy Transfer task %s lvol %s s3_id %d .\n", xfer_type_to_string(xfer->type),
+	 				xfer->lvol ? xfer->lvol->name : "NULL", xfer->s3_id);
+
 	spdk_poller_unregister(&xfer->tmo_poller);
 	xfer->tmo_poller = NULL;
 	spdk_dma_free(xfer->pdus);
 	free(xfer->reqs);
 	spdk_ring_free(xfer->free_ring);
 	spdk_ring_free(xfer->ready_ring);
+	if (xfer->chain)
+		free(xfer->chain);
+	if (xfer->clusters)
+		free(xfer->clusters);
+	if (xfer->chain_s3_ids)
+		free(xfer->chain_s3_ids);
+	if (xfer->old_clusters)
+		free(xfer->old_clusters);
 	free(xfer);
 	return -1;
 }
@@ -4514,9 +4569,12 @@ destroy_xfer_task_tmo(void *arg) {
 static void
 destroy_xfer_task(struct spdk_lvs_xfer *xfer) {
 	struct spdk_lvs_poll_group *lpg;
-	struct remove_event *ctx;
 
 	TAILQ_REMOVE(&g_lvs_xfer_tasks, xfer, entry);
+
+	if (xfer->lvol && xfer->lvol->transfer_status != XFER_DONE) {
+		xfer->lvol->transfer_status = XFER_FAILED;
+	}
 
 	if (XFER_S3_MERGE == xfer->type) {
 			SPDK_NOTICELOG("Transfer lvol %d %s task: status %s finished.\n", xfer->s3_id,
@@ -4528,264 +4586,17 @@ destroy_xfer_task(struct spdk_lvs_xfer *xfer) {
 					xfer_result_type_to_string(xfer->lvol->transfer_status));
 	}
 
-	if (xfer->lvol && xfer->lvol->transfer_status != XFER_DONE) {
-		xfer->lvol->transfer_status = XFER_FAILED;
-	}
-
-	if (xfer->final_migration && xfer->cb_fn) {
+	if (xfer->final_step && xfer->cb_fn) {
 		spdk_xfer_sync_mode(xfer);
 	}
 
 	// send msg to the lpg to NULL thier rings pointers in the rmt
 	TAILQ_FOREACH(lpg, &g_lvs_poll_groups, entry) {
-		ctx = calloc(1, sizeof(*ctx));
-		// check ctx before use
-		ctx->lpg = lpg;
-		ctx->bdev_name = xfer->bdev_name;
-		ctx->s3_id = xfer->s3_id;
-		spdk_thread_send_msg(lpg->thread, spdk_mark_rmt_pg, ctx);
+		xfer->pg[lpg->id] = true;
+		spdk_thread_send_msg(lpg->thread, spdk_delete_rmt_lvol_pg, xfer);
 	}
 	xfer->tmo_poller = spdk_poller_register(
-				destroy_xfer_task_tmo, xfer, 2000000);// do it after 2s
-}
-
-static int
-xfer_replication(struct spdk_lvs_xfer *xfer) {
-	struct spdk_lvs_xfer_req *req;
-	uint64_t page_size;
-	uint64_t page_per_cluster;
-	uint64_t current_time = spdk_get_ticks();
-	uint64_t timeout_ticks = spdk_get_ticks_hz() * 8;
-	int count = 0;
-	if (spdk_ring_dequeue(xfer->free_ring, (void **)&req, 1) == 0) {
-		if (current_time - xfer->timeout > timeout_ticks && xfer->outstanding_io == 0) {// in timeout consider outstanding io
-			destroy_xfer_task(xfer);
-		}
-		return 0;
-	}
-
-	// Note we can use the ring cnt here instead the outstanding io
-	if ((req->status == XFER_REQ_STATUS_FAILED || req->status == XFER_REQ_STATUS_DONE) && xfer->outstanding_io > 0) {
-		xfer->outstanding_io--;
-	}
-
-	if ((xfer->lvol->transfer_status == XFER_FAILED || xfer->lvol->transfer_status == XFER_DONE)) {
-		if (xfer->outstanding_io != 0) {
-			if (current_time - xfer->timeout > timeout_ticks) {
-				destroy_xfer_task(xfer);
-			}
-			return 0;
-		} else {
-			// remember to destroy the task
-			destroy_xfer_task(xfer);
-			return 0;
-		}
-	}
-
-	xfer->timeout = current_time;
-
-	if (req->status == XFER_REQ_STATUS_FAILED) {
-		xfer->lvol->transfer_status = XFER_FAILED;
-		return 0;
-	}
-
-	page_size = spdk_bs_get_page_size(xfer->lvol->lvol_store->blobstore);
-	page_per_cluster = spdk_bs_get_cluster_size(xfer->lvol->lvol_store->blobstore) / page_size;
-	while (xfer->lvol->last_offset + (page_per_cluster * xfer->cluster_batch * 2) < req->offset) {
-		xfer->lvol->last_offset = xfer->lvol->last_offset + (page_per_cluster * xfer->cluster_batch);
-	}
-
-	bool remain = false;
-	while (spdk_blob_check_offset_valid(xfer->lvol->blob, xfer->current_offset, page_per_cluster)) {
-		// inja eshtebah hastesh chon bayed current offset motenaseb ba real offset basheh
-		if (spdk_blob_get_offset_allocate(xfer->lvol->blob, xfer->current_offset)) {
-			req->offset = xfer->current_offset;
-			remain = true;
-			break;
-		}
-		xfer->current_offset += page_per_cluster;
-	}
-
-	if (!remain) {
-		xfer->lvol->transfer_status = XFER_DONE;
-		return 0;
-	}
-
-	xfer->outstanding_io++;
-	count++;
-	req->status = XFER_REQ_STATUS_NONE;
-	req->len = page_per_cluster;
-	// SPDK_NOTICELOG("cluster read lba %" PRIu64 " len %" PRIu64 " t %p .\n", req->offset, req->len , spdk_get_thread());
-	memset(req->payload, 0, page_size * req->len);
-	xfer->current_offset += page_per_cluster;
-
-	int rc = spdk_read_cluster_data_xfer(xfer->lvol->blob, req->payload,
-						req->offset, req->len, xfer->type, read_complete_cb, req);
-	if (rc != 0) {
-		/* read failed synchronously; correct outstanding and recycle req */
-		xfer->outstanding_io--;
-		if (spdk_ring_enqueue(xfer->free_ring, (void **)&req, 1, NULL) != 1) {
-			SPDK_ERRLOG("free_ring full after read submit failure\n");
-			assert(false);
-		}
-		xfer->lvol->transfer_status = XFER_FAILED;
-		return 0;
-	}
-	return count;
-}
-
-static int
-xfer_migration(struct spdk_lvs_xfer *xfer) {
-	uint64_t page_size;
-	uint64_t page_per_cluster;
-	uint64_t current_time = spdk_get_ticks();
-	uint64_t timeout_ticks = spdk_get_ticks_hz() * 4;
-	uint64_t offset = 0;
-	int count = 0, reqs_cnt = 0;
-
-	page_size = spdk_bs_get_page_size(xfer->lvol->lvol_store->blobstore);
-	page_per_cluster = spdk_bs_get_cluster_size(xfer->lvol->lvol_store->blobstore) / page_size;
-
-	if (page_per_cluster > 512) {
-		reqs_cnt = (page_per_cluster / 512) / ((spdk_blob_get_geometry(xfer->lvol->blob) & 0x3) + 1);
-	} else {
-		reqs_cnt = 1;
-	}
-
-	struct spdk_lvs_xfer_req *reqs[reqs_cnt], *req;
-	count = spdk_ring_dequeue(xfer->free_ring, (void **)reqs, reqs_cnt);
-	if (count == 0 || count < reqs_cnt) {
-		if ((current_time - xfer->timeout > timeout_ticks && xfer->outstanding_io == 0) || 
-						((xfer->lvol->transfer_status == XFER_FAILED ||  
-						xfer->lvol->transfer_status == XFER_DONE) &&
-						xfer->outstanding_io == 0)) {
-			destroy_xfer_task(xfer);
-			return 0;
-		}
-
-		if (count > 0) {
-
-			if ((xfer->lvol->transfer_status == XFER_FAILED || xfer->lvol->transfer_status == XFER_DONE) &&
-							xfer->outstanding_io != 0) {
-				for (int i = 0; i < count; i++) {
-					req = reqs[i];
-					// Note we can use the ring cnt here instead the outstanding io
-					if ((req->status == XFER_REQ_STATUS_FAILED || req->status == XFER_REQ_STATUS_DONE) && xfer->outstanding_io > 0) {
-						xfer->outstanding_io--;
-					}
-					if (req->status == XFER_REQ_STATUS_FAILED) {
-						xfer->lvol->transfer_status = XFER_FAILED;
-					}
-					req->status = XFER_REQ_STATUS_NONE;
-				}
-			}
-			// return the reqs to the free ring
-			if (spdk_ring_enqueue(xfer->free_ring, (void **)&reqs, count, NULL) != (size_t)count) {
-				SPDK_ERRLOG("free_ring full after read submit failure\n");
-				assert(false);
-			}
-		}
-		return 0;
-	}
-	count = 0;
-
-	for (int i = 0; i < reqs_cnt; i++) {
-		req = reqs[i];
-		// Note we can use the ring cnt here instead the outstanding io
-		if ((req->status == XFER_REQ_STATUS_FAILED || req->status == XFER_REQ_STATUS_DONE) && xfer->outstanding_io > 0) {
-			xfer->outstanding_io--;
-		}
-
-		if (req->status == XFER_REQ_STATUS_FAILED) {
-			xfer->lvol->transfer_status = XFER_FAILED;
-		}
-
-		if (req->status == XFER_REQ_STATUS_DONE) {
-			if (xfer->lvol->last_offset + (page_per_cluster * xfer->cluster_batch * 2) < req->offset) {
-				//TODO add loop guard		
-				xfer->lvol->last_offset = xfer->lvol->last_offset + (page_per_cluster * xfer->cluster_batch);
-			}
-		}
-
-		req->status = XFER_REQ_STATUS_NONE;
-
-		if (xfer->final_migration) {
-			req->offset = ((uint64_t)(req->offset) & MASK_OUT_USED_BITS);
-		}
-	}
-
-	if ((xfer->lvol->transfer_status == XFER_FAILED || xfer->lvol->transfer_status == XFER_DONE)) {
-		if (xfer->outstanding_io != 0) {
-			if (current_time - xfer->timeout > timeout_ticks) {
-				destroy_xfer_task(xfer);
-			}
-		} else {
-			// remember to destroy the task
-			destroy_xfer_task(xfer);
-		}
-		return 0;
-	}
-
-	xfer->timeout = current_time;
-
-	bool remain = false;
-	while (spdk_blob_check_offset_valid(xfer->lvol->blob, xfer->current_offset, page_per_cluster)) {
-		// inja eshtebah hastesh chon bayed current offset motenaseb ba real offset basheh
-		if (spdk_blob_get_offset_allocate(xfer->lvol->blob, xfer->current_offset)) {
-			offset = xfer->current_offset;
-			remain = true;
-			break;
-		}
-		xfer->current_offset += page_per_cluster;
-	}
-
-	if (!remain) {
-		// before set the Done state we should send signal to the target
-		// this is sync mode and I need to send signal
-		if (xfer->final_migration && !xfer->signal_sent) {
-			req = reqs[0];
-			xfer->outstanding_io++;
-			count++;	
-			req->len = 1;
-			req->offset = 0;
-			snprintf(req->payload, page_size,
-                   "migration_completed:%s", xfer->len ? xfer->snapshot_name : "none");
-			xfer->signal_sent = true;
-			read_complete_cb(req, 0);
-			return count;
-		}
-		xfer->lvol->transfer_status = XFER_DONE;
-		xfer->lvol->last_offset = xfer->current_offset;
-		return 0;
-	}
-
-	xfer->current_offset += page_per_cluster;
-
-	for (int i = 0; i < reqs_cnt; i++) {
-		req = reqs[i];
-
-		xfer->outstanding_io++;
-		count++;	
-		req->len = 8;
-		req->offset = offset + ((page_per_cluster / reqs_cnt) * i);
-		// SPDK_NOTICELOG("cluster read lba %" PRIu64 " len %" PRIu64 " t %p .\n", req->offset, req->len , spdk_get_thread());
-		memset(req->payload, 0, page_size * req->len);
-		
-
-		int rc = spdk_read_cluster_data_xfer(xfer->lvol->blob, req->payload,
-							req->offset, req->len, xfer->type, read_complete_cb, req);
-		if (rc != 0) {
-			/* read failed synchronously; correct outstanding and recycle req */
-			xfer->outstanding_io--;
-			if (spdk_ring_enqueue(xfer->free_ring, (void **)&req, 1, NULL) != 1) {
-				SPDK_ERRLOG("free_ring full after read submit failure\n");
-				assert(false);
-			}
-			xfer->lvol->transfer_status = XFER_FAILED;
-			return 0;
-		}
-	}
-	return count;
+				destroy_xfer_task_tmo, xfer, 200000);// do it after 200ms
 }
 
 static int
@@ -4814,7 +4625,7 @@ xfer_fill_queue(struct spdk_lvs_xfer *xfer, int initial) {
 }
 
 static int
-xfer_s3_wait_outstanding_io(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req **preq) {
+xfer_wait_outstanding_io(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req **preq) {
 	uint64_t current_time = spdk_get_ticks();
 	uint64_t timeout_ticks = spdk_get_ticks_hz() * 8;
 
@@ -4825,7 +4636,7 @@ xfer_s3_wait_outstanding_io(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req
 				xfer->state = XFER_STATE_FAILED;				
 			} else {
 				// print current outstanding io timeout error
-				SPDK_ERRLOG("S3 transfer timeout with outstanding io %u\n", xfer->outstanding_io);
+				SPDK_ERRLOG("Task transfer timeout with outstanding io %u\n", xfer->outstanding_io);
 			}
 			return 0;
 		}
@@ -4844,7 +4655,7 @@ xfer_s3_wait_outstanding_io(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req
 }
 
 static int
-xfer_s3_check(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req **preq, uint32_t count, enum xfer_state next_state, int initial) {
+xfer_status_check(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req **preq, uint32_t count, enum xfer_state next_state, int initial) {
 	uint64_t current_time = spdk_get_ticks();
 	uint64_t timeout_ticks = spdk_get_ticks_hz() * 8;
 
@@ -4867,13 +4678,13 @@ xfer_s3_check(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req **preq, uint3
 				}
 				xfer->state = XFER_STATE_FAILED;
 			} else {
-				xfer->s3_timeout_count++;
-				if (xfer->s3_timeout_count == 1) {
+				xfer->timeout_cnt++;
+				if (xfer->timeout_cnt == 1) {
 					SPDK_ERRLOG("S3 transfer timeout with outstanding io %u, state %d\n", xfer->outstanding_io, xfer->state);
 				}
-				if (xfer->s3_timeout_count >= 3) {
+				if (xfer->timeout_cnt >= 3) {
 					SPDK_ERRLOG("S3 transfer failed after %u timeouts, outstanding io %u, state %d\n",
-						xfer->s3_timeout_count, xfer->outstanding_io, xfer->state);
+						xfer->timeout_cnt, xfer->outstanding_io, xfer->state);
 					if (xfer->lvol) {
 						xfer->lvol->transfer_status = XFER_FAILED;
 					}
@@ -4902,10 +4713,246 @@ xfer_s3_check(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req **preq, uint3
 		xfer->success_cnt++;
 	}
 
-	// req->status = XFER_REQ_STATUS_NONE; // I can have function to reset req
-	// req->action = REQ_ACTION_NONE;
-	// req->len = 0;
 	return 0;
+}
+
+static int
+xfer_replication(struct spdk_lvs_xfer *xfer) {
+	struct spdk_lvs_xfer_req *req;
+	bool is_allocate = false;
+	enum xfer_state  next_state;
+	int count = 0, rc, next_cnt;
+
+	switch (xfer->state)
+	{
+		case XFER_STATE_NONE:
+			struct spdk_lvol *lvol = xfer->lvol;
+			prepare_s3_clusters(lvol->blob, xfer->clusters, xfer->num_clusters);
+			xfer->state = XFER_STATE_TRANSFER_CLUSTERS;
+			xfer_fill_queue(xfer, xfer->cluster_batch);
+			if (xfer->lvol->last_offset != 0) {
+				xfer->hold_idx = xfer->lvol->last_offset / xfer->page_per_cluster;
+				if (xfer->hold_idx >= xfer->num_clusters) {
+					xfer->state = XFER_STATE_DONE;
+				}
+			}
+			break;
+
+		case XFER_STATE_TRANSFER_CLUSTERS:
+			is_allocate = false;
+			next_state = xfer->final_step ? XFER_STATE_SIGNAL_TRANSFER : XFER_STATE_DONE;
+			next_cnt = xfer->final_step ? 1 : 0;
+			rc = xfer_status_check(xfer, &req, xfer->idx, next_state, next_cnt);
+			if (rc != 0) {
+				return 0;
+			}
+
+			xfer->lvol->last_offset = req->offset;
+			
+			// prepare req
+			memset(req->payload, 0, xfer->page_size * xfer->page_per_cluster);
+			if (xfer->hold_idx < xfer->num_clusters) {
+				for (uint32_t i = xfer->hold_idx; i < xfer->num_clusters; i++) {
+					if (xfer->clusters[i] == 0) {
+						continue;
+					}
+
+					is_allocate = true;
+					req->dst_offset = i * xfer->page_per_cluster;
+					if (xfer->lvol->redirect_map_id != 0) {
+						req->dst_offset = ((uint64_t)(xfer->lvol->redirect_map_id) << 48) | req->dst_offset;
+					}
+
+					req->offset = i * xfer->page_per_cluster;
+					req->len = xfer->page_per_cluster; // 2MB
+					req->action = REQ_ACTION_COPY_BACKUP;
+					req->status = XFER_REQ_STATUS_READY;
+
+					/* enqueue for transfer; if ready_ring is full, return req to free_ring or retry */
+					if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
+						SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
+						assert(false);
+					}
+
+					xfer->outstanding_io++;
+					xfer->idx++;
+					xfer->hold_idx = i + 1;
+					count++;
+					return count;
+				}
+
+				if (!is_allocate) {
+					if (xfer->idx == 0) {
+						// no clusters to send
+						xfer->state = xfer->final_step ?  XFER_STATE_SIGNAL_TRANSFER : XFER_STATE_DONE;
+						xfer_fill_queue(xfer, xfer->cluster_batch);
+						return 0;
+					}
+				}
+			}
+			break;
+		case XFER_STATE_SIGNAL_TRANSFER:
+			rc = xfer_status_check(xfer, &req, xfer->idx, XFER_STATE_DONE, 0);
+			if (rc != 0) {
+				return 0;
+			}
+
+			if (!xfer->signal_sent) {
+				xfer->outstanding_io++;
+				count++;	
+				req->len = 1;
+				req->offset = 0;
+				snprintf(req->payload, xfer->page_size, "migration_completed:%s", xfer->len ? xfer->snapshot_name : "none");
+				req->dst_offset = ((uint64_t)(xfer->lvol->redirect_map_id) << 48) | req->offset;
+				xfer->signal_sent = true;
+				if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
+						SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
+						assert(false);
+				}
+			}
+			break;
+		case XFER_STATE_DONE:
+			xfer->lvol->transfer_status = XFER_DONE;
+			destroy_xfer_task(xfer);
+			return 0;
+
+		case XFER_STATE_FAILED:
+			// should not come here
+			SPDK_ERRLOG("transfer task failed: -----\n");
+			if (xfer->outstanding_io != 0) {
+				//wait until all io done or timeout
+				SPDK_ERRLOG("transfer task failed: ----- but still have outstanding io %d\n", xfer->outstanding_io);
+				rc = xfer_wait_outstanding_io(xfer, &req);
+				if (rc != 0) {
+					return 0;
+				}
+			}
+			destroy_xfer_task(xfer);
+			return 0;
+		default:
+			break;
+
+	}
+	return count;
+}
+
+static int
+xfer_migration(struct spdk_lvs_xfer *xfer) {
+	struct spdk_lvs_xfer_req *req;
+	bool is_allocate = false;
+	enum xfer_state  next_state;
+	int count = 0, rc, next_cnt;
+
+	switch (xfer->state)
+	{
+		case XFER_STATE_NONE:
+			struct spdk_lvol *lvol = xfer->lvol;
+			prepare_s3_clusters(lvol->blob, xfer->clusters, xfer->num_clusters);
+			xfer->state = XFER_STATE_TRANSFER_CLUSTERS;
+			xfer_fill_queue(xfer, xfer->cluster_batch);
+			break;
+
+		case XFER_STATE_TRANSFER_CLUSTERS:
+			is_allocate = false;
+			next_state = xfer->final_step ? XFER_STATE_SIGNAL_TRANSFER : XFER_STATE_DONE;
+			next_cnt = xfer->final_step ? 1 : 0;
+			rc = xfer_status_check(xfer, &req, xfer->idx, next_state, next_cnt);
+			if (rc != 0) {
+				return 0;
+			}
+			
+			// prepare req
+			memset(req->payload, 0, xfer->page_size * 8); // 8 blocks
+			if (xfer->hold_idx < xfer->num_clusters) {
+				for (uint32_t i = xfer->hold_idx; i < xfer->num_clusters; i++) {
+					if (xfer->clusters[i] == 0) {
+						continue;
+					}
+
+					is_allocate = true;
+					req->dst_offset = i * xfer->page_per_cluster;
+					if (xfer->lvol->redirect_map_id != 0) {
+						req->dst_offset = ((uint64_t)(xfer->lvol->redirect_map_id) << 48) | req->dst_offset;
+					}
+
+					req->offset = i * xfer->page_per_cluster;
+					req->len = 8; // 8 blocks
+					req->action = REQ_ACTION_WRITE;
+					req->status = XFER_REQ_STATUS_READY;
+
+					xfer->outstanding_io++;
+					xfer->idx++;
+					xfer->hold_idx = i + 1;
+					count++;
+
+					int rc = spdk_read_cluster_data_xfer(xfer->lvol->blob, req->payload,
+										req->offset, req->len, xfer->type, read_complete_cb, req);
+					if (rc != 0) {
+						/* read failed synchronously; correct outstanding and recycle req */
+						xfer->outstanding_io--;
+						xfer->idx--;
+						if (spdk_ring_enqueue(xfer->free_ring, (void **)&req, 1, NULL) != 1) {
+							SPDK_ERRLOG("free_ring full after read submit failure\n");
+							assert(false);
+						}
+						xfer->state = XFER_STATE_FAILED;
+						return 0;
+					}
+					return count;
+				}
+
+				if (!is_allocate) {
+					if (xfer->idx == 0) {
+						// no clusters to send
+						xfer->state = xfer->final_step ?  XFER_STATE_SIGNAL_TRANSFER : XFER_STATE_DONE;
+						xfer_fill_queue(xfer, xfer->cluster_batch);
+						return 0;
+					}
+				}
+			}
+			break;
+		case XFER_STATE_SIGNAL_TRANSFER:
+			rc = xfer_status_check(xfer, &req, xfer->idx, XFER_STATE_DONE, 0);
+			if (rc != 0) {
+				return 0;
+			}
+
+			if (!xfer->signal_sent) {
+				xfer->outstanding_io++;
+				count++;	
+				req->len = 1;
+				req->offset = 0;
+				snprintf(req->payload, xfer->page_size, "transfer_task_completed:%s", xfer->len ? xfer->snapshot_name : "none");
+				req->dst_offset = ((uint64_t)(xfer->lvol->redirect_map_id) << 48) | req->offset;
+				xfer->signal_sent = true;
+				if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
+						SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
+						assert(false);
+				}
+			}
+			break;
+		case XFER_STATE_DONE:
+			xfer->lvol->transfer_status = XFER_DONE;
+			destroy_xfer_task(xfer);
+			return 0;
+		case XFER_STATE_FAILED:
+			// should not come here
+			SPDK_ERRLOG("transfer task failed: -----\n");
+			if (xfer->outstanding_io != 0) {
+				//wait until all io done or timeout
+				SPDK_ERRLOG("transfer task failed: ----- but still have outstanding io %d\n", xfer->outstanding_io);
+				rc = xfer_wait_outstanding_io(xfer, &req);
+				if (rc != 0) {
+					return 0;
+				}
+			}
+			destroy_xfer_task(xfer);
+			return 0;
+		default:
+			break;
+
+	}
+	return count;
 }
 
 struct cls_entry{
@@ -4935,22 +4982,22 @@ xfer_s3_backup(struct spdk_lvs_xfer *xfer) {
 
 		case XFER_STATE_TRANSFER_CLUSTERS:
 			is_allocate = false;
-			rc = xfer_s3_check(xfer, &req, xfer->idx, XFER_STATE_TRANSFER_MD_DATA, xfer->cluster_batch);
+			rc = xfer_status_check(xfer, &req, xfer->idx, XFER_STATE_TRANSFER_MD_DATA, xfer->cluster_batch);
 			if (rc != 0) {
 				return 0;
 			}
-			
+
 			// prepare req
 			memset(req->payload, 0, xfer->page_size * xfer->page_per_cluster);
-			if (xfer->idx < xfer->num_clusters) {
-				for (uint32_t i = xfer->idx; i < xfer->num_clusters; i++) {
+			if (xfer->hold_idx < xfer->num_clusters) {
+				for (uint32_t i = xfer->hold_idx; i < xfer->num_clusters; i++) {
 					if (xfer->clusters[i] == 0) {
 						continue;
 					}
 
-					is_allocate = true;					
+					is_allocate = true;
 					// 0 + id + 0 + index
-					req->s3_offset = s3_pack_offset(i, xfer->s3_id, false /* mid flag */, false /* MSB flag */);
+					req->dst_offset = s3_pack_offset(i, xfer->s3_id, false /* mid flag */, false /* MSB flag */);
 					req->offset = i * xfer->page_per_cluster;
 					req->len = xfer->page_per_cluster; // 2MB
 					req->action = REQ_ACTION_COPY_BACKUP;
@@ -4964,6 +5011,7 @@ xfer_s3_backup(struct spdk_lvs_xfer *xfer) {
 
 					xfer->outstanding_io++;
 					xfer->idx++;
+					xfer->hold_idx = i + 1;
 					count++;
 					return count;
 				}
@@ -4981,7 +5029,7 @@ xfer_s3_backup(struct spdk_lvs_xfer *xfer) {
 
 		case XFER_STATE_TRANSFER_MD_DATA:
 			is_allocate = false;
-			rc = xfer_s3_check(xfer, &req, xfer->num_extent_pages, XFER_STATE_TRANSFER_ROOT_MD, 1);
+			rc = xfer_status_check(xfer, &req, xfer->num_extent_pages, XFER_STATE_TRANSFER_ROOT_MD, 1);
 			if (rc != 0) {
 				return 0;
 			}
@@ -5019,7 +5067,7 @@ xfer_s3_backup(struct spdk_lvs_xfer *xfer) {
 
 				xfer->num_extent_pages++;
 				// 0 + id + 1 + index
-				req->s3_offset = s3_pack_offset(xfer->num_extent_pages, xfer->s3_id, true /* mid flag */, false);
+				req->dst_offset = s3_pack_offset(xfer->num_extent_pages, xfer->s3_id, true /* mid flag */, false);
 				req->len = xfer->page_per_cluster; // 2MB
 				req->action = REQ_ACTION_WRITE;
 				req->status = XFER_REQ_STATUS_READY;
@@ -5034,7 +5082,7 @@ xfer_s3_backup(struct spdk_lvs_xfer *xfer) {
 			}
 			break;
 		case XFER_STATE_TRANSFER_ROOT_MD:
-			rc = xfer_s3_check(xfer, &req, xfer->idx, XFER_STATE_DONE, 0);
+			rc = xfer_status_check(xfer, &req, xfer->idx, XFER_STATE_DONE, 0);
 			if (rc != 0) {
 				return 0;
 			}
@@ -5069,7 +5117,7 @@ xfer_s3_backup(struct spdk_lvs_xfer *xfer) {
 			p += SPDK_UUID_STRING_LEN;
 
 			// 0 + id + 1 + 0
-			req->s3_offset = s3_pack_offset(0, xfer->s3_id, true /* mid flag */, false);
+			req->dst_offset = s3_pack_offset(0, xfer->s3_id, true /* mid flag */, false);
 			req->len = xfer->page_per_cluster; // 2MB
 			req->action = REQ_ACTION_WRITE;
 			req->status = XFER_REQ_STATUS_READY;
@@ -5094,7 +5142,7 @@ xfer_s3_backup(struct spdk_lvs_xfer *xfer) {
 			if (xfer->outstanding_io != 0) {
 				//wait until all io done or timeout
 				SPDK_ERRLOG("S3 transfer task failed: ----- but still have outstanding io %d\n", xfer->outstanding_io);
-				rc = xfer_s3_wait_outstanding_io(xfer, &req);
+				rc = xfer_wait_outstanding_io(xfer, &req);
 				if (rc != 0) {
 					return 0;
 				}
@@ -5121,7 +5169,7 @@ xfer_s3_merge(struct spdk_lvs_xfer *xfer) {
 			xfer_fill_queue(xfer, 1);
 			break;
 		case XFER_STATE_READ_ROOT_MD:
-			rc = xfer_s3_check(xfer, &req, xfer->idx, XFER_STATE_READ_EXTENT_MD, xfer->cluster_batch);
+			rc = xfer_status_check(xfer, &req, xfer->idx, XFER_STATE_READ_EXTENT_MD, xfer->cluster_batch);
 			if (rc != 0) {
 				return 0;
 			}
@@ -5140,7 +5188,6 @@ xfer_s3_merge(struct spdk_lvs_xfer *xfer) {
 				xfer->clusters = calloc(xfer->num_clusters, sizeof(uint64_t));
 				if (xfer->clusters == NULL) {
 					SPDK_ERRLOG("Failed to allocate clusters array for merge S3\n");
-					xfer->lvol->transfer_status = XFER_FAILED;
 					xfer->state = XFER_STATE_FAILED;
 					return 0;
 				}
@@ -5161,7 +5208,7 @@ xfer_s3_merge(struct spdk_lvs_xfer *xfer) {
 			}
 
 			memset(req->payload, 0, xfer->page_size * xfer->page_per_cluster);
-			req->s3_offset = s3_pack_offset(0, xfer->s3_id, true /* mid flag */, false);
+			req->dst_offset = s3_pack_offset(0, xfer->s3_id, true /* mid flag */, false);
 			req->len = xfer->page_per_cluster; // 2MB
 			req->action = REQ_ACTION_READ;
 			req->status = XFER_REQ_STATUS_READY;
@@ -5177,7 +5224,7 @@ xfer_s3_merge(struct spdk_lvs_xfer *xfer) {
 			count++;
 			break;
 		case XFER_STATE_READ_EXTENT_MD:
-			rc = xfer_s3_check(xfer, &req, xfer->num_extent_pages, XFER_STATE_READ_ROOT_MD_2, 1);
+			rc = xfer_status_check(xfer, &req, xfer->num_extent_pages, XFER_STATE_READ_ROOT_MD_2, 1);
 			if (rc != 0) {
 				return 0;
 			}
@@ -5206,7 +5253,7 @@ xfer_s3_merge(struct spdk_lvs_xfer *xfer) {
 			if (xfer->idx < xfer->num_extent_pages) {
 				// prepare req
 				memset(req->payload, 0, xfer->page_size * xfer->page_per_cluster);
-				req->s3_offset = s3_pack_offset(xfer->idx + 1, xfer->s3_id, true /* mid flag */, false);
+				req->dst_offset = s3_pack_offset(xfer->idx + 1, xfer->s3_id, true /* mid flag */, false);
 				req->len = xfer->page_per_cluster; // 2MB
 				req->action = REQ_ACTION_READ;
 				req->status = XFER_REQ_STATUS_READY;
@@ -5225,7 +5272,7 @@ xfer_s3_merge(struct spdk_lvs_xfer *xfer) {
 			break;
 
 		case XFER_STATE_READ_ROOT_MD_2:
-			rc = xfer_s3_check(xfer, &req, xfer->idx, XFER_STATE_READ_EXTENT_MD_2, xfer->cluster_batch);
+			rc = xfer_status_check(xfer, &req, xfer->idx, XFER_STATE_READ_EXTENT_MD_2, xfer->cluster_batch);
 			if (rc != 0) {
 				return 0;
 			}
@@ -5242,7 +5289,6 @@ xfer_s3_merge(struct spdk_lvs_xfer *xfer) {
 				if (xfer->old_clusters == NULL) {
 					SPDK_ERRLOG("Failed to allocate old clusters array for merge S3\n");
 					free(xfer->clusters);
-					xfer->lvol->transfer_status = XFER_FAILED;
 					xfer->state = XFER_STATE_FAILED;
 					return 0;
 				}
@@ -5263,7 +5309,7 @@ xfer_s3_merge(struct spdk_lvs_xfer *xfer) {
 			}
 
 			memset(req->payload, 0, xfer->page_size * xfer->page_per_cluster);
-			req->s3_offset = s3_pack_offset(0, xfer->old_s3_id, true /* mid flag */, false);
+			req->dst_offset = s3_pack_offset(0, xfer->old_s3_id, true /* mid flag */, false);
 			req->len = xfer->page_per_cluster; // 2MB
 			req->action = REQ_ACTION_READ;
 			req->status = XFER_REQ_STATUS_READY;
@@ -5280,7 +5326,7 @@ xfer_s3_merge(struct spdk_lvs_xfer *xfer) {
 			break;
 
 		case XFER_STATE_READ_EXTENT_MD_2:
-			rc = xfer_s3_check(xfer, &req, xfer->old_num_extent_pages, XFER_STATE_SWAP_CLUSTERS, xfer->cluster_batch);
+			rc = xfer_status_check(xfer, &req, xfer->old_num_extent_pages, XFER_STATE_SWAP_CLUSTERS, xfer->cluster_batch);
 			if (rc != 0) {
 				return 0;
 			}
@@ -5311,7 +5357,7 @@ xfer_s3_merge(struct spdk_lvs_xfer *xfer) {
 			if (xfer->idx < xfer->old_num_extent_pages) {
 				// prepare req
 				memset(req->payload, 0, xfer->page_size * xfer->page_per_cluster);
-				req->s3_offset = s3_pack_offset(xfer->idx + 1, xfer->old_s3_id, true /* mid flag */, false);
+				req->dst_offset = s3_pack_offset(xfer->idx + 1, xfer->old_s3_id, true /* mid flag */, false);
 				req->len = xfer->page_per_cluster; // 2MB it should be page_size * page_per_cluster
 				req->action = REQ_ACTION_READ;
 				req->status = XFER_REQ_STATUS_READY;
@@ -5329,7 +5375,7 @@ xfer_s3_merge(struct spdk_lvs_xfer *xfer) {
 			}
 			break;
 		case XFER_STATE_SWAP_CLUSTERS:
-			rc = xfer_s3_check(xfer, &req, xfer->idx, XFER_STATE_TRANSFER_MD_DATA, xfer->cluster_batch);
+			rc = xfer_status_check(xfer, &req, xfer->idx, XFER_STATE_TRANSFER_MD_DATA, xfer->cluster_batch);
 			if (rc != 0) {
 				return 0;
 			}
@@ -5347,7 +5393,7 @@ xfer_s3_merge(struct spdk_lvs_xfer *xfer) {
 					// SPDK_NOTICELOG("Merge S3 SWAP: cluster index %u, idx %u\n", i, xfer->idx);
 
 					// prepare req
-					req->s3_offset = s3_pack_offset(i, xfer->s3_id, false /* mid flag */, false);
+					req->dst_offset = s3_pack_offset(i, xfer->s3_id, false /* mid flag */, false);
 					req->offset = xfer->old_clusters[i];
 					req->len = xfer->page_per_cluster; // 2MB
 					req->action = REQ_ACTION_SWAP;
@@ -5378,7 +5424,7 @@ xfer_s3_merge(struct spdk_lvs_xfer *xfer) {
 		case XFER_STATE_TRANSFER_MD_DATA:
 			bool is_allocate = false;
 			xfer->hold_idx = 0;
-			rc = xfer_s3_check(xfer, &req, xfer->num_extent_pages, XFER_STATE_DELETE, xfer->cluster_batch);
+			rc = xfer_status_check(xfer, &req, xfer->num_extent_pages, XFER_STATE_DELETE, xfer->cluster_batch);
 			if (rc != 0) {
 				return 0;
 			}
@@ -5416,7 +5462,7 @@ xfer_s3_merge(struct spdk_lvs_xfer *xfer) {
 
 				xfer->num_extent_pages++;
 				// 0 + id + 1 + index
-				req->s3_offset = s3_pack_offset(xfer->num_extent_pages, xfer->s3_id, true /* mid flag */, false);
+				req->dst_offset = s3_pack_offset(xfer->num_extent_pages, xfer->s3_id, true /* mid flag */, false);
 				req->len = xfer->page_per_cluster; // 2MB
 				req->action = REQ_ACTION_WRITE;
 				req->status = XFER_REQ_STATUS_READY;
@@ -5431,13 +5477,13 @@ xfer_s3_merge(struct spdk_lvs_xfer *xfer) {
 			}
 			break;
 		case XFER_STATE_DELETE:
-			rc = xfer_s3_check(xfer, &req, xfer->idx, XFER_STATE_DONE, 0);
+			rc = xfer_status_check(xfer, &req, xfer->idx, XFER_STATE_DONE, 0);
 			if (rc != 0) {
 				return 0;
 			}
 			//xfer->old_num_extent_pages + 1 number extent page plus root md
 			for (uint32_t i = xfer->idx; i < xfer->old_num_extent_pages + 1; i++) {
-				req->s3_offset = s3_pack_offset(i, xfer->old_s3_id, true /* mid flag */, false);
+				req->dst_offset = s3_pack_offset(i, xfer->old_s3_id, true /* mid flag */, false);
 				req->len = xfer->page_per_cluster; // 2MB
 				req->action = REQ_ACTION_UNMAP;
 				req->status = XFER_REQ_STATUS_READY;
@@ -5457,7 +5503,7 @@ xfer_s3_merge(struct spdk_lvs_xfer *xfer) {
 				xfer->hold_idx++;
 				// need to swap
 				if (xfer->old_clusters[i] != 0) {
-					req->s3_offset = s3_pack_offset(i, xfer->old_s3_id, false /* mid flag */, false);
+					req->dst_offset = s3_pack_offset(i, xfer->old_s3_id, false /* mid flag */, false);
 					req->len = xfer->page_per_cluster; // 2MB
 					req->action = REQ_ACTION_UNMAP;
 					req->status = XFER_REQ_STATUS_READY;
@@ -5487,7 +5533,7 @@ xfer_s3_merge(struct spdk_lvs_xfer *xfer) {
 			if (xfer->outstanding_io != 0) {
 				//wait until all io done or timeout
 				SPDK_ERRLOG("S3 transfer task failed: ----- but still have outstanding io %d\n", xfer->outstanding_io);
-				rc = xfer_s3_wait_outstanding_io(xfer, &req);
+				rc = xfer_wait_outstanding_io(xfer, &req);
 				if (rc != 0) {
 					return 0;
 				}
@@ -5525,7 +5571,7 @@ xfer_s3_recovery(struct spdk_lvs_xfer *xfer) {
 			xfer_fill_queue(xfer, xfer->cluster_batch);
 			break;
 		case XFER_STATE_READ_ROOT_MD:
-			rc = xfer_s3_check(xfer, &req, xfer->idx, XFER_STATE_READ_EXTENT_MD, xfer->cluster_batch);
+			rc = xfer_status_check(xfer, &req, xfer->idx, XFER_STATE_READ_EXTENT_MD, xfer->cluster_batch);
 			if (rc != 0) {
 				return 0;
 			}
@@ -5555,7 +5601,7 @@ xfer_s3_recovery(struct spdk_lvs_xfer *xfer) {
 			}
 
 			memset(req->payload, 0, xfer->page_size * xfer->page_per_cluster);
-			req->s3_offset = s3_pack_offset(0, xfer->chain_s3_ids[xfer->hold_idx], true /* mid flag */, false);
+			req->dst_offset = s3_pack_offset(0, xfer->chain_s3_ids[xfer->hold_idx], true /* mid flag */, false);
 			req->len = xfer->page_per_cluster; // 2MB
 			req->action = REQ_ACTION_READ;
 			req->status = XFER_REQ_STATUS_READY;
@@ -5571,7 +5617,7 @@ xfer_s3_recovery(struct spdk_lvs_xfer *xfer) {
 			count++;
 			break;
 		case XFER_STATE_READ_EXTENT_MD:
-			rc = xfer_s3_check(xfer, &req, xfer->num_extent_pages, XFER_STATE_NEXT_S3_ID, 1);
+			rc = xfer_status_check(xfer, &req, xfer->num_extent_pages, XFER_STATE_NEXT_S3_ID, 1);
 			if (rc != 0) {
 				return 0;
 			}
@@ -5602,7 +5648,7 @@ xfer_s3_recovery(struct spdk_lvs_xfer *xfer) {
 			if (xfer->idx < xfer->num_extent_pages) {
 				// prepare req
 				memset(req->payload, 0, xfer->page_size * xfer->page_per_cluster);
-				req->s3_offset = s3_pack_offset(xfer->idx + 1, xfer->chain_s3_ids[xfer->hold_idx], true /* mid flag */, false);
+				req->dst_offset = s3_pack_offset(xfer->idx + 1, xfer->chain_s3_ids[xfer->hold_idx], true /* mid flag */, false);
 				req->len = xfer->page_per_cluster; // 2MB
 				req->action = REQ_ACTION_READ;
 				req->status = XFER_REQ_STATUS_READY;
@@ -5620,7 +5666,7 @@ xfer_s3_recovery(struct spdk_lvs_xfer *xfer) {
 			}
 			break;
 		case XFER_STATE_RECOVER_CLUSTERS:
-			rc = xfer_s3_check(xfer, &req, xfer->idx, XFER_STATE_DONE, 0);
+			rc = xfer_status_check(xfer, &req, xfer->idx, XFER_STATE_DONE, 0);
 			if (rc != 0) {
 				return 0;
 			}
@@ -5633,7 +5679,7 @@ xfer_s3_recovery(struct spdk_lvs_xfer *xfer) {
 					// prepare req
 					xfer->persist_swap = true;
 					memset(req->payload, 0, xfer->page_size * xfer->page_per_cluster);
-					req->s3_offset = xfer->clusters[i];
+					req->dst_offset = xfer->clusters[i];
 					req->offset = i * xfer->page_per_cluster;
 					req->len = xfer->page_per_cluster; // 2MB
 					req->action = REQ_ACTION_COPY_RECOVER;
@@ -5662,7 +5708,7 @@ xfer_s3_recovery(struct spdk_lvs_xfer *xfer) {
 			break;
 		case XFER_STATE_DONE:
 			xfer->lvol->transfer_status = XFER_DONE;
-			destroy_xfer_task(xfer);			
+			destroy_xfer_task(xfer);
 			return 0;
 
 		case XFER_STATE_FAILED:
@@ -5671,7 +5717,7 @@ xfer_s3_recovery(struct spdk_lvs_xfer *xfer) {
 			if (xfer->outstanding_io != 0) {
 				//wait until all io done or timeout
 				SPDK_ERRLOG("S3 transfer task failed: ----- but still have outstanding io %d\n", xfer->outstanding_io);
-				rc = xfer_s3_wait_outstanding_io(xfer, &req);
+				rc = xfer_wait_outstanding_io(xfer, &req);
 				if (rc != 0) {
 					return 0;
 				}
@@ -5724,6 +5770,7 @@ spdk_lvs_create_poll_group_done(void *ctx)
 	if (!lpg) {
 		SPDK_ERRLOG("Failed to create lvs poll group\n");
 		/* Change the state to error but wait for completions from all other threads */
+		return;
 	}
 
 	TAILQ_INSERT_TAIL(&g_lvs_poll_groups, lpg, entry);
@@ -5754,21 +5801,21 @@ spdk_lvs_create_poll_group(void *ctx)
 	struct spdk_lvol_store *tmp;
 	pthread_mutex_lock(&g_lvol_stores_mutex);
 		TAILQ_FOREACH(tmp, &g_lvol_stores, link) {
-			lpg->lvs_info[lpg->lvs_cnt++].lvs = tmp;			
+			lpg->lvs_info[lpg->lvs_cnt++].lvs = tmp;
 		}
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
-
-
 
 	for (int i = 0; i < lpg->lvs_cnt; i++) {
 		lpg->lvs_info[i].md_channel = spdk_bs_alloc_io_channel(lpg->lvs_info[i].lvs->blobstore);
 		if (!lpg->lvs_info[i].md_channel) {
 			SPDK_ERRLOG("Failed to get md IO channel.\n");
+			free(lpg);
 			return;
 		}
 	}
+
 	lpg->xfer_poller = NULL;
-	const char *suffix = strrchr(lpg->thread_name, '_'); // find last '_'        
+	const char *suffix = strrchr(lpg->thread_name, '_'); // find last '_'
 	lpg->id =  atoi(suffix + 1);
 	SPDK_NOTICELOG("Create new thread %s for lvolstore with id %d t %p md %p.\n", lpg->thread_name, lpg->id, spdk_get_thread(), g_lvs_md_thread);
 	spdk_thread_send_msg(g_lvs_md_thread, spdk_lvs_create_poll_group_done, lpg);
@@ -5800,7 +5847,6 @@ spdk_lvs_create_poll_groups(struct spdk_lvol_store *lvs)
 	//for destroy the thread
 	// spdk_thread_exit(spdk_get_thread());
 }
-
 
 static int
 spdk_lvs_is_subset_of_env_core_mask(const struct spdk_cpuset *set)
@@ -5853,7 +5899,7 @@ spdk_lvs_rmt_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bde
 	struct spdk_transfer_dev *tdev = event_ctx;
 	switch (type) {
 	case SPDK_BDEV_EVENT_REMOVE:
-		SPDK_NOTICELOG("Receive remove event from callback tdev %s.\n", tdev->bdev_name);		
+		SPDK_NOTICELOG("Receive remove event from callback tdev %s.\n", tdev->bdev_name);
 		spdk_change_rmt_lvol_state(tdev->lvs, tdev);
 		break;
 	default:
@@ -5880,7 +5926,6 @@ spdk_check_rmt_bdev(const char *name, struct spdk_lvol_store *lvs)
 	}
 	return NULL;
 }
-
 
 static struct spdk_transfer_dev *
 spdk_find_s3_bdev(struct spdk_lvol_store *lvs)
@@ -5910,20 +5955,18 @@ spdk_open_rmt_bdev(const char *name, struct spdk_lvol_store *lvs, bool is_s3)
 	tdev = spdk_check_rmt_bdev(name, lvs);
 	if (tdev) {
 		SPDK_NOTICELOG("The remote bdev already opened.\n");
-		tdev->reused = true;
 		return tdev;
 	}
 
 	tdev = calloc(1, sizeof(*tdev));
 	if (!tdev) {
-		SPDK_ERRLOG("Cannot allocate memory for transfer device.\n");		
+		SPDK_ERRLOG("Cannot allocate memory for transfer device.\n");
 		return NULL;
 	}
 
 	snprintf(tdev->bdev_name, sizeof(tdev->bdev_name), "%s", name);
 	tdev->is_s3 = is_s3;
 	tdev->lvs = lvs;
-	tdev->reused = false;
 	tdev->thread = spdk_get_thread();
 	TAILQ_INIT(&tdev->redirect_channels);
 	rc = spdk_bdev_open_ext(tdev->bdev_name, true, spdk_lvs_rmt_bdev_event_cb, tdev, &tdev->desc);
@@ -5940,29 +5983,19 @@ spdk_open_rmt_bdev(const char *name, struct spdk_lvol_store *lvs, bool is_s3)
 static void
 spdk_lvs_add_rmt_bdev_to_poll_group(void *arg) {
 	struct remote_lvol_info *rmt_lvol = (struct remote_lvol_info *)(uintptr_t)arg;
-	struct remote_lvol_info *tmp;
 	struct spdk_lvs_poll_group *lpg = rmt_lvol->group;
-	if (rmt_lvol->reused) {
-		TAILQ_FOREACH(tmp , &lpg->rmt_lvols, entry) {
-			if (strcmp(tmp->bdev_name, rmt_lvol->bdev_name) != 0) {
-				continue;
-			}			
-			tmp->free_ring = rmt_lvol->free_ring;
-			tmp->ready_ring = rmt_lvol->ready_ring;
-			tmp->status = true;
-		}
-		free(rmt_lvol);
-		return;
-	}
+	struct spdk_transfer_dev *tdev = rmt_lvol->tdev;
 
 	rmt_lvol->channel = spdk_bdev_get_io_channel(rmt_lvol->desc);
 	if (!rmt_lvol->channel) {
 		// we should some how handl the error here
-		SPDK_ERRLOG("rmt-lvol Cannot get io channel for remote bdev %s.\n", rmt_lvol->bdev_name ? rmt_lvol->bdev_name : "s3 backup task");
+		SPDK_ERRLOG("rmt-lvol Cannot get io channel for remote bdev %s.\n", tdev->bdev_name ? tdev->bdev_name : "s3 backup task");
+		rmt_lvol->xfer_task->state = XFER_STATE_FAILED;
 		free(rmt_lvol);
 		return;
 	}
 	rmt_lvol->status = true;
+	tdev->pg[lpg->id]++;
 	TAILQ_INSERT_TAIL(&lpg->rmt_lvols, rmt_lvol, entry);
 	return;
 }
@@ -5971,169 +6004,10 @@ static void
 spdk_create_poller(void *arg) {
 	struct spdk_lvs_poll_group *lpg = arg;
 	if (pg_xfer_poller[lpg->id]) {
-		SPDK_NOTICELOG("The lpg id: %d poller for transfer task already exists.\n", lpg->id);
+		// SPDK_NOTICELOG("The lpg id: %d poller for transfer task already exists.\n", lpg->id);
 		return;
 	}	
 	pg_xfer_poller[lpg->id] = spdk_poller_register(helper_xfer_poller, lpg, 200);
-}
-
-int
-spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_batch, enum xfer_type type,
-				struct spdk_transfer_dev *tdev, const char *snapshot_name, uint32_t lvol_id,
-				spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg) {
-	struct spdk_lvs_xfer *xfer, *ctx;
-	struct spdk_lvs_xfer_req *req;
-	struct spdk_lvol_store *lvs = lvol->lvol_store;
-	struct spdk_lvs_poll_group *lpg;
-	uint64_t page_per_cluster = 0;
-	int s_elements_payload = 0;
-	// if (!lvs->leader) {
-	// 	SPDK_ERRLOG("Lvolstore %s: is not leader.\n", lvs->name);
-	// 	return -EINVAL;
-	// }
-
-	if (!tdev || !tdev->desc) {
-		SPDK_ERRLOG("Lvolstore %s: invalid transfer device.\n", lvs->name);
-		return -EINVAL;
-	}
-
-	TAILQ_FOREACH(xfer, &g_lvs_xfer_tasks, entry) {
-		if (xfer->lvol == lvol) {
-			SPDK_NOTICELOG("The same transfer task already exists.\n");
-			return -EEXIST;
-		}
-	}
-
-	ctx = calloc(1, sizeof(*ctx));
-	if (!ctx) {
-		SPDK_ERRLOG("Cannot allocate memory for transfer structure task.\n");
-		return -ENOMEM;
-	}
-	ctx->lvol = lvol;
-	lvol->last_offset = offset;
-	ctx->current_offset = offset;
-	ctx->cluster_batch = cluster_batch;
-	ctx->type = type;
-	ctx->cb_fn = cb_fn;
-	ctx->cb_arg = cb_arg;
-	ctx->final_migration = lvol_id ? true : false;
-
-	if (ctx->final_migration) {
-		ctx->signal_sent = false;
-	}
-
-	if (snapshot_name) {
-		ctx->len = snprintf(ctx->snapshot_name, sizeof(ctx->snapshot_name), "%s", snapshot_name);
-	}
-	snprintf(ctx->bdev_name, sizeof(ctx->bdev_name), "%s", tdev->bdev_name);
-
-	uint8_t extent = 1;
-	if (type == XFER_REPLICATE_SNAPSHOT) {
-		// s_elements_payload = spdk_bs_get_cluster_size(lvs->blobstore) / spdk_bs_get_page_size(lvs->blobstore);
-		s_elements_payload = spdk_bs_get_cluster_size(lvs->blobstore);
-	} else {
-		s_elements_payload = spdk_bs_get_page_size(lvs->blobstore) * 8; // 8 block per cluster transfer
-		page_per_cluster = spdk_bs_get_cluster_size(lvs->blobstore) / spdk_bs_get_page_size(lvs->blobstore);
-		if (page_per_cluster > 512) {
-			extent = (page_per_cluster / 512) / ((spdk_blob_get_geometry(lvol->blob) & 0x3) + 1);
-		}
-	}
-
-	ctx->free_ring  = spdk_ring_create(SPDK_RING_TYPE_MP_MC, ctx->cluster_batch * extent, SPDK_ENV_SOCKET_ID_ANY);
-	if (!ctx->free_ring) {
-		SPDK_ERRLOG("Unable to allocate rings on transfer task for lvol %s\n", lvol->name);
-		free(ctx);
-		return -ENOMEM;
-	}
-
-    ctx->ready_ring = spdk_ring_create(SPDK_RING_TYPE_MP_MC, ctx->cluster_batch * extent, SPDK_ENV_SOCKET_ID_ANY);
-	if (!ctx->ready_ring) {
-		SPDK_ERRLOG("Unable to allocate rings on transfer task for lvol %s\n", lvol->name);
-		spdk_ring_free(ctx->free_ring);
-		free(ctx);
-		return -ENOMEM;
-	}
-
-	ctx->reqs = calloc(ctx->cluster_batch * extent, sizeof(*ctx->reqs));
-	if (!ctx->reqs) {
-		SPDK_ERRLOG("Unable to allocate reqs on xfer task for lvol %s\n", lvol->name);		
-		spdk_ring_free(ctx->free_ring);
-		spdk_ring_free(ctx->ready_ring);
-		free(ctx);
-		return -ENOMEM;
-	}
-
-	ctx->pdus = spdk_dma_zmalloc(ctx->cluster_batch * extent * s_elements_payload, 0x1000, NULL);
-	if (!ctx->pdus) {
-		SPDK_ERRLOG("Unable to allocate pdu pool on transfer task for lvol %s.\n", lvol->name);
-		free(ctx->reqs);
-		spdk_ring_free(ctx->free_ring);
-		spdk_ring_free(ctx->ready_ring);
-		free(ctx);
-		return -ENOMEM;
-	}
-
-	for (int i = 0; i < ctx->cluster_batch * extent; i++) {
-        ctx->reqs[i].payload =  ctx->pdus + (i * s_elements_payload);
-        ctx->reqs[i].len = s_elements_payload;
-        // ctx->reqs[i].remote_desc = remote_desc;
-		ctx->reqs[i].xfer = ctx;
-		ctx->reqs[i].type = ctx->type;
-		req = &ctx->reqs[i];
-		req->status = XFER_REQ_STATUS_NONE;
-        int rc = spdk_ring_enqueue(ctx->free_ring, (void **)&req, 1, NULL);
-		if (rc != 1) {
-			assert(false);
-		}
-    }
-
-	// insert tdev to all helper cores and open channels	
-	TAILQ_FOREACH(lpg, &g_lvs_poll_groups, entry) {
-		struct remote_lvol_info *rmt_lvol = calloc(1, sizeof(*rmt_lvol));
-		if (!rmt_lvol) {
-			SPDK_ERRLOG("Cannot allocate memory for remote lvol info.\n");			
-			spdk_dma_free(xfer->pdus);
-			free(ctx->reqs);
-			spdk_ring_free(ctx->free_ring);
-			spdk_ring_free(ctx->ready_ring);
-			free(ctx);
-			return -ENOMEM;
-		}
-		tdev->pg[lpg->id] = true;
-		rmt_lvol->bdev_name = tdev->bdev_name;
-		rmt_lvol->desc = tdev->desc;
-		rmt_lvol->free_ring = ctx->free_ring;
-		rmt_lvol->ready_ring = ctx->ready_ring;
-		rmt_lvol->group = lpg;
-		rmt_lvol->reused = tdev->reused;
-		rmt_lvol->type = ctx->type;
-		spdk_thread_send_msg(lpg->thread, spdk_lvs_add_rmt_bdev_to_poll_group, rmt_lvol);
-	}
-
-	//freezing the lvol for incoming io here
-	//TODO put some delay for stating the migration bcs may we have inflight IO
-	lvol->tdev = tdev;
-	lvol->freezed = true;
-	lvol->redirect_map_id = lvol_id;
-
-	ctx->timeout = spdk_get_ticks();
-	lvol->transfer_status = XFER_IN_PROGRESS;
-	TAILQ_INSERT_TAIL(&g_lvs_xfer_tasks, ctx, entry);
-	SPDK_NOTICELOG("Transfer lvol %s %s task: last offset %" PRIu64 " status %s start.\n", ctx->lvol->name,
-		 			xfer_type_to_string(ctx->type), ctx->lvol->last_offset,
-					xfer_result_type_to_string(ctx->lvol->transfer_status));
-
-	TAILQ_FOREACH(lpg, &g_lvs_poll_groups, entry) {
-		spdk_thread_send_msg(lpg->thread, spdk_create_poller, lpg);
-		// pg_xfer_poller[lpg->id] = spdk_poller_register(helper_xfer_poller, lpg, 200);
-	}
-
-	if (!xfer_md_poller) {
-		xfer_md_poller = spdk_poller_register(md_xfer_poller, NULL, 1000);
-	}
-
-	tdev->reused = false;
-	return 0;
 }
 
 static int
@@ -6144,6 +6018,10 @@ spdk_lvol_create_backup_task(struct spdk_lvs_xfer *task, struct spdk_transfer_de
 	int s_elements_payload = 0;
 
 	s_elements_payload = spdk_bs_get_cluster_size(tdev->lvs->blobstore);
+
+	if (task->type == XFER_MIGRATE_SNAPSHOT) {
+		s_elements_payload = task->page_size * 8; // 8 block per cluster transfer for migration
+	}
 
 	task->free_ring  = spdk_ring_create(SPDK_RING_TYPE_MP_MC, task->cluster_batch, SPDK_ENV_SOCKET_ID_ANY);
 	if (!task->free_ring) {
@@ -6159,7 +6037,7 @@ spdk_lvol_create_backup_task(struct spdk_lvs_xfer *task, struct spdk_transfer_de
 
 	task->reqs = calloc(task->cluster_batch, sizeof(*task->reqs));
 	if (!task->reqs) {
-		SPDK_ERRLOG("Unable to allocate reqs on xfer task for lvol %d\n", task->s3_id);		
+		SPDK_ERRLOG("Unable to allocate reqs on xfer task for lvol %d\n", task->s3_id);
 		goto error;
 	}
 
@@ -6171,7 +6049,7 @@ spdk_lvol_create_backup_task(struct spdk_lvs_xfer *task, struct spdk_transfer_de
 
 	for (int i = 0; i < task->cluster_batch; i++) {
         task->reqs[i].payload =  task->pdus + (i * s_elements_payload);
-        task->reqs[i].len = s_elements_payload;
+        task->reqs[i].len = s_elements_payload / task->page_size; // in page unit
 		task->reqs[i].xfer = task;
 		task->reqs[i].type = task->type;
 		req = &task->reqs[i];
@@ -6184,16 +6062,17 @@ spdk_lvol_create_backup_task(struct spdk_lvs_xfer *task, struct spdk_transfer_de
 		if (!rmt_lvol) {
 			SPDK_ERRLOG("Cannot allocate memory for remote lvol info.\n");
 			task->state = XFER_STATE_FAILED;
-			task->lvol->transfer_status = XFER_FAILED;
+			if (task->lvol) {
+				task->lvol->transfer_status = XFER_FAILED;
+			}
 			break;
 		}
-		// tdev->pg[lpg->id] = true; //TODO we should consider better way
-		rmt_lvol->bdev_name = NULL;
 		rmt_lvol->desc = tdev->desc;
+		rmt_lvol->tdev = tdev;
 		rmt_lvol->free_ring = task->free_ring;
 		rmt_lvol->ready_ring = task->ready_ring;
 		rmt_lvol->type = task->type;
-		rmt_lvol->s3_id = task->s3_id;
+		rmt_lvol->xfer_task = task;
 		rmt_lvol->group = lpg;
 		if (task->lvol) {
 			for (int i = 0; i < lpg->lvs_cnt; i++) {
@@ -6224,7 +6103,6 @@ spdk_lvol_create_backup_task(struct spdk_lvs_xfer *task, struct spdk_transfer_de
 		xfer_md_poller = spdk_poller_register(md_xfer_poller, NULL, 1000);
 	}
 
-	TAILQ_INSERT_TAIL(&g_lvs_xfer_tasks, task, entry);
 	return 0;
 
 error:
@@ -6232,10 +6110,107 @@ error:
 	free(task->reqs);
 	spdk_ring_free(task->free_ring);
 	spdk_ring_free(task->ready_ring);
-	free(task->chain);
-	free(task->clusters);
+	if (task->chain)
+		free(task->chain);
+	if (task->clusters)
+		free(task->clusters);
+	if (task->chain_s3_ids)
+		free(task->chain_s3_ids);
 	free(task);
 	return -ENOMEM;
+}
+
+int
+spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_batch, enum xfer_type type,
+				struct spdk_transfer_dev *tdev, const char *snapshot_name, uint32_t lvol_id,
+				spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg) {
+	struct spdk_lvs_xfer *xfer, *task;	
+	struct spdk_lvol_store *lvs = lvol->lvol_store;	
+	int rc;
+	// if (!lvs->leader) {
+	// 	SPDK_ERRLOG("Lvolstore %s: is not leader.\n", lvs->name);
+	// 	return -EINVAL;
+	// }
+
+	if (!tdev || !tdev->desc || tdev->dev_in_remove) {
+		SPDK_ERRLOG("Lvolstore %s: invalid transfer device for %s.\n", lvs->name, xfer_type_to_string(type));
+		return -EINVAL;
+	}
+
+	TAILQ_FOREACH(xfer, &g_lvs_xfer_tasks, entry) {
+		if (xfer->lvol == lvol) {
+			SPDK_NOTICELOG("The same transfer task already exists.\n");
+			return -EEXIST;
+		}
+	}
+
+	task = calloc(1, sizeof(*task));
+	if (!task) {
+		SPDK_ERRLOG("Cannot allocate memory for transfer structure task.\n");
+		return -ENOMEM;
+	}
+	task->chain	= NULL;
+	task->clusters = NULL;
+	task->chain_s3_ids = NULL;
+	task->old_clusters = NULL;
+	task->lvol = lvol;
+	lvol->last_offset = offset;
+	task->current_offset = offset;
+	task->cluster_batch = cluster_batch;
+	task->type = type;
+	task->cb_fn = cb_fn;
+	task->cb_arg = cb_arg;
+	task->state = XFER_STATE_NONE;
+	
+
+	task->page_size = spdk_bs_get_page_size(lvol->lvol_store->blobstore);
+	task->page_per_cluster = spdk_bs_get_cluster_size(lvol->lvol_store->blobstore) / task->page_size;
+
+	if (snapshot_name) {
+		task->len = snprintf(task->snapshot_name, sizeof(task->snapshot_name), "%s", snapshot_name);
+		task->final_step = true;
+		task->signal_sent = false;
+	} else {
+		task->len = 0;
+		task->final_step = false;
+	}
+
+	task->num_clusters = spdk_blob_get_num_clusters(lvol->blob);
+	task->clusters = calloc(task->num_clusters, sizeof(uint64_t));
+	if (!task->clusters) {
+		SPDK_ERRLOG("Cannot allocate memory for transfer clusters array.\n");
+		free(task);
+		return -ENOMEM;
+	}
+
+	// rememeber
+	// if (type == XFER_MIGRATE_SNAPSHOT) {
+	// 	//TODO: in case we have cluster size more than 2MB 
+	// 	if (task->page_per_cluster > 512) {
+	// 		extent = (task->page_per_cluster / 512) / ((spdk_blob_get_geometry(lvol->blob) & 0x3) + 1);
+	// 	}
+	// }
+
+	lvol->redirect_map_id = lvol_id;
+	lvol->tdev = tdev;
+
+	rc = spdk_lvol_create_backup_task(task, tdev);
+	if (rc != 0) {
+		return rc;
+	}
+
+	//freezing the lvol for incoming io here
+	//TODO: put some delay for stating the migration bcs may we have inflight IO
+	if (task->final_step) {
+		lvol->freezed = true;
+	}
+	
+	SPDK_NOTICELOG("Transfer lvol %s %s task: last offset %" PRIu64 " status %s start.\n", task->lvol->name,
+		 			xfer_type_to_string(task->type), task->lvol->last_offset,
+					xfer_result_type_to_string(task->lvol->transfer_status));
+
+	TAILQ_INSERT_TAIL(&g_lvs_xfer_tasks, task, entry);
+	return 0;
 }
 
 int
@@ -6243,6 +6218,7 @@ spdk_lvol_s3_backup(struct spdk_lvol *lvol, uint32_t cluster_batch,
 				struct spdk_lvol **chain_snapshots, int num_snapshots, uint32_t s3_id) {
 	struct spdk_transfer_dev *tdev;
 	struct spdk_lvs_xfer *xfer, *task;
+	int rc;
 
 	TAILQ_FOREACH(xfer, &g_lvs_xfer_tasks, entry) {
 		if (xfer->s3_id == s3_id) {
@@ -6262,15 +6238,30 @@ spdk_lvol_s3_backup(struct spdk_lvol *lvol, uint32_t cluster_batch,
 		SPDK_ERRLOG("Cannot allocate memory for transfer structure task.\n");
 		return -ENOMEM;
 	}
+	task->chain	= NULL;
+	task->clusters = NULL;
+	task->chain_s3_ids = NULL;
+	task->old_clusters = NULL;
 	task->lvol = lvol;
 	task->lvol->transfer_status = XFER_NONE;
 	task->cluster_batch = cluster_batch;
 	task->type = XFER_S3_BACKUP;
 	task->state = XFER_STATE_NONE;
-	task->chain = chain_snapshots;
 	task->chain_count = num_snapshots;
 	task->s3_id = s3_id;
 	task->timeout = spdk_get_ticks();
+
+	task->chain = calloc(num_snapshots, sizeof(struct spdk_lvol *));
+	if (!task->chain) {
+		SPDK_ERRLOG("Cannot allocate memory for transfer clusters array.\n");
+		free(task);
+		return -ENOMEM;
+	}
+
+	for (int i = 0; i < num_snapshots; i++) {
+		task->chain[i] = chain_snapshots[i];
+		// SPDK_NOTICELOG("s3_id[%zu]=%u\n", i, s3_ids_chain[i]);
+	}
 
 	task->page_size = spdk_bs_get_page_size(lvol->lvol_store->blobstore);
 	task->page_per_cluster = spdk_bs_get_cluster_size(lvol->lvol_store->blobstore) / task->page_size;
@@ -6284,13 +6275,19 @@ spdk_lvol_s3_backup(struct spdk_lvol *lvol, uint32_t cluster_batch,
 		return -ENOMEM;
 	}
 
-	return spdk_lvol_create_backup_task(task, tdev);
+	rc = spdk_lvol_create_backup_task(task, tdev);
+	if (rc != 0) {
+		return rc;
+	}
+	TAILQ_INSERT_TAIL(&g_lvs_xfer_tasks, task, entry);
+	return 0;
 }
 
 int
 spdk_lvol_s3_merge(struct spdk_lvol_store *lvs, uint32_t s3_id, uint32_t old_s3_id, uint32_t cluster_batch) {
 	struct spdk_transfer_dev *tdev;
 	struct spdk_lvs_xfer *xfer, *task;
+	int rc;
 
 	TAILQ_FOREACH(xfer, &g_lvs_xfer_tasks, entry) {
 		if (xfer->s3_id == s3_id && xfer->old_s3_id == old_s3_id) {
@@ -6310,6 +6307,10 @@ spdk_lvol_s3_merge(struct spdk_lvol_store *lvs, uint32_t s3_id, uint32_t old_s3_
 		SPDK_ERRLOG("Cannot allocate memory for transfer structure task.\n");
 		return -ENOMEM;
 	}
+	task->chain	= NULL;
+	task->clusters = NULL;
+	task->chain_s3_ids = NULL;
+	task->old_clusters = NULL;
 	task->lvol = NULL;
 	task->cluster_batch = cluster_batch;
 	task->type = XFER_S3_MERGE;
@@ -6322,7 +6323,12 @@ spdk_lvol_s3_merge(struct spdk_lvol_store *lvs, uint32_t s3_id, uint32_t old_s3_
 	task->page_size = spdk_bs_get_page_size(lvs->blobstore);
 	task->page_per_cluster = spdk_bs_get_cluster_size(lvs->blobstore) / task->page_size;
 
-	return spdk_lvol_create_backup_task(task, tdev);
+	rc = spdk_lvol_create_backup_task(task, tdev);
+	if (rc != 0) {
+		return rc;
+	}
+	TAILQ_INSERT_TAIL(&g_lvs_xfer_tasks, task, entry);
+	return 0;
 }
 
 int
@@ -6330,6 +6336,7 @@ spdk_lvol_s3_recovery(struct spdk_lvol *lvol, uint32_t cluster_batch,
 				uint32_t *chain_s3_ids, uint32_t num_s3_ids) {
 	struct spdk_transfer_dev *tdev;
 	struct spdk_lvs_xfer *xfer, *task;
+	int rc;
 
 	TAILQ_FOREACH(xfer, &g_lvs_xfer_tasks, entry) {
 		if (xfer->lvol == lvol) {
@@ -6349,15 +6356,30 @@ spdk_lvol_s3_recovery(struct spdk_lvol *lvol, uint32_t cluster_batch,
 		SPDK_ERRLOG("Cannot allocate memory for transfer structure task.\n");
 		return -ENOMEM;
 	}
+	task->chain	= NULL;
+	task->clusters = NULL;
+	task->chain_s3_ids = NULL;
+	task->old_clusters = NULL;
 	task->lvol = lvol;
 	task->lvol->transfer_status = XFER_NONE;
 	task->cluster_batch = cluster_batch;
 	task->type = XFER_S3_RECOVER;
 	task->state = XFER_STATE_NONE;
 	task->s3_id = chain_s3_ids[0];
-	task->chain_s3_ids = chain_s3_ids;
-	task->chain_count = num_s3_ids;
 
+	task->chain_s3_ids = calloc(num_s3_ids, sizeof(uint32_t));
+	if (!task->chain_s3_ids) {
+		SPDK_ERRLOG("Cannot allocate memory for transfer clusters array.\n");		
+		free(task);
+		return -ENOMEM;
+	}
+
+	for (size_t i = 0; i < num_s3_ids; i++) {
+		task->chain_s3_ids[i] = chain_s3_ids[i];
+		// SPDK_NOTICELOG("s3_id[%zu]=%u\n", i, s3_ids_chain[i]);
+	}
+
+	task->chain_count = num_s3_ids;
 	task->timeout = spdk_get_ticks();
 
 	task->page_size = spdk_bs_get_page_size(lvol->lvol_store->blobstore);
@@ -6367,12 +6389,18 @@ spdk_lvol_s3_recovery(struct spdk_lvol *lvol, uint32_t cluster_batch,
 	task->clusters = calloc(task->num_clusters, sizeof(uint64_t));
 	if (!task->clusters) {
 		SPDK_ERRLOG("Cannot allocate memory for transfer clusters array.\n");
-		free(task->chain);
+		free(task->chain_s3_ids);
 		free(task);
 		return -ENOMEM;
 	}
 
-	return spdk_lvol_create_backup_task(task, tdev);
+	rc = spdk_lvol_create_backup_task(task, tdev);
+	if (rc != 0) {
+		return rc;
+	}
+
+	TAILQ_INSERT_TAIL(&g_lvs_xfer_tasks, task, entry);
+	return 0;
 }
 
 void
