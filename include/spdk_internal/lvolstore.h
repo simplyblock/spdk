@@ -185,6 +185,12 @@ struct lvolstore_info {
 	struct spdk_io_channel	*md_channel;
 };
 
+struct remote_dev_info {
+	struct spdk_transfer_dev *tdev;
+	struct spdk_io_channel	*tdev_channel;
+	TAILQ_ENTRY(remote_dev_info)	entry;// channel and tdev
+};
+
 struct spdk_lvs_poll_group {
 	TAILQ_HEAD(, remote_lvol_info)	rmt_lvols;
 	struct lvolstore_info lvs_info[4];
@@ -195,7 +201,8 @@ struct spdk_lvs_poll_group {
 	struct spdk_poller 	*xfer_poller;
 	const char *thread_name;
 	int id;
-	TAILQ_ENTRY(spdk_lvs_poll_group)	entry;
+	TAILQ_ENTRY(spdk_lvs_poll_group) entry;
+	TAILQ_HEAD(, remote_dev_info)	ch_tdev;	
 };
 
 

@@ -1417,13 +1417,11 @@ spdk_thread_send_msg(const struct spdk_thread *thread, spdk_msg_fn fn, void *ctx
 
 	local_thread = _get_thread();
 
-	if (local_thread != NULL && local_thread->name != NULL) {
+	if (local_thread != NULL) {
 		src_name = local_thread->name;
 	}
 
-	if (thread->name != NULL) {
-		dst_name = thread->name;
-	}
+	dst_name = thread->name;
 
 	msg = NULL;
 	if (local_thread != NULL) {

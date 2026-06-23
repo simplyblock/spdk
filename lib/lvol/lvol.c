@@ -3867,6 +3867,7 @@ spdk_wait_for_pg_io_cleanup(void *arg) {
 	struct remote_lvol_info *rmt_lvol, *tmp;
 	struct spdk_transfer_dev *tdev = arg;
 	struct spdk_lvs_poll_group *lpg = NULL;
+	struct remote_dev_info *rdi, *tmp_tdev;
 	// SPDK_NOTICELOG("destroy lvol in poller: 1.\n");
 
 	TAILQ_FOREACH(lpg, &g_lvs_poll_groups, entry) {
@@ -3879,6 +3880,17 @@ spdk_wait_for_pg_io_cleanup(void *arg) {
 	if (!lpg) {
 		SPDK_ERRLOG("Cannot find the poll group for the current thread.\n");
 		return;
+	}
+
+	// remove base channel
+	TAILQ_FOREACH_SAFE(rdi, &lpg->ch_tdev, entry, tmp_tdev) {
+		if (rdi->tdev == tdev) {
+			spdk_put_io_channel(rdi->tdev_channel);
+			tdev->pg[lpg->id]--;
+			TAILQ_REMOVE(&lpg->ch_tdev, rdi, entry);
+			free(rdi);
+			break;
+		}
 	}
 
 	TAILQ_FOREACH_SAFE(rmt_lvol , &lpg->rmt_lvols, entry, tmp) {
@@ -4804,7 +4816,7 @@ xfer_replication(struct spdk_lvs_xfer *xfer) {
 				req->offset = 0;
 				req->action = REQ_ACTION_WRITE;
 				req->status = XFER_REQ_STATUS_READY;
-				snprintf(req->payload, xfer->page_size, "migration_completed:%s", xfer->len ? xfer->snapshot_name : "none");
+				snprintf(req->payload, xfer->page_size, "transfer_task_completed:%s", xfer->len ? xfer->snapshot_name : "none");
 				req->dst_offset = ((uint64_t)(xfer->lvol->redirect_map_id) << 48) | req->offset;
 				xfer->signal_sent = true;
 				if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
@@ -5804,6 +5816,7 @@ spdk_lvs_create_poll_group(void *ctx)
 	lpg->thread = spdk_get_thread();
 	lpg->thread_name = spdk_thread_get_name(lpg->thread);
 	TAILQ_INIT(&lpg->rmt_lvols);
+	TAILQ_INIT(&lpg->ch_tdev);
 	lpg->md_thread = g_lvs_md_thread;
 
 	struct spdk_lvol_store *tmp;
@@ -5988,11 +6001,48 @@ spdk_open_rmt_bdev(const char *name, struct spdk_lvol_store *lvs, bool is_s3)
 	return tdev;
 }
 
+static int
+spdk_lvs_create_base_channel_pg(struct spdk_lvs_poll_group *lpg, struct spdk_transfer_dev *tdev) {
+
+	struct remote_dev_info *rdi = NULL;
+
+	TAILQ_FOREACH(rdi, &lpg->ch_tdev, entry) {
+		if (rdi->tdev == tdev) {
+			return 0;
+		}
+	}
+
+	rdi = calloc(1, sizeof(*rdi));
+	if (!rdi) {
+		return -1;
+	}
+	//open the base channel in this lines so on the destroing the task and put the rmt channel if we want to use the tdev again we can do it
+	//without facing duplicate issue with nvmf
+	rdi->tdev = tdev;
+	rdi->tdev_channel = spdk_bdev_get_io_channel(tdev->desc);
+	if (!rdi->tdev_channel) {
+		SPDK_ERRLOG("Cannot get base io channel for remote bdev %s.\n", tdev->bdev_name ? tdev->bdev_name : "s3 backup task");
+		free(rdi);
+		return -1;
+	}
+
+	TAILQ_INSERT_TAIL(&lpg->ch_tdev, rdi, entry);
+	tdev->pg[lpg->id]++;
+	return 0;
+}
+
 static void
 spdk_lvs_add_rmt_bdev_to_poll_group(void *arg) {
 	struct remote_lvol_info *rmt_lvol = (struct remote_lvol_info *)(uintptr_t)arg;
 	struct spdk_lvs_poll_group *lpg = rmt_lvol->group;
 	struct spdk_transfer_dev *tdev = rmt_lvol->tdev;
+
+	if (spdk_lvs_create_base_channel_pg(lpg, tdev) < 0) {
+		SPDK_ERRLOG("rmt-lvol Cannot get io channel for remote bdev %s.\n", tdev->bdev_name ? tdev->bdev_name : "s3 backup task");
+		rmt_lvol->xfer_task->state = XFER_STATE_FAILED;
+		free(rmt_lvol);
+		return;
+	}
 
 	rmt_lvol->channel = spdk_bdev_get_io_channel(rmt_lvol->desc);
 	if (!rmt_lvol->channel) {
@@ -6002,6 +6052,7 @@ spdk_lvs_add_rmt_bdev_to_poll_group(void *arg) {
 		free(rmt_lvol);
 		return;
 	}
+
 	rmt_lvol->status = true;
 	tdev->pg[lpg->id]++;
 	TAILQ_INSERT_TAIL(&lpg->rmt_lvols, rmt_lvol, entry);
