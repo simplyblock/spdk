@@ -4798,10 +4798,12 @@ xfer_replication(struct spdk_lvs_xfer *xfer) {
 			}
 
 			if (!xfer->signal_sent) {
-				xfer->outstanding_io++;
+				memset(req->payload, 0, xfer->page_size * xfer->page_per_cluster);
 				count++;	
 				req->len = 1;
 				req->offset = 0;
+				req->action = REQ_ACTION_WRITE;
+				req->status = XFER_REQ_STATUS_READY;
 				snprintf(req->payload, xfer->page_size, "migration_completed:%s", xfer->len ? xfer->snapshot_name : "none");
 				req->dst_offset = ((uint64_t)(xfer->lvol->redirect_map_id) << 48) | req->offset;
 				xfer->signal_sent = true;
@@ -4809,6 +4811,8 @@ xfer_replication(struct spdk_lvs_xfer *xfer) {
 						SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
 						assert(false);
 				}
+				xfer->idx = 1;
+				xfer->outstanding_io++;
 			}
 			break;
 		case XFER_STATE_DONE:
@@ -4918,10 +4922,12 @@ xfer_migration(struct spdk_lvs_xfer *xfer) {
 			}
 
 			if (!xfer->signal_sent) {
-				xfer->outstanding_io++;
+				memset(req->payload, 0, xfer->page_size * 8);
 				count++;	
 				req->len = 1;
 				req->offset = 0;
+				req->action = REQ_ACTION_WRITE;
+				req->status = XFER_REQ_STATUS_READY;
 				snprintf(req->payload, xfer->page_size, "transfer_task_completed:%s", xfer->len ? xfer->snapshot_name : "none");
 				req->dst_offset = ((uint64_t)(xfer->lvol->redirect_map_id) << 48) | req->offset;
 				xfer->signal_sent = true;
@@ -4929,6 +4935,8 @@ xfer_migration(struct spdk_lvs_xfer *xfer) {
 						SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
 						assert(false);
 				}
+				xfer->idx = 1;
+				xfer->outstanding_io++;
 			}
 			break;
 		case XFER_STATE_DONE:

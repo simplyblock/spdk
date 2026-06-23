@@ -264,7 +264,6 @@ struct spdk_nvmf_tcp_req  {
 	uint32_t				h2c_offset;
 	uint64_t 				time;
 	struct time_per_state	tps;
-	bool 					loged;
 
 	STAILQ_ENTRY(spdk_nvmf_tcp_req)		link;
 	TAILQ_ENTRY(spdk_nvmf_tcp_req)		state_link;
@@ -680,6 +679,7 @@ nvmf_tcp_cleanup_all_states(struct spdk_nvmf_tcp_qpair *tqpair)
 	nvmf_tcp_drain_state_queue(tqpair, TCP_REQUEST_STATE_NEW);
 	nvmf_tcp_drain_state_queue(tqpair, TCP_REQUEST_STATE_READY_TO_EXECUTE);
 	nvmf_tcp_drain_state_queue(tqpair, TCP_REQUEST_STATE_EXECUTING);
+	nvmf_tcp_drain_state_queue(tqpair, TCP_REQUEST_STATE_READY_TO_COMPLETE);
 	nvmf_tcp_drain_state_queue(tqpair, TCP_REQUEST_STATE_TRANSFERRING_HOST_TO_CONTROLLER);
 	nvmf_tcp_drain_state_queue(tqpair, TCP_REQUEST_STATE_AWAITING_R2T_ACK);
 	nvmf_tcp_drain_state_queue(tqpair, TCP_REQUEST_STATE_COMPLETED);
@@ -3245,22 +3245,22 @@ nvmf_tcp_check_fused_ordering(struct spdk_nvmf_tcp_transport *ttransport,
 	}
 }
 
-static void
-nvmf_tcp_dump_qpair_req_contents_s(struct spdk_nvmf_tcp_qpair *tqpair)
-{
-	int i;
-	char buf[255]; // Adjust the size as necessary
-	int offset = 0;
+// static void
+// nvmf_tcp_dump_qpair_req_contents_s(struct spdk_nvmf_tcp_qpair *tqpair)
+// {
+// 	int i;
+// 	char buf[255]; // Adjust the size as necessary
+// 	int offset = 0;
 
-	// Build the string with all states
-	offset += snprintf(buf + offset, sizeof(buf) - offset, "Dumping (QID %d): ", tqpair->qpair.qid);
-	for (i = 1; i < TCP_REQUEST_NUM_STATES; i++) {
-		offset += snprintf(buf + offset, sizeof(buf) - offset, "[%d]=%u ", i, tqpair->state_cntr[i]);
-	}
+// 	// Build the string with all states
+// 	offset += snprintf(buf + offset, sizeof(buf) - offset, "Dumping (QID %d): ", tqpair->qpair.qid);
+// 	for (i = 1; i < TCP_REQUEST_NUM_STATES; i++) {
+// 		offset += snprintf(buf + offset, sizeof(buf) - offset, "[%d]=%u ", i, tqpair->state_cntr[i]);
+// 	}
 
-	// Print the entire string in one line
-	SPDK_ERRLOG("%s \n", buf);
-}
+// 	// Print the entire string in one line
+// 	SPDK_ERRLOG("%s \n", buf);
+// }
 
 static void
 nvmf_tcp_dump_delay_req_status(struct spdk_nvmf_tcp_req *tcp_req, struct spdk_nvmf_tcp_qpair *tqpair)
@@ -3279,8 +3279,10 @@ nvmf_tcp_dump_delay_req_status(struct spdk_nvmf_tcp_req *tcp_req, struct spdk_nv
 			// 	SPDK_NOTICELOG("stop the tcpdump on the state 6 bigger than 500ms.\n");
 			// 	system("pkill -9 tcpdump");
 			// }
-			offset += snprintf(buf + offset, sizeof(buf) - offset, "[%d]=%.3f ", i, duration_us);
+			offset += snprintf(buf + offset, sizeof(buf) - offset, "[%d]=%.3f ", i, duration_us);			
 		}
+		tcp_req->tps.time_per_state[i] = 0;
+		tcp_req->tps.state[i] = 0;
 	}
 
 	// Print the entire string in one line
@@ -3289,7 +3291,7 @@ nvmf_tcp_dump_delay_req_status(struct spdk_nvmf_tcp_req *tcp_req, struct spdk_nv
 
 static void 
 check_time(struct spdk_nvmf_tcp_req *tcp_req, struct spdk_nvmf_tcp_qpair *tqpair) {
-	if (!tcp_req->loged && tcp_req->time && tqpair->qpair.qid != 0 /*&&(tqpair->target_port >= 9030 && tqpair->target_port <= 9090)*/) {
+	if (tcp_req->time && tqpair->qpair.qid != 0 /*&&(tqpair->target_port >= 9030 && tqpair->target_port <= 9090)*/) {
 		uint64_t current = spdk_get_ticks();
 		uint64_t ticks_hz = spdk_get_ticks_hz();
 		// Check if more than 28 ticks have passed since tcp_req->time
@@ -3306,14 +3308,12 @@ check_time(struct spdk_nvmf_tcp_req *tcp_req, struct spdk_nvmf_tcp_qpair *tqpair
 			spdk_nvme_print_command_s(tqpair->qpair.qid, &tcp_req->cmd);
 
 			// If more than 30 ticks have passed for the qpair, dump its contents
-			if ((current - tqpair->time) > ticks_hz * 10) {
-				nvmf_tcp_dump_qpair_req_contents_s(tqpair);
-				tqpair->time = current;
-			}
-
-			// Mark the request as logged
-			tcp_req->loged = true;
+			// if ((current - tqpair->time) > ticks_hz * 10) {
+			// 	nvmf_tcp_dump_qpair_req_contents_s(tqpair);
+			// 	tqpair->time = current;
+			// }
 		}
+		tcp_req->time = 0;
 	}
 }
 
@@ -3366,7 +3366,6 @@ nvmf_tcp_req_process(struct spdk_nvmf_tcp_transport *ttransport,
 			spdk_trace_record(TRACE_TCP_REQUEST_STATE_NEW, tqpair->qpair.trace_id, 0, (uintptr_t)tcp_req,
 					  tqpair->qpair.queue_depth);
 			tcp_req->time = spdk_get_ticks();
-			tcp_req->loged = false;
 			tcp_req->tps.state[TCP_REQUEST_STATE_NEW] = 1;
 			tcp_req->tps.time_per_state[TCP_REQUEST_STATE_NEW] = spdk_get_ticks();
 			/* copy the cmd from the receive pdu */
@@ -3679,6 +3678,11 @@ nvmf_tcp_req_process(struct spdk_nvmf_tcp_transport *ttransport,
 				tcp_req->tps.state[TCP_REQUEST_STATE_READY_TO_COMPLETE] = 1;
 				tcp_req->tps.time_per_state[TCP_REQUEST_STATE_READY_TO_COMPLETE] = spdk_get_ticks();
 			}
+
+			if (nvmf_tcp_queued_req(tqpair, tcp_req)) {
+				return false;
+			}
+
 			if (request_transfer_out(&tcp_req->req) != 0) {
 				assert(0); /* No good way to handle this currently */
 			}

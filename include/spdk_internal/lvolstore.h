@@ -153,9 +153,7 @@ struct spdk_transfer_dev {
 	char bdev_name[SPDK_LVOL_NAME_MAX];
 	struct spdk_thread		*thread;
 	struct spdk_poller *cleanup_poller;
-	// uint64_t transfered_io_count;
 	enum hublvol_state	state;
-	// uint64_t out_standing_io;
 	uint64_t redirected_io_count;
 	bool dev_in_remove;
 	bool drain_in_action;
@@ -171,7 +169,6 @@ struct remote_lvol_info {
 	enum xfer_type   type;
 	struct spdk_transfer_dev *tdev;
 	struct spdk_bdev_desc	*desc;
-	// char *bdev_name;
 	struct spdk_io_channel	*channel;
 	struct spdk_io_channel	*md_channel;
 	struct spdk_lvs_poll_group *group;
@@ -201,13 +198,6 @@ struct spdk_lvs_poll_group {
 	TAILQ_ENTRY(spdk_lvs_poll_group)	entry;
 };
 
-// struct remove_event {
-// 	struct spdk_lvs_poll_group *lpg;
-// 	struct spdk_transfer_dev *tdev;
-// 	struct remote_lvol_info *rmt_lvol;
-// 	struct spdk_lvs_xfer *xfer_task;
-// 	uint32_t s3_id;
-// };
 
 struct spdk_lvs_xfer_req {
 	enum xfer_req_status status;

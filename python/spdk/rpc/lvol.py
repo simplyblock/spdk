@@ -315,7 +315,7 @@ def bdev_lvol_s3_bdev(client, bdev=None, uuid=None, lvs_name=None):
         params['lvs_name'] = lvs_name
     return client.call('bdev_lvol_s3_bdev', params)
 
-def bdev_lvol_final_migration(client, lvol_name=None, lvol_id=0, snapshot_name=None, cluster_batch=16, gateway=None):
+def bdev_lvol_transfer_final_step(client, lvol_name=None, lvol_id=0, snapshot_name=None, cluster_batch=16, gateway=None, operation=None):
     """Replicate a logical volume on a logical volume store.
 
     Args:
@@ -334,8 +334,8 @@ def bdev_lvol_final_migration(client, lvol_name=None, lvol_id=0, snapshot_name=N
     if lvol_id <= 0:
         raise ValueError("lvol_id must be specified")
 
-    params = {'lvol_name': lvol_name, 'lvol_id': lvol_id, 'snapshot_name': snapshot_name, 'cluster_batch': cluster_batch, 'gateway': gateway}
-    return client.call('bdev_lvol_final_migration', params)
+    params = {'lvol_name': lvol_name, 'lvol_id': lvol_id, 'snapshot_name': snapshot_name, 'cluster_batch': cluster_batch, 'gateway': gateway, 'operation': operation}
+    return client.call('bdev_lvol_transfer_final_step', params)
 
 def bdev_lvol_transfer(client, lvol_name=None, lvol_id=0, offset=0, cluster_batch=16, gateway=None, operation=None):
     """Replicate a logical volume on a logical volume store.
