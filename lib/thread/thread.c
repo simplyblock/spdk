@@ -1405,6 +1405,8 @@ spdk_thread_send_msg(const struct spdk_thread *thread, spdk_msg_fn fn, void *ctx
 	struct spdk_thread *local_thread;
 	struct spdk_msg *msg;
 	int rc;
+	const char *src_name = "unknown";
+	const char *dst_name = "unknown";
 
 	assert(thread != NULL);
 
@@ -1414,6 +1416,14 @@ spdk_thread_send_msg(const struct spdk_thread *thread, spdk_msg_fn fn, void *ctx
 	}
 
 	local_thread = _get_thread();
+
+	if (local_thread != NULL && local_thread->name != NULL) {
+		src_name = local_thread->name;
+	}
+
+	if (thread->name != NULL) {
+		dst_name = thread->name;
+	}
 
 	msg = NULL;
 	if (local_thread != NULL) {
@@ -1428,7 +1438,8 @@ spdk_thread_send_msg(const struct spdk_thread *thread, spdk_msg_fn fn, void *ctx
 	if (msg == NULL) {
 		msg = spdk_mempool_get(g_spdk_msg_mempool);
 		if (!msg) {
-			SPDK_ERRLOG("msg could not be allocated\n");
+			SPDK_ERRLOG("msg could not be allocated: src thread '%s', dst thread '%s', fn %p\n",
+				    src_name, dst_name, fn);
 			return -ENOMEM;
 		}
 	}
@@ -1438,7 +1449,8 @@ spdk_thread_send_msg(const struct spdk_thread *thread, spdk_msg_fn fn, void *ctx
 
 	rc = spdk_ring_enqueue(thread->messages, (void **)&msg, 1, NULL);
 	if (rc != 1) {
-		SPDK_ERRLOG("msg could not be enqueued\n");
+		SPDK_ERRLOG("msg could not be enqueued: src thread '%s', dst thread '%s', fn %p\n",
+			    src_name, dst_name, fn);
 		spdk_mempool_put(g_spdk_msg_mempool, msg);
 		return -EIO;
 	}

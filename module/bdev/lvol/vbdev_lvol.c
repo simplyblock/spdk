@@ -1284,11 +1284,11 @@ process_migration_write_request(struct spdk_bdev_io *bdev_io, struct spdk_lvol *
         buf[copy_len] = '\0';
 
         // Check if this I/O carries the migration signal
-        if (strncmp(buf, "migration_completed:", 20) == 0) {
+        if (strncmp(buf, "transfer_task_completed:", 24) == 0) {
 			find_signal = true;
-            const char *snapshot_name = buf + 20;
+            const char *snapshot_name = buf + 24;
 
-            SPDK_NOTICELOG("Migration complete signal received. Snapshot: %s\n", snapshot_name);
+            SPDK_NOTICELOG("Transfer task completed signal received. Snapshot: %s\n", snapshot_name);
 			ctx = calloc(1, sizeof(*ctx));
 			if (ctx == NULL) {
 				SPDK_ERRLOG("Failed to allocate memory for migration context\n");
@@ -1954,7 +1954,7 @@ vbdev_lvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_
 		}
 	}
 
-	if (lvol->redirect_after_migration) {
+	if (lvol->redirect_io) {
 		if (io_type) {
 			if (lvol->redirect_failed) {
 				spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);

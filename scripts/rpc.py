@@ -2240,20 +2240,23 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('-b', '--bdev',  help='Target bdev name', required=True)
     p.set_defaults(func=bdev_lvol_s3_bdev)
 
-    def bdev_lvol_final_migration(args):
-        print_json(rpc.lvol.bdev_lvol_final_migration(args.client,
+    def bdev_lvol_transfer_final_step(args):
+        print_json(rpc.lvol.bdev_lvol_transfer_final_step(args.client,
                                              lvol_name=args.lvol_name,
                                              lvol_id=args.lvol_id,
                                              snapshot_name=args.snapshot_name,
                                              cluster_batch=args.cluster_batch,
-                                             gateway=args.gateway))
-    p = subparsers.add_parser('bdev_lvol_final_migration', help='Migrate an lvol between lvol stores via hublvol as gateway')
+                                             gateway=args.gateway,
+                                             operation=args.operation))
+
+    p = subparsers.add_parser('bdev_lvol_transfer_final_step', help='Transfer an lvol between lvol stores via hublvol as gateway')
     p.add_argument('--lvol-name', help='Name of the source lvol')
     p.add_argument('--lvol-id', help='Destination lvol map ID', type=int, required=True)
     p.add_argument('--snapshot-name', help='Destination snapshot name', required=True)
     p.add_argument('-b', '--cluster-batch', help='Transfering lvol with batch reqs: default 16 clusters', type=int)
     p.add_argument('-g', '--gateway', help='Target hubLvol name as gateway', required=True)
-    p.set_defaults(func=bdev_lvol_final_migration)
+    p.add_argument('-O', '--operation', help=("Operation to perform. Valid values: 'migrate' (metadata only), 'replicate' (metadata + data)"), choices=['migrate', 'replicate'], required=True)
+    p.set_defaults(func=bdev_lvol_transfer_final_step)
     
     def bdev_lvol_transfer(args):
         print_json(rpc.lvol.bdev_lvol_transfer(args.client,
