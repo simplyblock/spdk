@@ -3893,6 +3893,15 @@ spdk_wait_for_pg_io_cleanup(void *arg) {
 		}
 	}
 
+	if (TAILQ_EMPTY(&lpg->rmt_lvols)) {
+		// should not happens
+		if (tdev->pg[lpg->id] > 0) {
+			SPDK_ERRLOG("should not happens on remvoe event have reference to channel %s for pg %s.\n", tdev->bdev_name, lpg->thread_name);
+			tdev->pg[lpg->id] = 0;
+		}
+		return;
+	}
+
 	TAILQ_FOREACH_SAFE(rmt_lvol , &lpg->rmt_lvols, entry, tmp) {
 		if (rmt_lvol->tdev != tdev) {
 			continue;
@@ -4539,6 +4548,9 @@ spdk_delete_rmt_lvol_pg(void *arg) {
 
 		if (rmt_lvol->channel) {
 			spdk_put_io_channel(rmt_lvol->channel);
+			if (rmt_lvol->tdev->pg[lpg->id] > 0) {
+				rmt_lvol->tdev->pg[lpg->id]--;
+			}
 		}
 		
 		free(rmt_lvol);
