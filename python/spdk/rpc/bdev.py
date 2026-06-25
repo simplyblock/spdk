@@ -573,7 +573,7 @@ def bdev_xnvme_delete(client, name):
     return client.call('bdev_xnvme_delete', params)
 
 
-def bdev_nvme_set_options(client, action_on_timeout=None, timeout_us=None, timeout_admin_us=None,
+def bdev_nvme_set_options(client, action_on_timeout=None, timeout_us=None, pci_timeout_us=None, timeout_admin_us=None,
                           keep_alive_timeout_ms=None, arbitration_burst=None,
                           low_priority_weight=None, medium_priority_weight=None, high_priority_weight=None,
                           nvme_adminq_poll_period_us=None, nvme_ioq_poll_period_us=None, io_queue_requests=None,
@@ -587,6 +587,7 @@ def bdev_nvme_set_options(client, action_on_timeout=None, timeout_us=None, timeo
     Args:
         action_on_timeout:  action to take on command time out. Valid values are: none, reset, abort (optional)
         timeout_us: Timeout for each command, in microseconds. If 0, don't track timeouts (optional)
+        pci_timeout_us: Timeout for each command, in microseconds for pci transport layer. If 0, don't track timeouts (optional)
         timeout_admin_us: Timeout for each admin command, in microseconds. If 0, treat same as io timeouts (optional)
         keep_alive_timeout_ms: Keep alive timeout period in millisecond, default is 10s (optional)
         arbitration_burst: The value is expressed as a power of two (optional)
@@ -639,6 +640,8 @@ def bdev_nvme_set_options(client, action_on_timeout=None, timeout_us=None, timeo
         params['action_on_timeout'] = action_on_timeout
     if timeout_us is not None:
         params['timeout_us'] = timeout_us
+    if pci_timeout_us is not None:
+        params['pci_timeout_us'] = pci_timeout_us
     if timeout_admin_us is not None:
         params['timeout_admin_us'] = timeout_admin_us
     if keep_alive_timeout_ms is not None:

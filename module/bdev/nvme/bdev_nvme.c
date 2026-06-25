@@ -164,6 +164,7 @@ static struct spdk_bdev_nvme_opts g_opts = {
 	.action_on_timeout = SPDK_BDEV_NVME_TIMEOUT_ACTION_NONE,
 	.keep_alive_timeout_ms = SPDK_BDEV_NVME_DEFAULT_KEEP_ALIVE_TIMEOUT_IN_MS,
 	.timeout_us = 0,
+	.pci_timeout_us = 0,
 	.timeout_admin_us = 0,
 	.transport_retry_count = 4,
 	.arbitration_burst = 0,
@@ -6007,14 +6008,25 @@ nvme_ctrlr_create(struct spdk_nvme_ctrlr *ctrlr,
 			goto err;
 		}
 	}
-
-	if (g_opts.timeout_us > 0) {
-		/* Register timeout callback. Timeout values for IO vs. admin reqs can be different. */
-		/* If timeout_admin_us is 0 (not specified), admin uses same timeout as IO. */
-		uint64_t adm_timeout_us = (g_opts.timeout_admin_us == 0) ?
-					  g_opts.timeout_us : g_opts.timeout_admin_us;
-		spdk_nvme_ctrlr_register_timeout_callback(ctrlr, g_opts.timeout_us,
-				adm_timeout_us, timeout_cb, nvme_ctrlr);
+	//TODO: check if this cntrlr is for pci or tcp?
+	if (trid->trtype == SPDK_NVME_TRANSPORT_PCIE) {
+		if (g_opts.pci_timeout_us > 0) {
+			/* Register timeout callback. Timeout values for IO vs. admin reqs can be different. */
+			/* If timeout_admin_us is 0 (not specified), admin uses same timeout as IO. */
+			uint64_t adm_timeout_us = (g_opts.timeout_admin_us == 0) ?
+						g_opts.pci_timeout_us : g_opts.timeout_admin_us;
+			spdk_nvme_ctrlr_register_timeout_callback(ctrlr, g_opts.pci_timeout_us,
+					adm_timeout_us, timeout_cb, nvme_ctrlr);
+		}
+	} else {
+		if (g_opts.timeout_us > 0) {
+			/* Register timeout callback. Timeout values for IO vs. admin reqs can be different. */
+			/* If timeout_admin_us is 0 (not specified), admin uses same timeout as IO. */
+			uint64_t adm_timeout_us = (g_opts.timeout_admin_us == 0) ?
+						g_opts.timeout_us : g_opts.timeout_admin_us;
+			spdk_nvme_ctrlr_register_timeout_callback(ctrlr, g_opts.timeout_us,
+					adm_timeout_us, timeout_cb, nvme_ctrlr);
+		}
 	}
 
 	spdk_nvme_ctrlr_register_aer_callback(ctrlr, aer_cb, nvme_ctrlr);
@@ -6197,6 +6209,7 @@ spdk_bdev_nvme_get_opts(struct spdk_bdev_nvme_opts *opts, size_t opts_size)
 	SET_FIELD(action_on_timeout, 0);
 	SET_FIELD(keep_alive_timeout_ms, 0);
 	SET_FIELD(timeout_us, 0);
+	SET_FIELD(pci_timeout_us, 0);
 	SET_FIELD(timeout_admin_us, 0);
 	SET_FIELD(transport_retry_count, 0);
 	SET_FIELD(arbitration_burst, 0);
@@ -6230,7 +6243,7 @@ spdk_bdev_nvme_get_opts(struct spdk_bdev_nvme_opts *opts, size_t opts_size)
 
 	/* Do not remove this statement, you should always update this statement when you adding a new field,
 	 * and do not forget to add the SET_FIELD statement for your added field. */
-	SPDK_STATIC_ASSERT(sizeof(struct spdk_bdev_nvme_opts) == 128, "Incorrect size");
+	SPDK_STATIC_ASSERT(sizeof(struct spdk_bdev_nvme_opts) == 136, "Incorrect size");
 }
 
 static bool bdev_nvme_check_io_error_resiliency_params(int32_t ctrlr_loss_timeout_sec,
@@ -6316,6 +6329,7 @@ spdk_bdev_nvme_set_opts(const struct spdk_bdev_nvme_opts *opts)
 	SET_FIELD(action_on_timeout, 0);
 	SET_FIELD(keep_alive_timeout_ms, 0);
 	SET_FIELD(timeout_us, 0);
+	SET_FIELD(pci_timeout_us, 0);
 	SET_FIELD(timeout_admin_us, 0);
 	SET_FIELD(transport_retry_count, 0);
 	SET_FIELD(arbitration_burst, 0);
@@ -8900,6 +8914,7 @@ bdev_nvme_opts_config_json(struct spdk_json_write_ctx *w)
 	spdk_json_write_named_object_begin(w, "params");
 	spdk_json_write_named_string(w, "action_on_timeout", action);
 	spdk_json_write_named_uint64(w, "timeout_us", g_opts.timeout_us);
+	spdk_json_write_named_uint64(w, "pci_timeout_us", g_opts.pci_timeout_us);
 	spdk_json_write_named_uint64(w, "timeout_admin_us", g_opts.timeout_admin_us);
 	spdk_json_write_named_uint32(w, "keep_alive_timeout_ms", g_opts.keep_alive_timeout_ms);
 	spdk_json_write_named_uint32(w, "arbitration_burst", g_opts.arbitration_burst);

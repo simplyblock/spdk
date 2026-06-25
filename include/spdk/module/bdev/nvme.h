@@ -66,6 +66,7 @@ struct spdk_bdev_nvme_opts {
 	enum spdk_bdev_timeout_action action_on_timeout;
 	uint32_t keep_alive_timeout_ms;
 	uint64_t timeout_us;
+	uint64_t pci_timeout_us;
 	uint64_t timeout_admin_us;
 	/* The number of attempts per I/O in the transport layer before an I/O fails. */
 	uint32_t transport_retry_count;
@@ -106,7 +107,7 @@ struct spdk_bdev_nvme_opts {
 	uint8_t reserved121[3];
 	uint32_t tcp_connect_timeout_ms;
 };
-SPDK_STATIC_ASSERT(sizeof(struct spdk_bdev_nvme_opts) == 128, "Incorrect size");
+SPDK_STATIC_ASSERT(sizeof(struct spdk_bdev_nvme_opts) == 136, "Incorrect size");
 
 /**
  * Connect to the NVMe controller and populate namespaces as bdevs.
