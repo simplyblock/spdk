@@ -4702,6 +4702,7 @@ xfer_status_check(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req **preq, u
 				}
 				xfer->state = XFER_STATE_FAILED;
 			} else {
+				xfer->timeout = current_time;   // Reset timeout
 				xfer->timeout_cnt++;
 				if (xfer->timeout_cnt == 1) {
 					SPDK_ERRLOG("S3 transfer timeout with outstanding io %u, state %d\n", xfer->outstanding_io, xfer->state);
