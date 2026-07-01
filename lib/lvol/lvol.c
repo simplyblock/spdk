@@ -4513,6 +4513,48 @@ read_complete_cb(void *arg, int rc)
 	}
 }
 
+static int
+spdk_delete_rmt_lvol_pg_drain(void *arg) {
+	struct remote_lvol_info *rmt_lvol = arg;
+	struct spdk_lvs_poll_group *lpg = rmt_lvol->group;
+	struct spdk_transfer_dev *tdev = rmt_lvol->tdev;
+	struct spdk_lvs_xfer *xfer = rmt_lvol->xfer_task;
+
+	/* Wait for in-lfight I/O to complete. It will zero outstanding_io via
+	 * set_req_status_and_queued. Freeing before that would lead to a use-after-free.
+	 * Wait time is bounded in practice by I/O timeouts, a periodic warning is printed
+	 * if this should ever be truly stuck. */
+	if (rmt_lvol->outstanding_io > 0) {
+		if (spdk_get_ticks() > rmt_lvol->cleanup_warn_tick) {
+			SPDK_ERRLOG("rmt lvol cleanup stuck on tdev %s pg %d: %lu data-plane I/O "
+				"not draining; underlying device may be hung\n",
+				rmt_lvol->tdev->bdev_name ? rmt_lvol->tdev->bdev_name : "s3",
+				lpg->id, rmt_lvol->outstanding_io);
+			/* re-arm so we warn periodically, not once per poll */
+			rmt_lvol->cleanup_warn_tick = spdk_get_ticks() + spdk_get_ticks_hz() * 30;
+		}
+		return SPDK_POLLER_BUSY;
+	}
+
+	spdk_poller_unregister(&rmt_lvol->cleanup_poller);
+	rmt_lvol->cleanup_poller = NULL;
+
+	if (rmt_lvol->channel) {
+		spdk_put_io_channel(rmt_lvol->channel);
+		rmt_lvol->channel = NULL;
+		if (tdev->pg[lpg->id] > 0) {
+			tdev->pg[lpg->id]--;
+		}
+	}
+
+	/* Last time this poll group touches xfer: release the gate so
+	 * destroy_xfer_task_tmo() may free the xfer task and its rings/reqs. The
+	 * xfer is kept alive until now because xfer->pg[lpg->id] stayed set. */
+	xfer->pg[lpg->id] = false;
+	free(rmt_lvol);
+	return -1;
+}
+
 static void
 spdk_delete_rmt_lvol_pg(void *arg) {
 	struct spdk_lvs_xfer *xfer = arg;
@@ -4546,13 +4588,20 @@ spdk_delete_rmt_lvol_pg(void *arg) {
 		TAILQ_REMOVE(&lpg->rmt_lvols, rmt_lvol, entry);
 		rmt_lvol->status = false;
 
+		if (rmt_lvol->outstanding_io > 0) {
+			rmt_lvol->cleanup_warn_tick = spdk_get_ticks() + spdk_get_ticks_hz() * 30;
+			rmt_lvol->cleanup_poller = spdk_poller_register(
+				spdk_delete_rmt_lvol_pg_drain, rmt_lvol, 200000);// check every 200ms
+			return;
+		}
+
 		if (rmt_lvol->channel) {
 			spdk_put_io_channel(rmt_lvol->channel);
 			if (rmt_lvol->tdev->pg[lpg->id] > 0) {
 				rmt_lvol->tdev->pg[lpg->id]--;
 			}
 		}
-		
+
 		free(rmt_lvol);
 		break;
 	}
