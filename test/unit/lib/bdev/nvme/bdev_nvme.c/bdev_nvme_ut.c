@@ -1677,6 +1677,88 @@ test_race_between_reset_and_destruct_ctrlr(void)
 }
 
 static void
+test_destruct_abort_inflight_io(void)
+{
+	struct spdk_nvme_transport_id trid = {};
+	struct spdk_nvme_ctrlr ctrlr = {};
+	struct nvme_ctrlr *nvme_ctrlr;
+	struct spdk_io_channel *ch1, *ch2;
+	struct nvme_ctrlr_channel *ctrlr_ch1, *ctrlr_ch2;
+	int rc;
+
+	ut_init_trid(&trid);
+	TAILQ_INIT(&ctrlr.active_io_qpairs);
+
+	set_thread(0);
+
+	rc = nvme_ctrlr_create(&ctrlr, "nvme0", &trid, NULL);
+	CU_ASSERT(rc == 0);
+
+	nvme_ctrlr = nvme_ctrlr_get_by_name("nvme0");
+	SPDK_CU_ASSERT_FATAL(nvme_ctrlr != NULL);
+
+	/* Two consumers (e.g. journal clients) open I/O channels.  Each creates a
+	 * connected qpair and holds a reference on the controller.
+	 */
+	ch1 = spdk_get_io_channel(nvme_ctrlr);
+	SPDK_CU_ASSERT_FATAL(ch1 != NULL);
+	ctrlr_ch1 = spdk_io_channel_get_ctx(ch1);
+	SPDK_CU_ASSERT_FATAL(ctrlr_ch1->qpair != NULL);
+	SPDK_CU_ASSERT_FATAL(ctrlr_ch1->qpair->qpair != NULL);
+
+	set_thread(1);
+
+	ch2 = spdk_get_io_channel(nvme_ctrlr);
+	SPDK_CU_ASSERT_FATAL(ch2 != NULL);
+	ctrlr_ch2 = spdk_io_channel_get_ctx(ch2);
+	SPDK_CU_ASSERT_FATAL(ctrlr_ch2->qpair != NULL);
+	SPDK_CU_ASSERT_FATAL(ctrlr_ch2->qpair->qpair != NULL);
+
+	/* Delete (destruct) the controller while both consumers still hold their
+	 * channels.  The transport peer is silently gone -- the qpairs have NOT
+	 * been flagged as failed, so nothing outside destruct would disconnect
+	 * them, and the reset/failover path is now disabled by destruct.
+	 */
+	set_thread(0);
+
+	rc = bdev_nvme_delete("nvme0", &g_any_path, NULL, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(nvme_ctrlr->destruct == true);
+
+	poll_threads();
+
+	/* Regression check: no reset ran (destruct suppresses it) ... */
+	CU_ASSERT(nvme_ctrlr->resetting == false);
+
+	/* ... yet destruct disconnected the I/O qpairs on both channels on its
+	 * own, aborting any outstanding I/O.  Before the fix these stayed
+	 * connected (and their in-flight I/O un-abortable) until the consumers
+	 * closed their channels -- which, with the peer gone, never happened --
+	 * pinning the controller indefinitely.
+	 */
+	CU_ASSERT(ctrlr_ch1->qpair->qpair == NULL);
+	CU_ASSERT(ctrlr_ch2->qpair->qpair == NULL);
+
+	/* The controller is still referenced by the two open channels, so it is
+	 * not freed yet -- but the deadlock is broken.  Closing the channels now
+	 * lets the destruct complete.
+	 */
+	CU_ASSERT(nvme_ctrlr_get_by_name("nvme0") == nvme_ctrlr);
+
+	set_thread(0);
+	spdk_put_io_channel(ch1);
+
+	set_thread(1);
+	spdk_put_io_channel(ch2);
+
+	poll_threads();
+	spdk_delay_us(1000);
+	poll_threads();
+
+	CU_ASSERT(nvme_ctrlr_get_by_name("nvme0") == NULL);
+}
+
+static void
 test_failover_ctrlr(void)
 {
 	struct spdk_nvme_transport_id trid1 = {}, trid2 = {};
@@ -8173,6 +8255,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_create_ctrlr);
 	CU_ADD_TEST(suite, test_reset_ctrlr);
 	CU_ADD_TEST(suite, test_race_between_reset_and_destruct_ctrlr);
+	CU_ADD_TEST(suite, test_destruct_abort_inflight_io);
 	CU_ADD_TEST(suite, test_failover_ctrlr);
 	CU_ADD_TEST(suite, test_race_between_failover_and_add_secondary_trid);
 	CU_ADD_TEST(suite, test_pending_reset);

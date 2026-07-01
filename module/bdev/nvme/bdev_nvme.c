@@ -6079,11 +6079,62 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 }
 
 static void
+bdev_nvme_destruct_abort_qpairs_done(struct nvme_ctrlr *nvme_ctrlr, void *ctx, int status)
+{
+	NVME_CTRLR_INFOLOG(nvme_ctrlr, "qpairs were disconnected for destruct.\n");
+
+	/* Drop the reference taken in bdev_nvme_destruct_abort_qpairs() that kept
+	 * the controller alive across the asynchronous channel iteration.
+	 */
+	nvme_ctrlr_put_ref(nvme_ctrlr);
+}
+
+/* Once a controller is being destructed, bdev_nvme_reset_ctrlr_unsafe() and
+ * bdev_nvme_failover_ctrlr_unsafe() both return -ENXIO, so the reset/failover
+ * path can no longer tear down the I/O qpairs.  If the transport peer is
+ * unreachable (e.g. the remote target was stopped), any I/O already submitted
+ * to a qpair will therefore never be completed by a wire response, and never be
+ * aborted by a reset.  Consumers keep their channels open until that I/O
+ * finishes, which pins the controller indefinitely and blocks the destruct from
+ * ever completing.  Break that deadlock by disconnecting the qpairs here, which
+ * aborts the outstanding I/O (with DNR so it is failed rather than retried),
+ * allowing consumers to complete their I/O and close their channels.
+ */
+static void
+bdev_nvme_destruct_abort_qpairs(struct nvme_ctrlr *nvme_ctrlr)
+{
+	pthread_mutex_lock(&nvme_ctrlr->mutex);
+
+	/* A reset/failover already in progress will tear down the qpairs and
+	 * abort their outstanding I/O, so there is nothing to do here.
+	 */
+	if (nvme_ctrlr->resetting) {
+		pthread_mutex_unlock(&nvme_ctrlr->mutex);
+		return;
+	}
+
+	/* The controller is going away; fail aborted I/O instead of retrying it. */
+	nvme_ctrlr->dont_retry = true;
+	pthread_mutex_unlock(&nvme_ctrlr->mutex);
+
+	/* Keep the controller alive while the per-channel iteration runs;
+	 * released in bdev_nvme_destruct_abort_qpairs_done().
+	 */
+	nvme_ctrlr_get_ref(nvme_ctrlr);
+
+	nvme_ctrlr_for_each_channel(nvme_ctrlr,
+				    bdev_nvme_reset_destroy_qpair,
+				    NULL,
+				    bdev_nvme_destruct_abort_qpairs_done);
+}
+
+static void
 _nvme_ctrlr_destruct(void *ctx)
 {
 	struct nvme_ctrlr *nvme_ctrlr = ctx;
 
 	nvme_ctrlr_depopulate_namespaces(nvme_ctrlr);
+	bdev_nvme_destruct_abort_qpairs(nvme_ctrlr);
 	nvme_ctrlr_put_ref(nvme_ctrlr);
 }
 
