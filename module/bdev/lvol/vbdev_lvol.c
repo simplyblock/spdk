@@ -1759,6 +1759,8 @@ vbdev_redirect_after_migrate(struct spdk_lvol *lvol, struct spdk_io_channel *ch,
 	uint64_t offset = 0;
 	COMBINE_OFFSET(offset, lvol->redirect_map_id, bdev_io->u.bdev.offset_blocks);
 
+	SPDK_NOTICELOG("IO Migration - freezed blob: %" PRIu64 "  Lba: %" PRIu64 "  Cnt %" PRIu64 "  t %d \n",
+			 				lvol->blob_id, bdev_io->u.bdev.offset_blocks, bdev_io->u.bdev.num_blocks, bdev_io->type);
 	if (tdev->state == HUBLVOL_CONNECTED) {
 		//TODO check the state for channel
 		if (tdev->desc == NULL) {
