@@ -42,6 +42,8 @@ DEFINE_STUB_V(spdk_bs_grow_live,
 DEFINE_STUB_V(spdk_blob_unfreeze_cleanup,
 	      (struct spdk_blob *blob, spdk_blob_op_with_id_complete cb_fn, void *cb_arg));
 DEFINE_STUB_V(blob_freeze_on_failover, (struct spdk_blob *blob));
+DEFINE_STUB(spdk_blob_get_md_ro, bool, (struct spdk_blob *blob), false);
+DEFINE_STUB_V(spdk_blob_set_md_ro, (struct spdk_blob *blob, bool md_ro));
 DEFINE_STUB_V(spdk_snapshot_freeze_blob, (struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg));
 DEFINE_STUB(spdk_bs_delete_blob_non_leader, int ,(struct spdk_blob_store *bs, struct spdk_blob *blob), 0);
 DEFINE_STUB_V(spdk_bdev_free_io, (struct spdk_bdev_io *g_bdev_io));

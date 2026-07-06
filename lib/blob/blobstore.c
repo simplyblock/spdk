@@ -13338,6 +13338,20 @@ spdk_blob_set_xattr(struct spdk_blob *blob, const char *name, const void *value,
 	return blob_set_xattr(blob, name, value, value_len, false);
 }
 
+bool
+spdk_blob_get_md_ro(struct spdk_blob *blob)
+{
+	bool tmp = blob->md_ro;
+	blob->md_ro = false;
+	return tmp;
+}
+
+void
+spdk_blob_set_md_ro(struct spdk_blob *blob, bool md_ro)
+{
+	blob->md_ro = md_ro;
+}
+
 static int
 blob_remove_xattr(struct spdk_blob *blob, const char *name, bool internal)
 {

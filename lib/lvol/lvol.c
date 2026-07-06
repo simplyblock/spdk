@@ -2106,6 +2106,7 @@ static void
 lvol_rename_cb(void *cb_arg, int lvolerrno)
 {
 	struct spdk_lvol_req *req = cb_arg;
+	struct spdk_blob *blob = req->lvol->blob;
 
 	if (lvolerrno != 0) {
 		SPDK_ERRLOG("Lvol rename operation failed\n");
@@ -2113,6 +2114,7 @@ lvol_rename_cb(void *cb_arg, int lvolerrno)
 		snprintf(req->lvol->name, sizeof(req->lvol->name), "%s", req->name);
 	}
 
+	spdk_blob_set_md_ro(blob, req->md_ro);
 	req->cb_fn(req->cb_arg, lvolerrno);
 	free(req);
 }
@@ -2152,15 +2154,22 @@ spdk_lvol_rename(struct spdk_lvol *lvol, const char *new_name,
 	req->cb_arg = cb_arg;
 	req->lvol = lvol;
 	snprintf(req->name, sizeof(req->name), "%s", new_name);
+	req->md_ro = spdk_blob_get_md_ro(blob);
 
 	rc = spdk_blob_set_xattr(blob, "name", new_name, strlen(new_name) + 1);
 	if (rc < 0) {
+		spdk_blob_set_md_ro(blob, req->md_ro);
 		free(req);
 		cb_fn(cb_arg, rc);
 		return;
 	}
 
-	spdk_blob_sync_md(blob, lvol_rename_cb, req);
+	if (lvol->lvol_store->leader) {
+		spdk_blob_sync_md(blob, lvol_rename_cb, req);
+		return;
+	} else {
+		lvol_rename_cb(req, 0);		
+	}	
 }
 
 void

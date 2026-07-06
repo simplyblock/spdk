@@ -1384,6 +1384,23 @@ int spdk_blob_set_xattr(struct spdk_blob *blob, const char *name, const void *va
 			uint16_t value_len);
 
 /**
+ * Get md ro flag for the given blob and set it the flag to false.
+ *
+ * \param blob Blob to set attribute.
+ *
+ * \return true if the blob is read-only, false otherwise.
+ */
+bool spdk_blob_get_md_ro(struct spdk_blob *blob);
+
+/**
+ * Set md ro flag for the given blob.
+ *
+ * \param blob Blob to set attribute.
+ * \param md_ro Value of md ro flag.
+ */
+void spdk_blob_set_md_ro(struct spdk_blob *blob, bool md_ro);
+
+/**
  * Remove the extended attribute from the given blob.
  *
  * \param blob Blob to remove attribute.
