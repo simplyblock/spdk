@@ -1401,6 +1401,13 @@ bool spdk_blob_get_md_ro(struct spdk_blob *blob);
 void spdk_blob_set_md_ro(struct spdk_blob *blob, bool md_ro);
 
 /**
+ * Set the blob as clean.
+ *
+ * \param blob Blob to set attribute.
+ */
+void spdk_blob_set_clean(struct spdk_blob *blob);
+
+/**
  * Remove the extended attribute from the given blob.
  *
  * \param blob Blob to remove attribute.

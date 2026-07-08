@@ -2168,8 +2168,9 @@ spdk_lvol_rename(struct spdk_lvol *lvol, const char *new_name,
 		spdk_blob_sync_md(blob, lvol_rename_cb, req);
 		return;
 	} else {
-		lvol_rename_cb(req, 0);		
-	}	
+		spdk_blob_set_clean(blob);
+		lvol_rename_cb(req, 0);
+	}
 }
 
 void

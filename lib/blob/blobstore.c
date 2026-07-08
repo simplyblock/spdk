@@ -12918,7 +12918,7 @@ blob_close_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 			 *  when the deletion process starts - so don't try to
 			 *  remove them again.
 			 */
-			if (blob->active.num_pages > 0) {
+			if (blob->active.num_pages > 0 && blob->id != UINT32_MAX) {
 				spdk_bit_array_clear(blob->bs->open_blobids, blob->id);
 				RB_REMOVE(spdk_blob_tree, &blob->bs->open_blobs, blob);
 			}
@@ -13350,6 +13350,12 @@ void
 spdk_blob_set_md_ro(struct spdk_blob *blob, bool md_ro)
 {
 	blob->md_ro = md_ro;
+}
+
+void
+spdk_blob_set_clean(struct spdk_blob *blob)
+{
+	blob->state = SPDK_BLOB_STATE_CLEAN;
 }
 
 static int
