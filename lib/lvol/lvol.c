@@ -3528,8 +3528,20 @@ spdk_lvs_change_leader_state(uint64_t groupid)
 	int rc = 0;
 	SPDK_NOTICELOG("Attempting to change leadership state internally groupid %" PRIu64 ".\n", groupid);
 	pthread_mutex_lock(&g_lvol_stores_mutex);
+	/*
+	 * groupid == 0 is the network-outage path: the JC lost quorum and called
+	 * api_bdev_distrib_set_non_leader() with no jm_vuid (alg_journal.cpp
+	 * network-outage detection). In that case block ALL of this node's LVS
+	 * ports regardless of role/leadership -- leadership can move during the
+	 * outage (e.g. the primary goes offline while partitioned, so the
+	 * secondary becomes the new leader on recovery), so a follower's port
+	 * must be blocked too. For non-leaders the leadership-drop below is a
+	 * no-op; the freeze + block_port + hublvol-port reject still run, which
+	 * is the intended "same as leader" behaviour on outage. Non-zero groupid
+	 * (writer-conflict / targeted JC signal) stays leader-only, unchanged.
+	 */
 	TAILQ_FOREACH(lvs, &g_lvol_stores, link) {
-		if ((lvs->groupid == groupid || groupid == 0) && lvs->leader) {
+		if ((lvs->groupid == groupid || groupid == 0) && (lvs->leader || groupid == 0)) {
 			lvs->queue_failed_rsp = true;
 			if (spdk_blob_freeze_on_conflict_send_msg(lvs->blobstore,
 					spdk_lvs_conflict_signal, lvs)) {
