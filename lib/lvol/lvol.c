@@ -39,8 +39,8 @@ static struct spdk_cpuset *g_helper_set = NULL;
 static TAILQ_HEAD(, spdk_lvs_poll_group) g_lvs_poll_groups = TAILQ_HEAD_INITIALIZER(g_lvs_poll_groups);
 static TAILQ_HEAD(, spdk_lvs_xfer) g_lvs_xfer_tasks = TAILQ_HEAD_INITIALIZER(g_lvs_xfer_tasks);
 static uint32_t g_lvs_num_pgs = 0;
-static struct spdk_poller *pg_xfer_poller[20] = {NULL};
-static struct spdk_poller *xfer_md_poller = NULL;
+static struct spdk_poller *g_pg_xfer_poller[20] = {NULL};
+static struct spdk_poller *g_xfer_md_poller = NULL;
 
 static inline int lvs_opts_copy(const struct spdk_lvs_opts *src, struct spdk_lvs_opts *dst);
 static int lvs_esnap_bs_dev_create(void *bs_ctx, void *blob_ctx, struct spdk_blob *blob,
@@ -991,6 +991,17 @@ spdk_lvs_unload(struct spdk_lvol_store *lvs, spdk_lvs_op_complete cb_fn,
 
 	lvs_req->cb_fn = cb_fn;
 	lvs_req->cb_arg = cb_arg;
+
+	if (lvs->hublvol_poller) {
+		spdk_poller_unregister(&lvs->hublvol_poller);
+		lvs->hublvol_poller = NULL;
+	}
+	
+	if (lvs->redirect_poller) {
+		spdk_poller_unregister(&lvs->redirect_poller);
+		lvs->redirect_poller = NULL;
+	}
+		
 
 	SPDK_INFOLOG(lvol, "Unloading lvol store\n");
 	spdk_bs_unload(lvs->blobstore, _lvs_unload_cb, lvs_req);
@@ -5804,6 +5815,80 @@ md_xfer_poller(void *cb_arg)
     return count ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
 }
 
+struct lvs_channel_info {
+	struct spdk_lvs_poll_group *lpg;
+	int idx;
+};
+
+static void
+spdk_put_md_channel_poll_group(void *ctx)
+{
+	struct lvs_channel_info *info = ctx;
+	struct spdk_lvs_poll_group *lpg = info->lpg;
+	struct spdk_io_channel *md_channel;
+	int idx = info->idx;
+	int last_idx;
+
+	assert(spdk_get_thread() == lpg->thread);
+	assert(idx >= 0);
+	assert(idx < lpg->lvs_cnt);
+
+	md_channel = lpg->lvs_info[idx].md_channel;
+	if (md_channel != NULL) {
+		spdk_put_io_channel(md_channel);
+	}
+
+	/*
+	 * Keep lvs_info[] compact by moving the last active entry into
+	 * the slot being removed.
+	 */
+	last_idx = lpg->lvs_cnt - 1;
+
+	if (idx != last_idx) {
+		lpg->lvs_info[idx] = lpg->lvs_info[last_idx];
+	}
+
+	memset(&lpg->lvs_info[last_idx], 0, sizeof(lpg->lvs_info[last_idx]));
+
+	lpg->lvs_cnt--;
+
+	free(info);
+}
+
+bool
+spdk_unload_lvs_poll_group(struct spdk_lvol_store *lvs)
+{
+	struct spdk_lvs_poll_group *lpg;
+	struct lvs_channel_info *info;
+	struct spdk_lvs_xfer *xfer;
+
+	TAILQ_FOREACH(lpg, &g_lvs_poll_groups, entry) {
+		for (int i = 0; i < lpg->lvs_cnt; i++) {
+			if (lpg->lvs_info[i].lvs == lvs && lpg->lvs_info[i].status) {
+				info = calloc(1, sizeof(*info));
+				if (!info) {
+					SPDK_ERRLOG("Not enough memory to allocate ctx to return poll groups channel in lvs.\n");
+					continue;
+				}
+				info->lpg = lpg;
+				info->idx = i;
+				lpg->lvs_info[i].status = false;
+				spdk_thread_send_msg(lpg->thread, spdk_put_md_channel_poll_group, info);
+			}
+		}
+	}
+
+	TAILQ_FOREACH(xfer, &g_lvs_xfer_tasks, entry) {
+		if (xfer->lvol && xfer->lvol->lvol_store == lvs) {
+			SPDK_NOTICELOG("Transfer task already exists for lvs %s.\n", lvs->name);
+			return true;
+		}
+	}
+
+	return false;
+
+}
+
 static void
 spdk_lvs_create_poll_group_done(void *ctx)
 {
@@ -5839,25 +5924,7 @@ spdk_lvs_create_poll_group(void *ctx)
 	lpg->thread_name = spdk_thread_get_name(lpg->thread);
 	TAILQ_INIT(&lpg->rmt_lvols);
 	TAILQ_INIT(&lpg->ch_tdev);
-	lpg->md_thread = g_lvs_md_thread;
-
-	struct spdk_lvol_store *tmp;
-	pthread_mutex_lock(&g_lvol_stores_mutex);
-		TAILQ_FOREACH(tmp, &g_lvol_stores, link) {
-			lpg->lvs_info[lpg->lvs_cnt++].lvs = tmp;
-		}
-	pthread_mutex_unlock(&g_lvol_stores_mutex);
-
-	for (int i = 0; i < lpg->lvs_cnt; i++) {
-		lpg->lvs_info[i].md_channel = spdk_bs_alloc_io_channel(lpg->lvs_info[i].lvs->blobstore);
-		if (!lpg->lvs_info[i].md_channel) {
-			SPDK_ERRLOG("Failed to get md IO channel.\n");
-			free(lpg);
-			return;
-		}
-	}
-
-	lpg->xfer_poller = NULL;
+	// lpg->md_thread = g_lvs_md_thread;
 	const char *suffix = strrchr(lpg->thread_name, '_'); // find last '_'
 	lpg->id =  atoi(suffix + 1);
 	SPDK_NOTICELOG("Create new thread %s for lvolstore with id %d t %p md %p.\n", lpg->thread_name, lpg->id, spdk_get_thread(), g_lvs_md_thread);
@@ -5949,6 +6016,13 @@ spdk_lvs_rmt_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bde
 		SPDK_NOTICELOG("Unsupported bdev event: type %d\n", type);
 		break;
 	}
+}
+
+void
+spdk_lvs_rmt_bdev_remove(struct spdk_transfer_dev *tdev)
+{
+	SPDK_NOTICELOG("Hotplug removal for tdev %s.\n", tdev->bdev_name);
+	spdk_change_rmt_lvol_state(tdev->lvs, tdev);
 }
 
 static struct spdk_transfer_dev *
@@ -6058,6 +6132,7 @@ spdk_lvs_add_rmt_bdev_to_poll_group(void *arg) {
 	struct remote_lvol_info *rmt_lvol = (struct remote_lvol_info *)(uintptr_t)arg;
 	struct spdk_lvs_poll_group *lpg = rmt_lvol->group;
 	struct spdk_transfer_dev *tdev = rmt_lvol->tdev;
+	bool found = false;
 
 	if (spdk_lvs_create_base_channel_pg(lpg, tdev) < 0) {
 		SPDK_ERRLOG("rmt-lvol Cannot get io channel for remote bdev %s.\n", tdev->bdev_name ? tdev->bdev_name : "s3 backup task");
@@ -6075,6 +6150,37 @@ spdk_lvs_add_rmt_bdev_to_poll_group(void *arg) {
 		return;
 	}
 
+	if (rmt_lvol->xfer_task->lvol && !rmt_lvol->md_channel) {
+		for (int i = 0; i < lpg->lvs_cnt; i++) {
+			if (lpg->lvs_info[i].lvs == tdev->lvs) {
+				if (!lpg->lvs_info[i].md_channel) {
+					lpg->lvs_info[i].md_channel = spdk_bs_alloc_io_channel(lpg->lvs_info[i].lvs->blobstore);
+					lpg->lvs_info[i].status = true;
+				}
+				rmt_lvol->md_channel = lpg->lvs_info[i].md_channel;
+				found = true;
+			}
+		}
+
+		if (!found) {
+			int idx = lpg->lvs_cnt;
+			lpg->lvs_info[idx].lvs = tdev->lvs;
+			lpg->lvs_info[idx].md_channel = spdk_bs_alloc_io_channel(lpg->lvs_info[idx].lvs->blobstore);
+			if (!lpg->lvs_info[idx].md_channel) {
+				SPDK_ERRLOG("Failed to get md IO channel.\n");				
+				spdk_put_io_channel(rmt_lvol->channel);
+				lpg->lvs_info[idx].lvs = NULL;
+				rmt_lvol->channel = NULL;
+				rmt_lvol->xfer_task->state = XFER_STATE_FAILED;
+				free(rmt_lvol);
+				return;
+			}
+			lpg->lvs_info[idx].status = true;
+			rmt_lvol->md_channel = lpg->lvs_info[idx].md_channel;
+			lpg->lvs_cnt++;
+		}
+	}
+
 	rmt_lvol->status = true;
 	tdev->pg[lpg->id]++;
 	TAILQ_INSERT_TAIL(&lpg->rmt_lvols, rmt_lvol, entry);
@@ -6084,11 +6190,11 @@ spdk_lvs_add_rmt_bdev_to_poll_group(void *arg) {
 static void
 spdk_create_poller(void *arg) {
 	struct spdk_lvs_poll_group *lpg = arg;
-	if (pg_xfer_poller[lpg->id]) {
+	if (g_pg_xfer_poller[lpg->id]) {
 		// SPDK_NOTICELOG("The lpg id: %d poller for transfer task already exists.\n", lpg->id);
 		return;
-	}	
-	pg_xfer_poller[lpg->id] = spdk_poller_register(helper_xfer_poller, lpg, 200);
+	}
+	g_pg_xfer_poller[lpg->id] = spdk_poller_register(helper_xfer_poller, lpg, 200);
 }
 
 static int
@@ -6155,16 +6261,6 @@ spdk_lvol_create_backup_task(struct spdk_lvs_xfer *task, struct spdk_transfer_de
 		rmt_lvol->type = task->type;
 		rmt_lvol->xfer_task = task;
 		rmt_lvol->group = lpg;
-		if (task->lvol) {
-			for (int i = 0; i < lpg->lvs_cnt; i++) {
-				if (lpg->lvs_info[i].lvs == tdev->lvs) {
-					rmt_lvol->md_channel = lpg->lvs_info[i].md_channel;
-				}
-
-				// TODO if not we should raise error but we should complete the task
-				// like set status to failed and wait for md poller to clean up
-			}
-		}
 		spdk_thread_send_msg(lpg->thread, spdk_lvs_add_rmt_bdev_to_poll_group, rmt_lvol);
 	}
 	
@@ -6180,8 +6276,8 @@ spdk_lvol_create_backup_task(struct spdk_lvs_xfer *task, struct spdk_transfer_de
 		spdk_thread_send_msg(lpg->thread, spdk_create_poller, lpg);
 	}
 
-	if (!xfer_md_poller) {
-		xfer_md_poller = spdk_poller_register(md_xfer_poller, NULL, 1000);
+	if (!g_xfer_md_poller) {
+		g_xfer_md_poller = spdk_poller_register(md_xfer_poller, NULL, 1000);
 	}
 
 	return 0;
@@ -6293,7 +6389,8 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
 	TAILQ_INSERT_TAIL(&g_lvs_xfer_tasks, task, entry);
 	return 0;
 }
-
+//TODO: we assign the tdev to the lvs and if we want to use this tdev for another lvolstore we should check if the tdev is already used by to another lvolstore or not
+// bcs we cannot open the same tdev for two lvolstore at the same time
 int
 spdk_lvol_s3_backup(struct spdk_lvol *lvol, uint32_t cluster_batch,
 				struct spdk_lvol **chain_snapshots, int num_snapshots, uint32_t s3_id) {

@@ -171,6 +171,9 @@ void spdk_lvs_rename(struct spdk_lvol_store *lvs, const char *new_name,
  */
 int spdk_lvs_unload(struct spdk_lvol_store *lvol_store,
 		    spdk_lvs_op_complete cb_fn, void *cb_arg);
+struct spdk_transfer_dev;
+void spdk_lvs_rmt_bdev_remove(struct spdk_transfer_dev *tdev);
+bool spdk_unload_lvs_poll_group(struct spdk_lvol_store *lvs);
 
 /**
  * Destroy lvolstore.

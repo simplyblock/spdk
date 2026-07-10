@@ -494,10 +494,55 @@ _vbdev_lvs_remove(struct spdk_lvol_store *lvs, spdk_lvs_op_complete cb_fn, void 
 	}
 }
 
+static int
+vbdev_lvs_destroy_tdevs_poller(void *ctx) {
+	struct spdk_lvs_req *req = ctx;
+	struct spdk_lvol_store *lvs = req->lvol_store;	
+
+	if (!TAILQ_EMPTY(&lvs->transfer_devs)) {
+		return SPDK_POLLER_BUSY;
+	}
+
+	if (spdk_unload_lvs_poll_group(lvs)) {
+		return SPDK_POLLER_BUSY;
+	}
+
+	_vbdev_lvs_remove(lvs, req->cb_fn, req->cb_arg, false);
+	spdk_poller_unregister(&req->poller);
+	req->poller = NULL;
+	free(req);
+	return -1;
+
+}
+
 void
 vbdev_lvs_unload(struct spdk_lvol_store *lvs, spdk_lvs_op_complete cb_fn, void *cb_arg)
 {
-	_vbdev_lvs_remove(lvs, cb_fn, cb_arg, false);
+	struct spdk_lvs_req *req;
+	struct spdk_transfer_dev *tdev;
+
+	req = calloc(1, sizeof(*req));
+	if (!req) {
+		SPDK_ERRLOG("Cannot alloc memory for vbdev lvol store request pointer\n");
+		if (cb_fn != NULL) {
+			cb_fn(cb_arg, -ENOMEM);
+		}
+		return;
+	}
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+	req->lvol_store = lvs;
+
+	TAILQ_FOREACH(tdev, &lvs->transfer_devs, entry) {
+		if (tdev->dev_in_remove) {
+			continue;
+		}
+		spdk_lvs_rmt_bdev_remove(tdev);
+	}
+
+	req->poller = spdk_poller_register(vbdev_lvs_destroy_tdevs_poller, req, 100000); // 100ms
+
+	// lvs->hub_dev->destroy(lvs->hub_dev);// we should destroy the hub device before unloading the lvs
 }
 
 void

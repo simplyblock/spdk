@@ -184,6 +184,7 @@ struct remote_lvol_info {
 struct lvolstore_info {
 	struct spdk_lvol_store	*lvs;
 	struct spdk_io_channel	*md_channel;
+	bool status; // true - connected, false - disconnected
 };
 
 struct remote_dev_info {
@@ -198,8 +199,8 @@ struct spdk_lvs_poll_group {
 	int lvs_cnt;
 	// struct spdk_lvs_poll_group	*next;
 	struct spdk_thread	*thread;
-	struct spdk_thread	*md_thread;
-	struct spdk_poller 	*xfer_poller;
+	// struct spdk_thread	*md_thread;
+	// struct spdk_poller 	*xfer_poller;
 	const char *thread_name;
 	int id;
 	TAILQ_ENTRY(spdk_lvs_poll_group) entry;
