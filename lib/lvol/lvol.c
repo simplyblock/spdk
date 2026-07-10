@@ -4380,24 +4380,31 @@ helper_xfer_poller(void *arg)
     return count ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
 }
 
-bool
+enum freeze_io_result
 spdk_lvol_freeze_io(struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io, spdk_lvol_op_migrate_complete cb_fn)
 {
 	struct spdk_migrate_io *migrate_io;
-	pthread_mutex_lock(&g_lvs_queue_mutex);	
 	migrate_io = calloc(1, sizeof(*migrate_io));
-	if (!migrate_io) {
+	if (migrate_io == NULL) {
 		SPDK_ERRLOG("Cannot allocate memory for migrate_io.\n");
-		pthread_mutex_unlock(&g_lvs_queue_mutex);
-		return false;
+		return FREEZE_IO_NOMEM;
 	}
+
 	migrate_io->bdev_io = bdev_io;
 	migrate_io->thread = spdk_get_thread();
 	migrate_io->ch = ch;
 	migrate_io->cb_fn = cb_fn;
+
+	pthread_mutex_lock(&g_lvs_queue_mutex);
+	if (!lvol->freezed) {
+		pthread_mutex_unlock(&g_lvs_queue_mutex);
+		free(migrate_io);
+		return FREEZE_IO_NOT_FROZEN;
+	}
+
 	TAILQ_INSERT_TAIL(&lvol->redirect_migrate_io, migrate_io, entry);
 	pthread_mutex_unlock(&g_lvs_queue_mutex);
-	return true;
+	return FREEZE_IO_QUEUED;
 }
 
 void
@@ -4495,6 +4502,11 @@ spdk_xfer_sync_mode(struct spdk_lvs_xfer *xfer)
 		spdk_lvol_unfreeze_io(lvol);
 		rc = -1;
 	}
+	
+	if (xfer->num_sub_tasks > 0 && xfer->list_task[0] != xfer) {
+		return;
+	}
+
 	xfer->cb_fn(xfer->cb_arg, lvol, rc);
 	return;
 }
@@ -4615,7 +4627,19 @@ static void
 destroy_xfer_task(struct spdk_lvs_xfer *xfer) {
 	struct spdk_lvs_poll_group *lpg;
 
-	TAILQ_REMOVE(&g_lvs_xfer_tasks, xfer, entry);
+	if (xfer->num_sub_tasks > 0) {
+		xfer->waiting_for_sub_tasks = true;
+		if (xfer->state == XFER_STATE_FAILED) {
+			SPDK_ERRLOG("Sub task failed for migration of lvol %s\n", xfer->lvol->name);
+			for (int i = 0; i < xfer->num_sub_tasks; i++) {
+				if(xfer->list_task[i]->state != XFER_STATE_FAILED) {
+					xfer->list_task[i]->state = XFER_STATE_FAILED;
+				}
+			}
+		}
+	} else {
+		TAILQ_REMOVE(&g_lvs_xfer_tasks, xfer, entry);
+	}
 
 	if (xfer->lvol && xfer->lvol->transfer_status != XFER_DONE) {
 		xfer->lvol->transfer_status = XFER_FAILED;
@@ -4631,7 +4655,8 @@ destroy_xfer_task(struct spdk_lvs_xfer *xfer) {
 					xfer_result_type_to_string(xfer->lvol->transfer_status));
 	}
 
-	if (xfer->final_step && xfer->cb_fn) {
+	if (xfer->final_step && xfer->cb_fn &&
+		(xfer->num_sub_tasks == 0 || xfer->lvol->transfer_status == XFER_FAILED)) {
 		spdk_xfer_sync_mode(xfer);
 	}
 
@@ -4640,9 +4665,72 @@ destroy_xfer_task(struct spdk_lvs_xfer *xfer) {
 		xfer->pg[lpg->id] = true;
 		spdk_thread_send_msg(lpg->thread, spdk_delete_rmt_lvol_pg, xfer);
 	}
+
+	if (xfer->num_sub_tasks > 0) {
+		return;
+	}
+	
 	xfer->tmo_poller = spdk_poller_register(
 				destroy_xfer_task_tmo, xfer, 200000);// do it after 200ms
 }
+
+static void
+destroy_parent_xfer_task(struct spdk_lvs_xfer *xfer)
+{
+	struct spdk_lvs_xfer **list_task;
+	struct spdk_lvs_xfer *sub_xfer;
+	bool batch_failed = false;
+
+	TAILQ_REMOVE(&g_lvs_xfer_tasks, xfer, entry);
+
+	list_task = xfer->list_task;
+
+	for (int i = 0; i < xfer->num_sub_tasks; i++) {
+		sub_xfer = list_task[i];
+
+		if (sub_xfer->state == XFER_STATE_FAILED ||
+			(sub_xfer->lvol != NULL && sub_xfer->lvol->transfer_status == XFER_FAILED)) {
+			batch_failed = true;
+			break;
+		}
+	}
+
+	SPDK_NOTICELOG("Batch transfer with parent lvol %s, type %s, status %s finished.\n",
+		       xfer->lvol ? xfer->lvol->name : "NULL",
+		       xfer_type_to_string(xfer->type),
+		       batch_failed ? "FAILED" : "DONE");
+
+	for (int i = 0; i < xfer->num_sub_tasks; i++) {
+		sub_xfer = list_task[i];
+
+		/*
+		 * Tasks that failed were already unfrozen by
+		 * destroy_xfer_task(). Tasks that completed successfully
+		 * remained frozen while waiting for the rest of the batch.
+		 */
+		if (sub_xfer->lvol != NULL && sub_xfer->lvol->transfer_status == XFER_DONE) {
+			if (batch_failed) {
+				sub_xfer->state = XFER_STATE_FAILED;
+				sub_xfer->lvol->transfer_status = XFER_FAILED;
+			}
+
+			spdk_xfer_sync_mode(sub_xfer);
+		}
+
+		/*
+		 * Prevent a dangling shared-array pointer after the owner
+		 * releases it.
+		 */
+		sub_xfer->list_task = NULL;
+		sub_xfer->num_sub_tasks = 0;
+
+		sub_xfer->tmo_poller = spdk_poller_register(
+			destroy_xfer_task_tmo, sub_xfer, 200000);
+	}
+
+	free(list_task);
+}
+
 
 static int
 xfer_fill_queue(struct spdk_lvs_xfer *xfer, int initial) {
@@ -5789,15 +5877,34 @@ static int
 md_xfer_poller(void *cb_arg)
 {
 	struct spdk_lvs_xfer *xfer, *tmp;
+	struct spdk_lvs_xfer *sub_xfer;	
 	int count = 0;
 	TAILQ_FOREACH_SAFE(xfer, &g_lvs_xfer_tasks, entry, tmp) {
+		int sub_count = 0;
 		switch (xfer->type)
 		{
 			case XFER_REPLICATE_SNAPSHOT:
 				count += xfer_replication(xfer);
 				break;
 			case XFER_MIGRATE_SNAPSHOT:
-				count += xfer_migration(xfer);
+				if (xfer->num_sub_tasks > 0) {
+					for (int i = 0; i < xfer->num_sub_tasks; i++) {
+						sub_xfer = xfer->list_task[i];
+						if (sub_xfer->waiting_for_sub_tasks) {
+							// waiting for sub tasks to finish
+							sub_count++;
+							continue;
+						} else {
+							count += xfer_migration(sub_xfer);
+						}
+					}
+					if (sub_count == xfer->num_sub_tasks) {
+						// all sub tasks done, we can delete the main task
+						destroy_parent_xfer_task(xfer);
+					}
+				} else {
+					count += xfer_migration(xfer);
+				}
 				break;
 			case XFER_S3_BACKUP:
 				count += xfer_s3_backup(xfer);
@@ -6389,6 +6496,144 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
 	TAILQ_INSERT_TAIL(&g_lvs_xfer_tasks, task, entry);
 	return 0;
 }
+
+int
+spdk_batch_lvol_transfer(uint32_t cluster_batch, enum xfer_type type, struct spdk_transfer_dev *tdev,
+				struct spdk_lvol **batch_lvols, int num_lvols,
+				char **batch_snapshots, int num_snapshots,
+				uint32_t *batch_lvol_ids, int num_lvol_ids,
+				spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg) {
+	struct spdk_lvs_xfer *xfer, *task;
+	
+	struct spdk_lvol_store *lvs;
+	struct spdk_lvol *lvol;
+	char *snapshot_name;
+	uint32_t lvol_id;
+	struct spdk_lvs_xfer **list_xfer;
+	int rc = -ENOMEM, created_tasks = 0;
+	// if (!lvs->leader) {
+	// 	SPDK_ERRLOG("Lvolstore %s: is not leader.\n", lvs->name);
+	// 	return -EINVAL;
+	// }	
+	if (num_lvols <= 0 || batch_lvols == NULL ||
+    	batch_snapshots == NULL || batch_lvol_ids == NULL ||
+    	num_snapshots != num_lvols || num_lvol_ids != num_lvols) {
+		return -EINVAL;
+	}
+
+	lvs = batch_lvols[0]->lvol_store;
+	if (!tdev || !tdev->desc || tdev->dev_in_remove) {
+		SPDK_ERRLOG("Lvolstore %s: invalid transfer device for %s.\n", lvs->name, xfer_type_to_string(type));
+		return -EINVAL;
+	}
+
+	struct spdk_lvs_xfer *list_task[num_lvols];
+
+	TAILQ_FOREACH(xfer, &g_lvs_xfer_tasks, entry) {
+		for (int i = 0; i < num_lvols; i++) {
+			if (xfer->lvol == batch_lvols[i]) {
+				SPDK_NOTICELOG("The same transfer task already exists.\n");
+				return -EEXIST;
+			}
+		}
+	}
+
+	list_xfer = calloc(num_lvols, sizeof(*list_xfer));
+	if (list_xfer == NULL) {
+		SPDK_ERRLOG("Cannot allocate the batch task list.\n");
+		return -ENOMEM;
+	}
+
+	for (int i = 0; i < num_lvols; i++) {
+		lvol = batch_lvols[i];
+		snapshot_name = batch_snapshots[i];
+		lvol_id = batch_lvol_ids[i];
+
+		task = calloc(1, sizeof(*task));
+		if (!task) {
+			SPDK_ERRLOG("Cannot allocate memory for transfer structure task.\n");
+			created_tasks = i;
+			goto error;
+		}
+		list_task[i] = task;
+		task->list_task = list_xfer;
+		task->num_sub_tasks = num_lvols;
+		task->chain	= NULL;
+		task->clusters = NULL;
+		task->chain_s3_ids = NULL;
+		task->old_clusters = NULL;
+		task->lvol = lvol;
+		lvol->last_offset = 0;
+		task->current_offset = 0;
+		task->cluster_batch = cluster_batch;
+		task->type = type;
+		task->cb_fn = cb_fn;
+		task->cb_arg = cb_arg;
+		task->state = XFER_STATE_NONE;
+		
+
+		task->page_size = spdk_bs_get_page_size(lvol->lvol_store->blobstore);
+		task->page_per_cluster = spdk_bs_get_cluster_size(lvol->lvol_store->blobstore) / task->page_size;
+
+		if (snapshot_name) {
+			task->len = snprintf(task->snapshot_name, sizeof(task->snapshot_name), "%s", snapshot_name);
+			task->final_step = true;
+			task->signal_sent = false;
+		} else {
+			task->len = 0;
+			task->final_step = false;
+		}
+
+		task->num_clusters = spdk_blob_get_num_clusters(lvol->blob);
+		task->clusters = calloc(task->num_clusters, sizeof(uint64_t));
+		if (!task->clusters) {
+			SPDK_ERRLOG("Cannot allocate memory for transfer clusters array.\n");
+			free(task);
+			created_tasks = i;
+			goto error;
+		}
+
+
+		lvol->redirect_map_id = lvol_id;
+		lvol->tdev = tdev;
+
+		rc = spdk_lvol_create_backup_task(task, tdev);
+		if (rc != 0) {
+			created_tasks = i;
+			goto error;
+		}
+
+		SPDK_NOTICELOG("Transfer lvol %s %s task: last offset %" PRIu64 " status %s start.\n", task->lvol->name,
+						xfer_type_to_string(task->type), task->lvol->last_offset,
+						xfer_result_type_to_string(task->lvol->transfer_status));
+	}
+
+	for (int i = 0; i < num_lvols; i++) {
+		list_task[i]->lvol->freezed = true;
+		for (int j = 0; j < num_lvols; j++) {
+			list_task[i]->list_task[j] = list_task[j];
+		}
+	}
+
+	TAILQ_INSERT_TAIL(&g_lvs_xfer_tasks, list_task[0], entry);
+	return 0;
+error:
+	if (created_tasks <= 0) {
+		free(list_xfer);
+		return rc;
+	}
+
+	for (int i = 0; i < created_tasks; i++) {
+		list_task[i]->state = XFER_STATE_FAILED;
+		list_task[i]->num_sub_tasks = created_tasks;
+		for (int j = 0; j < created_tasks; j++) {
+			list_task[i]->list_task[j] = list_task[j];
+		}
+	}
+	TAILQ_INSERT_TAIL(&g_lvs_xfer_tasks, list_task[0], entry);
+	return 0;
+}
+
 //TODO: we assign the tdev to the lvs and if we want to use this tdev for another lvolstore we should check if the tdev is already used by to another lvolstore or not
 // bcs we cannot open the same tdev for two lvolstore at the same time
 int

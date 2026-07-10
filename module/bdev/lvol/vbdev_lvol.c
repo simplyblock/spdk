@@ -1989,14 +1989,23 @@ vbdev_lvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_
 	struct spdk_lvol *lvol = bdev_io->bdev->ctxt;
 	struct spdk_lvol_store *lvs = lvol->lvol_store;
 	bool io_type = check_IO_type(bdev_io->type);
+	enum freeze_io_result result;
 
-	if (lvol->freezed) {
-		if (io_type) {
-			if (!spdk_lvol_freeze_io(lvol, ch, bdev_io, vbdev_lvol_dequeue_io)) {
-				SPDK_NOTICELOG("FAILED IO - freezed blob: %" PRIu64 "  Lba: %" PRIu64 "  Cnt %" PRIu64 "  t %d \n",
-			 				lvol->blob_id, bdev_io->u.bdev.offset_blocks, bdev_io->u.bdev.num_blocks, bdev_io->type);
-				spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
-			}
+	if (lvol->freezed && io_type) {
+		result = spdk_lvol_freeze_io(lvol, ch, bdev_io, vbdev_lvol_dequeue_io);
+		switch (result) {
+		case FREEZE_IO_QUEUED:
+			return;
+
+		case FREEZE_IO_NOT_FROZEN:
+			// Unfreeze happened between the initial check and acquiring the mutex. Continue normal submission.
+			break;
+
+		case FREEZE_IO_NOMEM:
+			SPDK_ERRLOG("Failed to queue I/O while lvol is frozen: ""blob=%" PRIu64 " lba=%" PRIu64
+				    " blocks=%" PRIu64 " type=%d\n", lvol->blob_id, bdev_io->u.bdev.offset_blocks,
+				    bdev_io->u.bdev.num_blocks, bdev_io->type);
+			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 			return;
 		}
 	}

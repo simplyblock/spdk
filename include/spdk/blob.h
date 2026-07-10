@@ -49,6 +49,12 @@ typedef uint64_t spdk_blob_id;
 #define ERR_LEADERSHIP_CHANGED  -35
 #define ERR_UPDATE_FAILED  -36
 
+enum freeze_io_result {
+	FREEZE_IO_QUEUED,
+	FREEZE_IO_NOT_FROZEN,
+	FREEZE_IO_NOMEM,
+};
+
 enum blob_clear_method {
 	BLOB_CLEAR_WITH_DEFAULT,
 	BLOB_CLEAR_WITH_NONE,

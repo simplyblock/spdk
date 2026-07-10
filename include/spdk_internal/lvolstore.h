@@ -224,6 +224,9 @@ struct spdk_lvs_xfer_req {
 };
 
 struct spdk_lvs_xfer {
+	struct spdk_lvs_xfer **list_task;
+	bool waiting_for_sub_tasks;
+	int num_sub_tasks;
 	struct spdk_lvol		*lvol;
 	struct spdk_lvs_xfer_req *reqs;
 	void *pdus;

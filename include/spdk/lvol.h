@@ -352,8 +352,8 @@ void spdk_lvol_chain(struct spdk_lvol *origlvol, struct spdk_lvol *clone,
 		 spdk_lvol_op_complete cb_fn, void *cb_arg);
 void spdk_lvol_convert(struct spdk_lvol *origlvol, spdk_lvol_op_complete cb_fn, void *cb_arg);
 void spdk_lvol_set_migration_flag(struct spdk_lvol *lvol);
-bool spdk_lvol_freeze_io(struct spdk_lvol *lvol, struct spdk_io_channel *ch, 
-						struct spdk_bdev_io *bdev_io, spdk_lvol_op_migrate_complete cb_fn);
+enum freeze_io_result spdk_lvol_freeze_io(struct spdk_lvol *lvol, struct spdk_io_channel *ch, 
+				struct spdk_bdev_io *bdev_io, spdk_lvol_op_migrate_complete cb_fn);
 void spdk_tdev_store_hublvol_channel(struct spdk_transfer_dev *tdev, struct spdk_io_channel *channel);
 struct spdk_io_channel * spdk_tdev_get_hub_channel(struct spdk_transfer_dev *tdev, struct spdk_thread *thread);
 void spdk_lvol_rediret_io_change_state(struct spdk_lvol *lvol);
