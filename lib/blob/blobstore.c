@@ -2563,6 +2563,7 @@ blob_persist_clear_clusters(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	size_t				i;
 	uint64_t			lba;
 	uint64_t			lba_count;
+	uint64_t	index = 0;
 
 	/* Clusters don't move around in blobs. The list shrinks or grows
 	 * at the end, but no changes ever occur in the middle of the list.
@@ -2605,11 +2606,16 @@ blob_persist_clear_clusters(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 
 		/* If a run of LBAs previously existing, clear them now */
 		if (lba_count > 0) {
+			if (special_io) {
+				SPDK_NOTICELOG("spatial unmap blob %" PRIu64 ": lba=%" PRIu64 ", real_offset=%" PRIu64 ", CNT=%" PRIu64 ", index=%" PRIu64 "\n", blob->id, lba, (index * blob->bs->pages_per_cluster), lba_count, index);
+			}
 			bs_batch_clear_dev(ctx->blob, batch, lba, lba_count);
+			index = 0;
 		}
 
 		/* Start building the next batch */
 		lba = next_lba;
+		index = i;
 		if (next_lba > 0) {
 			lba_count = next_lba_count;
 		} else {
@@ -2619,6 +2625,9 @@ blob_persist_clear_clusters(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 
 	/* If we ended with a contiguous set of LBAs, clear them now */
 	if (lba_count > 0) {
+		if (special_io) {
+				SPDK_NOTICELOG("spatial unmap blob %" PRIu64 ": lba=%" PRIu64 ", real_offset=%" PRIu64 ", CNT=%" PRIu64 ",index=%" PRIu64 "\n", blob->id, lba, (index * blob->bs->pages_per_cluster), lba_count, index);
+		}
 		bs_batch_clear_dev(ctx->blob, batch, lba, lba_count);
 	}
 

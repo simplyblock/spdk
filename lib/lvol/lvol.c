@@ -4646,7 +4646,7 @@ destroy_xfer_task(struct spdk_lvs_xfer *xfer) {
 	}
 
 	if (XFER_S3_MERGE == xfer->type) {
-			SPDK_NOTICELOG("Transfer lvol %d %s task: status %s finished.\n", xfer->s3_id,
+		SPDK_NOTICELOG("Transfer lvol %d %s task: status %s finished.\n", xfer->s3_id,
 					xfer_type_to_string(xfer->type),
 					xfer->state == XFER_STATE_DONE ? "DONE" : "FAILED");
 	} else {
@@ -4717,10 +4717,6 @@ destroy_parent_xfer_task(struct spdk_lvs_xfer *xfer)
 			spdk_xfer_sync_mode(sub_xfer);
 		}
 
-		/*
-		 * Prevent a dangling shared-array pointer after the owner
-		 * releases it.
-		 */
 		sub_xfer->list_task = NULL;
 		sub_xfer->num_sub_tasks = 0;
 
@@ -4766,7 +4762,7 @@ xfer_wait_outstanding_io(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req **
 		if (current_time - xfer->timeout > timeout_ticks) {// in timeout consider outstanding io
 			if (xfer->outstanding_io == 0) {
 				xfer->lvol->transfer_status = XFER_FAILED;
-				xfer->state = XFER_STATE_FAILED;				
+				xfer->state = XFER_STATE_FAILED;
 			} else {
 				// print current outstanding io timeout error
 				SPDK_ERRLOG("Task transfer timeout with outstanding io %u\n", xfer->outstanding_io);
@@ -6498,7 +6494,7 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
 }
 
 int
-spdk_batch_lvol_transfer(uint32_t cluster_batch, enum xfer_type type, struct spdk_transfer_dev *tdev,
+spdk_lvol_batch_transfer(uint32_t cluster_batch, enum xfer_type type, struct spdk_transfer_dev *tdev,
 				struct spdk_lvol **batch_lvols, int num_lvols,
 				char **batch_snapshots, int num_snapshots,
 				uint32_t *batch_lvol_ids, int num_lvol_ids,

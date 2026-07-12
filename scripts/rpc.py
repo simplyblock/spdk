@@ -2261,6 +2261,24 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('-O', '--operation', help=("Operation to perform. Valid values: 'migrate' (metadata only), 'replicate' (metadata + data)"), choices=['migrate', 'replicate'], required=True)
     p.set_defaults(func=bdev_lvol_transfer_final_step)
     
+    def bdev_lvol_batch_transfer_final_step(args):
+        print_json(rpc.lvol.bdev_lvol_batch_transfer_final_step(args.client,
+                                             lvol_names=args.lvol_name,
+                                             ids=args.lvol_id,
+                                             snapshots=args.snapshot_name,
+                                             cluster_batch=args.cluster_batch,
+                                             gateway=args.gateway,
+                                             operation=args.operation))
+
+    p = subparsers.add_parser('bdev_lvol_batch_transfer_final_step', help='Transfer an lvol between lvol stores via hublvol as gateway')
+    p.add_argument('--lvol-names', help='Lvol names, whitespace separated list in quotes', required=True)
+    p.add_argument('--ids', help='Destination lvol map IDs, whitespace-separated list in quotes (e.g. "12 13 20")', required=True)
+    p.add_argument('--snapshots', help='snapshots name, whitespace separated list in quotes', required=True)
+    p.add_argument('-b', '--cluster-batch', help='Transfering lvol with batch reqs: default 16 clusters', type=int)
+    p.add_argument('-g', '--gateway', help='Target hubLvol name as gateway', required=True)
+    p.add_argument('-O', '--operation', help=("Operation to perform. Valid values: 'migrate' (metadata only), 'replicate' (metadata + data)"), choices=['migrate', 'replicate'], required=True)
+    p.set_defaults(func=bdev_lvol_batch_transfer_final_step)
+
     def bdev_lvol_transfer(args):
         print_json(rpc.lvol.bdev_lvol_transfer(args.client,
                                              lvol_name=args.lvol_name,

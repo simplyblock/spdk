@@ -342,6 +342,10 @@ struct spdk_transfer_dev *spdk_open_rmt_bdev(const char *name, struct spdk_lvol_
 int spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_batch,
 				enum xfer_type type, struct spdk_transfer_dev *tdev, const char *snapshot_name,
 				uint32_t lvol_id, spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
+int spdk_lvol_batch_transfer(uint32_t cluster_batch, enum xfer_type type, struct spdk_transfer_dev *tdev,
+				struct spdk_lvol **batch_lvols, int num_lvols, char **batch_snapshots, int num_snapshots,
+				uint32_t *batch_lvol_ids, int num_lvol_ids, spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
+
 int spdk_lvol_s3_backup(struct spdk_lvol *lvol, uint32_t cluster_batch,
 				struct spdk_lvol **chain_snapshots, int num_snapshots, uint32_t s3_id);
 int spdk_lvol_s3_merge(struct spdk_lvol_store *lvs, uint32_t s3_id,

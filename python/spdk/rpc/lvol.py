@@ -337,6 +337,31 @@ def bdev_lvol_transfer_final_step(client, lvol_name=None, lvol_id=0, snapshot_na
     params = {'lvol_name': lvol_name, 'lvol_id': lvol_id, 'snapshot_name': snapshot_name, 'cluster_batch': cluster_batch, 'gateway': gateway, 'operation': operation}
     return client.call('bdev_lvol_transfer_final_step', params)
 
+def bdev_lvol_batch_transfer_final_step(client, lvol_names=None, ids=None, snapshots=None, cluster_batch=16, gateway=None, operation=None):
+    """Replicate multiple logical volumes on a logical volume store.
+
+    Args:
+        lvol_names: Names of the logical volumes to replicate (required)
+        ids: Destination lvol map IDs (required)
+        snapshots: Snapshot names (required)
+        cluster_batch: elements count in the queue between pollers
+        gateway: Name of the gateway to use for transfer (required)
+        operation: action type to be useed for transfer (required)
+    """
+    if not lvol_names:
+        raise ValueError("lvol_names must be specified")
+    if not ids:
+        raise ValueError("ids must be specified")
+    if not snapshots:
+        raise ValueError("snapshots must be specified")
+    if not gateway:
+        raise ValueError("Gateway must be specified")
+    if not operation:
+        raise ValueError("Operation must be specified")
+
+    params = {'lvol_names': lvol_names, 'ids': ids, 'snapshots': snapshots, 'cluster_batch': cluster_batch, 'gateway': gateway, 'operation': operation}
+    return client.call('bdev_lvol_batch_transfer_final_step', params)
+
 def bdev_lvol_transfer(client, lvol_name=None, lvol_id=0, offset=0, cluster_batch=16, gateway=None, operation=None):
     """Replicate a logical volume on a logical volume store.
 

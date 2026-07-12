@@ -1079,6 +1079,12 @@ raid_bdev_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_i
 	raid_io->used_bits.geometry = (bdev_io->u.bdev.offset_blocks & GEOMETRY_MASK) >> GEOMETRY_BITS_POS;
 	raid_io->used_bits.special_io = (bdev_io->u.bdev.offset_blocks & SPECIAL_IO_MASK) >> SPECIAL_IO_BITS_POS;
 
+	if (raid_io->used_bits.special_io) {
+		__atomic_add_fetch(&raid_io->raid_bdev->trace_cnt, 1, __ATOMIC_SEQ_CST);
+		raid_io->used_bits.trace_id = raid_io->raid_bdev->trace_cnt;
+		SPDK_NOTICELOG("raid: lba=%lu,(H) %"PRIx64" trace id=%"PRIu64" %d,\n", bdev_io->u.bdev.offset_blocks, bdev_io->u.bdev.offset_blocks, raid_io->used_bits.trace_id, bdev_io->type);
+	}
+
 	if (raid_io->used_bits.priority_class) { raid_io->raid_bdev->supports_priority_class = 1; }
 	spdk_trace_record(TRACE_BDEV_RAID_IO_START, 0, 0, (uintptr_t)raid_io, (uintptr_t)bdev_io);
 
