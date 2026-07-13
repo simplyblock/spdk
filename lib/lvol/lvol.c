@@ -6400,6 +6400,30 @@ error:
 	return -ENOMEM;
 }
 
+static int spdk_lvol_transfer_delay(void *ctx);
+
+static void 
+spdk_lvol_transfer_delay_cb(void *ctx, int rc) {
+	struct spdk_lvs_xfer *xfer = ctx;
+	if (rc == 0) {
+		TAILQ_INSERT_TAIL(&g_lvs_xfer_tasks, xfer, entry);
+	} else {
+		SPDK_NOTICELOG("Transfer lvol %s %s task: last offset %" PRIu64 " status %s still has IO inflight.\n", xfer->lvol->name,
+		 			xfer_type_to_string(xfer->type), xfer->lvol->last_offset,
+					xfer_result_type_to_string(xfer->lvol->transfer_status));
+		xfer->tmo_poller =  spdk_poller_register(spdk_lvol_transfer_delay, xfer, 50000);// 50ms
+	}
+}
+
+static int 
+spdk_lvol_transfer_delay(void *ctx) {
+	struct spdk_lvs_xfer *xfer = ctx;
+	spdk_poller_unregister(&xfer->tmo_poller);
+	xfer->tmo_poller = NULL;
+	blob_check_io_inflaight(xfer->lvol->blob, spdk_lvol_transfer_delay_cb, xfer);
+	return -1;
+}
+
 int
 spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_batch, enum xfer_type type,
 				struct spdk_transfer_dev *tdev, const char *snapshot_name, uint32_t lvol_id,
@@ -6488,8 +6512,8 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
 	SPDK_NOTICELOG("Transfer lvol %s %s task: last offset %" PRIu64 " status %s start.\n", task->lvol->name,
 		 			xfer_type_to_string(task->type), task->lvol->last_offset,
 					xfer_result_type_to_string(task->lvol->transfer_status));
-
-	TAILQ_INSERT_TAIL(&g_lvs_xfer_tasks, task, entry);
+	task->tmo_poller =  spdk_poller_register(spdk_lvol_transfer_delay, task, 50000);// 50ms
+	// TAILQ_INSERT_TAIL(&g_lvs_xfer_tasks, task, entry);
 	return 0;
 }
 

@@ -492,6 +492,7 @@ void spdk_bs_convert_blob(struct spdk_blob *origblob, bool leader, bool update_i
 			    spdk_blob_op_complete cb_fn, void *cb_arg);
 void spdk_bs_set_migration_flag_blob(struct spdk_blob *blob);
 bool spdk_bs_get_migration_flag_blob(struct spdk_blob *blob);
+void blob_check_io_inflaight(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
 /**
  * update a blobstore according to bit array synced.
  * Can be used on loaded blobstore, even with opened blobs.

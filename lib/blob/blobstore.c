@@ -521,6 +521,7 @@ blob_set_back_bs_dev(struct spdk_blob *blob, struct spdk_bs_dev *back_bs_dev,
 struct freeze_io_ctx {
 	struct spdk_bs_cpl cpl;
 	struct spdk_blob *blob;
+	int has_io;
 };
 
 static void
@@ -589,6 +590,58 @@ blob_freeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg
 	blob->frozen_refcnt++;
 
 	spdk_for_each_channel(blob->bs, blob_io_sync, ctx, blob_io_cpl);
+}
+
+static void
+blob_check_io_inflaight_cpl(struct spdk_io_channel_iter *i, int status)
+{
+	struct freeze_io_ctx *ctx = spdk_io_channel_iter_get_ctx(i);
+
+	ctx->cpl.u.blob_basic.cb_fn(ctx->cpl.u.blob_basic.cb_arg, ctx->has_io);
+
+	free(ctx);
+}
+
+static void
+blob_check_io_inflaight_itr(struct spdk_io_channel_iter *i)
+{
+	struct spdk_io_channel *_ch = spdk_io_channel_iter_get_channel(i);
+	struct spdk_bs_channel *ch = spdk_io_channel_get_ctx(_ch);
+	struct freeze_io_ctx *ctx = spdk_io_channel_iter_get_ctx(i);
+	struct spdk_bs_request_set	*set;
+	struct spdk_bs_user_op_args	*args;
+	spdk_bs_user_op_t *op, *tmp;
+	TAILQ_FOREACH_SAFE(op, &ch->queued_io, link, tmp) {
+		set = (struct spdk_bs_request_set *)op;
+		args = &set->u.user_op;
+
+		if (args->blob == ctx->blob) {
+			ctx->has_io++;
+		}
+	}
+
+	spdk_for_each_channel_continue(i, 0);
+}
+
+void
+blob_check_io_inflaight(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	struct freeze_io_ctx *ctx;
+
+	blob_verify_md_op(blob);
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+
+	ctx->cpl.type = SPDK_BS_CPL_TYPE_BS_BASIC;
+	ctx->cpl.u.blob_basic.cb_fn = cb_fn;
+	ctx->cpl.u.blob_basic.cb_arg = cb_arg;
+	ctx->blob = blob;
+
+	spdk_for_each_channel(blob->bs, blob_check_io_inflaight_itr, ctx, blob_check_io_inflaight_cpl);
 }
 
 struct drain_io_ctx {
