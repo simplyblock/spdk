@@ -11820,6 +11820,7 @@ blob_clear_clusters_async(spdk_bs_sequence_t *seq, struct spdk_blob	*blob)
 	size_t				i;
 	uint64_t			lba;
 	uint64_t			lba_count;
+	uint64_t	index = 0;
 
 	uint8_t special_io = blob->migration_flag ? 1 : 0;
 	batch = bs_sequence_to_batch_s(seq, blob->geometry, special_io, blob_clear_clusters_async_cpl, blob);
@@ -11855,11 +11856,16 @@ blob_clear_clusters_async(spdk_bs_sequence_t *seq, struct spdk_blob	*blob)
 
 		/* If a run of LBAs previously existing, clear them now */
 		if (lba_count > 0) {
+			if (special_io) {
+				SPDK_NOTICELOG("spatial unmap blob %" PRIu64 ": lba=%" PRIu64 ", real_offset=%" PRIu64 ", CNT=%" PRIu64 ", index=%" PRIu64 "\n", blob->id, lba, (index * blob->bs->pages_per_cluster), lba_count, index);
+			}
 			bs_batch_clear_dev(blob, batch, lba, lba_count);
+			index = 0;
 		}
 
 		/* Start building the next batch */
 		lba = next_lba;
+		index = i;
 		if (next_lba > 0) {
 			lba_count = next_lba_count;
 		} else {
@@ -11869,6 +11875,9 @@ blob_clear_clusters_async(spdk_bs_sequence_t *seq, struct spdk_blob	*blob)
 
 	/* If we ended with a contiguous set of LBAs, clear them now */
 	if (lba_count > 0) {
+		if (special_io) {
+				SPDK_NOTICELOG("spatial unmap blob %" PRIu64 ": lba=%" PRIu64 ", real_offset=%" PRIu64 ", CNT=%" PRIu64 ",index=%" PRIu64 "\n", blob->id, lba, (index * blob->bs->pages_per_cluster), lba_count, index);
+		}
 		bs_batch_clear_dev(blob, batch, lba, lba_count);
 	}
 
