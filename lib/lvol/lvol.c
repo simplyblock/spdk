@@ -291,6 +291,7 @@ load_next_lvol(void *cb_arg, struct spdk_blob *blob, int lvolerrno)
 	lvol->lvol_store = lvs;
 	lvol->map_id = spdk_blob_get_map_id(blob);
 	lvs->lvol_map.lvol[lvol->map_id] = lvol;
+	TAILQ_INIT(&lvol->redirect_migrate_io);
 
 	rc = spdk_blob_get_xattr_value(blob, "uuid", (const void **)&attr, &value_len);
 	if (rc != 0 || value_len != SPDK_UUID_STRING_LEN || attr[SPDK_UUID_STRING_LEN - 1] != '\0' ||
@@ -4467,53 +4468,25 @@ spdk_migration_open_channel_on_threads(void *arg)
 
 void
 spdk_lvol_rediret_io_change_state(struct spdk_lvol *lvol)
-{
-	lvol->redirect_failed = true;
+{	
+	pthread_mutex_lock(&g_lvs_queue_mutex);
+	lvol->redirect_failed = true;	
+	pthread_mutex_unlock(&g_lvs_queue_mutex);
 }
 
-struct unfreeze{
-	struct spdk_lvol *lvol;
-	struct spdk_poller 	*poller;
-};
-
-static int
-spdk_lvol_unfreeze_poller(void *arg) {
-	struct unfreeze *ctx = arg;
-	struct spdk_lvol *lvol = ctx->lvol;
+static void
+spdk_lvol_unfreeze_io(void *arg)
+{
+	struct spdk_lvol *lvol = arg;
+	pthread_mutex_lock(&g_lvs_queue_mutex);
+	lvol->freezed = false;
+	pthread_mutex_unlock(&g_lvs_queue_mutex);
 	struct spdk_migrate_io *migrate_io, *tmp;
 	TAILQ_FOREACH_SAFE(migrate_io, &lvol->redirect_migrate_io, entry, tmp) {
 		assert(migrate_io != NULL);
 		TAILQ_REMOVE(&lvol->redirect_migrate_io, migrate_io, entry); // Remove it from the queue.
 		spdk_thread_send_msg(migrate_io->thread, migrate_io->cb_fn, migrate_io);
 	}
-	spdk_poller_unregister(&ctx->poller);
-	ctx->poller = NULL;
-	free(ctx);
-	return -1;
-}
-
-
-static void
-spdk_lvol_unfreeze_io(void *arg)
-{
-	struct spdk_lvol *lvol = arg;
-	lvol->freezed = false;
-	struct unfreeze *ctx;
-
-	ctx = calloc(1, sizeof(*ctx));
-	if (!ctx) {
-		SPDK_ERRLOG("Cannot allocate memory for hublvol_ch.\n");
-		struct spdk_migrate_io *migrate_io, *tmp;
-		TAILQ_FOREACH_SAFE(migrate_io, &lvol->redirect_migrate_io, entry, tmp) {
-			assert(migrate_io != NULL);
-			TAILQ_REMOVE(&lvol->redirect_migrate_io, migrate_io, entry); // Remove it from the queue.
-			spdk_thread_send_msg(migrate_io->thread, migrate_io->cb_fn, migrate_io);
-		}
-		return;
-	}
-	SPDK_NOTICELOG("Set poller for unfreez lvol after 50ms.\n");
-	ctx->lvol = lvol;
-	ctx->poller =  spdk_poller_register(spdk_lvol_unfreeze_poller, ctx, 50000);// 50ms
 	return;
 }
 
