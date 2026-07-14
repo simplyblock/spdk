@@ -1709,17 +1709,17 @@ spdk_lvol_create_snapshot(struct spdk_lvol *origlvol, const char *snapshot_name,
 		return;
 	}
 
-	if (!origlvol->lvol_store->leader || !origlvol->leader) {
-		SPDK_ERRLOG("Cannot create snapshot; the lvs/lvol not leader.\n");
-		cb_fn(cb_arg, NULL, -ERR_LEADERSHIP_CHANGED);
-		return;
-	}
-
 	origblob = origlvol->blob;
 	lvs = origlvol->lvol_store;
 	if (lvs == NULL) {
 		SPDK_ERRLOG("lvol store does not exist\n");
 		cb_fn(cb_arg, NULL, -EINVAL);
+		return;
+	}
+
+	if (!lvs->leader || !origlvol->leader) {
+		SPDK_ERRLOG("Cannot create snapshot; the lvs/lvol not leader.\n");
+		cb_fn(cb_arg, NULL, -ERR_LEADERSHIP_CHANGED);
 		return;
 	}
 
