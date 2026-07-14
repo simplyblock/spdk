@@ -291,7 +291,7 @@ load_next_lvol(void *cb_arg, struct spdk_blob *blob, int lvolerrno)
 	lvol->lvol_store = lvs;
 	lvol->map_id = spdk_blob_get_map_id(blob);
 	lvs->lvol_map.lvol[lvol->map_id] = lvol;
-	TAILQ_INIT(&lvol->redirect_migrate_io);
+	// TAILQ_INIT(&lvol->redirect_migrate_io);
 
 	rc = spdk_blob_get_xattr_value(blob, "uuid", (const void **)&attr, &value_len);
 	if (rc != 0 || value_len != SPDK_UUID_STRING_LEN || attr[SPDK_UUID_STRING_LEN - 1] != '\0' ||
@@ -1658,7 +1658,7 @@ spdk_lvol_create_snapshot_poller(void *cb_arg) {
 
 	spdk_poller_unregister(&req->poller);
 
-	if (!lvs->leader) {
+	if (!lvs->leader || !req->origlvol->leader) {
 		SPDK_ERRLOG("Cannot create snapshot; poller activated after delay, leadership lost.\n");
 		req->frozen_refcnt = 0;
 		req->force_failure = -1;
@@ -1706,6 +1706,12 @@ spdk_lvol_create_snapshot(struct spdk_lvol *origlvol, const char *snapshot_name,
 	if (origlvol == NULL) {
 		SPDK_INFOLOG(lvol, "Lvol not provided.\n");
 		cb_fn(cb_arg, NULL, -EINVAL);
+		return;
+	}
+
+	if (!origlvol->lvol_store->leader || !origlvol->leader) {
+		SPDK_ERRLOG("Cannot create snapshot; the lvs/lvol not leader.\n");
+		cb_fn(cb_arg, NULL, -ERR_LEADERSHIP_CHANGED);
 		return;
 	}
 
