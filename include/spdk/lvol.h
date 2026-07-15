@@ -171,6 +171,9 @@ void spdk_lvs_rename(struct spdk_lvol_store *lvs, const char *new_name,
  */
 int spdk_lvs_unload(struct spdk_lvol_store *lvol_store,
 		    spdk_lvs_op_complete cb_fn, void *cb_arg);
+struct spdk_transfer_dev;
+void spdk_lvs_rmt_bdev_remove(struct spdk_transfer_dev *tdev);
+bool spdk_unload_lvs_poll_group(struct spdk_lvol_store *lvs);
 
 /**
  * Destroy lvolstore.
@@ -339,6 +342,10 @@ struct spdk_transfer_dev *spdk_open_rmt_bdev(const char *name, struct spdk_lvol_
 int spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_batch,
 				enum xfer_type type, struct spdk_transfer_dev *tdev, const char *snapshot_name,
 				uint32_t lvol_id, spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
+int spdk_lvol_batch_transfer(uint32_t cluster_batch, enum xfer_type type, struct spdk_transfer_dev *tdev,
+				struct spdk_lvol **batch_lvols, int num_lvols, char **batch_snapshots, int num_snapshots,
+				uint32_t *batch_lvol_ids, int num_lvol_ids, spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
+
 int spdk_lvol_s3_backup(struct spdk_lvol *lvol, uint32_t cluster_batch,
 				struct spdk_lvol **chain_snapshots, int num_snapshots, uint32_t s3_id);
 int spdk_lvol_s3_merge(struct spdk_lvol_store *lvs, uint32_t s3_id,
@@ -349,8 +356,8 @@ void spdk_lvol_chain(struct spdk_lvol *origlvol, struct spdk_lvol *clone,
 		 spdk_lvol_op_complete cb_fn, void *cb_arg);
 void spdk_lvol_convert(struct spdk_lvol *origlvol, spdk_lvol_op_complete cb_fn, void *cb_arg);
 void spdk_lvol_set_migration_flag(struct spdk_lvol *lvol);
-bool spdk_lvol_freeze_io(struct spdk_lvol *lvol, struct spdk_io_channel *ch, 
-						struct spdk_bdev_io *bdev_io, spdk_lvol_op_migrate_complete cb_fn);
+enum freeze_io_result spdk_lvol_freeze_io(struct spdk_lvol *lvol, struct spdk_io_channel *ch, 
+				struct spdk_bdev_io *bdev_io, spdk_lvol_op_migrate_complete cb_fn);
 void spdk_tdev_store_hublvol_channel(struct spdk_transfer_dev *tdev, struct spdk_io_channel *channel);
 struct spdk_io_channel * spdk_tdev_get_hub_channel(struct spdk_transfer_dev *tdev, struct spdk_thread *thread);
 void spdk_lvol_rediret_io_change_state(struct spdk_lvol *lvol);

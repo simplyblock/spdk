@@ -39,8 +39,8 @@ static struct spdk_cpuset *g_helper_set = NULL;
 static TAILQ_HEAD(, spdk_lvs_poll_group) g_lvs_poll_groups = TAILQ_HEAD_INITIALIZER(g_lvs_poll_groups);
 static TAILQ_HEAD(, spdk_lvs_xfer) g_lvs_xfer_tasks = TAILQ_HEAD_INITIALIZER(g_lvs_xfer_tasks);
 static uint32_t g_lvs_num_pgs = 0;
-static struct spdk_poller *pg_xfer_poller[20] = {NULL};
-static struct spdk_poller *xfer_md_poller = NULL;
+static struct spdk_poller *g_pg_xfer_poller[20] = {NULL};
+static struct spdk_poller *g_xfer_md_poller = NULL;
 
 static inline int lvs_opts_copy(const struct spdk_lvs_opts *src, struct spdk_lvs_opts *dst);
 static int lvs_esnap_bs_dev_create(void *bs_ctx, void *blob_ctx, struct spdk_blob *blob,
@@ -291,6 +291,7 @@ load_next_lvol(void *cb_arg, struct spdk_blob *blob, int lvolerrno)
 	lvol->lvol_store = lvs;
 	lvol->map_id = spdk_blob_get_map_id(blob);
 	lvs->lvol_map.lvol[lvol->map_id] = lvol;
+	TAILQ_INIT(&lvol->redirect_migrate_io);
 
 	rc = spdk_blob_get_xattr_value(blob, "uuid", (const void **)&attr, &value_len);
 	if (rc != 0 || value_len != SPDK_UUID_STRING_LEN || attr[SPDK_UUID_STRING_LEN - 1] != '\0' ||
@@ -992,6 +993,17 @@ spdk_lvs_unload(struct spdk_lvol_store *lvs, spdk_lvs_op_complete cb_fn,
 	lvs_req->cb_fn = cb_fn;
 	lvs_req->cb_arg = cb_arg;
 
+	if (lvs->hublvol_poller) {
+		spdk_poller_unregister(&lvs->hublvol_poller);
+		lvs->hublvol_poller = NULL;
+	}
+	
+	if (lvs->redirect_poller) {
+		spdk_poller_unregister(&lvs->redirect_poller);
+		lvs->redirect_poller = NULL;
+	}
+		
+
 	SPDK_INFOLOG(lvol, "Unloading lvol store\n");
 	spdk_bs_unload(lvs->blobstore, _lvs_unload_cb, lvs_req);
 	lvs_free(lvs);
@@ -1646,7 +1658,7 @@ spdk_lvol_create_snapshot_poller(void *cb_arg) {
 
 	spdk_poller_unregister(&req->poller);
 
-	if (!lvs->leader) {
+	if (!lvs->leader || !req->origlvol->leader) {
 		SPDK_ERRLOG("Cannot create snapshot; poller activated after delay, leadership lost.\n");
 		req->frozen_refcnt = 0;
 		req->force_failure = -1;
@@ -1702,6 +1714,12 @@ spdk_lvol_create_snapshot(struct spdk_lvol *origlvol, const char *snapshot_name,
 	if (lvs == NULL) {
 		SPDK_ERRLOG("lvol store does not exist\n");
 		cb_fn(cb_arg, NULL, -EINVAL);
+		return;
+	}
+
+	if (!lvs->leader || !origlvol->leader) {
+		SPDK_ERRLOG("Cannot create snapshot; the lvs/lvol not leader.\n");
+		cb_fn(cb_arg, NULL, -ERR_LEADERSHIP_CHANGED);
 		return;
 	}
 
@@ -2106,6 +2124,7 @@ static void
 lvol_rename_cb(void *cb_arg, int lvolerrno)
 {
 	struct spdk_lvol_req *req = cb_arg;
+	struct spdk_blob *blob = req->lvol->blob;
 
 	if (lvolerrno != 0) {
 		SPDK_ERRLOG("Lvol rename operation failed\n");
@@ -2113,6 +2132,7 @@ lvol_rename_cb(void *cb_arg, int lvolerrno)
 		snprintf(req->lvol->name, sizeof(req->lvol->name), "%s", req->name);
 	}
 
+	spdk_blob_set_md_ro(blob, req->md_ro);
 	req->cb_fn(req->cb_arg, lvolerrno);
 	free(req);
 }
@@ -2152,15 +2172,23 @@ spdk_lvol_rename(struct spdk_lvol *lvol, const char *new_name,
 	req->cb_arg = cb_arg;
 	req->lvol = lvol;
 	snprintf(req->name, sizeof(req->name), "%s", new_name);
+	req->md_ro = spdk_blob_get_md_ro(blob);
 
 	rc = spdk_blob_set_xattr(blob, "name", new_name, strlen(new_name) + 1);
 	if (rc < 0) {
+		spdk_blob_set_md_ro(blob, req->md_ro);
 		free(req);
 		cb_fn(cb_arg, rc);
 		return;
 	}
 
-	spdk_blob_sync_md(blob, lvol_rename_cb, req);
+	if (lvol->lvol_store->leader) {
+		spdk_blob_sync_md(blob, lvol_rename_cb, req);
+		return;
+	} else {
+		spdk_blob_set_clean(blob);
+		lvol_rename_cb(req, 0);
+	}
 }
 
 void
@@ -4371,24 +4399,31 @@ helper_xfer_poller(void *arg)
     return count ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
 }
 
-bool
+enum freeze_io_result
 spdk_lvol_freeze_io(struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io, spdk_lvol_op_migrate_complete cb_fn)
 {
 	struct spdk_migrate_io *migrate_io;
-	pthread_mutex_lock(&g_lvs_queue_mutex);	
 	migrate_io = calloc(1, sizeof(*migrate_io));
-	if (!migrate_io) {
+	if (migrate_io == NULL) {
 		SPDK_ERRLOG("Cannot allocate memory for migrate_io.\n");
-		pthread_mutex_unlock(&g_lvs_queue_mutex);
-		return false;
+		return FREEZE_IO_NOMEM;
 	}
+
 	migrate_io->bdev_io = bdev_io;
 	migrate_io->thread = spdk_get_thread();
 	migrate_io->ch = ch;
 	migrate_io->cb_fn = cb_fn;
+
+	pthread_mutex_lock(&g_lvs_queue_mutex);
+	if (!lvol->freezed) {
+		pthread_mutex_unlock(&g_lvs_queue_mutex);
+		free(migrate_io);
+		return FREEZE_IO_NOT_FROZEN;
+	}
+
 	TAILQ_INSERT_TAIL(&lvol->redirect_migrate_io, migrate_io, entry);
 	pthread_mutex_unlock(&g_lvs_queue_mutex);
-	return true;
+	return FREEZE_IO_QUEUED;
 }
 
 void
@@ -4486,6 +4521,11 @@ spdk_xfer_sync_mode(struct spdk_lvs_xfer *xfer)
 		spdk_lvol_unfreeze_io(lvol);
 		rc = -1;
 	}
+	
+	if (xfer->num_sub_tasks > 0 && xfer->list_task[0] != xfer) {
+		return;
+	}
+
 	xfer->cb_fn(xfer->cb_arg, lvol, rc);
 	return;
 }
@@ -4606,14 +4646,26 @@ static void
 destroy_xfer_task(struct spdk_lvs_xfer *xfer) {
 	struct spdk_lvs_poll_group *lpg;
 
-	TAILQ_REMOVE(&g_lvs_xfer_tasks, xfer, entry);
+	if (xfer->num_sub_tasks > 0) {
+		xfer->waiting_for_sub_tasks = true;
+		if (xfer->state == XFER_STATE_FAILED) {
+			SPDK_ERRLOG("Sub task failed for migration of lvol %s\n", xfer->lvol->name);
+			for (int i = 0; i < xfer->num_sub_tasks; i++) {
+				if(xfer->list_task[i]->state != XFER_STATE_FAILED) {
+					xfer->list_task[i]->state = XFER_STATE_FAILED;
+				}
+			}
+		}
+	} else {
+		TAILQ_REMOVE(&g_lvs_xfer_tasks, xfer, entry);
+	}
 
 	if (xfer->lvol && xfer->lvol->transfer_status != XFER_DONE) {
 		xfer->lvol->transfer_status = XFER_FAILED;
 	}
 
 	if (XFER_S3_MERGE == xfer->type) {
-			SPDK_NOTICELOG("Transfer lvol %d %s task: status %s finished.\n", xfer->s3_id,
+		SPDK_NOTICELOG("Transfer lvol %d %s task: status %s finished.\n", xfer->s3_id,
 					xfer_type_to_string(xfer->type),
 					xfer->state == XFER_STATE_DONE ? "DONE" : "FAILED");
 	} else {
@@ -4622,7 +4674,8 @@ destroy_xfer_task(struct spdk_lvs_xfer *xfer) {
 					xfer_result_type_to_string(xfer->lvol->transfer_status));
 	}
 
-	if (xfer->final_step && xfer->cb_fn) {
+	if (xfer->final_step && xfer->cb_fn &&
+		(xfer->num_sub_tasks == 0 || xfer->lvol->transfer_status == XFER_FAILED)) {
 		spdk_xfer_sync_mode(xfer);
 	}
 
@@ -4631,9 +4684,68 @@ destroy_xfer_task(struct spdk_lvs_xfer *xfer) {
 		xfer->pg[lpg->id] = true;
 		spdk_thread_send_msg(lpg->thread, spdk_delete_rmt_lvol_pg, xfer);
 	}
+
+	if (xfer->num_sub_tasks > 0) {
+		return;
+	}
+	
 	xfer->tmo_poller = spdk_poller_register(
 				destroy_xfer_task_tmo, xfer, 200000);// do it after 200ms
 }
+
+static void
+destroy_parent_xfer_task(struct spdk_lvs_xfer *xfer)
+{
+	struct spdk_lvs_xfer **list_task;
+	struct spdk_lvs_xfer *sub_xfer;
+	bool batch_failed = false;
+
+	TAILQ_REMOVE(&g_lvs_xfer_tasks, xfer, entry);
+
+	list_task = xfer->list_task;
+
+	for (int i = 0; i < xfer->num_sub_tasks; i++) {
+		sub_xfer = list_task[i];
+
+		if (sub_xfer->state == XFER_STATE_FAILED ||
+			(sub_xfer->lvol != NULL && sub_xfer->lvol->transfer_status == XFER_FAILED)) {
+			batch_failed = true;
+			break;
+		}
+	}
+
+	SPDK_NOTICELOG("Batch transfer with parent lvol %s, type %s, status %s finished.\n",
+		       xfer->lvol ? xfer->lvol->name : "NULL",
+		       xfer_type_to_string(xfer->type),
+		       batch_failed ? "FAILED" : "DONE");
+
+	for (int i = 0; i < xfer->num_sub_tasks; i++) {
+		sub_xfer = list_task[i];
+
+		/*
+		 * Tasks that failed were already unfrozen by
+		 * destroy_xfer_task(). Tasks that completed successfully
+		 * remained frozen while waiting for the rest of the batch.
+		 */
+		if (sub_xfer->lvol != NULL && sub_xfer->lvol->transfer_status == XFER_DONE) {
+			if (batch_failed) {
+				sub_xfer->state = XFER_STATE_FAILED;
+				sub_xfer->lvol->transfer_status = XFER_FAILED;
+			}
+
+			spdk_xfer_sync_mode(sub_xfer);
+		}
+
+		sub_xfer->list_task = NULL;
+		sub_xfer->num_sub_tasks = 0;
+
+		sub_xfer->tmo_poller = spdk_poller_register(
+			destroy_xfer_task_tmo, sub_xfer, 200000);
+	}
+
+	free(list_task);
+}
+
 
 static int
 xfer_fill_queue(struct spdk_lvs_xfer *xfer, int initial) {
@@ -4669,7 +4781,7 @@ xfer_wait_outstanding_io(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req **
 		if (current_time - xfer->timeout > timeout_ticks) {// in timeout consider outstanding io
 			if (xfer->outstanding_io == 0) {
 				xfer->lvol->transfer_status = XFER_FAILED;
-				xfer->state = XFER_STATE_FAILED;				
+				xfer->state = XFER_STATE_FAILED;
 			} else {
 				// print current outstanding io timeout error
 				SPDK_ERRLOG("Task transfer timeout with outstanding io %u\n", xfer->outstanding_io);
@@ -5780,15 +5892,34 @@ static int
 md_xfer_poller(void *cb_arg)
 {
 	struct spdk_lvs_xfer *xfer, *tmp;
+	struct spdk_lvs_xfer *sub_xfer;	
 	int count = 0;
 	TAILQ_FOREACH_SAFE(xfer, &g_lvs_xfer_tasks, entry, tmp) {
+		int sub_count = 0;
 		switch (xfer->type)
 		{
 			case XFER_REPLICATE_SNAPSHOT:
 				count += xfer_replication(xfer);
 				break;
 			case XFER_MIGRATE_SNAPSHOT:
-				count += xfer_migration(xfer);
+				if (xfer->num_sub_tasks > 0) {
+					for (int i = 0; i < xfer->num_sub_tasks; i++) {
+						sub_xfer = xfer->list_task[i];
+						if (sub_xfer->waiting_for_sub_tasks) {
+							// waiting for sub tasks to finish
+							sub_count++;
+							continue;
+						} else {
+							count += xfer_migration(sub_xfer);
+						}
+					}
+					if (sub_count == xfer->num_sub_tasks) {
+						// all sub tasks done, we can delete the main task
+						destroy_parent_xfer_task(xfer);
+					}
+				} else {
+					count += xfer_migration(xfer);
+				}
 				break;
 			case XFER_S3_BACKUP:
 				count += xfer_s3_backup(xfer);
@@ -5804,6 +5935,80 @@ md_xfer_poller(void *cb_arg)
 		}
 	}
     return count ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
+}
+
+struct lvs_channel_info {
+	struct spdk_lvs_poll_group *lpg;
+	int idx;
+};
+
+static void
+spdk_put_md_channel_poll_group(void *ctx)
+{
+	struct lvs_channel_info *info = ctx;
+	struct spdk_lvs_poll_group *lpg = info->lpg;
+	struct spdk_io_channel *md_channel;
+	int idx = info->idx;
+	int last_idx;
+
+	assert(spdk_get_thread() == lpg->thread);
+	assert(idx >= 0);
+	assert(idx < lpg->lvs_cnt);
+
+	md_channel = lpg->lvs_info[idx].md_channel;
+	if (md_channel != NULL) {
+		spdk_put_io_channel(md_channel);
+	}
+
+	/*
+	 * Keep lvs_info[] compact by moving the last active entry into
+	 * the slot being removed.
+	 */
+	last_idx = lpg->lvs_cnt - 1;
+
+	if (idx != last_idx) {
+		lpg->lvs_info[idx] = lpg->lvs_info[last_idx];
+	}
+
+	memset(&lpg->lvs_info[last_idx], 0, sizeof(lpg->lvs_info[last_idx]));
+
+	lpg->lvs_cnt--;
+
+	free(info);
+}
+
+bool
+spdk_unload_lvs_poll_group(struct spdk_lvol_store *lvs)
+{
+	struct spdk_lvs_poll_group *lpg;
+	struct lvs_channel_info *info;
+	struct spdk_lvs_xfer *xfer;
+
+	TAILQ_FOREACH(lpg, &g_lvs_poll_groups, entry) {
+		for (int i = 0; i < lpg->lvs_cnt; i++) {
+			if (lpg->lvs_info[i].lvs == lvs && lpg->lvs_info[i].status) {
+				info = calloc(1, sizeof(*info));
+				if (!info) {
+					SPDK_ERRLOG("Not enough memory to allocate ctx to return poll groups channel in lvs.\n");
+					continue;
+				}
+				info->lpg = lpg;
+				info->idx = i;
+				lpg->lvs_info[i].status = false;
+				spdk_thread_send_msg(lpg->thread, spdk_put_md_channel_poll_group, info);
+			}
+		}
+	}
+
+	TAILQ_FOREACH(xfer, &g_lvs_xfer_tasks, entry) {
+		if (xfer->lvol && xfer->lvol->lvol_store == lvs) {
+			SPDK_NOTICELOG("Transfer task already exists for lvs %s.\n", lvs->name);
+			return true;
+		}
+	}
+
+	return false;
+
 }
 
 static void
@@ -5841,25 +6046,7 @@ spdk_lvs_create_poll_group(void *ctx)
 	lpg->thread_name = spdk_thread_get_name(lpg->thread);
 	TAILQ_INIT(&lpg->rmt_lvols);
 	TAILQ_INIT(&lpg->ch_tdev);
-	lpg->md_thread = g_lvs_md_thread;
-
-	struct spdk_lvol_store *tmp;
-	pthread_mutex_lock(&g_lvol_stores_mutex);
-		TAILQ_FOREACH(tmp, &g_lvol_stores, link) {
-			lpg->lvs_info[lpg->lvs_cnt++].lvs = tmp;
-		}
-	pthread_mutex_unlock(&g_lvol_stores_mutex);
-
-	for (int i = 0; i < lpg->lvs_cnt; i++) {
-		lpg->lvs_info[i].md_channel = spdk_bs_alloc_io_channel(lpg->lvs_info[i].lvs->blobstore);
-		if (!lpg->lvs_info[i].md_channel) {
-			SPDK_ERRLOG("Failed to get md IO channel.\n");
-			free(lpg);
-			return;
-		}
-	}
-
-	lpg->xfer_poller = NULL;
+	// lpg->md_thread = g_lvs_md_thread;
 	const char *suffix = strrchr(lpg->thread_name, '_'); // find last '_'
 	lpg->id =  atoi(suffix + 1);
 	SPDK_NOTICELOG("Create new thread %s for lvolstore with id %d t %p md %p.\n", lpg->thread_name, lpg->id, spdk_get_thread(), g_lvs_md_thread);
@@ -5951,6 +6138,13 @@ spdk_lvs_rmt_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bde
 		SPDK_NOTICELOG("Unsupported bdev event: type %d\n", type);
 		break;
 	}
+}
+
+void
+spdk_lvs_rmt_bdev_remove(struct spdk_transfer_dev *tdev)
+{
+	SPDK_NOTICELOG("Hotplug removal for tdev %s.\n", tdev->bdev_name);
+	spdk_change_rmt_lvol_state(tdev->lvs, tdev);
 }
 
 static struct spdk_transfer_dev *
@@ -6060,6 +6254,7 @@ spdk_lvs_add_rmt_bdev_to_poll_group(void *arg) {
 	struct remote_lvol_info *rmt_lvol = (struct remote_lvol_info *)(uintptr_t)arg;
 	struct spdk_lvs_poll_group *lpg = rmt_lvol->group;
 	struct spdk_transfer_dev *tdev = rmt_lvol->tdev;
+	bool found = false;
 
 	if (spdk_lvs_create_base_channel_pg(lpg, tdev) < 0) {
 		SPDK_ERRLOG("rmt-lvol Cannot get io channel for remote bdev %s.\n", tdev->bdev_name ? tdev->bdev_name : "s3 backup task");
@@ -6077,6 +6272,37 @@ spdk_lvs_add_rmt_bdev_to_poll_group(void *arg) {
 		return;
 	}
 
+	if (rmt_lvol->xfer_task->lvol && !rmt_lvol->md_channel) {
+		for (int i = 0; i < lpg->lvs_cnt; i++) {
+			if (lpg->lvs_info[i].lvs == tdev->lvs) {
+				if (!lpg->lvs_info[i].md_channel) {
+					lpg->lvs_info[i].md_channel = spdk_bs_alloc_io_channel(lpg->lvs_info[i].lvs->blobstore);
+					lpg->lvs_info[i].status = true;
+				}
+				rmt_lvol->md_channel = lpg->lvs_info[i].md_channel;
+				found = true;
+			}
+		}
+
+		if (!found) {
+			int idx = lpg->lvs_cnt;
+			lpg->lvs_info[idx].lvs = tdev->lvs;
+			lpg->lvs_info[idx].md_channel = spdk_bs_alloc_io_channel(lpg->lvs_info[idx].lvs->blobstore);
+			if (!lpg->lvs_info[idx].md_channel) {
+				SPDK_ERRLOG("Failed to get md IO channel.\n");				
+				spdk_put_io_channel(rmt_lvol->channel);
+				lpg->lvs_info[idx].lvs = NULL;
+				rmt_lvol->channel = NULL;
+				rmt_lvol->xfer_task->state = XFER_STATE_FAILED;
+				free(rmt_lvol);
+				return;
+			}
+			lpg->lvs_info[idx].status = true;
+			rmt_lvol->md_channel = lpg->lvs_info[idx].md_channel;
+			lpg->lvs_cnt++;
+		}
+	}
+
 	rmt_lvol->status = true;
 	tdev->pg[lpg->id]++;
 	TAILQ_INSERT_TAIL(&lpg->rmt_lvols, rmt_lvol, entry);
@@ -6086,11 +6312,11 @@ spdk_lvs_add_rmt_bdev_to_poll_group(void *arg) {
 static void
 spdk_create_poller(void *arg) {
 	struct spdk_lvs_poll_group *lpg = arg;
-	if (pg_xfer_poller[lpg->id]) {
+	if (g_pg_xfer_poller[lpg->id]) {
 		// SPDK_NOTICELOG("The lpg id: %d poller for transfer task already exists.\n", lpg->id);
 		return;
-	}	
-	pg_xfer_poller[lpg->id] = spdk_poller_register(helper_xfer_poller, lpg, 200);
+	}
+	g_pg_xfer_poller[lpg->id] = spdk_poller_register(helper_xfer_poller, lpg, 200);
 }
 
 static int
@@ -6157,16 +6383,6 @@ spdk_lvol_create_backup_task(struct spdk_lvs_xfer *task, struct spdk_transfer_de
 		rmt_lvol->type = task->type;
 		rmt_lvol->xfer_task = task;
 		rmt_lvol->group = lpg;
-		if (task->lvol) {
-			for (int i = 0; i < lpg->lvs_cnt; i++) {
-				if (lpg->lvs_info[i].lvs == tdev->lvs) {
-					rmt_lvol->md_channel = lpg->lvs_info[i].md_channel;
-				}
-
-				// TODO if not we should raise error but we should complete the task
-				// like set status to failed and wait for md poller to clean up
-			}
-		}
 		spdk_thread_send_msg(lpg->thread, spdk_lvs_add_rmt_bdev_to_poll_group, rmt_lvol);
 	}
 	
@@ -6182,8 +6398,8 @@ spdk_lvol_create_backup_task(struct spdk_lvs_xfer *task, struct spdk_transfer_de
 		spdk_thread_send_msg(lpg->thread, spdk_create_poller, lpg);
 	}
 
-	if (!xfer_md_poller) {
-		xfer_md_poller = spdk_poller_register(md_xfer_poller, NULL, 1000);
+	if (!g_xfer_md_poller) {
+		g_xfer_md_poller = spdk_poller_register(md_xfer_poller, NULL, 1000);
 	}
 
 	return 0;
@@ -6201,6 +6417,30 @@ error:
 		free(task->chain_s3_ids);
 	free(task);
 	return -ENOMEM;
+}
+
+static int spdk_lvol_transfer_delay(void *ctx);
+
+static void 
+spdk_lvol_transfer_delay_cb(void *ctx, int rc) {
+	struct spdk_lvs_xfer *xfer = ctx;
+	if (rc == 0) {
+		TAILQ_INSERT_TAIL(&g_lvs_xfer_tasks, xfer, entry);
+	} else {
+		SPDK_NOTICELOG("Transfer lvol %s %s task: last offset %" PRIu64 " status %s still has IO inflight.\n", xfer->lvol->name,
+		 			xfer_type_to_string(xfer->type), xfer->lvol->last_offset,
+					xfer_result_type_to_string(xfer->lvol->transfer_status));
+		xfer->tmo_poller =  spdk_poller_register(spdk_lvol_transfer_delay, xfer, 50000);// 50ms
+	}
+}
+
+static int 
+spdk_lvol_transfer_delay(void *ctx) {
+	struct spdk_lvs_xfer *xfer = ctx;
+	spdk_poller_unregister(&xfer->tmo_poller);
+	xfer->tmo_poller = NULL;
+	blob_check_io_inflaight(xfer->lvol->blob, spdk_lvol_transfer_delay_cb, xfer);
+	return -1;
 }
 
 int
@@ -6291,11 +6531,150 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
 	SPDK_NOTICELOG("Transfer lvol %s %s task: last offset %" PRIu64 " status %s start.\n", task->lvol->name,
 		 			xfer_type_to_string(task->type), task->lvol->last_offset,
 					xfer_result_type_to_string(task->lvol->transfer_status));
-
-	TAILQ_INSERT_TAIL(&g_lvs_xfer_tasks, task, entry);
+	task->tmo_poller =  spdk_poller_register(spdk_lvol_transfer_delay, task, 50000);// 50ms
+	// TAILQ_INSERT_TAIL(&g_lvs_xfer_tasks, task, entry);
 	return 0;
 }
 
+int
+spdk_lvol_batch_transfer(uint32_t cluster_batch, enum xfer_type type, struct spdk_transfer_dev *tdev,
+				struct spdk_lvol **batch_lvols, int num_lvols,
+				char **batch_snapshots, int num_snapshots,
+				uint32_t *batch_lvol_ids, int num_lvol_ids,
+				spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg) {
+	struct spdk_lvs_xfer *xfer, *task;
+	
+	struct spdk_lvol_store *lvs;
+	struct spdk_lvol *lvol;
+	char *snapshot_name;
+	uint32_t lvol_id;
+	struct spdk_lvs_xfer **list_xfer;
+	int rc = -ENOMEM, created_tasks = 0;
+	// if (!lvs->leader) {
+	// 	SPDK_ERRLOG("Lvolstore %s: is not leader.\n", lvs->name);
+	// 	return -EINVAL;
+	// }	
+	if (num_lvols <= 0 || batch_lvols == NULL ||
+    	batch_snapshots == NULL || batch_lvol_ids == NULL ||
+    	num_snapshots != num_lvols || num_lvol_ids != num_lvols) {
+		return -EINVAL;
+	}
+
+	lvs = batch_lvols[0]->lvol_store;
+	if (!tdev || !tdev->desc || tdev->dev_in_remove) {
+		SPDK_ERRLOG("Lvolstore %s: invalid transfer device for %s.\n", lvs->name, xfer_type_to_string(type));
+		return -EINVAL;
+	}
+
+	struct spdk_lvs_xfer *list_task[num_lvols];
+
+	TAILQ_FOREACH(xfer, &g_lvs_xfer_tasks, entry) {
+		for (int i = 0; i < num_lvols; i++) {
+			if (xfer->lvol == batch_lvols[i]) {
+				SPDK_NOTICELOG("The same transfer task already exists.\n");
+				return -EEXIST;
+			}
+		}
+	}
+
+	list_xfer = calloc(num_lvols, sizeof(*list_xfer));
+	if (list_xfer == NULL) {
+		SPDK_ERRLOG("Cannot allocate the batch task list.\n");
+		return -ENOMEM;
+	}
+
+	for (int i = 0; i < num_lvols; i++) {
+		lvol = batch_lvols[i];
+		snapshot_name = batch_snapshots[i];
+		lvol_id = batch_lvol_ids[i];
+
+		task = calloc(1, sizeof(*task));
+		if (!task) {
+			SPDK_ERRLOG("Cannot allocate memory for transfer structure task.\n");
+			created_tasks = i;
+			goto error;
+		}
+		list_task[i] = task;
+		task->list_task = list_xfer;
+		task->num_sub_tasks = num_lvols;
+		task->chain	= NULL;
+		task->clusters = NULL;
+		task->chain_s3_ids = NULL;
+		task->old_clusters = NULL;
+		task->lvol = lvol;
+		lvol->last_offset = 0;
+		task->current_offset = 0;
+		task->cluster_batch = cluster_batch;
+		task->type = type;
+		task->cb_fn = cb_fn;
+		task->cb_arg = cb_arg;
+		task->state = XFER_STATE_NONE;
+		
+
+		task->page_size = spdk_bs_get_page_size(lvol->lvol_store->blobstore);
+		task->page_per_cluster = spdk_bs_get_cluster_size(lvol->lvol_store->blobstore) / task->page_size;
+
+		if (snapshot_name) {
+			task->len = snprintf(task->snapshot_name, sizeof(task->snapshot_name), "%s", snapshot_name);
+			task->final_step = true;
+			task->signal_sent = false;
+		} else {
+			task->len = 0;
+			task->final_step = false;
+		}
+
+		task->num_clusters = spdk_blob_get_num_clusters(lvol->blob);
+		task->clusters = calloc(task->num_clusters, sizeof(uint64_t));
+		if (!task->clusters) {
+			SPDK_ERRLOG("Cannot allocate memory for transfer clusters array.\n");
+			free(task);
+			created_tasks = i;
+			goto error;
+		}
+
+
+		lvol->redirect_map_id = lvol_id;
+		lvol->tdev = tdev;
+
+		rc = spdk_lvol_create_backup_task(task, tdev);
+		if (rc != 0) {
+			created_tasks = i;
+			goto error;
+		}
+
+		SPDK_NOTICELOG("Transfer lvol %s %s task: last offset %" PRIu64 " status %s start.\n", task->lvol->name,
+						xfer_type_to_string(task->type), task->lvol->last_offset,
+						xfer_result_type_to_string(task->lvol->transfer_status));
+	}
+
+	for (int i = 0; i < num_lvols; i++) {
+		list_task[i]->lvol->freezed = true;
+		for (int j = 0; j < num_lvols; j++) {
+			list_task[i]->list_task[j] = list_task[j];
+		}
+	}
+
+	TAILQ_INSERT_TAIL(&g_lvs_xfer_tasks, list_task[0], entry);
+	return 0;
+error:
+	if (created_tasks <= 0) {
+		free(list_xfer);
+		return rc;
+	}
+
+	for (int i = 0; i < created_tasks; i++) {
+		list_task[i]->state = XFER_STATE_FAILED;
+		list_task[i]->num_sub_tasks = created_tasks;
+		for (int j = 0; j < created_tasks; j++) {
+			list_task[i]->list_task[j] = list_task[j];
+		}
+	}
+	TAILQ_INSERT_TAIL(&g_lvs_xfer_tasks, list_task[0], entry);
+	return 0;
+}
+
+//TODO: we assign the tdev to the lvs and if we want to use this tdev for another lvolstore we should check if the tdev is already used by to another lvolstore or not
+// bcs we cannot open the same tdev for two lvolstore at the same time
 int
 spdk_lvol_s3_backup(struct spdk_lvol *lvol, uint32_t cluster_batch,
 				struct spdk_lvol **chain_snapshots, int num_snapshots, uint32_t s3_id) {

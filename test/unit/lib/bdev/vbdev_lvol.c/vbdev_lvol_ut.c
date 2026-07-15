@@ -56,7 +56,9 @@ DEFINE_STUB_V(spdk_lvs_store_hublvol_channel, (struct spdk_lvol_store *lvs, stru
 DEFINE_STUB_V(spdk_lvol_rediret_io_change_state, (struct spdk_lvol *lvol));
 DEFINE_STUB_V(spdk_lvol_chain, (struct spdk_lvol *origlvol, struct spdk_lvol *clone, spdk_lvol_op_complete cb_fn, void *cb_arg));
 DEFINE_STUB(spdk_tdev_get_hub_channel, struct spdk_io_channel *, (struct spdk_transfer_dev *tdev, struct spdk_thread *thread), NULL);
-DEFINE_STUB(spdk_lvol_freeze_io, bool, (struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io, spdk_lvol_op_migrate_complete cb_fn), true);
+DEFINE_STUB_V(spdk_lvs_rmt_bdev_remove, (struct spdk_transfer_dev *tdev));
+DEFINE_STUB(spdk_unload_lvs_poll_group, bool, (struct spdk_lvol_store *lvs), false);
+DEFINE_STUB(spdk_lvol_freeze_io, enum freeze_io_result, (struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io, spdk_lvol_op_migrate_complete cb_fn), FREEZE_IO_QUEUED);
 DEFINE_STUB_V(spdk_add_stat_ext, (struct spdk_io_channel *ch));
 DEFINE_STUB(spdk_bdev_get_memory_domains, int, (struct spdk_bdev *bdev,
 		struct spdk_memory_domain **domains, int array_size), 0);

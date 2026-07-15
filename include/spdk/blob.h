@@ -49,6 +49,12 @@ typedef uint64_t spdk_blob_id;
 #define ERR_LEADERSHIP_CHANGED  -35
 #define ERR_UPDATE_FAILED  -36
 
+enum freeze_io_result {
+	FREEZE_IO_QUEUED,
+	FREEZE_IO_NOT_FROZEN,
+	FREEZE_IO_NOMEM,
+};
+
 enum blob_clear_method {
 	BLOB_CLEAR_WITH_DEFAULT,
 	BLOB_CLEAR_WITH_NONE,
@@ -486,6 +492,7 @@ void spdk_bs_convert_blob(struct spdk_blob *origblob, bool leader, bool update_i
 			    spdk_blob_op_complete cb_fn, void *cb_arg);
 void spdk_bs_set_migration_flag_blob(struct spdk_blob *blob);
 bool spdk_bs_get_migration_flag_blob(struct spdk_blob *blob);
+void blob_check_io_inflaight(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
 /**
  * update a blobstore according to bit array synced.
  * Can be used on loaded blobstore, even with opened blobs.
@@ -1382,6 +1389,30 @@ void spdk_bs_iter_next(struct spdk_blob_store *bs, struct spdk_blob *blob,
  */
 int spdk_blob_set_xattr(struct spdk_blob *blob, const char *name, const void *value,
 			uint16_t value_len);
+
+/**
+ * Get md ro flag for the given blob and set it the flag to false.
+ *
+ * \param blob Blob to set attribute.
+ *
+ * \return true if the blob is read-only, false otherwise.
+ */
+bool spdk_blob_get_md_ro(struct spdk_blob *blob);
+
+/**
+ * Set md ro flag for the given blob.
+ *
+ * \param blob Blob to set attribute.
+ * \param md_ro Value of md ro flag.
+ */
+void spdk_blob_set_md_ro(struct spdk_blob *blob, bool md_ro);
+
+/**
+ * Set the blob as clean.
+ *
+ * \param blob Blob to set attribute.
+ */
+void spdk_blob_set_clean(struct spdk_blob *blob);
 
 /**
  * Remove the extended attribute from the given blob.

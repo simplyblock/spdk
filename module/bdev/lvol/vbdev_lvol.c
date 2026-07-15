@@ -494,10 +494,53 @@ _vbdev_lvs_remove(struct spdk_lvol_store *lvs, spdk_lvs_op_complete cb_fn, void 
 	}
 }
 
+static int
+vbdev_lvs_destroy_tdevs_poller(void *ctx) {
+	struct spdk_lvs_req *req = ctx;
+	struct spdk_lvol_store *lvs = req->lvol_store;	
+
+	if (!TAILQ_EMPTY(&lvs->transfer_devs)) {
+		return SPDK_POLLER_BUSY;
+	}
+
+	if (spdk_unload_lvs_poll_group(lvs)) {
+		return SPDK_POLLER_BUSY;
+	}
+
+	_vbdev_lvs_remove(lvs, req->cb_fn, req->cb_arg, false);
+	spdk_poller_unregister(&req->poller);
+	req->poller = NULL;
+	free(req);
+	return -1;
+
+}
+
 void
 vbdev_lvs_unload(struct spdk_lvol_store *lvs, spdk_lvs_op_complete cb_fn, void *cb_arg)
 {
-	_vbdev_lvs_remove(lvs, cb_fn, cb_arg, false);
+	struct spdk_lvs_req *req;
+	struct spdk_transfer_dev *tdev;
+
+	req = calloc(1, sizeof(*req));
+	if (!req) {
+		SPDK_ERRLOG("Cannot alloc memory for vbdev lvol store request pointer\n");
+		if (cb_fn != NULL) {
+			cb_fn(cb_arg, -ENOMEM);
+		}
+		return;
+	}
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+	req->lvol_store = lvs;
+
+	TAILQ_FOREACH(tdev, &lvs->transfer_devs, entry) {
+		if (tdev->dev_in_remove) {
+			continue;
+		}
+		spdk_lvs_rmt_bdev_remove(tdev);
+	}
+
+	req->poller = spdk_poller_register(vbdev_lvs_destroy_tdevs_poller, req, 100000); // 100ms
 }
 
 void
@@ -1759,6 +1802,8 @@ vbdev_redirect_after_migrate(struct spdk_lvol *lvol, struct spdk_io_channel *ch,
 	uint64_t offset = 0;
 	COMBINE_OFFSET(offset, lvol->redirect_map_id, bdev_io->u.bdev.offset_blocks);
 
+	// SPDK_NOTICELOG("IO Migration - freezed blob: %" PRIu64 "  Lba: %" PRIu64 "  Cnt %" PRIu64 "  t %d \n",
+	// 		 				lvol->blob_id, bdev_io->u.bdev.offset_blocks, bdev_io->u.bdev.num_blocks, bdev_io->type);
 	if (tdev->state == HUBLVOL_CONNECTED) {
 		//TODO check the state for channel
 		if (tdev->desc == NULL) {
@@ -1942,14 +1987,23 @@ vbdev_lvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_
 	struct spdk_lvol *lvol = bdev_io->bdev->ctxt;
 	struct spdk_lvol_store *lvs = lvol->lvol_store;
 	bool io_type = check_IO_type(bdev_io->type);
+	enum freeze_io_result result;
 
-	if (lvol->freezed) {
-		if (io_type) {
-			if (!spdk_lvol_freeze_io(lvol, ch, bdev_io, vbdev_lvol_dequeue_io)) {
-				SPDK_NOTICELOG("FAILED IO - freezed blob: %" PRIu64 "  Lba: %" PRIu64 "  Cnt %" PRIu64 "  t %d \n",
-			 				lvol->blob_id, bdev_io->u.bdev.offset_blocks, bdev_io->u.bdev.num_blocks, bdev_io->type);
-				spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
-			}
+	if (lvol->freezed && io_type) {
+		result = spdk_lvol_freeze_io(lvol, ch, bdev_io, vbdev_lvol_dequeue_io);
+		switch (result) {
+		case FREEZE_IO_QUEUED:
+			return;
+
+		case FREEZE_IO_NOT_FROZEN:
+			// Unfreeze happened between the initial check and acquiring the mutex. Continue normal submission.
+			break;
+
+		case FREEZE_IO_NOMEM:
+			SPDK_ERRLOG("Failed to queue I/O while lvol is frozen: ""blob=%" PRIu64 " lba=%" PRIu64
+				    " blocks=%" PRIu64 " type=%d\n", lvol->blob_id, bdev_io->u.bdev.offset_blocks,
+				    bdev_io->u.bdev.num_blocks, bdev_io->type);
+			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 			return;
 		}
 	}

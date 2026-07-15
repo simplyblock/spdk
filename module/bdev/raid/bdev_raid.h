@@ -126,6 +126,7 @@ struct raid_io_used_bits {
 	uint8_t		geometry;
 	/* special_io bits of the parent SPDK blob and lvol who submitted this I/O request */
 	uint8_t		special_io;
+	uint64_t    trace_id;
 };
 /*
  * raid_bdev_io is the context part of bdev_io. It contains the information
@@ -214,8 +215,9 @@ struct raid_bdev {
 	uint32_t			strip_size;
 
 	/* unmap io number inflight */
-	uint32_t			unmap_inflight;	
-	uint32_t 			io_unmap_limit;	
+	uint32_t			unmap_inflight;
+	uint32_t 			io_unmap_limit;
+	uint64_t 			trace_cnt;
 	struct spdk_spinlock		used_lock;
 	TAILQ_HEAD(unmap_io_queue, raid_bdev_io) unmap_queue;
 
@@ -435,6 +437,10 @@ raid_bdev_readv_blocks_ext(struct raid_base_bdev_info *base_info, struct spdk_io
 	 										((uint64_t)used_bits->geometry << GEOMETRY_BITS_POS) |
 											((uint64_t)used_bits->special_io << SPECIAL_IO_BITS_POS) | (base_info->data_offset + offset_blocks);
 
+	// if (used_bits->special_io) {
+	// 	SPDK_NOTICELOG("raid: lba=%lu,(H) %"PRIx64" trace id=%"PRIu64" 1,\n", priority_lba, priority_lba, used_bits->trace_id);
+	// }
+
 	return spdk_bdev_readv_blocks_ext(base_info->desc, ch, iov, iovcnt,
 					  priority_lba, num_blocks, cb, cb_arg, opts);
 }
@@ -464,6 +470,10 @@ raid_bdev_writev_blocks_ext(struct raid_base_bdev_info *base_info, struct spdk_i
 											((uint64_t)used_bits->geometry << GEOMETRY_BITS_POS) |
 											((uint64_t)used_bits->special_io << SPECIAL_IO_BITS_POS) | remapped_offset_blocks;
 
+	// if (used_bits->special_io) {
+	// 	SPDK_NOTICELOG("raid: lba=%lu,(H) %"PRIx64" trace id=%"PRIu64" 2,\n", priority_lba, priority_lba, used_bits->trace_id);
+	// }
+
 	return spdk_bdev_writev_blocks_ext(base_info->desc, ch, iov, iovcnt,
 					   priority_lba, num_blocks, cb, cb_arg, opts);
 }
@@ -480,6 +490,10 @@ raid_bdev_unmap_blocks(struct raid_base_bdev_info *base_info, struct spdk_io_cha
 	const uint64_t priority_lba = ((uint64_t)used_bits->priority_class << PRIORITY_CLASS_BITS_POS) |
 	 										((uint64_t)used_bits->geometry << GEOMETRY_BITS_POS) |
 											((uint64_t)used_bits->special_io << SPECIAL_IO_BITS_POS) | (base_info->data_offset + offset_blocks);
+	
+	// if (used_bits->special_io) {
+	// 	SPDK_NOTICELOG("raid: lba=%lu,(H) %"PRIx64" trace id=%"PRIu64" 3,\n", priority_lba, priority_lba, used_bits->trace_id);
+	// }
 
 	return spdk_bdev_unmap_blocks(base_info->desc, ch, priority_lba,
 				      num_blocks, cb, cb_arg);
