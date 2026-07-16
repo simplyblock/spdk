@@ -291,7 +291,7 @@ load_next_lvol(void *cb_arg, struct spdk_blob *blob, int lvolerrno)
 	lvol->lvol_store = lvs;
 	lvol->map_id = spdk_blob_get_map_id(blob);
 	lvs->lvol_map.lvol[lvol->map_id] = lvol;
-	// TAILQ_INIT(&lvol->redirect_migrate_io);
+	TAILQ_INIT(&lvol->redirect_migrate_io);
 
 	rc = spdk_blob_get_xattr_value(blob, "uuid", (const void **)&attr, &value_len);
 	if (rc != 0 || value_len != SPDK_UUID_STRING_LEN || attr[SPDK_UUID_STRING_LEN - 1] != '\0' ||
