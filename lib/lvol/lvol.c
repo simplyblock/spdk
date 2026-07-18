@@ -2716,12 +2716,24 @@ lvol_update_on_failover(struct spdk_lvol_store *lvs, struct spdk_lvol *lvol, boo
 	}
 }
 
+static void spdk_lvs_promotion_give_up(struct spdk_lvol_store *lvs);
+
 static void
 lvs_update_on_failover_cpl(void *cb_arg, int lvolerrno)
 {
 	struct spdk_lvs_req *req = (struct spdk_lvs_req *)cb_arg;
 	struct spdk_lvol_store *lvs = req->lvol_store;
 	struct spdk_lvol *lvol, *tmp;
+
+	/* A writer-conflict demotion that landed while this update was in
+	 * flight cancelled the promotion and blocked the ports — a late
+	 * SUCCESS completion must not re-claim leadership behind it. */
+	if (lvolerrno == 0 && !lvs->update_in_progress) {
+		SPDK_NOTICELOG("Lvolstore failover update completed after demotion; ignoring.\n");
+		free(req);
+		return;
+	}
+
 	if (lvolerrno == 0) {
 		spdk_lvs_set_leader(lvs, true);
 		lvs->timeout_trigger = 0;
@@ -2737,23 +2749,56 @@ lvs_update_on_failover_cpl(void *cb_arg, int lvolerrno)
 	}
 
 	SPDK_ERRLOG("Cannot update lvolstore on failover ...\n");
+
+	/* A concurrent writer-conflict demotion cancelled this promotion
+	 * (spdk_lvs_change_leader_state set update_in_progress=false) and
+	 * owns the cleanup: ports are blocked and the conflict unfreeze
+	 * flushes the held queues. Do not retry, double-clean, or escalate
+	 * to abort() for an update the conflict already invalidated (the
+	 * conflict sets timeout_trigger=1, which would otherwise trip the
+	 * abort below for a mid-flight completion). */
+	if (!lvs->update_in_progress) {
+		free(req);
+		return;
+	}
+
 	if (lvolerrno == -ENOTCONN || (lvolerrno != 0 && lvs->timeout_trigger == 1)) {
     	SPDK_ERRLOG("Failed to update lvolstore during failover due to distrib-level functionality.\n");
     	SPDK_ERRLOG("Forcing application shutdown via abort.\n");
 		// Ensure all log messages are flushed
     	fflush(stderr);
 		abort();
-	}	
+	}
+
+	if (lvs->retry_on_update <= 3) {
+		/* Retries remain: keep client IO held (promotion_hold) and
+		 * frozen blobs frozen, and retry the update in place. The old
+		 * behavior flushed every queued IO with EIO on EVERY failed
+		 * attempt — during a 2.5 s contended failover that surfaced
+		 * thousands of non-retryable INTERNAL DEVICE ERRORs to
+		 * initiators (scale-break 2026-07-16). */
+		lvs->retry_on_update++;
+		SPDK_NOTICELOG("Retrying lvolstore failover update (attempt %d); held IO stays queued.\n",
+			       lvs->retry_on_update);
+		req->poller = spdk_poller_register(spdk_lvs_update_on_failover_poller, req, 500000); // Delay of 500ms
+		return;
+	}
+
+	/* Retry budget exhausted: fail closed. Block the LVS ports FIRST so
+	 * the EIO completions from the queue flush die behind the block (the
+	 * initiator sees the path go away and retries elsewhere) instead of
+	 * reaching connected clients as non-retryable device errors. */
+	spdk_lvs_promotion_give_up(lvs);
 	spdk_lvs_set_failed_on_update(lvs, true);
 	//remember call function to drop the IO for this lvol
 	TAILQ_FOREACH_SAFE(lvol, &lvs->pending_update_lvols, entry_to_update, tmp) {
 		TAILQ_REMOVE(&lvs->pending_update_lvols, lvol, entry_to_update);
 		assert(lvol->update_in_progress == true);
 		lvol->failed_on_update = true;
-		spdk_blob_update_failed_cleanup(lvol->blob, lvol_update_failed_cpl, lvol);		
+		spdk_blob_update_failed_cleanup(lvol->blob, lvol_update_failed_cpl, lvol);
 	}
 	free(req);
-	return;	
+	return;
 }
 
 static int
@@ -2761,6 +2806,12 @@ spdk_lvs_update_on_failover_poller(void *cb_arg)
 {
 	struct spdk_lvs_req *req = cb_arg;
 	spdk_poller_unregister(&req->poller);
+	if (!req->lvol_store->update_in_progress) {
+		/* Promotion was cancelled (writer-conflict demotion) between
+		 * arming and firing; the conflict path owns the cleanup. */
+		free(req);
+		return -1;
+	}
 	SPDK_NOTICELOG("Update lvolstore starting.... read super block.\n");
 	spdk_bs_update_on_failover(req->lvol_store->blobstore, lvs_update_on_failover_cpl, req);
 	return -1;
@@ -3450,11 +3501,57 @@ spdk_lvs_remove_rules_poller(void *cb_arg)
 	return -1;
 }
 
+/* Promotion failed permanently (retry budget exhausted): fail closed.
+ * Block the LVS data port (and reject the hublvol port for non-tertiary
+ * roles) BEFORE the held/frozen queues are flushed, so the resulting EIO
+ * completions die behind the block — the initiator sees the path drop and
+ * retries on another path — instead of reaching live client connections as
+ * non-retryable device errors. Mirrors the writer-conflict demotion
+ * sequence in spdk_lvs_unfreeze_on_conflict(). */
+static void
+spdk_lvs_promotion_give_up(struct spdk_lvol_store *lvs)
+{
+	struct spdk_lvs_req *req;
+
+	SPDK_ERRLOG("Lvolstore %s promotion failed permanently; blocking ports and releasing held IO.\n",
+		    node_role_to_string(lvs->node_role));
+
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+	block_port(lvs->subsystem_port);
+
+	if (lvs->node_role != NODE_TERTIARY && lvs->hublvol_port != 0) {
+		add_reject_hublvol_port(lvs->hublvol_port);
+		req = calloc(1, sizeof(*req));
+		if (req == NULL) {
+			SPDK_ERRLOG("Cannot alloc memory for request structure\n");
+			// in this case we should not wait for the IO inflyight
+			remove_reject_hublvol_port(lvs->hublvol_port);
+		} else {
+			req->lvol_store = lvs;
+			req->poller = spdk_poller_register(spdk_lvs_remove_rules_poller, req, 10000000); // Delay of 10s
+		}
+	}
+
+	lvs->leadership_timeout = spdk_get_ticks();
+	lvs->timeout_trigger = 1;
+	lvs->leader = false;
+	lvs->retry_on_update = 0;
+	spdk_bs_set_leader(lvs->blobstore, false);
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+
+	/* Held (never-frozen) ops flush as EIO behind the blocked port; ops
+	 * queued against still-frozen blobs are flushed by the per-blob
+	 * update_failed_cleanup that follows in the caller. */
+	spdk_bs_set_promotion_hold(lvs->blobstore, false);
+	spdk_bs_flush_held_io(lvs->blobstore);
+}
+
 static void
 spdk_lvs_unfreeze_on_conflict(struct spdk_lvol_store *lvs)
 {
-	struct spdk_lvol *lvol;
+	struct spdk_lvol *lvol, *tmp_lvol;
 	struct spdk_lvs_req *req;
+	TAILQ_HEAD(, spdk_lvol) pending = TAILQ_HEAD_INITIALIZER(pending);
 
 	pthread_mutex_lock(&g_lvol_stores_mutex);
 	block_port(lvs->subsystem_port);
@@ -3490,8 +3587,32 @@ spdk_lvs_unfreeze_on_conflict(struct spdk_lvol_store *lvs)
 		lvol->update_in_progress = false;
 	}
 
+	/* Cancel a candidate's promotion-pending lvols: their per-lvol
+	 * updates never ran, so (a) leaving them listed double-inserts on
+	 * the next promotion, and (b) their blob_freeze_on_failover refcnt
+	 * is released by nobody else (the conflict unfreeze below only
+	 * drops the conflict-freeze reference). Drain the list here and
+	 * clean each entry after the lock drops. */
+	TAILQ_FOREACH_SAFE(lvol, &lvs->pending_update_lvols, entry_to_update, tmp_lvol) {
+		TAILQ_REMOVE(&lvs->pending_update_lvols, lvol, entry_to_update);
+		TAILQ_INSERT_TAIL(&pending, lvol, entry_to_update);
+	}
+
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
 	spdk_lvs_dequeu_rsp(lvs);
+
+	TAILQ_FOREACH_SAFE(lvol, &pending, entry_to_update, tmp_lvol) {
+		TAILQ_REMOVE(&pending, lvol, entry_to_update);
+		lvol->failed_on_update = true;
+		spdk_blob_update_failed_cleanup(lvol->blob, lvol_update_failed_cpl, lvol);
+	}
+
+	/* If the conflict hit a promotion candidate, ops may be held by
+	 * promotion_hold on blobs that were never frozen — release and flush
+	 * them here (they abort as EIO behind the ports blocked above); the
+	 * frozen blobs' queues are flushed by the unfreeze below. */
+	spdk_bs_set_promotion_hold(lvs->blobstore, false);
+	spdk_bs_flush_held_io(lvs->blobstore);
 
 	SPDK_NOTICELOG("Starting unfreeze the lvols.\n");
 	spdk_lvs_unfreeze_on_conflict_msg(lvs->blobstore);
@@ -3532,7 +3653,7 @@ int
 spdk_lvs_change_leader_state(uint64_t groupid)
 {
 	struct spdk_lvol_store *lvs;
-	struct spdk_lvol *lvol;
+	struct spdk_lvol *lvol, *tmp_lvol;
 	struct spdk_lvs_req *req;
 	int rc = 0;
 	SPDK_NOTICELOG("Attempting to change leadership state internally groupid %" PRIu64 ".\n", groupid);
@@ -3587,6 +3708,23 @@ spdk_lvs_change_leader_state(uint64_t groupid)
 				}
 
 				spdk_lvs_dequeu_rsp(lvs);
+
+				/* ENOMEM fallback (freeze msg could not be sent):
+				 * drop promotion-pending entries so the next
+				 * promotion cannot double-insert them. Their
+				 * failover-freeze refs are not released here (no
+				 * md-thread context) — acceptable on this
+				 * allocation-failure path. */
+				TAILQ_FOREACH_SAFE(lvol, &lvs->pending_update_lvols, entry_to_update, tmp_lvol) {
+					TAILQ_REMOVE(&lvs->pending_update_lvols, lvol, entry_to_update);
+					lvol->failed_on_update = true;
+				}
+
+				/* Candidate demotion: release ops held by
+				 * promotion_hold (never-frozen blobs) behind the
+				 * ports blocked above. */
+				spdk_bs_set_promotion_hold(lvs->blobstore, false);
+				spdk_bs_flush_held_io(lvs->blobstore);
 			}
 			SPDK_NOTICELOG("Leadership state changed internally to false for lvs %s. Timeout has been set.\n", node_role_to_string(lvs->node_role));
 			rc = 1;
@@ -6477,6 +6615,16 @@ spdk_lvs_check_active_process(struct spdk_lvol_store *lvs, struct spdk_lvol *lvo
 		lvs->failed_on_update = false;
 		lvs->trigger_leader_sent = false;
 		lvs->retry_on_update++;
+		/* Hold user blob IO from this moment until the failover update
+		 * confirms (or permanently fails) the promotion. Without the
+		 * hold, IO accepted between this trigger and the update's blob
+		 * freezes (the 500 ms poller delay below, plus the first-write
+		 * race per lvol) executes against the journal from a node whose
+		 * leadership was never confirmed — the premature appends that
+		 * produce a writer conflict (scale-break 2026-07-16 23:44:22.6:
+		 * hub IO redirected to a just-triggered secondary passed
+		 * through unfrozen; conflict flagged at 23:44:22.960). */
+		spdk_bs_set_promotion_hold(lvs->blobstore, true);
 		spdk_bs_set_leader(lvs->blobstore, true);
 		SPDK_NOTICELOG("Lvolstore %s failover set poller - trigger refresh: %" PRIu64 " t %d \n", node_role_to_string(lvs->node_role), lvol->blob_id, type);
 		req->poller = spdk_poller_register(spdk_lvs_update_on_failover_poller, req, 500000); // Delay of 500ms
@@ -6497,6 +6645,13 @@ spdk_lvs_set_leader(struct spdk_lvol_store *lvs, bool leader)
 	lvs->retry_on_update = 0;
 
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
+
+	/* Promotion resolved: release IO held since the trigger. With
+	 * leadership confirmed the held ops execute in order; on a demote
+	 * (leader=false) they abort behind the ports the demotion path
+	 * blocked. No-op when nothing is held. */
+	spdk_bs_set_promotion_hold(lvs->blobstore, false);
+	spdk_bs_flush_held_io(lvs->blobstore);
 }
 
 void

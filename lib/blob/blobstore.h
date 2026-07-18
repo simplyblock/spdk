@@ -217,6 +217,15 @@ struct spdk_blob_store {
 	 * Only when the distrib internal force state changes, it will be set to false.
 	 */
 	bool				is_leader;
+	/* True while a leadership failover (promotion) is being confirmed.
+	 * User blob IO submitted while set is queued on the channel
+	 * (same queued_io list the per-blob freeze uses) instead of being
+	 * executed — a promotion candidate must not append client IO to the
+	 * journal before its leadership is confirmed, and must not fail it
+	 * while confirmation is still in progress. Released via
+	 * spdk_bs_set_promotion_hold(false) + spdk_bs_flush_held_io().
+	 */
+	bool				promotion_hold;
 	node_role_t 		node_role;
 	bool				read_only;
 	bool 				stop;
