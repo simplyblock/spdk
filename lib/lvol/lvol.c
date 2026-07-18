@@ -3478,6 +3478,7 @@ spdk_lvs_unfreeze_on_conflict(struct spdk_lvol_store *lvs)
 
 	lvs->update_in_progress = false;
 	lvs->failed_on_update = false;
+	lvs->retry_on_update = 0;
 	lvs->leadership_timeout = spdk_get_ticks();
 	lvs->timeout_trigger = 1;
 	lvs->leader = false;
@@ -3537,7 +3538,18 @@ spdk_lvs_change_leader_state(uint64_t groupid)
 	SPDK_NOTICELOG("Attempting to change leadership state internally groupid %" PRIu64 ".\n", groupid);
 	pthread_mutex_lock(&g_lvol_stores_mutex);
 	TAILQ_FOREACH(lvs, &g_lvol_stores, link) {
-		if ((lvs->groupid == groupid || groupid == 0) && lvs->leader) {
+		/* A writer conflict must demote not only an ESTABLISHED leader
+		 * (lvs->leader) but also a promotion CANDIDATE mid-failover
+		 * (update_in_progress): the candidate has already flipped the
+		 * blobstore leader flag and may have journal appends in flight,
+		 * yet lvs->leader is still false until the failover update
+		 * completes. Skipping it here leaves its NVMf ports open during
+		 * the conflict, so the failed-update path flushes queued client
+		 * IO as EIO straight to connected initiators (scale-break
+		 * incident 2026-07-16 23:44: both survivors were candidates,
+		 * "total blocked ports: 0" for the whole event). */
+		if ((lvs->groupid == groupid || groupid == 0) &&
+		    (lvs->leader || lvs->update_in_progress)) {
 			lvs->queue_failed_rsp = true;
 			if (spdk_blob_freeze_on_conflict_send_msg(lvs->blobstore,
 					spdk_lvs_conflict_signal, lvs)) {
@@ -3562,6 +3574,7 @@ spdk_lvs_change_leader_state(uint64_t groupid)
 
 				lvs->update_in_progress = false;
 				lvs->failed_on_update = false;
+				lvs->retry_on_update = 0;
 				lvs->leadership_timeout = spdk_get_ticks();
 				lvs->timeout_trigger = 1;
 				lvs->leader = false;
