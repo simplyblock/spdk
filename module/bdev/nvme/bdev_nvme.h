@@ -208,6 +208,13 @@ struct nvme_io_path {
 
 struct nvme_bdev_channel {
 	struct nvme_io_path			*current_io_path;
+	/* Transient hint, set only for the duration of a single (synchronous)
+	 * path selection during a failover retry: the io_path that just failed
+	 * the I/O and should be skipped if any other path is available. It is
+	 * consumed and cleared by _bdev_nvme_find_io_path(). Never dereferenced
+	 * outside that synchronous window.
+	 */
+	struct nvme_io_path			*io_path_to_avoid;
 	enum spdk_bdev_nvme_multipath_policy	mp_policy;
 	enum spdk_bdev_nvme_multipath_selector	mp_selector;
 	uint32_t				rr_min_io;

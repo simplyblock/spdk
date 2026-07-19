@@ -122,8 +122,21 @@ struct nvme_bdev_io {
 	/** Keeps track if first of fused commands was completed */
 	bool first_fused_completed;
 
-	/* How many times the current I/O was retried. */
+	/* How many times the current I/O was retried on the same path. */
 	int32_t retry_count;
+
+	/* How many times the current I/O was failed over to a different path
+	 * because of a non-path (generic) error. Bounded by the number of
+	 * io_paths so that a deterministic error still terminates. This is
+	 * counted separately from retry_count so that failing over does not
+	 * consume the same-path retry budget (bdev_retry_count).
+	 */
+	int32_t path_failover_count;
+
+	/* On a failover retry, the io_path that just failed this I/O; the next
+	 * path selection avoids it if another path is available.
+	 */
+	struct nvme_io_path *io_path_to_avoid;
 
 	/** Expiration value in ticks to retry the current I/O. */
 	uint64_t retry_ticks;
@@ -1150,12 +1163,13 @@ static struct nvme_io_path *
 _bdev_nvme_find_io_path(struct nvme_bdev_channel *nbdev_ch)
 {
 	struct nvme_io_path *io_path, *start, *non_optimized = NULL;
+	struct nvme_io_path *avoid = nbdev_ch->io_path_to_avoid;
 
 	start = nvme_io_path_get_next(nbdev_ch, nbdev_ch->current_io_path);
 
 	io_path = start;
 	do {
-		if (spdk_likely(nvme_io_path_is_available(io_path))) {
+		if (spdk_likely(nvme_io_path_is_available(io_path)) && io_path != avoid) {
 			switch (io_path->nvme_ns->ana_state) {
 			case SPDK_NVME_ANA_OPTIMIZED_STATE:
 				nbdev_ch->current_io_path = io_path;
@@ -1172,6 +1186,18 @@ _bdev_nvme_find_io_path(struct nvme_bdev_channel *nbdev_ch)
 		}
 		io_path = nvme_io_path_get_next(nbdev_ch, io_path);
 	} while (io_path != start);
+
+	/* On a failover retry we skip the path that just failed the I/O. If it
+	 * turns out to be the only usable path, fall back to it rather than
+	 * failing the I/O outright.
+	 */
+	if (non_optimized == NULL && avoid != NULL && nvme_io_path_is_available(avoid)) {
+		if (nbdev_ch->mp_policy == BDEV_NVME_MP_POLICY_ACTIVE_PASSIVE ||
+		    avoid->nvme_ns->ana_state == SPDK_NVME_ANA_OPTIMIZED_STATE) {
+			nbdev_ch->current_io_path = avoid;
+		}
+		return avoid;
+	}
 
 	if (nbdev_ch->mp_policy == BDEV_NVME_MP_POLICY_ACTIVE_ACTIVE) {
 		/* We come here only if there is no optimized path. Cache even non_optimized
@@ -1277,6 +1303,41 @@ any_io_path_may_become_available(struct nvme_bdev_channel *nbdev_ch)
 
 		if (nvme_qpair_is_connected(io_path->qpair) ||
 		    !nvme_ctrlr_is_failed(io_path->qpair->ctrlr)) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+/* Total number of io_paths in the channel (regardless of current state). Used
+ * only to bound the number of failover attempts for a single I/O.
+ */
+static uint32_t
+bdev_nvme_num_io_paths(struct nvme_bdev_channel *nbdev_ch)
+{
+	struct nvme_io_path *io_path;
+	uint32_t num = 0;
+
+	STAILQ_FOREACH(io_path, &nbdev_ch->io_path_list, stailq) {
+		num++;
+	}
+
+	return num;
+}
+
+/* Return true if there is an available io_path other than "except". */
+static bool
+bdev_nvme_another_io_path_is_available(struct nvme_bdev_channel *nbdev_ch,
+				       struct nvme_io_path *except)
+{
+	struct nvme_io_path *io_path;
+
+	STAILQ_FOREACH(io_path, &nbdev_ch->io_path_list, stailq) {
+		if (io_path == except) {
+			continue;
+		}
+		if (nvme_io_path_is_available(io_path)) {
 			return true;
 		}
 	}
@@ -1537,6 +1598,34 @@ bdev_nvme_check_retry_io(struct nvme_bdev_io *bio,
 			return false;
 		}
 		*_delay_ms = 0;
+	} else if (bio->path_failover_count < bdev_nvme_num_io_paths(nbdev_ch) &&
+		   bdev_nvme_another_io_path_is_available(nbdev_ch, io_path)) {
+		/*
+		 * A non-path (generic) error was returned on a path whose qpair and
+		 * controller still look healthy, so it did not match the path-error
+		 * checks above. In a multipath configuration where each path leads to
+		 * an independent controller, such an error is frequently specific to
+		 * this path/controller while other paths are healthy (e.g. the target
+		 * node is failing but its connection has not been torn down yet).
+		 *
+		 * Fail the I/O over to a different path instead of retrying on the
+		 * same, possibly-dying path. Crucially this is counted against
+		 * path_failover_count, not retry_count, so that dead-end attempts do
+		 * not consume the same-path retry budget (bdev_retry_count) that the
+		 * failover itself also relies on.
+		 *
+		 * The number of failovers is bounded by the number of io_paths and we
+		 * only fail over while a *different* path is available, so a genuinely
+		 * deterministic error (e.g. a media error returned identically by every
+		 * path) still terminates: once every path has been tried the I/O falls
+		 * through to the same-path retry branch below and is eventually
+		 * reported to the upper layer.
+		 */
+		bio->path_failover_count++;
+		bio->io_path_to_avoid = io_path;
+		bdev_nvme_clear_current_io_path(nbdev_ch);
+		bio->io_path = NULL;
+		*_delay_ms = 0;
 	} else {
 		bio->retry_count++;
 
@@ -1592,6 +1681,8 @@ bdev_nvme_io_complete_nvme_status(struct nvme_bdev_io *bio,
 
 complete:
 	bio->retry_count = 0;
+	bio->path_failover_count = 0;
+	bio->io_path_to_avoid = NULL;
 	bio->submit_tsc = 0;
 	bdev_io->u.bdev.accel_sequence = NULL;
 	__bdev_nvme_io_complete(bdev_io, 0, cpl);
@@ -1635,6 +1726,8 @@ bdev_nvme_io_complete(struct nvme_bdev_io *bio, int rc)
 	}
 
 	bio->retry_count = 0;
+	bio->path_failover_count = 0;
+	bio->io_path_to_avoid = NULL;
 	bio->submit_tsc = 0;
 	__bdev_nvme_io_complete(bdev_io, io_status, NULL);
 }
@@ -3455,7 +3548,12 @@ bdev_nvme_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_i
 	}
 
 	spdk_trace_record(TRACE_BDEV_NVME_IO_START, 0, 0, (uintptr_t)nbdev_io, (uintptr_t)bdev_io);
+	/* Publish the failover skip hint for the duration of this synchronous
+	 * path selection only, then clear it so it cannot affect other I/Os.
+	 */
+	nbdev_ch->io_path_to_avoid = nbdev_io->io_path_to_avoid;
 	nbdev_io->io_path = bdev_nvme_find_io_path(nbdev_ch);
+	nbdev_ch->io_path_to_avoid = NULL;
 	if (spdk_unlikely(!nbdev_io->io_path)) {
 		if (!bdev_nvme_io_type_is_admin(bdev_io->type)) {
 			bdev_nvme_io_complete(nbdev_io, -ENXIO);
