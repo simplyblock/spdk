@@ -1267,20 +1267,31 @@ any_io_path_may_become_available(struct nvme_bdev_channel *nbdev_ch)
 	struct nvme_io_path *io_path;
 
 	if (nbdev_ch->resetting) {
+		SPDK_NOTICELOG("MPDBG any_io_path nbdev_ch=%p resetting=1 -> FALSE\n", nbdev_ch);
 		return false;
 	}
 
 	STAILQ_FOREACH(io_path, &nbdev_ch->io_path_list, stailq) {
+		SPDK_NOTICELOG("MPDBG any_io_path nbdev_ch=%p io_path=%p ctrlr=%s ana_state=%d "
+			       "ana_timedout=%d ns_updating=%d qpair_connected=%d ctrlr_failed=%d\n",
+			       nbdev_ch, io_path, io_path->qpair->ctrlr->nbdev_ctrlr->name,
+			       io_path->nvme_ns->ana_state, io_path->nvme_ns->ana_transition_timedout,
+			       io_path->nvme_ns->ana_state_updating,
+			       nvme_qpair_is_connected(io_path->qpair),
+			       nvme_ctrlr_is_failed(io_path->qpair->ctrlr));
 		if (io_path->nvme_ns->ana_transition_timedout) {
 			continue;
 		}
 
 		if (nvme_qpair_is_connected(io_path->qpair) ||
 		    !nvme_ctrlr_is_failed(io_path->qpair->ctrlr)) {
+			SPDK_NOTICELOG("MPDBG any_io_path nbdev_ch=%p -> TRUE via io_path=%p\n",
+				       nbdev_ch, io_path);
 			return true;
 		}
 	}
 
+	SPDK_NOTICELOG("MPDBG any_io_path nbdev_ch=%p -> FALSE (no available path)\n", nbdev_ch);
 	return false;
 }
 
@@ -1291,8 +1302,12 @@ bdev_nvme_retry_io(struct nvme_bdev_channel *nbdev_ch, struct spdk_bdev_io *bdev
 	struct spdk_io_channel *ch;
 
 	if (nbdev_io->io_path != NULL && nvme_io_path_is_available(nbdev_io->io_path)) {
+		SPDK_NOTICELOG("MPDBG retry_io bio=%p re-dispatch on SAME io_path=%p ctrlr=%s\n",
+			       nbdev_io, nbdev_io->io_path, nbdev_io->io_path->qpair->ctrlr->nbdev_ctrlr->name);
 		_bdev_nvme_submit_request(nbdev_ch, bdev_io);
 	} else {
+		SPDK_NOTICELOG("MPDBG retry_io bio=%p re-select via find_io_path (prev io_path=%p)\n",
+			       nbdev_io, nbdev_io->io_path);
 		ch = spdk_io_channel_from_ctx(nbdev_ch);
 		bdev_nvme_submit_request(ch, bdev_io);
 	}
@@ -1522,6 +1537,10 @@ bdev_nvme_check_retry_io(struct nvme_bdev_io *bio,
 	struct nvme_ctrlr *nvme_ctrlr = io_path->qpair->ctrlr;
 	const struct spdk_nvme_ctrlr_data *cdata;
 
+	SPDK_NOTICELOG("MPDBG check_retry bio=%p ctrlr=%s path_err=%d sq_del=%d io_avail=%d ctrlr_avail=%d\n",
+		       bio, nvme_ctrlr->nbdev_ctrlr->name,
+		       spdk_nvme_cpl_is_path_error(cpl), spdk_nvme_cpl_is_aborted_sq_deletion(cpl),
+		       nvme_io_path_is_available(io_path), nvme_ctrlr_is_available(nvme_ctrlr));
 	if (spdk_nvme_cpl_is_path_error(cpl) ||
 	    spdk_nvme_cpl_is_aborted_sq_deletion(cpl) ||
 	    !nvme_io_path_is_available(io_path) ||
@@ -1534,10 +1553,14 @@ bdev_nvme_check_retry_io(struct nvme_bdev_io *bio,
 			}
 		}
 		if (!any_io_path_may_become_available(nbdev_ch)) {
+			SPDK_NOTICELOG("MPDBG check_retry bio=%p REROUTE-branch -> FALSE (fail up, no path)\n", bio);
 			return false;
 		}
+		SPDK_NOTICELOG("MPDBG check_retry bio=%p REROUTE-branch -> TRUE (reroute, delay 0)\n", bio);
 		*_delay_ms = 0;
 	} else {
+		SPDK_NOTICELOG("MPDBG check_retry bio=%p SAMEPATH-branch retry_count=%d\n",
+			       bio, bio->retry_count);
 		bio->retry_count++;
 
 		cdata = spdk_nvme_ctrlr_get_data(nvme_ctrlr->ctrlr);
@@ -1572,23 +1595,34 @@ bdev_nvme_io_complete_nvme_status(struct nvme_bdev_io *bio,
 	 */
 	bdev_nvme_update_nvme_error_stat(bdev_io, cpl);
 
+	SPDK_NOTICELOG("MPDBG io_complete bio=%p ctrlr=%s sct=%u sc=%u dnr=%u retry_count=%d "
+		       "bdev_retry_count=%d accel_seq=%p\n",
+		       bio, bio->io_path ? bio->io_path->qpair->ctrlr->nbdev_ctrlr->name : "none",
+		       cpl->status.sct, cpl->status.sc, cpl->status.dnr,
+		       bio->retry_count, g_opts.bdev_retry_count, (void *)bdev_io->u.bdev.accel_sequence);
+
 	if (cpl->status.dnr != 0 || spdk_nvme_cpl_is_aborted_by_request(cpl) ||
 	    (g_opts.bdev_retry_count != -1 && bio->retry_count >= g_opts.bdev_retry_count)) {
+		SPDK_NOTICELOG("MPDBG io_complete bio=%p GATE1 fail-up (dnr/aborted_by_req/retry_exhausted)\n", bio);
 		goto complete;
 	}
 
 	/* At this point we don't know whether the sequence was successfully executed or not, so we
 	 * cannot retry the IO */
 	if (bdev_io->u.bdev.accel_sequence != NULL) {
+		SPDK_NOTICELOG("MPDBG io_complete bio=%p GATE2 fail-up (accel_sequence set)\n", bio);
 		goto complete;
 	}
 
 	nbdev_ch = spdk_io_channel_get_ctx(spdk_bdev_io_get_io_channel(bdev_io));
 
 	if (bdev_nvme_check_retry_io(bio, cpl, nbdev_ch, &delay_ms)) {
+		SPDK_NOTICELOG("MPDBG io_complete bio=%p check_retry_io=TRUE -> requeue delay=%"PRIu64"\n",
+			       bio, delay_ms);
 		bdev_nvme_queue_retry_io(nbdev_ch, bio, delay_ms);
 		return;
 	}
+	SPDK_NOTICELOG("MPDBG io_complete bio=%p check_retry_io=FALSE -> fail-up\n", bio);
 
 complete:
 	bio->retry_count = 0;
