@@ -1124,6 +1124,10 @@ lvol_op_comp(void *cb_arg, int bserrno)
 			lvol = lvs->lvol_map.lvol[offset >> 48];
 		}
 
+		if (!lvs->queue_failed_rsp && lvs->timeout_trigger != 1) {
+			spdk_lvs_queued_failed_IO(lvs);
+		}
+
 		if (lvs->queue_failed_rsp) {
 			if (spdk_lvs_queued_rsp(lvs, bdev_io)) {
 				return;

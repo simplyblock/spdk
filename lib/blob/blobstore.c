@@ -1745,7 +1745,8 @@ blob_load_snapshot_cpl(void *cb_arg, struct spdk_blob *snapshot, int bserrno)
 	if (bserrno != 0) {
 		// spdk_bit_array_clear(blob->bs->open_blobids, blob->parent_id);
 		// this line onlt for failover case
-		spdk_bit_array_clear(blob->bs->used_blobids, blob->parent_id);
+		uint32_t page_idx = bs_blobid_to_page(blob->parent_id);
+		spdk_bit_array_clear(blob->bs->used_blobids, page_idx);
 		blob->parent_id = SPDK_BLOBID_INVALID;
 		blob->back_bs_dev = NULL;
 		blob_remove_xattr(blob, BLOB_SNAPSHOT, true);
@@ -2745,9 +2746,10 @@ persist_bs_write_used_blobids(spdk_bs_sequence_t *seq, void *arg, int bserrno)
 		mask->length = bs->md_len;
 
 		assert(mask->length == spdk_bit_array_capacity(bs->used_blobids));
-
+		// spdk_spin_lock(&bs->used_lock);
 		spdk_bit_array_store_mask_one_page(bs->used_blobids,
 					mask->mask, first_bit_inpage, last_bit_inpage);
+		// spdk_spin_unlock(&bs->used_lock);
 	} else {
 		pageidx = 1 + ((ctx->idx_blobids - first_page_bits) / SPDK_BS_PAGE_SIZE_INBIT);
 		first_bit_inpage = first_page_bits + ((pageidx - 1) * SPDK_BS_PAGE_SIZE_INBIT);
@@ -2756,9 +2758,10 @@ persist_bs_write_used_blobids(spdk_bs_sequence_t *seq, void *arg, int bserrno)
 		if (last_bit_inpage > bs->md_len) {
 			last_bit_inpage = bs->md_len;
 		}
-
+		// spdk_spin_lock(&bs->used_lock);//not sure we need this tbh
 		spdk_bit_array_store_mask_one_page(bs->used_blobids,
 					ctx->bit_page, first_bit_inpage, last_bit_inpage);
+		// spdk_spin_unlock(&bs->used_lock);
 	}
 
 	if (pageidx >= bs->used_blobid_mask_len) {
@@ -8424,9 +8427,7 @@ error:
 	}
 	spdk_spin_lock(&bs->used_lock);
 	spdk_bit_array_clear(bs->used_blobids, page_idx);
-	if (blob->map_id) {
-		spdk_bit_array_clear(bs->map_blobids, map_id);
-	}
+	spdk_bit_array_clear(bs->map_blobids, map_id);
 	bs_release_md_page(bs, page_idx);
 	spdk_spin_unlock(&bs->used_lock);
 	cb_fn(cb_arg, 0, rc);
@@ -14452,7 +14453,8 @@ bs_update_replay_md_chain_cpl(struct spdk_bs_update_ctx *ctx)
 	do {
 		ctx->page_index++;
 		ctx->page_index = spdk_bit_array_find_first_set(ctx->synnced_used_blobid_pages, ctx->page_index);
-		if (spdk_bit_array_get(ctx->synnced_used_blobid_pages, ctx->page_index) == true && 
+		if (ctx->page_index != UINT32_MAX && 
+			spdk_bit_array_get(ctx->synnced_used_blobid_pages, ctx->page_index) == true && 
 			spdk_bit_array_get(ctx->used_md_pages, ctx->page_index) == false) {
 			break;
 		}

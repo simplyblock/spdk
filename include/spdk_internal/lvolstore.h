@@ -296,6 +296,7 @@ struct spdk_lvol_store {
 	TAILQ_HEAD(, spdk_transfer_dev)	transfer_devs;
 	bool is_deletion_in_progress;
 	bool				queue_failed_rsp;
+	bool				on_failed_rsp;
 	bool				load_esnaps;
 	bool				on_list;
 	TAILQ_ENTRY(spdk_lvol_store)	link;

@@ -144,6 +144,7 @@ lvol_alloc(struct spdk_lvol_store *lvs, const char *name, bool thin_provision,
 		spdk_uuid_generate(&lvol->uuid);
 	} else {
 		if (spdk_uuid_parse(&uuid, uuid_str)) {
+			free(lvol);
 			return NULL;
 		}
 		spdk_uuid_copy(&lvol->uuid, &uuid);
@@ -3308,6 +3309,7 @@ spdk_lvs_nonleader_timeout(struct spdk_lvol_store *lvs)
 		if (current_time - lvs->leadership_timeout < timeout_ticks)	{
 			state = true;
 		} else {
+			lvs->timeout_trigger = 0;
 			spdk_bs_set_leader(lvs->blobstore, true);
 		}
 	}
@@ -3452,7 +3454,14 @@ spdk_lvs_unfreeze_on_conflict(struct spdk_lvol_store *lvs)
 	block_port(lvs->subsystem_port);
 
 	if (lvs->node_role != NODE_TERTIARY && lvs->hublvol_port != 0) {
-		add_reject_hublvol_port(lvs->hublvol_port);
+
+		if (lvs->on_failed_rsp) {
+			lvs->on_failed_rsp = false;
+			block_port(lvs->hublvol_port);
+		} else {
+			add_reject_hublvol_port(lvs->hublvol_port);
+		}
+
 		req = calloc(1, sizeof(*req));
 		if (req == NULL) {
 			SPDK_ERRLOG("Cannot alloc memory for request structure\n");		
@@ -3583,6 +3592,72 @@ spdk_lvs_change_leader_state(uint64_t groupid)
 			rc = 1;
 		}
 	}
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+	return rc;
+}
+
+int
+spdk_lvs_queued_failed_IO(struct spdk_lvol_store *lvs)
+{
+	struct spdk_lvol *lvol;
+	struct spdk_lvs_req *req;
+	int rc = 0;
+	SPDK_NOTICELOG("Queued failed IO and change leadership state internally groupid %" PRIu64 ".\n", lvs->groupid);
+
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+
+	pthread_mutex_lock(&g_lvs_queue_mutex);
+
+	if (lvs->queue_failed_rsp || lvs->timeout_trigger == 1) {
+		pthread_mutex_unlock(&g_lvs_queue_mutex);
+		pthread_mutex_unlock(&g_lvol_stores_mutex);
+		return 0;
+	}
+
+	lvs->on_failed_rsp = true;
+	lvs->queue_failed_rsp = true;
+
+	pthread_mutex_unlock(&g_lvs_queue_mutex);
+
+	if (spdk_blob_freeze_on_conflict_send_msg(lvs->blobstore, spdk_lvs_conflict_signal, lvs)) {
+
+		block_port(lvs->subsystem_port);
+
+		if (lvs->node_role != NODE_TERTIARY && lvs->hublvol_port != 0) {
+
+			block_port(lvs->hublvol_port);
+
+			req = calloc(1, sizeof(*req));
+			if (req == NULL) {
+				SPDK_ERRLOG("Cannot alloc memory for request structure\n");
+				// in this case we should not wait for the IO inflyight
+				remove_reject_hublvol_port(lvs->hublvol_port);
+			} else {
+				req->lvol_store = lvs;
+				req->poller = spdk_poller_register(spdk_lvs_remove_rules_poller, req, 10000000); // Delay of 10s
+			}
+		}
+
+		pthread_mutex_lock(&g_lvs_queue_mutex);
+		lvs->queue_failed_rsp = false;
+		pthread_mutex_unlock(&g_lvs_queue_mutex);
+
+		lvs->update_in_progress = false;
+		lvs->failed_on_update = false;
+		lvs->leadership_timeout = spdk_get_ticks();
+		lvs->timeout_trigger = 1;
+		lvs->leader = false;
+
+		spdk_bs_set_leader(lvs->blobstore, false);
+
+		TAILQ_FOREACH(lvol, &lvs->lvols, link) {
+			lvol->leader = false;
+			lvol->update_in_progress = false;
+		}
+
+		spdk_lvs_dequeu_rsp(lvs);
+	}
+	SPDK_NOTICELOG("Queued failed IO and Leadership state changed internally to false for lvs %s. Timeout has been set.\n", node_role_to_string(lvs->node_role));
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
 	return rc;
 }
