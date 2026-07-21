@@ -4850,7 +4850,7 @@ timeout_cb(void *cb_arg, struct spdk_nvme_ctrlr *ctrlr,
 		qpair == NULL ? "ADMIN_TIMEOUT" : "IO_TIMEOUT",
 		thread_name, start_tsc);
 
-	if (nvme_ctrlr->active_path_id->trid.trtype == SPDK_NVME_TRANSPORT_PCIE || qpair != NULL) {
+	if (nvme_ctrlr->active_path_id->trid.trtype == SPDK_NVME_TRANSPORT_PCIE) {
 		csts = spdk_nvme_ctrlr_get_regs_csts(ctrlr);
 		if (csts.bits.cfs) {
 			elapsed_us = (spdk_get_ticks() - start_tsc) *
