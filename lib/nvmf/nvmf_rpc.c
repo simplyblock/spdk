@@ -3309,6 +3309,37 @@ rpc_nvmf_port_unblock(struct spdk_jsonrpc_request *request,
 SPDK_RPC_REGISTER("nvmf_port_unblock", rpc_nvmf_port_unblock, SPDK_RPC_RUNTIME);
 
 static void
+rpc_nvmf_skip_port_covert(struct spdk_jsonrpc_request *request,
+		       const struct spdk_json_val *params)
+{
+	bool rc = false;
+	struct rpc_port_rule req;
+	req.port = 0;
+
+	if (params) {
+		if (spdk_json_decode_object(params, rpc_port_decoders,
+					    SPDK_COUNTOF(rpc_port_decoders),
+					    &req)) {
+			SPDK_ERRLOG("spdk_json_decode_object failed\n");
+			spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS, "Invalid parameters");
+			return;
+		}
+	}
+
+	if (req.port <= 0) {
+		SPDK_ERRLOG("Invalid port number\n");
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS, "Invalid port number");
+		return;
+	}
+
+	spdk_nvmf_skip_port_convert(req.port);
+
+	spdk_jsonrpc_send_bool_response(request, true);
+}
+
+SPDK_RPC_REGISTER("nvmf_skip_port_convert", rpc_nvmf_skip_port_covert, SPDK_RPC_RUNTIME);
+
+static void
 rpc_nvmf_get_blocked_ports(struct spdk_jsonrpc_request *request, 
 		       const struct spdk_json_val *params)
 {

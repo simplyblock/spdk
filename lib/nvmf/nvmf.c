@@ -2011,7 +2011,7 @@ spdk_nvmf_get_blocked_ports(struct spdk_json_write_ctx *w)
 	spdk_json_write_named_array_begin(w, "blocked_ports");
 
 	for (int i = 0; i < MAX_NUM_BLOCKED_PORTS; i++) {
-		if (g_nvmf_blocked_ports[i].port == 0) {
+		if (g_nvmf_blocked_ports[i].port == 0 || g_nvmf_blocked_ports[i].skip) {
 			continue;
 		}
 
@@ -2049,6 +2049,10 @@ spdk_nvmf_check_port_timeout(uint64_t ack_timeout)
 				continue;
 			}
 
+			if (g_nvmf_blocked_ports[i].skip) {
+				continue;
+			}
+
 			port = g_nvmf_blocked_ports[i].port;
 			current_ticks = spdk_get_ticks();
 			ack_timeout_ticks = ack_timeout * 3 * spdk_get_ticks_hz() / 1000;
@@ -2072,10 +2076,24 @@ spdk_nvmf_check_port_permission(uint16_t port, bool *is_reject)
 		for (int i = 0; i < MAX_NUM_BLOCKED_PORTS; i++) {
 			if (port == g_nvmf_blocked_ports[i].port) {
 				*is_reject = g_nvmf_blocked_ports[i].is_reject;
-				return false; 
+				return false;
 			}
 		}
 	}
 
 	return true;
+}
+
+void
+spdk_nvmf_skip_port_convert(uint16_t port)
+{
+	if (g_nvmf_num_blocked_ports > 0) {
+		for (int i = 0; i < MAX_NUM_BLOCKED_PORTS; i++) {
+			if (port == g_nvmf_blocked_ports[i].port) {
+				g_nvmf_blocked_ports[i].skip = true;
+				return;
+			}
+		}
+	}
+	return;
 }

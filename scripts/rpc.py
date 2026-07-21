@@ -3018,6 +3018,15 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
                               help='Unblock a specific NVMf port')
     p.add_argument('-p', '--port', help='NVMf port ID to unblock', type=int, required=True)
     p.set_defaults(func=nvmf_port_unblock)
+    
+    def nvmf_skip_port_convert(args):
+        rpc.nvmf.nvmf_skip_port_convert(args.client,
+                                   port=args.port)
+
+    p = subparsers.add_parser('nvmf_skip_port_convert',
+                              help='Unblock a specific NVMf port')
+    p.add_argument('-p', '--port', help='NVMf port ID to unblock', type=int, required=True)
+    p.set_defaults(func=nvmf_skip_port_convert)
 
     def nvmf_set_config(args):
         rpc.nvmf.nvmf_set_config(args.client,

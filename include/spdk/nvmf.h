@@ -61,6 +61,7 @@ struct spdk_nvmf_rules {
 	uint16_t port;
 	uint64_t timeout;
 	bool is_reject;
+	bool skip;
 };
 
 struct spdk_nvmf_target_opts {
@@ -1601,6 +1602,7 @@ void spdk_nvmf_send_discovery_log_notice(struct spdk_nvmf_tgt *tgt, const char *
 
 bool spdk_nvmf_port_block(uint16_t port, bool is_reject);
 bool spdk_nvmf_port_unblock(uint16_t port);
+void spdk_nvmf_skip_port_convert(uint16_t port);
 void spdk_nvmf_get_blocked_ports(struct spdk_json_write_ctx *w);
 bool spdk_nvmf_check_port_permission(uint16_t port, bool *is_reject);
 int spdk_nvmf_check_port_timeout(uint64_t ack_timeout);

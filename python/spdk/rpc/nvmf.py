@@ -57,6 +57,20 @@ def nvmf_port_unblock(client, port=None):
     params['port'] = port
     return client.call('nvmf_port_unblock', params)
 
+def nvmf_skip_port_convert(client, port=None):
+    """Unblock a specific NVMe-oF port.
+
+    Args:
+        port_id: The ID of the NVMe-oF port to unblock.
+
+    Returns:
+        True or False
+    """
+    params = {}
+
+    params['port'] = port
+    return client.call('nvmf_skip_port_convert', params)
+
 
 def nvmf_set_config(client,
                     passthru_identify_ctrlr=None,
