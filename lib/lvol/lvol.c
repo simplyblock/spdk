@@ -2816,7 +2816,7 @@ spdk_lvol_update_on_failover(struct spdk_lvol_store *lvs, struct spdk_lvol *lvol
 	bool update = false;
 	pthread_mutex_lock(&g_lvol_stores_mutex);
 
-	if (lvs->node_role != NODE_PRIMARY && !lvs->skip_redirecting) {
+	if (lvs->node_role != NODE_PRIMARY && !lvs->skip_redirecting && !lvs->leader) {
 		pthread_mutex_unlock(&g_lvol_stores_mutex);
 		return;
 	}

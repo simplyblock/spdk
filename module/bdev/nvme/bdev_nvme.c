@@ -4815,27 +4815,55 @@ timeout_cb(void *cb_arg, struct spdk_nvme_ctrlr *ctrlr,
 	struct nvme_ctrlr *nvme_ctrlr = cb_arg;
 	union spdk_nvme_csts_register csts;
 	int rc;
+	uint64_t start_tsc;
+	uint64_t elapsed_us;
+	uint32_t qid = 0;
+	const char *thread_name = "unknown";
 
 	assert(nvme_ctrlr->ctrlr == ctrlr);
 
-	NVME_CTRLR_WARNLOG(nvme_ctrlr, "Warning: Detected a timeout. ctrlr=%p qpair=%p cid=%u\n",
-			   ctrlr, qpair, cid);
+	// NVME_CTRLR_WARNLOG(nvme_ctrlr, "Warning: Detected a timeout. ctrlr=%p qpair=%p cid=%u\n",
+	// 		   ctrlr, qpair, cid);
+	if (qpair != NULL) {
+		qid = spdk_nvme_qpair_get_id(qpair);
+	}
 
-	SPDK_ERRLOG("Warning: Detected a timeout. ctrlr=%p qpair=%p cid=%u\n",
-			   ctrlr, qpair, cid);
+	if (spdk_get_thread() != NULL) {
+		thread_name = spdk_thread_get_name(spdk_get_thread());
+	}
+
+	start_tsc = spdk_get_ticks();
+
+	SPDK_ERRLOG("CSTS_GET_START: nvme_ctrlr=%p spdk_ctrlr=%p qpair=%p qid=%u cid=%u type=%s "
+		"thread=%s ticks=%" PRIu64 "\n",
+		nvme_ctrlr, ctrlr, qpair, qid, cid, qpair == NULL ? "ADMIN_TIMEOUT" : "IO_TIMEOUT",
+		thread_name, start_tsc);
 	/* Only try to read CSTS if it's a PCIe controller or we have a timeout on an I/O
 	 * queue.  (Note: qpair == NULL when there's an admin cmd timeout.)  Otherwise we
 	 * would submit another fabrics cmd on the admin queue to read CSTS and check for its
 	 * completion recursively.
 	 */
-	if (nvme_ctrlr->active_path_id->trid.trtype == SPDK_NVME_TRANSPORT_PCIE || qpair != NULL) {
+	if (nvme_ctrlr->active_path_id->trid.trtype == SPDK_NVME_TRANSPORT_PCIE) {
 		csts = spdk_nvme_ctrlr_get_regs_csts(ctrlr);
 		if (csts.bits.cfs) {
+			elapsed_us = (spdk_get_ticks() - start_tsc) * SPDK_SEC_TO_USEC / spdk_get_ticks_hz();
+			SPDK_ERRLOG("CSTS_GET_DONE: nvme_ctrlr=%p spdk_ctrlr=%p qpair=%p qid=%u cid=%u raw=0x%08x "
+				"rdy=%u cfs=%u shst=%u thread=%s elapsed_us=%" PRIu64 "\n",
+				nvme_ctrlr, ctrlr, qpair, qid, cid, csts.raw, csts.bits.rdy,
+				csts.bits.cfs, csts.bits.shst, thread_name, elapsed_us);
+
 			NVME_CTRLR_ERRLOG(nvme_ctrlr, "Controller Fatal Status, reset required\n");
 			bdev_nvme_reset_ctrlr(nvme_ctrlr);
 			return;
 		}
 	}
+
+	elapsed_us = (spdk_get_ticks() - start_tsc) * SPDK_SEC_TO_USEC / spdk_get_ticks_hz();
+
+	SPDK_ERRLOG("wihtout CSTS_GET_START: nvme_ctrlr=%p spdk_ctrlr=%p qpair=%p qid=%u cid=%u type=%s "
+		"thread=%s ticks=%" PRIu64 "\n",
+		nvme_ctrlr, ctrlr, qpair, qid, cid, qpair == NULL ? "ADMIN_TIMEOUT" : "IO_TIMEOUT",
+		thread_name, elapsed_us);
 
 	switch (g_opts.action_on_timeout) {
 	case SPDK_BDEV_NVME_TIMEOUT_ACTION_ABORT:

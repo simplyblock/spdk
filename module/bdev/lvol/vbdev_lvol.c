@@ -2075,8 +2075,8 @@ vbdev_lvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_
 	if (!lvol->leader && !lvol->update_in_progress) {
 		if (io_type) {
 			spdk_lvol_update_on_failover(lvs, lvol, true);
-			if (lvs->node_role != NODE_PRIMARY && !lvs->skip_redirecting) {
-				SPDK_NOTICELOG("2- Lvolstore %s: we should redirecting the IO\n", lvs->name);
+			if (lvs->node_role != NODE_PRIMARY && !lvs->skip_redirecting && !lvs->leader) {
+				SPDK_NOTICELOG("3- Lvolstore %s: we should redirecting the IO\n", lvs->name);
 				vbdev_lvol_submit_request(ch, bdev_io);
 				return;
 			}
