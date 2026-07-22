@@ -1720,7 +1720,12 @@ spdk_lvol_create_snapshot(struct spdk_lvol *origlvol, const char *snapshot_name,
 
 	if (!lvs->leader || !origlvol->leader) {
 		SPDK_ERRLOG("Cannot create snapshot; the lvs/lvol not leader.\n");
-		cb_fn(cb_arg, NULL, -ERR_LEADERSHIP_CHANGED);
+		/* ERR_LEADERSHIP_CHANGED is already negative (-35). Negating it
+		 * here delivered +35, which sailed past the `lvolerrno < 0`
+		 * failure guard in _vbdev_lvol_create_cb and dereferenced the
+		 * NULL lvol (SIGSEGV, run mass_create_delete 2026-07-21, node
+		 * c42f1686). Every other call site passes the macro unnegated. */
+		cb_fn(cb_arg, NULL, ERR_LEADERSHIP_CHANGED);
 		return;
 	}
 

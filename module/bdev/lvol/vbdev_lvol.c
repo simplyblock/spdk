@@ -2345,7 +2345,17 @@ _vbdev_lvol_create_cb(void *cb_arg, struct spdk_lvol *lvol, int lvolerrno)
 {
 	struct spdk_lvol_with_handle_req *req = cb_arg;
 
-	if (lvolerrno < 0) {
+	/* Failure contract: lvol == NULL with a negative errno. Harden against
+	 * a positive errno slipping through (a single sign slip here crashed
+	 * the node on a leadership demotion): any nonzero errno or NULL lvol
+	 * is a failure, and the errno is normalized to negative so downstream
+	 * `< 0` checks keep working. */
+	if (lvolerrno != 0 || lvol == NULL) {
+		if (lvolerrno > 0) {
+			lvolerrno = -lvolerrno;
+		} else if (lvolerrno == 0) {
+			lvolerrno = -EINVAL;
+		}
 		goto end;
 	}
 
