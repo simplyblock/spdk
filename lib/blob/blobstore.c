@@ -23,6 +23,7 @@
 #include "spdk/log.h"
 
 #include "blobstore.h"
+#include "blob_md_journal.h"
 
 #define BLOB_CRC32C_INITIAL    0xffffffffUL
 
@@ -4676,6 +4677,10 @@ struct spdk_bs_load_ctx {
 
 	bool					force_recover;
 
+	/* deferred spdk_bs_load completion while the md journal recovers */
+	spdk_bs_op_with_handle_complete		load_cb_fn;
+	void					*load_cb_arg;
+
 	/* These fields are used in the spdk_bs_dump path. */
 	bool					dumping;
 	bool              		snapshot_create_mode;
@@ -6494,6 +6499,13 @@ bs_parse_super(struct spdk_bs_load_ctx *ctx)
 		return -ENOMEM;
 	}
 
+	if (ctx->bs->md_journal != NULL) {
+		/* metadata layout is known now — arm write/read interception
+		 * for the whole md region (super, masks, md pages) */
+		bs_md_journal_enable(ctx->bs->md_journal,
+				     bs_page_to_lba(ctx->bs, ctx->bs->md_start + ctx->bs->md_len));
+	}
+
 	ctx->bs->total_data_clusters = ctx->bs->total_clusters - spdk_divide_round_up(
 					       ctx->bs->md_start + ctx->bs->md_len, ctx->bs->pages_per_cluster);
 	ctx->bs->super_blob = ctx->super->super_blob;
@@ -6596,12 +6608,13 @@ bs_opts_print(struct spdk_bs_opts *opts)
 	return 0;
 }
 
+static void bs_load_read_super(void *cb_arg, int bserrno);
+
 void
 spdk_bs_load(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	     spdk_bs_op_with_handle_complete cb_fn, void *cb_arg)
 {
 	struct spdk_blob_store	*bs;
-	struct spdk_bs_cpl	cpl;
 	struct spdk_bs_load_ctx *ctx;
 	struct spdk_bs_opts	opts = {};
 	int err;
@@ -6629,24 +6642,63 @@ spdk_bs_load(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 		return;
 	}
 
-	err = bs_alloc(dev, &opts, &bs, &ctx);
-	if (err) {
-		dev->destroy(dev);
-		cb_fn(cb_arg, NULL, err);
+	/* Torn-write protection: run the md journal in front of the device.
+	 * On wrap failure (tiny dev) fall back to the raw, unprotected path. */
+	{
+		struct spdk_bs_md_journal *journal = NULL;
+		struct spdk_bs_dev *jdev = bs_md_journal_dev_create(dev, &journal);
+
+		if (jdev != NULL) {
+			dev = jdev;
+		}
+		err = bs_alloc(dev, &opts, &bs, &ctx);
+		if (err) {
+			dev->destroy(dev);
+			cb_fn(cb_arg, NULL, err);
+			return;
+		}
+		bs->md_journal = journal;
+	}
+
+	ctx->load_cb_fn = cb_fn;
+	ctx->load_cb_arg = cb_arg;
+
+	if (bs->md_journal != NULL) {
+		/* recover the journal (scan ring, rebuild buffer/dictionary)
+		 * before the first md read — reads are overlaid from it */
+		bs_md_journal_start(bs->md_journal, false, bs_load_read_super, ctx);
+		return;
+	}
+	bs_load_read_super(ctx, 0);
+}
+
+static void
+bs_load_read_super(void *cb_arg, int bserrno)
+{
+	struct spdk_bs_load_ctx *ctx = cb_arg;
+	struct spdk_blob_store *bs = ctx->bs;
+	struct spdk_bs_cpl cpl;
+
+	if (bserrno != 0) {
+		SPDK_ERRLOG("md journal recovery failed: %d\n", bserrno);
+		spdk_free(ctx->super);
+		ctx->load_cb_fn(ctx->load_cb_arg, NULL, bserrno);
+		free(ctx);
+		bs_free(bs);
 		return;
 	}
 
 	cpl.type = SPDK_BS_CPL_TYPE_BS_HANDLE;
-	cpl.u.bs_handle.cb_fn = cb_fn;
-	cpl.u.bs_handle.cb_arg = cb_arg;
+	cpl.u.bs_handle.cb_fn = ctx->load_cb_fn;
+	cpl.u.bs_handle.cb_arg = ctx->load_cb_arg;
 	cpl.u.bs_handle.bs = bs;
 
 	ctx->seq = bs_sequence_start_bs(bs->md_channel, &cpl);
 	if (!ctx->seq) {
 		spdk_free(ctx->super);
+		ctx->load_cb_fn(ctx->load_cb_arg, NULL, -ENOMEM);
 		free(ctx);
 		bs_free(bs);
-		cb_fn(cb_arg, NULL, -ENOMEM);
 		return;
 	}
 
@@ -7431,11 +7483,22 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 		return;
 	}
 
-	rc = bs_alloc(dev, &opts, &bs, &ctx);
-	if (rc) {
-		dev->destroy(dev);
-		cb_fn(cb_arg, NULL, rc);
-		return;
+	/* Torn-write protection: reserve the ring by wrapping the device
+	 * before the blobstore sizes itself. */
+	{
+		struct spdk_bs_md_journal *journal = NULL;
+		struct spdk_bs_dev *jdev = bs_md_journal_dev_create(dev, &journal);
+
+		if (jdev != NULL) {
+			dev = jdev;
+		}
+		rc = bs_alloc(dev, &opts, &bs, &ctx);
+		if (rc) {
+			dev->destroy(dev);
+			cb_fn(cb_arg, NULL, rc);
+			return;
+		}
+		bs->md_journal = journal;
 	}
 
 	if (opts.num_md_pages == SPDK_BLOB_OPTS_NUM_MD_PAGES) {
@@ -7545,6 +7608,13 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 
 	num_md_lba = bs_page_to_lba(bs, num_md_pages);
 
+	if (bs->md_journal != NULL) {
+		/* no recovery on fresh format; arm interception for the md
+		 * region — the ring itself is zeroed in the init batch below */
+		bs_md_journal_start(bs->md_journal, true, NULL, NULL);
+		bs_md_journal_enable(bs->md_journal, num_md_lba);
+	}
+
 	ctx->super->size = dev->blockcnt * dev->blocklen;
 
 	ctx->super->crc = blob_md_page_calc_crc(ctx->super);
@@ -7597,6 +7667,13 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	/* Clear metadata space */
 	// bs->w_io++;
 	// bs_batch_write_zeroes_dev(batch, 0, num_md_lba);
+
+	if (bs->md_journal != NULL) {
+		/* fresh format: zero the journal ring (raw region above the
+		 * proxy's blockcnt; write_zeroes passes through) */
+		bs_batch_write_zeroes_dev(batch, bs_md_journal_ring_lba(bs->md_journal),
+					  bs_md_journal_ring_lba_count(bs->md_journal));
+	}
 
 	lba = num_md_lba;
 	lba_count = ctx->bs->dev->blockcnt - lba;

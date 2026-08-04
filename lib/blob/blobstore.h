@@ -185,6 +185,9 @@ struct spdk_blob_store {
 	int priority_class; // max priority_class of all constituent blobs to speed up metadata I/Os
 
 	struct spdk_bs_dev		*dev;
+	/* torn-write-protection journal owning the top of the base dev;
+	 * bs->dev is its proxy when set (see blob_md_journal.h) */
+	struct spdk_bs_md_journal	*md_journal;
 
 	struct spdk_bit_array		*used_md_pages;		/* Protected by used_lock */
 	struct spdk_bit_pool		*used_clusters;		/* Protected by used_lock */
