@@ -1079,6 +1079,14 @@ bs_md_journal_start(struct spdk_bs_md_journal *jr, bool fresh_format,
 		return;
 	}
 
+	/* Arm interception for the whole proxy range before the caller
+	 * issues its first md read: the super block is read before the
+	 * metadata layout is known, and after a crash its newest version
+	 * may still sit in the ring (torn or stale home copy). Overlaying
+	 * is correct for any LBA — a dictionary miss passes through — and
+	 * the caller tightens the limit once the super is parsed. */
+	bs_md_journal_enable(jr, jr->journal_start_lba);
+
 	/* recovery: read the whole ring with up to 32 parallel 64K IOs */
 	jr->entry_valid = calloc(BS_MD_JOURNAL_NUM_SLOTS, 1);
 	jr->recovery_buf = spdk_zmalloc((uint64_t)BS_MD_JOURNAL_RECOVERY_QDEPTH *

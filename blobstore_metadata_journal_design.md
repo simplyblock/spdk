@@ -116,6 +116,11 @@ power-off), **before any other md read**:
    for duplicate LBAs the later entry wins.
 5. Continue normal load: md reads are already correct via §7, and the **LVS drain thread works
    the backlog off in the background** — no upfront redo pass, no load stall.
+6. Recovery completion arms read/write interception for the **whole device range** immediately:
+   the super block is read before the metadata layout is known, and after a crash its newest
+   version may still sit in the ring (home copy stale or torn by the power loss mid-drain).
+   Overlaying is correct for any LBA (a dictionary miss passes through untouched); the range is
+   tightened to the metadata region once the super block is parsed.
 
 ## 9. Why this is correct (invariants)
 

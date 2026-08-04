@@ -40,6 +40,16 @@ unit_tests.yml — container + python suite driving RPCs):
 - I3  torn-write injection: with ALLOW_FAILURE_GENERATION build flag (CI uses
       it), or dd partial 512B overwrite of a ring entry + of a home md page
       while down -> load must recover/ignore correctly
+      NOTE representativeness: neither kill -9 (io_submit'ed IOs complete
+      in-kernel, unsubmitted ones never start) nor AWS Nitro storage (16 KiB
+      torn-write prevention on EBS/instance store) produces naturally torn
+      4K writes, so ALL torn states must be synthesized by injection; the
+      injected states model the 512B-sector-atomic worst case of the distr
+      virtual device (the design's actual target)
+- I6  torn HOME page repair (the headline scenario): synthesize valid ring
+      entries (bit-exact magic+crc32c) for real md pages, tear those home
+      pages (and the super, keeping sector 0) on the raw file -> load must
+      succeed and repair every page byte-exactly from the ring
 - I4  journal-full pressure: mass create/delete driving ring saturation;
       operations stall but complete; no errors
 - I5  restart-recovery drain: fill ring, power off, restart, verify ring

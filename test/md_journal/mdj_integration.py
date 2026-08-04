@@ -398,6 +398,102 @@ def t5_ring_drain(all_workloads):
     print(f"    ok ({len(before)} objects, all journal entries drained+zeroed)")
 
 
+def crc32c_raw(data):
+    """spdk_crc32c_update(buf, len, 0): raw reflected CRC32C (Castagnoli),
+    init as passed (0), no final inversion."""
+    crc = 0
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            crc = (crc >> 1) ^ (0x82F63B78 if crc & 1 else 0)
+    return crc
+
+
+def t6_torn_home_repair(all_workloads):
+    """I6: THE torn-write-protection scenario, synthesized deterministically.
+
+    Neither kill -9 (io_submit'ed IOs complete in-kernel; unsubmitted ones
+    never start) nor AWS Nitro storage (16 KiB torn-write prevention on
+    EBS/instance store) can produce naturally torn 4K writes on this rig,
+    so the power-loss state of 512B-atomic storage is synthesized: valid
+    ring entries holding the newest md pages, with the corresponding HOME
+    pages torn mid-write. Load must repair every one of them byte-exactly
+    from the ring."""
+    print("I6  torn home md pages repaired from the ring")
+    # quiesce with a drained ring (idle store drains fast); inert garbage
+    # slots injected by I3 are empty by definition and stay until the
+    # head wraps over them
+    valid, leftover = None, None
+    for _ in range(3):
+        kill9_tgt()
+        valid, nonzero = ring_slots()
+        leftover = [s for s in nonzero if s not in g_injected_slots]
+        if not valid and not leftover:
+            break
+        start_tgt()
+        attach_and_load()
+        time.sleep(5)
+    if not check(valid == [] and leftover == [],
+                 f"I6: could not reach a drained ring (valid={valid} other={leftover})"):
+        return
+
+    with open(IMG, "rb") as f:
+        img_read = f.read(1028 * BLOCKLEN)
+
+    def page(lba):
+        return img_read[lba * BLOCKLEN:(lba + 1) * BLOCKLEN]
+
+    # three blob md pages (deep in the md region: stable during idle load)
+    victims = [l for l in range(100, 1028) if any(page(l))][:3]
+    check(len(victims) == 3, f"I6: found only {len(victims)} blob md pages to tear")
+    saved = {l: page(l) for l in victims}
+    super_page = page(0)
+
+    with open(IMG, "r+b") as f:
+        # synthetic ring entries (slots 0..3): [header][newest page]
+        for slot, lba in enumerate(victims + [0]):
+            content = saved.get(lba, super_page)
+            hdr = struct.pack("<IIQ", HDR_MAGIC, crc32c_raw(content), lba)
+            f.seek(RING_START + slot * ENTRY_BYTES)
+            f.write(hdr + b"\0" * (BLOCKLEN - len(hdr)) + content)
+        # tear the home pages mid-write (512B sectors are atomic, the 4K
+        # write is not): garbage in sectors 2-5 of each blob page, sector
+        # 2 of the super (signature+flag in sector 0 stay readable)
+        for lba in victims:
+            f.seek(lba * BLOCKLEN + 1024)
+            f.write(b"\xFF" * 2048)
+        f.seek(1024)
+        f.write(b"\xFF" * 512)
+
+    with open(TGT_LOG) as f:
+        log_mark = len(f.read())
+
+    start_tgt()
+    attach_and_load()   # torn super/blob pages unrepaired => load abort
+    check(verify_after_restart(all_workloads, "I6"), "I6: object set wrong after torn-home repair")
+
+    # the drain must land the ring copies home, byte-exact
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        time.sleep(3)
+        valid, _ = ring_slots()
+        if not valid:
+            break
+    check(valid == [], "I6: synthetic entries never drained")
+    with open(IMG, "rb") as f:
+        for lba in victims:
+            f.seek(lba * BLOCKLEN)
+            repaired = f.read(BLOCKLEN)
+            check(repaired == saved[lba], f"I6: home page lba {lba} not repaired byte-exactly")
+
+    with open(TGT_LOG) as f:
+        f.seek(log_mark)
+        boot_log = f.read()
+    check("crc mismatch" not in boot_log, "I6: md crc errors during repaired load")
+    check("Metadata page" not in boot_log, "I6: blob md errors during repaired load")
+    print(f"    ok (3 torn blob md pages + torn super repaired from ring, lbas {victims})")
+
+
 def main():
     random.seed(20260804)
     if os.geteuid() != 0:
@@ -417,6 +513,7 @@ def main():
     t3_torn_injection(workloads)
     t4_mass_pressure()
     t5_ring_drain(workloads)
+    t6_torn_home_repair(workloads)
 
     stop_tgt_clean()
     print()
@@ -425,7 +522,7 @@ def main():
         for m in g_failures:
             print(f"  - {m}")
         return 1
-    print("RESULT: all integration tests passed (I1-I5)")
+    print("RESULT: all integration tests passed (I1-I6)")
     return 0
 
 

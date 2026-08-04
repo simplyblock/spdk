@@ -753,6 +753,10 @@ ut_journal_recover(int expected_rc)
 	CU_ASSERT(start_ctx.rc == expected_rc);
 
 	if (expected_rc == 0) {
+		/* recovery must arm interception for the whole proxy range
+		 * before the caller's first (super block) read; the caller
+		 * then tightens the limit after parsing the super */
+		CU_ASSERT(g_jr->md_limit_lba == g_jr->journal_start_lba);
 		bs_md_journal_enable(g_jr, UT_MD_LIMIT_LBA);
 	}
 }

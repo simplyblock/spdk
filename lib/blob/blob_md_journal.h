@@ -46,9 +46,12 @@ typedef void (*bs_md_journal_start_cb)(void *cb_arg, int bserrno);
 /* Asynchronous bring-up on the blobstore md thread.
  * fresh_format=true  (spdk_bs_init): no disk IO — the caller must zero the
  * ring region (bs_md_journal_ring_lba/_count) in its init batch; completes
- * inline.
+ * inline. Interception stays off until bs_md_journal_enable.
  * fresh_format=false (spdk_bs_load): run recovery (parallel scan, checksum
- * validation, buffer/dictionary/pointer rebuild).
+ * validation, buffer/dictionary/pointer rebuild) and arm interception for
+ * the WHOLE proxy range — the super block is read before the md layout is
+ * known and its newest version may still sit in the ring; the caller
+ * tightens the range via bs_md_journal_enable once the super is parsed.
  * Also creates the journal's base-dev channel and registers the drain
  * poller. Must complete before any md read is issued on load. */
 void bs_md_journal_start(struct spdk_bs_md_journal *journal, bool fresh_format,
