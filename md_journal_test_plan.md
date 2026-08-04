@@ -17,6 +17,9 @@ Cases:
 - U10 proxy geometry: blockcnt shrunk by 64 MB; data write above limit passthrough
 - U11 multi-page append (mask-style N-page write) FIFO order + single ack
 - U12 destroy with in-flight IO (deferred teardown, no use-after-free)
+- U13 read-vs-drain race: home read in flight while drain completes ->
+      issue-time dict snapshot must win over stale device data (found
+      as blob-md crc mismatch in single-node integration, 2026-08-04)
 
 ## 2. Build (EC2 Rocky 9 / Fedora)
 Per ultra CI (docker/Dockerfile_spdk_ultra): spdk configured+built, then ultra

@@ -96,6 +96,21 @@ ut_io_alloc(struct ut_dev *d, enum ut_io_type type, uint64_t lba, uint32_t lba_c
 	return io;
 }
 
+/* Reads snapshot the device content at ISSUE time (worst-case device
+ * behavior: a read overlapping a concurrent write may return the old
+ * data) — this is what exposes read-vs-drain ordering bugs. */
+static void
+ut_dev_read_snapshot(struct ut_dev *d, struct ut_io *io)
+{
+	uint64_t off = io->lba * UT_BLOCKLEN;
+	uint64_t len = (uint64_t)io->lba_count * UT_BLOCKLEN;
+
+	SPDK_CU_ASSERT_FATAL(off + len <= UT_DEV_SIZE);
+	io->wdata = malloc(len);
+	SPDK_CU_ASSERT_FATAL(io->wdata != NULL);
+	memcpy(io->wdata, d->buf + off, len);
+}
+
 static void
 ut_dev_read(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
 	    uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
@@ -104,6 +119,7 @@ ut_dev_read(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payl
 	struct ut_io *io = ut_io_alloc(d, UT_IO_READ, lba, lba_count, cb_args);
 
 	io->rpayload = payload;
+	ut_dev_read_snapshot(d, io);
 }
 
 static void
@@ -116,6 +132,7 @@ ut_dev_readv(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 
 	io->riov = iov;
 	io->riovcnt = iovcnt;
+	ut_dev_read_snapshot(d, io);
 }
 
 static void
@@ -198,13 +215,14 @@ ut_dev_complete_one(struct ut_dev *d)
 
 	switch (io->type) {
 	case UT_IO_READ:
+		/* serve the issue-time snapshot, not the current content */
 		if (io->rpayload != NULL) {
-			memcpy(io->rpayload, d->buf + off, len);
+			memcpy(io->rpayload, io->wdata, len);
 		} else {
-			uint64_t pos = off;
+			uint64_t pos = 0;
 
 			for (i = 0; i < io->riovcnt; i++) {
-				memcpy(io->riov[i].iov_base, d->buf + pos, io->riov[i].iov_len);
+				memcpy(io->riov[i].iov_base, io->wdata + pos, io->riov[i].iov_len);
 				pos += io->riov[i].iov_len;
 			}
 		}
@@ -234,6 +252,24 @@ ut_dev_complete_all(struct ut_dev *d)
 		n++;
 	}
 	return n;
+}
+
+/* complete the oldest pending IO of @type out of order (device-level
+ * reordering of concurrent IOs) */
+static bool
+ut_dev_complete_first_of(struct ut_dev *d, enum ut_io_type type)
+{
+	struct ut_io *io;
+
+	TAILQ_FOREACH(io, &d->io_queue, link) {
+		if (io->type == type) {
+			/* move to the head, then complete it */
+			TAILQ_REMOVE(&d->io_queue, io, link);
+			TAILQ_INSERT_HEAD(&d->io_queue, io, link);
+			return ut_dev_complete_one(d);
+		}
+	}
+	return false;
 }
 
 /* Alternate pollers (drain) and IO completion until the system is idle. */
@@ -1094,6 +1130,51 @@ test_destroy_inflight(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* U13: read vs drain race: a home read issued while the page is still
+ * journaled must return the journaled content even when the drain
+ * completes (home write + zero + dict drop) before the read does and
+ * the device serves the read from the pre-drain page content          */
+
+static void
+test_read_vs_drain_race(void)
+{
+	uint8_t stale[BS_MD_JOURNAL_PAGE_SIZE];
+	uint8_t expect[BS_MD_JOURNAL_PAGE_SIZE];
+	uint8_t rbuf[BS_MD_JOURNAL_PAGE_SIZE];
+	struct ut_cb_ctx ctx = {};
+	struct spdk_bs_dev_cb_args cb_args = { .cb_fn = ut_io_cb, .channel = NULL, .cb_arg = &ctx };
+
+	ut_journal_setup();
+
+	ut_fill_page(stale, 33, 0x11);
+	memcpy(ut_disk_at(33), stale, BS_MD_JOURNAL_PAGE_SIZE);
+	ut_fill_page(expect, 33, 0x99);
+	ut_append_page(33, 0x99);		/* journaled, acked, not drained */
+
+	/* the read is issued now — the mock snapshots the still-stale home */
+	g_proxy->read(g_proxy, NULL, rbuf, 33, 1, &cb_args);
+	CU_ASSERT(!ctx.done);
+
+	/* the drain overtakes the in-flight read: home write, then entry
+	 * zeroing, dict entry dropped, slot freed */
+	poll_threads();
+	CU_ASSERT(ut_dev_complete_first_of(&g_base, UT_IO_WRITE));
+	CU_ASSERT(ut_dev_complete_first_of(&g_base, UT_IO_WRITE_ZEROES));
+	spdk_spin_lock(&g_jr->lock);
+	CU_ASSERT(dict_get(g_jr, 33) == JOURNAL_SLOT_INVALID);
+	spdk_spin_unlock(&g_jr->lock);
+	CU_ASSERT(g_jr->used_slots == 0);
+
+	/* now the read completes with its pre-drain (stale) device data:
+	 * the issue-time snapshot must win */
+	CU_ASSERT(ut_dev_complete_all(&g_base) == 1);
+	CU_ASSERT(ctx.done && ctx.rc == 0);
+	CU_ASSERT(memcmp(rbuf, expect, BS_MD_JOURNAL_PAGE_SIZE) == 0);
+
+	ut_journal_teardown();
+}
+
+/* ------------------------------------------------------------------ */
 
 int
 main(int argc, char **argv)
@@ -1117,6 +1198,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_proxy_geometry_passthrough);
 	CU_ADD_TEST(suite, test_multi_page_append);
 	CU_ADD_TEST(suite, test_destroy_inflight);
+	CU_ADD_TEST(suite, test_read_vs_drain_race);
 
 	allocate_threads(1);
 	set_thread(0);

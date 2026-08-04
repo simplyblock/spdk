@@ -55,6 +55,12 @@ struct md_journal_read_ctx {
 	int				iovcnt;
 	uint64_t			lba;
 	uint32_t			lba_count;
+	/* issue-time snapshot of the dictionary hits (spec §7): the drain
+	 * may complete a home write and recycle the slot while the home
+	 * read is still in flight, so the newest page copies are captured
+	 * when the read is issued, not looked up on completion */
+	uint8_t				**hit_pages;	/* [num_pages], NULL = home */
+	uint32_t			num_pages;
 	struct spdk_bs_dev_cb_args	*orig_cb_args;
 	struct spdk_bs_dev_cb_args	shim_cb_args;
 };
@@ -552,28 +558,35 @@ overlay_copy_page(struct md_journal_read_ctx *ctx, uint32_t page_idx, const uint
 }
 
 static void
+overlay_ctx_free(struct md_journal_read_ctx *ctx)
+{
+	uint32_t i;
+
+	if (ctx->hit_pages != NULL) {
+		for (i = 0; i < ctx->num_pages; i++) {
+			free(ctx->hit_pages[i]);
+		}
+		free(ctx->hit_pages);
+	}
+	free(ctx);
+}
+
+static void
 overlay_read_cpl(struct spdk_io_channel *ch, void *cb_arg, int bserrno)
 {
 	struct md_journal_read_ctx *ctx = cb_arg;
-	struct spdk_bs_md_journal *jr = ctx->jr;
 	struct spdk_bs_dev_cb_args *orig = ctx->orig_cb_args;
-	uint32_t pages, i;
+	uint32_t i;
 
 	if (bserrno == 0) {
-		pages = ctx->lba_count / jr->blocks_per_page;
-		spdk_spin_lock(&jr->lock);
-		for (i = 0; i < pages; i++) {
-			uint64_t lba = ctx->lba + (uint64_t)i * jr->blocks_per_page;
-			uint32_t slot = dict_get(jr, lba);
-
-			if (slot != JOURNAL_SLOT_INVALID) {
-				overlay_copy_page(ctx, i, slot_page(jr, slot));
+		for (i = 0; i < ctx->num_pages; i++) {
+			if (ctx->hit_pages[i] != NULL) {
+				overlay_copy_page(ctx, i, ctx->hit_pages[i]);
 			}
 		}
-		spdk_spin_unlock(&jr->lock);
 	}
 
-	free(ctx);
+	overlay_ctx_free(ctx);
 	orig->cb_fn(orig->channel, orig->cb_arg, bserrno);
 }
 
@@ -582,6 +595,7 @@ overlay_ctx_create(struct spdk_bs_md_journal *jr, void *payload, struct iovec *i
 		   uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
 {
 	struct md_journal_read_ctx *ctx;
+	uint32_t i;
 
 	ctx = calloc(1, sizeof(*ctx));
 	if (ctx == NULL) {
@@ -593,10 +607,37 @@ overlay_ctx_create(struct spdk_bs_md_journal *jr, void *payload, struct iovec *i
 	ctx->iovcnt = iovcnt;
 	ctx->lba = lba;
 	ctx->lba_count = lba_count;
+	ctx->num_pages = lba_count / jr->blocks_per_page;
 	ctx->orig_cb_args = cb_args;
 	ctx->shim_cb_args.cb_fn = overlay_read_cpl;
 	ctx->shim_cb_args.channel = cb_args->channel;
 	ctx->shim_cb_args.cb_arg = ctx;
+
+	ctx->hit_pages = calloc(ctx->num_pages, sizeof(*ctx->hit_pages));
+	if (ctx->hit_pages == NULL) {
+		free(ctx);
+		return NULL;
+	}
+
+	/* snapshot every dictionary hit now — the slot may be drained and
+	 * recycled before the home read completes, and the home read may
+	 * return the pre-drain content of the page */
+	spdk_spin_lock(&jr->lock);
+	for (i = 0; i < ctx->num_pages; i++) {
+		uint32_t slot = dict_get(jr, lba + (uint64_t)i * jr->blocks_per_page);
+
+		if (slot == JOURNAL_SLOT_INVALID) {
+			continue;
+		}
+		ctx->hit_pages[i] = malloc(BS_MD_JOURNAL_PAGE_SIZE);
+		if (ctx->hit_pages[i] == NULL) {
+			spdk_spin_unlock(&jr->lock);
+			overlay_ctx_free(ctx);
+			return NULL;
+		}
+		memcpy(ctx->hit_pages[i], slot_page(jr, slot), BS_MD_JOURNAL_PAGE_SIZE);
+	}
+	spdk_spin_unlock(&jr->lock);
 	return ctx;
 }
 
@@ -651,10 +692,14 @@ proxy_read(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *paylo
 		struct md_journal_read_ctx *ctx =
 			overlay_ctx_create(jr, payload, NULL, 0, lba, lba_count, cb_args);
 
-		if (ctx != NULL) {
-			jr->base->read(jr->base, channel, payload, lba, lba_count, &ctx->shim_cb_args);
+		if (ctx == NULL) {
+			/* a raw fallback read could serve pages the journal
+			 * has not written home yet — fail instead */
+			cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, -ENOMEM);
 			return;
 		}
+		jr->base->read(jr->base, channel, payload, lba, lba_count, &ctx->shim_cb_args);
+		return;
 	}
 	jr->base->read(jr->base, channel, payload, lba, lba_count, cb_args);
 }
@@ -683,11 +728,13 @@ proxy_readv(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		struct md_journal_read_ctx *ctx =
 			overlay_ctx_create(jr, NULL, iov, iovcnt, lba, lba_count, cb_args);
 
-		if (ctx != NULL) {
-			jr->base->readv(jr->base, channel, iov, iovcnt, lba, lba_count,
-					&ctx->shim_cb_args);
+		if (ctx == NULL) {
+			cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, -ENOMEM);
 			return;
 		}
+		jr->base->readv(jr->base, channel, iov, iovcnt, lba, lba_count,
+				&ctx->shim_cb_args);
+		return;
 	}
 	jr->base->readv(jr->base, channel, iov, iovcnt, lba, lba_count, cb_args);
 }
@@ -717,11 +764,13 @@ proxy_readv_ext(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		struct md_journal_read_ctx *ctx =
 			overlay_ctx_create(jr, NULL, iov, iovcnt, lba, lba_count, cb_args);
 
-		if (ctx != NULL) {
-			jr->base->readv_ext(jr->base, channel, iov, iovcnt, lba, lba_count,
-					    &ctx->shim_cb_args, ext_opts);
+		if (ctx == NULL) {
+			cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, -ENOMEM);
 			return;
 		}
+		jr->base->readv_ext(jr->base, channel, iov, iovcnt, lba, lba_count,
+				    &ctx->shim_cb_args, ext_opts);
+		return;
 	}
 	jr->base->readv_ext(jr->base, channel, iov, iovcnt, lba, lba_count, cb_args, ext_opts);
 }

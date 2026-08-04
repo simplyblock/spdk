@@ -93,8 +93,12 @@ zeroing is what makes the valid region of the ring contiguous.
 
 On every md read: **first look up the dictionary** (under the spinlock). For each 4K page of the
 read range that hits, serve it from the in-memory copy (validate its checksum); pages that miss
-are read from home. Implementation: issue the home read, then overlay dictionary hits on
-completion — correct because the dictionary always holds the newest version of a page.
+are read from home. Implementation: **snapshot the dictionary hits (page copies) at read issue
+time**, issue the home read, and overlay the snapshots on completion. The snapshot at issue is
+load-bearing: the drain can complete a home write, zero the entry and drop the dictionary entry
+*while the home read is in flight*, and the concurrent home read may still return the pre-drain
+page — a completion-time lookup would then miss and serve that stale data (found as a blob-md
+CRC mismatch in single-node integration testing).
 
 ## 8. Sudden power-off and fail-over (recovery)
 
