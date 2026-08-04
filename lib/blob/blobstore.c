@@ -6610,14 +6610,93 @@ bs_opts_print(struct spdk_bs_opts *opts)
 
 static void bs_load_read_super(void *cb_arg, int bserrno);
 
+/* Raw pre-probe of the super block: the md_journal feature flag decides
+ * whether the device must be wrapped with the torn-write-protection
+ * journal before any other metadata access (legacy stores load through
+ * the unwrapped path unchanged). The flag never changes over a store's
+ * lifetime, so even a stale or torn-on-drain raw super carries it. */
+struct bs_load_probe_ctx {
+	struct spdk_bs_dev		*dev;
+	struct spdk_bs_opts		opts;
+	spdk_bs_op_with_handle_complete	cb_fn;
+	void				*cb_arg;
+	struct spdk_bs_super_block	*super;
+	struct spdk_io_channel		*ch;
+	struct spdk_bs_dev_cb_args	cb_args;
+};
+
+static void
+bs_load_continue(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts,
+		 spdk_bs_op_with_handle_complete cb_fn, void *cb_arg, bool journaled)
+{
+	struct spdk_blob_store	*bs;
+	struct spdk_bs_load_ctx *ctx;
+	struct spdk_bs_md_journal *journal = NULL;
+	int err;
+
+	if (journaled) {
+		struct spdk_bs_dev *jdev = bs_md_journal_dev_create(dev, &journal);
+
+		if (jdev == NULL) {
+			/* the store is flagged as journal-formatted but the
+			 * ring cannot be mapped — loading unprotected would
+			 * read stale metadata */
+			SPDK_ERRLOG("store has an md journal but the device cannot carry it\n");
+			dev->destroy(dev);
+			cb_fn(cb_arg, NULL, -EILSEQ);
+			return;
+		}
+		dev = jdev;
+	}
+
+	err = bs_alloc(dev, opts, &bs, &ctx);
+	if (err) {
+		dev->destroy(dev);
+		cb_fn(cb_arg, NULL, err);
+		return;
+	}
+	bs->md_journal = journal;
+
+	ctx->load_cb_fn = cb_fn;
+	ctx->load_cb_arg = cb_arg;
+
+	if (bs->md_journal != NULL) {
+		/* recover the journal (scan ring, rebuild buffer/dictionary)
+		 * before the first md read — reads are overlaid from it */
+		bs_md_journal_start(bs->md_journal, false, bs_load_read_super, ctx);
+		return;
+	}
+	bs_load_read_super(ctx, 0);
+}
+
+static void
+bs_load_probe_super_cpl(struct spdk_io_channel *ch, void *cb_arg, int bserrno)
+{
+	struct bs_load_probe_ctx *probe = cb_arg;
+	struct spdk_bs_dev *dev = probe->dev;
+	struct spdk_bs_opts opts = probe->opts;
+	spdk_bs_op_with_handle_complete cb_fn = probe->cb_fn;
+	void *probe_cb_arg = probe->cb_arg;
+	bool journaled;
+
+	journaled = bserrno == 0 &&
+		    memcmp(probe->super->signature, SPDK_BS_SUPER_BLOCK_SIG,
+			   sizeof(probe->super->signature)) == 0 &&
+		    probe->super->md_journal == 1;
+
+	dev->destroy_channel(dev, probe->ch);
+	spdk_free(probe->super);
+	free(probe);
+
+	bs_load_continue(dev, &opts, cb_fn, probe_cb_arg, journaled);
+}
+
 void
 spdk_bs_load(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	     spdk_bs_op_with_handle_complete cb_fn, void *cb_arg)
 {
-	struct spdk_blob_store	*bs;
-	struct spdk_bs_load_ctx *ctx;
+	struct bs_load_probe_ctx *probe;
 	struct spdk_bs_opts	opts = {};
-	int err;
 
 	SPDK_INFOLOG(blob, "Loading blobstore from dev %p\n", dev);
 
@@ -6642,34 +6721,35 @@ spdk_bs_load(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 		return;
 	}
 
-	/* Torn-write protection: run the md journal in front of the device.
-	 * On wrap failure (tiny dev) fall back to the raw, unprotected path. */
-	{
-		struct spdk_bs_md_journal *journal = NULL;
-		struct spdk_bs_dev *jdev = bs_md_journal_dev_create(dev, &journal);
-
-		if (jdev != NULL) {
-			dev = jdev;
-		}
-		err = bs_alloc(dev, &opts, &bs, &ctx);
-		if (err) {
-			dev->destroy(dev);
-			cb_fn(cb_arg, NULL, err);
-			return;
-		}
-		bs->md_journal = journal;
-	}
-
-	ctx->load_cb_fn = cb_fn;
-	ctx->load_cb_arg = cb_arg;
-
-	if (bs->md_journal != NULL) {
-		/* recover the journal (scan ring, rebuild buffer/dictionary)
-		 * before the first md read — reads are overlaid from it */
-		bs_md_journal_start(bs->md_journal, false, bs_load_read_super, ctx);
+	probe = calloc(1, sizeof(*probe));
+	if (probe == NULL) {
+		dev->destroy(dev);
+		cb_fn(cb_arg, NULL, -ENOMEM);
 		return;
 	}
-	bs_load_read_super(ctx, 0);
+	probe->super = spdk_zmalloc(sizeof(*probe->super), 0x1000, NULL,
+				    SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+	probe->ch = dev->create_channel(dev);
+	if (probe->super == NULL || probe->ch == NULL) {
+		if (probe->ch != NULL) {
+			dev->destroy_channel(dev, probe->ch);
+		}
+		spdk_free(probe->super);
+		free(probe);
+		dev->destroy(dev);
+		cb_fn(cb_arg, NULL, -ENOMEM);
+		return;
+	}
+	probe->dev = dev;
+	probe->opts = opts;
+	probe->cb_fn = cb_fn;
+	probe->cb_arg = cb_arg;
+	probe->cb_args.cb_fn = bs_load_probe_super_cpl;
+	probe->cb_args.channel = probe->ch;
+	probe->cb_args.cb_arg = probe;
+
+	dev->read(dev, probe->ch, probe->super, 0,
+		  sizeof(*probe->super) / dev->blocklen, &probe->cb_args);
 }
 
 static void
@@ -7423,6 +7503,15 @@ bs_init_persist_super_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
 	struct spdk_bs_load_ctx *ctx = cb_arg;
 
+	if (bserrno == 0 && ctx->bs->md_journal != NULL) {
+		/* the super block (with the md_journal flag) is home-durable
+		 * now — arm md write/read interception for everything that
+		 * follows */
+		bs_md_journal_enable(ctx->bs->md_journal,
+				     bs_page_to_lba(ctx->bs,
+						    ctx->super->md_start + ctx->super->md_len));
+	}
+
 	ctx->bs->used_clusters = spdk_bit_pool_create_from_array(ctx->used_clusters);
 	spdk_free(ctx->super);
 	free(ctx);
@@ -7609,10 +7698,13 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	num_md_lba = bs_page_to_lba(bs, num_md_pages);
 
 	if (bs->md_journal != NULL) {
-		/* no recovery on fresh format; arm interception for the md
-		 * region — the ring itself is zeroed in the init batch below */
+		/* No recovery on fresh format; the ring itself is zeroed in
+		 * the init batch below. Interception is armed only once the
+		 * super block is home-durable (bs_init_persist_super_cpl):
+		 * the format writes go raw so that a store whose super was
+		 * ever acknowledged always carries the flag on disk. */
 		bs_md_journal_start(bs->md_journal, true, NULL, NULL);
-		bs_md_journal_enable(bs->md_journal, num_md_lba);
+		ctx->super->md_journal = 1;
 	}
 
 	ctx->super->size = dev->blockcnt * dev->blocklen;

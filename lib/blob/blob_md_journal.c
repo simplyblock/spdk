@@ -89,10 +89,14 @@ struct spdk_bs_md_journal {
 	TAILQ_HEAD(, md_journal_append_op) append_queue;
 	bool				append_inflight;
 	uint8_t				*hdr_dma;		/* one 4K header staging block */
+	/* cb_args must stay valid until IO completion; one append IO in
+	 * flight -> one embedded instance */
+	struct spdk_bs_dev_cb_args	append_cb_args;
 
 	/* drain state: one entry in flight */
 	struct spdk_poller		*drain_poller;
 	bool				drain_inflight;
+	struct spdk_bs_dev_cb_args	drain_cb_args;
 	bool				stopping;
 	bool				destroy_pending;
 
@@ -348,7 +352,6 @@ md_journal_append_pump(struct spdk_bs_md_journal *jr)
 	struct md_journal_append_op *op;
 	struct md_journal_entry_hdr *hdr;
 	struct iovec iov[2];
-	struct spdk_bs_dev_cb_args cb_args;
 	uint32_t slot, page_idx;
 	uint8_t *page;
 
@@ -391,12 +394,12 @@ md_journal_append_pump(struct spdk_bs_md_journal *jr)
 	iov[1].iov_base = page;
 	iov[1].iov_len = BS_MD_JOURNAL_PAGE_SIZE;
 
-	cb_args.cb_fn = append_write_cpl;
-	cb_args.channel = jr->ch;
-	cb_args.cb_arg = jr;
+	jr->append_cb_args.cb_fn = append_write_cpl;
+	jr->append_cb_args.channel = jr->ch;
+	jr->append_cb_args.cb_arg = jr;
 	/* single 8K IO: [header][page] */
 	jr->base->writev(jr->base, jr->ch, iov, 2, slot_to_lba(jr, slot),
-			 2 * jr->blocks_per_page, &cb_args);
+			 2 * jr->blocks_per_page, &jr->append_cb_args);
 }
 
 static void
@@ -455,7 +458,6 @@ static void
 drain_home_write_cpl(struct spdk_io_channel *ch, void *cb_arg, int bserrno)
 {
 	struct spdk_bs_md_journal *jr = cb_arg;
-	struct spdk_bs_dev_cb_args cb_args;
 
 	if (jr->stopping) {
 		jr->drain_inflight = false;
@@ -469,18 +471,17 @@ drain_home_write_cpl(struct spdk_io_channel *ch, void *cb_arg, int bserrno)
 	}
 
 	/* spec §6(2): unmap (zero) both blocks of the entry */
-	cb_args.cb_fn = drain_zero_cpl;
-	cb_args.channel = jr->ch;
-	cb_args.cb_arg = jr;
+	jr->drain_cb_args.cb_fn = drain_zero_cpl;
+	jr->drain_cb_args.channel = jr->ch;
+	jr->drain_cb_args.cb_arg = jr;
 	jr->base->write_zeroes(jr->base, jr->ch, slot_to_lba(jr, jr->mem_tail),
-			       2 * jr->blocks_per_page, &cb_args);
+			       2 * jr->blocks_per_page, &jr->drain_cb_args);
 }
 
 static int
 md_journal_drain_poll(void *arg)
 {
 	struct spdk_bs_md_journal *jr = arg;
-	struct spdk_bs_dev_cb_args cb_args;
 	uint32_t slot;
 	bool superseded;
 
@@ -505,19 +506,19 @@ md_journal_drain_poll(void *arg)
 	spdk_spin_unlock(&jr->lock);
 
 	if (superseded) {
-		cb_args.cb_fn = drain_zero_cpl;
-		cb_args.channel = jr->ch;
-		cb_args.cb_arg = jr;
+		jr->drain_cb_args.cb_fn = drain_zero_cpl;
+		jr->drain_cb_args.channel = jr->ch;
+		jr->drain_cb_args.cb_arg = jr;
 		jr->base->write_zeroes(jr->base, jr->ch, slot_to_lba(jr, slot),
-				       2 * jr->blocks_per_page, &cb_args);
+				       2 * jr->blocks_per_page, &jr->drain_cb_args);
 		return SPDK_POLLER_BUSY;
 	}
 
-	cb_args.cb_fn = drain_home_write_cpl;
-	cb_args.channel = jr->ch;
-	cb_args.cb_arg = jr;
+	jr->drain_cb_args.cb_fn = drain_home_write_cpl;
+	jr->drain_cb_args.channel = jr->ch;
+	jr->drain_cb_args.cb_arg = jr;
 	jr->base->write(jr->base, jr->ch, slot_page(jr, slot),
-			jr->slot_hdr[slot].target_lba, jr->blocks_per_page, &cb_args);
+			jr->slot_hdr[slot].target_lba, jr->blocks_per_page, &jr->drain_cb_args);
 	return SPDK_POLLER_BUSY;
 }
 
