@@ -110,6 +110,10 @@ struct spdk_bs_md_journal {
 	/* cb_args must stay valid until IO completion; one append IO in
 	 * flight -> one embedded instance */
 	struct spdk_bs_dev_cb_args	append_cb_args;
+	/* iov array of the in-flight append write: base devs may consume the
+	 * iovs long after submit (the distrib bdev copies on its own poller
+	 * thread), so it must not live on the submitting stack */
+	struct iovec			append_iov[2];
 
 	/* drain state: one entry in flight */
 	struct spdk_poller		*drain_poller;
@@ -369,7 +373,6 @@ md_journal_append_pump(struct spdk_bs_md_journal *jr)
 {
 	struct md_journal_append_op *op;
 	struct md_journal_entry_hdr *hdr;
-	struct iovec iov[2];
 	uint32_t slot, page_idx;
 	uint8_t *page;
 
@@ -411,16 +414,16 @@ md_journal_append_pump(struct spdk_bs_md_journal *jr)
 	spdk_spin_unlock(&jr->lock);
 	jr->append_inflight = true;
 
-	iov[0].iov_base = jr->hdr_dma;
-	iov[0].iov_len = BS_MD_JOURNAL_PAGE_SIZE;
-	iov[1].iov_base = page;
-	iov[1].iov_len = BS_MD_JOURNAL_PAGE_SIZE;
+	jr->append_iov[0].iov_base = jr->hdr_dma;
+	jr->append_iov[0].iov_len = BS_MD_JOURNAL_PAGE_SIZE;
+	jr->append_iov[1].iov_base = page;
+	jr->append_iov[1].iov_len = BS_MD_JOURNAL_PAGE_SIZE;
 
 	jr->append_cb_args.cb_fn = append_write_cpl;
 	jr->append_cb_args.channel = jr->ch;
 	jr->append_cb_args.cb_arg = jr;
 	/* single 8K IO: [header][page] */
-	jr->base->writev(jr->base, jr->ch, iov, 2, slot_to_lba(jr, slot),
+	jr->base->writev(jr->base, jr->ch, jr->append_iov, 2, slot_to_lba(jr, slot),
 			 2 * jr->blocks_per_page, &jr->append_cb_args, &g_ring_io_opts);
 }
 
