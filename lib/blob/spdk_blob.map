@@ -11,6 +11,8 @@
 	spdk_bs_set_super;
 	spdk_bs_get_super;
 	spdk_bs_get_cluster_size;
+	spdk_bs_get_md_journal_stats;
+	spdk_bs_set_md_journal_drain_paused;
 	spdk_bs_get_page_size;
 	spdk_bs_get_io_unit_size;
 	spdk_bs_free_cluster_count;

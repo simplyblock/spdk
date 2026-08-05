@@ -2756,6 +2756,118 @@ cleanup:
 
 SPDK_RPC_REGISTER("bdev_lvol_block_data_port", rpc_bdev_lvol_block_data_port, SPDK_RPC_RUNTIME)
 
+/* md journal (blob_md_journal.h): ring introspection and the drain test hook.
+ * Both are per-LVS and act on the blobstore of this process only - the ring
+ * itself is shared with the peers on the same virtual device, the in-memory
+ * view reported here is not. */
+struct rpc_bdev_lvol_md_journal {
+	char		*uuid;
+	char		*lvs_name;
+	bool		paused;
+};
+
+static void
+free_rpc_bdev_lvol_md_journal(struct rpc_bdev_lvol_md_journal *req)
+{
+	free(req->uuid);
+	free(req->lvs_name);
+}
+
+static const struct spdk_json_object_decoder rpc_bdev_lvol_md_journal_decoders[] = {
+	{"uuid", offsetof(struct rpc_bdev_lvol_md_journal, uuid), spdk_json_decode_string, true},
+	{"lvs_name", offsetof(struct rpc_bdev_lvol_md_journal, lvs_name), spdk_json_decode_string, true},
+};
+
+static const struct spdk_json_object_decoder rpc_bdev_lvol_md_journal_drain_decoders[] = {
+	{"uuid", offsetof(struct rpc_bdev_lvol_md_journal, uuid), spdk_json_decode_string, true},
+	{"lvs_name", offsetof(struct rpc_bdev_lvol_md_journal, lvs_name), spdk_json_decode_string, true},
+	{"paused", offsetof(struct rpc_bdev_lvol_md_journal, paused), spdk_json_decode_bool},
+};
+
+static void
+rpc_bdev_lvol_get_md_journal_stats(struct spdk_jsonrpc_request *request,
+				   const struct spdk_json_val *params)
+{
+	struct rpc_bdev_lvol_md_journal req = {};
+	struct spdk_bs_md_journal_stats stats = {};
+	struct spdk_lvol_store *lvs = NULL;
+	struct spdk_json_write_ctx *w;
+	int rc;
+
+	if (spdk_json_decode_object(params, rpc_bdev_lvol_md_journal_decoders,
+				    SPDK_COUNTOF(rpc_bdev_lvol_md_journal_decoders),
+				    &req)) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "spdk_json_decode_object failed");
+		goto cleanup;
+	}
+
+	rc = vbdev_get_lvol_store_by_uuid_xor_name(req.uuid, req.lvs_name, &lvs);
+	if (rc != 0) {
+		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
+		goto cleanup;
+	}
+
+	rc = spdk_bs_get_md_journal_stats(lvs->blobstore, &stats);
+	if (rc != 0) {
+		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
+		goto cleanup;
+	}
+
+	w = spdk_jsonrpc_begin_result(request);
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_bool(w, "enabled", stats.enabled);
+	spdk_json_write_named_bool(w, "drain_paused", stats.drain_paused);
+	spdk_json_write_named_uint32(w, "num_slots", stats.num_slots);
+	spdk_json_write_named_uint32(w, "used_slots", stats.used_slots);
+	spdk_json_write_named_uint32(w, "mem_head", stats.mem_head);
+	spdk_json_write_named_uint32(w, "mem_tail", stats.mem_tail);
+	spdk_json_write_named_uint32(w, "disk_head", stats.disk_head);
+	spdk_json_write_named_uint32(w, "disk_tail", stats.disk_tail);
+	spdk_json_write_object_end(w);
+	spdk_jsonrpc_end_result(request, w);
+
+cleanup:
+	free_rpc_bdev_lvol_md_journal(&req);
+}
+SPDK_RPC_REGISTER("bdev_lvol_get_md_journal_stats", rpc_bdev_lvol_get_md_journal_stats,
+		  SPDK_RPC_RUNTIME)
+
+static void
+rpc_bdev_lvol_set_md_journal_drain(struct spdk_jsonrpc_request *request,
+				   const struct spdk_json_val *params)
+{
+	struct rpc_bdev_lvol_md_journal req = {};
+	struct spdk_lvol_store *lvs = NULL;
+	int rc;
+
+	if (spdk_json_decode_object(params, rpc_bdev_lvol_md_journal_drain_decoders,
+				    SPDK_COUNTOF(rpc_bdev_lvol_md_journal_drain_decoders),
+				    &req)) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "spdk_json_decode_object failed");
+		goto cleanup;
+	}
+
+	rc = vbdev_get_lvol_store_by_uuid_xor_name(req.uuid, req.lvs_name, &lvs);
+	if (rc != 0) {
+		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
+		goto cleanup;
+	}
+
+	rc = spdk_bs_set_md_journal_drain_paused(lvs->blobstore, req.paused);
+	if (rc != 0) {
+		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
+		goto cleanup;
+	}
+	spdk_jsonrpc_send_bool_response(request, true);
+
+cleanup:
+	free_rpc_bdev_lvol_md_journal(&req);
+}
+SPDK_RPC_REGISTER("bdev_lvol_set_md_journal_drain", rpc_bdev_lvol_set_md_journal_drain,
+		  SPDK_RPC_RUNTIME)
+
 struct rpc_bdev_lvol_shallow_copy {
 	char *src_lvol_name;
 	char *dst_bdev_name;

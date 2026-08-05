@@ -55,14 +55,35 @@ unit_tests.yml — container + python suite driving RPCs):
 - I5  restart-recovery drain: fill ring, power off, restart, verify ring
       drains to empty (entries zeroed) and md pages land home
 
-## 4. Failover (needs >= 2 instances — later phase)
-Secondary/tertiary takes over the shared virtual device and runs recovery on
-lvstore load (spec §"Sudden power-off and fail-over"). Reuse the multipath
-test harness (sbcli/scripts) on a 2-3 node cluster; kill primary mid-md-load,
-verify secondary's journal recovery + no md loss. Blocked until single-node
-suites are green.
+## 4. Failover — DONE (ultra scripts/run_mdj_failover_tests.sh,
+##    DISTR_v2/src_scripts_test_local/mdj_failover_tests.py)
+Rig: three bdts processes on one host. A device server owns the NVMe, builds
+alceml (+jm) -> 2 distribs -> raid0 and exports the raid over nvmf-tcp; nodes
+A and B (own RPC socket / shm-id / hugepages, --no-pci) both attach that one
+namespace, so the lvstore's backing virtual device is shared exactly as a
+primary/secondary pair shares a distr. The device server doubles as an
+out-of-band ring observer (dbg_direct_io_read on the raid), so ring state is
+read without asking either lvstore node.
+
+- F1  failover integrity, >= 4 rounds alternating roles and takeover mode:
+      'load' (peer bdev_examine's after the leader dies — design §8) and
+      'preloaded' (peer loaded the lvstore while the leader was alive and is
+      promoted with bdev_lvol_update_lvstore + bdev_lvol_set_leader_all — the
+      product path). Every acked create present, every sync-acked delete gone.
+- F2  recovery with entries: the drain keeps the ring at ~1 entry under any
+      workload (6 parallel md clients still left 0 at kill time), so the
+      journal exposes bdev_lvol_set_md_journal_drain for tests: pause, build a
+      backlog of acked-but-not-home pages, kill -9, and require the takeover
+      to replay exactly that many entries and drain to empty.
+- F3  single-writer fencing (§11.2): SIGSTOP the leader, promote the peer,
+      SIGCONT the old leader and let it attempt md writes.
+- F4  journal-full failover: same as F2 with a deep backlog.
 
 ## Status / blockers
-- ultra repo local checkout stale (2026-04-22); origin auth (PAT in remote
-  URL) broken -> cannot rebase md-journal or build current ultra until
-  credentials are fixed. spdk-side work proceeds independently.
+- Phases 1-3 green. Phase 3 produced one fix (journal rescan on promotion,
+  design §8.1) and the drain-pause / ring-stats test interface
+  (bdev_lvol_get_md_journal_stats, bdev_lvol_set_md_journal_drain).
+- Not covered by the single-host rig: real multi-node behaviour on an
+  sbcli-deployed cluster (hublvol redirect IO, ANA multipath, CP-driven
+  demote/promote ordering). Those need the multipath harness on a real
+  2-3 node cluster.

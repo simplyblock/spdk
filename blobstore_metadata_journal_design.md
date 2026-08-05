@@ -122,6 +122,37 @@ power-off), **before any other md read**:
    Overlaying is correct for any LBA (a dictionary miss passes through untouched); the range is
    tightened to the metadata region once the super block is parsed.
 
+### 8.1 Promotion of an already-loaded peer (rescan)
+
+The product does **not** load the LVS at failover. The secondary/tertiary loaded it when the
+LVS was created or activated, and takeover is `bdev_lvol_update_lvstore` +
+`bdev_lvol_set_leader_all` (`storage_node_ops` leaderless recovery / failover), plus the
+IO-driven reactive promotion (`spdk_bs_update_on_failover`). Neither loads the blobstore, so
+§8 recovery would never run on the node that becomes the new leader.
+
+That is not survivable: the ring is shared state on the shared device, the buffer/dictionary
+that overlays reads from it is **per process**. A peer's ring view is a snapshot as of its own
+load; every entry the leader appended (and acknowledged) afterwards is invisible to it. A peer
+promoted without a rescan therefore
+
+- serves the **home** page for every page the dead leader acknowledged but did not drain — the
+  acknowledged md is lost, which is exactly what the journal exists to prevent; and
+- appends at **its own stale head**, overwriting those undrained entries and breaking the single
+  contiguous run that §8 step 3 relies on, so even a later crash-recovery cannot get them back.
+
+`spdk_bs_update_live()` therefore re-runs recovery (`bs_md_journal_rescan()`) before it re-reads
+the super block whenever the whole store is reloaded (`id == 0`), which covers the explicit
+promotion RPC and the reactive failover path. The rescan waits for the append/drain pipeline to
+quiesce, drops the dictionary and both pointer pairs, re-reads the ring exactly as §8 does, and
+re-arms the drain poller, so the new leader inherits the dead leader's backlog and drains it.
+The per-blob variant of the same call (`bdev_lvol_register`, `id != 0`) does not rescan: it runs
+per lvol create in a live cluster and the cost would land on the create path.
+
+Measured on the two-instance failover rig (ultra `mdj_failover_tests.py`, phase 3): without the
+rescan a promotion logged no recovery at all; with it, promotion logs
+`md journal rescan: re-reading the ring on takeover` followed by the normal
+`md journal recovery: N entries` line.
+
 ## 9. Why this is correct (invariants)
 
 - **I1 — ack after journal durability**: the caller sees completion only once the entry is on
@@ -156,6 +187,26 @@ power-off), **before any other md read**:
    today's md writes already assume this.
 2. **Single-writer fencing** — one appender at a time; gate on the existing lvstore leadership
    gate (re-drain is idempotent, concurrent append is not).
+   **VALIDATED — the gate does not exist in the data plane** (phase-3 failover test F3,
+   2026-08-05). A leader was SIGSTOPped, the peer promoted, then the old leader thawed while
+   still believing it owned the LVS (which is what a network partition or a long stall looks
+   like — the CP cannot demote a node it cannot reach). It accepted every metadata operation
+   put to it: `bdev_lvol_get_lvstores` on it still reported `"lvs leadership": true`, three
+   creates and a sync delete were acknowledged, its ring head advanced by 9 slots, and its drain
+   poller wrote those md pages to their home LBAs on the *shared* device behind the new leader.
+   No leadership-related rejection appeared in its log.
+   The blob layer's `is_leader` checks only cover async delete and cleanup
+   (`bs_delete_blob_non_leader`, `blob_clear_clusters_async`, `bs_cleanup_*`); the lvol layer
+   gates on `lvs->leader`, which the stale node still has set. Nothing consults the *device* —
+   there is no epoch/fence token in the super block or in the ring header, so a second appender
+   is indistinguishable from the first.
+   Consequence for the journal specifically: two appenders share one ring, so I3 (FIFO,
+   contiguous run) and I2 (a slot is recycled only after its page is home) can both be broken by
+   the stale writer, and recovery can then mis-derive tail/head.
+   Fixing this needs a fence the *device* can see — e.g. a monotonically increasing leadership
+   epoch stamped in the super block and carried in every entry header, with appends rejected
+   when the on-disk epoch has moved on. That is a design change beyond the journal and is NOT
+   implemented.
 3. **Journal-full behavior** under md-heavy bursts (mass create/delete): writers stall until the
    drain frees slots — benchmark; drain batches multiple entries per poll.
 4. **Unmap-vs-zero**: if the device's unmap does not guarantee deterministic zero-read, use

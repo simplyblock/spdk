@@ -119,6 +119,9 @@ struct spdk_bs_md_journal {
 
 	/* drain state: one entry in flight */
 	struct spdk_poller		*drain_poller;
+	bool				drain_paused;	/* test hook */
+	/* waits for the append/drain pipeline to quiesce before a rescan */
+	struct spdk_poller		*rescan_poller;
 	bool				drain_inflight;
 	struct spdk_bs_dev_cb_args	drain_cb_args;
 	bool				stopping;
@@ -522,7 +525,7 @@ md_journal_drain_poll(void *arg)
 	uint32_t slot;
 	bool superseded;
 
-	if (jr->drain_inflight || jr->stopping) {
+	if (jr->drain_inflight || jr->stopping || jr->drain_paused) {
 		return SPDK_POLLER_IDLE;
 	}
 	/* only entries whose journal write has completed (disk_head) may be
@@ -1177,6 +1180,122 @@ bs_md_journal_start(struct spdk_bs_md_journal *jr, bool fresh_format,
 	}
 }
 
+/* ---------------------------------------------------------------------- */
+/* rescan: recovery on an already-started journal (peer takeover)          */
+
+static int
+md_journal_rescan_start(struct spdk_bs_md_journal *jr)
+{
+	uint32_t i;
+
+	jr->entry_valid = calloc(BS_MD_JOURNAL_NUM_SLOTS, 1);
+	jr->recovery_buf = spdk_zmalloc((uint64_t)BS_MD_JOURNAL_RECOVERY_QDEPTH *
+					BS_MD_JOURNAL_RECOVERY_IO_SIZE,
+					BS_MD_JOURNAL_PAGE_SIZE, NULL,
+					SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+	if (jr->entry_valid == NULL || jr->recovery_buf == NULL) {
+		start_finish(jr, -ENOMEM);
+		return -ENOMEM;
+	}
+
+	/* drop the view built at load time: every pointer and every cached
+	 * page is re-derived from the ring below */
+	spdk_spin_lock(&jr->lock);
+	dict_reset(jr);
+	jr->mem_head = jr->mem_tail = jr->disk_head = jr->disk_tail = 0;
+	jr->used_slots = 0;
+	spdk_spin_unlock(&jr->lock);
+
+	jr->recovery_next_chunk = 0;
+	jr->recovery_chunks_done = 0;
+	jr->recovery_inflight = 0;
+	jr->recovery_rc = 0;
+	SPDK_NOTICELOG("md journal rescan: re-reading the ring on takeover\n");
+	for (i = 0; i < BS_MD_JOURNAL_RECOVERY_QDEPTH; i++) {
+		recovery_issue_next(jr, i);
+	}
+	return 0;
+}
+
+static int
+md_journal_rescan_quiesce_poll(void *arg)
+{
+	struct spdk_bs_md_journal *jr = arg;
+
+	if (jr->stopping || jr->destroy_pending) {
+		spdk_poller_unregister(&jr->rescan_poller);
+		start_finish(jr, -ESHUTDOWN);
+		return SPDK_POLLER_BUSY;
+	}
+	if (jr->drain_inflight || jr->append_inflight ||
+	    !TAILQ_EMPTY(&jr->append_queue)) {
+		return SPDK_POLLER_IDLE;
+	}
+	spdk_poller_unregister(&jr->rescan_poller);
+	md_journal_rescan_start(jr);
+	return SPDK_POLLER_BUSY;
+}
+
+void
+bs_md_journal_rescan(struct spdk_bs_md_journal *jr, bs_md_journal_start_cb cb_fn,
+		     void *cb_arg)
+{
+	assert(spdk_get_thread() == jr->md_thread);
+
+	if (jr->stopping || jr->destroy_pending) {
+		cb_fn(cb_arg, -ESHUTDOWN);
+		return;
+	}
+	if (jr->start_cb != NULL || jr->rescan_poller != NULL) {
+		/* a start/rescan is already running */
+		cb_fn(cb_arg, -EBUSY);
+		return;
+	}
+
+	jr->start_cb = cb_fn;
+	jr->start_cb_arg = cb_arg;
+
+	/* the drain poller must not touch the ring while it is re-read, and
+	 * start_finish() re-registers it when the rescan completes */
+	spdk_poller_unregister(&jr->drain_poller);
+
+	if (jr->drain_inflight || jr->append_inflight ||
+	    !TAILQ_EMPTY(&jr->append_queue)) {
+		/* an entry write or home write is in flight: its completion
+		 * still writes into the old buffer/pointers, so wait it out */
+		jr->rescan_poller = SPDK_POLLER_REGISTER(md_journal_rescan_quiesce_poll,
+							 jr, 200);
+		return;
+	}
+	md_journal_rescan_start(jr);
+}
+
+void
+bs_md_journal_get_stats(struct spdk_bs_md_journal *jr, bool *enabled,
+			uint32_t *num_slots, uint32_t *used_slots,
+			uint32_t *mem_head, uint32_t *mem_tail,
+			uint32_t *disk_head, uint32_t *disk_tail,
+			bool *drain_paused)
+{
+	spdk_spin_lock(&jr->lock);
+	*enabled = (jr->md_limit_lba != 0);
+	*num_slots = BS_MD_JOURNAL_NUM_SLOTS;
+	*used_slots = jr->used_slots;
+	*mem_head = jr->mem_head;
+	*mem_tail = jr->mem_tail;
+	*disk_head = jr->disk_head;
+	*disk_tail = jr->disk_tail;
+	*drain_paused = jr->drain_paused;
+	spdk_spin_unlock(&jr->lock);
+}
+
+void
+bs_md_journal_set_drain_paused(struct spdk_bs_md_journal *jr, bool paused)
+{
+	SPDK_NOTICELOG("md journal drain %s\n", paused ? "PAUSED (test hook)" : "resumed");
+	jr->drain_paused = paused;
+}
+
 void
 bs_md_journal_enable(struct spdk_bs_md_journal *jr, uint64_t md_limit_lba)
 {
@@ -1192,6 +1311,7 @@ md_journal_finish_destroy(struct spdk_bs_md_journal *jr)
 	struct spdk_bs_dev *base = jr->base;
 
 	spdk_poller_unregister(&jr->drain_poller);
+	spdk_poller_unregister(&jr->rescan_poller);
 	if (jr->ch != NULL) {
 		base->destroy_channel(base, jr->ch);
 		jr->ch = NULL;
