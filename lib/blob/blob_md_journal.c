@@ -54,6 +54,8 @@ struct md_journal_append_op {
 	uint64_t			lba;		/* first target lba */
 	uint32_t			lba_count;	/* total blocks */
 	uint32_t			blocks_done;
+	/* write_zeroes/unmap journaled as all-zero page appends (no payload) */
+	bool				zeroes;
 	struct spdk_bs_io_opts		io_opts;	/* caller routing, per page */
 	struct spdk_bs_dev_cb_args	*cb_args;
 	TAILQ_ENTRY(md_journal_append_op) link;
@@ -300,6 +302,11 @@ append_op_copy_page(struct md_journal_append_op *op, uint32_t page_idx, uint8_t 
 	uint64_t skip, copied = 0, len, n;
 	int i;
 
+	if (op->zeroes) {
+		memset(dst, 0, BS_MD_JOURNAL_PAGE_SIZE);
+		return;
+	}
+
 	if (op->payload != NULL) {
 		memcpy(dst, (uint8_t *)op->payload + (uint64_t)page_idx * BS_MD_JOURNAL_PAGE_SIZE,
 		       BS_MD_JOURNAL_PAGE_SIZE);
@@ -430,7 +437,7 @@ md_journal_append_pump(struct spdk_bs_md_journal *jr)
 static void
 md_journal_append(struct spdk_bs_md_journal *jr, void *payload, struct iovec *iov, int iovcnt,
 		  uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args,
-		  struct spdk_bs_io_opts *bs_io_opts)
+		  struct spdk_bs_io_opts *bs_io_opts, bool zeroes)
 {
 	struct md_journal_append_op *op;
 
@@ -442,6 +449,7 @@ md_journal_append(struct spdk_bs_md_journal *jr, void *payload, struct iovec *io
 	op->payload = payload;
 	op->iov = iov;
 	op->iovcnt = iovcnt;
+	op->zeroes = zeroes;
 	op->lba = lba;
 	op->lba_count = lba_count;
 	if (bs_io_opts != NULL) {
@@ -749,7 +757,7 @@ proxy_write(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payl
 	struct spdk_bs_md_journal *jr = __proxy_to_journal(dev);
 
 	if (lba_is_md(jr, lba, lba_count)) {
-		md_journal_append(jr, payload, NULL, 0, lba, lba_count, cb_args, bs_io_opts);
+		md_journal_append(jr, payload, NULL, 0, lba, lba_count, cb_args, bs_io_opts, false);
 		return;
 	}
 	jr->base->write(jr->base, channel, payload, lba, lba_count, cb_args, bs_io_opts);
@@ -785,7 +793,7 @@ proxy_writev(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	struct spdk_bs_md_journal *jr = __proxy_to_journal(dev);
 
 	if (lba_is_md(jr, lba, lba_count)) {
-		md_journal_append(jr, NULL, iov, iovcnt, lba, lba_count, cb_args, bs_io_opts);
+		md_journal_append(jr, NULL, iov, iovcnt, lba, lba_count, cb_args, bs_io_opts, false);
 		return;
 	}
 	jr->base->writev(jr->base, channel, iov, iovcnt, lba, lba_count, cb_args, bs_io_opts);
@@ -824,7 +832,7 @@ proxy_writev_ext(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	struct spdk_bs_md_journal *jr = __proxy_to_journal(dev);
 
 	if (lba_is_md(jr, lba, lba_count)) {
-		md_journal_append(jr, NULL, iov, iovcnt, lba, lba_count, cb_args, bs_io_opts);
+		md_journal_append(jr, NULL, iov, iovcnt, lba, lba_count, cb_args, bs_io_opts, false);
 		return;
 	}
 	jr->base->writev_ext(jr->base, channel, iov, iovcnt, lba, lba_count, cb_args, ext_opts,
@@ -847,8 +855,18 @@ proxy_write_zeroes(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 {
 	struct spdk_bs_md_journal *jr = __proxy_to_journal(dev);
 
-	/* md-range zeroing is a page write like any other; route 4K-aligned
-	 * short ranges through the journal, everything else passthrough. */
+	/* md-range zeroing (e.g. blob delete / md-chain release zeroing pages
+	 * in place, blob_persist_zero_pages) MUST take the same FIFO path as
+	 * journaled page writes: a raw passthrough races the deferred home
+	 * write of an older journaled copy of the same page, and the drain
+	 * would then resurrect the zeroed page on disk. Journal it as an
+	 * append of all-zero pages. */
+	if (lba_is_md(jr, lba, lba_count) &&
+	    lba % jr->blocks_per_page == 0 && lba_count % jr->blocks_per_page == 0) {
+		md_journal_append(jr, NULL, NULL, 0, lba, (uint32_t)lba_count, cb_args,
+				  bs_io_opts, true);
+		return;
+	}
 	jr->base->write_zeroes(jr->base, channel, lba, lba_count, cb_args, bs_io_opts);
 }
 
@@ -859,6 +877,15 @@ proxy_unmap(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 {
 	struct spdk_bs_md_journal *jr = __proxy_to_journal(dev);
 
+	/* same ordering hazard as proxy_write_zeroes: unmapped md ranges read
+	 * back as zeros, so journaling an all-zero page append is equivalent
+	 * and keeps FIFO order with pending journaled writes of the page */
+	if (lba_is_md(jr, lba, lba_count) &&
+	    lba % jr->blocks_per_page == 0 && lba_count % jr->blocks_per_page == 0) {
+		md_journal_append(jr, NULL, NULL, 0, lba, (uint32_t)lba_count, cb_args,
+				  bs_io_opts, true);
+		return;
+	}
 	jr->base->unmap(jr->base, channel, lba, lba_count, cb_args, bs_io_opts);
 }
 
