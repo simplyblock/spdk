@@ -28,7 +28,18 @@ struct md_journal_entry_hdr {
 	uint32_t	magic;
 	uint32_t	crc;		/* CRC32C of the 4K md page */
 	uint64_t	target_lba;	/* home LBA, base-dev blocks */
+	/* bs_io_opts of the originating md write (simplyblock fork routing
+	 * hints); persisted so the deferred home write — including one issued
+	 * by recovery after a crash — replays with identical routing */
+	uint8_t		io_priority;
+	uint8_t		io_geometry;
+	uint8_t		io_special;
+	uint8_t		io_rsvd;
 };
+
+/* journal-generated IO (ring writes/reads, entry zeroing) uses default
+ * routing, matching bs-level md sequences (request.c: geometry 0) */
+static struct spdk_bs_io_opts g_ring_io_opts;
 
 struct md_journal_dict_bucket {
 	uint64_t	lba;	/* DICT_EMPTY_KEY / DICT_TOMBSTONE_KEY / target lba */
@@ -43,6 +54,7 @@ struct md_journal_append_op {
 	uint64_t			lba;		/* first target lba */
 	uint32_t			lba_count;	/* total blocks */
 	uint32_t			blocks_done;
+	struct spdk_bs_io_opts		io_opts;	/* caller routing, per page */
 	struct spdk_bs_dev_cb_args	*cb_args;
 	TAILQ_ENTRY(md_journal_append_op) link;
 };
@@ -385,6 +397,10 @@ md_journal_append_pump(struct spdk_bs_md_journal *jr)
 	hdr->magic = BS_MD_JOURNAL_HDR_MAGIC;
 	hdr->crc = spdk_crc32c_update(page, BS_MD_JOURNAL_PAGE_SIZE, 0);
 	hdr->target_lba = op->lba + (uint64_t)page_idx * jr->blocks_per_page;
+	hdr->io_priority = op->io_opts.priority;
+	hdr->io_geometry = op->io_opts.geometry;
+	hdr->io_special = op->io_opts.special_io;
+	hdr->io_rsvd = 0;
 
 	memset(jr->hdr_dma, 0, BS_MD_JOURNAL_PAGE_SIZE);
 	memcpy(jr->hdr_dma, hdr, sizeof(*hdr));
@@ -405,12 +421,13 @@ md_journal_append_pump(struct spdk_bs_md_journal *jr)
 	jr->append_cb_args.cb_arg = jr;
 	/* single 8K IO: [header][page] */
 	jr->base->writev(jr->base, jr->ch, iov, 2, slot_to_lba(jr, slot),
-			 2 * jr->blocks_per_page, &jr->append_cb_args);
+			 2 * jr->blocks_per_page, &jr->append_cb_args, &g_ring_io_opts);
 }
 
 static void
 md_journal_append(struct spdk_bs_md_journal *jr, void *payload, struct iovec *iov, int iovcnt,
-		  uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
+		  uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args,
+		  struct spdk_bs_io_opts *bs_io_opts)
 {
 	struct md_journal_append_op *op;
 
@@ -424,6 +441,9 @@ md_journal_append(struct spdk_bs_md_journal *jr, void *payload, struct iovec *io
 	op->iovcnt = iovcnt;
 	op->lba = lba;
 	op->lba_count = lba_count;
+	if (bs_io_opts != NULL) {
+		op->io_opts = *bs_io_opts;
+	}
 	op->cb_args = cb_args;
 	TAILQ_INSERT_TAIL(&jr->append_queue, op, link);
 	md_journal_append_pump(jr);
@@ -481,7 +501,7 @@ drain_home_write_cpl(struct spdk_io_channel *ch, void *cb_arg, int bserrno)
 	jr->drain_cb_args.channel = jr->ch;
 	jr->drain_cb_args.cb_arg = jr;
 	jr->base->write_zeroes(jr->base, jr->ch, slot_to_lba(jr, jr->mem_tail),
-			       2 * jr->blocks_per_page, &jr->drain_cb_args);
+			       2 * jr->blocks_per_page, &jr->drain_cb_args, &g_ring_io_opts);
 }
 
 static int
@@ -516,15 +536,27 @@ md_journal_drain_poll(void *arg)
 		jr->drain_cb_args.channel = jr->ch;
 		jr->drain_cb_args.cb_arg = jr;
 		jr->base->write_zeroes(jr->base, jr->ch, slot_to_lba(jr, slot),
-				       2 * jr->blocks_per_page, &jr->drain_cb_args);
+				       2 * jr->blocks_per_page, &jr->drain_cb_args,
+				       &g_ring_io_opts);
 		return SPDK_POLLER_BUSY;
 	}
 
-	jr->drain_cb_args.cb_fn = drain_home_write_cpl;
-	jr->drain_cb_args.channel = jr->ch;
-	jr->drain_cb_args.cb_arg = jr;
-	jr->base->write(jr->base, jr->ch, slot_page(jr, slot),
-			jr->slot_hdr[slot].target_lba, jr->blocks_per_page, &jr->drain_cb_args);
+	{
+		/* replay the originating write's routing (consumed synchronously
+		 * at submit, a stack copy is fine — same pattern as request.c) */
+		struct spdk_bs_io_opts home_opts = {
+			.priority = jr->slot_hdr[slot].io_priority,
+			.geometry = jr->slot_hdr[slot].io_geometry,
+			.special_io = jr->slot_hdr[slot].io_special,
+		};
+
+		jr->drain_cb_args.cb_fn = drain_home_write_cpl;
+		jr->drain_cb_args.channel = jr->ch;
+		jr->drain_cb_args.cb_arg = jr;
+		jr->base->write(jr->base, jr->ch, slot_page(jr, slot),
+				jr->slot_hdr[slot].target_lba, jr->blocks_per_page,
+				&jr->drain_cb_args, &home_opts);
+	}
 	return SPDK_POLLER_BUSY;
 }
 
@@ -684,7 +716,8 @@ proxy_destroy(struct spdk_bs_dev *dev)
 
 static void
 proxy_read(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
-	   uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
+	   uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args,
+	   struct spdk_bs_io_opts *bs_io_opts)
 {
 	struct spdk_bs_md_journal *jr = __proxy_to_journal(dev);
 
@@ -698,29 +731,31 @@ proxy_read(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *paylo
 			cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, -ENOMEM);
 			return;
 		}
-		jr->base->read(jr->base, channel, payload, lba, lba_count, &ctx->shim_cb_args);
+		jr->base->read(jr->base, channel, payload, lba, lba_count, &ctx->shim_cb_args,
+			       bs_io_opts);
 		return;
 	}
-	jr->base->read(jr->base, channel, payload, lba, lba_count, cb_args);
+	jr->base->read(jr->base, channel, payload, lba, lba_count, cb_args, bs_io_opts);
 }
 
 static void
 proxy_write(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
-	    uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
+	    uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args,
+	    struct spdk_bs_io_opts *bs_io_opts)
 {
 	struct spdk_bs_md_journal *jr = __proxy_to_journal(dev);
 
 	if (lba_is_md(jr, lba, lba_count)) {
-		md_journal_append(jr, payload, NULL, 0, lba, lba_count, cb_args);
+		md_journal_append(jr, payload, NULL, 0, lba, lba_count, cb_args, bs_io_opts);
 		return;
 	}
-	jr->base->write(jr->base, channel, payload, lba, lba_count, cb_args);
+	jr->base->write(jr->base, channel, payload, lba, lba_count, cb_args, bs_io_opts);
 }
 
 static void
 proxy_readv(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	    struct iovec *iov, int iovcnt, uint64_t lba, uint32_t lba_count,
-	    struct spdk_bs_dev_cb_args *cb_args)
+	    struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts)
 {
 	struct spdk_bs_md_journal *jr = __proxy_to_journal(dev);
 
@@ -733,30 +768,31 @@ proxy_readv(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 			return;
 		}
 		jr->base->readv(jr->base, channel, iov, iovcnt, lba, lba_count,
-				&ctx->shim_cb_args);
+				&ctx->shim_cb_args, bs_io_opts);
 		return;
 	}
-	jr->base->readv(jr->base, channel, iov, iovcnt, lba, lba_count, cb_args);
+	jr->base->readv(jr->base, channel, iov, iovcnt, lba, lba_count, cb_args, bs_io_opts);
 }
 
 static void
 proxy_writev(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	     struct iovec *iov, int iovcnt, uint64_t lba, uint32_t lba_count,
-	     struct spdk_bs_dev_cb_args *cb_args)
+	     struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts)
 {
 	struct spdk_bs_md_journal *jr = __proxy_to_journal(dev);
 
 	if (lba_is_md(jr, lba, lba_count)) {
-		md_journal_append(jr, NULL, iov, iovcnt, lba, lba_count, cb_args);
+		md_journal_append(jr, NULL, iov, iovcnt, lba, lba_count, cb_args, bs_io_opts);
 		return;
 	}
-	jr->base->writev(jr->base, channel, iov, iovcnt, lba, lba_count, cb_args);
+	jr->base->writev(jr->base, channel, iov, iovcnt, lba, lba_count, cb_args, bs_io_opts);
 }
 
 static void
 proxy_readv_ext(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		struct iovec *iov, int iovcnt, uint64_t lba, uint32_t lba_count,
-		struct spdk_bs_dev_cb_args *cb_args, struct spdk_blob_ext_io_opts *ext_opts)
+		struct spdk_bs_dev_cb_args *cb_args, struct spdk_blob_ext_io_opts *ext_opts,
+		struct spdk_bs_io_opts *bs_io_opts)
 {
 	struct spdk_bs_md_journal *jr = __proxy_to_journal(dev);
 
@@ -769,24 +805,27 @@ proxy_readv_ext(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 			return;
 		}
 		jr->base->readv_ext(jr->base, channel, iov, iovcnt, lba, lba_count,
-				    &ctx->shim_cb_args, ext_opts);
+				    &ctx->shim_cb_args, ext_opts, bs_io_opts);
 		return;
 	}
-	jr->base->readv_ext(jr->base, channel, iov, iovcnt, lba, lba_count, cb_args, ext_opts);
+	jr->base->readv_ext(jr->base, channel, iov, iovcnt, lba, lba_count, cb_args, ext_opts,
+			    bs_io_opts);
 }
 
 static void
 proxy_writev_ext(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		 struct iovec *iov, int iovcnt, uint64_t lba, uint32_t lba_count,
-		 struct spdk_bs_dev_cb_args *cb_args, struct spdk_blob_ext_io_opts *ext_opts)
+		 struct spdk_bs_dev_cb_args *cb_args, struct spdk_blob_ext_io_opts *ext_opts,
+		 struct spdk_bs_io_opts *bs_io_opts)
 {
 	struct spdk_bs_md_journal *jr = __proxy_to_journal(dev);
 
 	if (lba_is_md(jr, lba, lba_count)) {
-		md_journal_append(jr, NULL, iov, iovcnt, lba, lba_count, cb_args);
+		md_journal_append(jr, NULL, iov, iovcnt, lba, lba_count, cb_args, bs_io_opts);
 		return;
 	}
-	jr->base->writev_ext(jr->base, channel, iov, iovcnt, lba, lba_count, cb_args, ext_opts);
+	jr->base->writev_ext(jr->base, channel, iov, iovcnt, lba, lba_count, cb_args, ext_opts,
+			     bs_io_opts);
 }
 
 static void
@@ -800,22 +839,24 @@ proxy_flush(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 
 static void
 proxy_write_zeroes(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
-		   uint64_t lba, uint64_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
+		   uint64_t lba, uint64_t lba_count, struct spdk_bs_dev_cb_args *cb_args,
+		   struct spdk_bs_io_opts *bs_io_opts)
 {
 	struct spdk_bs_md_journal *jr = __proxy_to_journal(dev);
 
 	/* md-range zeroing is a page write like any other; route 4K-aligned
 	 * short ranges through the journal, everything else passthrough. */
-	jr->base->write_zeroes(jr->base, channel, lba, lba_count, cb_args);
+	jr->base->write_zeroes(jr->base, channel, lba, lba_count, cb_args, bs_io_opts);
 }
 
 static void
 proxy_unmap(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
-	    uint64_t lba, uint64_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
+	    uint64_t lba, uint64_t lba_count, struct spdk_bs_dev_cb_args *cb_args,
+	    struct spdk_bs_io_opts *bs_io_opts)
 {
 	struct spdk_bs_md_journal *jr = __proxy_to_journal(dev);
 
-	jr->base->unmap(jr->base, channel, lba, lba_count, cb_args);
+	jr->base->unmap(jr->base, channel, lba, lba_count, cb_args, bs_io_opts);
 }
 
 static struct spdk_bdev *
@@ -856,11 +897,11 @@ proxy_translate_lba(struct spdk_bs_dev *dev, uint64_t lba, uint64_t *base_lba)
 static void
 proxy_copy(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	   uint64_t dst_lba, uint64_t src_lba, uint64_t lba_count,
-	   struct spdk_bs_dev_cb_args *cb_args)
+	   struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts)
 {
 	struct spdk_bs_md_journal *jr = __proxy_to_journal(dev);
 
-	jr->base->copy(jr->base, channel, dst_lba, src_lba, lba_count, cb_args);
+	jr->base->copy(jr->base, channel, dst_lba, src_lba, lba_count, cb_args, bs_io_opts);
 }
 
 static bool
@@ -1052,7 +1093,7 @@ recovery_issue_next(struct spdk_bs_md_journal *jr, uint32_t buf_idx)
 		       (uint64_t)chunk * (BS_MD_JOURNAL_RECOVERY_IO_SIZE / BS_MD_JOURNAL_PAGE_SIZE) *
 		       jr->blocks_per_page,
 		       (BS_MD_JOURNAL_RECOVERY_IO_SIZE / BS_MD_JOURNAL_PAGE_SIZE) * jr->blocks_per_page,
-		       &rctx->shim_cb_args);
+		       &rctx->shim_cb_args, &g_ring_io_opts);
 }
 
 void

@@ -22,6 +22,9 @@
 #include "thread/thread.c"
 #include "blob/blob_md_journal.c"
 
+/* default routing opts for all UT-issued proxy IO (fork bs_io_opts) */
+static struct spdk_bs_io_opts g_ut_io_opts;
+
 #define UT_BLOCKLEN		4096
 #define UT_DEV_SIZE		(192ULL * 1024 * 1024)
 #define UT_BLOCKCNT		(UT_DEV_SIZE / UT_BLOCKLEN)
@@ -113,7 +116,8 @@ ut_dev_read_snapshot(struct ut_dev *d, struct ut_io *io)
 
 static void
 ut_dev_read(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
-	    uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
+	    uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args,
+	    struct spdk_bs_io_opts *bs_io_opts)
 {
 	struct ut_dev *d = SPDK_CONTAINEROF(dev, struct ut_dev, bs_dev);
 	struct ut_io *io = ut_io_alloc(d, UT_IO_READ, lba, lba_count, cb_args);
@@ -125,7 +129,7 @@ ut_dev_read(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payl
 static void
 ut_dev_readv(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	     struct iovec *iov, int iovcnt, uint64_t lba, uint32_t lba_count,
-	     struct spdk_bs_dev_cb_args *cb_args)
+	     struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts)
 {
 	struct ut_dev *d = SPDK_CONTAINEROF(dev, struct ut_dev, bs_dev);
 	struct ut_io *io = ut_io_alloc(d, UT_IO_READ, lba, lba_count, cb_args);
@@ -137,7 +141,8 @@ ut_dev_readv(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 
 static void
 ut_dev_write(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
-	     uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
+	     uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args,
+	     struct spdk_bs_io_opts *bs_io_opts)
 {
 	struct ut_dev *d = SPDK_CONTAINEROF(dev, struct ut_dev, bs_dev);
 	struct ut_io *io = ut_io_alloc(d, UT_IO_WRITE, lba, lba_count, cb_args);
@@ -151,7 +156,7 @@ ut_dev_write(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *pay
 static void
 ut_dev_writev(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	      struct iovec *iov, int iovcnt, uint64_t lba, uint32_t lba_count,
-	      struct spdk_bs_dev_cb_args *cb_args)
+	      struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts)
 {
 	struct ut_dev *d = SPDK_CONTAINEROF(dev, struct ut_dev, bs_dev);
 	struct ut_io *io = ut_io_alloc(d, UT_IO_WRITE, lba, lba_count, cb_args);
@@ -170,7 +175,8 @@ ut_dev_writev(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 
 static void
 ut_dev_write_zeroes(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
-		    uint64_t lba, uint64_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
+		    uint64_t lba, uint64_t lba_count, struct spdk_bs_dev_cb_args *cb_args,
+		    struct spdk_bs_io_opts *bs_io_opts)
 {
 	struct ut_dev *d = SPDK_CONTAINEROF(dev, struct ut_dev, bs_dev);
 
@@ -186,7 +192,8 @@ ut_dev_flush(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 
 static void
 ut_dev_unmap(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
-	     uint64_t lba, uint64_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
+	     uint64_t lba, uint64_t lba_count, struct spdk_bs_dev_cb_args *cb_args,
+	     struct spdk_bs_io_opts *bs_io_opts)
 {
 	struct ut_dev *d = SPDK_CONTAINEROF(dev, struct ut_dev, bs_dev);
 
@@ -394,7 +401,7 @@ ut_append_page(uint64_t lba, uint8_t seed)
 
 	SPDK_CU_ASSERT_FATAL(page != NULL);
 	ut_fill_page(page, lba, seed);
-	g_proxy->write(g_proxy, NULL, page, lba, 1, &cb_args);
+	g_proxy->write(g_proxy, NULL, page, lba, 1, &cb_args, &g_ut_io_opts);
 	CU_ASSERT(!ctx.done);				/* I1: no ack before journal write */
 	CU_ASSERT(ut_dev_complete_all(&g_base) >= 1);
 	CU_ASSERT(ctx.done && ctx.rc == 0);
@@ -408,7 +415,7 @@ ut_read_page(uint64_t lba, uint8_t *dst)
 	struct ut_cb_ctx ctx = {};
 	struct spdk_bs_dev_cb_args cb_args = { .cb_fn = ut_io_cb, .channel = NULL, .cb_arg = &ctx };
 
-	g_proxy->read(g_proxy, NULL, dst, lba, 1, &cb_args);
+	g_proxy->read(g_proxy, NULL, dst, lba, 1, &cb_args, &g_ut_io_opts);
 	CU_ASSERT(ut_dev_complete_all(&g_base) == 1);
 	CU_ASSERT(ctx.done && ctx.rc == 0);
 }
@@ -452,7 +459,7 @@ test_append_ack_ordering(void)
 	ut_fill_page(page, 5, 0xA5);
 	memcpy(expect, page, sizeof(expect));
 
-	g_proxy->write(g_proxy, NULL, page, 5, 1, &cb_args);
+	g_proxy->write(g_proxy, NULL, page, 5, 1, &cb_args, &g_ut_io_opts);
 
 	/* the md write was redirected to the ring, not to LBA 5 */
 	CU_ASSERT(g_base.pending == 1);
@@ -533,7 +540,7 @@ test_read_overlay(void)
 			{ .iov_base = part2, .iov_len = sizeof(part2) },
 		};
 
-		g_proxy->readv(g_proxy, NULL, iov, 2, 7, 1, &cb_args);
+		g_proxy->readv(g_proxy, NULL, iov, 2, 7, 1, &cb_args, &g_ut_io_opts);
 		CU_ASSERT(ut_dev_complete_all(&g_base) == 1);
 		CU_ASSERT(ctx.done && ctx.rc == 0);
 		CU_ASSERT(memcmp(part1, expect, sizeof(part1)) == 0);
@@ -686,7 +693,7 @@ test_ring_full_stall(void)
 		cbs[i].cb_fn = ut_io_cb;
 		cbs[i].cb_arg = &ctxs[i];
 		ut_fill_page(page, i, 0x55);
-		g_proxy->write(g_proxy, NULL, page, i, 1, &cbs[i]);
+		g_proxy->write(g_proxy, NULL, page, i, 1, &cbs[i], &g_ut_io_opts);
 		/* strict FIFO: exactly one journal write in flight */
 		CU_ASSERT(g_base.pending == 1);
 		CU_ASSERT(ut_dev_complete_all(&g_base) == 1);
@@ -697,7 +704,7 @@ test_ring_full_stall(void)
 
 	/* the 8192nd append must stall: no base IO, no ack */
 	ut_fill_page(page, 4000, 0x77);
-	g_proxy->write(g_proxy, NULL, page, 4000, 1, &stall_cb);
+	g_proxy->write(g_proxy, NULL, page, 4000, 1, &stall_cb, &g_ut_io_opts);
 	CU_ASSERT(g_base.pending == 0);
 	CU_ASSERT(!stall_ctx.done);
 
@@ -929,7 +936,7 @@ test_power_off_simulation(void)
 	/* one more write is issued but its journal write never completes:
 	 * the caller was never acknowledged */
 	ut_fill_page(page, 25, 0xEE);
-	g_proxy->write(g_proxy, NULL, page, 25, 1, &unacked_cb);
+	g_proxy->write(g_proxy, NULL, page, 25, 1, &unacked_cb, &g_ut_io_opts);
 	CU_ASSERT(g_base.pending == 1);
 	CU_ASSERT(!unacked_ctx.done);
 
@@ -995,7 +1002,7 @@ test_proxy_geometry_passthrough(void)
 
 	/* a write above the md limit goes straight to its home LBA */
 	ut_fill_page(data, data_lba, 0x44);
-	g_proxy->write(g_proxy, NULL, data, data_lba, 1, &cb_args);
+	g_proxy->write(g_proxy, NULL, data, data_lba, 1, &cb_args, &g_ut_io_opts);
 	CU_ASSERT(g_base.pending == 1);
 	io = TAILQ_FIRST(&g_base.io_queue);
 	SPDK_CU_ASSERT_FATAL(io != NULL);
@@ -1013,7 +1020,7 @@ test_proxy_geometry_passthrough(void)
 		uint8_t two_pages[2 * BS_MD_JOURNAL_PAGE_SIZE];
 
 		memset(two_pages, 0x5A, sizeof(two_pages));
-		g_proxy->write(g_proxy, NULL, two_pages, UT_MD_LIMIT_LBA - 1, 2, &cb2);
+		g_proxy->write(g_proxy, NULL, two_pages, UT_MD_LIMIT_LBA - 1, 2, &cb2, &g_ut_io_opts);
 		CU_ASSERT(g_base.pending == 1);
 		io = TAILQ_FIRST(&g_base.io_queue);
 		SPDK_CU_ASSERT_FATAL(io != NULL);
@@ -1057,7 +1064,7 @@ test_multi_page_append(void)
 	iov[1].iov_base = content + 2 * BS_MD_JOURNAL_PAGE_SIZE;
 	iov[1].iov_len = BS_MD_JOURNAL_PAGE_SIZE;
 
-	g_proxy->writev(g_proxy, NULL, iov, 2, 40, 3, &cb_args);
+	g_proxy->writev(g_proxy, NULL, iov, 2, 40, 3, &cb_args, &g_ut_io_opts);
 
 	/* page-by-page FIFO: three journal writes, strictly one at a time;
 	 * the caller is acknowledged only after the last one (I1/I3) */
@@ -1113,7 +1120,7 @@ test_destroy_inflight(void)
 	ut_journal_setup();
 
 	ut_fill_page(page, 50, 0xD0);
-	g_proxy->write(g_proxy, NULL, page, 50, 1, &cb_args);
+	g_proxy->write(g_proxy, NULL, page, 50, 1, &cb_args, &g_ut_io_opts);
 	CU_ASSERT(g_base.pending == 1);
 	CU_ASSERT(!ctx.done);
 
@@ -1156,7 +1163,7 @@ test_read_vs_drain_race(void)
 	ut_append_page(33, 0x99);		/* journaled, acked, not drained */
 
 	/* the read is issued now — the mock snapshots the still-stale home */
-	g_proxy->read(g_proxy, NULL, rbuf, 33, 1, &cb_args);
+	g_proxy->read(g_proxy, NULL, rbuf, 33, 1, &cb_args, &g_ut_io_opts);
 	CU_ASSERT(!ctx.done);
 
 	/* the drain overtakes the in-flight read: home write, then entry

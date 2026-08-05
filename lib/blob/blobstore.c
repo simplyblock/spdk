@@ -6748,8 +6748,12 @@ spdk_bs_load(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	probe->cb_args.channel = probe->ch;
 	probe->cb_args.cb_arg = probe;
 
-	dev->read(dev, probe->ch, probe->super, 0,
-		  sizeof(*probe->super) / dev->blocklen, &probe->cb_args);
+	{
+		struct spdk_bs_io_opts bs_io_opts = {0};
+
+		dev->read(dev, probe->ch, probe->super, 0,
+			  sizeof(*probe->super) / dev->blocklen, &probe->cb_args, &bs_io_opts);
+	}
 }
 
 static void
