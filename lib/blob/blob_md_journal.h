@@ -86,6 +86,22 @@ void bs_md_journal_rescan(struct spdk_bs_md_journal *journal,
  * Called once the metadata layout is known (super parsed / init layout). */
 void bs_md_journal_enable(struct spdk_bs_md_journal *journal, uint64_t md_limit_lba);
 
+/* Follow the lvstore's leadership: only the leader may drain.
+ *
+ * The drain poller is a background writer that the pre-journal md path did not
+ * have - it keeps pushing this process's in-memory pages to their home LBAs on
+ * the SHARED device with no IO to trigger it. A node that stops being the
+ * leader but stays alive therefore keeps writing metadata behind the new
+ * leader's back. That happens in the product on the network-outage path
+ * (spdk_lvs_change_leader_state / groupid 0: freeze, block_port, leader=false,
+ * process still running) and in the window before a writer-conflict abort
+ * completes. Stopping the drain on demotion is the journal's half of that
+ * contract; the buffer it was holding is rebuilt by bs_md_journal_rescan when
+ * this node is promoted again.
+ *
+ * Called from spdk_bs_set_leader(). */
+void bs_md_journal_set_leader(struct spdk_bs_md_journal *journal, bool leader);
+
 /* Ring state as this process sees it, and the drain test hook (see
  * spdk_bs_md_journal_stats in include/spdk/blob.h). Pausing the drain lets a
  * test accumulate acknowledged-but-not-home entries: at any md rate the
@@ -96,7 +112,7 @@ void bs_md_journal_get_stats(struct spdk_bs_md_journal *journal, bool *enabled,
 			     uint32_t *num_slots, uint32_t *used_slots,
 			     uint32_t *mem_head, uint32_t *mem_tail,
 			     uint32_t *disk_head, uint32_t *disk_tail,
-			     bool *drain_paused);
+			     bool *drain_paused, bool *drain_demoted);
 void bs_md_journal_set_drain_paused(struct spdk_bs_md_journal *journal, bool paused);
 
 /* Teardown happens through the proxy's bs_dev->destroy(): it quiesces

@@ -490,6 +490,7 @@ void spdk_bs_set_read_only(struct spdk_blob_store *bs, bool state);
 struct spdk_bs_md_journal_stats {
 	bool		enabled;	/* journal present and intercepting */
 	bool		drain_paused;
+	bool		drain_demoted;	/* drain stopped: not the leader */
 	uint32_t	num_slots;
 	uint32_t	used_slots;
 	uint32_t	mem_head;

@@ -185,28 +185,46 @@ rescan a promotion logged no recovery at all; with it, promotion logs
 
 1. **Completion ⇒ durability** on the backing dev (distr/JC committed) — required for I1/I2;
    today's md writes already assume this.
-2. **Single-writer fencing** — one appender at a time; gate on the existing lvstore leadership
-   gate (re-drain is idempotent, concurrent append is not).
-   **VALIDATED — the gate does not exist in the data plane** (phase-3 failover test F3,
-   2026-08-05). A leader was SIGSTOPped, the peer promoted, then the old leader thawed while
-   still believing it owned the LVS (which is what a network partition or a long stall looks
-   like — the CP cannot demote a node it cannot reach). It accepted every metadata operation
-   put to it: `bdev_lvol_get_lvstores` on it still reported `"lvs leadership": true`, three
-   creates and a sync delete were acknowledged, its ring head advanced by 9 slots, and its drain
-   poller wrote those md pages to their home LBAs on the *shared* device behind the new leader.
-   No leadership-related rejection appeared in its log.
-   The blob layer's `is_leader` checks only cover async delete and cleanup
-   (`bs_delete_blob_non_leader`, `blob_clear_clusters_async`, `bs_cleanup_*`); the lvol layer
-   gates on `lvs->leader`, which the stale node still has set. Nothing consults the *device* —
-   there is no epoch/fence token in the super block or in the ring header, so a second appender
-   is indistinguishable from the first.
-   Consequence for the journal specifically: two appenders share one ring, so I3 (FIFO,
-   contiguous run) and I2 (a slot is recycled only after its page is home) can both be broken by
-   the stale writer, and recovery can then mis-derive tail/head.
-   Fixing this needs a fence the *device* can see — e.g. a monotonically increasing leadership
-   epoch stamped in the super block and carried in every entry header, with appends rejected
-   when the on-disk epoch has moved on. That is a design change beyond the journal and is NOT
-   implemented.
+2. **Single-writer fencing** — one appender at a time; re-drain is idempotent, concurrent append
+   is not.
+
+   **How the product actually fences: fail-stop.** Leadership moves only when the old leader is
+   gone — its SPDK process died (abort, segfault, container kill, host reboot) or, on a network
+   outage, the node aborts itself from inside. There is no scenario in the intended design where
+   a healthy old leader keeps serving while a peer is promoted, and the journal inherits that
+   guarantee rather than adding one.
+
+   **What phase-3 test F3 establishes (2026-08-05).** The journal contributes *no* fence of its
+   own, so the assumption above carries all the weight. Freezing a leader with SIGSTOP, promoting
+   the peer and thawing the old leader — deliberately breaking fail-stop — it accepted every
+   metadata operation: `bdev_lvol_get_lvstores` still reported `"lvs leadership": true`, three
+   creates and a sync delete were acknowledged, its ring head advanced 2673 → 2688 (15 entries)
+   while the new leader was at head 23, and its drain poller wrote those pages to their home LBAs
+   on the shared device. Nothing logged a leadership rejection. The blob layer's `is_leader`
+   checks cover only async delete and cleanup (`bs_delete_blob_non_leader`,
+   `blob_clear_clusters_async`, `bs_cleanup_*`); the lvol layer gates on `lvs->leader`, which a
+   stale node still has set. Nothing consults the device: with no epoch in the super block or the
+   entry header, a second appender is indistinguishable from the first.
+
+   **Why this matters even under fail-stop: the journal widens the blast radius.** Before the
+   journal a stale writer wrote stale md pages to their home LBAs — damaging but page-local.
+   Now it also mutates *shared ring structure* with pointers that have diverged from the new
+   leader's (2673 vs 23 above): it appends into slots the new leader believes are free, and its
+   drain zeroes slots and writes home pages the new leader's recovery depends on, so I2 (a slot
+   is recycled only after its page is home) and I3 (FIFO, one contiguous run) can both break and
+   recovery can mis-derive tail/head. Any window where fail-stop is soft is therefore more
+   expensive than it used to be — and such windows are real, not hypothetical: the self-abort on
+   a network outage is a timed reaction and **a promotion elsewhere can precede it** (confirmed
+   with the product owner, 2026-08-05), and a reactor stalled by host swap thrash that later
+   resumes (MCD incident 2026-07-13) looks exactly like the SIGSTOP above. The exposure is
+   bounded by how long the old leader can still reach the shared device after the peer is
+   promoted.
+
+   **Not implemented, and deliberately so:** closing this needs a fence the device can see — a
+   monotonically increasing leadership epoch in the super block, carried in every entry header,
+   with appends refused once the on-disk epoch has moved on. That is a change beyond the journal
+   (the epoch has to be owned by whoever grants leadership) and is out of scope here; it is
+   recorded so the trade-off is a decision rather than an oversight.
 3. **Journal-full behavior** under md-heavy bursts (mass create/delete): writers stall until the
    drain frees slots — benchmark; drain batches multiple entries per poll.
 4. **Unmap-vs-zero**: if the device's unmap does not guarantee deterministic zero-read, use

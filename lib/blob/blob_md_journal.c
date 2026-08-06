@@ -120,6 +120,9 @@ struct spdk_bs_md_journal {
 	/* drain state: one entry in flight */
 	struct spdk_poller		*drain_poller;
 	bool				drain_paused;	/* test hook */
+	/* set while this node is not the lvstore leader: the ring belongs to
+	 * whoever is, so this process must not write to the shared device */
+	bool				drain_demoted;
 	/* waits for the append/drain pipeline to quiesce before a rescan */
 	struct spdk_poller		*rescan_poller;
 	bool				drain_inflight;
@@ -525,7 +528,8 @@ md_journal_drain_poll(void *arg)
 	uint32_t slot;
 	bool superseded;
 
-	if (jr->drain_inflight || jr->stopping || jr->drain_paused) {
+	if (jr->drain_inflight || jr->stopping || jr->drain_paused ||
+	    jr->drain_demoted) {
 		return SPDK_POLLER_IDLE;
 	}
 	/* only entries whose journal write has completed (disk_head) may be
@@ -1271,11 +1275,23 @@ bs_md_journal_rescan(struct spdk_bs_md_journal *jr, bs_md_journal_start_cb cb_fn
 }
 
 void
+bs_md_journal_set_leader(struct spdk_bs_md_journal *jr, bool leader)
+{
+	if (jr->drain_demoted == !leader) {
+		return;
+	}
+	jr->drain_demoted = !leader;
+	SPDK_NOTICELOG("md journal drain %s: this node is %s the lvstore leader "
+		       "(%u entries held)\n", leader ? "resumed" : "stopped",
+		       leader ? "again" : "no longer", jr->used_slots);
+}
+
+void
 bs_md_journal_get_stats(struct spdk_bs_md_journal *jr, bool *enabled,
 			uint32_t *num_slots, uint32_t *used_slots,
 			uint32_t *mem_head, uint32_t *mem_tail,
 			uint32_t *disk_head, uint32_t *disk_tail,
-			bool *drain_paused)
+			bool *drain_paused, bool *drain_demoted)
 {
 	spdk_spin_lock(&jr->lock);
 	*enabled = (jr->md_limit_lba != 0);
@@ -1286,6 +1302,7 @@ bs_md_journal_get_stats(struct spdk_bs_md_journal *jr, bool *enabled,
 	*disk_head = jr->disk_head;
 	*disk_tail = jr->disk_tail;
 	*drain_paused = jr->drain_paused;
+	*drain_demoted = jr->drain_demoted;
 	spdk_spin_unlock(&jr->lock);
 }
 

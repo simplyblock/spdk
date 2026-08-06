@@ -8149,7 +8149,12 @@ spdk_bs_get_super(struct spdk_blob_store *bs,
 void
 spdk_bs_set_leader(struct spdk_blob_store *bs, bool state)
 {
-	bs->is_leader = state;	
+	bs->is_leader = state;
+	if (bs->md_journal != NULL) {
+		/* only the leader may drain the shared ring - see
+		 * bs_md_journal_set_leader() */
+		bs_md_journal_set_leader(bs->md_journal, state);
+	}
 }
 
 int
@@ -8163,7 +8168,7 @@ spdk_bs_get_md_journal_stats(struct spdk_blob_store *bs,
 	bs_md_journal_get_stats(bs->md_journal, &stats->enabled, &stats->num_slots,
 				&stats->used_slots, &stats->mem_head, &stats->mem_tail,
 				&stats->disk_head, &stats->disk_tail,
-				&stats->drain_paused);
+				&stats->drain_paused, &stats->drain_demoted);
 	return 0;
 }
 

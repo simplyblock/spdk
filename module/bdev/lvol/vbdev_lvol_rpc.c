@@ -2818,6 +2818,7 @@ rpc_bdev_lvol_get_md_journal_stats(struct spdk_jsonrpc_request *request,
 	spdk_json_write_object_begin(w);
 	spdk_json_write_named_bool(w, "enabled", stats.enabled);
 	spdk_json_write_named_bool(w, "drain_paused", stats.drain_paused);
+	spdk_json_write_named_bool(w, "drain_demoted", stats.drain_demoted);
 	spdk_json_write_named_uint32(w, "num_slots", stats.num_slots);
 	spdk_json_write_named_uint32(w, "used_slots", stats.used_slots);
 	spdk_json_write_named_uint32(w, "mem_head", stats.mem_head);
