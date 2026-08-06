@@ -11413,10 +11413,19 @@ bs_is_blob_deletable(struct spdk_blob *blob, bool *update_clone)
 }
 
 // added by sadegh
+struct clone_update_ctx {
+	struct spdk_blob *clone;
+	spdk_blob_id parent_id;
+	struct spdk_bs_dev *back_bs_dev;
+};
+
 static void
 clone_update_delete_sync_cpl(void *cb_arg, int lvolerrno)
 {
-	struct spdk_blob *clone = cb_arg;
+	struct clone_update_ctx *ctx = cb_arg;
+	struct spdk_blob_list *snapshot_entry = NULL;
+	struct spdk_blob_list *clone_entry = NULL;
+	struct spdk_blob *clone = ctx->clone;
 	clone->md_ro = true;
 	clone->state = SPDK_BLOB_STATE_CLEAN;
 	if (lvolerrno < 0) {
@@ -11424,6 +11433,69 @@ clone_update_delete_sync_cpl(void *cb_arg, int lvolerrno)
 		return;
 	}
 	SPDK_NOTICELOG("update clone blob for async lvol delete blobid 0x%" PRIx64 " done.\n", clone->id);
+
+	if (ctx->parent_id != clone->parent_id) {
+		if (ctx->back_bs_dev != NULL) {
+			free(ctx->back_bs_dev);
+		}
+
+		snapshot_entry = bs_get_snapshot_entry(clone->bs, ctx->parent_id);
+		TAILQ_FOREACH(clone_entry, &snapshot_entry->clones, link) {
+			if (clone_entry->id == clone->id) {
+				break;
+			}
+			clone_entry = NULL;
+		}
+
+		if (clone_entry) {
+			TAILQ_REMOVE(&snapshot_entry->clones, clone_entry, link);
+			snapshot_entry->clone_count--;
+			free(clone_entry);
+		}
+	}
+
+	free(ctx);
+}
+
+static void
+delete_blob_manually(struct spdk_blob_store *bs, struct spdk_blob *blob) {
+	struct spdk_blob_list *snapshot_entry = NULL;
+	struct spdk_blob_list *clone_entry = NULL, *clone_entry_tmp = NULL;
+	struct spdk_blob *tmp_blob = blob_lookup(blob->bs, blob->id);
+	if (tmp_blob) {
+		/*
+		* Remove the blob from the blob_store list now, to ensure it does not
+		*  get returned after this point by blob_lookup().
+		*/
+		spdk_bit_array_clear(blob->bs->open_blobids, blob->id);
+		RB_REMOVE(spdk_blob_tree, &blob->bs->open_blobs, tmp_blob);
+	}
+
+	uint32_t page_num;
+	spdk_spin_lock(&bs->used_lock);
+	
+	page_num = bs_blobid_to_page(blob->id);
+	spdk_bit_array_clear(bs->used_blobids, page_num);
+	spdk_bit_array_clear(bs->map_blobids, blob->map_id);
+	bs_release_md_page(bs, page_num);
+	
+	spdk_spin_unlock(&bs->used_lock);
+
+	/* Remove snapshot and its clonesfrom the list */
+	snapshot_entry = bs_get_snapshot_entry(blob->bs, blob->id);
+	if (snapshot_entry != NULL) {
+		TAILQ_FOREACH_SAFE(clone_entry, &snapshot_entry->clones, link, clone_entry_tmp) {
+			if (clone_entry) {
+				TAILQ_REMOVE(&snapshot_entry->clones, clone_entry, link);
+				free(clone_entry);
+			}
+		}
+		TAILQ_REMOVE(&bs->snapshots, snapshot_entry, link);
+		free(snapshot_entry);
+	}
+
+	blob->back_bs_dev = NULL;
+	blob_free(blob);
 }
 
 int
@@ -11436,20 +11508,24 @@ spdk_bs_delete_blob_non_leader(struct spdk_blob_store *bs, struct spdk_blob *blo
 	const void *value;
 	int rc;
 	size_t len;
+	struct spdk_blob *snapshot = blob;
+	struct spdk_blob_list *parent_snapshot_entry = NULL;
+	struct spdk_blob_list *snapshot_entry = NULL;
+	struct spdk_blob_list *clone_entry = NULL, *clone_entry_tmp = NULL;
+	struct spdk_blob_list *snapshot_clone_entry = NULL;
+	struct spdk_blob *clone = NULL;
 
 	/* Check if blob can be removed and if it is a snapshot with clone on top of it */
 	int bserrno = bs_is_blob_deletable(blob, &update_clone);
 	if (bserrno) {
 		SPDK_ERRLOG("Cannot remove blob in state nonleader.\n");
-		blob->back_bs_dev = NULL;
-		blob_free(blob);
+		delete_blob_manually(bs, blob);
 		return -1;
 	}
 
 	if (blob->locked_operation_in_progress) {
 		SPDK_DEBUGLOG(blob, "Cannot remove blob - another operation in progress\n");
-		blob->back_bs_dev = NULL;
-		blob_free(blob);
+		delete_blob_manually(bs, blob);
 		return -EBUSY;
 	}
 
@@ -11463,25 +11539,6 @@ spdk_bs_delete_blob_non_leader(struct spdk_blob_store *bs, struct spdk_blob *blo
 	}
 
 	if (update_clone || corrupted_mode) {
-		struct spdk_blob *tmp_blob = blob_lookup(blob->bs, blob->id);
-		if (tmp_blob) {
-			/*
-			* Remove the blob from the blob_store list now, to ensure it does not
-			*  get returned after this point by blob_lookup().
-			*/
-			spdk_bit_array_clear(blob->bs->open_blobids, blob->id);
-			RB_REMOVE(spdk_blob_tree, &blob->bs->open_blobs, tmp_blob);
-		}
-		struct spdk_blob *snapshot = blob;
-		struct spdk_blob_list *parent_snapshot_entry = NULL;
-		struct spdk_blob_list *snapshot_entry = NULL;
-		struct spdk_blob_list *clone_entry = NULL;
-		struct spdk_blob_list *snapshot_clone_entry = NULL;
-		struct spdk_blob *clone = NULL;
-
-		// TO DO this snapshot had clone and it should reload it again in nonleader state
-		/* This blob is a snapshot with active clone - update clone first */
-
 		snapshot_entry = bs_get_snapshot_entry(snapshot->bs, snapshot->id);
 		if (snapshot_entry) {
 			/* Get clone of the snapshot (at this point there can be only one clone) */
@@ -11500,12 +11557,15 @@ spdk_bs_delete_blob_non_leader(struct spdk_blob_store *bs, struct spdk_blob *blo
 			SPDK_ERRLOG("The clone for snapshot 0x%" PRIx64 " is missing\n", blob->id);
 		}
 
-		assert(clone != NULL);
 		/* Get snapshot entry for parent snapshot and clone entry within that snapshot for
 		* snapshot that we are removing */
 		blob_get_snapshot_and_clone_entries(snapshot, &parent_snapshot_entry,
 							&snapshot_clone_entry);
 
+		if (clone->back_bs_dev != NULL) {
+			/* Free blob_bs_dev */
+			free(clone->back_bs_dev);
+		}
 
 		if (parent_snapshot_entry != NULL) {
 			/* ...to parent snapshot */
@@ -11557,33 +11617,42 @@ spdk_bs_delete_blob_non_leader(struct spdk_blob_store *bs, struct spdk_blob *blo
 				}
 		}
 
-		/* Remove snapshot from the list */
-		if (snapshot_entry != NULL) {
-			TAILQ_REMOVE(&blob->bs->snapshots, snapshot_entry, link);
-			free(snapshot_entry);
-		}
-		blob->back_bs_dev = NULL;
-		uint32_t page_num;
-		spdk_spin_lock(&bs->used_lock);
-		
-		page_num = bs_blobid_to_page(blob->id);
-		spdk_bit_array_clear(bs->used_blobids, page_num);
-		spdk_bit_array_clear(bs->map_blobids, blob->map_id);
-		bs_release_md_page(bs, page_num);
-		
-		spdk_spin_unlock(&bs->used_lock);
-		blob_free(blob);
+		delete_blob_manually(bs, blob);
+
 		clone_entry = bs_get_snapshot_entry(clone->bs, clone->id);
 		if (clone_entry || clone->md_ro) {
 			// The clone is snapshot too so we should update it
-			clone->md_ro = false;
-			SPDK_NOTICELOG("start updating clone for sync blob delete blobid 0x%" PRIx64 ".\n", clone->id);
-			blob_freeze_on_failover(clone);
-			spdk_blob_update_on_failover(clone, clone_update_delete_sync_cpl, clone);
+			struct clone_update_ctx *ctx;
+			ctx = calloc(1, sizeof(*ctx));
+			if (ctx) {
+				clone->md_ro = false;
+				ctx->back_bs_dev = clone->back_bs_dev;
+				ctx->clone = clone;
+				ctx->parent_id = clone->parent_id;
+
+				SPDK_NOTICELOG("start updating clone for sync blob delete blobid 0x%" PRIx64 ".\n", clone->id);
+				blob_freeze_on_failover(clone);
+				spdk_blob_update_on_failover(clone, clone_update_delete_sync_cpl, ctx);
+			}
 		}
 	} else {
 		/* This blob does not have any clones - just remove it */
 		bs_blob_list_remove(blob);
+
+		/* Remove snapshot and its clonesfrom the list */
+		snapshot_entry = bs_get_snapshot_entry(blob->bs, blob->id);
+		if (snapshot_entry != NULL) {
+			TAILQ_FOREACH_SAFE(clone_entry, &snapshot_entry->clones, link, clone_entry_tmp) {
+				if (clone_entry) {
+					TAILQ_REMOVE(&snapshot_entry->clones, clone_entry, link);
+					free(clone_entry);
+				}
+			}
+			TAILQ_REMOVE(&bs->snapshots, snapshot_entry, link);
+			free(snapshot_entry);
+		}
+
+
 		uint32_t page_num;
 		uint32_t i;
 		spdk_spin_lock(&bs->used_lock);
