@@ -220,7 +220,21 @@ rescan a promotion logged no recovery at all; with it, promotion logs
    bounded by how long the old leader can still reach the shared device after the peer is
    promoted.
 
-   **Not implemented, and deliberately so:** closing this needs a fence the device can see — a
+   **Partially addressed:** `spdk_bs_set_leader()` now stops the drain poller when the node is
+   not the leader (`bs_md_journal_set_leader`), because the drain is a *background* writer that
+   the pre-journal md path did not have — it pushed this node's pages to the shared device with
+   no IO to trigger it. A demoted-but-living node (network-outage path, or the window before a
+   conflict abort completes) therefore no longer writes metadata home behind the new leader.
+   Test F3b confirms `drain_demoted` goes true on demotion and the held entries stop moving.
+
+   **Still open after that:** a demoted node can still *append*. The lvol layer gates destroy and
+   async delete on `lvs->leader` but not create, and it deliberately permits a **sync delete on a
+   non-leader** — so "a non-leader never writes md" is not the fork's model today. Entries such a
+   node appends now stay in its ring until it is promoted (and rescans) or the real leader's head
+   marches over those slots. Deciding this needs the lvol layer: either md-mutating work is
+   refused on a non-leader, or the ring gets an owner/epoch.
+
+   **Not implemented, and deliberately so:** closing the general case needs a fence the device can see — a
    monotonically increasing leadership epoch in the super block, carried in every entry header,
    with appends refused once the on-disk epoch has moved on. That is a change beyond the journal
    (the epoch has to be owned by whoever grants leadership) and is out of scope here; it is

@@ -99,7 +99,19 @@ void bs_md_journal_enable(struct spdk_bs_md_journal *journal, uint64_t md_limit_
  * contract; the buffer it was holding is rebuilt by bs_md_journal_rescan when
  * this node is promoted again.
  *
- * Called from spdk_bs_set_leader(). */
+ * Called from spdk_bs_set_leader().
+ *
+ * OPEN QUESTION (phase-3 test F3b): a demoted node can still APPEND. The lvol
+ * layer gates destroy and async delete on lvs->leader but not create, and it
+ * deliberately allows a SYNC delete on a non-leader
+ * (rpc_bdev_lvol_delete: "Deleting async lvol on non-leader lvs" is refused,
+ * sync is not) - so "a non-leader never writes md" is not the fork's model.
+ * Entries a non-leader appends now stay in its ring (this stops it writing
+ * them home over the leader's data) until it is promoted and rescans, or the
+ * leader's own head marches over the slots. Either the lvol layer must refuse
+ * md-mutating work on a non-leader, or the ring needs an owner/epoch so a
+ * second appender is rejected by the device. Recorded in
+ * blobstore_metadata_journal_design.md section 11.2. */
 void bs_md_journal_set_leader(struct spdk_bs_md_journal *journal, bool leader);
 
 /* Ring state as this process sees it, and the drain test hook (see
