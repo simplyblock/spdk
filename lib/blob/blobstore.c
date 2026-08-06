@@ -11435,7 +11435,7 @@ clone_update_delete_sync_cpl(void *cb_arg, int lvolerrno)
 	SPDK_NOTICELOG("update clone blob for async lvol delete blobid 0x%" PRIx64 " done.\n", clone->id);
 
 	if (ctx->parent_id != clone->parent_id) {
-		if (ctx->back_bs_dev != NULL) {
+		if (ctx->back_bs_dev != NULL && ctx->parent_id != SPDK_BLOBID_INVALID) {
 			free(ctx->back_bs_dev);
 		}
 
