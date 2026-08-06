@@ -11434,17 +11434,19 @@ clone_update_delete_sync_cpl(void *cb_arg, int lvolerrno)
 	}
 	SPDK_NOTICELOG("update clone blob for async lvol delete blobid 0x%" PRIx64 " done.\n", clone->id);
 
-	if (ctx->parent_id != clone->parent_id) {
-		if (ctx->back_bs_dev != NULL && ctx->parent_id != SPDK_BLOBID_INVALID) {
+	if (ctx->parent_id != clone->parent_id && ctx->parent_id != SPDK_BLOBID_INVALID) {
+		if (ctx->back_bs_dev != NULL) {
 			free(ctx->back_bs_dev);
 		}
 
 		snapshot_entry = bs_get_snapshot_entry(clone->bs, ctx->parent_id);
-		TAILQ_FOREACH(clone_entry, &snapshot_entry->clones, link) {
-			if (clone_entry->id == clone->id) {
-				break;
+		if (snapshot_entry) {
+			TAILQ_FOREACH(clone_entry, &snapshot_entry->clones, link) {
+				if (clone_entry->id == clone->id) {
+					break;
+				}
+				clone_entry = NULL;
 			}
-			clone_entry = NULL;
 		}
 
 		if (clone_entry) {
