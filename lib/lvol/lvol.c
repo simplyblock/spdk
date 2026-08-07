@@ -3967,6 +3967,7 @@ spdk_wait_for_pg_io_cleanup_poller(void *arg) {
 	struct remote_lvol_info *rmt_lvol = arg;
 	struct spdk_lvs_poll_group *lpg = rmt_lvol->group;
 	struct spdk_transfer_dev *tdev = rmt_lvol->tdev;
+	struct spdk_lvs_xfer *xfer_task = rmt_lvol->xfer_task;
 
 	if (rmt_lvol->outstanding_io > 0) {
 		return SPDK_POLLER_BUSY;
@@ -3979,6 +3980,15 @@ spdk_wait_for_pg_io_cleanup_poller(void *arg) {
 	rmt_lvol->channel = NULL;
 	tdev->pg[lpg->id]--;
 	free(rmt_lvol);
+	/*
+	 * If an xfer-task teardown (spdk_delete_rmt_lvol_pg) raced this device-remove and
+	 * deferred to us instead of freeing directly, it left xfer_task->pg[lpg->id] set so
+	 * destroy_xfer_task_tmo would wait. We now own completing that hand-off. Harmless
+	 * no-op when no such race happened (flag is already false).
+	 */
+	if (xfer_task) {
+		xfer_task->pg[lpg->id] = false;
+	}
 	return -1;
 }
 
@@ -4156,14 +4166,15 @@ set_req_status_and_queued(struct spdk_lvs_xfer_req *req, enum xfer_req_status st
 	if (rmt->outstanding_io == 0) {
 		SPDK_ERRLOG("outstanding_io underflow\n");
 		assert(false);
-	} else {
-		rmt->outstanding_io--;
+		return;
 	}
+	rmt->outstanding_io--;
 
 	req->status = status;
 	if (spdk_ring_enqueue(rmt->free_ring, (void **)&req, 1, NULL) != 1) {
 		SPDK_ERRLOG("free_ring full while handling write submit failure\n");
 		assert(false);
+		return;
 	}
 }
 
@@ -4410,6 +4421,7 @@ helper_xfer_poller(void *arg)
 		count++;
 		rmt_lvol->outstanding_io++;
 		req->rmt_lvol = rmt_lvol;
+		req->status = XFER_REQ_STATUS_IN_FLIGHT;
 
 		if (rmt_lvol->desc == NULL || rmt_lvol->channel == NULL || !rmt_lvol->status) {
 			set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
@@ -4646,10 +4658,72 @@ read_complete_cb(void *arg, int rc)
 }
 
 static void
+xfer_abort_cpl(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	spdk_bdev_free_io(bdev_io);
+}
+
+/*
+ * Best-effort: nudge any req still mid-flight for this rmt_lvol so the drain below
+ * resolves faster. A req that already moved past the S3-GET leg (e.g. into the local
+ * blobstore write) has no matching bdev_io here and spdk_bdev_abort() is a harmless
+ * no-op for it; it will still complete and drain on its own via outstanding_io.
+ */
+static void
+abort_inflight_reqs_for_rmt_lvol(struct spdk_lvs_xfer *xfer, struct remote_lvol_info *rmt_lvol)
+{
+	if (rmt_lvol->desc == NULL || rmt_lvol->channel == NULL) {
+		return;
+	}
+
+	for (int i = 0; i < xfer->cluster_batch; i++) {
+		struct spdk_lvs_xfer_req *req = &xfer->reqs[i];
+
+		if (req->rmt_lvol == rmt_lvol && req->status == XFER_REQ_STATUS_IN_FLIGHT) {
+			spdk_bdev_abort(rmt_lvol->desc, rmt_lvol->channel, req, xfer_abort_cpl, NULL);
+		}
+	}
+}
+
+/*
+ * Mirrors spdk_wait_for_pg_io_cleanup_poller (device-remove path): defers
+ * put_io_channel/free(rmt_lvol) until outstanding_io drains to zero. Additionally clears
+ * xfer->pg[lpg->id], which spdk_delete_rmt_lvol_pg deferred to this poller instead of
+ * clearing immediately, so destroy_xfer_task_tmo cannot free reqs/pdus/rings while this
+ * rmt_lvol's IO is still in flight.
+ */
+static int
+spdk_wait_for_xfer_pg_io_cleanup_poller(void *arg)
+{
+	struct remote_lvol_info *rmt_lvol = arg;
+	struct spdk_lvs_poll_group *lpg = rmt_lvol->group;
+	struct spdk_lvs_xfer *xfer = rmt_lvol->xfer_task;
+
+	if (rmt_lvol->outstanding_io > 0) {
+		return SPDK_POLLER_BUSY;
+	}
+
+	spdk_poller_unregister(&rmt_lvol->cleanup_poller);
+	rmt_lvol->cleanup_poller = NULL;
+
+	if (rmt_lvol->channel) {
+		spdk_put_io_channel(rmt_lvol->channel);
+		if (rmt_lvol->tdev->pg[lpg->id] > 0) {
+			rmt_lvol->tdev->pg[lpg->id]--;
+		}
+	}
+
+	free(rmt_lvol);
+	xfer->pg[lpg->id] = false;
+	return -1;
+}
+
+static void
 spdk_delete_rmt_lvol_pg(void *arg) {
 	struct spdk_lvs_xfer *xfer = arg;
 	struct spdk_lvs_poll_group *lpg = NULL;
 	struct remote_lvol_info *rmt_lvol, *tmp;
+	bool deferred = false;
 
 	TAILQ_FOREACH(lpg, &g_lvs_poll_groups, entry) {
 		if (lpg->thread != spdk_get_thread()) {
@@ -4668,9 +4742,11 @@ spdk_delete_rmt_lvol_pg(void *arg) {
 			continue;
 		}
 
-		// if the poller is already set, it means the channel is in cleaning up progress,
-		// skip it to avoid duplicate cleanup		
+		// if the poller is already set, it means the channel is in cleaning up progress
+		// (racing device-remove teardown, spdk_wait_for_pg_io_cleanup_poller); that poller
+		// clears xfer_task->pg[lpg->id] itself once it completes, so leave it set here.
 		if (rmt_lvol->cleanup_poller) {
+			deferred = true;
 			continue;
 		}
 		SPDK_NOTICELOG("destroy rmt lvol and transfer task ---: 2.\n");
@@ -4678,17 +4754,30 @@ spdk_delete_rmt_lvol_pg(void *arg) {
 		TAILQ_REMOVE(&lpg->rmt_lvols, rmt_lvol, entry);
 		rmt_lvol->status = false;
 
+		if (rmt_lvol->outstanding_io > 0) {
+			SPDK_NOTICELOG("Waiting for %lu I/Os to finish for pg %s (xfer teardown).\n",
+					rmt_lvol->outstanding_io, lpg->thread_name);
+			abort_inflight_reqs_for_rmt_lvol(xfer, rmt_lvol);
+			rmt_lvol->cleanup_poller = spdk_poller_register(
+				spdk_wait_for_xfer_pg_io_cleanup_poller, rmt_lvol, 200000); // check every 200ms
+			deferred = true;
+			break;
+		}
+
 		if (rmt_lvol->channel) {
 			spdk_put_io_channel(rmt_lvol->channel);
 			if (rmt_lvol->tdev->pg[lpg->id] > 0) {
 				rmt_lvol->tdev->pg[lpg->id]--;
 			}
 		}
-		
+
 		free(rmt_lvol);
 		break;
 	}
-	xfer->pg[lpg->id] = false;
+
+	if (!deferred) {
+		xfer->pg[lpg->id] = false;
+	}
 }
 
 static int
