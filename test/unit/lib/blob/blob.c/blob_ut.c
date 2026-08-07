@@ -15,6 +15,7 @@
 #include "thread/thread.c"
 #include "ext_dev.c"
 #include "blob/blobstore.c"
+#include "blob/blob_md_journal.c"
 #include "blob/request.c"
 #include "blob/zeroes.c"
 #include "blob/blob_bs_dev.c"

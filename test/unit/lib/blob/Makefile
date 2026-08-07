@@ -11,8 +11,8 @@ include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 #  rather than on configuration values. All sub-directories are
 #  added to $(DIRS-y) so that they are included in 'make clean'.
 #  $(ALL_DIRS) contains the list of sub-directories to compile.
-DIRS-y = blob.c blob_bdev.c
-ALL_DIRS = blob_bdev.c
+DIRS-y = blob.c blob_bdev.c blob_md_journal.c
+ALL_DIRS = blob_bdev.c blob_md_journal.c
 
 HASH = \#
 CUNIT_VERSION = $(shell echo "$(HASH)include <CUnit/CUnit.h>" | $(CC) $(CFLAGS) -E -dM - | sed -n -e 's/\#define CU_VERSION "\([0-9\.\-]*\).*/\1/p')

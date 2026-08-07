@@ -185,6 +185,9 @@ struct spdk_blob_store {
 	int priority_class; // max priority_class of all constituent blobs to speed up metadata I/Os
 
 	struct spdk_bs_dev		*dev;
+	/* torn-write-protection journal owning the top of the base dev;
+	 * bs->dev is its proxy when set (see blob_md_journal.h) */
+	struct spdk_bs_md_journal	*md_journal;
 
 	struct spdk_bit_array		*used_md_pages;		/* Protected by used_lock */
 	struct spdk_bit_pool		*used_clusters;		/* Protected by used_lock */
@@ -476,7 +479,13 @@ struct spdk_bs_super_block {
 	uint64_t	size; /* size of blobstore in bytes */
 	uint32_t	io_unit_size; /* Size of io unit in bytes */
 
-	uint8_t		reserved[4000];
+	/* Torn-write-protection md journal (blob_md_journal.h): 1 iff the
+	 * store was formatted with the reserved ring region at the top of
+	 * the device. Legacy stores have 0 here and load unchanged. The
+	 * flag never changes over the lifetime of a store. */
+	uint32_t	md_journal;
+
+	uint8_t		reserved[3996];
 	uint32_t	crc;
 };
 SPDK_STATIC_ASSERT(sizeof(struct spdk_bs_super_block) == 0x1000, "Invalid super block size");
