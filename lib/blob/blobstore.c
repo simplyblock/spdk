@@ -1749,7 +1749,13 @@ blob_load_snapshot_cpl(void *cb_arg, struct spdk_blob *snapshot, int bserrno)
 		spdk_bit_array_clear(blob->bs->used_blobids, page_idx);
 		blob->parent_id = SPDK_BLOBID_INVALID;
 		blob->back_bs_dev = NULL;
+		enum spdk_blob_state old_state = blob->state;
+		bool  md_ro = blob->md_ro;
+		blob->md_ro = false;
+		blob->state = SPDK_BLOB_STATE_CLEAN;
 		blob_remove_xattr(blob, BLOB_SNAPSHOT, true);
+		blob->state = old_state;
+		blob->md_ro = md_ro;
 		bserrno = 0;
 		SPDK_ERRLOG("Snapshot fail\n");
 	}
@@ -10874,6 +10880,44 @@ bs_delete_close_cpl(void *cb_arg, int bserrno)
 	bs_sequence_finish(seq, bserrno);
 }
 
+// static void
+// bs_print_snapshot_tree(struct spdk_blob_store *bs)
+// {
+//     struct spdk_blob_list *snapshot_entry;
+//     struct spdk_blob_list *clone_entry;
+//     struct spdk_blob *snapshot_blob;
+//     struct spdk_blob *clone_blob;
+
+//     SPDK_NOTICELOG("========== SNAPSHOT TREE BEGIN ==========\n");
+
+//     TAILQ_FOREACH(snapshot_entry, &bs->snapshots, link) {
+//         snapshot_blob = blob_lookup(bs, snapshot_entry->id);
+
+//         SPDK_NOTICELOG("SNAPSHOT id=0x%" PRIx64" clone_count=%" PRIu64"   parent_id=0x%" PRIx64 " open_ref=%u\n",
+//             snapshot_entry->id, snapshot_entry->clone_count,
+//             snapshot_blob ? snapshot_blob->parent_id : SPDK_BLOBID_INVALID, snapshot_blob->open_ref);
+
+//         uint32_t actual_clone_count = 0;
+
+//         TAILQ_FOREACH(clone_entry, &snapshot_entry->clones, link) {
+//             clone_blob = blob_lookup(bs, clone_entry->id);
+//             actual_clone_count++;
+
+//             SPDK_NOTICELOG("    CLONE id=0x%" PRIx64" parent_id=0x%" PRIx64" open_ref=%u\n",
+//                 clone_entry->id,
+//                 clone_blob ? clone_blob->parent_id : SPDK_BLOBID_INVALID,
+//                 clone_blob ? clone_blob->open_ref :0);
+//         }
+
+//         if (actual_clone_count != snapshot_entry->clone_count) {
+//             SPDK_ERRLOG("SNAPSHOT TREE ERROR: snapshot=0x%" PRIx64" clone_count=%" PRIu64"  actual_count=%u\n",
+//                 snapshot_entry->id, snapshot_entry->clone_count, actual_clone_count);
+//         }
+//     }
+
+//     SPDK_NOTICELOG("=========== SNAPSHOT TREE END ===========\n");
+// }
+
 static void
 bs_delete_persist_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
@@ -10897,6 +10941,7 @@ bs_delete_persist_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	 *  points into code that touches the blob->open_ref count
 	 *  and the blobstore's blob list.
 	 */
+	// bs_print_snapshot_tree(blob->bs);
 	spdk_blob_close(blob, bs_delete_close_cpl, seq);
 }
 
@@ -11419,6 +11464,70 @@ struct clone_update_ctx {
 	struct spdk_bs_dev *back_bs_dev;
 };
 
+static bool
+bs_branch_contains_blob(struct spdk_blob_store *bs, spdk_blob_id root_id, spdk_blob_id target_id, uint32_t depth)
+{
+	struct spdk_blob_list *snapshot_entry;
+	struct spdk_blob_list *clone_entry;
+
+	if (root_id == target_id) {
+		return true;
+	}
+
+	/* Protect against corrupted loops. */
+	if (depth >= 1000) {
+		SPDK_ERRLOG("Snapshot tree depth exceeded while searching root=0x%" PRIx64 " target=0x%" PRIx64 "\n", root_id, target_id);
+		return false;
+	}
+
+	/*
+	 * If root_id is also a snapshot, inspect its children.
+	 */
+	snapshot_entry = bs_get_snapshot_entry(bs, root_id);
+	if (!snapshot_entry) {
+		return false;
+	}
+
+	TAILQ_FOREACH(clone_entry, &snapshot_entry->clones, link) {
+		if (clone_entry->id == target_id) {
+			return true;
+		}
+
+		if (bs_branch_contains_blob(bs, clone_entry->id, target_id, depth + 1)) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static struct spdk_blob_list *
+bs_find_branch_to_replace(struct spdk_blob_store *bs, struct spdk_blob_list *parent_entry, spdk_blob_id target_id)
+{
+	struct spdk_blob_list *entry;
+
+	if (!parent_entry) {
+		return NULL;
+	}
+
+	TAILQ_FOREACH(entry, &parent_entry->clones, link) {
+
+		/* Target is already a direct child. */
+		if (entry->id == target_id) {
+			return entry;
+		}
+
+		/*
+		 * This direct child represents the branch
+		 * that eventually reaches target_id.
+		 */
+		if (bs_branch_contains_blob(bs, entry->id, target_id, 0)) {
+			return entry;
+		}
+	}
+	return NULL;
+}
+
 static void
 clone_update_delete_sync_cpl(void *cb_arg, int lvolerrno)
 {
@@ -11426,6 +11535,7 @@ clone_update_delete_sync_cpl(void *cb_arg, int lvolerrno)
 	struct spdk_blob_list *snapshot_entry = NULL;
 	struct spdk_blob_list *clone_entry = NULL;
 	struct spdk_blob *clone = ctx->clone;
+	bool find = false;
 	clone->md_ro = true;
 	clone->state = SPDK_BLOB_STATE_CLEAN;
 	if (lvolerrno < 0) {
@@ -11435,27 +11545,78 @@ clone_update_delete_sync_cpl(void *cb_arg, int lvolerrno)
 	SPDK_NOTICELOG("update clone blob for async lvol delete blobid 0x%" PRIx64 " done.\n", clone->id);
 
 	if (ctx->parent_id != clone->parent_id && ctx->parent_id != SPDK_BLOBID_INVALID) {
-		if (ctx->back_bs_dev != NULL) {
-			free(ctx->back_bs_dev);
-		}
-
 		snapshot_entry = bs_get_snapshot_entry(clone->bs, ctx->parent_id);
 		if (snapshot_entry) {
 			TAILQ_FOREACH(clone_entry, &snapshot_entry->clones, link) {
 				if (clone_entry->id == clone->id) {
+					find = true;
 					break;
 				}
-				clone_entry = NULL;
 			}
 		}
 
-		if (clone_entry) {
+		if (find && clone_entry) {
 			TAILQ_REMOVE(&snapshot_entry->clones, clone_entry, link);
 			snapshot_entry->clone_count--;
 			free(clone_entry);
 		}
+
+		struct spdk_blob *parent_blob = blob_lookup(clone->bs, ctx->parent_id);
+		if (ctx->back_bs_dev != NULL && (parent_blob && snapshot_entry && parent_blob->open_ref > snapshot_entry->clone_count + 1 )) {
+			SPDK_NOTICELOG( "Close parent 0x%" PRIx64 " open refrence %u, clone count %lu\n", parent_blob->id, parent_blob->open_ref, snapshot_entry->clone_count);
+			ctx->back_bs_dev->destroy(ctx->back_bs_dev);
+		} else {
+			free(ctx->back_bs_dev);
+		}
 	}
 
+	if (clone->parent_id != SPDK_BLOBID_INVALID && ctx->parent_id != clone->parent_id) {
+		struct spdk_blob_list *new_parent_entry;
+		struct spdk_blob_list *stale_entry;
+		struct spdk_blob_list *new_clone_entry;
+
+		new_parent_entry = bs_get_snapshot_entry(clone->bs, clone->parent_id);
+
+		if (!new_parent_entry) {
+			SPDK_ERRLOG("New parent snapshot 0x%" PRIx64" not found for clone 0x%" PRIx64 "\n", clone->parent_id, clone->id);
+			goto out;
+		}
+
+		TAILQ_FOREACH(new_clone_entry, &new_parent_entry->clones, link) {
+			if (new_clone_entry->id == clone->id) {
+				SPDK_NOTICELOG( "Clone 0x%" PRIx64" already exists under new parent ""0x%" PRIx64 "\n", clone->id, clone->parent_id);
+				goto out;
+			}
+		}
+
+		stale_entry = bs_find_branch_to_replace( clone->bs, new_parent_entry, clone->id);
+		if (stale_entry) {
+			SPDK_NOTICELOG("Replacing stale branch 0x%" PRIx64 " with clone 0x%" PRIx64 " under new parent 0x%" PRIx64 "\n",
+				stale_entry->id, clone->id, clone->parent_id);
+			stale_entry->id = clone->id;
+
+		} else {
+			new_clone_entry = calloc(1, sizeof(*new_clone_entry));
+
+			if (!new_clone_entry) {
+				SPDK_ERRLOG("Could not allocate clone entry\n");
+				goto out;
+			}
+
+			new_clone_entry->id = clone->id;
+			struct spdk_blob *parent_blob = blob_lookup(clone->bs, new_parent_entry->id);
+			if (parent_blob) {
+				parent_blob->open_ref++;
+			}
+			TAILQ_INSERT_TAIL(&new_parent_entry->clones, new_clone_entry, link);
+			new_parent_entry->clone_count++;
+
+			SPDK_NOTICELOG("Added clone 0x%" PRIx64" under new parent 0x%" PRIx64 "\n", clone->id, clone->parent_id);
+		}
+	}
+
+out:
+	// bs_print_snapshot_tree(clone->bs);
 	free(ctx);
 }
 
@@ -11636,7 +11797,9 @@ spdk_bs_delete_blob_non_leader(struct spdk_blob_store *bs, struct spdk_blob *blo
 				blob_freeze_on_failover(clone);
 				spdk_blob_update_on_failover(clone, clone_update_delete_sync_cpl, ctx);
 			}
+			return 0;
 		}
+		// bs_print_snapshot_tree(bs);
 	} else {
 		/* This blob does not have any clones - just remove it */
 		bs_blob_list_remove(blob);
@@ -11691,6 +11854,7 @@ spdk_bs_delete_blob_non_leader(struct spdk_blob_store *bs, struct spdk_blob *blo
 
 		spdk_spin_unlock(&bs->used_lock);
 		blob->back_bs_dev = NULL;
+		// bs_print_snapshot_tree(bs);
 		blob_free(blob);
 	}
 	return 0;
