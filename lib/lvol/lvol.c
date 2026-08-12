@@ -6733,8 +6733,8 @@ spdk_lvol_batch_transfer(uint32_t cluster_batch, enum xfer_type type, struct spd
 			list_task[i]->list_task[j] = list_task[j];
 		}
 	}
-
-	TAILQ_INSERT_TAIL(&g_lvs_xfer_tasks, list_task[0], entry);
+	list_task[0]->tmo_poller =  spdk_poller_register(spdk_lvol_transfer_delay, list_task[0], 100000);// 50ms
+	// TAILQ_INSERT_TAIL(&g_lvs_xfer_tasks, list_task[0], entry);
 	return 0;
 error:
 	if (created_tasks <= 0) {
