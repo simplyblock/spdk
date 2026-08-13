@@ -4236,7 +4236,7 @@ fragment_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 
 	/* if this was the last fragment, do final work and recycle req */
 	if (req->fragments_outstanding == 0) {
-		// SPDK_NOTICELOG("3- Remote write I/O offset: %" PRIu64 " len: %" PRIu64 " frag: %d t %p\n", req->offset, req->len, req->fragments_outstanding, spdk_get_thread());
+		SPDK_NOTICELOG("3- Remote write I/O src: %" PRIu64 ", dst: %" PRIu64 " len: %" PRIu64 " frag: %d t %p\n", req->offset, req->dst_offset, req->len, req->fragments_outstanding, spdk_get_thread());
 		/* final aggregated status */
 		int st = req->aggregated_status;
 		if (st != 0) {
@@ -4995,7 +4995,7 @@ xfer_replication(struct spdk_lvs_xfer *xfer) {
 					req->len = xfer->page_per_cluster; // 2MB
 					req->action = REQ_ACTION_COPY_BACKUP;
 					req->status = XFER_REQ_STATUS_READY;
-
+					SPDK_NOTICELOG("1- Remote write I/O src: %" PRIu64 ", dst: %" PRIu64 " len: %" PRIu64 "\n", req->offset, req->dst_offset, req->len);
 					/* enqueue for transfer; if ready_ring is full, return req to free_ring or retry */
 					if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
 						SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
