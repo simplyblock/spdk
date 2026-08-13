@@ -332,6 +332,108 @@ invalid:
 }
 
 static void
+load_one_lvol_from_blob(void *cb_arg, struct spdk_blob *blob, int lvolerrno)
+{
+	struct spdk_lvs_with_handle_req *req = cb_arg;
+	struct spdk_lvol_store *lvs = req->lvol_store;
+	struct spdk_blob_store *bs = lvs->blobstore;
+	struct spdk_lvol *lvol, *tmp;
+	spdk_blob_id blob_id;
+	const char *attr;
+	size_t value_len;
+	int rc;
+
+	if (lvolerrno == -ENOENT) {
+		/* Finished iterating */
+		if (req->lvserrno == 0) {
+			lvs->load_esnaps = true;
+			req->cb_fn(req->cb_arg, lvs, req->lvserrno);
+			free(req);
+		} else {
+			TAILQ_FOREACH_SAFE(lvol, &lvs->lvols, link, tmp) {
+				TAILQ_REMOVE(&lvs->lvols, lvol, link);
+				lvol_free(lvol);
+			}
+			lvs_free(lvs);
+			spdk_bs_unload(bs, bs_unload_with_error_cb, req);
+		}
+		return;
+	} else if (lvolerrno < 0) {
+		SPDK_ERRLOG("Failed to fetch blobs list\n");
+		req->lvserrno = lvolerrno;
+		return;
+	}
+
+	blob_id = spdk_blob_get_id(blob);
+
+	if (blob_id == lvs->super_blob_id) {
+		SPDK_INFOLOG(lvol, "found superblob %"PRIu64"\n", (uint64_t)blob_id);
+		return;
+	}
+
+	lvol = calloc(1, sizeof(*lvol));
+	if (!lvol) {
+		SPDK_ERRLOG("Cannot alloc memory for lvol base pointer\n");
+		req->lvserrno = -ENOMEM;
+		return;
+	}
+
+	/*
+	 * Do not store a reference to blob now because spdk_bs_iter_next() will close it.
+	 * Storing blob_id for future lookups is fine.
+	 */
+	lvol->blob_id = blob_id;
+	lvol->lvol_store = lvs;
+	lvol->map_id = spdk_blob_get_map_id(blob);
+	TAILQ_INIT(&lvol->redirect_migrate_io);
+
+	rc = spdk_blob_get_xattr_value(blob, "uuid", (const void **)&attr, &value_len);
+	if (rc != 0 || value_len != SPDK_UUID_STRING_LEN || attr[SPDK_UUID_STRING_LEN - 1] != '\0' ||
+	    spdk_uuid_parse(&lvol->uuid, attr) != 0) {
+		SPDK_INFOLOG(lvol, "Missing or corrupt lvol uuid\n");
+		spdk_uuid_set_null(&lvol->uuid);
+	}
+	spdk_uuid_fmt_lower(lvol->uuid_str, sizeof(lvol->uuid_str), &lvol->uuid);
+
+	if (!spdk_uuid_is_null(&lvol->uuid)) {
+		snprintf(lvol->unique_id, sizeof(lvol->unique_id), "%s", lvol->uuid_str);
+	} else {
+		spdk_uuid_fmt_lower(lvol->unique_id, sizeof(lvol->unique_id), &lvol->lvol_store->uuid);
+		value_len = strlen(lvol->unique_id);
+		snprintf(lvol->unique_id + value_len, sizeof(lvol->unique_id) - value_len, "_%"PRIu64,
+			 (uint64_t)blob_id);
+	}
+
+	rc = spdk_blob_get_xattr_value(blob, "name", (const void **)&attr, &value_len);
+	if (rc != 0 || value_len > SPDK_LVOL_NAME_MAX) {
+		SPDK_ERRLOG("Cannot assign lvol name\n");
+		lvol_free(lvol);
+		req->lvserrno = -EINVAL;
+		return;
+	}
+
+	snprintf(lvol->name, sizeof(lvol->name), "%s", attr);
+
+	lvs->lvol_map.lvol[lvol->map_id] = lvol;
+	TAILQ_INSERT_TAIL(&lvs->lvols, lvol, link);
+
+	lvs->lvol_count++;
+
+	SPDK_INFOLOG(lvol, "added lvol %s (%s)\n", lvol->unique_id, lvol->uuid_str);
+
+	return;
+}
+
+static void
+load_lvols_from_loaded_blobs(void *cb_arg, struct spdk_blob *blob, int lvolerrno)
+{
+	struct spdk_lvs_with_handle_req *req = cb_arg;
+	(void)blob;
+	(void)lvolerrno;
+	spdk_bs_for_each_loaded_blob(req->lvol_store->blobstore, load_one_lvol_from_blob, req);
+}
+
+static void
 lvs_get_super_blobid_on_examine(void *cb_arg, spdk_blob_id blobid, int lvolerrno) {
 	struct spdk_lvs_with_handle_req *req = (struct spdk_lvs_with_handle_req *)cb_arg;
 	struct spdk_lvol_store *lvs = req->lvol_store;
@@ -345,7 +447,7 @@ lvs_get_super_blobid_on_examine(void *cb_arg, spdk_blob_id blobid, int lvolerrno
 		return;
 	}
 
-	spdk_bs_open_blob_without_reference(bs, blobid, NULL, load_next_lvol, req);
+	spdk_bs_open_blob_without_reference(bs, blobid, NULL, load_lvols_from_loaded_blobs, req);
 }
 
 static void

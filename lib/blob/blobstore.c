@@ -47,12 +47,6 @@ static void blob_freeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, 
 
 static void bs_shallow_copy_cluster_find_next(void *cb_arg);
 
-void spdk_bs_iter_next_without_close(struct spdk_blob_store *bs, struct spdk_blob *blob,
-		  spdk_blob_op_with_handle_complete cb_fn, void *cb_arg);
-
-void spdk_bs_iter_next_without_close_with_id(struct spdk_blob_store *bs, spdk_blob_id blobid,
-		  spdk_blob_op_with_handle_complete cb_fn, void *cb_arg);
-
 static void bs_delete_open_cpl(void *cb_arg, struct spdk_blob *blob, int bserrno);
 
 /*
@@ -13028,6 +13022,67 @@ bs_iter_cpl(void *cb_arg, struct spdk_blob *_blob, int bserrno)
 	id = bs_page_to_blobid(ctx->page_num);
 	SPDK_INFOLOG(blob, "====  Starting to open blob id 0x%" PRIx64 " and the page number is 0x%" PRIx64 "\n", id, ctx->page_num);
 	spdk_bs_open_blob(bs, id, bs_iter_cpl, ctx);
+}
+
+int
+spdk_bs_for_each_loaded_blob(struct spdk_blob_store *bs,
+			     spdk_bs_loaded_blob_fn fn, void *cb_arg)
+{
+	struct spdk_blob *blob;
+	spdk_blob_id blobid;
+	uint32_t page;
+	uint32_t capacity;
+
+	if (bs == NULL || fn == NULL) {
+		return -EINVAL;
+	}
+
+	assert(spdk_get_thread() == bs->md_thread);
+
+	capacity = spdk_bit_array_capacity(bs->used_blobids);
+
+	page = spdk_bit_array_find_first_set(bs->used_blobids, 0);
+
+	while (page < capacity) {
+		blobid = bs_page_to_blobid(page);
+
+		blob = blob_lookup(bs, blobid);
+		if (blob == NULL) {
+			SPDK_ERRLOG("Blob 0x%" PRIx64" is present in used_blobids but not loaded\n", blobid);
+
+			/*
+			 * Record error.
+			 */
+			fn(cb_arg, NULL, -EINVAL);
+
+			/*
+			 * End iteration and trigger normal cleanup.
+			 */
+			fn(cb_arg, NULL, -ENOENT);
+
+			return -ENOENT;
+		}
+
+		SPDK_INFOLOG(blob, "Loading blob id 0x%" PRIx64" into lvol open_ref: %" PRIu32 "\n",
+			blob->id, blob->open_ref);
+
+		fn(cb_arg, blob, 0);
+
+		if (page == UINT32_MAX) {
+			break;
+		}
+		/*
+		 * Advance to next loaded blob.
+		 */
+		page = spdk_bit_array_find_first_set(bs->used_blobids, page + 1);
+	}
+
+	/*
+	 * Normal end of iteration.
+	 */
+	fn(cb_arg, NULL, -ENOENT);
+
+	return 0;
 }
 
 void
