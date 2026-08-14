@@ -6058,7 +6058,7 @@ bs_recover(struct spdk_bs_load_ctx *ctx)
 	ctx->bs->used_clusters = spdk_bit_pool_create_from_array(ctx->used_clusters);
 
 	set_count = spdk_bit_array_count_set(ctx->bs->used_blobids);
-	count = spdk_min(set_count, 1000U);
+	count = spdk_min(set_count, 3000U);
 
 	struct spdk_bs_load_ctx *ctxs;
 	ctxs = calloc(count, sizeof(*ctxs));
