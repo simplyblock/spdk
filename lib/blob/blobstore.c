@@ -5996,7 +5996,7 @@ bs_load_blob_iter_on_examine(struct spdk_bs_load_ctx *ctx)
 
 	id = bs_page_to_blobid(ctx->page_index);
 
-	SPDK_INFOLOG(blob,"Starting to open blob 0x%" PRIx64" page 0x%" PRIx32 "\n", id, ctx->page_index);
+	// SPDK_INFOLOG(blob,"Starting to open blob 0x%" PRIx64" page 0x%" PRIx32 "\n", id, ctx->page_index);
 
 	spdk_bs_open_blob_on_examine(bs, id, bs_load_iter_on_examine, ctx);
 }
@@ -12323,7 +12323,7 @@ void
 spdk_bs_open_blob_on_examine(struct spdk_blob_store *bs, spdk_blob_id blobid,
 		  spdk_blob_op_with_handle_complete cb_fn, void *cb_arg)
 {
-	SPDK_NOTICELOG("Opening blob snap 0x%" PRIx64 " \n", blobid);
+	// SPDK_NOTICELOG("Opening blob snap 0x%" PRIx64 " \n", blobid);
 	bs_open_blob_on_failover(bs, blobid, SPDK_BLOB_LOAD_EXAMINE, NULL, cb_fn, cb_arg);
 }
 
@@ -13063,8 +13063,8 @@ spdk_bs_for_each_loaded_blob(struct spdk_blob_store *bs,
 			return -ENOENT;
 		}
 
-		SPDK_INFOLOG(blob, "Loading blob id 0x%" PRIx64" into lvol open_ref: %" PRIu32 "\n",
-			blob->id, blob->open_ref);
+		// SPDK_INFOLOG(blob, "Loading blob id 0x%" PRIx64" into lvol open_ref: %" PRIu32 "\n",
+		// 	blob->id, blob->open_ref);
 
 		fn(cb_arg, blob, 0);
 

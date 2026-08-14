@@ -289,6 +289,7 @@ load_next_lvol(void *cb_arg, struct spdk_blob *blob, int lvolerrno)
 	 * Storing blob_id for future lookups is fine.
 	 */
 	lvol->blob_id = blob_id;
+	lvol->blob = blob;
 	lvol->lvol_store = lvs;
 	lvol->map_id = spdk_blob_get_map_id(blob);
 	lvs->lvol_map.lvol[lvol->map_id] = lvol;
@@ -383,6 +384,7 @@ load_one_lvol_from_blob(void *cb_arg, struct spdk_blob *blob, int lvolerrno)
 	 * Storing blob_id for future lookups is fine.
 	 */
 	lvol->blob_id = blob_id;
+	lvol->blob = blob;
 	lvol->lvol_store = lvs;
 	lvol->map_id = spdk_blob_get_map_id(blob);
 	TAILQ_INIT(&lvol->redirect_migrate_io);
@@ -418,9 +420,7 @@ load_one_lvol_from_blob(void *cb_arg, struct spdk_blob *blob, int lvolerrno)
 	TAILQ_INSERT_TAIL(&lvs->lvols, lvol, link);
 
 	lvs->lvol_count++;
-
-	SPDK_INFOLOG(lvol, "added lvol %s (%s)\n", lvol->unique_id, lvol->uuid_str);
-
+	// SPDK_INFOLOG(lvol, "added lvol %s (%s)\n", lvol->unique_id, lvol->uuid_str);	
 	return;
 }
 
@@ -430,7 +430,9 @@ load_lvols_from_loaded_blobs(void *cb_arg, struct spdk_blob *blob, int lvolerrno
 	struct spdk_lvs_with_handle_req *req = cb_arg;
 	(void)blob;
 	(void)lvolerrno;
+	SPDK_NOTICELOG("Starting to load lvols from loaded blobs\n");
 	spdk_bs_for_each_loaded_blob(req->lvol_store->blobstore, load_one_lvol_from_blob, req);
+	SPDK_NOTICELOG("Finished loading lvols from loaded blobs\n");
 }
 
 static void

@@ -2906,7 +2906,7 @@ end:
 		return;
 	}
 	if (lvs->lvols_opened >= lvs->lvol_count) {
-		SPDK_INFOLOG(vbdev_lvol, "Opening lvols finished\n");
+		SPDK_NOTICELOG("Opening lvols finished\n");
 		_vbdev_lvs_examine_done(req, 0);
 	}
 }
@@ -3013,7 +3013,9 @@ _vbdev_lvs_examine_cb(void *arg, struct spdk_lvol_store *lvol_store, int lvserrn
 	} else {
 		/* Open all lvols */
 		TAILQ_FOREACH_SAFE(lvol, &lvol_store->lvols, link, tmp) {
-			spdk_lvol_open(lvol, _vbdev_lvs_examine_finish, ori_req);
+			// spdk_lvol_open(lvol, _vbdev_lvs_examine_finish, ori_req);
+			lvol->ref_count++;
+			_vbdev_lvs_examine_finish(ori_req, lvol, 0);
 		}
 	}
 
