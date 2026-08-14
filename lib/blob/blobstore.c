@@ -1888,8 +1888,13 @@ blob_load_backing_dev(spdk_bs_sequence_t *seq, void *cb_arg)
 					  		blob_load_snapshot_cpl, ctx);
 				}
 			} else {
-				spdk_bs_open_blob(blob->bs, blob->parent_id,
+				if (blob->examine_flag) {
+					spdk_bs_open_blob_on_examine(blob->bs, blob->parent_id,
 					  	blob_load_snapshot_cpl, ctx);
+				} else {
+					spdk_bs_open_blob(blob->bs, blob->parent_id,
+						  	blob_load_snapshot_cpl, ctx);
+				}
 			}
 			return;
 		} else {
@@ -12057,6 +12062,10 @@ bs_open_blob_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
 	struct spdk_blob *blob = cb_arg;
 	struct spdk_blob *existing;
+
+	if (blob->examine_flag) {
+		blob->examine_flag = false;
+	}
 
 	if (bserrno != 0) {
 		blob_free(blob);
