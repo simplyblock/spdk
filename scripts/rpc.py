@@ -2190,12 +2190,14 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
         print_json(rpc.lvol.bdev_lvol_s3_backup(args.client,
                                              s3_id=args.s3_id,
                                              snapshot_names=snapshots,
+                                             s3_bdev=args.s3_bdev,
                                              cluster_batch=args.cluster_batch))
 
     p = subparsers.add_parser('bdev_lvol_s3_backup', help='Back up one or more lvol snapshots to S3')
     p.add_argument('-i', '--s3-id', help='Destination S3 backup ID', type=int)
+    p.add_argument('-d', '--s3-bdev', help='S3 bdev to write through', required=True)
     p.add_argument('-b', '--cluster-batch', help='Number of cluster requests queued per poller iteration (default: 16)', type=int)
-    p.add_argument('-s', '--snapshots', help='snapshots name, whitespace separated list in quotes', required=True)
+    p.add_argument('-s', '--snapshots', help='snapshot names, NEWEST FIRST, whitespace separated list in quotes', required=True)
     p.set_defaults(func=bdev_lvol_s3_backup)
     
     def bdev_lvol_s3_merge(args):
@@ -2204,13 +2206,15 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
                                              lvs_name=args.lvs_name,
                                              s3_id=args.s3_id,
                                              old_s3_id=args.old_s3_id,
+                                             s3_bdev=args.s3_bdev,
                                              cluster_batch=args.cluster_batch))
 
     p = subparsers.add_parser('bdev_lvol_s3_merge', help='Merge data from one S3 backup ID into another')
     p.add_argument('-u', '--uuid', help='lvol store UUID')
     p.add_argument('-l', '--lvs-name', help='lvol store name')
     p.add_argument('-i', '--s3_id', help='Destination S3 backup ID', type=int)
-    p.add_argument('-o', '--old_s3_id', help='Source S3 backup ID', type=int)    
+    p.add_argument('-o', '--old_s3_id', help='Source S3 backup ID', type=int)
+    p.add_argument('-d', '--s3-bdev', help='S3 bdev holding both backups', required=True)
     p.add_argument('-b', '--cluster-batch', help='Number of cluster requests queued per poller iteration (default: 16)', type=int)
     p.set_defaults(func=bdev_lvol_s3_merge)
     
@@ -2220,15 +2224,15 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
             s3_ids.append(int(u))
         print_json(rpc.lvol.bdev_lvol_s3_recovery(args.client,
                                              lvol_name=args.lvol_name,
-                                             offset=args.offset,
+                                             s3_bdev=args.s3_bdev,
                                              cluster_batch=args.cluster_batch,
                                              s3_ids=s3_ids))
 
     p = subparsers.add_parser('bdev_lvol_s3_recovery', help='Recover an lvol from one or more S3 backup IDs')
     p.add_argument('-n', '--lvol_name', help='Target lvol name to recover', required=True)
-    p.add_argument('-o', '--offset', help='Starting lvol offset to transfer: default 0', type=int)
+    p.add_argument('-d', '--s3-bdev', help='S3 bdev to read from', required=True)
     p.add_argument('-b', '--cluster-batch', help='Transfering lvol with batch reqs: default 16 clusters', type=int)
-    p.add_argument('-i', '--s3-ids', help='S3 backup IDs, whitespace-separated list in quotes (e.g. "12 13 20")', required=True)
+    p.add_argument('-i', '--s3-ids', help='S3 backup IDs, NEWEST FIRST, whitespace-separated list in quotes (e.g. "20 13 12")', required=True)
     p.set_defaults(func=bdev_lvol_s3_recovery)
 
     def bdev_lvol_s3_bdev(args):

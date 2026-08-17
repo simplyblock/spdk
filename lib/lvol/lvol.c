@@ -6246,14 +6246,28 @@ spdk_check_rmt_bdev(const char *name, struct spdk_lvol_store *lvs)
 	return NULL;
 }
 
+/*
+ * Find the named S3 transfer device on this lvolstore.
+ *
+ * The caller names the device rather than this picking one, because an
+ * lvolstore can carry several: its own backup bucket, plus whatever a restore
+ * has attached for a bucket belonging to another cluster. This used to return
+ * the first entry with is_s3 set, which is ambiguous exactly when it matters --
+ * during a restore from a foreign bucket, when two are attached.
+ */
 static struct spdk_transfer_dev *
-spdk_find_s3_bdev(struct spdk_lvol_store *lvs)
+spdk_find_s3_bdev(struct spdk_lvol_store *lvs, const char *name)
 {
 	struct spdk_transfer_dev *tdev;
 	bool bdev_found = false;
+
+	if (name == NULL) {
+		return NULL;
+	}
+
 	pthread_mutex_lock(&g_lvol_stores_mutex);
 	TAILQ_FOREACH(tdev, &lvs->transfer_devs, entry) {
-		if (tdev->is_s3) {
+		if (tdev->is_s3 && strcmp(tdev->bdev_name, name) == 0) {
 			bdev_found = true;
 			break;
 		}
@@ -6757,7 +6771,8 @@ error:
 // bcs we cannot open the same tdev for two lvolstore at the same time
 int
 spdk_lvol_s3_backup(struct spdk_lvol *lvol, uint32_t cluster_batch,
-				struct spdk_lvol **chain_snapshots, int num_snapshots, uint32_t s3_id) {
+				struct spdk_lvol **chain_snapshots, int num_snapshots, uint32_t s3_id,
+				const char *s3_bdev) {
 	struct spdk_transfer_dev *tdev;
 	struct spdk_lvs_xfer *xfer, *task;
 	int rc;
@@ -6769,10 +6784,11 @@ spdk_lvol_s3_backup(struct spdk_lvol *lvol, uint32_t cluster_batch,
 		}
 	}
 
-	tdev = spdk_find_s3_bdev(lvol->lvol_store);
+	tdev = spdk_find_s3_bdev(lvol->lvol_store, s3_bdev);
 	if (!tdev) {
-		SPDK_ERRLOG("Cannot find S3 transfer device.\n");
-		return -EINVAL;
+		SPDK_ERRLOG("No S3 transfer device named %s on this lvolstore.\n",
+			    s3_bdev ? s3_bdev : "(null)");
+		return -ENODEV;
 	}
 
 	task = calloc(1, sizeof(*task));
@@ -6826,7 +6842,8 @@ spdk_lvol_s3_backup(struct spdk_lvol *lvol, uint32_t cluster_batch,
 }
 
 int
-spdk_lvol_s3_merge(struct spdk_lvol_store *lvs, uint32_t s3_id, uint32_t old_s3_id, uint32_t cluster_batch) {
+spdk_lvol_s3_merge(struct spdk_lvol_store *lvs, uint32_t s3_id, uint32_t old_s3_id,
+				uint32_t cluster_batch, const char *s3_bdev) {
 	struct spdk_transfer_dev *tdev;
 	struct spdk_lvs_xfer *xfer, *task;
 	int rc;
@@ -6838,10 +6855,11 @@ spdk_lvol_s3_merge(struct spdk_lvol_store *lvs, uint32_t s3_id, uint32_t old_s3_
 		}
 	}
 
-	tdev = spdk_find_s3_bdev(lvs);
+	tdev = spdk_find_s3_bdev(lvs, s3_bdev);
 	if (!tdev) {
-		SPDK_ERRLOG("Cannot find S3 transfer device.\n");
-		return -EINVAL;
+		SPDK_ERRLOG("No S3 transfer device named %s on this lvolstore.\n",
+			    s3_bdev ? s3_bdev : "(null)");
+		return -ENODEV;
 	}
 
 	task = calloc(1, sizeof(*task));
@@ -6875,7 +6893,8 @@ spdk_lvol_s3_merge(struct spdk_lvol_store *lvs, uint32_t s3_id, uint32_t old_s3_
 
 int
 spdk_lvol_s3_recovery(struct spdk_lvol *lvol, uint32_t cluster_batch,
-				uint32_t *chain_s3_ids, uint32_t num_s3_ids) {
+				uint32_t *chain_s3_ids, uint32_t num_s3_ids,
+				const char *s3_bdev) {
 	struct spdk_transfer_dev *tdev;
 	struct spdk_lvs_xfer *xfer, *task;
 	int rc;
@@ -6887,10 +6906,11 @@ spdk_lvol_s3_recovery(struct spdk_lvol *lvol, uint32_t cluster_batch,
 		}
 	}
 
-	tdev = spdk_find_s3_bdev(lvol->lvol_store);
+	tdev = spdk_find_s3_bdev(lvol->lvol_store, s3_bdev);
 	if (!tdev) {
-		SPDK_ERRLOG("Cannot find S3 transfer device.\n");
-		return -EINVAL;
+		SPDK_ERRLOG("No S3 transfer device named %s on this lvolstore.\n",
+			    s3_bdev ? s3_bdev : "(null)");
+		return -ENODEV;
 	}
 
 	task = calloc(1, sizeof(*task));

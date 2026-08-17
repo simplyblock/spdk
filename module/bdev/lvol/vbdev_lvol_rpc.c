@@ -3188,6 +3188,7 @@ struct rpc_bdev_lvol_s3_backup {
 	// uint64_t offset;
 	uint32_t cluster_batch;
 	uint32_t s3_id;	
+	char *s3_bdev;
 	struct rpc_bdev_lvol_s3_backup_snapshots snapshot_names;
 };
 
@@ -3204,6 +3205,7 @@ decode_snapshot_names(const struct spdk_json_val *val, void *out)
 
 static void 
 free_rpc_bdev_lvol_s3_backup(struct rpc_bdev_lvol_s3_backup *req) {
+	free(req->s3_bdev);
 	for (size_t i = 0; i < req->snapshot_names.num; i++) {
 		free(req->snapshot_names.names[i]);
 	}
@@ -3213,6 +3215,10 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_s3_backup_decoders[] 
 	// {"offset", offsetof(struct rpc_bdev_lvol_s3_backup, offset), spdk_json_decode_uint64},
 	{"cluster_batch", offsetof(struct rpc_bdev_lvol_s3_backup, cluster_batch), spdk_json_decode_uint32, true},
 	{"s3_id", offsetof(struct rpc_bdev_lvol_s3_backup, s3_id), spdk_json_decode_uint32},
+	/* Required: an lvolstore may carry several S3 devices, and defaulting to
+	 * "the first" is ambiguous exactly during a restore from a foreign bucket.
+	 * A missing parameter is rejected by the decoder rather than guessed. */
+	{"s3_bdev", offsetof(struct rpc_bdev_lvol_s3_backup, s3_bdev), spdk_json_decode_string},
 	{"snapshot_names", offsetof(struct rpc_bdev_lvol_s3_backup, snapshot_names), decode_snapshot_names},
 };
 
@@ -3223,7 +3229,10 @@ rpc_bdev_lvol_s3_backup(struct spdk_jsonrpc_request *request,
 	struct rpc_bdev_lvol_s3_backup req = {};
 	struct spdk_lvol *snapshot;
 	struct spdk_bdev *lvol_bdev;
-	struct spdk_lvol *snapshot_chain[40];
+	/* Sized to the decoder's own bound. This was 40 while the decoder accepted
+	 * RPC_MAX_LVOL_VBDEV, so a longer chain overran the stack of the process
+	 * serving live volumes. */
+	struct spdk_lvol *snapshot_chain[RPC_MAX_LVOL_VBDEV];
 	int rc = 0;
 
 	if (spdk_json_decode_object(params, rpc_bdev_lvol_s3_backup_decoders,
@@ -3235,8 +3244,10 @@ rpc_bdev_lvol_s3_backup(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 	
-	if (req.s3_id == 0) {
-		SPDK_ERRLOG("s3_id must be specified");
+	/* The offset packing masks s3_id to S3_ID_BITS and does not validate, so a
+	 * larger value silently aliases onto another backup's object keys. */
+	if (req.s3_id == 0 || req.s3_id >= (1u << S3_ID_BITS)) {
+		SPDK_ERRLOG("s3_id must be non-zero and below %u\n", 1u << S3_ID_BITS);
 		spdk_jsonrpc_send_error_response(request, -EINVAL, spdk_strerror(EINVAL));
 		goto cleanup;
 	}
@@ -3261,7 +3272,8 @@ rpc_bdev_lvol_s3_backup(struct spdk_jsonrpc_request *request,
 
 	SPDK_NOTICELOG("Backing up lvol %s to S3 id %u.\n", snapshot_chain[0]->name,  req.s3_id);
 
-	rc = spdk_lvol_s3_backup(snapshot_chain[0], req.cluster_batch, snapshot_chain, req.snapshot_names.num, req.s3_id);
+	rc = spdk_lvol_s3_backup(snapshot_chain[0], req.cluster_batch, snapshot_chain,
+				 req.snapshot_names.num, req.s3_id, req.s3_bdev);
 	if (rc < 0) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 spdk_strerror(-rc));
@@ -3278,6 +3290,7 @@ SPDK_RPC_REGISTER("bdev_lvol_s3_backup", rpc_bdev_lvol_s3_backup, SPDK_RPC_RUNTI
 struct rpc_bdev_lvol_s3_merge {
 	char *uuid;
 	char *lvs_name;
+	char *s3_bdev;
 	uint32_t old_s3_id;
 	uint32_t s3_id;
 	uint32_t cluster_batch;
@@ -3285,6 +3298,7 @@ struct rpc_bdev_lvol_s3_merge {
 
 static void 
 free_rpc_bdev_lvol_s3_merge(struct rpc_bdev_lvol_s3_merge *req) {
+	free(req->s3_bdev);
 	free(req->uuid);
 	free(req->lvs_name);
 }
@@ -3295,6 +3309,7 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_s3_merge_decoders[] =
 	{"old_s3_id", offsetof(struct rpc_bdev_lvol_s3_merge, old_s3_id), spdk_json_decode_uint32},
 	{"cluster_batch", offsetof(struct rpc_bdev_lvol_s3_merge, cluster_batch), spdk_json_decode_uint32},
 	{"s3_id", offsetof(struct rpc_bdev_lvol_s3_merge, s3_id), spdk_json_decode_uint32},
+	{"s3_bdev", offsetof(struct rpc_bdev_lvol_s3_merge, s3_bdev), spdk_json_decode_string},
 };
 
 static void 
@@ -3314,8 +3329,10 @@ rpc_bdev_lvol_s3_merge(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
-	if (req.old_s3_id == 0 || req.s3_id == 0) {
-		SPDK_ERRLOG("old_s3_id and s3_id must be specified");
+	if (req.old_s3_id == 0 || req.s3_id == 0
+	    || req.old_s3_id >= (1u << S3_ID_BITS) || req.s3_id >= (1u << S3_ID_BITS)) {
+		SPDK_ERRLOG("old_s3_id and s3_id must be non-zero and below %u\n",
+			    1u << S3_ID_BITS);
 		spdk_jsonrpc_send_error_response(request, -EINVAL, spdk_strerror(EINVAL));
 		goto cleanup;
 	}
@@ -3329,7 +3346,7 @@ rpc_bdev_lvol_s3_merge(struct spdk_jsonrpc_request *request,
 	// SPDK_NOTICELOG("Backing up lvol %s to S3 id %u.\n", req.lvol_name,  req.s3_id);
 	SPDK_NOTICELOG("Backing up s3 id %u to S3 id %u.\n", req.old_s3_id,  req.s3_id);
 
-	rc = spdk_lvol_s3_merge(lvs, req.s3_id, req.old_s3_id, req.cluster_batch);
+	rc = spdk_lvol_s3_merge(lvs, req.s3_id, req.old_s3_id, req.cluster_batch, req.s3_bdev);
 	if (rc < 0) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 spdk_strerror(-rc));
@@ -3353,6 +3370,7 @@ struct rpc_bdev_lvol_recovery_s3_ids {
 
 struct rpc_bdev_lvol_s3_recovery {
 	char *lvol_name;
+	char *s3_bdev;
 	uint32_t cluster_batch;
 	struct rpc_bdev_lvol_recovery_s3_ids s3_ids;  /* JSON array */
 };
@@ -3370,12 +3388,14 @@ decode_s3_ids(const struct spdk_json_val *val, void *out)
 
 static void 
 free_rpc_bdev_lvol_s3_recovery(struct rpc_bdev_lvol_s3_recovery *req) {
+	free(req->s3_bdev);
 	free(req->lvol_name);	
 }
 
 static const struct spdk_json_object_decoder rpc_bdev_lvol_s3_recovery_decoders[] = {
 	{"lvol_name", offsetof(struct rpc_bdev_lvol_s3_recovery, lvol_name), spdk_json_decode_string},
 	{"cluster_batch", offsetof(struct rpc_bdev_lvol_s3_recovery, cluster_batch), spdk_json_decode_uint32},
+	{"s3_bdev", offsetof(struct rpc_bdev_lvol_s3_recovery, s3_bdev), spdk_json_decode_string},
 	{"s3_ids", offsetof(struct rpc_bdev_lvol_s3_recovery, s3_ids), decode_s3_ids},
 };
 
@@ -3386,7 +3406,8 @@ rpc_bdev_lvol_s3_recovery(struct spdk_jsonrpc_request *request,
 	struct rpc_bdev_lvol_s3_recovery req = {};
 	struct spdk_lvol *lvol;
 	struct spdk_bdev *lvol_bdev;
-	uint32_t s3_ids_chain[40];
+	/* Sized to the decoder's own bound; see the note in s3_backup. */
+	uint32_t s3_ids_chain[RPC_MAX_LVOL_VBDEV];
 	int rc = 0;
 
 	if (spdk_json_decode_object(params, rpc_bdev_lvol_s3_recovery_decoders,
@@ -3425,7 +3446,8 @@ rpc_bdev_lvol_s3_recovery(struct spdk_jsonrpc_request *request,
 
 	SPDK_NOTICELOG("Recovering lvol %s from S3.\n", req.lvol_name);
 
-	rc = spdk_lvol_s3_recovery(lvol, req.cluster_batch, s3_ids_chain, req.s3_ids.num);
+	rc = spdk_lvol_s3_recovery(lvol, req.cluster_batch, s3_ids_chain, req.s3_ids.num,
+				   req.s3_bdev);
 	if (rc < 0) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 spdk_strerror(-rc));
