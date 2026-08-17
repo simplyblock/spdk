@@ -4916,7 +4916,9 @@ destroy_parent_xfer_task(struct spdk_lvs_xfer *xfer)
 				sub_xfer->state = XFER_STATE_FAILED;
 				sub_xfer->lvol->transfer_status = XFER_FAILED;
 			}
-
+			SPDK_NOTICELOG("call sync for lvol %s, id %" PRIx64 ", status %s finished.\n",
+				sub_xfer->lvol ? sub_xfer->lvol->name : "NULL",
+				sub_xfer->lvol->blob_id, xfer_result_type_to_string(sub_xfer->lvol->transfer_status));
 			spdk_xfer_sync_mode(sub_xfer);
 		}
 
@@ -6608,7 +6610,16 @@ static int spdk_lvol_transfer_delay(void *ctx);
 static void 
 spdk_lvol_transfer_delay_cb(void *ctx, int rc) {
 	struct spdk_lvs_xfer *xfer = ctx;
+	struct spdk_lvs_xfer *sub_xfer;
+	
 	if (rc == 0) {
+		if (xfer->num_sub_tasks > 0 && xfer->idx < (uint32_t)xfer->num_sub_tasks) {
+			xfer->idx++;
+			sub_xfer = xfer->list_task[xfer->idx];
+			blob_check_io_inflaight(sub_xfer->lvol->blob, spdk_lvol_transfer_delay_cb, xfer);
+			return;
+		}
+		xfer->idx = 0;
 		TAILQ_INSERT_TAIL(&g_lvs_xfer_tasks, xfer, entry);
 	} else {
 		SPDK_NOTICELOG("Transfer lvol %s %s task: last offset %" PRIu64 " status %s still has IO inflight.\n", xfer->lvol->name,
@@ -6826,9 +6837,9 @@ spdk_lvol_batch_transfer(uint32_t cluster_batch, enum xfer_type type, struct spd
 			goto error;
 		}
 
-		SPDK_NOTICELOG("Transfer lvol %s %s task: last offset %" PRIu64 " status %s start.\n", task->lvol->name,
-						xfer_type_to_string(task->type), task->lvol->last_offset,
-						xfer_result_type_to_string(task->lvol->transfer_status));
+		// SPDK_NOTICELOG("Transfer lvol %s %s task: last offset %" PRIu64 " status %s start.\n", task->lvol->name,
+		// 				xfer_type_to_string(task->type), task->lvol->last_offset,
+		// 				xfer_result_type_to_string(task->lvol->transfer_status));
 	}
 
 	for (int i = 0; i < num_lvols; i++) {
