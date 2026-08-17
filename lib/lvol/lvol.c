@@ -6613,7 +6613,7 @@ spdk_lvol_transfer_delay_cb(void *ctx, int rc) {
 	struct spdk_lvs_xfer *sub_xfer;
 	
 	if (rc == 0) {
-		if (xfer->num_sub_tasks > 0 && xfer->idx < (uint32_t)xfer->num_sub_tasks) {
+		if (xfer->num_sub_tasks > 0 && xfer->idx < (uint32_t)xfer->num_sub_tasks - 1) {
 			xfer->idx++;
 			sub_xfer = xfer->list_task[xfer->idx];
 			blob_check_io_inflaight(sub_xfer->lvol->blob, spdk_lvol_transfer_delay_cb, xfer);
