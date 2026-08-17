@@ -4903,8 +4903,8 @@ destroy_parent_xfer_task(struct spdk_lvs_xfer *xfer)
 		       xfer_type_to_string(xfer->type),
 		       batch_failed ? "FAILED" : "DONE");
 
-	for (int i = 0; i < xfer->num_sub_tasks; i++) {
-		sub_xfer = list_task[i];
+	for (int i = xfer->num_sub_tasks; i > 0; i--) {
+		sub_xfer = list_task[i - 1];
 
 		/*
 		 * Tasks that failed were already unfrozen by
