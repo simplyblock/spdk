@@ -347,12 +347,19 @@ int spdk_lvol_batch_transfer(uint32_t cluster_batch, enum xfer_type type, struct
 				struct spdk_lvol **batch_lvols, int num_lvols, char **batch_snapshots, int num_snapshots,
 				uint32_t *batch_lvol_ids, int num_lvol_ids, spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
 
+/*
+ * S3 backup, merge and restore. Each names the S3 transfer device to use:
+ * an lvolstore may carry more than one, and picking "the first" is ambiguous
+ * precisely during a restore from another cluster's bucket.
+ */
 int spdk_lvol_s3_backup(struct spdk_lvol *lvol, uint32_t cluster_batch,
-				struct spdk_lvol **chain_snapshots, int num_snapshots, uint32_t s3_id);
+				struct spdk_lvol **chain_snapshots, int num_snapshots, uint32_t s3_id,
+				const char *s3_bdev);
 int spdk_lvol_s3_merge(struct spdk_lvol_store *lvs, uint32_t s3_id,
-				uint32_t old_s3_id, uint32_t cluster_batch);
+				uint32_t old_s3_id, uint32_t cluster_batch, const char *s3_bdev);
 int spdk_lvol_s3_recovery(struct spdk_lvol *lvol, uint32_t cluster_batch,
-				uint32_t *chain_s3_ids, uint32_t num_s3_ids);
+				uint32_t *chain_s3_ids, uint32_t num_s3_ids,
+				const char *s3_bdev);
 void spdk_lvol_chain(struct spdk_lvol *origlvol, struct spdk_lvol *clone,
 		 spdk_lvol_op_complete cb_fn, void *cb_arg);
 void spdk_lvol_convert(struct spdk_lvol *origlvol, spdk_lvol_op_complete cb_fn, void *cb_arg);
