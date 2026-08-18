@@ -2254,7 +2254,7 @@ spdk_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_
 	}
 
 	lvol->action_in_progress = true;
-	if (strcmp("hublvol", lvol->name) == 0) {
+	if (lvol->hublvol || strcmp("hublvol", lvol->name) == 0) {
 		lvol_delete_blob_cb(req , 0);
 		return;
 	}

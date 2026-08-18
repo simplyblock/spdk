@@ -869,7 +869,7 @@ _vbdev_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *c
 void
 vbdev_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg, bool is_sync)
 {
-	struct lvol_store_bdev *lvs_bdev;
+	// struct lvol_store_bdev *lvs_bdev;
 	struct spdk_lvol_store *lvs = lvol->lvol_store;
 	size_t count;
 
@@ -905,6 +905,12 @@ vbdev_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb
 		// check blob state it must be CLEAN
 		// copy the blob
 		SPDK_NOTICELOG("Deleting blob 0x%" PRIx64 " in secondary mode.\n", lvol->blob_id);
+
+		if (lvol->hublvol) {
+			_vbdev_lvol_destroy(lvol, cb_fn, cb_arg, true);
+			return;
+		}
+
 		if (spdk_lvol_copy_blob(lvol)) {
 			SPDK_ERRLOG("Deleting blob 0x%" PRIx64 " in secondary mode failed not enough resources.\n", lvol->blob_id);
 			cb_fn(cb_arg, -ENOMEM);
