@@ -893,13 +893,13 @@ vbdev_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb
 	 * are all deleted. There may be some IO required
 	 */
 
-	lvs_bdev = vbdev_get_lvs_bdev_by_lvs(lvs);
-	if (lvs_bdev == NULL) {
-		SPDK_ERRLOG("lvol %s: lvolstore is being removed\n",
-			      lvol->unique_id);
-		cb_fn(cb_arg, -ENODEV);
-		return;
-	}
+	// lvs_bdev = vbdev_get_lvs_bdev_by_lvs(lvs);
+	// if (lvs_bdev == NULL) {
+	// 	SPDK_ERRLOG("lvol %s: lvolstore is being removed\n",
+	// 		      lvol->unique_id);
+	// 	cb_fn(cb_arg, -ENODEV);
+	// 	return;
+	// }
 
 	if (!lvs->leader) {
 		// check blob state it must be CLEAN
