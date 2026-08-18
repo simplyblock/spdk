@@ -26,6 +26,7 @@ struct spdk_lvs_req {
 	struct spdk_lvol_store		*lvol_store;
 	struct spdk_poller *poller;
 	int				lvserrno;
+	bool			destroy;
 };
 
 struct spdk_lvol_update_on_failover_req {

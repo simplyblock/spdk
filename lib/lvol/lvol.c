@@ -1060,11 +1060,14 @@ spdk_lvs_destroy(struct spdk_lvol_store *lvs, spdk_lvs_op_complete cb_fn,
 		}
 	}
 
-	if (lvs->node_role == NODE_PRIMARY) {
-		if (lvs->hublvol_poller) {
-			spdk_poller_unregister(&lvs->hublvol_poller);
-			lvs->hublvol_poller = NULL;
-		}
+	if (lvs->hublvol_poller) {
+		spdk_poller_unregister(&lvs->hublvol_poller);
+		lvs->hublvol_poller = NULL;
+	}
+	
+	if (lvs->redirect_poller) {
+		spdk_poller_unregister(&lvs->redirect_poller);
+		lvs->redirect_poller = NULL;
 	}
 
 	TAILQ_FOREACH_SAFE(iter_lvol, &lvs->lvols, link, tmp) {
