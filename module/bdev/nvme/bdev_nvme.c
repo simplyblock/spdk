@@ -971,6 +971,41 @@ static inline void
 __bdev_nvme_io_complete(struct spdk_bdev_io *bdev_io, enum spdk_bdev_io_status status,
 			const struct spdk_nvme_cpl *cpl)
 {
+	struct nvme_bdev_io *bio = (struct nvme_bdev_io *)bdev_io->driver_ctx;
+
+	/* Reset the per-IO retry state here, at the single point every
+	 * completion funnels through, so the nvme_bdev_io buffer is always
+	 * returned clean.
+	 *
+	 * The bdev layer does not zero driver_ctx and bdev_nvme_submit_request
+	 * does not initialise retry_count, so these fields are inherited from
+	 * whatever previously occupied the buffer. Only 2 of the 9 callers of
+	 * this function used to clear them, and the abort paths
+	 * (bdev_nvme_abort_retry_ios / _bdev_nvme_abort_retry_io) were not
+	 * among them -- exactly the paths taken when a qpair is torn down.
+	 *
+	 * A later I/O reusing such a buffer starts with a stale retry_count and,
+	 * if that value happens to be >= bdev_retry_count, fails on its FIRST
+	 * error with no reroute attempted, because bdev_nvme_io_complete_nvme_status
+	 * checks the budget before bdev_nvme_check_retry_io gets a chance to send
+	 * an aborted-SQ-deletion completion down the (non-budgeted) reroute path.
+	 *
+	 * Measured on a 6-node multipath cluster (2026-08-19, one data NIC
+	 * dropped cluster-wide): of 1005 aborted internal writes, 909 rerouted
+	 * correctly and 96 failed up through that budget check -- every one of
+	 * them with an impossible retry_count of 8, 9 or 32723 against a budget
+	 * of 2. Those 96 EIOs stoplisted 7 of 12 devices in 130 ms, which
+	 * collapsed distrib placement to 'relaxed' (no anti-affinity), which
+	 * wrote stripes with two columns on one node, which made a later
+	 * two-node outage unreadable and killed client I/O.
+	 *
+	 * Resetting on completion rather than on submission is deliberate: a
+	 * retried I/O re-enters bdev_nvme_submit_request and must keep its
+	 * count, so zeroing there would make the same-path budget unbounded.
+	 */
+	bio->retry_count = 0;
+	bio->submit_tsc = 0;
+
 	spdk_trace_record(TRACE_BDEV_NVME_IO_DONE, 0, 0, (uintptr_t)bdev_io->driver_ctx,
 			  (uintptr_t)bdev_io);
 	if (cpl) {
