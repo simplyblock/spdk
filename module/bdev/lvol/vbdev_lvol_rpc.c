@@ -15,6 +15,9 @@
 
 SPDK_LOG_REGISTER_COMPONENT(lvol_rpc)
 #define RPC_MAX_LVOL_VBDEV 255
+#define RPC_MAX_S3_IDS 40
+#define RPC_INVALID_S3_ID_FMT \
+	"S3 ID %u does not fit into the " SPDK_STRINGIFY(S3_ID_BITS) " bits available for it"
 
 struct rpc_shallow_copy_status {
 	uint32_t				operation_id;
@@ -3223,7 +3226,7 @@ rpc_bdev_lvol_s3_backup(struct spdk_jsonrpc_request *request,
 	struct rpc_bdev_lvol_s3_backup req = {};
 	struct spdk_lvol *snapshot;
 	struct spdk_bdev *lvol_bdev;
-	struct spdk_lvol *snapshot_chain[40];
+	struct spdk_lvol *snapshot_chain[RPC_MAX_S3_IDS];
 	int rc = 0;
 
 	if (spdk_json_decode_object(params, rpc_bdev_lvol_s3_backup_decoders,
@@ -3238,6 +3241,20 @@ rpc_bdev_lvol_s3_backup(struct spdk_jsonrpc_request *request,
 	if (req.s3_id == 0) {
 		SPDK_ERRLOG("s3_id must be specified");
 		spdk_jsonrpc_send_error_response(request, -EINVAL, spdk_strerror(EINVAL));
+		goto cleanup;
+	} else if (req.s3_id & ~(S3_ID_MASK)) {
+		SPDK_ERRLOG(RPC_INVALID_S3_ID_FMT "\n", req.s3_id);
+		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						     RPC_INVALID_S3_ID_FMT, req.s3_id);
+		goto cleanup;
+	}
+
+	if (req.snapshot_names.num > RPC_MAX_S3_IDS) {
+		SPDK_ERRLOG("snapshot chain of %zu snapshots exceeds the maximum of %d\n",
+			    req.snapshot_names.num, RPC_MAX_S3_IDS);
+		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						     "snapshot chain of %zu snapshots exceeds the maximum of %d",
+						     req.snapshot_names.num, RPC_MAX_S3_IDS);
 		goto cleanup;
 	}
 
@@ -3379,14 +3396,14 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_s3_recovery_decoders[
 	{"s3_ids", offsetof(struct rpc_bdev_lvol_s3_recovery, s3_ids), decode_s3_ids},
 };
 
-static void 
+static void
 rpc_bdev_lvol_s3_recovery(struct spdk_jsonrpc_request *request,
-			      const struct spdk_json_val *params) 
+			      const struct spdk_json_val *params)
 {
 	struct rpc_bdev_lvol_s3_recovery req = {};
 	struct spdk_lvol *lvol;
 	struct spdk_bdev *lvol_bdev;
-	uint32_t s3_ids_chain[40];
+	uint32_t s3_ids_chain[RPC_MAX_S3_IDS];
 	int rc = 0;
 
 	if (spdk_json_decode_object(params, rpc_bdev_lvol_s3_recovery_decoders,
@@ -3418,7 +3435,23 @@ rpc_bdev_lvol_s3_recovery(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
+	if (req.s3_ids.num > RPC_MAX_S3_IDS) {
+		SPDK_ERRLOG("recovery chain of %zu S3 IDs exceeds the maximum of %d\n",
+			    req.s3_ids.num, RPC_MAX_S3_IDS);
+		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						     "recovery chain of %zu S3 IDs exceeds the maximum of %d",
+						     req.s3_ids.num, RPC_MAX_S3_IDS);
+		goto cleanup;
+	}
+
 	for (size_t i = 0; i < req.s3_ids.num; i++) {
+		if (req.s3_ids.ids[i] & ~(S3_ID_MASK)) {
+			SPDK_ERRLOG("s3_ids[%zu]: " RPC_INVALID_S3_ID_FMT "\n", i, req.s3_ids.ids[i]);
+			spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+							     "s3_ids[%zu]: " RPC_INVALID_S3_ID_FMT,
+							     i, req.s3_ids.ids[i]);
+			goto cleanup;
+		}
 		s3_ids_chain[i] = req.s3_ids.ids[i];
 		// SPDK_NOTICELOG("s3_id[%zu]=%u\n", i, s3_ids_chain[i]);
 	}
