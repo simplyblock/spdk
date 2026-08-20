@@ -222,7 +222,7 @@ ut_bs_reload(struct spdk_blob_store **bs, struct spdk_bs_opts *opts)
 
 	dev = init_dev();
 	/* Load an existing blob store */
-	spdk_bs_load(dev, opts, bs_op_with_handle_complete, NULL);
+	spdk_bs_load(dev, opts, bs_op_with_handle_complete, NULL, 0);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
@@ -241,7 +241,7 @@ ut_bs_dirty_load(struct spdk_blob_store **bs, struct spdk_bs_opts *opts)
 
 	dev = init_dev();
 	/* Load an existing blob store */
-	spdk_bs_load(dev, opts, bs_op_with_handle_complete, NULL);
+	spdk_bs_load(dev, opts, bs_op_with_handle_complete, NULL, 0);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
@@ -2417,7 +2417,7 @@ bs_load(void)
 	/* Load should fail for device with an unsupported blocklen */
 	dev = init_dev();
 	dev->blocklen = g_phys_blocklen * 2;
-	spdk_bs_load(dev, NULL, bs_op_with_handle_complete, NULL);
+	spdk_bs_load(dev, NULL, bs_op_with_handle_complete, NULL, 0);
 	poll_threads();
 	CU_ASSERT(g_bserrno == -EINVAL);
 
@@ -2425,7 +2425,7 @@ bs_load(void)
 	dev = init_dev();
 	spdk_bs_opts_init(&opts, sizeof(opts));
 	opts.max_md_ops = 0;
-	spdk_bs_load(dev, &opts, bs_op_with_handle_complete, NULL);
+	spdk_bs_load(dev, &opts, bs_op_with_handle_complete, NULL, 0);
 	poll_threads();
 	CU_ASSERT(g_bserrno == -EINVAL);
 
@@ -2433,7 +2433,7 @@ bs_load(void)
 	dev = init_dev();
 	spdk_bs_opts_init(&opts, sizeof(opts));
 	opts.max_channel_ops = 0;
-	spdk_bs_load(dev, &opts, bs_op_with_handle_complete, NULL);
+	spdk_bs_load(dev, &opts, bs_op_with_handle_complete, NULL, 0);
 	poll_threads();
 	CU_ASSERT(g_bserrno == -EINVAL);
 
@@ -2441,7 +2441,7 @@ bs_load(void)
 	dev = init_dev();
 	spdk_bs_opts_init(&opts, sizeof(opts));
 	snprintf(opts.bstype.bstype, sizeof(opts.bstype.bstype), "TESTTYPE");
-	spdk_bs_load(dev, &opts, bs_op_with_handle_complete, NULL);
+	spdk_bs_load(dev, &opts, bs_op_with_handle_complete, NULL, 0);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
@@ -2492,7 +2492,7 @@ bs_load(void)
 
 	spdk_bs_opts_init(&opts, sizeof(opts));
 	snprintf(opts.bstype.bstype, sizeof(opts.bstype.bstype), "TESTTYPE");
-	spdk_bs_load(dev, &opts, bs_op_with_handle_complete, NULL);
+	spdk_bs_load(dev, &opts, bs_op_with_handle_complete, NULL, 0);
 	poll_threads();
 
 	CU_ASSERT(g_bserrno == -EILSEQ);
@@ -2503,7 +2503,7 @@ bs_load(void)
 
 	spdk_bs_opts_init(&opts, sizeof(opts));
 	snprintf(opts.bstype.bstype, sizeof(opts.bstype.bstype), "TESTTYPE");
-	spdk_bs_load(dev, &opts, bs_op_with_handle_complete, NULL);
+	spdk_bs_load(dev, &opts, bs_op_with_handle_complete, NULL, 0);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
@@ -2522,7 +2522,7 @@ bs_load(void)
 
 	spdk_bs_opts_init(&opts, sizeof(opts));
 	snprintf(opts.bstype.bstype, sizeof(opts.bstype.bstype), "TESTTYPE");
-	spdk_bs_load(dev, &opts, bs_op_with_handle_complete, NULL);
+	spdk_bs_load(dev, &opts, bs_op_with_handle_complete, NULL, 0);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
@@ -2682,7 +2682,7 @@ bs_load_custom_cluster_size(void)
 	dev = init_dev();
 	spdk_bs_opts_init(&opts, sizeof(opts));
 	snprintf(opts.bstype.bstype, sizeof(opts.bstype.bstype), "TESTTYPE");
-	spdk_bs_load(dev, &opts, bs_op_with_handle_complete, NULL);
+	spdk_bs_load(dev, &opts, bs_op_with_handle_complete, NULL, 0);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
@@ -2791,7 +2791,7 @@ bs_load_after_failed_grow(void)
 	spdk_bs_opts_init(&opts, sizeof(opts));
 	opts.clear_method = BS_CLEAR_WITH_NONE;
 	snprintf(opts.bstype.bstype, sizeof(opts.bstype.bstype), "TESTTYPE");
-	spdk_bs_load(dev, &opts, bs_op_with_handle_complete, NULL);
+	spdk_bs_load(dev, &opts, bs_op_with_handle_complete, NULL, 0);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
@@ -2858,7 +2858,7 @@ bs_load_error(void)
 	dev_set_power_failure_thresholds(thresholds);
 	g_bserrno = -1;
 	dev = init_dev();
-	spdk_bs_load(dev, &opts, bs_op_with_handle_complete, NULL);
+	spdk_bs_load(dev, &opts, bs_op_with_handle_complete, NULL, 0);
 	poll_threads();
 	CU_ASSERT(g_bserrno == -EIO);
 	CU_ASSERT(g_bs == NULL);
@@ -2867,7 +2867,7 @@ bs_load_error(void)
 	/* Load fails with NOMEM error */
 	g_bserrno = -1;
 	dev = init_dev();
-	spdk_bs_load(dev, &opts, bs_op_with_handle_complete, NULL);
+	spdk_bs_load(dev, &opts, bs_op_with_handle_complete, NULL, 0);
 	MOCK_SET(spdk_zmalloc, NULL);
 	poll_threads();
 	CU_ASSERT(g_bserrno == -ENOMEM);
@@ -2904,14 +2904,14 @@ bs_type(void)
 	/* Load non existing blobstore type */
 	dev = init_dev();
 	snprintf(opts.bstype.bstype, sizeof(opts.bstype.bstype), "NONEXISTING");
-	spdk_bs_load(dev, &opts, bs_op_with_handle_complete, NULL);
+	spdk_bs_load(dev, &opts, bs_op_with_handle_complete, NULL, 0);
 	poll_threads();
 	CU_ASSERT(g_bserrno != 0);
 
 	/* Load with empty blobstore type */
 	dev = init_dev();
 	memset(opts.bstype.bstype, 0, sizeof(opts.bstype.bstype));
-	spdk_bs_load(dev, &opts, bs_op_with_handle_complete, NULL);
+	spdk_bs_load(dev, &opts, bs_op_with_handle_complete, NULL, 0);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
@@ -2939,14 +2939,14 @@ bs_type(void)
 	/* Load non existing blobstore type */
 	dev = init_dev();
 	snprintf(opts.bstype.bstype, sizeof(opts.bstype.bstype), "NONEXISTING");
-	spdk_bs_load(dev, &opts, bs_op_with_handle_complete, NULL);
+	spdk_bs_load(dev, &opts, bs_op_with_handle_complete, NULL, 0);
 	poll_threads();
 	CU_ASSERT(g_bserrno != 0);
 
 	/* Load with empty blobstore type */
 	dev = init_dev();
 	memset(opts.bstype.bstype, 0, sizeof(opts.bstype.bstype));
-	spdk_bs_load(dev, &opts, bs_op_with_handle_complete, NULL);
+	spdk_bs_load(dev, &opts, bs_op_with_handle_complete, NULL, 0);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
@@ -2992,7 +2992,7 @@ bs_super_block(void)
 
 	dev = init_dev();
 	memset(opts.bstype.bstype, 0, sizeof(opts.bstype.bstype));
-	spdk_bs_load(dev, &opts, bs_op_with_handle_complete, NULL);
+	spdk_bs_load(dev, &opts, bs_op_with_handle_complete, NULL, 0);
 	poll_threads();
 	CU_ASSERT(g_bserrno != 0);
 
@@ -3015,7 +3015,7 @@ bs_super_block(void)
 	memcpy(g_dev_buffer, &super_block_v1, sizeof(struct spdk_bs_super_block_ver1));
 
 	memset(opts.bstype.bstype, 0, sizeof(opts.bstype.bstype));
-	spdk_bs_load(dev, &opts, bs_op_with_handle_complete, NULL);
+	spdk_bs_load(dev, &opts, bs_op_with_handle_complete, NULL, 0);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
@@ -3062,7 +3062,7 @@ bs_test_recover_cluster_count(void)
 	memcpy(g_dev_buffer, &super_block, sizeof(struct spdk_bs_super_block));
 
 	memset(opts.bstype.bstype, 0, sizeof(opts.bstype.bstype));
-	spdk_bs_load(dev, &opts, bs_op_with_handle_complete, NULL);
+	spdk_bs_load(dev, &opts, bs_op_with_handle_complete, NULL, 0);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
@@ -3139,7 +3139,7 @@ bs_grow_live_size(uint64_t new_blockcnt)
 	/* Load blobstore and check the cluster counts again. */
 	dev = init_dev();
 	dev->blockcnt = new_blockcnt;
-	spdk_bs_load(dev, NULL, bs_op_with_handle_complete, NULL);
+	spdk_bs_load(dev, NULL, bs_op_with_handle_complete, NULL, 0);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
@@ -3252,7 +3252,7 @@ bs_grow_live_no_space(void)
 
 	/* Load blobstore and check the cluster counts again. */
 	dev = init_dev();
-	spdk_bs_load(dev, NULL, bs_op_with_handle_complete, NULL);
+	spdk_bs_load(dev, NULL, bs_op_with_handle_complete, NULL, 0);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
@@ -3612,7 +3612,7 @@ bs_destroy(void)
 	dev = init_dev();
 
 	g_bserrno = 0;
-	spdk_bs_load(dev, NULL, bs_op_with_handle_complete, NULL);
+	spdk_bs_load(dev, NULL, bs_op_with_handle_complete, NULL, 0);
 	poll_threads();
 	CU_ASSERT(g_bserrno != 0);
 }
@@ -3764,7 +3764,7 @@ super_block_crc(void)
 
 	/* Load an existing blob store */
 	g_bserrno = 0;
-	spdk_bs_load(dev, NULL, bs_op_with_handle_complete, NULL);
+	spdk_bs_load(dev, NULL, bs_op_with_handle_complete, NULL, 0);
 	poll_threads();
 	CU_ASSERT(g_bserrno == -EILSEQ);
 }
@@ -4199,7 +4199,7 @@ bs_version(void)
 
 	/* Load an existing blob store */
 	dev = init_dev();
-	spdk_bs_load(dev, NULL, bs_op_with_handle_complete, NULL);
+	spdk_bs_load(dev, NULL, bs_op_with_handle_complete, NULL, 0);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
@@ -4228,7 +4228,7 @@ bs_version(void)
 	CU_ASSERT(super->used_blobid_mask_len == 0);
 
 	dev = init_dev();
-	spdk_bs_load(dev, NULL, bs_op_with_handle_complete, NULL);
+	spdk_bs_load(dev, NULL, bs_op_with_handle_complete, NULL, 0);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
@@ -5251,7 +5251,7 @@ bs_load_iter_test(void)
 	opts.iter_cb_arg = &iter_ctx;
 
 	/* Test blob iteration during load after a clean shutdown. */
-	spdk_bs_load(dev, &opts, bs_op_with_handle_complete, NULL);
+	spdk_bs_load(dev, &opts, bs_op_with_handle_complete, NULL, 0);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
@@ -5268,7 +5268,7 @@ bs_load_iter_test(void)
 	opts.iter_cb_arg = &iter_ctx;
 
 	/* Test blob iteration during load after a dirty shutdown. */
-	spdk_bs_load(dev, &opts, bs_op_with_handle_complete, NULL);
+	spdk_bs_load(dev, &opts, bs_op_with_handle_complete, NULL, 0);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
@@ -7724,7 +7724,7 @@ blob_io_unit_compatibility(void)
 	dev->blocklen = 512;
 	dev->blockcnt =  DEV_BUFFER_SIZE / dev->blocklen;
 
-	spdk_bs_load(dev, &bsopts, bs_op_with_handle_complete, NULL);
+	spdk_bs_load(dev, &bsopts, bs_op_with_handle_complete, NULL, 0);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
@@ -8408,7 +8408,7 @@ blob_esnap_clone_reload(void)
 	spdk_bs_opts_init(&bs_opts, sizeof(bs_opts));
 	bs_opts.esnap_bs_dev_create = ut_esnap_create;
 	dev = init_dev();
-	spdk_bs_load(dev, &bs_opts, bs_op_with_handle_complete, NULL);
+	spdk_bs_load(dev, &bs_opts, bs_op_with_handle_complete, NULL, 0);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 	SPDK_CU_ASSERT_FATAL(g_bs != NULL);

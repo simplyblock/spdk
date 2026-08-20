@@ -222,7 +222,7 @@ spdk_bs_set_super(struct spdk_blob_store *bs, spdk_blob_id blobid,
 
 void
 spdk_bs_load(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts,
-	     spdk_bs_op_with_handle_complete cb_fn, void *cb_arg)
+	     spdk_bs_op_with_handle_complete cb_fn, void *cb_arg, int condition)
 {
 	struct lvol_ut_bs_dev *ut_dev = SPDK_CONTAINEROF(dev, struct lvol_ut_bs_dev, bs_dev);
 	struct spdk_blob_store *bs = NULL;
