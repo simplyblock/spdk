@@ -5,6 +5,8 @@
 # ---------------------------------------------------------------------------
 FROM public.ecr.aws/docker/library/fedora:41 AS builder
 
+ARG OPENSSL_VERSION=3.5.8
+
 USER root
 
 WORKDIR /root
@@ -14,13 +16,13 @@ RUN dnf install -y git diffutils procps-ng pip kmod hostname wget pkg-config cma
     nvme-cli librdmacm-utils perftest numactl gdisk zlib-devel make gcc perl curl \
     libcurl-devel libuuid-devel pulseaudio-libs-devel
 
-# Build OpenSSL
-RUN wget https://www.openssl.org/source/openssl-3.5.8.tar.gz && \
-    tar -xvf openssl-3.5.8.tar.gz && \
-    cd openssl-3.5.8 && \
+# Build OpenSSL (bump OPENSSL_VERSION above to pick up CVE fixes)
+RUN wget https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz && \
+    tar -xvf openssl-${OPENSSL_VERSION}.tar.gz && \
+    cd openssl-${OPENSSL_VERSION} && \
     ./config && make -j"$(nproc)" && make install && \
     echo /usr/local/lib64 > /etc/ld.so.conf.d/openssl.conf && ldconfig && \
-    cd .. && rm -rf openssl-3.5.8*
+    cd .. && rm -rf openssl-${OPENSSL_VERSION}*
 
 # Clone + build AWS SDK
 RUN cd /root/ && git clone --depth 1 --recurse-submodules https://github.com/simplyblock-io/aws-sdk-cpp && \
