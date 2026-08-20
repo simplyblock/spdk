@@ -1,5 +1,7 @@
 FROM public.ecr.aws/docker/library/fedora:41
 
+ARG OPENSSL_VERSION=3.5.8
+
 # push to "simplyblock/spdk-core:base_image"
 
 USER root
@@ -17,16 +19,16 @@ RUN cd spdk && scripts/pkgdep.sh --rdma --pmem
 RUN rm -rf /root/spdk
 
 
-# Build OpenSSL
+# Build OpenSSL (bump OPENSSL_VERSION above to pick up CVE fixes)
 RUN dnf update -y && dnf upgrade -y && \
     dnf install -y zlib-devel make gcc perl curl \
     libcurl-devel libuuid-devel pulseaudio-libs-devel && \
-    wget https://www.openssl.org/source/openssl-3.5.6.tar.gz && \
-    tar -xvf openssl-3.5.6.tar.gz && \
-    cd openssl-3.5.6 && \
+    wget https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz && \
+    tar -xvf openssl-${OPENSSL_VERSION}.tar.gz && \
+    cd openssl-${OPENSSL_VERSION} && \
     ./config && make -j"$(nproc)" && make install && \
     echo /usr/local/lib64 > /etc/ld.so.conf.d/openssl.conf && ldconfig && \
-    cd .. && rm -rf openssl-3.5.6*
+    cd .. && rm -rf openssl-${OPENSSL_VERSION}*
 
 # Clone + build AWS SDK
 RUN git clone --recurse-submodules https://github.com/simplyblock-io/aws-sdk-cpp && \
