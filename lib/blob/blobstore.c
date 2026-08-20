@@ -6378,26 +6378,26 @@ bs_load_only_used_blobid_pages_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bs
 
 	//LVS_4819
 	if (ctx->condition == 2) {
-		spdk_bit_array_set(ctx->bs->used_blobids, 0xc012);
-		spdk_bit_array_set(ctx->bs->used_blobids, 0xc05d);
-		spdk_bit_array_set(ctx->bs->used_blobids, 0xc087);
-		spdk_bit_array_set(ctx->bs->used_blobids, 0xc0ad);
-		spdk_bit_array_set(ctx->bs->used_blobids, 0xc0f1);
-		spdk_bit_array_set(ctx->bs->used_blobids, 0xc12c);
-		spdk_bit_array_set(ctx->bs->used_blobids, 0xc156);
-		spdk_bit_array_set(ctx->bs->used_blobids, 0xc18b);
+		spdk_bit_array_set(ctx->used_blobid_pages, 0xc012);
+		spdk_bit_array_set(ctx->used_blobid_pages, 0xc05d);
+		spdk_bit_array_set(ctx->used_blobid_pages, 0xc087);
+		spdk_bit_array_set(ctx->used_blobid_pages, 0xc0ad);
+		spdk_bit_array_set(ctx->used_blobid_pages, 0xc0f1);
+		spdk_bit_array_set(ctx->used_blobid_pages, 0xc12c);
+		spdk_bit_array_set(ctx->used_blobid_pages, 0xc156);
+		spdk_bit_array_set(ctx->used_blobid_pages, 0xc18b);
 	}
 
 	//LVS_8874
 	if (ctx->condition == 1) {
-		spdk_bit_array_set(ctx->bs->used_blobids, 0xaf0c);
-		spdk_bit_array_set(ctx->bs->used_blobids, 0xb010);
-		spdk_bit_array_set(ctx->bs->used_blobids, 0xb15a);
-		spdk_bit_array_set(ctx->bs->used_blobids, 0xb179);
-		spdk_bit_array_set(ctx->bs->used_blobids, 0xb1f0);
-		spdk_bit_array_set(ctx->bs->used_blobids, 0xb2ce);
-		spdk_bit_array_set(ctx->bs->used_blobids, 0xb32f);
-		spdk_bit_array_set(ctx->bs->used_blobids, 0xb3b4);
+		spdk_bit_array_set(ctx->used_blobid_pages, 0xaf0c);
+		spdk_bit_array_set(ctx->used_blobid_pages, 0xb010);
+		spdk_bit_array_set(ctx->used_blobid_pages, 0xb15a);
+		spdk_bit_array_set(ctx->used_blobid_pages, 0xb179);
+		spdk_bit_array_set(ctx->used_blobid_pages, 0xb1f0);
+		spdk_bit_array_set(ctx->used_blobid_pages, 0xb2ce);
+		spdk_bit_array_set(ctx->used_blobid_pages, 0xb32f);
+		spdk_bit_array_set(ctx->used_blobid_pages, 0xb3b4);
 	}
 	bs_recover(ctx);
 }
