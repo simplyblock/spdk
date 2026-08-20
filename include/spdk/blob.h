@@ -469,6 +469,21 @@ void spdk_blob_update_failed_cleanup(struct spdk_blob *blob,
 				 spdk_blob_op_complete cb_fn, void *cb_arg);
 
 void spdk_bs_set_leader(struct spdk_blob_store *bs, bool state);
+
+/**
+ * Hold (queue) all user blob IO submitted to this blobstore while a
+ * leadership promotion is being confirmed. Held ops are released by
+ * spdk_bs_flush_held_io() after the hold is cleared: they execute when
+ * the blobstore is leader, otherwise they fail with -EIO (callers are
+ * expected to block the NVMf ports first in that case).
+ */
+void spdk_bs_set_promotion_hold(struct spdk_blob_store *bs, bool hold);
+
+/**
+ * Flush ops queued while promotion_hold was set (skips ops belonging to
+ * blobs that are still frozen — their unfreeze flushes them).
+ */
+void spdk_bs_flush_held_io(struct spdk_blob_store *bs);
 void spdk_bs_set_role(struct spdk_blob_store *bs, node_role_t role);
 node_role_t node_role_from_string(const char *str);
 const char *node_role_to_string(node_role_t role);

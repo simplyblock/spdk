@@ -3778,8 +3778,11 @@ blob_request_submit_op_single(struct spdk_io_channel *_ch, struct spdk_blob *blo
 	cpl.u.blob_basic.cb_fn = cb_fn;
 	cpl.u.blob_basic.cb_arg = cb_arg;
 
-	if (blob->frozen_refcnt) {
-		/* This blob I/O is frozen */
+	if (blob->frozen_refcnt || blob->bs->promotion_hold) {
+		/* This blob I/O is frozen, or the store is a promotion
+		 * candidate whose leadership is not yet confirmed — hold the
+		 * IO instead of appending it to the journal pre-confirmation
+		 * (a premature append is a writer conflict waiting to happen). */
 		spdk_bs_user_op_t *op;
 		struct spdk_bs_channel *bs_channel = spdk_io_channel_get_ctx(_ch);
 
@@ -4130,8 +4133,10 @@ blob_request_submit_rw_iov(struct spdk_blob *blob, struct spdk_io_channel *_chan
 		cpl.u.blob_basic.cb_fn = cb_fn;
 		cpl.u.blob_basic.cb_arg = cb_arg;
 
-		if (blob->frozen_refcnt) {
-			/* This blob I/O is frozen */
+		if (blob->frozen_refcnt || blob->bs->promotion_hold) {
+			/* This blob I/O is frozen, or the store is a promotion
+			 * candidate whose leadership is not yet confirmed — hold
+			 * the IO (see blob_request_submit_op_single). */
 			enum spdk_blob_op_type op_type;
 			spdk_bs_user_op_t *op;
 			struct spdk_bs_channel *bs_channel = spdk_io_channel_get_ctx(_channel);
@@ -7925,7 +7930,75 @@ spdk_bs_get_super(struct spdk_blob_store *bs,
 void
 spdk_bs_set_leader(struct spdk_blob_store *bs, bool state)
 {
-	bs->is_leader = state;	
+	bs->is_leader = state;
+}
+
+void
+spdk_bs_set_promotion_hold(struct spdk_blob_store *bs, bool hold)
+{
+	if (bs->promotion_hold != hold) {
+		SPDK_NOTICELOG("Promotion hold %s.\n", hold ? "engaged" : "released");
+	}
+	bs->promotion_hold = hold;
+}
+
+struct bs_held_io_ctx {
+	struct spdk_blob_store *bs;
+};
+
+static void
+bs_flush_held_io_channel(struct spdk_io_channel_iter *i)
+{
+	struct spdk_io_channel *_ch = spdk_io_channel_iter_get_channel(i);
+	struct spdk_bs_channel *ch = spdk_io_channel_get_ctx(_ch);
+	struct bs_held_io_ctx *ctx = spdk_io_channel_iter_get_ctx(i);
+	struct spdk_blob_store *bs = ctx->bs;
+	struct spdk_bs_request_set	*set;
+	struct spdk_bs_user_op_args	*args;
+	spdk_bs_user_op_t *op, *tmp;
+
+	TAILQ_FOREACH_SAFE(op, &ch->queued_io, link, tmp) {
+		set = (struct spdk_bs_request_set *)op;
+		args = &set->u.user_op;
+
+		if (args->blob->frozen_refcnt > 0) {
+			/* Still frozen for a blob md update: the blob's own
+			 * unfreeze flushes these. */
+			continue;
+		}
+		TAILQ_REMOVE(&ch->queued_io, op, link);
+		if (bs->is_leader && !args->blob->failed_on_update) {
+			bs_user_op_execute(op);
+		} else {
+			SPDK_NOTICELOG("The IO return with EIO error due to leader or failed update.\n");
+			bs_user_op_abort(op, -EIO);
+		}
+	}
+
+	spdk_for_each_channel_continue(i, 0);
+}
+
+static void
+bs_flush_held_io_cpl(struct spdk_io_channel_iter *i, int status)
+{
+	struct bs_held_io_ctx *ctx = spdk_io_channel_iter_get_ctx(i);
+
+	free(ctx);
+}
+
+void
+spdk_bs_flush_held_io(struct spdk_blob_store *bs)
+{
+	struct bs_held_io_ctx *ctx;
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		SPDK_ERRLOG("Cannot allocate ctx to flush held IO.\n");
+		return;
+	}
+	ctx->bs = bs;
+
+	spdk_for_each_channel(bs, bs_flush_held_io_channel, ctx, bs_flush_held_io_cpl);
 }
 
 void
