@@ -848,7 +848,7 @@ spdk_fs_load(struct spdk_bs_dev *dev, fs_send_request_fn send_request_fn,
 	spdk_bs_opts_init(&bs_opts, sizeof(bs_opts));
 	bs_opts.iter_cb_fn = iter_cb;
 	bs_opts.iter_cb_arg = req;
-	spdk_bs_load(dev, &bs_opts, load_cb, req);
+	spdk_bs_load(dev, &bs_opts, load_cb, req, 0);
 }
 
 static void

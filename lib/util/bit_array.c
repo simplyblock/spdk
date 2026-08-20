@@ -304,24 +304,45 @@ spdk_bit_array_store_mask(const struct spdk_bit_array *ba, void *mask)
 }
 
 void
-spdk_bit_array_store_mask_one_page(const struct spdk_bit_array *ba, void *mask, uint64_t fisrtbit, uint64_t lastbit)
+spdk_bit_array_store_mask_one_page(const struct spdk_bit_array *ba, void *mask, uint64_t firstbit, uint64_t lastbit)
 {
-	uint32_t size, i, skip;
-	// uint32_t num_bits = spdk_bit_array_capacity(ba);
-	assert(spdk_bit_array_capacity(ba) >= lastbit);
-	size = (lastbit - fisrtbit) / CHAR_BIT;
-	if (!fisrtbit) {
-		skip = 0;
-	} else {
-		skip = fisrtbit / CHAR_BIT;
-	}
-	memcpy(mask, ba->words + skip, size);
+	const uint8_t *src;
+	uint8_t *dst = mask;
+	uint64_t num_bits;
+	uint64_t full_bytes;
+	uint64_t remaining_bits;
+	uint64_t skip_bytes;
+	uint64_t i;
 
-	for (i = 0; i < (lastbit - fisrtbit) % CHAR_BIT; i++) {
-		if (spdk_bit_array_get(ba, i + size * CHAR_BIT)) {
-			((uint8_t *)mask)[size] |= (1U << i);
-		} else {
-			((uint8_t *)mask)[size] &= ~(1U << i);
+	assert(ba != NULL);
+	assert(mask != NULL);
+	assert(firstbit <= lastbit);
+	assert(lastbit <= spdk_bit_array_capacity(ba));
+
+	/*
+	 * This implementation assumes the source range starts
+	 * on a byte boundary.
+	*/
+	assert((firstbit % CHAR_BIT) == 0);
+
+	src = (const uint8_t *)ba->words;
+
+	num_bits = lastbit - firstbit;
+	full_bytes = num_bits / CHAR_BIT;
+	remaining_bits = num_bits % CHAR_BIT;
+	skip_bytes = firstbit / CHAR_BIT;
+
+	memcpy(dst, src + skip_bytes, full_bytes);
+
+	if (remaining_bits != 0) {
+		dst[full_bytes] = 0;
+
+		for (i = 0; i < remaining_bits; i++) {
+			uint64_t source_bit = firstbit + full_bytes * CHAR_BIT + i;
+
+			if (spdk_bit_array_get(ba, source_bit)) {
+				dst[full_bytes] |= (uint8_t)(1U << i);
+			}
 		}
 	}
 }

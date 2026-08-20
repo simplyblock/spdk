@@ -415,7 +415,7 @@ void spdk_bs_opts_init(struct spdk_bs_opts *opts, size_t opts_size);
  * \param cb_arg Argument passed to function cb_fn.
  */
 void spdk_bs_load(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts,
-		  spdk_bs_op_with_handle_complete cb_fn, void *cb_arg);
+		  spdk_bs_op_with_handle_complete cb_fn, void *cb_arg, int condition);
 
 /**
  * Grow a blobstore to fill the underlying device

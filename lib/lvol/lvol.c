@@ -495,7 +495,7 @@ lvs_load(struct spdk_bs_dev *bs_dev, const struct spdk_lvs_opts *_lvs_opts,
 	struct spdk_lvs_with_handle_req *req;
 	struct spdk_bs_opts bs_opts = {};
 	struct spdk_lvs_opts lvs_opts;
-
+	int lvs_condition = 0;
 	assert(cb_fn != NULL);
 
 	if (bs_dev == NULL) {
@@ -532,6 +532,16 @@ lvs_load(struct spdk_bs_dev *bs_dev, const struct spdk_lvs_opts *_lvs_opts,
 	req->bs_dev = bs_dev;
 	req->examine = examine;
 
+	if (examine) {
+		struct spdk_lvs_with_handle_req *oldreq = cb_arg;
+		if (oldreq->lvs_8874) {
+			lvs_condition = 1;
+		}
+		if (oldreq->lvs_4819) {
+			lvs_condition = 2;
+		}
+	}
+
 	lvs_bs_opts_init(&bs_opts);
 	snprintf(bs_opts.bstype.bstype, sizeof(bs_opts.bstype.bstype), "LVOLSTORE");
 
@@ -541,7 +551,7 @@ lvs_load(struct spdk_bs_dev *bs_dev, const struct spdk_lvs_opts *_lvs_opts,
 		bs_opts.esnap_ctx = req->lvol_store;
 	}
 
-	spdk_bs_load(bs_dev, &bs_opts, lvs_load_cb, req);
+	spdk_bs_load(bs_dev, &bs_opts, lvs_load_cb, req, lvs_condition);
 }
 
 void
