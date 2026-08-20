@@ -119,6 +119,7 @@ enum xfer_req_status {
 	XFER_REQ_STATUS_READY,
 	XFER_REQ_STATUS_DONE,
 	XFER_REQ_STATUS_FAILED,
+	XFER_REQ_STATUS_IN_FLIGHT,
 };
 
 typedef enum {
