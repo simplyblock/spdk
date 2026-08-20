@@ -2979,14 +2979,14 @@ _vbdev_lvs_examine(struct spdk_bdev *bdev, struct spdk_lvs_req *ori_req,
 
 	req->base_bdev = bdev;
 	req->cb_arg = ori_req;
-	req->lvs_8874 = false;
-	req->lvs_4819 = false;
+	// req->lvs_8874 = false;
+	// req->lvs_4819 = false;
 
-	if (strcmp(bdev->name, "raid0_8874") == 0) {
-        req->lvs_8874 = true;
-    } else if (strcmp(bdev->name, "raid0_4819") == 0) {
-        req->lvs_4819 = true;
-	}
+	// if (strcmp(bdev->name, "raid0_8874") == 0) {
+    //     req->lvs_8874 = true;
+    // } else if (strcmp(bdev->name, "raid0_4819") == 0) {
+    //     req->lvs_4819 = true;
+	// }
 
 	action(bs_dev, _vbdev_lvs_examine_cb, req);
 }

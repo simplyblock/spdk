@@ -532,15 +532,15 @@ lvs_load(struct spdk_bs_dev *bs_dev, const struct spdk_lvs_opts *_lvs_opts,
 	req->bs_dev = bs_dev;
 	req->examine = examine;
 
-	if (examine) {
-		struct spdk_lvs_with_handle_req *oldreq = cb_arg;
-		if (oldreq->lvs_8874) {
-			lvs_condition = 1;
-		}
-		if (oldreq->lvs_4819) {
-			lvs_condition = 2;
-		}
-	}
+	// if (examine) {
+	// 	struct spdk_lvs_with_handle_req *oldreq = cb_arg;
+	// 	if (oldreq->lvs_8874) {
+	// 		lvs_condition = 1;
+	// 	}
+	// 	if (oldreq->lvs_4819) {
+	// 		lvs_condition = 2;
+	// 	}
+	// }
 
 	lvs_bs_opts_init(&bs_opts);
 	snprintf(bs_opts.bstype.bstype, sizeof(bs_opts.bstype.bstype), "LVOLSTORE");
