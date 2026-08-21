@@ -218,6 +218,106 @@ helper_drains_ready_ring(void)
 	free_xfer(xfer);
 }
 
+/* The read phase must be fragmented and parallel, like the write phase: one
+ * monolithic cluster-sized spdk_blob_io_read serialized every cluster's read,
+ * adding its full latency to each cluster even with a full dispatch window. */
+static void
+xfer_read_phase_is_fragmented(void)
+{
+	const int alloc[2] = {1, 1};
+	struct spdk_lvs_xfer *xfer;
+	struct spdk_lvs_xfer_req *req;
+	struct remote_lvol_info rmt;
+
+	xfer = make_xfer(2, 2, alloc);
+	/* real-world geometry: 4K pages, 512 pages per 2 MiB cluster */
+	xfer->page_size = 4096;
+	xfer->page_per_cluster = 512;
+	for (int i = 0; i < 2; i++) {
+		free(xfer->reqs[i].payload);
+		xfer->reqs[i].payload = calloc(1, xfer->page_size * xfer->page_per_cluster);
+		SPDK_CU_ASSERT_FATAL(xfer->reqs[i].payload != NULL);
+	}
+
+	memset(&rmt, 0, sizeof(rmt));
+	rmt.status = true;
+	rmt.type = XFER_REPLICATE_SNAPSHOT;
+	rmt.md_channel = (struct spdk_io_channel *)0x1;
+	/* the ut "stubs" dereference desc->bdev->blocklen: give them real fakes */
+	static struct spdk_bdev fake_bdev;
+	static struct spdk_bdev_desc fake_desc;
+	fake_bdev.blocklen = 4096;
+	fake_desc.bdev = &fake_bdev;
+	rmt.desc = &fake_desc;
+	rmt.channel = (struct spdk_io_channel *)0x1;
+
+	req = &xfer->reqs[0];
+	req->rmt_lvol = &rmt;
+	req->action = REQ_ACTION_COPY_BACKUP;
+	req->offset = 0;
+	req->len = xfer->page_per_cluster;
+
+	CU_ASSERT(submit_rw_reqs_local(req) == 0);
+	/* 2 MiB at 64 KiB fragments = 32 parallel reads in flight */
+	CU_ASSERT(req->fragments_outstanding == 32);
+
+	/* completing every read fragment must hand the payload to the write
+	 * phase (submit_rw_reqs_remote -> submit_req_fragments arms the write
+	 * fragment counter) */
+	for (int i = 0; i < 32; i++) {
+		fragment_read_cb(req, 0);
+	}
+	/* 512 blocks at 64 KiB fragments (16 x 4096B blocks) = 32 write frags */
+	CU_ASSERT(req->fragments_outstanding == 32);
+	CU_ASSERT(req->status != XFER_REQ_STATUS_FAILED);
+
+	free_xfer(xfer);
+}
+
+static void
+xfer_read_fragment_failure_fails_the_request(void)
+{
+	const int alloc[1] = {1};
+	struct spdk_lvs_xfer *xfer;
+	struct spdk_lvs_xfer_req *req;
+	struct remote_lvol_info rmt;
+
+	xfer = make_xfer(1, 1, alloc);
+	xfer->page_size = 4096;
+	xfer->page_per_cluster = 512;
+	free(xfer->reqs[0].payload);
+	xfer->reqs[0].payload = calloc(1, xfer->page_size * xfer->page_per_cluster);
+	SPDK_CU_ASSERT_FATAL(xfer->reqs[0].payload != NULL);
+
+	memset(&rmt, 0, sizeof(rmt));
+	rmt.md_channel = (struct spdk_io_channel *)0x1;
+	/* the failure path recycles the request the way the helper set it up:
+	 * one in-flight against this remote, free ring aliased to the task's */
+	rmt.outstanding_io = 1;
+	rmt.free_ring = xfer->free_ring;
+
+	req = &xfer->reqs[0];
+	req->rmt_lvol = &rmt;
+	req->action = REQ_ACTION_COPY_BACKUP;
+	req->offset = 0;
+	req->len = xfer->page_per_cluster;
+
+	CU_ASSERT(submit_rw_reqs_local(req) == 0);
+	CU_ASSERT(req->fragments_outstanding == 32);
+
+	/* one bad fragment poisons the request, but only once ALL fragments
+	 * returned -- the buffer must not be handed onward half-filled */
+	fragment_read_cb(req, -5);
+	for (int i = 0; i < 30; i++) {
+		fragment_read_cb(req, 0);
+	}
+	CU_ASSERT(req->status != XFER_REQ_STATUS_FAILED);   /* one still out */
+	fragment_read_cb(req, 0);
+	CU_ASSERT(req->status == XFER_REQ_STATUS_FAILED);
+
+	free_xfer(xfer);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -232,6 +332,8 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, xfer_skips_unallocated_clusters);
 	CU_ADD_TEST(suite, xfer_second_pass_continues_and_completes);
 	CU_ADD_TEST(suite, helper_drains_ready_ring);
+	CU_ADD_TEST(suite, xfer_read_phase_is_fragmented);
+	CU_ADD_TEST(suite, xfer_read_fragment_failure_fails_the_request);
 
 	allocate_threads(1);
 	set_thread(0);

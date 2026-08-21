@@ -4371,6 +4371,66 @@ local_op_comp(void *cb_arg, int bserrno)
 
 }
 
+static void
+fragment_read_cb(void *cb_arg, int bserrno)
+{
+	struct spdk_lvs_xfer_req *req = cb_arg;
+
+	if (bserrno != 0) {
+		SPDK_ERRLOG("Local read fragment failed at offset: %" PRIu64 " len: %" PRIu64 " frag: %d\n",
+				req->offset, req->len, req->fragments_outstanding);
+		req->aggregated_status = -EIO;
+	}
+
+	req->fragments_outstanding--;
+
+	if (req->fragments_outstanding == 0) {
+		if (req->aggregated_status != 0) {
+			set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
+			return;
+		}
+		/* whole payload filled: continue exactly where the monolithic
+		 * read's completion used to go */
+		local_op_comp(req, 0);
+	}
+}
+
+static int
+submit_read_fragments(struct spdk_lvs_xfer_req *req)
+{
+	struct spdk_lvs_xfer *xfer = req->xfer;
+	struct spdk_io_channel *md_ch = req->rmt_lvol->md_channel;
+	uint64_t max_bytes = 16 * 0x1000;	/* same 64 KiB unit as the write fragments */
+	uint64_t frag_pages = max_bytes / xfer->page_size;
+	uint64_t remaining, offset;
+	uint8_t *payload = (uint8_t *)req->payload;
+
+	if (frag_pages == 0) {
+		frag_pages = 1;
+	}
+
+	/* Fill the payload with PARALLEL 64 KiB reads instead of one monolithic
+	 * cluster-sized read: a single 2 MiB spdk_blob_io_read serialized the whole
+	 * read phase per cluster, so read latency added linearly to every cluster
+	 * even when the window held plenty of them. Pre-count the fragments so an
+	 * early completion cannot observe outstanding==0 mid-submission. */
+	req->aggregated_status = 0;
+	req->fragments_outstanding = (int)((req->len + frag_pages - 1) / frag_pages);
+
+	remaining = req->len;
+	offset = req->offset;
+	while (remaining > 0) {
+		uint64_t n = (remaining > frag_pages) ? frag_pages : remaining;
+
+		spdk_blob_io_read(xfer->lvol->blob, md_ch,
+				  payload + ((req->len - remaining) * xfer->page_size),
+				  offset, n, fragment_read_cb, req);
+		offset += n;
+		remaining -= n;
+	}
+	return 0;
+}
+
 static int
 submit_rw_reqs_local(struct spdk_lvs_xfer_req *req)
 {
@@ -4381,10 +4441,8 @@ submit_rw_reqs_local(struct spdk_lvs_xfer_req *req)
 	switch (req->action)
 	{
 		case REQ_ACTION_COPY_BACKUP:
-			// read from local and write to remote
-			spdk_blob_io_read(xfer->lvol->blob, md_ch, req->payload, req->offset,
-								req->len, local_op_comp, req);
-			break;
+			// read from local (fragmented, parallel) and write to remote
+			return submit_read_fragments(req);
 		case REQ_ACTION_COPY_RECOVER:
 			// read from remote and write to local
 			spdk_blob_io_write(xfer->lvol->blob, md_ch, req->payload, req->offset,
