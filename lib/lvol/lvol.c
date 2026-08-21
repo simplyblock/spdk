@@ -4405,10 +4405,12 @@ helper_xfer_poller(void *arg)
 	struct spdk_lvs_xfer_req *req;
 	int rc, count = 0;
 	TAILQ_FOREACH(rmt_lvol, &lpg->rmt_lvols, entry) {
+		/* Drain the ring, do not take ONE request per 200us tick: with the
+		 * dispatcher now filling the whole window per tick, a single-dequeue
+		 * here would re-serialize everything it batched. The ring is bounded
+		 * by cluster_batch, so a full drain is a bounded amount of work. */
+		while (spdk_ring_dequeue(rmt_lvol->ready_ring, (void **)&req, 1) != 0) {
 		rc = 0;
-		if (spdk_ring_dequeue(rmt_lvol->ready_ring, (void **)&req, 1) == 0) {
-			continue;
-		}
 
 		count++;
 		rmt_lvol->outstanding_io++;
@@ -4477,6 +4479,7 @@ helper_xfer_poller(void *arg)
 				SPDK_ERRLOG("Unknown transfer type %d\n", rmt_lvol->type);
 				set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
 				break;
+		}
 		}
 	}
     return count ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
@@ -4970,46 +4973,57 @@ xfer_replication(struct spdk_lvs_xfer *xfer) {
 			break;
 
 		case XFER_STATE_TRANSFER_CLUSTERS:
-			is_allocate = false;
 			next_state = xfer->final_step ? XFER_STATE_SIGNAL_TRANSFER : XFER_STATE_DONE;
 			next_cnt = xfer->final_step ? 1 : 0;
-			rc = xfer_status_check(xfer, &req, xfer->idx, next_state, next_cnt);
-			if (rc != 0) {
-				return 0;
-			}
-
-			xfer->lvol->last_offset = req->offset;
-			
-			// prepare req
-			memset(req->payload, 0, xfer->page_size * xfer->page_per_cluster);
-			if (xfer->hold_idx < xfer->num_clusters) {
-				for (uint32_t i = xfer->hold_idx; i < xfer->num_clusters; i++) {
-					if (xfer->clusters[i] == 0) {
-						continue;
-					}
-
-					is_allocate = true;
-					req->dst_offset = i * xfer->page_per_cluster;
-					if (xfer->lvol->redirect_map_id != 0) {
-						req->dst_offset = ((uint64_t)(xfer->lvol->redirect_map_id) << 48) | req->dst_offset;
-					}
-
-					req->offset = i * xfer->page_per_cluster;
-					req->len = xfer->page_per_cluster; // 2MB
-					req->action = REQ_ACTION_COPY_BACKUP;
-					req->status = XFER_REQ_STATUS_READY;
-					SPDK_NOTICELOG("1- Remote write I/O src: %" PRIu64 ", dst: %" PRIu64 " len: %" PRIu64 "\n", req->offset, req->dst_offset, req->len);
-					/* enqueue for transfer; if ready_ring is full, return req to free_ring or retry */
-					if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
-						SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
-						assert(false);
-					}
-
-					xfer->outstanding_io++;
-					xfer->idx++;
-					xfer->hold_idx = i + 1;
-					count++;
+			/* Fill the WHOLE window each tick, not one cluster per tick.
+			 * The single-shot version dispatched at most one cluster per
+			 * md_xfer_poller period (1ms) -- an artificial ceiling of
+			 * ~1000 clusters/s in the best case, and far less on a reactor
+			 * shared with live IO, where every starved tick is a lost
+			 * dispatch slot. Under fio load the replicate path measured
+			 * ~29 MiB/s per volume against a 345 MiB/s writer (2026-08-21).
+			 * The window stays bounded by the free_ring (cluster_batch), so
+			 * looping until it is empty cannot over-submit. */
+			while (true) {
+				is_allocate = false;
+				rc = xfer_status_check(xfer, &req, xfer->idx, next_state, next_cnt);
+				if (rc != 0) {
+					/* no free request, or the state machine moved on */
 					return count;
+				}
+
+				xfer->lvol->last_offset = req->offset;
+
+				// prepare req
+				memset(req->payload, 0, xfer->page_size * xfer->page_per_cluster);
+				if (xfer->hold_idx < xfer->num_clusters) {
+					for (uint32_t i = xfer->hold_idx; i < xfer->num_clusters; i++) {
+						if (xfer->clusters[i] == 0) {
+							continue;
+						}
+
+						is_allocate = true;
+						req->dst_offset = i * xfer->page_per_cluster;
+						if (xfer->lvol->redirect_map_id != 0) {
+							req->dst_offset = ((uint64_t)(xfer->lvol->redirect_map_id) << 48) | req->dst_offset;
+						}
+
+						req->offset = i * xfer->page_per_cluster;
+						req->len = xfer->page_per_cluster; // 2MB
+						req->action = REQ_ACTION_COPY_BACKUP;
+						req->status = XFER_REQ_STATUS_READY;
+						/* enqueue for transfer; if ready_ring is full, return req to free_ring or retry */
+						if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
+							SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
+							assert(false);
+						}
+
+						xfer->outstanding_io++;
+						xfer->idx++;
+						xfer->hold_idx = i + 1;
+						count++;
+						break;
+					}
 				}
 
 				if (!is_allocate) {
@@ -5017,11 +5031,15 @@ xfer_replication(struct spdk_lvs_xfer *xfer) {
 						// no clusters to send
 						xfer->state = xfer->final_step ?  XFER_STATE_SIGNAL_TRANSFER : XFER_STATE_DONE;
 						xfer_fill_queue(xfer, xfer->cluster_batch);
-						return 0;
 					}
+					/* Tail of the scan: nothing left to enqueue this tick.
+					 * Outstanding IO completes on its own; the success_cnt
+					 * check above transitions the state on a later tick. */
+					return count;
 				}
 			}
 			break;
+
 		case XFER_STATE_SIGNAL_TRANSFER:
 			rc = xfer_status_check(xfer, &req, xfer->idx, XFER_STATE_DONE, 0);
 			if (rc != 0) {
