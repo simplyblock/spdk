@@ -1993,6 +1993,14 @@ static void
 ut_vbdev_lvol_submit_request(void)
 {
 	struct spdk_lvol request_lvol = {};
+	/* Same NULL-store crash as ut_lvol_read_write: the submit path reads
+	 * lvol->lvol_store->node_role before anything else. Leader, so the
+	 * request follows the normal (non-promotion) path. */
+	struct spdk_lvol_store request_lvs = {};
+
+	request_lvs.leader = true;
+	request_lvol.lvol_store = &request_lvs;
+
 	g_io = calloc(1, sizeof(struct spdk_bdev_io));
 	SPDK_CU_ASSERT_FATAL(g_io != NULL);
 	g_io->bdev = &g_bdev;
