@@ -1947,10 +1947,21 @@ ut_lvol_submit_in_promotion_window_reports_ana_transition(void)
 static void
 ut_lvol_read_write(void)
 {
+	/* lvol_op_comp dereferences lvol->lvol_store (IO accounting, leader
+	 * state), so an lvol without a store segfaults the whole suite before
+	 * any later test runs -- which is how this file stood on R26.3,
+	 * verified 2026-08-24 by rebuilding it at ce876a169 with no local
+	 * changes. Give the lvol the store it always has in practice. */
+	static struct spdk_lvol_store rw_lvs;
+
 	g_io = calloc(1, sizeof(struct spdk_bdev_io) + vbdev_lvs_get_ctx_size());
 	SPDK_CU_ASSERT_FATAL(g_io != NULL);
 	g_lvol = calloc(1, sizeof(struct spdk_lvol));
 	SPDK_CU_ASSERT_FATAL(g_lvol != NULL);
+
+	memset(&rw_lvs, 0, sizeof(rw_lvs));
+	rw_lvs.leader = true;
+	g_lvol->lvol_store = &rw_lvs;
 
 	g_io->bdev = &g_bdev;
 	g_io->bdev->ctxt = g_lvol;
