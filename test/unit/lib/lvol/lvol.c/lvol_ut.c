@@ -154,6 +154,16 @@ spdk_bdev_get_io_channel(struct spdk_bdev_desc *desc)
 	return NULL;
 }
 
+int
+spdk_bdev_abort(struct spdk_bdev_desc *desc,
+		struct spdk_io_channel *ch,
+		void *bio_cb_arg,
+		spdk_bdev_io_completion_cb cb,
+		void *cb_arg)
+{
+	return 0;
+}
+
 void
 spdk_bs_inflate_blob(struct spdk_blob_store *bs, struct spdk_io_channel *channel,
 		     spdk_blob_id blobid, spdk_blob_op_complete cb_fn, void *cb_arg)
