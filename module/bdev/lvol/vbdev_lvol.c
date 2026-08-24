@@ -1138,6 +1138,23 @@ check_IO_type(enum spdk_bdev_io_type type) {
 static void
 vbdev_lvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io);
 
+/* Complete a HOST IO that cannot be served because this node is not (yet)
+ * the lvstore leader with an ANA-transition PATH status instead of a generic
+ * internal error. The distinction is what the initiator kernel does with it:
+ * a path status makes nvme-multipath fail the command over and requeue it
+ * until a usable path appears, while a generic error is final -- it reaches
+ * the filesystem as EIO, XFS shuts down, and the application dies. Case 6
+ * (run 20260824_172623) hit exactly that: a graceful primary shutdown gave
+ * hard EIO within seconds to every volume whose primary died (3/3), because
+ * the surviving peer rejected host IO with an internal error during its
+ * reactive promotion window. */
+static void
+vbdev_lvol_complete_ana_transition(struct spdk_bdev_io *bdev_io)
+{
+	spdk_bdev_io_complete_nvme_status(bdev_io, 0, SPDK_NVME_SCT_PATH,
+					  SPDK_NVME_SC_ASYMMETRIC_ACCESS_TRANSITION);
+}
+
 static void
 lvol_op_comp(void *cb_arg, int bserrno)
 {
@@ -1147,6 +1164,7 @@ lvol_op_comp(void *cb_arg, int bserrno)
 	// spdk_sub_stat_ext(ch);
 	struct spdk_lvol *lvol = bdev_io->bdev->ctxt;
 	struct spdk_lvol_store *lvs = lvol->lvol_store;
+	bool host_io = !lvol->hublvol;   /* hublvol completions answer PEER redirects */
 	__atomic_sub_fetch(&lvs->current_io_t, 1, __ATOMIC_SEQ_CST);
 
 	if (bserrno != 0) {
@@ -1170,6 +1188,16 @@ lvol_op_comp(void *cb_arg, int bserrno)
 		if (bserrno == -ENOMEM) {
 			status = SPDK_BDEV_IO_STATUS_NOMEM;
 		} else {
+			/* An in-flight HOST IO that failed because leadership moved
+			 * under it is a path event, not a device error: the command
+			 * did not complete and the host may retry it on the (new)
+			 * leader. Peer-redirect (hublvol) completions keep the
+			 * generic failure -- their initiator is the peer's redirect
+			 * logic, which drives its own retry state machine. */
+			if (host_io && (!lvs->leader || bserrno == ERR_LEADERSHIP_CHANGED)) {
+				vbdev_lvol_complete_ana_transition(bdev_io);
+				return;
+			}
 			status = SPDK_BDEV_IO_STATUS_FAILED;
 		}
 	}
@@ -2088,7 +2116,10 @@ vbdev_lvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_
 								lvol->blob_id, bdev_io->u.bdev.offset_blocks,
 								bdev_io->u.bdev.num_blocks, bdev_io->type);
 			}
-			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+			/* Promotion window: this node is not the leader (yet).
+			 * Report ANA transition so the initiator requeues instead
+			 * of surfacing EIO -- see vbdev_lvol_complete_ana_transition. */
+			vbdev_lvol_complete_ana_transition(bdev_io);
 			return;
 		}
 
