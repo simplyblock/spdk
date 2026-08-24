@@ -175,6 +175,7 @@ struct remote_lvol_info {
 	struct spdk_io_channel	*md_channel;
 	struct spdk_lvs_poll_group *group;
 	struct spdk_poller *cleanup_poller;
+	struct spdk_poller *abort_inflight_poller;
 	struct spdk_lvs_xfer *xfer_task;
 	uint64_t outstanding_io;
 	struct spdk_ring *free_ring;     /* tasks available for this snapshot */
