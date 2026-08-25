@@ -89,6 +89,282 @@ drain_ready(struct spdk_lvs_xfer *xfer, uint64_t *offsets, uint32_t max)
 	return n;
 }
 
+
+/* While a freeze-critical FINAL transfer runs, background transfers must not
+ * dispatch a single request: the client is stalled behind the frozen volume,
+ * and every tick spent on a background snapshot is added stall. Resuming
+ * must not trip the 8s stall detector either. */
+static void
+xfer_background_pauses_while_priority_active(void)
+{
+	const int alloc[8] = {1, 1, 1, 1, 1, 1, 1, 1};
+	struct spdk_lvs_xfer *xfer = make_xfer(8, 8, alloc);
+
+	__atomic_store_n(&g_priority_xfer_cnt, 1, __ATOMIC_SEQ_CST);
+	CU_ASSERT(xfer_replication(xfer) == 0);
+	CU_ASSERT(xfer->outstanding_io == 0);
+	CU_ASSERT(drain_ready(xfer, NULL, 8) == 0);
+
+	/* the pause keeps the stall clock fresh */
+	uint64_t t = xfer->timeout;
+	CU_ASSERT(t != 0);
+
+	__atomic_store_n(&g_priority_xfer_cnt, 0, __ATOMIC_SEQ_CST);
+	CU_ASSERT(xfer_replication(xfer) == 8);
+	CU_ASSERT(drain_ready(xfer, NULL, 8) == 8);
+
+	free_xfer(xfer);
+}
+
+/* A PRIORITY transfer keeps dispatching while the counter is up -- it is the
+ * one the counter exists for. */
+static void
+xfer_priority_task_dispatches_during_priority_window(void)
+{
+	const int alloc[4] = {1, 1, 1, 1};
+	struct spdk_lvs_xfer *xfer = make_xfer(4, 4, alloc);
+
+	xfer->priority = true;
+	__atomic_store_n(&g_priority_xfer_cnt, 1, __ATOMIC_SEQ_CST);
+	CU_ASSERT(xfer_replication(xfer) == 4);
+	CU_ASSERT(drain_ready(xfer, NULL, 4) == 4);
+	__atomic_store_n(&g_priority_xfer_cnt, 0, __ATOMIC_SEQ_CST);
+
+	free_xfer(xfer);
+}
+
+/* The helper poller serves priority rings first and, while a priority
+ * transfer is active anywhere, does not touch non-priority rings at all. */
+static void
+helper_serves_priority_first_and_exclusively(void)
+{
+	const int alloc[4] = {1, 1, 1, 1};
+	struct spdk_lvs_xfer *x_bg = make_xfer(4, 4, alloc);
+	struct spdk_lvs_xfer *x_pr = make_xfer(4, 4, alloc);
+	struct spdk_lvs_poll_group lpg;
+	struct remote_lvol_info rmt_bg, rmt_pr;
+
+	x_pr->priority = true;
+	CU_ASSERT(xfer_replication(x_bg) == 4);        /* queue bg work first */
+	__atomic_store_n(&g_priority_xfer_cnt, 1, __ATOMIC_SEQ_CST);
+	CU_ASSERT(xfer_replication(x_pr) == 4);
+
+	memset(&lpg, 0, sizeof(lpg));
+	TAILQ_INIT(&lpg.rmt_lvols);
+	memset(&rmt_bg, 0, sizeof(rmt_bg));
+	rmt_bg.status = true;
+	rmt_bg.type = XFER_REPLICATE_SNAPSHOT;
+	rmt_bg.desc = (struct spdk_bdev_desc *)0x1;
+	rmt_bg.channel = (struct spdk_io_channel *)0x1;
+	rmt_bg.md_channel = (struct spdk_io_channel *)0x1;
+	rmt_bg.ready_ring = x_bg->ready_ring;
+	rmt_bg.free_ring = x_bg->free_ring;
+	rmt_pr = rmt_bg;
+	rmt_pr.priority = true;
+	rmt_pr.ready_ring = x_pr->ready_ring;
+	rmt_pr.free_ring = x_pr->free_ring;
+	/* background first in the list: order must come from priority, not
+	 * from list position */
+	TAILQ_INSERT_TAIL(&lpg.rmt_lvols, &rmt_bg, entry);
+	TAILQ_INSERT_TAIL(&lpg.rmt_lvols, &rmt_pr, entry);
+
+	helper_xfer_poller(&lpg);
+	CU_ASSERT(rmt_pr.outstanding_io == 4);         /* priority ring drained */
+	CU_ASSERT(rmt_bg.outstanding_io == 0);         /* background untouched */
+	CU_ASSERT(drain_ready(x_bg, NULL, 4) == 4);    /* still queued */
+
+	/* priority window over: background is served again */
+	__atomic_store_n(&g_priority_xfer_cnt, 0, __ATOMIC_SEQ_CST);
+	CU_ASSERT(xfer_replication(x_bg) == 0);        /* free ring is empty now */
+	struct spdk_lvs_xfer_req *req;
+	while (spdk_ring_dequeue(x_bg->free_ring, (void **)&req, 1) == 1) {
+		req->status = XFER_REQ_STATUS_READY;
+		CU_ASSERT(spdk_ring_enqueue(x_bg->ready_ring, (void **)&req, 1, NULL) == 1);
+	}
+	helper_xfer_poller(&lpg);
+	CU_ASSERT(rmt_bg.outstanding_io > 0);
+
+	free_xfer(x_bg);
+	free_xfer(x_pr);
+}
+
+/* Special (geometry) IO cannot be split below the blob cluster: with
+ * special_io set, the write phase must be ONE cluster-sized write, not
+ * 64 KiB fragments. The read phase (never special) stays fragmented. */
+static void
+xfer_special_io_writes_whole_cluster(void)
+{
+	const int alloc[1] = {1};
+	struct spdk_lvs_xfer *xfer;
+	struct spdk_lvs_xfer_req *req;
+	struct remote_lvol_info rmt;
+
+	xfer = make_xfer(1, 1, alloc);
+	xfer->page_size = 4096;
+	xfer->page_per_cluster = 512;
+	xfer->special_io = true;
+	free(xfer->reqs[0].payload);
+	xfer->reqs[0].payload = calloc(1, xfer->page_size * xfer->page_per_cluster);
+	SPDK_CU_ASSERT_FATAL(xfer->reqs[0].payload != NULL);
+
+	memset(&rmt, 0, sizeof(rmt));
+	rmt.status = true;
+	rmt.type = XFER_REPLICATE_SNAPSHOT;
+	rmt.md_channel = (struct spdk_io_channel *)0x1;
+	static struct spdk_bdev fake_bdev2;
+	static struct spdk_bdev_desc fake_desc2;
+	fake_bdev2.blocklen = 4096;
+	fake_desc2.bdev = &fake_bdev2;
+	rmt.desc = &fake_desc2;
+	rmt.channel = (struct spdk_io_channel *)0x1;
+
+	req = &xfer->reqs[0];
+	req->rmt_lvol = &rmt;
+	req->action = REQ_ACTION_COPY_BACKUP;
+	req->offset = 0;
+	req->len = xfer->page_per_cluster;
+
+	CU_ASSERT(submit_rw_reqs_local(req) == 0);
+	CU_ASSERT(req->fragments_outstanding == 32);   /* reads stay fragmented */
+
+	for (int i = 0; i < 32; i++) {
+		fragment_read_cb(req, 0);
+	}
+	/* ONE whole-cluster write via complete_op_cb -- no write fragments armed */
+	CU_ASSERT(req->fragments_outstanding == 0);
+	CU_ASSERT(req->status != XFER_REQ_STATUS_FAILED);
+
+	free_xfer(xfer);
+}
+
+
+/* The pipelined path must issue a fragment's hub WRITE the moment ITS read
+ * completes -- while other reads are still outstanding. That overlap is the
+ * whole point: the request costs ~max(read phase, write phase), not their
+ * sum. (Requests without a frag_ctx keep the barrier path -- covered by
+ * xfer_read_phase_is_fragmented below.) */
+static void
+xfer_pipeline_overlaps_read_and_write(void)
+{
+	const int alloc[1] = {1};
+	struct spdk_lvs_xfer *xfer;
+	struct spdk_lvs_xfer_req *req;
+	struct remote_lvol_info rmt;
+	struct spdk_lvs_xfer_frag *frags;
+
+	xfer = make_xfer(1, 1, alloc);
+	xfer->page_size = 4096;
+	xfer->page_per_cluster = 512;
+	free(xfer->reqs[0].payload);
+	xfer->reqs[0].payload = calloc(1, xfer->page_size * xfer->page_per_cluster);
+	SPDK_CU_ASSERT_FATAL(xfer->reqs[0].payload != NULL);
+	frags = calloc(32, sizeof(*frags));
+	SPDK_CU_ASSERT_FATAL(frags != NULL);
+
+	memset(&rmt, 0, sizeof(rmt));
+	rmt.status = true;
+	rmt.type = XFER_REPLICATE_SNAPSHOT;
+	rmt.md_channel = (struct spdk_io_channel *)0x1;
+	static struct spdk_bdev fake_bdev3;
+	static struct spdk_bdev_desc fake_desc3;
+	fake_bdev3.blocklen = 4096;
+	fake_desc3.bdev = &fake_bdev3;
+	rmt.desc = &fake_desc3;
+	rmt.channel = (struct spdk_io_channel *)0x1;
+	rmt.outstanding_io = 1;
+	rmt.free_ring = xfer->free_ring;
+
+	req = &xfer->reqs[0];
+	req->rmt_lvol = &rmt;
+	req->action = REQ_ACTION_COPY_BACKUP;
+	req->offset = 0;
+	req->dst_offset = 0;
+	req->len = xfer->page_per_cluster;
+	req->frag_ctx = frags;
+
+	CU_ASSERT(submit_rw_reqs_local(req) == 0);
+	CU_ASSERT(req->reads_outstanding == 32);
+	CU_ASSERT(req->writes_outstanding == 0);
+
+	/* first read completes -> ITS write goes out with 31 reads in flight */
+	pipelined_read_cb(&req->frag_ctx[0], 0);
+	CU_ASSERT(req->reads_outstanding == 31);
+	CU_ASSERT(req->writes_outstanding == 1);
+
+	for (int k = 1; k < 32; k++) {
+		pipelined_read_cb(&req->frag_ctx[k], 0);
+	}
+	CU_ASSERT(req->reads_outstanding == 0);
+	CU_ASSERT(req->writes_outstanding == 32);
+	CU_ASSERT(req->status != XFER_REQ_STATUS_DONE);
+
+	for (int k = 0; k < 32; k++) {
+		pipelined_write_cb(NULL, true, &req->frag_ctx[k]);
+	}
+	CU_ASSERT(req->status == XFER_REQ_STATUS_DONE);
+	CU_ASSERT(rmt.outstanding_io == 0);            /* recycled to free ring */
+
+	free(frags);
+	free_xfer(xfer);
+}
+
+/* A failed read must not send its fragment; the request finalizes FAILED
+ * only after everything in flight has drained. */
+static void
+xfer_pipeline_read_failure_skips_the_write(void)
+{
+	const int alloc[1] = {1};
+	struct spdk_lvs_xfer *xfer;
+	struct spdk_lvs_xfer_req *req;
+	struct remote_lvol_info rmt;
+	struct spdk_lvs_xfer_frag *frags;
+
+	xfer = make_xfer(1, 1, alloc);
+	xfer->page_size = 4096;
+	xfer->page_per_cluster = 512;
+	free(xfer->reqs[0].payload);
+	xfer->reqs[0].payload = calloc(1, xfer->page_size * xfer->page_per_cluster);
+	SPDK_CU_ASSERT_FATAL(xfer->reqs[0].payload != NULL);
+	frags = calloc(32, sizeof(*frags));
+	SPDK_CU_ASSERT_FATAL(frags != NULL);
+
+	memset(&rmt, 0, sizeof(rmt));
+	rmt.status = true;
+	rmt.type = XFER_REPLICATE_SNAPSHOT;
+	rmt.md_channel = (struct spdk_io_channel *)0x1;
+	static struct spdk_bdev fake_bdev4;
+	static struct spdk_bdev_desc fake_desc4;
+	fake_bdev4.blocklen = 4096;
+	fake_desc4.bdev = &fake_bdev4;
+	rmt.desc = &fake_desc4;
+	rmt.channel = (struct spdk_io_channel *)0x1;
+	rmt.outstanding_io = 1;
+	rmt.free_ring = xfer->free_ring;
+
+	req = &xfer->reqs[0];
+	req->rmt_lvol = &rmt;
+	req->action = REQ_ACTION_COPY_BACKUP;
+	req->len = xfer->page_per_cluster;
+	req->frag_ctx = frags;
+
+	CU_ASSERT(submit_rw_reqs_local(req) == 0);
+
+	pipelined_read_cb(&req->frag_ctx[0], -EIO);    /* first read fails */
+	CU_ASSERT(req->writes_outstanding == 0);       /* no write for it */
+
+	/* later reads complete fine but the request is already poisoned --
+	 * no further writes go out either */
+	for (int k = 1; k < 32; k++) {
+		pipelined_read_cb(&req->frag_ctx[k], 0);
+	}
+	CU_ASSERT(req->writes_outstanding == 0);
+	CU_ASSERT(req->status == XFER_REQ_STATUS_FAILED);
+	CU_ASSERT(rmt.outstanding_io == 0);
+
+	free(frags);
+	free_xfer(xfer);
+}
+
 /* The fix itself: one call must fill the whole window, not one cluster. */
 static void
 xfer_fills_whole_window(void)
@@ -328,6 +604,12 @@ main(int argc, char **argv)
 
 	suite = CU_add_suite("lvol_xfer", NULL, NULL);
 	CU_ADD_TEST(suite, xfer_fills_whole_window);
+	CU_ADD_TEST(suite, xfer_background_pauses_while_priority_active);
+	CU_ADD_TEST(suite, xfer_priority_task_dispatches_during_priority_window);
+	CU_ADD_TEST(suite, helper_serves_priority_first_and_exclusively);
+	CU_ADD_TEST(suite, xfer_special_io_writes_whole_cluster);
+	CU_ADD_TEST(suite, xfer_pipeline_overlaps_read_and_write);
+	CU_ADD_TEST(suite, xfer_pipeline_read_failure_skips_the_write);
 	CU_ADD_TEST(suite, xfer_stops_at_last_cluster);
 	CU_ADD_TEST(suite, xfer_skips_unallocated_clusters);
 	CU_ADD_TEST(suite, xfer_second_pass_continues_and_completes);

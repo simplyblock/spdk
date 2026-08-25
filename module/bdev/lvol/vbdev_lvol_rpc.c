@@ -3540,6 +3540,7 @@ struct rpc_bdev_lvol_transfer_final_step {
 	char *gateway;
 	char *snapshot_name;
 	char *operation;
+	bool special_io;
 };
 
 static void 
@@ -3556,6 +3557,7 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_transfer_final_step_d
 	{"cluster_batch", offsetof(struct rpc_bdev_lvol_transfer_final_step, cluster_batch), spdk_json_decode_uint32, true},
 	{"gateway", offsetof(struct rpc_bdev_lvol_transfer_final_step, gateway), spdk_json_decode_string},
 	{"snapshot_name", offsetof(struct rpc_bdev_lvol_transfer_final_step, snapshot_name), spdk_json_decode_string},
+	{"special_io", offsetof(struct rpc_bdev_lvol_transfer_final_step, special_io), spdk_json_decode_bool, true},
 	{"operation", offsetof(struct rpc_bdev_lvol_transfer_final_step, operation), spdk_json_decode_string},
 };
 
@@ -3655,7 +3657,8 @@ rpc_bdev_lvol_transfer_final_step(struct spdk_jsonrpc_request *request,
 	SPDK_NOTICELOG("Transfering lvol %s in mode %s for final step.\n", req.lvol_name, req.operation);
 
 	rc = spdk_lvol_transfer(lvol, 0, req.cluster_batch, type, tdev, req.snapshot_name, req.lvol_id, false,
-		 											rpc_bdev_lvol_transfer_final_step_cb, request);
+							req.special_io,
+		 					rpc_bdev_lvol_transfer_final_step_cb, request);
 	if (rc < 0) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 spdk_strerror(-rc));
@@ -3855,6 +3858,7 @@ struct rpc_bdev_lvol_transfer {
 	char *gateway;
 	char *operation;
 	bool allow_partial;
+	bool special_io;
 };
 
 static void 
@@ -3872,6 +3876,7 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_transfer_decoders[] =
 	{"operation", offsetof(struct rpc_bdev_lvol_transfer, operation), spdk_json_decode_string},
 	{"lvol_id", offsetof(struct rpc_bdev_lvol_transfer, lvol_id), spdk_json_decode_uint32, true},
 	{"allow_partial", offsetof(struct rpc_bdev_lvol_transfer, allow_partial), spdk_json_decode_bool, true},
+	{"special_io", offsetof(struct rpc_bdev_lvol_transfer, special_io), spdk_json_decode_bool, true},
 };
 
 static void 
@@ -3939,7 +3944,7 @@ rpc_bdev_lvol_transfer(struct spdk_jsonrpc_request *request,
 	SPDK_NOTICELOG("Transfering lvol %s in %s mode.\n", req.lvol_name, req.operation);
 
 	rc = spdk_lvol_transfer(lvol, req.offset, req.cluster_batch, type, tdev, NULL, req.lvol_id,
-				req.allow_partial, NULL, NULL);
+				req.allow_partial, req.special_io, NULL, NULL);
 	if (rc < 0) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 spdk_strerror(-rc));
