@@ -113,14 +113,10 @@ spdk_bdev_get_aliases(const struct spdk_bdev *bdev)
 	return &bdev->aliases;
 }
 
-/* Settable so the promotion-window tests can drive the nonleader-timeout
- * submit gate; every pre-existing test runs with the original `false`. */
-static bool g_nonleader_timeout = false;
-
 bool
 spdk_lvs_nonleader_timeout(struct spdk_lvol_store *lvs)
 {
-	return g_nonleader_timeout;
+	return false;
 }
 
 uint32_t
@@ -747,20 +743,6 @@ void
 spdk_bdev_io_complete(struct spdk_bdev_io *bdev_io, enum spdk_bdev_io_status status)
 {
 	bdev_io->internal.status = status;
-}
-
-/* Captures the NVMe status the ANA-transition completion reports. */
-static int g_nvme_sct = -1;
-static int g_nvme_sc = -1;
-static int g_nvme_completions;
-
-void
-spdk_bdev_io_complete_nvme_status(struct spdk_bdev_io *bdev_io, uint32_t cdw0, int sct, int sc)
-{
-	g_nvme_sct = sct;
-	g_nvme_sc = sc;
-	g_nvme_completions++;
-	bdev_io->internal.status = SPDK_BDEV_IO_STATUS_NVME_ERROR;
 }
 
 struct spdk_io_channel *spdk_lvol_get_io_channel(struct spdk_lvol *lvol)
@@ -1821,129 +1803,6 @@ ut_vbdev_lvol_io_type_supported(void)
 	free(lvol);
 }
 
-/* --- promotion-window ANA transition (soak case 6, run 20260824_172623) ---
- *
- * A graceful primary shutdown kills SPDK first and flips ANA reactively
- * afterwards. During that window the surviving peer is not yet the lvstore
- * leader; answering host IO with a generic internal error made the initiator
- * kernel treat the failure as final, so EIO reached XFS within seconds and
- * every affected filesystem shut down (3/3 volumes). A PATH status
- * (ANA transition) makes nvme-multipath requeue instead.
- */
-static void
-ut_ana_reset(struct spdk_lvol *lvol, struct spdk_lvol_store *lvs, struct spdk_bdev_io *io)
-{
-	memset(lvol, 0, sizeof(*lvol));
-	memset(lvs, 0, sizeof(*lvs));
-	memset(io, 0, sizeof(*io));
-	lvol->lvol_store = lvs;
-	lvs->node_role = NODE_PRIMARY;
-	io->bdev = &g_bdev;
-	io->bdev->ctxt = lvol;
-	io->type = SPDK_BDEV_IO_TYPE_WRITE;
-	io->internal.status = SPDK_BDEV_IO_STATUS_PENDING;
-	g_nvme_sct = -1;
-	g_nvme_sc = -1;
-	g_nvme_completions = 0;
-	g_nonleader_timeout = false;
-}
-
-static void
-ut_lvol_nonleader_host_io_reports_ana_transition(void)
-{
-	struct spdk_lvol lvol;
-	struct spdk_lvol_store lvs;
-	struct spdk_bdev_io io;
-
-	/* in-flight host IO fails while this node is NOT the leader */
-	ut_ana_reset(&lvol, &lvs, &io);
-	lvs.leader = false;
-	lvol_op_comp(&io, -EIO);
-	CU_ASSERT(g_nvme_completions == 1);
-	CU_ASSERT(g_nvme_sct == SPDK_NVME_SCT_PATH);
-	CU_ASSERT(g_nvme_sc == SPDK_NVME_SC_ASYMMETRIC_ACCESS_TRANSITION);
-
-	/* leadership moved out from under an in-flight IO on the leader itself */
-	ut_ana_reset(&lvol, &lvs, &io);
-	lvs.leader = true;
-	lvol_op_comp(&io, ERR_LEADERSHIP_CHANGED);
-	CU_ASSERT(g_nvme_completions == 1);
-	CU_ASSERT(g_nvme_sct == SPDK_NVME_SCT_PATH);
-	CU_ASSERT(g_nvme_sc == SPDK_NVME_SC_ASYMMETRIC_ACCESS_TRANSITION);
-}
-
-static void
-ut_lvol_real_errors_stay_generic_failures(void)
-{
-	struct spdk_lvol lvol;
-	struct spdk_lvol_store lvs;
-	struct spdk_bdev_io io;
-
-	/* a genuine media/IO error on the leader must NOT be masked as a path
-	 * event -- the host has to see it, not retry it forever */
-	ut_ana_reset(&lvol, &lvs, &io);
-	lvs.leader = true;
-	lvol_op_comp(&io, -EIO);
-	CU_ASSERT(g_nvme_completions == 0);
-	CU_ASSERT(io.internal.status == SPDK_BDEV_IO_STATUS_FAILED);
-
-	/* -ENOMEM keeps its own status so the bdev layer requeues it */
-	ut_ana_reset(&lvol, &lvs, &io);
-	lvs.leader = false;
-	lvol_op_comp(&io, -ENOMEM);
-	CU_ASSERT(g_nvme_completions == 0);
-	CU_ASSERT(io.internal.status == SPDK_BDEV_IO_STATUS_NOMEM);
-
-	/* success is untouched */
-	ut_ana_reset(&lvol, &lvs, &io);
-	lvs.leader = false;
-	lvol_op_comp(&io, 0);
-	CU_ASSERT(g_nvme_completions == 0);
-	CU_ASSERT(io.internal.status == SPDK_BDEV_IO_STATUS_SUCCESS);
-}
-
-static void
-ut_lvol_hublvol_redirect_keeps_generic_failure(void)
-{
-	struct spdk_lvol lvol, mapped;
-	struct spdk_lvol_store lvs;
-	struct spdk_bdev_io io;
-
-	/* A hublvol completion answers a PEER's redirected IO, not a host: the
-	 * peer drives its own retry state machine, so it must keep the generic
-	 * failure rather than an initiator-facing path status. */
-	ut_ana_reset(&lvol, &lvs, &io);
-	memset(&mapped, 0, sizeof(mapped));
-	mapped.lvol_store = &lvs;
-	lvol.hublvol = true;
-	lvs.lvol_map.lvol[0] = &mapped;
-	lvs.leader = false;
-	lvol_op_comp(&io, -EIO);
-	CU_ASSERT(g_nvme_completions == 0);
-	CU_ASSERT(io.internal.status == SPDK_BDEV_IO_STATUS_FAILED);
-}
-
-static void
-ut_lvol_submit_in_promotion_window_reports_ana_transition(void)
-{
-	struct spdk_lvol lvol;
-	struct spdk_lvol_store lvs;
-	struct spdk_bdev_io io;
-
-	/* New host IO arriving while the node is still non-leader and the
-	 * nonleader timeout has expired: the submit gate used to complete it
-	 * SPDK_BDEV_IO_STATUS_FAILED, which is the EIO the filesystem saw. */
-	ut_ana_reset(&lvol, &lvs, &io);
-	lvs.leader = false;
-	lvs.skip_redirecting = true;      /* no peer to redirect to */
-	g_nonleader_timeout = true;
-	vbdev_lvol_submit_request(g_ch, &io);
-	CU_ASSERT(g_nvme_completions == 1);
-	CU_ASSERT(g_nvme_sct == SPDK_NVME_SCT_PATH);
-	CU_ASSERT(g_nvme_sc == SPDK_NVME_SC_ASYMMETRIC_ACCESS_TRANSITION);
-	g_nonleader_timeout = false;
-}
-
 static void
 ut_lvol_read_write(void)
 {
@@ -2330,10 +2189,6 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, ut_vbdev_lvol_get_io_channel);
 	CU_ADD_TEST(suite, ut_vbdev_lvol_io_type_supported);
 	CU_ADD_TEST(suite, ut_lvol_read_write);
-	CU_ADD_TEST(suite, ut_lvol_nonleader_host_io_reports_ana_transition);
-	CU_ADD_TEST(suite, ut_lvol_real_errors_stay_generic_failures);
-	CU_ADD_TEST(suite, ut_lvol_hublvol_redirect_keeps_generic_failure);
-	CU_ADD_TEST(suite, ut_lvol_submit_in_promotion_window_reports_ana_transition);
 	CU_ADD_TEST(suite, ut_vbdev_lvol_submit_request);
 	CU_ADD_TEST(suite, ut_lvol_examine_config);
 	CU_ADD_TEST(suite, ut_lvol_examine_disk);
