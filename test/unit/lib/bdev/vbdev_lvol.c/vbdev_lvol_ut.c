@@ -729,6 +729,11 @@ spdk_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_
 void
 spdk_lvol_destroy_async(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg)
 {
+	{
+		extern void grp_record_destroy_async(void);
+
+		grp_record_destroy_async();
+	}
 	if (lvol->ref_count != 0) {
 		cb_fn(cb_arg, -ENODEV);
 	}
@@ -966,6 +971,7 @@ grp_reset(void)
 }
 
 void grp_record_destroy(void);
+void grp_record_destroy_async(void);
 static void grp_event(char kind, int idx);
 
 void
@@ -974,6 +980,14 @@ grp_record_destroy(void)
 	/* Only meaningful while a group test is recording. */
 	if (g_grp_event_count > 0) {
 		grp_event('D', 0);
+	}
+}
+
+void
+grp_record_destroy_async(void)
+{
+	if (g_grp_event_count > 0) {
+		grp_event('d', 0);
 	}
 }
 
@@ -1384,6 +1398,11 @@ ut_lvol_group_snapshot_midfail_unfreezes_then_gcs(void)
 	first_d = strchr(ev, 'D');
 	SPDK_CU_ASSERT_FATAL(first_d != NULL);
 	CU_ASSERT(strstr(first_d, "U") == NULL);   /* no unfreeze after any delete */
+	/* The GC must be the SYNC destroy: the fork's async delete leaves the
+	 * blob metadata and the bdev registered, waiting for a control-plane
+	 * sync follow-up that never comes for a partial group snapshot
+	 * (integration run 2026-08-25: the GC'd bdev stayed visible). */
+	CU_ASSERT(strchr(ev, 'd') == NULL);
 
 	vbdev_lvs_destruct(lvs, lvol_store_op_complete, NULL);
 	grp_reset();

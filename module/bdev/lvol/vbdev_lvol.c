@@ -2729,8 +2729,16 @@ group_snap_advance(struct vbdev_lvol_group_snap_ctx *ctx)
 	case GRP_SNAP_GC:
 		while (ctx->idx < ctx->count) {
 			if (ctx->entries[ctx->idx].snap != NULL) {
+				/* is_sync = true: the fork's async delete only clears
+				 * data clusters and leaves the blob metadata AND the
+				 * bdev registered (the control plane follows it with a
+				 * sync delete). A partial group snapshot must be gone
+				 * entirely -- integration run 2026-08-25: with the async
+				 * path the GC'd snapshot's bdev remained visible. These
+				 * snapshots are seconds old and own no user data, so the
+				 * direct sync destroy is exactly right. */
 				vbdev_lvol_destroy(ctx->entries[ctx->idx].snap,
-						   group_snap_gc_cb, ctx, false);
+						   group_snap_gc_cb, ctx, true);
 				return;
 			}
 			ctx->idx++;
