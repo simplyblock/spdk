@@ -169,9 +169,14 @@ def main():
         p_a = start_tgt(SOCK_A, "[2,3]", auto_examine=False)
         procs += [p_b, p_a]
 
-        base_blocks = (VOL_MIB + 512) * 256          # 4K blocks, volume + slack
-        rpc(SOCK_B, "bdev_malloc_create", {"num_blocks": base_blocks,
-                                           "block_size": 4096, "name": "mallocB"})
+        # AIO on /dev/shm, not malloc: malloc bdevs live in the DPDK huge
+        # pool (-s 1280) and cannot hold gigabytes; tmpfs-backed AIO is RAM
+        # speed without hugepage cost. Sized for RUNS volumes per side.
+        base_mib = RUNS * VOL_MIB + 512
+        sh(f"truncate -s {base_mib}M /dev/shm/dbxbench_b.img")
+        rpc(SOCK_B, "bdev_aio_create", {"name": "mallocB",
+                                        "filename": "/dev/shm/dbxbench_b.img",
+                                        "block_size": 4096})
         rpc(SOCK_B, "bdev_lvol_create_lvstore",
             {"bdev_name": "mallocB", "lvs_name": "lvsB", "cluster_sz": CLUSTER_SZ})
         rpc(SOCK_B, "bdev_lvol_set_leader_all",
@@ -179,8 +184,10 @@ def main():
         hub_id = rpc(SOCK_B, "bdev_lvol_create_hublvol", {"lvs_name": "lvsB"})
         nqn_hub = nvmf_up(SOCK_B, "hub", "lvsB/hublvol", PORT_HUB)
 
-        rpc(SOCK_A, "bdev_malloc_create", {"num_blocks": base_blocks,
-                                           "block_size": 4096, "name": "mallocA"})
+        sh(f"truncate -s {base_mib}M /dev/shm/dbxbench_a.img")
+        rpc(SOCK_A, "bdev_aio_create", {"name": "mallocA",
+                                        "filename": "/dev/shm/dbxbench_a.img",
+                                        "block_size": 4096})
         rpc(SOCK_A, "bdev_lvol_create_lvstore",
             {"bdev_name": "mallocA", "lvs_name": "lvsA", "cluster_sz": CLUSTER_SZ})
         rpc(SOCK_A, "bdev_lvol_set_leader_all",
@@ -260,6 +267,7 @@ def main():
     finally:
         for nqn in devs:
             sh(f"nvme disconnect -n {nqn}", check=False)
+        sh("rm -f /dev/shm/dbxbench_a.img /dev/shm/dbxbench_b.img", check=False)
         for p in procs:
             p.terminate()
         for p in procs:
