@@ -2617,8 +2617,7 @@ group_snap_freeze_cb(void *cb_arg, int lvolerrno)
 	struct vbdev_lvol_group_snap_ctx *ctx = cb_arg;
 
 	if (lvolerrno != 0) {
-		SPDK_ERRLOG("group snapshot: freeze of member %u (%s) failed: %d
-",
+		SPDK_ERRLOG("group snapshot: freeze of member %u (%s) failed: %d\n",
 			    ctx->idx, ctx->entries[ctx->idx].lvol->name, lvolerrno);
 		ctx->rc = lvolerrno;
 		/* Nothing created yet; unwind the freezes taken so far. */
@@ -2638,8 +2637,7 @@ group_snap_create_cb(void *cb_arg, struct spdk_lvol *snap, int lvolerrno)
 	struct vbdev_lvol_group_snap_ctx *ctx = cb_arg;
 
 	if (lvolerrno != 0 || snap == NULL) {
-		SPDK_ERRLOG("group snapshot: snapshot %s of member %s failed: %d
-",
+		SPDK_ERRLOG("group snapshot: snapshot %s of member %s failed: %d\n",
 			    ctx->entries[ctx->idx].snapshot_name,
 			    ctx->entries[ctx->idx].lvol->name, lvolerrno);
 		ctx->rc = lvolerrno != 0 ? lvolerrno : -EIO;
@@ -2662,8 +2660,7 @@ group_snap_unfreeze_cb(void *cb_arg, int lvolerrno)
 
 	if (lvolerrno != 0) {
 		/* Keep going: the remaining members must still be unfrozen. */
-		SPDK_ERRLOG("group snapshot: unfreeze of member %u (%s) failed: %d
-",
+		SPDK_ERRLOG("group snapshot: unfreeze of member %u (%s) failed: %d\n",
 			    ctx->idx, ctx->entries[ctx->idx].lvol->name, lvolerrno);
 		if (ctx->rc == 0) {
 			ctx->rc = lvolerrno;
@@ -2680,8 +2677,7 @@ group_snap_gc_cb(void *cb_arg, int lvolerrno)
 
 	if (lvolerrno != 0) {
 		SPDK_ERRLOG("group snapshot: GC of partial snapshot %u failed: %d "
-			    "(snapshot left behind)
-", ctx->idx, lvolerrno);
+			    "(snapshot left behind)\n", ctx->idx, lvolerrno);
 	} else {
 		ctx->entries[ctx->idx].snap = NULL;
 	}
@@ -2766,8 +2762,7 @@ vbdev_lvol_create_snapshot_group(struct vbdev_lvol_group_snap_entry *entries,
 	lvs = entries[0].lvol->lvol_store;
 	for (i = 0; i < count; i++) {
 		if (entries[i].lvol == NULL || entries[i].lvol->lvol_store != lvs) {
-			SPDK_ERRLOG("group snapshot: member %u missing or not in lvs %s
-",
+			SPDK_ERRLOG("group snapshot: member %u missing or not in lvs %s\n",
 				    i, lvs ? lvs->name : "?");
 			cb_fn(cb_arg, entries, count, -EINVAL);
 			return;
