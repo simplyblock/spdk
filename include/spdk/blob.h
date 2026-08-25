@@ -468,6 +468,24 @@ void spdk_blob_failover_unfreaze(struct spdk_blob *blob,
 				spdk_blob_op_complete cb_fn, void *cb_arg);
 
 void spdk_snapshot_freeze_blob(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
+
+/**
+ * Group-freeze IO on a blob: pure refcounted freeze with NO
+ * locked_operation_in_progress gate, so a subsequent per-blob snapshot
+ * (which takes its own freeze via spdk_snapshot_freeze_blob) still works.
+ * Used by consistency-group snapshots to park IO on EVERY member blob
+ * before the first snapshot of the group is taken and until after the
+ * last one; the per-snapshot freeze/unfreeze inside the window only moves
+ * the refcount between 1 and 2, so IO stays parked for the whole group.
+ * Must be called from the blobstore md thread.
+ */
+void spdk_blob_group_freeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
+
+/**
+ * Counterpart of spdk_blob_group_freeze_io: refcounted unfreeze; queued IO
+ * resumes when the count reaches zero.
+ */
+void spdk_blob_group_unfreeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
 int spdk_blob_get_freeze_cnt(struct spdk_blob *blob);
 
 void spdk_blob_unfreeze_cleanup(struct spdk_blob *blob,

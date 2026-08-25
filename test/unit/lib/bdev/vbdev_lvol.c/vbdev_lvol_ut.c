@@ -710,6 +710,9 @@ spdk_lvol_deletable(struct spdk_lvol *lvol)
 void
 spdk_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg)
 {
+	extern void grp_record_destroy(void);
+
+	grp_record_destroy();
 	if (lvol->ref_count != 0) {
 		cb_fn(cb_arg, -ENODEV);
 	}
@@ -931,11 +934,133 @@ spdk_lvol_create(struct spdk_lvol_store *lvs, const char *name, size_t sz,
 	return 0;
 }
 
+/* --- consistency-group snapshot test harness -------------------------------
+ * Records the group state machine's calls in order ('F' freeze, 'S' snapshot,
+ * 'U' unfreeze, 'D' destroy/GC) with the member index, and simulates the
+ * per-blob freeze refcount so the tests can PROVE each snapshot is taken
+ * while its blob is frozen.
+ */
+#define GRP_EV_MAX 64
+static char g_grp_events[GRP_EV_MAX][8];
+static int g_grp_event_count;
+static struct spdk_blob *g_grp_blobs[GRP_EV_MAX];
+static int g_grp_freeze_cnt[GRP_EV_MAX];
+static int g_grp_snapshot_fail_at;     /* 1-based call number to fail; 0 = never */
+static int g_grp_snapshot_calls;
+static int g_grp_freeze_fail_at;       /* 1-based freeze call to fail; 0 = never */
+static int g_grp_freeze_calls;
+static int g_grp_snap_taken_while_frozen;
+
+static void
+grp_reset(void)
+{
+	memset(g_grp_events, 0, sizeof(g_grp_events));
+	memset(g_grp_blobs, 0, sizeof(g_grp_blobs));
+	memset(g_grp_freeze_cnt, 0, sizeof(g_grp_freeze_cnt));
+	g_grp_event_count = 0;
+	g_grp_snapshot_fail_at = 0;
+	g_grp_snapshot_calls = 0;
+	g_grp_freeze_fail_at = 0;
+	g_grp_freeze_calls = 0;
+	g_grp_snap_taken_while_frozen = 0;
+}
+
+void grp_record_destroy(void);
+static void grp_event(char kind, int idx);
+
+void
+grp_record_destroy(void)
+{
+	/* Only meaningful while a group test is recording. */
+	if (g_grp_event_count > 0) {
+		grp_event('D', 0);
+	}
+}
+
+static void
+grp_event(char kind, int idx)
+{
+	if (g_grp_event_count < GRP_EV_MAX) {
+		snprintf(g_grp_events[g_grp_event_count], sizeof(g_grp_events[0]),
+			 "%c%d", kind, idx);
+		g_grp_event_count++;
+	}
+}
+
+static int *
+grp_freeze_slot(struct spdk_blob *blob)
+{
+	int i;
+
+	for (i = 0; i < GRP_EV_MAX; i++) {
+		if (g_grp_blobs[i] == blob) {
+			return &g_grp_freeze_cnt[i];
+		}
+		if (g_grp_blobs[i] == NULL) {
+			g_grp_blobs[i] = blob;
+			return &g_grp_freeze_cnt[i];
+		}
+	}
+	return &g_grp_freeze_cnt[0];
+}
+
+static int
+grp_blob_index(struct spdk_blob *blob)
+{
+	int i;
+
+	for (i = 0; i < GRP_EV_MAX; i++) {
+		if (g_grp_blobs[i] == blob) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+void
+spdk_blob_group_freeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	g_grp_freeze_calls++;
+	if (g_grp_freeze_fail_at && g_grp_freeze_calls == g_grp_freeze_fail_at) {
+		grp_event('f', grp_blob_index(blob) >= 0 ? grp_blob_index(blob) : g_grp_freeze_calls - 1);
+		cb_fn(cb_arg, -EBUSY);
+		return;
+	}
+	(*grp_freeze_slot(blob))++;
+	grp_event('F', grp_blob_index(blob));
+	cb_fn(cb_arg, 0);
+}
+
+void
+spdk_blob_group_unfreeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	int *slot = grp_freeze_slot(blob);
+
+	if (*slot > 0) {
+		(*slot)--;
+	}
+	grp_event('U', grp_blob_index(blob));
+	cb_fn(cb_arg, 0);
+}
+
 void
 spdk_lvol_create_snapshot(struct spdk_lvol *lvol, const char *snapshot_name,
 			  spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg)
 {
 	struct spdk_lvol *snap;
+	int bidx = grp_blob_index(lvol->blob);
+
+	g_grp_snapshot_calls++;
+	if (bidx >= 0) {
+		grp_event('S', bidx);
+		if (g_grp_freeze_cnt[bidx] > 0) {
+			g_grp_snap_taken_while_frozen++;
+		}
+	}
+	if (g_grp_snapshot_fail_at && g_grp_snapshot_calls == g_grp_snapshot_fail_at) {
+		cb_fn(cb_arg, NULL, -EIO);
+		return;
+	}
 
 	snap = _lvol_create(lvol->lvol_store);
 	snprintf(snap->name, sizeof(snap->name), "%s", snapshot_name);
@@ -1133,6 +1258,182 @@ ut_lvol_init(void)
 	vbdev_lvs_destruct(lvs, lvol_store_op_complete, NULL);
 	CU_ASSERT(g_lvserrno == 0);
 	CU_ASSERT(g_lvol_store == NULL);
+}
+
+
+/* --- consistency-group snapshot tests -------------------------------------- */
+
+static struct vbdev_lvol_group_snap_entry g_grp_entries[4];
+static int g_grp_done_rc;
+static int g_grp_done_called;
+
+static void
+grp_snapshot_done(void *cb_arg, struct vbdev_lvol_group_snap_entry *entries,
+		  uint32_t count, int lvolerrno)
+{
+	g_grp_done_rc = lvolerrno;
+	g_grp_done_called++;
+}
+
+static struct spdk_lvol_store *
+grp_setup(struct spdk_lvol *lvols[3])
+{
+	struct spdk_lvol_store *lvs;
+	int i, rc;
+
+	ut_init_bdev(DEFAULT_BDEV_NAME, DEFAULT_BDEV_UUID);
+	rc = vbdev_lvs_create(DEFAULT_BDEV_NAME, "lvs", 0, LVS_CLEAR_WITH_UNMAP, 0,
+			      lvol_store_op_with_handle_complete, NULL);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+	SPDK_CU_ASSERT_FATAL(g_lvol_store != NULL);
+	for (i = 0; i < 3; i++) {
+		g_lvolerrno = -1;
+		char lvname[16];
+		snprintf(lvname, sizeof(lvname), "grp_lvol%d", i);
+		rc = vbdev_lvol_create(g_lvol_store, lvname, 10, false, LVOL_CLEAR_WITH_DEFAULT,
+				       0, 0, vbdev_lvol_create_complete, NULL);
+		SPDK_CU_ASSERT_FATAL(rc == 0);
+		SPDK_CU_ASSERT_FATAL(g_lvol != NULL);
+		lvols[i] = g_lvol;
+		/* Distinct blob pointers so the freeze-refcount simulation can
+		 * track each member separately. */
+		lvols[i]->blob = (struct spdk_blob *)(uintptr_t)(0x1000 + i);
+	}
+	grp_reset();
+	/* Pre-register the blobs so event indices match member order. */
+	(void)grp_freeze_slot(lvols[0]->blob); g_grp_freeze_cnt[0] = 0;
+	(void)grp_freeze_slot(lvols[1]->blob); g_grp_freeze_cnt[1] = 0;
+	(void)grp_freeze_slot(lvols[2]->blob); g_grp_freeze_cnt[2] = 0;
+	return g_lvol_store;
+}
+
+static const char *
+grp_events_joined(void)
+{
+	static char buf[512];
+	int i;
+
+	buf[0] = 0;
+	for (i = 0; i < g_grp_event_count; i++) {
+		strcat(buf, g_grp_events[i]);
+		strcat(buf, " ");
+	}
+	return buf;
+}
+
+static void
+ut_lvol_group_snapshot_ordering(void)
+{
+	struct spdk_lvol *lvols[3];
+	struct spdk_lvol_store *lvs;
+
+	lvs = grp_setup(lvols);
+
+	g_grp_entries[0] = (struct vbdev_lvol_group_snap_entry){lvols[0], (char *)"s0", NULL};
+	g_grp_entries[1] = (struct vbdev_lvol_group_snap_entry){lvols[1], (char *)"s1", NULL};
+	g_grp_entries[2] = (struct vbdev_lvol_group_snap_entry){lvols[2], (char *)"s2", NULL};
+	g_grp_done_called = 0;
+	vbdev_lvol_create_snapshot_group(g_grp_entries, 3, grp_snapshot_done, NULL);
+
+	CU_ASSERT(g_grp_done_called == 1);
+	CU_ASSERT(g_grp_done_rc == 0);
+	CU_ASSERT(g_grp_entries[0].snap != NULL);
+	CU_ASSERT(g_grp_entries[1].snap != NULL);
+	CU_ASSERT(g_grp_entries[2].snap != NULL);
+	/* Every freeze precedes every snapshot; every snapshot precedes every
+	 * unfreeze -- the whole group shares one frozen window. */
+	CU_ASSERT(strcmp(grp_events_joined(),
+			 "F0 F1 F2 S0 S1 S2 U0 U1 U2 ") == 0);
+	/* Each snapshot was taken while ITS blob was frozen: the fork's
+	 * bs_create_snapshot path has no freeze interlock (freeze is
+	 * externalized), and the group machine depends on that. */
+	CU_ASSERT(g_grp_snap_taken_while_frozen == 3);
+
+	vbdev_lvs_destruct(lvs, lvol_store_op_complete, NULL);
+	grp_reset();
+}
+
+static void
+ut_lvol_group_snapshot_midfail_unfreezes_then_gcs(void)
+{
+	struct spdk_lvol *lvols[3];
+	struct spdk_lvol_store *lvs;
+	const char *ev;
+	const char *first_d;
+
+	lvs = grp_setup(lvols);
+	g_grp_snapshot_fail_at = 2;      /* second member's snapshot fails */
+
+	g_grp_entries[0] = (struct vbdev_lvol_group_snap_entry){lvols[0], (char *)"s0", NULL};
+	g_grp_entries[1] = (struct vbdev_lvol_group_snap_entry){lvols[1], (char *)"s1", NULL};
+	g_grp_entries[2] = (struct vbdev_lvol_group_snap_entry){lvols[2], (char *)"s2", NULL};
+	g_grp_done_called = 0;
+	vbdev_lvol_create_snapshot_group(g_grp_entries, 3, grp_snapshot_done, NULL);
+
+	CU_ASSERT(g_grp_done_called == 1);
+	CU_ASSERT(g_grp_done_rc == -EIO);
+	/* The partial snapshot was garbage-collected. */
+	CU_ASSERT(g_grp_entries[0].snap == NULL);
+	CU_ASSERT(g_grp_entries[1].snap == NULL);
+	CU_ASSERT(g_grp_entries[2].snap == NULL);
+	ev = grp_events_joined();
+	/* All three members freeze, snapshots stop at the failure, then ALL
+	 * THREE unfreeze BEFORE the GC delete runs: host IO is never held
+	 * hostage to cleanup. */
+	CU_ASSERT(strncmp(ev, "F0 F1 F2 S0 S1 U0 U1 U2 D", strlen("F0 F1 F2 S0 S1 U0 U1 U2 D")) == 0);
+	first_d = strchr(ev, 'D');
+	SPDK_CU_ASSERT_FATAL(first_d != NULL);
+	CU_ASSERT(strstr(first_d, "U") == NULL);   /* no unfreeze after any delete */
+
+	vbdev_lvs_destruct(lvs, lvol_store_op_complete, NULL);
+	grp_reset();
+}
+
+static void
+ut_lvol_group_snapshot_freeze_fail_unwinds(void)
+{
+	struct spdk_lvol *lvols[3];
+	struct spdk_lvol_store *lvs;
+	const char *ev;
+
+	lvs = grp_setup(lvols);
+	g_grp_freeze_fail_at = 2;        /* second member's freeze fails */
+
+	g_grp_entries[0] = (struct vbdev_lvol_group_snap_entry){lvols[0], (char *)"s0", NULL};
+	g_grp_entries[1] = (struct vbdev_lvol_group_snap_entry){lvols[1], (char *)"s1", NULL};
+	g_grp_entries[2] = (struct vbdev_lvol_group_snap_entry){lvols[2], (char *)"s2", NULL};
+	g_grp_done_called = 0;
+	vbdev_lvol_create_snapshot_group(g_grp_entries, 3, grp_snapshot_done, NULL);
+
+	CU_ASSERT(g_grp_done_called == 1);
+	CU_ASSERT(g_grp_done_rc == -EBUSY);
+	CU_ASSERT(g_grp_entries[0].snap == NULL);
+	ev = grp_events_joined();
+	/* Only the successfully frozen member is unfrozen; no snapshot, no GC. */
+	CU_ASSERT(strcmp(ev, "F0 f1 U0 ") == 0);
+	CU_ASSERT(strchr(ev, 'S') == NULL);
+	CU_ASSERT(strchr(ev, 'D') == NULL);
+
+	vbdev_lvs_destruct(lvs, lvol_store_op_complete, NULL);
+	grp_reset();
+}
+
+static void
+ut_lvol_group_snapshot_rejects_empty_and_null(void)
+{
+	struct spdk_lvol *lvols[3];
+	struct spdk_lvol_store *lvs;
+
+	lvs = grp_setup(lvols);
+
+	g_grp_done_called = 0;
+	vbdev_lvol_create_snapshot_group(g_grp_entries, 0, grp_snapshot_done, NULL);
+	CU_ASSERT(g_grp_done_called == 1);
+	CU_ASSERT(g_grp_done_rc == -EINVAL);
+	CU_ASSERT(g_grp_event_count == 0);
+
+	vbdev_lvs_destruct(lvs, lvol_store_op_complete, NULL);
+	grp_reset();
 }
 
 static void
@@ -2180,6 +2481,10 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, ut_lvs_init);
 	CU_ADD_TEST(suite, ut_lvol_init);
 	CU_ADD_TEST(suite, ut_lvol_snapshot);
+	CU_ADD_TEST(suite, ut_lvol_group_snapshot_ordering);
+	CU_ADD_TEST(suite, ut_lvol_group_snapshot_midfail_unfreezes_then_gcs);
+	CU_ADD_TEST(suite, ut_lvol_group_snapshot_freeze_fail_unwinds);
+	CU_ADD_TEST(suite, ut_lvol_group_snapshot_rejects_empty_and_null);
 	CU_ADD_TEST(suite, ut_lvol_clone);
 	CU_ADD_TEST(suite, ut_lvs_destroy);
 	CU_ADD_TEST(suite, ut_lvs_unload);
