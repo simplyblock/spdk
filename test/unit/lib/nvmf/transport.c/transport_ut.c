@@ -4,7 +4,7 @@
 
 #include "spdk/stdinc.h"
 #include "spdk_internal/cunit.h"
-#include "common/lib/test_env.c"
+#include "common/lib/ut_multithread.c"
 #include "common/lib/test_iobuf.c"
 #include "nvmf/transport.c"
 #include "nvmf/rdma.c"
@@ -86,7 +86,8 @@ DEFINE_STUB(ut_transport_listen, int, (struct spdk_nvmf_transport *transport,
 DEFINE_STUB_V(ut_transport_stop_listen, (struct spdk_nvmf_transport *transport,
 		const struct spdk_nvme_transport_id *trid));
 DEFINE_STUB(spdk_mempool_lookup, struct spdk_mempool *, (const char *name), NULL);
-
+DEFINE_STUB(spdk_rdma_cm_id_get_numa_id, int32_t, (struct rdma_cm_id *cm_id), 0);
+DEFINE_STUB(spdk_nvmf_check_port_permission, bool, (uint16_t port, bool *is_reject), false);
 /* ibv_reg_mr can be a macro, need to undefine it */
 #ifdef ibv_reg_mr
 #undef ibv_reg_mr
@@ -167,6 +168,39 @@ test_spdk_nvmf_transport_create(void)
 	CU_ASSERT(transport == NULL);
 
 	g_rdma_ut_transport_opts.io_unit_size = SPDK_NVMF_RDMA_MIN_IO_BUFFER_SIZE;
+
+	/* Ensure kas cannot be set to 0 */
+	g_rdma_ut_transport_opts.kas = 0;
+	rc = spdk_nvmf_transport_create_async("new_ops", &g_rdma_ut_transport_opts,
+					      test_nvmf_create_transport_done, &transport);
+	CU_ASSERT(rc != 0);
+	CU_ASSERT(transport == NULL);
+
+	g_rdma_ut_transport_opts.kas = NVMF_DEFAULT_KAS;
+
+	/* Ensure min_kato cannot be set to 0 */
+	g_rdma_ut_transport_opts.min_kato = 0;
+	rc = spdk_nvmf_transport_create_async("new_ops", &g_rdma_ut_transport_opts,
+					      test_nvmf_create_transport_done, &transport);
+	CU_ASSERT(rc != 0);
+	CU_ASSERT(transport == NULL);
+
+	g_rdma_ut_transport_opts.min_kato = NVMF_DEFAULT_MIN_KATO;
+
+	/* min_kato should be rounded up to a multiple of kas * NVMF_KAS_TIME_UNIT_IN_MS */
+	g_rdma_ut_transport_opts.kas = NVMF_DEFAULT_KAS;
+	g_rdma_ut_transport_opts.min_kato = 1000;
+	rc = spdk_nvmf_transport_create_async("new_ops", &g_rdma_ut_transport_opts,
+					      test_nvmf_create_transport_done, &transport);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(transport == &ut_transport);
+	CU_ASSERT(transport->opts.min_kato == NVMF_DEFAULT_KAS * NVMF_KAS_TIME_UNIT_IN_MS);
+
+	rc = spdk_nvmf_transport_destroy(transport, NULL, NULL);
+	CU_ASSERT(rc == 0);
+
+	g_rdma_ut_transport_opts.kas = NVMF_DEFAULT_KAS;
+	g_rdma_ut_transport_opts.min_kato = NVMF_DEFAULT_MIN_KATO;
 
 	/* Create transport successfully */
 	rc = spdk_nvmf_transport_create_async("new_ops", &g_rdma_ut_transport_opts,
@@ -393,6 +427,9 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_nvmf_transport_poll_group_create);
 	CU_ADD_TEST(suite, test_spdk_nvmf_transport_opts_init);
 	CU_ADD_TEST(suite, test_spdk_nvmf_transport_listen_ext);
+
+	allocate_threads(1);
+	set_thread(0);
 
 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
 	CU_cleanup_registry();

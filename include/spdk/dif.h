@@ -27,6 +27,7 @@ extern "C" {
 #define SPDK_DIF_FLAGS_REFTAG_CHECK	(1U << 26)
 #define SPDK_DIF_FLAGS_APPTAG_CHECK	(1U << 27)
 #define SPDK_DIF_FLAGS_GUARD_CHECK	(1U << 28)
+#define SPDK_DIF_FLAGS_NVME_PRACT	(1U << 29)
 
 #define SPDK_DIF_REFTAG_ERROR	0x1
 #define SPDK_DIF_APPTAG_ERROR	0x2
@@ -223,6 +224,10 @@ int spdk_dif_update_crc32c(struct iovec *iovs, int iovcnt, uint32_t num_blocks,
 /**
  * Copy data and generate DIF for extended LBA payload.
  *
+ * NOTE: If PRACT is set in the DIF context, this function simulates the NVMe PRACT feature.
+ * If metadata size is larger than DIF size, not only bounce buffer but also source buffer
+ * should be extended LBA payload.
+
  * \param iovs iovec array describing the LBA payload.
  * \param iovcnt Number of elements in the iovec array.
  * \param bounce_iovs A contiguous buffer forming extended LBA payload.
@@ -238,6 +243,10 @@ int spdk_dif_generate_copy(struct iovec *iovs, int iovcnt, struct iovec *bounce_
 
 /**
  * Verify DIF and copy data for extended LBA payload.
+ *
+ * NOTE: If PRACT is set in the DIF context, this function simulates the NVMe PRACT feature.
+ * If metadata size is larger than DIF size, not only bounce buffer but also destination buffer
+ * should be extended LBA payload.
  *
  * \param iovs iovec array describing the LBA payload.
  * \param iovcnt Number of elements in the iovec array.
@@ -467,6 +476,16 @@ int spdk_dix_remap_ref_tag(struct iovec *md_iov, uint32_t num_blocks,
 			   const struct spdk_dif_ctx *dif_ctx,
 			   struct spdk_dif_error *err_blk,
 			   bool check_ref_tag);
+
+/**
+ * Get PI field size for the PI format
+ *
+ * \param dif_pi_format DIF PI format type
+ *
+ * \return Size of the PI field.
+ */
+uint32_t spdk_dif_pi_format_get_size(enum spdk_dif_pi_format dif_pi_format);
+
 #ifdef __cplusplus
 }
 #endif

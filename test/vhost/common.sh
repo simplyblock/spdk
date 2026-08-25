@@ -240,6 +240,13 @@ function vhost_kill() {
 				echo "."
 			done
 		fi
+		# If this PID is our child, we should attempt to verify its status
+		# to catch any "silent" crashes that may happen upon termination.
+		if is_pid_child "$vhost_pid"; then
+			notice "Checking status of $vhost_pid"
+			wait "$vhost_pid" || rc=1
+		fi
+
 	elif kill -0 $vhost_pid; then
 		error "vhost NOT killed - you need to kill it manually"
 		rc=1
@@ -523,7 +530,6 @@ function vm_setup() {
 	local vm_migrate_to=""
 	local force_vm=""
 	local guest_memory=1024
-	local queue_number=""
 	local vhost_dir
 	local packed=false
 	vhost_dir="$(get_vhost_dir 0)"
@@ -540,7 +546,6 @@ function vm_setup() {
 					raw-cache=*) raw_cache=",cache${OPTARG#*=}" ;;
 					force=*) force_vm=${OPTARG#*=} ;;
 					memory=*) guest_memory=${OPTARG#*=} ;;
-					queue_num=*) queue_number=${OPTARG#*=} ;;
 					incoming=*) vm_incoming="${OPTARG#*=}" ;;
 					migrate-to=*) vm_migrate_to="${OPTARG#*=}" ;;
 					vhost-name=*) vhost_dir="$(get_vhost_dir ${OPTARG#*=})" ;;
@@ -644,28 +649,14 @@ function vm_setup() {
 	local gdbserver_socket=$((vm_socket_offset + 4))
 	local vnc_socket=$((100 + vm_num))
 	local qemu_pid_file="$vm_dir/qemu.pid"
-	local cpu_num=0
+	local cpu_list
+	local cpu_num=0 queue_number=0
 
-	set +x
-	# cpu list for taskset can be comma separated or range
-	# or both at the same time, so first split on commas
-	cpu_list=$(echo $task_mask | tr "," "\n")
-	queue_number=0
-	for c in $cpu_list; do
-		# if range is detected - count how many cpus
-		if [[ $c =~ [0-9]+-[0-9]+ ]]; then
-			val=$((c - 1))
-			val=${val#-}
-		else
-			val=1
-		fi
-		cpu_num=$((cpu_num + val))
-		queue_number=$((queue_number + val))
-	done
+	cpu_list=($(parse_cpu_list <(echo "$task_mask")))
+	cpu_num=${#cpu_list[@]} queue_number=$cpu_num
 
-	if [ -z $queue_number ]; then
-		queue_number=$cpu_num
-	fi
+	# Let's be paranoid about it
+	((cpu_num > 0 && queue_number > 0)) || return 1
 
 	# Normalize tcp ports to make sure they are available
 	ssh_socket=$(get_free_tcp_port "$ssh_socket")
@@ -1404,41 +1395,6 @@ function get_free_tcp_port() {
 	done
 
 	echo "$port"
-}
-
-function limit_vhost_kernel_threads() {
-	local cpus=$1 nodes cpu _cpus=() _nodes=()
-	local _pids=() pid cgroup pid
-
-	xtrace_disable_per_cmd map_cpus
-
-	_cpus=($(parse_cpu_list <(echo "$cpus")))
-
-	for cpu in "${_cpus[@]}"; do
-		_nodes+=("${cpu_node_map[cpu]}")
-	done
-
-	nodes=$(fold_array_onto_string "${_nodes[@]}")
-
-	# vhost kernel threads are named as vhost-PID
-	_pids=($(pgrep vhost))
-	((${#_pids[@]} > 0)) || return 1
-
-	# All threads should be located under the same initial cgroup. kthreadd does not put them
-	# under root cgroup, but rather the cgroup of a session from which target/vhost was configured.
-	# We create dedicated cgroup under the initial one to move all the threads only once instead of
-	# having an extra step of moving them to the root cgroup first.
-	set_cgroup_attr_top_bottom "${_pids[0]}" cgroup.subtree_control "+cpuset"
-
-	cgroup=$(get_cgroup "${_pids[0]}")
-	create_cgroup "$cgroup/vhost"
-
-	set_cgroup_attr "$cgroup/vhost" cpuset.cpus "$cpus"
-	set_cgroup_attr "$cgroup/vhost" cpuset.mems "$nodes"
-
-	for pid in "${_pids[@]}"; do
-		move_proc "$pid" "$cgroup/vhost" "$cgroup" cgroup.threads
-	done
 }
 
 function gen_cpu_vm_spdk_config() (

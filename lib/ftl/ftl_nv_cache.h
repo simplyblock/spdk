@@ -12,6 +12,7 @@
 
 #include "ftl_io.h"
 #include "ftl_utils.h"
+#include "ftl_internal.h"
 #include "nvc/ftl_nvc_dev.h"
 
 /*
@@ -91,8 +92,11 @@ struct ftl_nv_cache_chunk_md {
 	/* CRC32 checksum of the associated P2L map when chunk is in closed state */
 	uint32_t p2l_map_checksum;
 
+	/* P2L IO log type */
+	enum ftl_layout_region_type p2l_log_type;
+
 	/* Reserved */
-	uint8_t reserved[4044];
+	uint8_t reserved[4040];
 } __attribute__((packed));
 
 SPDK_STATIC_ASSERT(sizeof(struct ftl_nv_cache_chunk_md) == FTL_BLOCK_SIZE,
@@ -125,6 +129,9 @@ struct ftl_nv_cache_chunk {
 
 	/* For writing metadata */
 	struct ftl_md_io_entry_ctx md_persist_entry_ctx;
+
+	/* P2L Log for IOs */
+	struct ftl_p2l_log *p2l_log;
 };
 
 struct ftl_nv_cache_compactor {
@@ -238,6 +245,7 @@ void ftl_nv_cache_scrub(struct spdk_ftl_dev *dev, nvc_scrub_cb cb, void *cb_ctx)
 int ftl_nv_cache_init(struct spdk_ftl_dev *dev);
 void ftl_nv_cache_deinit(struct spdk_ftl_dev *dev);
 bool ftl_nv_cache_write(struct ftl_io *io);
+void ftl_nv_cache_write_complete(struct ftl_io *io, bool success);
 void ftl_nv_cache_fill_md(struct ftl_io *io);
 int ftl_nv_cache_read(struct ftl_io *io, ftl_addr addr, uint32_t num_blocks,
 		      spdk_bdev_io_completion_cb cb, void *cb_arg);
@@ -249,6 +257,8 @@ void ftl_chunk_map_set_lba(struct ftl_nv_cache_chunk *chunk,
 uint64_t ftl_chunk_map_get_lba(struct ftl_nv_cache_chunk *chunk, uint64_t offset);
 
 void ftl_nv_cache_set_addr(struct spdk_ftl_dev *dev, uint64_t lba, ftl_addr addr);
+
+void ftl_nv_cache_chunk_set_addr(struct ftl_nv_cache_chunk *chunk, uint64_t lba, ftl_addr addr);
 
 int ftl_nv_cache_save_state(struct ftl_nv_cache *nv_cache);
 

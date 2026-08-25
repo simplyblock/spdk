@@ -24,6 +24,9 @@ SPDK_LOG_REGISTER_COMPONENT(nvmf)
 
 static TAILQ_HEAD(, spdk_nvmf_tgt) g_nvmf_tgts = TAILQ_HEAD_INITIALIZER(g_nvmf_tgts);
 
+struct spdk_nvmf_rules g_nvmf_blocked_ports[MAX_NUM_BLOCKED_PORTS] = {0};
+static uint16_t g_nvmf_num_blocked_ports = 0;
+
 typedef void (*nvmf_qpair_disconnect_cpl)(void *ctx, int status);
 
 /* supplied to a single call to nvmf_qpair_disconnect */
@@ -104,7 +107,7 @@ spdk_nvmf_tgt_add_referral(struct spdk_nvmf_tgt *tgt,
 	spdk_strcpy_pad(referral->entry.traddr, trid->traddr, sizeof(referral->entry.traddr), ' ');
 
 	TAILQ_INSERT_HEAD(&tgt->referrals, referral, link);
-	nvmf_update_discovery_log(tgt, NULL);
+	spdk_nvmf_send_discovery_log_notice(tgt, NULL);
 
 	return 0;
 }
@@ -128,7 +131,7 @@ spdk_nvmf_tgt_remove_referral(struct spdk_nvmf_tgt *tgt,
 	}
 
 	TAILQ_REMOVE(&tgt->referrals, referral, link);
-	nvmf_update_discovery_log(tgt, NULL);
+	spdk_nvmf_send_discovery_log_notice(tgt, NULL);
 
 	free(referral);
 
@@ -143,25 +146,6 @@ nvmf_qpair_set_state(struct spdk_nvmf_qpair *qpair,
 	assert(qpair->group->thread == spdk_get_thread());
 
 	qpair->state = state;
-}
-
-static int
-nvmf_poll_group_poll(void *ctx)
-{
-	struct spdk_nvmf_poll_group *group = ctx;
-	int rc;
-	int count = 0;
-	struct spdk_nvmf_transport_poll_group *tgroup;
-
-	TAILQ_FOREACH(tgroup, &group->tgroups, link) {
-		rc = nvmf_transport_poll_group_poll(tgroup);
-		if (rc < 0) {
-			return SPDK_POLLER_BUSY;
-		}
-		count += rc;
-	}
-
-	return count > 0 ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
 }
 
 /*
@@ -196,8 +180,6 @@ nvmf_tgt_cleanup_poll_group(struct spdk_nvmf_poll_group *group)
 	}
 
 	free(group->sgroups);
-
-	spdk_poller_unregister(&group->poller);
 
 	if (group->destroy_cb_fn) {
 		group->destroy_cb_fn(group->destroy_cb_arg, 0);
@@ -249,11 +231,6 @@ nvmf_poll_group_add_transport(struct spdk_nvmf_poll_group *group,
 	return 0;
 }
 
-static void
-nvmf_tgt_poller_set_interrupt_mode(struct spdk_poller *poller, void *cb_arg, bool interrupt_mode)
-{
-}
-
 static int
 nvmf_tgt_create_poll_group(void *io_device, void *ctx_buf)
 {
@@ -270,9 +247,6 @@ nvmf_tgt_create_poll_group(void *io_device, void *ctx_buf)
 	TAILQ_INIT(&group->qpairs);
 	group->thread = thread;
 	pthread_mutex_init(&group->mutex, NULL);
-
-	group->poller = SPDK_POLLER_REGISTER(nvmf_poll_group_poll, group, 0);
-	spdk_poller_register_interrupt(group->poller, nvmf_tgt_poller_set_interrupt_mode, NULL);
 
 	SPDK_DTRACE_PROBE1_TICKS(nvmf_create_poll_group, spdk_thread_get_id(thread));
 
@@ -1001,8 +975,11 @@ _nvmf_tgt_pause_polling(struct spdk_io_channel_iter *i)
 {
 	struct spdk_io_channel *ch = spdk_io_channel_iter_get_channel(i);
 	struct spdk_nvmf_poll_group *group = spdk_io_channel_get_ctx(ch);
+	struct spdk_nvmf_transport_poll_group *tgroup;
 
-	spdk_poller_unregister(&group->poller);
+	TAILQ_FOREACH(tgroup, &group->tgroups, link) {
+		nvmf_transport_poll_group_pause(tgroup);
+	}
 
 	spdk_for_each_channel_continue(i, 0);
 }
@@ -1060,9 +1037,11 @@ _nvmf_tgt_resume_polling(struct spdk_io_channel_iter *i)
 {
 	struct spdk_io_channel *ch = spdk_io_channel_iter_get_channel(i);
 	struct spdk_nvmf_poll_group *group = spdk_io_channel_get_ctx(ch);
+	struct spdk_nvmf_transport_poll_group *tgroup;
 
-	assert(group->poller == NULL);
-	group->poller = SPDK_POLLER_REGISTER(nvmf_poll_group_poll, group, 0);
+	TAILQ_FOREACH(tgroup, &group->tgroups, link) {
+		nvmf_transport_poll_group_resume(tgroup);
+	}
 
 	spdk_for_each_channel_continue(i, 0);
 }
@@ -1122,6 +1101,17 @@ spdk_nvmf_tgt_find_subsystem(struct spdk_nvmf_tgt *tgt, const char *subnqn)
 	return RB_FIND(subsystem_tree, &tgt->subsystems, &subsystem);
 }
 
+void
+spdk_nvmf_tgt_dump_subsystem(struct spdk_nvmf_tgt *tgt)
+{
+	struct spdk_nvmf_subsystem *subsystem;
+
+	RB_FOREACH(subsystem, subsystem_tree, &tgt->subsystems) {
+		// Access each subnqn here
+		SPDK_NOTICELOG("SUBNQN %s\n", subsystem->subnqn);
+	}
+}
+
 struct spdk_nvmf_transport *
 spdk_nvmf_tgt_get_transport(struct spdk_nvmf_tgt *tgt, const char *transport_name)
 {
@@ -1151,6 +1141,13 @@ _nvmf_poll_group_add(void *_ctx)
 
 	if (spdk_nvmf_poll_group_add(group, qpair) != 0) {
 		SPDK_ERRLOG("Unable to add the qpair to a poll group.\n");
+
+		assert(qpair->state == SPDK_NVMF_QPAIR_UNINITIALIZED);
+		pthread_mutex_lock(&group->mutex);
+		assert(group->current_unassociated_qpairs > 0);
+		group->current_unassociated_qpairs--;
+		pthread_mutex_unlock(&group->mutex);
+
 		spdk_nvmf_qpair_disconnect(qpair);
 	}
 }
@@ -1264,11 +1261,17 @@ _nvmf_ctrlr_free_from_qpair(void *ctx)
 	uint32_t count;
 
 	spdk_bit_array_clear(ctrlr->qpair_mask, qpair_ctx->qid);
+	// if (strstr(ctrlr->subsys->subnqn, "vm") != NULL) {
+	SPDK_NOTICELOG("destroy qpair %p (cntlid:%u, qid:%u) on subsystem %s\n",
+				     qpair_ctx->qpair, ctrlr->cntlid, qpair_ctx->qid, ctrlr->subsys->subnqn);
+	// }
+
 	SPDK_DEBUGLOG(nvmf, "qpair_mask cleared, qid %u\n", qpair_ctx->qid);
 	count = spdk_bit_array_count_set(ctrlr->qpair_mask);
 	if (count == 0) {
 		assert(!ctrlr->in_destruct);
 		SPDK_DEBUGLOG(nvmf, "Last qpair %u, destroy ctrlr 0x%hx\n", qpair_ctx->qid, ctrlr->cntlid);
+		SPDK_NOTICELOG("Last qpair %u, destroy ctrlr 0x%hx\n", qpair_ctx->qid, ctrlr->cntlid);
 		ctrlr->in_destruct = true;
 		spdk_thread_send_msg(ctrlr->subsys->thread, _nvmf_ctrlr_destruct, ctrlr);
 	}
@@ -1364,6 +1367,7 @@ _nvmf_qpair_destroy(void *ctx, int status)
 		}
 	} else {
 		pthread_mutex_lock(&qpair->group->mutex);
+		assert(qpair->group->current_unassociated_qpairs > 0);
 		qpair->group->current_unassociated_qpairs--;
 		pthread_mutex_unlock(&qpair->group->mutex);
 	}
@@ -1399,7 +1403,7 @@ spdk_nvmf_qpair_disconnect(struct spdk_nvmf_qpair *qpair)
 {
 	struct spdk_nvmf_poll_group *group = qpair->group;
 	struct nvmf_qpair_disconnect_ctx *qpair_ctx;
-
+	SPDK_NOTICELOG("trying disconnect qpair id : %d, outstanding : %d.\n", qpair->qid, TAILQ_EMPTY(&qpair->outstanding) ? 0 : 1);
 	if (__atomic_test_and_set(&qpair->disconnect_started, __ATOMIC_RELAXED)) {
 		return -EINPROGRESS;
 	}
@@ -1550,6 +1554,23 @@ poll_group_update_subsystem(struct spdk_nvmf_poll_group *group,
 				      group,
 				      ns_info->num_blocks,
 				      spdk_bdev_get_num_blocks(ns->bdev));
+			// SPDK_NOTICELOG("Namespace resized: subsystem_id %u,"
+			// 	      " nsid %u, pg %p, old %" PRIu64 ", new %" PRIu64 "\n",
+			// 	      subsystem->id,
+			// 	      ns->nsid,
+			// 	      group,
+			// 	      ns_info->num_blocks,
+			// 	      spdk_bdev_get_num_blocks(ns->bdev));
+			ns_changed = true;
+		} else if (ns_info->anagrpid != ns->anagrpid) {
+			/* Namespace is still there but ANA group ID has changed */
+			SPDK_DEBUGLOG(nvmf, "ANA group ID changed: subsystem_id %u,"
+				      "nsid %u, pg %p, old %u, new %u\n",
+				      subsystem->id,
+				      ns->nsid,
+				      group,
+				      ns_info->anagrpid,
+				      ns->anagrpid);
 			ns_changed = true;
 		}
 
@@ -1558,6 +1579,7 @@ poll_group_update_subsystem(struct spdk_nvmf_poll_group *group,
 		} else {
 			ns_info->uuid = *spdk_bdev_get_uuid(ns->bdev);
 			ns_info->num_blocks = spdk_bdev_get_num_blocks(ns->bdev);
+			ns_info->anagrpid = ns->anagrpid;
 			ns_info->crkey = ns->crkey;
 			ns_info->rtype = ns->rtype;
 			if (ns->holder) {
@@ -1622,7 +1644,6 @@ nvmf_poll_group_add_subsystem(struct spdk_nvmf_poll_group *group,
 				SPDK_ERRLOG("Transport request free error!\n");
 			}
 		}
-		assert(false);
 	}
 
 	rc = poll_group_update_subsystem(group, subsystem);
@@ -1926,4 +1947,135 @@ spdk_nvmf_poll_group_dump_stat(struct spdk_nvmf_poll_group *group, struct spdk_j
 
 	spdk_json_write_array_end(w);
 	spdk_json_write_object_end(w);
+}
+
+bool 
+spdk_nvmf_port_block(uint16_t port, bool is_reject)
+{
+	if (g_nvmf_num_blocked_ports < MAX_NUM_BLOCKED_PORTS && port > 0) {
+		for (int i = 0; i < MAX_NUM_BLOCKED_PORTS; i++) {
+			if (port == g_nvmf_blocked_ports[i].port) {
+				if (g_nvmf_blocked_ports[i].is_reject != is_reject) {
+					g_nvmf_blocked_ports[i].is_reject = is_reject;
+				}
+				SPDK_NOTICELOG("nvmf port %u is already %s.\n", port, g_nvmf_blocked_ports[i].is_reject ? "rejected" : "blocked");
+				return  true; 
+			}
+		}
+
+		for (int i = 0; i < MAX_NUM_BLOCKED_PORTS; i++) {
+			if (!g_nvmf_blocked_ports[i].port) {
+				g_nvmf_blocked_ports[i].port = port;
+				g_nvmf_blocked_ports[i].is_reject = is_reject;
+				g_nvmf_blocked_ports[i].timeout = spdk_get_ticks();
+				g_nvmf_num_blocked_ports++;
+				SPDK_NOTICELOG("nvmf port %u is %s successfully.\n", port, is_reject ? "rejected" : "blocked");
+				return true;
+			}
+		}
+		return true;
+	}
+	SPDK_NOTICELOG("Failed to block nvmf port %u. Maximum number of blocked ports reached.\n", port);
+	return false;
+}
+
+bool 
+spdk_nvmf_port_unblock(uint16_t port) 
+{
+	if (g_nvmf_num_blocked_ports > 0 && port > 0) {
+		for (int i = 0; i < MAX_NUM_BLOCKED_PORTS; i++) {
+			if (port == g_nvmf_blocked_ports[i].port) {
+				g_nvmf_blocked_ports[i].timeout = 0;
+				g_nvmf_blocked_ports[i].is_reject = false;
+				g_nvmf_blocked_ports[i].port = 0;
+				g_nvmf_num_blocked_ports--;
+				SPDK_NOTICELOG("nvmf port %u is unblocked successfully.\n", port);
+				return  true;
+			}
+		}
+	}
+	return true;
+}
+
+void
+spdk_nvmf_get_blocked_ports(struct spdk_json_write_ctx *w)
+{
+	bool is_reject;
+
+	SPDK_NOTICELOG("Get blocked nvmf ports, total blocked ports: %d\n", g_nvmf_num_blocked_ports);
+
+	spdk_json_write_object_begin(w);
+
+	spdk_json_write_named_uint32(w, "total_blocked_ports", g_nvmf_num_blocked_ports);
+
+	spdk_json_write_named_array_begin(w, "blocked_ports");
+
+	for (int i = 0; i < MAX_NUM_BLOCKED_PORTS; i++) {
+		if (g_nvmf_blocked_ports[i].port == 0) {
+			continue;
+		}
+
+		is_reject = __atomic_load_n(&g_nvmf_blocked_ports[i].is_reject, __ATOMIC_SEQ_CST);
+
+		SPDK_NOTICELOG("Blocked port[%d]: %u is_reject: %s\n", i, g_nvmf_blocked_ports[i].port, is_reject ? "true" : "false");
+
+		spdk_json_write_object_begin(w);
+
+		spdk_json_write_named_uint16(w, "port", g_nvmf_blocked_ports[i].port);
+
+		spdk_json_write_named_bool(w, "is_reject", is_reject);
+
+		spdk_json_write_object_end(w);
+	}
+
+	spdk_json_write_array_end(w);
+	spdk_json_write_object_end(w);
+}
+
+int
+spdk_nvmf_check_port_timeout(uint64_t ack_timeout) 
+{
+	uint16_t port = 0;
+	bool expected = false;
+	uint64_t ack_timeout_ticks = 0, current_ticks = 0;
+
+	if (g_nvmf_num_blocked_ports > 0) {
+		for (int i = 0; i < MAX_NUM_BLOCKED_PORTS; i++) {
+			if (!g_nvmf_blocked_ports[i].port) {
+				continue;
+			}
+
+			if (g_nvmf_blocked_ports[i].is_reject) {
+				continue;
+			}
+
+			port = g_nvmf_blocked_ports[i].port;
+			current_ticks = spdk_get_ticks();
+			ack_timeout_ticks = ack_timeout * 4 * spdk_get_ticks_hz() / 1000;
+
+			if (g_nvmf_blocked_ports[i].timeout && (current_ticks - g_nvmf_blocked_ports[i].timeout > ack_timeout_ticks)) {
+				if (__atomic_compare_exchange_n(&g_nvmf_blocked_ports[i].is_reject, &expected, true, false,
+							__ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+					/* only one core enters here */
+					SPDK_NOTICELOG("Blocked nvmf port %u is automatically converted to reject mode after ack timeout.\n", port);
+				}
+			}
+		}
+	}
+	return g_nvmf_num_blocked_ports;
+}
+
+bool 
+spdk_nvmf_check_port_permission(uint16_t port, bool *is_reject)
+{
+	if (g_nvmf_num_blocked_ports > 0) {
+		for (int i = 0; i < MAX_NUM_BLOCKED_PORTS; i++) {
+			if (port == g_nvmf_blocked_ports[i].port) {
+				*is_reject = g_nvmf_blocked_ports[i].is_reject;
+				return false; 
+			}
+		}
+	}
+
+	return true;
 }

@@ -56,6 +56,9 @@ DEFINE_STUB(spdk_nvme_ctrlr_cmd_security_send, int, (struct spdk_nvme_ctrlr *ctr
 		uint8_t secp, uint16_t spsp, uint8_t nssf, void *payload,
 		uint32_t payload_size, spdk_nvme_cmd_cb cb_fn, void *cb_arg), 0);
 DEFINE_STUB_V(nvme_qpair_abort_queued_reqs, (struct spdk_nvme_qpair *qpair));
+DEFINE_STUB(spdk_nvme_qpair_authenticate, int, (struct spdk_nvme_qpair *qpair,
+		spdk_nvme_authenticate_cb cb_fn, void *cb_ctx), 0);
+DEFINE_STUB(nvme_transport_ctrlr_enable_interrupts, int, (struct spdk_nvme_ctrlr *ctrlr), 0);
 
 int
 nvme_get_default_hostnqn(char *buf, int len)
@@ -2026,6 +2029,17 @@ test_ctrlr_get_default_io_qpair_opts(void)
 	CU_ASSERT_EQUAL(opts.qprio, SPDK_NVME_QPRIO_URGENT);
 	CU_ASSERT_EQUAL(opts.io_queue_size, DEFAULT_IO_QUEUE_SIZE);
 	CU_ASSERT_EQUAL(opts.io_queue_requests, DEFAULT_IO_QUEUE_REQUESTS);
+	CU_ASSERT_EQUAL(opts.delay_cmd_submit, false);
+	CU_ASSERT_EQUAL(opts.sq.vaddr, NULL);
+	CU_ASSERT_EQUAL(opts.sq.paddr, 0);
+	CU_ASSERT_EQUAL(opts.sq.buffer_size, 0);
+	CU_ASSERT_EQUAL(opts.cq.vaddr, NULL);
+	CU_ASSERT_EQUAL(opts.cq.paddr, 0);
+	CU_ASSERT_EQUAL(opts.cq.buffer_size, 0);
+	CU_ASSERT_EQUAL(opts.create_only, false);
+	CU_ASSERT_EQUAL(opts.async_mode, false);
+	CU_ASSERT_EQUAL(opts.disable_pcie_sgl_merge, false);
+	CU_ASSERT_EQUAL(opts.opts_size, sizeof(opts));
 }
 
 #if 0 /* TODO: move to PCIe-specific unit test */
@@ -2366,7 +2380,7 @@ test_spdk_nvme_ctrlr_set_trid(void)
 	ctrlr.is_failed = true;
 	new_trid.trtype = SPDK_NVME_TRANSPORT_TCP;
 	CU_ASSERT(spdk_nvme_ctrlr_set_trid(&ctrlr, &new_trid) == -EINVAL);
-	CU_ASSERT(ctrlr.trid.trtype = SPDK_NVME_TRANSPORT_RDMA);
+	CU_ASSERT(ctrlr.trid.trtype == SPDK_NVME_TRANSPORT_RDMA);
 
 	new_trid.trtype = SPDK_NVME_TRANSPORT_RDMA;
 	snprintf(new_trid.subnqn, SPDK_NVMF_NQN_MAX_LEN, "%s", "nqn.2016-06.io.spdk:cnode2");
@@ -3412,6 +3426,22 @@ test_nvme_ctrlr_disable(void)
 	nvme_ctrlr_destruct(&ctrlr);
 }
 
+static void
+test_nvme_numa_id(void)
+{
+	struct spdk_nvme_ctrlr ctrlr = {};
+
+	ctrlr.numa.id = 3;
+	ctrlr.numa.id_valid = 0;
+	CU_ASSERT(spdk_nvme_ctrlr_get_numa_id(&ctrlr) == SPDK_ENV_NUMA_ID_ANY);
+
+	ctrlr.numa.id_valid = 1;
+	CU_ASSERT(spdk_nvme_ctrlr_get_numa_id(&ctrlr) == 3);
+
+	ctrlr.numa.id = SPDK_ENV_NUMA_ID_ANY;
+	CU_ASSERT(spdk_nvme_ctrlr_get_numa_id(&ctrlr) == SPDK_ENV_NUMA_ID_ANY);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -3469,6 +3499,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_nvme_ctrlr_get_memory_domains);
 	CU_ADD_TEST(suite, test_nvme_transport_ctrlr_ready);
 	CU_ADD_TEST(suite, test_nvme_ctrlr_disable);
+	CU_ADD_TEST(suite, test_nvme_numa_id);
 
 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
 	CU_cleanup_registry();

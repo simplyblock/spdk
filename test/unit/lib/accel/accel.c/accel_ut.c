@@ -121,6 +121,21 @@ _supports_opcode(enum spdk_accel_opcode opc)
 	return false;
 }
 
+static bool
+_supports_algo(enum spdk_accel_comp_algo algo)
+{
+	return true;
+}
+
+static int
+_get_compress_level_range(enum spdk_accel_comp_algo algo, uint32_t *min_level, uint32_t *max_level)
+{
+	*min_level = 0;
+	*max_level = UINT32_MAX;
+
+	return 0;
+}
+
 static int
 test_setup(void)
 {
@@ -141,6 +156,8 @@ test_setup(void)
 
 	g_module_if.submit_tasks = sw_accel_submit_tasks;
 	g_module_if.name = "software";
+	g_module_if.compress_supports_algo = _supports_algo;
+	g_module_if.get_compress_level_range = _get_compress_level_range;
 	for (i = 0; i < SPDK_ACCEL_OPC_LAST; i++) {
 		g_accel_ch->module_ch[i] = g_module_ch;
 		g_modules_opc[i] = g_module;
@@ -2012,6 +2029,7 @@ test_sequence_accel_buffers(void)
 	void *buf[2], *domain_ctx[2], *iobuf_buf;
 	struct spdk_memory_domain *domain[2];
 	struct spdk_iobuf_buffer *cache_entry;
+	struct spdk_iobuf_pool_cache *small;
 	spdk_iobuf_buffer_stailq_t small_cache;
 	uint32_t small_cache_count;
 	int i, rc, completed;
@@ -2310,11 +2328,12 @@ test_sequence_accel_buffers(void)
 	 * available
 	 */
 	accel_ch = spdk_io_channel_get_ctx(ioch);
-	small_cache_count = accel_ch->iobuf.small.cache_count;
+	small = &accel_ch->iobuf.cache[0].small;
+	small_cache_count = small->cache_count;
 	STAILQ_INIT(&small_cache);
-	STAILQ_SWAP(&accel_ch->iobuf.small.cache, &small_cache, spdk_iobuf_buffer);
-	accel_ch->iobuf.small.cache_count = 0;
-	accel_ch->iobuf.small.cache_size = 0;
+	STAILQ_SWAP(&small->cache, &small_cache, spdk_iobuf_buffer);
+	small->cache_count = 0;
+	small->cache_size = 0;
 	g_iobuf.small_pool_count = 0;
 
 	/* First allocate a single buffer used by two operations */
@@ -2364,13 +2383,13 @@ test_sequence_accel_buffers(void)
 	spdk_accel_put_buf(ioch, buf[0], domain[0], domain_ctx[0]);
 
 	/* Return the buffers back to the cache */
-	while (!STAILQ_EMPTY(&accel_ch->iobuf.small.cache)) {
-		cache_entry = STAILQ_FIRST(&accel_ch->iobuf.small.cache);
-		STAILQ_REMOVE_HEAD(&accel_ch->iobuf.small.cache, stailq);
+	while (!STAILQ_EMPTY(&small->cache)) {
+		cache_entry = STAILQ_FIRST(&small->cache);
+		STAILQ_REMOVE_HEAD(&small->cache, stailq);
 		STAILQ_INSERT_HEAD(&small_cache, cache_entry, stailq);
 		small_cache_count++;
 	}
-	accel_ch->iobuf.small.cache_count = 0;
+	small->cache_count = 0;
 	g_iobuf.small_pool_count = 0;
 
 	/* Check a bit more complex scenario, with two buffers in the sequence */
@@ -2444,17 +2463,17 @@ test_sequence_accel_buffers(void)
 	spdk_accel_put_buf(ioch, buf[1], domain[1], domain_ctx[1]);
 
 	/* Return the buffers back to the cache */
-	while (!STAILQ_EMPTY(&accel_ch->iobuf.small.cache)) {
-		cache_entry = STAILQ_FIRST(&accel_ch->iobuf.small.cache);
-		STAILQ_REMOVE_HEAD(&accel_ch->iobuf.small.cache, stailq);
+	while (!STAILQ_EMPTY(&small->cache)) {
+		cache_entry = STAILQ_FIRST(&small->cache);
+		STAILQ_REMOVE_HEAD(&small->cache, stailq);
 		STAILQ_INSERT_HEAD(&small_cache, cache_entry, stailq);
 		small_cache_count++;
 	}
-	accel_ch->iobuf.small.cache_count = 0;
+	small->cache_count = 0;
 
 	g_iobuf.small_pool_count = 32;
-	STAILQ_SWAP(&accel_ch->iobuf.small.cache, &small_cache, spdk_iobuf_buffer);
-	accel_ch->iobuf.small.cache_count = small_cache_count;
+	STAILQ_SWAP(&small->cache, &small_cache, spdk_iobuf_buffer);
+	small->cache_count = small_cache_count;
 
 	for (i = 0; i < SPDK_ACCEL_OPC_LAST; ++i) {
 		g_modules_opc[i] = modules[i];
@@ -2488,6 +2507,7 @@ test_sequence_memory_domain(void)
 	struct spdk_iobuf_buffer *cache_entry;
 	struct accel_module modules[SPDK_ACCEL_OPC_LAST];
 	struct spdk_memory_domain *accel_domain;
+	struct spdk_iobuf_pool_cache *small;
 	spdk_iobuf_buffer_stailq_t small_cache;
 	char srcbuf[4096], dstbuf[4096], expected[4096], tmp[4096];
 	struct iovec src_iovs[2], dst_iovs[2];
@@ -2657,10 +2677,11 @@ test_sequence_memory_domain(void)
 	seq = NULL;
 	/* Make sure the buffer pool is empty */
 	accel_ch = spdk_io_channel_get_ctx(ioch);
-	small_cache_count = accel_ch->iobuf.small.cache_count;
+	small = &accel_ch->iobuf.cache[0].small;
+	small_cache_count = small->cache_count;
 	STAILQ_INIT(&small_cache);
-	STAILQ_SWAP(&accel_ch->iobuf.small.cache, &small_cache, spdk_iobuf_buffer);
-	accel_ch->iobuf.small.cache_count = 0;
+	STAILQ_SWAP(&small->cache, &small_cache, spdk_iobuf_buffer);
+	small->cache_count = 0;
 	g_iobuf.small_pool_count = 0;
 
 	src_iovs[0].iov_base = (void *)0xdeadbeef;
@@ -2707,17 +2728,17 @@ test_sequence_memory_domain(void)
 	CU_ASSERT_EQUAL(memcmp(expected, dstbuf, sizeof(dstbuf)), 0);
 
 	/* Return the buffers back to the cache */
-	while (!STAILQ_EMPTY(&accel_ch->iobuf.small.cache)) {
-		cache_entry = STAILQ_FIRST(&accel_ch->iobuf.small.cache);
-		STAILQ_REMOVE_HEAD(&accel_ch->iobuf.small.cache, stailq);
+	while (!STAILQ_EMPTY(&small->cache)) {
+		cache_entry = STAILQ_FIRST(&small->cache);
+		STAILQ_REMOVE_HEAD(&small->cache, stailq);
 		STAILQ_INSERT_HEAD(&small_cache, cache_entry, stailq);
 		small_cache_count++;
 	}
-	accel_ch->iobuf.small.cache_count = 0;
+	small->cache_count = 0;
 
 	g_iobuf.small_pool_count = 32;
-	STAILQ_SWAP(&accel_ch->iobuf.small.cache, &small_cache, spdk_iobuf_buffer);
-	accel_ch->iobuf.small.cache_count = small_cache_count;
+	STAILQ_SWAP(&small->cache, &small_cache, spdk_iobuf_buffer);
+	small->cache_count = small_cache_count;
 
 	/* Check error cases, starting with an error from spdk_memory_domain_pull_data() */
 	completed = 0;
@@ -4101,6 +4122,220 @@ test_sequence_crc32(void)
 	poll_threads();
 }
 
+static void
+test_sequence_dix_generate_verify(void)
+{
+	struct spdk_accel_sequence *seq;
+	struct spdk_io_channel *ioch;
+	struct ut_sequence ut_seq = {};
+	char srcbuf[3][4096], dstbuf[3][4096];
+	struct iovec src_iovs[3], dst_iovs[3];
+	uint32_t block_size = 512, md_size = 8;
+	struct spdk_dif_ctx_init_ext_opts dif_opts;
+	struct spdk_dif_ctx dif_ctx = {};
+	struct spdk_dif_error dif_err;
+	int i, rc, completed = 0;
+
+	ioch = spdk_accel_get_io_channel();
+	SPDK_CU_ASSERT_FATAL(ioch != NULL);
+
+	for (i = 0; i < 3; i++) {
+		memset(srcbuf[i], 0xdead, sizeof(srcbuf[i]));
+		memset(dstbuf[i], 0, sizeof(dstbuf[i]));
+		src_iovs[i].iov_base = srcbuf[i];
+		src_iovs[i].iov_len = sizeof(srcbuf[i]);
+		dst_iovs[i].iov_base = dstbuf[i];
+		dst_iovs[i].iov_len = sizeof(dstbuf[i]);
+	}
+
+	dif_opts.size = SPDK_SIZEOF(&dif_opts, dif_pi_format);
+	dif_opts.dif_pi_format = SPDK_DIF_PI_FORMAT_16;
+
+	rc = spdk_dif_ctx_init(&dif_ctx, block_size, md_size, false, true, SPDK_DIF_TYPE1,
+			       SPDK_DIF_FLAGS_GUARD_CHECK | SPDK_DIF_FLAGS_APPTAG_CHECK |
+			       SPDK_DIF_FLAGS_REFTAG_CHECK, 10, 0xFFFF, 20, 0, 0, &dif_opts);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+
+	seq = NULL;
+	completed = 0;
+	for (i = 0; i < 3; i++) {
+		rc = spdk_accel_append_dix_generate(&seq, ioch, &dst_iovs[i], 1, NULL, NULL,
+						    &src_iovs[i], NULL, NULL,
+						    src_iovs[i].iov_len / block_size, &dif_ctx,
+						    ut_sequence_step_cb, &completed);
+		CU_ASSERT_EQUAL(rc, 0);
+		rc = spdk_accel_append_dix_verify(&seq, ioch, &dst_iovs[i], 1, NULL, NULL,
+						  &src_iovs[i], NULL, NULL,
+						  src_iovs[i].iov_len / block_size, &dif_ctx,
+						  &dif_err, ut_sequence_step_cb, &completed);
+		CU_ASSERT_EQUAL(rc, 0);
+	}
+
+	ut_seq.complete = false;
+	spdk_accel_sequence_finish(seq, ut_sequence_complete_cb, &ut_seq);
+
+	poll_threads();
+	CU_ASSERT_EQUAL(completed, 6);
+	CU_ASSERT(ut_seq.complete);
+	CU_ASSERT_EQUAL(ut_seq.status, 0);
+
+	/* DIX metadata should be equal for the same source buffers and tags */
+	CU_ASSERT_EQUAL(memcmp(dstbuf[0], dstbuf[1], 4096), 0);
+	CU_ASSERT_EQUAL(memcmp(dstbuf[0], dstbuf[2], 4096), 0);
+
+	ut_clear_operations();
+	spdk_put_io_channel(ioch);
+	poll_threads();
+}
+
+static void
+test_sequence_dix(void)
+{
+	struct spdk_accel_sequence *seq = NULL;
+	struct spdk_io_channel *ioch;
+	struct ut_sequence ut_seq = {};
+	char buf[3][4096], md_buf[64];
+	struct iovec iovs[3], md_iov;
+	uint32_t block_size = 512, md_size = 8;
+	struct spdk_dif_ctx_init_ext_opts dif_opts;
+	struct spdk_dif_ctx dif_ctx = {};
+	struct spdk_dif_error dif_err;
+	struct spdk_accel_crypto_key *key;
+	struct spdk_accel_crypto_key_create_param key_params = {
+		.cipher = "AES_XTS",
+		.hex_key = "00112233445566778899aabbccddeeff",
+		.hex_key2 = "ffeeddccbbaa99887766554433221100",
+		.key_name = "ut_key",
+	};
+	int i, rc, completed = 0;
+	struct accel_module modules[SPDK_ACCEL_OPC_LAST];
+
+	ioch = spdk_accel_get_io_channel();
+	SPDK_CU_ASSERT_FATAL(ioch != NULL);
+
+	rc = spdk_accel_crypto_key_create(&key_params);
+	CU_ASSERT_EQUAL(rc, 0);
+	key = spdk_accel_crypto_key_get(key_params.key_name);
+	SPDK_CU_ASSERT_FATAL(key != NULL);
+
+	/* Override the submit_tasks function. */
+	g_module_if.submit_tasks = ut_sequence_submit_tasks;
+	for (i = 0; i < SPDK_ACCEL_OPC_LAST; ++i) {
+		g_seq_operations[i].complete_status = 0;
+		g_seq_operations[i].submit_status = 0;
+		g_seq_operations[i].count = 0;
+
+		modules[i] = g_modules_opc[i];
+		g_modules_opc[i] = g_module;
+	}
+
+	for (i = 0; i < 3; i++) {
+		memset(buf[i], 0, sizeof(buf[i]));
+		iovs[i].iov_base = buf[i];
+		iovs[i].iov_len = sizeof(buf[i]);
+	}
+	memset(md_buf, 0, sizeof(md_buf));
+	md_iov.iov_base = md_buf;
+	md_iov.iov_len = sizeof(md_buf);
+
+	/* Prepare first source buffer. */
+	memset(iovs[0].iov_base, 0xde, iovs[0].iov_len);
+
+	g_seq_operations[SPDK_ACCEL_OPC_COPY].count = 0;
+	g_seq_operations[SPDK_ACCEL_OPC_ENCRYPT].count = 0;
+	g_seq_operations[SPDK_ACCEL_OPC_ENCRYPT].dst_iovcnt = 1;
+	g_seq_operations[SPDK_ACCEL_OPC_ENCRYPT].src_iovcnt = 1;
+	g_seq_operations[SPDK_ACCEL_OPC_ENCRYPT].src_iovs = &iovs[0];
+	/* Copy will be skipped, so the destination buffer of encrypt will change. */
+	g_seq_operations[SPDK_ACCEL_OPC_ENCRYPT].dst_iovs = &iovs[2];
+
+	rc = spdk_accel_append_encrypt(&seq, ioch, key, &iovs[1], 1, NULL, NULL,
+				       &iovs[0], 1, NULL, NULL, 0, block_size,
+				       ut_sequence_step_cb, &completed);
+	CU_ASSERT_EQUAL(rc, 0);
+
+	dif_opts.size = SPDK_SIZEOF(&dif_opts, dif_pi_format);
+	dif_opts.dif_pi_format = SPDK_DIF_PI_FORMAT_16;
+
+	rc = spdk_dif_ctx_init(&dif_ctx, block_size, md_size, false, true, SPDK_DIF_TYPE1,
+			       SPDK_DIF_FLAGS_GUARD_CHECK | SPDK_DIF_FLAGS_APPTAG_CHECK |
+			       SPDK_DIF_FLAGS_REFTAG_CHECK, 10, 0xFFFF, 20, 0, 0, &dif_opts);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+
+	rc = spdk_accel_append_dix_generate(&seq, ioch, &iovs[1], 1, NULL, NULL,
+					    &md_iov, NULL, NULL, iovs[1].iov_len / block_size,
+					    &dif_ctx, ut_sequence_step_cb, &completed);
+	CU_ASSERT_EQUAL(rc, 0);
+
+	rc = spdk_accel_append_copy(&seq, ioch, &iovs[2], 1, NULL, NULL,
+				    &iovs[1], 1, NULL, NULL,
+				    ut_sequence_step_cb, &completed);
+	CU_ASSERT_EQUAL(rc, 0);
+
+	ut_seq.complete = false;
+	spdk_accel_sequence_finish(seq, ut_sequence_complete_cb, &ut_seq);
+
+	poll_threads();
+
+	CU_ASSERT_EQUAL(completed, 3);
+	CU_ASSERT(ut_seq.complete);
+	CU_ASSERT_EQUAL(ut_seq.status, 0);
+	CU_ASSERT_EQUAL(g_seq_operations[SPDK_ACCEL_OPC_ENCRYPT].count, 1);
+	CU_ASSERT_EQUAL(g_seq_operations[SPDK_ACCEL_OPC_COPY].count, 0);
+
+	seq = NULL;
+	completed = 0;
+
+	/* This time we start with first iovec containing encrypted data from previous sequence. */
+	memcpy(iovs[0].iov_base, iovs[2].iov_base, iovs[0].iov_len);
+
+	g_seq_operations[SPDK_ACCEL_OPC_COPY].count = 0;
+	g_seq_operations[SPDK_ACCEL_OPC_DECRYPT].count = 0;
+	g_seq_operations[SPDK_ACCEL_OPC_DECRYPT].dst_iovcnt = 1;
+	g_seq_operations[SPDK_ACCEL_OPC_DECRYPT].src_iovcnt = 1;
+	g_seq_operations[SPDK_ACCEL_OPC_DECRYPT].src_iovs = &iovs[0];
+	/* Copy will be skipped, so the destination buffer of decrypt will change. */
+	g_seq_operations[SPDK_ACCEL_OPC_DECRYPT].dst_iovs = &iovs[2];
+
+	rc = spdk_accel_append_decrypt(&seq, ioch, key, &iovs[1], 1, NULL, NULL,
+				       &iovs[0], 1, NULL, NULL, 0, block_size,
+				       ut_sequence_step_cb, &completed);
+	CU_ASSERT_EQUAL(rc, 0);
+
+	rc = spdk_accel_append_dix_verify(&seq, ioch, &iovs[1], 1, NULL, NULL, &md_iov, NULL, NULL,
+					  iovs[1].iov_len / block_size, &dif_ctx, &dif_err,
+					  ut_sequence_step_cb, &completed);
+	CU_ASSERT_EQUAL(rc, 0);
+
+	rc = spdk_accel_append_copy(&seq, ioch, &iovs[2], 1, NULL, NULL, &iovs[1], 1, NULL, NULL,
+				    ut_sequence_step_cb, &completed);
+	CU_ASSERT_EQUAL(rc, 0);
+
+	ut_seq.complete = false;
+	spdk_accel_sequence_finish(seq, ut_sequence_complete_cb, &ut_seq);
+
+	poll_threads();
+
+	CU_ASSERT_EQUAL(completed, 3);
+	CU_ASSERT(ut_seq.complete);
+	CU_ASSERT_EQUAL(ut_seq.status, 0);
+	CU_ASSERT_EQUAL(g_seq_operations[SPDK_ACCEL_OPC_DECRYPT].count, 1);
+	CU_ASSERT_EQUAL(g_seq_operations[SPDK_ACCEL_OPC_COPY].count, 0);
+
+	ut_clear_operations();
+
+	/* Cleanup module pointers to make subsequent tests work correctly. */
+	for (i = 0; i < SPDK_ACCEL_OPC_LAST; ++i) {
+		g_modules_opc[i] = modules[i];
+	}
+
+	rc = spdk_accel_crypto_key_destroy(key);
+	CU_ASSERT_EQUAL(rc, 0);
+
+	spdk_put_io_channel(ioch);
+	poll_threads();
+}
+
 static int
 test_sequence_setup(void)
 {
@@ -4121,6 +4356,10 @@ test_sequence_setup(void)
 		CU_ASSERT(false);
 		return -1;
 	}
+
+	g_module_if.name = "software";
+	g_module_if.compress_supports_algo = _supports_algo;
+	g_module_if.get_compress_level_range = _get_compress_level_range;
 
 	return 0;
 }
@@ -4187,6 +4426,8 @@ main(int argc, char **argv)
 	CU_ADD_TEST(seq_suite, test_sequence_driver);
 	CU_ADD_TEST(seq_suite, test_sequence_same_iovs);
 	CU_ADD_TEST(seq_suite, test_sequence_crc32);
+	CU_ADD_TEST(seq_suite, test_sequence_dix_generate_verify);
+	CU_ADD_TEST(seq_suite, test_sequence_dix);
 
 	suite = CU_add_suite("accel", test_setup, test_cleanup);
 	CU_ADD_TEST(suite, test_spdk_accel_task_complete);

@@ -8,6 +8,7 @@
 
 #include "spdk/bdev_module.h"
 #include "spdk/uuid.h"
+#include "spdk/priority_class.h"
 
 #define RAID_BDEV_MIN_DATA_OFFSET_SIZE	(1024*1024) /* 1 MiB */
 
@@ -117,6 +118,16 @@ struct raid_bdev_io;
 typedef void (*raid_bdev_io_completion_cb)(struct raid_bdev_io *raid_io,
 		enum spdk_bdev_io_status status);
 
+
+struct raid_io_used_bits {
+	/* priority class of the parent SPDK blob and lvol who submitted this I/O request */
+	uint8_t		priority_class;
+	/* geometry of the parent SPDK blob and lvol who submitted this I/O request */
+	uint8_t		geometry;
+	/* special_io bits of the parent SPDK blob and lvol who submitted this I/O request */
+	uint8_t		special_io;
+	uint64_t    trace_id;
+};
 /*
  * raid_bdev_io is the context part of bdev_io. It contains the information
  * related to bdev_io for a raid bdev
@@ -125,6 +136,7 @@ struct raid_bdev_io {
 	/* The raid bdev associated with this IO */
 	struct raid_bdev *raid_bdev;
 
+	struct raid_io_used_bits used_bits;
 	uint64_t offset_blocks;
 	uint64_t num_blocks;
 	struct iovec *iovs;
@@ -158,6 +170,8 @@ struct raid_bdev_io {
 		struct iovec		*iov;
 		struct iovec		iov_copy;
 	} split;
+
+	TAILQ_ENTRY(raid_bdev_io) entries;
 };
 
 struct raid_bdev_process_request {
@@ -195,8 +209,17 @@ struct raid_bdev {
 	/* array of base bdev info */
 	struct raid_base_bdev_info	*base_bdev_info;
 
+	uint8_t supports_priority_class; // whether lvol priority is supported, default 0 (false)
+
 	/* strip size of raid bdev in blocks */
 	uint32_t			strip_size;
+
+	/* unmap io number inflight */
+	uint32_t			unmap_inflight;
+	uint32_t 			io_unmap_limit;
+	uint64_t 			trace_cnt;
+	struct spdk_spinlock		used_lock;
+	TAILQ_HEAD(unmap_io_queue, raid_bdev_io) unmap_queue;
 
 	/* strip size of raid bdev in KB */
 	uint32_t			strip_size_kb;
@@ -264,7 +287,7 @@ typedef void (*raid_bdev_destruct_cb)(void *cb_ctx, int rc);
 
 int raid_bdev_create(const char *name, uint32_t strip_size, uint8_t num_base_bdevs,
 		     enum raid_level level, bool superblock, const struct spdk_uuid *uuid,
-		     struct raid_bdev **raid_bdev_out);
+		     struct raid_bdev **raid_bdev_out, uint32_t io_unmap_limit);
 void raid_bdev_delete(struct raid_bdev *raid_bdev, raid_bdev_destruct_cb cb_fn, void *cb_ctx);
 int raid_bdev_add_base_bdev(struct raid_bdev *raid_bdev, const char *name,
 			    raid_base_bdev_cb cb_fn, void *cb_ctx);
@@ -408,10 +431,18 @@ static inline int
 raid_bdev_readv_blocks_ext(struct raid_base_bdev_info *base_info, struct spdk_io_channel *ch,
 			   struct iovec *iov, int iovcnt, uint64_t offset_blocks,
 			   uint64_t num_blocks, spdk_bdev_io_completion_cb cb, void *cb_arg,
-			   struct spdk_bdev_ext_io_opts *opts)
+			   struct spdk_bdev_ext_io_opts *opts, struct raid_io_used_bits *used_bits)
 {
+	const uint64_t priority_lba = ((uint64_t)used_bits->priority_class << PRIORITY_CLASS_BITS_POS) |
+	 										((uint64_t)used_bits->geometry << GEOMETRY_BITS_POS) |
+											((uint64_t)used_bits->special_io << SPECIAL_IO_BITS_POS) | (base_info->data_offset + offset_blocks);
+
+	// if (used_bits->special_io) {
+	// 	SPDK_NOTICELOG("raid: lba=%lu,(H) %"PRIx64" trace id=%"PRIu64" 1,\n", priority_lba, priority_lba, used_bits->trace_id);
+	// }
+
 	return spdk_bdev_readv_blocks_ext(base_info->desc, ch, iov, iovcnt,
-					  base_info->data_offset + offset_blocks, num_blocks, cb, cb_arg, opts);
+					  priority_lba, num_blocks, cb, cb_arg, opts);
 }
 
 /**
@@ -421,7 +452,7 @@ static inline int
 raid_bdev_writev_blocks_ext(struct raid_base_bdev_info *base_info, struct spdk_io_channel *ch,
 			    struct iovec *iov, int iovcnt, uint64_t offset_blocks,
 			    uint64_t num_blocks, spdk_bdev_io_completion_cb cb, void *cb_arg,
-			    struct spdk_bdev_ext_io_opts *opts)
+			    struct spdk_bdev_ext_io_opts *opts, struct raid_io_used_bits *used_bits)
 {
 	int rc;
 	uint64_t remapped_offset_blocks = base_info->data_offset + offset_blocks;
@@ -435,8 +466,16 @@ raid_bdev_writev_blocks_ext(struct raid_base_bdev_info *base_info, struct spdk_i
 		}
 	}
 
+	const uint64_t priority_lba = ((uint64_t)used_bits->priority_class << PRIORITY_CLASS_BITS_POS) |
+											((uint64_t)used_bits->geometry << GEOMETRY_BITS_POS) |
+											((uint64_t)used_bits->special_io << SPECIAL_IO_BITS_POS) | remapped_offset_blocks;
+
+	// if (used_bits->special_io) {
+	// 	SPDK_NOTICELOG("raid: lba=%lu,(H) %"PRIx64" trace id=%"PRIu64" 2,\n", priority_lba, priority_lba, used_bits->trace_id);
+	// }
+
 	return spdk_bdev_writev_blocks_ext(base_info->desc, ch, iov, iovcnt,
-					   remapped_offset_blocks, num_blocks, cb, cb_arg, opts);
+					   priority_lba, num_blocks, cb, cb_arg, opts);
 }
 
 /**
@@ -447,7 +486,16 @@ raid_bdev_unmap_blocks(struct raid_base_bdev_info *base_info, struct spdk_io_cha
 		       uint64_t offset_blocks, uint64_t num_blocks,
 		       spdk_bdev_io_completion_cb cb, void *cb_arg)
 {
-	return spdk_bdev_unmap_blocks(base_info->desc, ch, base_info->data_offset + offset_blocks,
+	struct raid_io_used_bits *used_bits = &((struct raid_bdev_io*)cb_arg)->used_bits;
+	const uint64_t priority_lba = ((uint64_t)used_bits->priority_class << PRIORITY_CLASS_BITS_POS) |
+	 										((uint64_t)used_bits->geometry << GEOMETRY_BITS_POS) |
+											((uint64_t)used_bits->special_io << SPECIAL_IO_BITS_POS) | (base_info->data_offset + offset_blocks);
+	
+	// if (used_bits->special_io) {
+	// 	SPDK_NOTICELOG("raid: lba=%lu,(H) %"PRIx64" trace id=%"PRIu64" 3,\n", priority_lba, priority_lba, used_bits->trace_id);
+	// }
+
+	return spdk_bdev_unmap_blocks(base_info->desc, ch, priority_lba,
 				      num_blocks, cb, cb_arg);
 }
 
@@ -459,7 +507,12 @@ raid_bdev_flush_blocks(struct raid_base_bdev_info *base_info, struct spdk_io_cha
 		       uint64_t offset_blocks, uint64_t num_blocks,
 		       spdk_bdev_io_completion_cb cb, void *cb_arg)
 {
-	return spdk_bdev_flush_blocks(base_info->desc, ch, base_info->data_offset + offset_blocks,
+	struct raid_io_used_bits *used_bits = &((struct raid_bdev_io*)cb_arg)->used_bits;
+	const uint64_t priority_lba = ((uint64_t)used_bits->priority_class << PRIORITY_CLASS_BITS_POS) |
+											((uint64_t)used_bits->geometry << GEOMETRY_BITS_POS) |
+											((uint64_t)used_bits->special_io << SPECIAL_IO_BITS_POS) | (base_info->data_offset + offset_blocks);
+
+	return spdk_bdev_flush_blocks(base_info->desc, ch, priority_lba,
 				      num_blocks, cb, cb_arg);
 }
 

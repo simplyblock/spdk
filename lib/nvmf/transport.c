@@ -153,10 +153,12 @@ nvmf_transport_opts_copy(struct spdk_nvmf_transport_opts *opts,
 	SET_FIELD(zcopy);
 	SET_FIELD(ack_timeout);
 	SET_FIELD(data_wr_pool_size);
+	SET_FIELD(min_kato);
+	SET_FIELD(kas);
 
 	/* Do not remove this statement, you should always update this statement when you adding a new field,
 	 * and do not forget to add the SET_FIELD statement for your added field. */
-	SPDK_STATIC_ASSERT(sizeof(struct spdk_nvmf_transport_opts) == 72, "Incorrect size");
+	SPDK_STATIC_ASSERT(sizeof(struct spdk_nvmf_transport_opts) == 78, "Incorrect size");
 
 #undef SET_FIELD
 #undef FILED_CHECK
@@ -230,6 +232,7 @@ nvmf_transport_create(const char *transport_name, struct spdk_nvmf_transport_opt
 	struct spdk_iobuf_opts opts_iobuf = {};
 	int rc;
 	uint64_t count;
+	uint32_t kas_in_ms;
 
 	ctx = calloc(1, sizeof(*ctx));
 	if (!ctx) {
@@ -265,6 +268,19 @@ nvmf_transport_create(const char *transport_name, struct spdk_nvmf_transport_opt
 			    ctx->opts.max_aq_depth);
 		ctx->opts.max_aq_depth = SPDK_NVMF_MIN_ADMIN_MAX_SQ_SIZE;
 	}
+
+	if (ctx->opts.kas == 0) {
+		SPDK_ERRLOG("kas cannot be 0\n");
+		goto err;
+	}
+
+	if (ctx->opts.min_kato == 0) {
+		SPDK_ERRLOG("min_kato cannot be 0\n");
+		goto err;
+	}
+
+	kas_in_ms = ctx->opts.kas * NVMF_KAS_TIME_UNIT_IN_MS;
+	ctx->opts.min_kato = kas_in_ms * spdk_divide_round_up(ctx->opts.min_kato, kas_in_ms);
 
 	spdk_iobuf_get_opts(&opts_iobuf, sizeof(opts_iobuf));
 	if (ctx->opts.io_unit_size == 0) {
@@ -571,6 +587,25 @@ nvmf_transport_listener_discover(struct spdk_nvmf_transport *transport,
 	transport->ops->listener_discover(transport, trid, entry);
 }
 
+static int
+nvmf_tgroup_poll(void *arg)
+{
+	struct spdk_nvmf_transport_poll_group *tgroup = arg;
+	int rc;
+	rc = nvmf_transport_poll_group_poll(tgroup);
+	return rc == 0 ? SPDK_POLLER_IDLE : SPDK_POLLER_BUSY;
+}
+
+static void
+nvmf_transport_poll_group_create_poller(struct spdk_nvmf_transport_poll_group *tgroup)
+{
+	char poller_name[SPDK_NVMF_TRSTRING_MAX_LEN + 32];
+
+	snprintf(poller_name, sizeof(poller_name), "nvmf_%s", tgroup->transport->ops->name);
+	tgroup->poller = spdk_poller_register_named(nvmf_tgroup_poll, tgroup, 0, poller_name);
+	spdk_poller_register_interrupt(tgroup->poller, NULL, NULL);
+}
+
 struct spdk_nvmf_transport_poll_group *
 nvmf_transport_poll_group_create(struct spdk_nvmf_transport *transport,
 				 struct spdk_nvmf_poll_group *group)
@@ -587,6 +622,7 @@ nvmf_transport_poll_group_create(struct spdk_nvmf_transport *transport,
 		return NULL;
 	}
 	tgroup->transport = transport;
+	nvmf_transport_poll_group_create_poller(tgroup);
 
 	STAILQ_INIT(&tgroup->pending_buf_queue);
 
@@ -672,6 +708,8 @@ nvmf_transport_poll_group_destroy(struct spdk_nvmf_transport_poll_group *group)
 
 	transport = group->transport;
 
+	spdk_poller_unregister(&group->poller);
+
 	if (!STAILQ_EMPTY(&group->pending_buf_queue)) {
 		SPDK_ERRLOG("Pending I/O list wasn't empty on poll group destruction\n");
 	}
@@ -691,6 +729,18 @@ nvmf_transport_poll_group_destroy(struct spdk_nvmf_transport_poll_group *group)
 		spdk_iobuf_channel_fini(ch);
 		free(ch);
 	}
+}
+
+void
+nvmf_transport_poll_group_pause(struct spdk_nvmf_transport_poll_group *tgroup)
+{
+	spdk_poller_unregister(&tgroup->poller);
+}
+
+void
+nvmf_transport_poll_group_resume(struct spdk_nvmf_transport_poll_group *tgroup)
+{
+	nvmf_transport_poll_group_create_poller(tgroup);
 }
 
 int
@@ -813,6 +863,8 @@ spdk_nvmf_transport_opts_init(const char *transport_name,
 	opts_local.association_timeout = NVMF_TRANSPORT_DEFAULT_ASSOCIATION_TIMEOUT_IN_MS;
 	opts_local.acceptor_poll_rate = SPDK_NVMF_DEFAULT_ACCEPT_POLL_RATE_US;
 	opts_local.disable_command_passthru = false;
+	opts_local.kas = NVMF_DEFAULT_KAS;
+	opts_local.min_kato = NVMF_DEFAULT_MIN_KATO;
 	ops->opts_init(&opts_local);
 
 	nvmf_transport_opts_copy(opts, &opts_local, opts_size);
@@ -826,7 +878,7 @@ spdk_nvmf_request_free_buffers(struct spdk_nvmf_request *req,
 			       struct spdk_nvmf_transport *transport)
 {
 	uint32_t i;
-
+	// SPDK_NOTICELOG("free buf group %p \n", group);
 	for (i = 0; i < req->iovcnt; i++) {
 		spdk_iobuf_put(group->buf_cache, req->iov[i].iov_base, req->iov[i].iov_len);
 		req->iov[i].iov_base = NULL;
@@ -881,6 +933,8 @@ nvmf_request_get_buffers(struct spdk_nvmf_request *req,
 	 */
 	num_buffers = SPDK_CEIL_DIV(length, io_unit_size);
 	if (spdk_unlikely(num_buffers > NVMF_REQ_MAX_BUFFERS)) {
+		SPDK_ERRLOG("qpair id:%d nqn:%s Request requires %u buffers, which is more than the maximum allowed (%u)\n", req->qpair->qid,
+			    req->qpair->ctrlr->subsys->subnqn, num_buffers, NVMF_REQ_MAX_BUFFERS);
 		return -EINVAL;
 	}
 
@@ -893,6 +947,7 @@ nvmf_request_get_buffers(struct spdk_nvmf_request *req,
 		buffer = spdk_iobuf_get(group->buf_cache, spdk_min(io_unit_size, length), entry,
 					nvmf_request_iobuf_get_cb);
 		if (spdk_unlikely(buffer == NULL)) {
+			spdk_iobuf_get_stats_per_channel(group->buf_cache, req->qpair->ctrlr->subsys->subnqn, req->qpair->qid);
 			req->iobuf.remaining_length = length;
 			return -ENOMEM;
 		}
@@ -941,10 +996,16 @@ spdk_nvmf_request_get_buffers(struct spdk_nvmf_request *req,
 	assert(nvmf_transport_use_iobuf(transport));
 
 	req->iovcnt = 0;
+	// SPDK_NOTICELOG("get buf group %p \n", group);
 	rc = nvmf_request_get_buffers(req, group, transport, length, transport->opts.io_unit_size, false);
 	if (spdk_unlikely(rc == -ENOMEM && transport->ops->req_get_buffers_done == NULL)) {
+		SPDK_NOTICELOG("waiting for release buf,qid:%d nqn:%s \n", req->qpair->qid, req->qpair->ctrlr->subsys->subnqn);
 		spdk_nvmf_request_free_buffers(req, group, transport);
 	}
+
+	// if (req->cmd->nvme_cmd.opc == SPDK_NVME_OPC_ASYNC_EVENT_REQUEST) {
+	// 	SPDK_NOTICELOG("getting buf for async event.\n");
+	// }
 
 	return rc;
 }
@@ -974,14 +1035,7 @@ nvmf_request_get_buffers_abort(struct spdk_nvmf_request *req)
 
 	assert(tgroup != NULL);
 
-	rc = spdk_iobuf_for_each_entry(tgroup->buf_cache, &tgroup->buf_cache->small,
-				       nvmf_request_get_buffers_abort_cb, req);
-	if (rc == 1) {
-		return true;
-	}
-
-	rc = spdk_iobuf_for_each_entry(tgroup->buf_cache, &tgroup->buf_cache->large,
-				       nvmf_request_get_buffers_abort_cb, req);
+	rc = spdk_iobuf_for_each_entry(tgroup->buf_cache, nvmf_request_get_buffers_abort_cb, req);
 	return rc == 1;
 }
 

@@ -5,7 +5,6 @@
  */
 
 #include "spdk/stdinc.h"
-#include "spdk/util.h"
 #include "spdk_internal/cunit.h"
 #include "spdk/env.h"
 #include "spdk_internal/mock.h"
@@ -227,6 +226,11 @@ struct spdk_io_channel *
 spdk_bdev_get_io_channel(struct spdk_bdev_desc *desc)
 {
 	return spdk_get_io_channel(&g_bdev_ch_io_device);
+}
+
+struct spdk_io_channel *
+spdk_bdev_io_get_io_channel(struct spdk_bdev_io *bdev_io) {
+ 	return spdk_get_io_channel(&g_bdev_ch_io_device);
 }
 
 static int

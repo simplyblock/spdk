@@ -41,7 +41,8 @@ if [ "$SPDK_TEST_NVMF_TRANSPORT" = "tcp" ]; then
 	run_test "nvmf_tls" $rootdir/test/nvmf/target/tls.sh "${TEST_ARGS[@]}"
 	run_test "nvmf_fips" $rootdir/test/nvmf/fips/fips.sh "${TEST_ARGS[@]}"
 	run_test "nvmf_control_msg_list" $rootdir/test/nvmf/target/control_msg_list.sh "${TEST_ARGS[@]}"
-	run_test "nvmf_wait_for_buf" $rootdir/test/nvmf/target/wait_for_buf.sh "${TEST_ARGS[@]}"
+	run_test "nvmf_wait_for_buf_clean_flow" $rootdir/test/nvmf/target/wait_for_buf.sh clean_flow "${TEST_ARGS[@]}"
+	run_test "nvmf_wait_for_buf_dirty_flow" $rootdir/test/nvmf/target/wait_for_buf.sh dirty_flow "${TEST_ARGS[@]}"
 fi
 
 if [ $RUN_NIGHTLY -eq 1 ]; then
@@ -64,5 +65,6 @@ if [[ $NET_TYPE == phy ]]; then
 	fi
 	run_test "nvmf_shutdown" $rootdir/test/nvmf/target/shutdown.sh "${TEST_ARGS[@]}"
 fi
+run_test "nvmf_nsid" "$rootdir/test/nvmf/target/nsid.sh" "${TEST_ARGS[@]}"
 
 trap - SIGINT SIGTERM EXIT

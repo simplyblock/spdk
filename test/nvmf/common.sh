@@ -30,6 +30,10 @@ function build_nvmf_app_args() {
 
 	NVMF_APP+=("${NO_HUGE[@]}")
 
+	if [ "$TEST_INTERRUPT_MODE" -eq 1 ]; then
+		NVMF_APP+=(--interrupt-mode)
+	fi
+
 	if [ -n "$SPDK_HUGE_DIR" ]; then
 		NVMF_APP+=(--huge-dir "$SPDK_HUGE_DIR")
 	elif [ $SPDK_RUN_NON_ROOT -eq 1 ]; then
@@ -324,12 +328,19 @@ function gather_supported_nvmf_pci_devs() {
 	x722+=(${pci_bus_cache["$intel:0x37d2"]})
 	# BlueField 3
 	mlx+=(${pci_bus_cache["$mellanox:0xa2dc"]})
+	mlx+=(${pci_bus_cache["$mellanox:0xa2dd"]})
 	# ConnectX-7
 	mlx+=(${pci_bus_cache["$mellanox:0x1021"]})
+	mlx+=(${pci_bus_cache["$mellanox:0x1022"]})
 	# BlueField 2
 	mlx+=(${pci_bus_cache["$mellanox:0xa2d6"]})
+	mlx+=(${pci_bus_cache["$mellanox:0xa2d7"]})
 	# ConnectX-6 Dx
 	mlx+=(${pci_bus_cache["$mellanox:0x101d"]})
+	mlx+=(${pci_bus_cache["$mellanox:0x101e"]})
+	# ConnectX-6
+	mlx+=(${pci_bus_cache["$mellanox:0x101b"]})
+	mlx+=(${pci_bus_cache["$mellanox:0x101c"]})
 	# ConnectX-5
 	mlx+=(${pci_bus_cache["$mellanox:0x1017"]})
 	mlx+=(${pci_bus_cache["$mellanox:0x1019"]})
@@ -391,7 +402,9 @@ function gather_supported_nvmf_pci_devs() {
 	# E810 cards also need irdma driver to be around.
 	if [[ $SPDK_TEST_NVMF_NICS == e810 && $TEST_TRANSPORT == rdma ]]; then
 		if [[ -e /sys/module/irdma/parameters/roce_ena ]]; then
-			# Our tests don't play well with iWARP protocol. Make sure we use RoCEv2 instead.
+			# Our tests don't play well with iWARP protocol since CQ resize is not supported.
+			# This may affect some tests, especially those which target multiconnection setups.
+			# Considering all that, make sure we use RoCEv2 instead.
 			(($(< /sys/module/irdma/parameters/roce_ena) != 1)) && modprobe -r irdma
 		fi
 		modinfo irdma && modprobe irdma roce_ena=1

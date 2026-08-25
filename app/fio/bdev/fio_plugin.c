@@ -10,6 +10,7 @@
 #include "spdk/bdev_zone.h"
 #include "spdk/accel.h"
 #include "spdk/env.h"
+#include "spdk/file.h"
 #include "spdk/init.h"
 #include "spdk/thread.h"
 #include "spdk/log.h"
@@ -108,6 +109,8 @@ struct spdk_fio_oat_ctx {
 
 static bool g_spdk_env_initialized = false;
 static const char *g_json_config_file = NULL;
+static void *g_json_data;
+static size_t g_json_data_size;
 static const char *g_rpc_listen_addr = NULL;
 
 static int spdk_fio_init(struct thread_data *td);
@@ -265,11 +268,42 @@ spdk_fio_bdev_init_done(int rc, void *cb_arg)
 {
 	*(bool *)cb_arg = true;
 
+	free(g_json_data);
+	if (rc) {
+		SPDK_ERRLOG("RUNTIME RPCs failed\n");
+		exit(1);
+	}
+}
+
+static void
+spdk_fio_bdev_subsystem_init_done(int rc, void *cb_arg)
+{
+	if (rc) {
+		SPDK_ERRLOG("subsystem init failed\n");
+		exit(1);
+	}
+
+	spdk_rpc_set_state(SPDK_RPC_RUNTIME);
+	spdk_subsystem_load_config(g_json_data, g_json_data_size,
+				   spdk_fio_bdev_init_done, cb_arg, true);
+}
+
+static void
+spdk_fio_bdev_startup_done(int rc, void *cb_arg)
+{
+	if (rc) {
+		SPDK_ERRLOG("STARTUP RPCs failed\n");
+		exit(1);
+	}
+
 	if (g_rpc_listen_addr != NULL) {
-		if (spdk_rpc_initialize(g_rpc_listen_addr, NULL) == 0) {
-			spdk_rpc_set_state(SPDK_RPC_RUNTIME);
+		if (spdk_rpc_initialize(g_rpc_listen_addr, NULL) != 0) {
+			SPDK_ERRLOG("could not initialize RPC address %s\n", g_rpc_listen_addr);
+			exit(1);
 		}
 	}
+
+	spdk_subsystem_init(spdk_fio_bdev_subsystem_init_done, cb_arg);
 }
 
 static void
@@ -277,8 +311,17 @@ spdk_fio_bdev_init_start(void *arg)
 {
 	bool *done = arg;
 
-	spdk_subsystem_init_from_json_config(g_json_config_file, SPDK_DEFAULT_RPC_ADDR,
-					     spdk_fio_bdev_init_done, done, true);
+	g_json_data = spdk_posix_file_load_from_name(g_json_config_file, &g_json_data_size);
+
+	if (g_json_data == NULL) {
+		SPDK_ERRLOG("could not allocate buffer for json config file\n");
+		exit(1);
+	}
+
+	/* Load SPDK_RPC_STARTUP RPCs from config file */
+	assert(spdk_rpc_get_state() == SPDK_RPC_STARTUP);
+	spdk_subsystem_load_config(g_json_data, g_json_data_size,
+				   spdk_fio_bdev_startup_done, done, true);
 }
 
 static void
@@ -356,7 +399,8 @@ spdk_init_thread_poll(void *arg)
 	spdk_unaffinitize_thread();
 
 	if (eo->log_flags) {
-		char *tok = strtok(eo->log_flags, ",");
+		char *sp = NULL;
+		char *tok = strtok_r(eo->log_flags, ",", &sp);
 		do {
 			rc = spdk_log_set_flag(tok);
 			if (rc < 0) {
@@ -364,7 +408,7 @@ spdk_init_thread_poll(void *arg)
 				rc = EINVAL;
 				goto err_exit;
 			}
-		} while ((tok = strtok(NULL, ",")) != NULL);
+		} while ((tok = strtok_r(NULL, ",", &sp)) != NULL);
 #ifdef DEBUG
 		spdk_log_set_print_level(SPDK_LOG_DEBUG);
 #endif
@@ -790,7 +834,26 @@ spdk_fio_close(struct thread_data *td, struct fio_file *f)
 static int
 spdk_fio_iomem_alloc(struct thread_data *td, size_t total_mem)
 {
-	td->orig_buffer = spdk_dma_zmalloc(total_mem, 0x1000, NULL);
+	struct spdk_fio_thread	*fio_thread = td->io_ops_data;
+	struct spdk_fio_target	*fio_target;
+	int32_t numa_id = SPDK_ENV_NUMA_ID_ANY, tmp_numa_id;
+
+	/* If all bdevs used by this fio_thread have the same numa socket
+	 * id, allocate from that socket. If they come from different numa
+	 * sockets, then don't try to optimize and just use NUMA_ID_ANY.
+	 */
+	TAILQ_FOREACH(fio_target, &fio_thread->targets, link) {
+		tmp_numa_id = spdk_bdev_get_numa_id(fio_target->bdev);
+		if (numa_id == SPDK_ENV_NUMA_ID_ANY) {
+			numa_id = tmp_numa_id;
+		} else if (tmp_numa_id != numa_id &&
+			   tmp_numa_id != SPDK_ENV_NUMA_ID_ANY) {
+			numa_id = SPDK_ENV_NUMA_ID_ANY;
+			break;
+		}
+	}
+
+	td->orig_buffer = spdk_dma_zmalloc_socket(total_mem, 0x1000, NULL, numa_id);
 	return td->orig_buffer == NULL;
 }
 

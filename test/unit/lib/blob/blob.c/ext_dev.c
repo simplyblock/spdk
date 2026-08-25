@@ -31,7 +31,7 @@ ext_dev_destroy(struct spdk_bs_dev *dev)
 static void
 ext_dev_read(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
 	     uint64_t lba, uint32_t lba_count,
-	     struct spdk_bs_dev_cb_args *cb_args)
+	     struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts)
 {
 	uint64_t offset, length;
 
@@ -49,7 +49,7 @@ ext_dev_read(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *pay
 static void
 ext_dev_write(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
 	      uint64_t lba, uint32_t lba_count,
-	      struct spdk_bs_dev_cb_args *cb_args)
+	      struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts)
 {
 	uint64_t offset, length;
 

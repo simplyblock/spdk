@@ -11,9 +11,12 @@
 #include "spdk/blob_bdev.h"
 #include "spdk/tree.h"
 #include "spdk/util.h"
+#include "spdk/cpuset.h"
+#include "spdk_internal/thread.h"
+#include "spdk/nvmf.h"
 
 /* Default blob channel opts for lvol */
-#define SPDK_LVOL_BLOB_OPTS_CHANNEL_OPS 512
+#define SPDK_LVOL_BLOB_OPTS_CHANNEL_OPS 12000
 
 #define LVOL_NAME "name"
 
@@ -29,6 +32,15 @@ struct spdk_lvs_degraded_lvol_set {
 
 static TAILQ_HEAD(, spdk_lvol_store) g_lvol_stores = TAILQ_HEAD_INITIALIZER(g_lvol_stores);
 static pthread_mutex_t g_lvol_stores_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_lvs_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static struct spdk_thread *g_lvs_md_thread = NULL;
+static struct spdk_cpuset *g_helper_set = NULL;
+static TAILQ_HEAD(, spdk_lvs_poll_group) g_lvs_poll_groups = TAILQ_HEAD_INITIALIZER(g_lvs_poll_groups);
+static TAILQ_HEAD(, spdk_lvs_xfer) g_lvs_xfer_tasks = TAILQ_HEAD_INITIALIZER(g_lvs_xfer_tasks);
+static uint32_t g_lvs_num_pgs = 0;
+static struct spdk_poller *g_pg_xfer_poller[20] = {NULL};
+static struct spdk_poller *g_xfer_md_poller = NULL;
 
 static inline int lvs_opts_copy(const struct spdk_lvs_opts *src, struct spdk_lvs_opts *dst);
 static int lvs_esnap_bs_dev_create(void *bs_ctx, void *blob_ctx, struct spdk_blob *blob,
@@ -75,8 +87,17 @@ lvs_alloc(void)
 	TAILQ_INIT(&lvs->lvols);
 	TAILQ_INIT(&lvs->pending_lvols);
 	TAILQ_INIT(&lvs->retry_open_lvols);
+	TAILQ_INIT(&lvs->pending_update_lvols);
+	TAILQ_INIT(&lvs->pending_iorsp);
+	TAILQ_INIT(&lvs->pending_delete_requests);
+	TAILQ_INIT(&lvs->hublvol_channels);
+	TAILQ_INIT(&lvs->transfer_devs);
+	lvs->is_deletion_in_progress = false;
+	lvs->queue_failed_rsp = false;
 
 	lvs->load_esnaps = false;
+	lvs->leader = false;
+	lvs->read_only = false;
 	RB_INIT(&lvs->degraded_lvol_sets_tree);
 	lvs->thread = spdk_get_thread();
 
@@ -99,9 +120,10 @@ lvs_free(struct spdk_lvol_store *lvs)
 
 static struct spdk_lvol *
 lvol_alloc(struct spdk_lvol_store *lvs, const char *name, bool thin_provision,
-	   enum lvol_clear_method clear_method)
+	   enum lvol_clear_method clear_method, const char *uuid_str)
 {
 	struct spdk_lvol *lvol;
+	struct spdk_uuid uuid;
 
 	lvol = calloc(1, sizeof(*lvol));
 	if (lvol == NULL) {
@@ -109,11 +131,28 @@ lvol_alloc(struct spdk_lvol_store *lvs, const char *name, bool thin_provision,
 	}
 
 	lvol->lvol_store = lvs;
+	// TODO add flag to check if load successfully done for blob
+	// on the fail we should response the incoming IO with -EIO
+	if (lvs->leader) {
+		lvol->leader = true;
+	} else {
+		lvol->leader = false;
+	}
 	lvol->clear_method = (enum blob_clear_method)clear_method;
-	snprintf(lvol->name, sizeof(lvol->name), "%s", name);
-	spdk_uuid_generate(&lvol->uuid);
+	snprintf(lvol->name, sizeof(lvol->name), "%s", name);	
+	if (uuid_str == NULL) {
+		spdk_uuid_generate(&lvol->uuid);
+	} else {
+		if (spdk_uuid_parse(&uuid, uuid_str)) {
+			free(lvol);
+			return NULL;
+		}
+		spdk_uuid_copy(&lvol->uuid, &uuid);
+	}
 	spdk_uuid_fmt_lower(lvol->uuid_str, sizeof(lvol->uuid_str), &lvol->uuid);
 	spdk_uuid_fmt_lower(lvol->unique_id, sizeof(lvol->uuid_str), &lvol->uuid);
+
+	TAILQ_INIT(&lvol->redirect_migrate_io);
 
 	TAILQ_INSERT_TAIL(&lvs->pending_lvols, lvol, link);
 
@@ -184,7 +223,8 @@ spdk_lvol_open(struct spdk_lvol *lvol, spdk_lvol_op_with_handle_complete cb_fn, 
 	spdk_blob_open_opts_init(&opts, sizeof(opts));
 	opts.clear_method = lvol->clear_method;
 
-	spdk_bs_open_blob_ext(lvol->lvol_store->blobstore, lvol->blob_id, &opts, lvol_open_cb, req);
+	// spdk_bs_open_blob_ext(lvol->lvol_store->blobstore, lvol->blob_id, &opts, lvol_open_cb, req);
+	spdk_bs_open_blob_without_reference(lvol->lvol_store->blobstore, lvol->blob_id, &opts, lvol_open_cb, req);
 }
 
 static void
@@ -249,7 +289,11 @@ load_next_lvol(void *cb_arg, struct spdk_blob *blob, int lvolerrno)
 	 * Storing blob_id for future lookups is fine.
 	 */
 	lvol->blob_id = blob_id;
+	lvol->blob = blob;
 	lvol->lvol_store = lvs;
+	lvol->map_id = spdk_blob_get_map_id(blob);
+	lvs->lvol_map.lvol[lvol->map_id] = lvol;
+	TAILQ_INIT(&lvol->redirect_migrate_io);
 
 	rc = spdk_blob_get_xattr_value(blob, "uuid", (const void **)&attr, &value_len);
 	if (rc != 0 || value_len != SPDK_UUID_STRING_LEN || attr[SPDK_UUID_STRING_LEN - 1] != '\0' ||
@@ -289,6 +333,126 @@ invalid:
 }
 
 static void
+load_one_lvol_from_blob(void *cb_arg, struct spdk_blob *blob, int lvolerrno)
+{
+	struct spdk_lvs_with_handle_req *req = cb_arg;
+	struct spdk_lvol_store *lvs = req->lvol_store;
+	struct spdk_blob_store *bs = lvs->blobstore;
+	struct spdk_lvol *lvol, *tmp;
+	spdk_blob_id blob_id;
+	const char *attr;
+	size_t value_len;
+	int rc;
+
+	if (lvolerrno == -ENOENT) {
+		/* Finished iterating */
+		if (req->lvserrno == 0) {
+			lvs->load_esnaps = true;
+			req->cb_fn(req->cb_arg, lvs, req->lvserrno);
+			free(req);
+		} else {
+			TAILQ_FOREACH_SAFE(lvol, &lvs->lvols, link, tmp) {
+				TAILQ_REMOVE(&lvs->lvols, lvol, link);
+				lvol_free(lvol);
+			}
+			lvs_free(lvs);
+			spdk_bs_unload(bs, bs_unload_with_error_cb, req);
+		}
+		return;
+	} else if (lvolerrno < 0) {
+		SPDK_ERRLOG("Failed to fetch blobs list\n");
+		req->lvserrno = lvolerrno;
+		return;
+	}
+
+	blob_id = spdk_blob_get_id(blob);
+
+	if (blob_id == lvs->super_blob_id) {
+		SPDK_INFOLOG(lvol, "found superblob %"PRIu64"\n", (uint64_t)blob_id);
+		return;
+	}
+
+	lvol = calloc(1, sizeof(*lvol));
+	if (!lvol) {
+		SPDK_ERRLOG("Cannot alloc memory for lvol base pointer\n");
+		req->lvserrno = -ENOMEM;
+		return;
+	}
+
+	/*
+	 * Do not store a reference to blob now because spdk_bs_iter_next() will close it.
+	 * Storing blob_id for future lookups is fine.
+	 */
+	lvol->blob_id = blob_id;
+	lvol->blob = blob;
+	lvol->lvol_store = lvs;
+	lvol->map_id = spdk_blob_get_map_id(blob);
+	TAILQ_INIT(&lvol->redirect_migrate_io);
+
+	rc = spdk_blob_get_xattr_value(blob, "uuid", (const void **)&attr, &value_len);
+	if (rc != 0 || value_len != SPDK_UUID_STRING_LEN || attr[SPDK_UUID_STRING_LEN - 1] != '\0' ||
+	    spdk_uuid_parse(&lvol->uuid, attr) != 0) {
+		SPDK_INFOLOG(lvol, "Missing or corrupt lvol uuid\n");
+		spdk_uuid_set_null(&lvol->uuid);
+	}
+	spdk_uuid_fmt_lower(lvol->uuid_str, sizeof(lvol->uuid_str), &lvol->uuid);
+
+	if (!spdk_uuid_is_null(&lvol->uuid)) {
+		snprintf(lvol->unique_id, sizeof(lvol->unique_id), "%s", lvol->uuid_str);
+	} else {
+		spdk_uuid_fmt_lower(lvol->unique_id, sizeof(lvol->unique_id), &lvol->lvol_store->uuid);
+		value_len = strlen(lvol->unique_id);
+		snprintf(lvol->unique_id + value_len, sizeof(lvol->unique_id) - value_len, "_%"PRIu64,
+			 (uint64_t)blob_id);
+	}
+
+	rc = spdk_blob_get_xattr_value(blob, "name", (const void **)&attr, &value_len);
+	if (rc != 0 || value_len > SPDK_LVOL_NAME_MAX) {
+		SPDK_ERRLOG("Cannot assign lvol name\n");
+		lvol_free(lvol);
+		req->lvserrno = -EINVAL;
+		return;
+	}
+
+	snprintf(lvol->name, sizeof(lvol->name), "%s", attr);
+
+	lvs->lvol_map.lvol[lvol->map_id] = lvol;
+	TAILQ_INSERT_TAIL(&lvs->lvols, lvol, link);
+
+	lvs->lvol_count++;
+	// SPDK_INFOLOG(lvol, "added lvol %s (%s)\n", lvol->unique_id, lvol->uuid_str);	
+	return;
+}
+
+static void
+load_lvols_from_loaded_blobs(void *cb_arg, struct spdk_blob *blob, int lvolerrno)
+{
+	struct spdk_lvs_with_handle_req *req = cb_arg;
+	(void)blob;
+	(void)lvolerrno;
+	SPDK_NOTICELOG("Starting to load lvols from loaded blobs\n");
+	spdk_bs_for_each_loaded_blob(req->lvol_store->blobstore, load_one_lvol_from_blob, req);
+	SPDK_NOTICELOG("Finished loading lvols from loaded blobs\n");
+}
+
+// static void
+// lvs_get_super_blobid_on_examine(void *cb_arg, spdk_blob_id blobid, int lvolerrno) {
+// 	struct spdk_lvs_with_handle_req *req = (struct spdk_lvs_with_handle_req *)cb_arg;
+// 	struct spdk_lvol_store *lvs = req->lvol_store;
+// 	struct spdk_blob_store *bs = lvs->blobstore;
+
+// 	if (lvolerrno != 0) {
+// 		SPDK_INFOLOG(lvol, "Could not close super blob2.\n");
+// 		lvs_free(lvs);
+// 		req->lvserrno = -ENODEV;
+// 		spdk_bs_unload(bs, bs_unload_with_error_cb, req);
+// 		return;
+// 	}
+
+// 	spdk_bs_open_blob_without_reference(bs, blobid, NULL, load_lvols_from_loaded_blobs, req);
+// }
+
+static void
 close_super_cb(void *cb_arg, int lvolerrno)
 {
 	struct spdk_lvs_with_handle_req *req = (struct spdk_lvs_with_handle_req *)cb_arg;
@@ -304,6 +468,10 @@ close_super_cb(void *cb_arg, int lvolerrno)
 	}
 
 	/* Start loading lvols */
+	if (req->examine) {
+		load_lvols_from_loaded_blobs(req, NULL, 0);
+		return;
+	}
 	spdk_bs_iter_first(lvs->blobstore, load_next_lvol, req);
 }
 
@@ -371,7 +539,10 @@ lvs_read_uuid(void *cb_arg, struct spdk_blob *blob, int lvolerrno)
 	}
 
 	lvs->super_blob_id = spdk_blob_get_id(blob);
-
+	// if (req->examine) {
+	// 	close_super_cb(req, 0);
+	// 	return;
+	// }
 	spdk_blob_close(blob, close_super_cb, req);
 }
 
@@ -390,6 +561,10 @@ lvs_open_super(void *cb_arg, spdk_blob_id blobid, int lvolerrno)
 		return;
 	}
 
+	if (req->examine) {
+		spdk_bs_open_blob_without_reference(bs, blobid, NULL, lvs_read_uuid, req);
+		return;
+	}
 	spdk_bs_open_blob(bs, blobid, lvs_read_uuid, req);
 }
 
@@ -421,7 +596,7 @@ lvs_bs_opts_init(struct spdk_bs_opts *opts)
 
 static void
 lvs_load(struct spdk_bs_dev *bs_dev, const struct spdk_lvs_opts *_lvs_opts,
-	 spdk_lvs_op_with_handle_complete cb_fn, void *cb_arg)
+	 spdk_lvs_op_with_handle_complete cb_fn, void *cb_arg, bool examine)
 {
 	struct spdk_lvs_with_handle_req *req;
 	struct spdk_bs_opts bs_opts = {};
@@ -461,6 +636,7 @@ lvs_load(struct spdk_bs_dev *bs_dev, const struct spdk_lvs_opts *_lvs_opts,
 	req->cb_fn = cb_fn;
 	req->cb_arg = cb_arg;
 	req->bs_dev = bs_dev;
+	req->examine = examine;
 
 	lvs_bs_opts_init(&bs_opts);
 	snprintf(bs_opts.bstype.bstype, sizeof(bs_opts.bstype.bstype), "LVOLSTORE");
@@ -477,14 +653,14 @@ lvs_load(struct spdk_bs_dev *bs_dev, const struct spdk_lvs_opts *_lvs_opts,
 void
 spdk_lvs_load(struct spdk_bs_dev *bs_dev, spdk_lvs_op_with_handle_complete cb_fn, void *cb_arg)
 {
-	lvs_load(bs_dev, NULL, cb_fn, cb_arg);
+	lvs_load(bs_dev, NULL, cb_fn, cb_arg, false);
 }
 
 void
 spdk_lvs_load_ext(struct spdk_bs_dev *bs_dev, const struct spdk_lvs_opts *opts,
 		  spdk_lvs_op_with_handle_complete cb_fn, void *cb_arg)
 {
-	lvs_load(bs_dev, opts, cb_fn, cb_arg);
+	lvs_load(bs_dev, opts, cb_fn, cb_arg, true);
 }
 
 static void
@@ -674,6 +850,16 @@ setup_lvs_opts(struct spdk_bs_opts *bs_opts, struct spdk_lvs_opts *o, uint32_t t
 	snprintf(bs_opts->bstype.bstype, sizeof(bs_opts->bstype.bstype), "LVOLSTORE");
 }
 
+
+static void
+print_lvs_opts(struct spdk_lvs_opts *o)
+{
+	SPDK_NOTICELOG("LVS options:\n");
+	SPDK_NOTICELOG("  cluster_sz: %u\n", o->cluster_sz);
+	SPDK_NOTICELOG("  clear_method: %d\n", o->clear_method);
+	SPDK_NOTICELOG("  num_md_pages_per_cluster_ratio: %u\n", o->num_md_pages_per_cluster_ratio);
+}
+
 int
 spdk_lvs_init(struct spdk_bs_dev *bs_dev, struct spdk_lvs_opts *o,
 	      spdk_lvs_op_with_handle_complete cb_fn, void *cb_arg)
@@ -700,6 +886,8 @@ spdk_lvs_init(struct spdk_bs_dev *bs_dev, struct spdk_lvs_opts *o,
 		SPDK_ERRLOG("spdk_lvs_opts invalid\n");
 		return -EINVAL;
 	}
+	print_lvs_opts(o);
+	print_lvs_opts(&lvs_opts);
 
 	if (lvs_opts.cluster_sz < bs_dev->blocklen) {
 		SPDK_ERRLOG("Cluster size %" PRIu32 " is smaller than blocklen %" PRIu32 "\n",
@@ -707,7 +895,7 @@ spdk_lvs_init(struct spdk_bs_dev *bs_dev, struct spdk_lvs_opts *o,
 		return -EINVAL;
 	}
 	total_clusters = bs_dev->blockcnt / (lvs_opts.cluster_sz / bs_dev->blocklen);
-
+	SPDK_NOTICELOG("  total_clusters: %u blockcnt: %lu blocklen: %u\n", total_clusters, bs_dev->blockcnt, bs_dev->blocklen);
 	lvs = lvs_alloc();
 	if (!lvs) {
 		SPDK_ERRLOG("Cannot alloc memory for lvol store base pointer\n");
@@ -910,6 +1098,17 @@ spdk_lvs_unload(struct spdk_lvol_store *lvs, spdk_lvs_op_complete cb_fn,
 	lvs_req->cb_fn = cb_fn;
 	lvs_req->cb_arg = cb_arg;
 
+	if (lvs->hublvol_poller) {
+		spdk_poller_unregister(&lvs->hublvol_poller);
+		lvs->hublvol_poller = NULL;
+	}
+	
+	if (lvs->redirect_poller) {
+		spdk_poller_unregister(&lvs->redirect_poller);
+		lvs->redirect_poller = NULL;
+	}
+		
+
 	SPDK_INFOLOG(lvol, "Unloading lvol store\n");
 	spdk_bs_unload(lvs->blobstore, _lvs_unload_cb, lvs_req);
 	lvs_free(lvs);
@@ -963,6 +1162,16 @@ spdk_lvs_destroy(struct spdk_lvol_store *lvs, spdk_lvs_op_complete cb_fn,
 			cb_fn(cb_arg, -EBUSY);
 			return -EBUSY;
 		}
+	}
+
+	if (lvs->hublvol_poller) {
+		spdk_poller_unregister(&lvs->hublvol_poller);
+		lvs->hublvol_poller = NULL;
+	}
+	
+	if (lvs->redirect_poller) {
+		spdk_poller_unregister(&lvs->redirect_poller);
+		lvs->redirect_poller = NULL;
 	}
 
 	TAILQ_FOREACH_SAFE(iter_lvol, &lvs->lvols, link, tmp) {
@@ -1025,7 +1234,7 @@ lvol_delete_blob_cb(void *cb_arg, int lvolerrno)
 	if (lvolerrno < 0) {
 		SPDK_ERRLOG("Could not remove blob on lvol gracefully - forced removal\n");
 	} else {
-		SPDK_INFOLOG(lvol, "Lvol %s deleted\n", lvol->unique_id);
+		SPDK_NOTICELOG("Lvol %s deleted\n", lvol->unique_id);
 	}
 
 	if (lvol->degraded_set != NULL) {
@@ -1051,10 +1260,27 @@ lvol_delete_blob_cb(void *cb_arg, int lvolerrno)
 }
 
 static void
+lvol_delete_async_cb(void *cb_arg, int lvolerrno)
+{
+	struct spdk_lvol_req *req = cb_arg;
+	struct spdk_lvol *lvol = req->lvol;	
+
+	if (lvolerrno < 0) {
+		SPDK_ERRLOG("Could not async unmap cluster lvol uuid %s name %s - forced removal\n", lvol->unique_id, lvol->name);
+	} else {
+		SPDK_NOTICELOG("Lvol uuid %s name %s async unmap clusters done.\n", lvol->unique_id, lvol->name);
+	}
+	lvol->action_in_progress = false;
+	req->cb_fn(req->cb_arg, lvolerrno);
+	free(req);
+}
+
+static void
 lvol_create_open_cb(void *cb_arg, struct spdk_blob *blob, int lvolerrno)
 {
 	struct spdk_lvol_with_handle_req *req = cb_arg;
 	struct spdk_lvol *lvol = req->lvol;
+	struct spdk_lvol_store *lvs = lvol->lvol_store;
 
 	TAILQ_REMOVE(&req->lvol->lvol_store->pending_lvols, req->lvol, link);
 
@@ -1067,6 +1293,10 @@ lvol_create_open_cb(void *cb_arg, struct spdk_blob *blob, int lvolerrno)
 
 	lvol->blob = blob;
 	lvol->blob_id = spdk_blob_get_id(blob);
+	lvol->map_id = spdk_blob_get_map_id(blob);
+	if (!lvol->hublvol) {
+		lvs->lvol_map.lvol[lvol->map_id] = lvol;
+	}
 
 	TAILQ_INSERT_TAIL(&lvol->lvol_store->lvols, lvol, link);
 
@@ -1083,12 +1313,33 @@ lvol_create_cb(void *cb_arg, spdk_blob_id blobid, int lvolerrno)
 	struct spdk_lvol_with_handle_req *req = cb_arg;
 	struct spdk_blob_store *bs;
 	struct spdk_blob_open_opts opts;
-
+	struct spdk_blob *origblob;
+	
 	if (lvolerrno < 0) {
+		if (req->origlvol != NULL) {
+			origblob = req->origlvol->blob;
+			if (req->frozen_refcnt > 0 && 
+				req->frozen_refcnt == spdk_blob_get_freeze_cnt(origblob)) {
+				SPDK_ERRLOG("Leader change occurred while creating a new lvol; blob will be unfrozen.\n");
+				req->frozen_refcnt = 0;
+				req->force_failure = -1;
+				spdk_blob_unfreeze_cleanup(origblob, lvol_create_cb, req);
+				return;
+			}
+		}
 		TAILQ_REMOVE(&req->lvol->lvol_store->pending_lvols, req->lvol, link);
 		lvol_free(req->lvol);
 		assert(req->cb_fn != NULL);
 		req->cb_fn(req->cb_arg, NULL, lvolerrno);
+		free(req);
+		return;
+	}
+
+	if (req->force_failure < 0) {
+		TAILQ_REMOVE(&req->lvol->lvol_store->pending_lvols, req->lvol, link);
+		lvol_free(req->lvol);
+		assert(req->cb_fn != NULL);
+		req->cb_fn(req->cb_arg, NULL, -EPERM);
 		free(req);
 		return;
 	}
@@ -1142,6 +1393,154 @@ lvol_get_xattr_value(void *xattr_ctx, const char *name,
 	*value_len = 0;
 }
 
+void
+lvs_print_lvols_info(struct spdk_lvol_store *lvs, struct spdk_json_write_ctx *w)
+{
+	struct spdk_lvol *tmp, *base_lvol;
+	uint64_t blobids[1000];
+	int lvol_count, child_count;
+	uint64_t parent;
+	int rc = 0;
+	int type = 0;
+	bool has_clones = false, is_snapshot = false;
+
+	/* Result root */
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_array_begin(w, "lvols");
+
+	TAILQ_FOREACH(tmp, &lvs->lvols, link) {
+		memset(blobids, 0, sizeof(blobids));
+		lvol_count = 0;
+		parent = 0;
+		child_count = 0;
+		has_clones = false;
+		is_snapshot = false;
+		type = 0;
+		spdk_json_write_object_begin(w);
+		/* Common fields */
+		if (strncmp(tmp->name, "CLN_", 4) == 0) {
+			type = 1;
+			spdk_json_write_named_string(w, "Mtype", "clone");
+		} else if (strncmp(tmp->name, "LVOL", 4) == 0) {
+			type = 2;
+			spdk_json_write_named_string(w, "Mtype", "lvol");
+		} else if (strncmp(tmp->name, "SNAP", 4) == 0) {
+			type = 3;
+			spdk_json_write_named_string(w, "Mtype", "snapshot");
+		} else {
+			spdk_json_write_named_string(w, "Mtype", "Unknown");
+			spdk_json_write_named_string(w, "Stype", "Unknown");
+			spdk_json_write_named_string(w, "error", "Unknown lvol type");
+		}
+		spdk_json_write_named_string(w, "name", tmp->name);
+		spdk_json_write_named_string(w, "uuid", tmp->uuid_str);
+		spdk_json_write_named_uint64(w, "blobid", tmp->blob_id);
+		spdk_json_write_named_int32(w, "ref", spdk_blob_get_open_ref(tmp->blob));
+
+		rc = spdk_bs_dump_tree(tmp->blob, blobids, &lvol_count, &parent, &child_count, &is_snapshot, &has_clones);
+		if (rc < 0) {
+			/* "snapshot-with-clones" path */
+			spdk_json_write_named_string(w, "Ltype", "snapshot");
+			if (type == 3 /* SNAP */) {
+				spdk_json_write_named_string(w, "Stype", "snapshot");
+			} else if (type == 1 || type == 2) {
+				spdk_json_write_named_string(w, "Stype", "clone/lvol");
+				spdk_json_write_named_string(w, "error", "something wrong");
+			}
+			if (parent != 0) {
+				TAILQ_FOREACH(base_lvol, &lvs->lvols, link) {
+					if (base_lvol->blob_id == parent) {
+						spdk_json_write_named_uint64(w, "parent_blobid", parent);
+						spdk_json_write_named_string(w, "parent_uuid", base_lvol->uuid_str);
+						spdk_json_write_named_string(w, "parent_name", base_lvol->name);
+						break;
+					}
+				}
+			}
+
+			if (child_count > 0) {
+				spdk_json_write_named_array_begin(w, "children");				
+				for (int i = 0; i < child_count; i++) {
+					bool found = false;
+					TAILQ_FOREACH(base_lvol, &lvs->lvols, link) {
+						if (base_lvol->blob_id == blobids[i]) {
+							spdk_json_write_object_begin(w);
+							spdk_json_write_named_string(w, "uuid", base_lvol->uuid_str);
+							spdk_json_write_named_uint64(w, "blobid", base_lvol->blob_id);
+							spdk_json_write_named_int32(w, "ref", spdk_blob_get_open_ref(base_lvol->blob));
+							spdk_json_write_named_string(w, "name", base_lvol->name);
+							spdk_json_write_object_end(w);
+							found = true;
+							break;
+						}
+					}
+					if (!found) {
+						spdk_json_write_object_begin(w);
+						spdk_json_write_named_uint64(w, "blobid", blobids[i]);
+						spdk_json_write_named_bool(w, "missing", true);
+						spdk_json_write_object_end(w);
+					}
+				}
+				spdk_json_write_array_end(w);
+			}
+			spdk_json_write_object_end(w);
+			continue;
+		}
+
+		if (lvol_count > 0) {
+			/* Clone path */
+			if (is_snapshot) {
+				spdk_json_write_named_string(w, "Ltype", "snapshot without clones");
+			} else {
+				spdk_json_write_named_string(w, "Ltype", "clone/lvol");
+			}
+
+			if (type == 3 /* SNAP */) {
+				spdk_json_write_named_string(w, "Stype", "snapshot");
+			} else if (type == 1 || type == 2) {
+				spdk_json_write_named_string(w, "Stype", "clone/lvol");
+			}
+			spdk_json_write_named_array_begin(w, "blob_chain");
+			for (int i = 0; i < lvol_count; i++) {
+				bool found = false;
+				TAILQ_FOREACH(base_lvol, &lvs->lvols, link) {
+					if (base_lvol->blob_id == blobids[i]) {
+						spdk_json_write_object_begin(w);
+						spdk_json_write_named_string(w, "uuid", base_lvol->uuid_str);
+						spdk_json_write_named_uint64(w, "blobid", base_lvol->blob_id);
+						spdk_json_write_named_int32(w, "ref", spdk_blob_get_open_ref(base_lvol->blob));
+						spdk_json_write_named_string(w, "name", base_lvol->name);
+						spdk_json_write_object_end(w);
+						found = true;
+						break;
+					}
+				}
+				if (!found) {
+					spdk_json_write_object_begin(w);
+					spdk_json_write_named_uint64(w, "blobid", blobids[i]);
+					spdk_json_write_named_bool(w, "missing", true);
+					spdk_json_write_object_end(w);
+				}
+			}
+			spdk_json_write_array_end(w);
+		} else {
+			if (is_snapshot) {
+				spdk_json_write_named_string(w, "Ltype", "snapshot without clones and parent");
+			} else {
+				spdk_json_write_named_string(w, "Ltype", "clone/lvol");
+			}
+			if (type == 3 /* SNAP */) {
+				spdk_json_write_named_string(w, "Stype", "snapshot");
+			} else if (type == 1 || type == 2) {
+				spdk_json_write_named_string(w, "Stype", "clone/lvol");
+			}
+		}
+		spdk_json_write_object_end(w);
+	}
+	spdk_json_write_array_end(w);
+	spdk_json_write_object_end(w);
+}
+
 static int
 lvs_verify_lvol_name(struct spdk_lvol_store *lvs, const char *name)
 {
@@ -1175,8 +1574,8 @@ lvs_verify_lvol_name(struct spdk_lvol_store *lvs, const char *name)
 }
 
 int
-spdk_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz,
-		 bool thin_provision, enum lvol_clear_method clear_method, spdk_lvol_op_with_handle_complete cb_fn,
+spdk_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz, bool thin_provision,
+		 enum lvol_clear_method clear_method, uint8_t geometry, spdk_lvol_op_with_handle_complete cb_fn,
 		 void *cb_arg)
 {
 	struct spdk_lvol_with_handle_req *req;
@@ -1206,7 +1605,7 @@ spdk_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz,
 	req->cb_fn = cb_fn;
 	req->cb_arg = cb_arg;
 
-	lvol = lvol_alloc(lvs, name, thin_provision, clear_method);
+	lvol = lvol_alloc(lvs, name, thin_provision, clear_method, NULL);
 	if (!lvol) {
 		free(req);
 		SPDK_ERRLOG("Cannot alloc memory for lvol base pointer\n");
@@ -1217,6 +1616,7 @@ spdk_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz,
 	spdk_blob_opts_init(&opts, sizeof(opts));
 	opts.thin_provision = thin_provision;
 	opts.num_clusters = spdk_divide_round_up(sz, spdk_bs_get_cluster_size(bs));
+	opts.geometry = geometry;
 	opts.clear_method = lvol->clear_method;
 	opts.xattrs.count = SPDK_COUNTOF(xattr_names);
 	opts.xattrs.names = xattr_names;
@@ -1225,6 +1625,66 @@ spdk_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz,
 
 	spdk_bs_create_blob_ext(lvs->blobstore, &opts, lvol_create_cb, req);
 
+	return 0;
+}
+
+int
+spdk_lvol_create_hublvol(struct spdk_lvol_store *lvs, const char *name, spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg)
+{
+	struct spdk_lvol_with_handle_req *req;
+	struct spdk_lvol *lvol;
+	struct spdk_blob_opts opts;
+	char *xattr_names[] = {LVOL_NAME, "uuid"};
+	int rc;
+
+	if (lvs == NULL) {
+		SPDK_ERRLOG("lvol store does not exist\n");
+		return -EINVAL;
+	}
+
+	rc = lvs_verify_lvol_name(lvs, name);
+	if (rc < 0) {
+		return rc;
+	}
+
+	req = calloc(1, sizeof(*req));
+	if (!req) {
+		SPDK_ERRLOG("Cannot alloc memory for lvol request pointer\n");
+		return -ENOMEM;
+	}
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+
+	lvol = lvol_alloc(lvs, name, true, LVOL_CLEAR_WITH_DEFAULT, NULL);
+	if (!lvol) {
+		free(req);
+		SPDK_ERRLOG("Cannot alloc memory for lvol base pointer\n");
+		return -ENOMEM;
+	}
+	lvol->hublvol = true;
+	req->lvol = lvol;
+	spdk_blob_opts_init(&opts, sizeof(opts));
+	opts.thin_provision = true;
+	opts.num_clusters = UINT64_MAX;//spdk_divide_round_up(UINT64_MAX, spdk_bs_get_cluster_size(bs));
+	opts.clear_method = lvol->clear_method;
+	opts.xattrs.count = SPDK_COUNTOF(xattr_names);
+	opts.xattrs.names = xattr_names;
+	opts.xattrs.ctx = lvol;
+	opts.xattrs.get_value = lvol_get_xattr_value;
+
+	spdk_bs_create_hubblob(lvs->blobstore, &opts, lvol_create_open_cb, req);
+
+	return 0;
+}
+
+// TODO check the reference for that blob incase of snapshots and clons
+int
+spdk_lvol_copy_blob(struct spdk_lvol *lvol)
+{
+	lvol->tmp_blob = spdk_bs_copy_blob(lvol->lvol_store->blobstore, lvol->blob);
+	if (!lvol->tmp_blob) {
+		return -1;
+	}
 	return 0;
 }
 
@@ -1269,7 +1729,7 @@ spdk_lvol_create_esnap_clone(const void *esnap_id, uint32_t id_len, uint64_t siz
 	req->cb_fn = cb_fn;
 	req->cb_arg = cb_arg;
 
-	lvol = lvol_alloc(lvs, clone_name, true, LVOL_CLEAR_WITH_DEFAULT);
+	lvol = lvol_alloc(lvs, clone_name, true, LVOL_CLEAR_WITH_DEFAULT, NULL);
 	if (!lvol) {
 		free(req);
 		SPDK_ERRLOG("Cannot alloc memory for lvol base pointer\n");
@@ -1293,6 +1753,54 @@ spdk_lvol_create_esnap_clone(const void *esnap_id, uint32_t id_len, uint64_t siz
 	return 0;
 }
 
+static int
+spdk_lvol_create_snapshot_poller(void *cb_arg) {
+	struct spdk_lvol_store *lvs;
+	struct spdk_blob *origblob;
+	struct spdk_lvol_with_handle_req *req = cb_arg;
+	struct spdk_blob_xattr_opts snapshot_xattrs;
+	char *xattr_names[] = {LVOL_NAME, "uuid"};
+
+	origblob = req->origlvol->blob;
+	lvs = req->origlvol->lvol_store;
+
+	spdk_poller_unregister(&req->poller);
+
+	if (!lvs->leader || !req->origlvol->leader) {
+		SPDK_ERRLOG("Cannot create snapshot; poller activated after delay, leadership lost.\n");
+		req->frozen_refcnt = 0;
+		req->force_failure = -1;
+		spdk_blob_unfreeze_cleanup(origblob, lvol_create_cb, req);
+		return -1;
+	}
+
+	snapshot_xattrs.count = SPDK_COUNTOF(xattr_names);
+	snapshot_xattrs.ctx = req->lvol;
+	snapshot_xattrs.names = xattr_names;
+	snapshot_xattrs.get_value = lvol_get_xattr_value;
+
+	spdk_bs_create_snapshot(lvs->blobstore, spdk_blob_get_id(origblob), &snapshot_xattrs,
+				lvol_create_cb, req);
+	return -1;
+}
+
+static void
+spdk_create_snapshot_freez_cpl(void *cb_arg, int lvolerrno) {
+	struct spdk_lvol_with_handle_req *req = cb_arg;
+	if (lvolerrno < 0) {
+		SPDK_ERRLOG("Cannot freeze blob for snapshot creation.\n");
+		TAILQ_REMOVE(&req->lvol->lvol_store->pending_lvols, req->lvol, link);
+		lvol_free(req->lvol);
+		req->cb_fn(req->cb_arg, NULL, lvolerrno);
+		free(req);
+		return;
+	}
+
+	req->frozen_refcnt = spdk_blob_get_freeze_cnt(req->origlvol->blob);
+	// TODO: Consider taking the delay value from RPC; it might be better.
+	req->poller = spdk_poller_register(spdk_lvol_create_snapshot_poller, req, 50000); // Delay of 50ms
+}
+
 void
 spdk_lvol_create_snapshot(struct spdk_lvol *origlvol, const char *snapshot_name,
 			  spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg)
@@ -1301,8 +1809,6 @@ spdk_lvol_create_snapshot(struct spdk_lvol *origlvol, const char *snapshot_name,
 	struct spdk_lvol *newlvol;
 	struct spdk_blob *origblob;
 	struct spdk_lvol_with_handle_req *req;
-	struct spdk_blob_xattr_opts snapshot_xattrs;
-	char *xattr_names[] = {LVOL_NAME, "uuid"};
 	int rc;
 
 	if (origlvol == NULL) {
@@ -1316,6 +1822,17 @@ spdk_lvol_create_snapshot(struct spdk_lvol *origlvol, const char *snapshot_name,
 	if (lvs == NULL) {
 		SPDK_ERRLOG("lvol store does not exist\n");
 		cb_fn(cb_arg, NULL, -EINVAL);
+		return;
+	}
+
+	if (!lvs->leader || !origlvol->leader) {
+		SPDK_ERRLOG("Cannot create snapshot; the lvs/lvol not leader.\n");
+		/* ERR_LEADERSHIP_CHANGED is already negative (-35). Negating it
+		 * here delivered +35, which sailed past the `lvolerrno < 0`
+		 * failure guard in _vbdev_lvol_create_cb and dereferenced the
+		 * NULL lvol (SIGSEGV, run mass_create_delete 2026-07-21, node
+		 * c42f1686). Every other call site passes the macro unnegated. */
+		cb_fn(cb_arg, NULL, ERR_LEADERSHIP_CHANGED);
 		return;
 	}
 
@@ -1333,25 +1850,110 @@ spdk_lvol_create_snapshot(struct spdk_lvol *origlvol, const char *snapshot_name,
 	}
 
 	newlvol = lvol_alloc(origlvol->lvol_store, snapshot_name, true,
-			     (enum lvol_clear_method)origlvol->clear_method);
+			     (enum lvol_clear_method)origlvol->clear_method, NULL);
 	if (!newlvol) {
 		SPDK_ERRLOG("Cannot alloc memory for lvol base pointer\n");
 		free(req);
 		cb_fn(cb_arg, NULL, -ENOMEM);
 		return;
 	}
-
-	snapshot_xattrs.count = SPDK_COUNTOF(xattr_names);
-	snapshot_xattrs.ctx = newlvol;
-	snapshot_xattrs.names = xattr_names;
-	snapshot_xattrs.get_value = lvol_get_xattr_value;
 	req->lvol = newlvol;
 	req->origlvol = origlvol;
 	req->cb_fn = cb_fn;
 	req->cb_arg = cb_arg;
 
-	spdk_bs_create_snapshot(lvs->blobstore, spdk_blob_get_id(origblob), &snapshot_xattrs,
-				lvol_create_cb, req);
+	spdk_snapshot_freeze_blob(origblob, spdk_create_snapshot_freez_cpl, req);
+}
+
+static void
+snapshot_clone_update_cb(void *cb_arg, struct spdk_blob *blob, int lvolerrno)
+{
+	struct spdk_lvol_with_handle_req *req = cb_arg;
+
+	if (lvolerrno < 0) {
+		// TODO on failover
+		SPDK_ERRLOG("Cannot update clone and snapshot on secondary.\n");
+		req->cb_fn(req->cb_arg, NULL, lvolerrno);
+		free(req);
+		return;
+	}
+
+	assert(req->cb_fn != NULL);
+	req->cb_fn(req->cb_arg, req->lvol, lvolerrno);
+	free(req);
+
+}
+
+void
+spdk_lvol_update_snapshot_clone(struct spdk_lvol *lvol, struct spdk_lvol *origlvol,
+			  spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg)
+{
+	struct spdk_lvol_store *lvs;
+	bool update_blob = false;
+	bool update_on_failover = false;
+	struct spdk_blob *origblob;
+	struct spdk_blob *snapshot_blob;
+	struct spdk_lvol_with_handle_req *req;
+
+	if (origlvol == NULL) {
+		SPDK_INFOLOG(lvol, "Lvol not provided.\n");
+		cb_fn(cb_arg, NULL, -EINVAL);
+		return;
+	}
+
+	origblob = origlvol->blob;
+	snapshot_blob = lvol->blob;
+	lvs = origlvol->lvol_store;
+	if (lvs == NULL) {
+		SPDK_ERRLOG("lvol store does not exist\n");
+		cb_fn(cb_arg, NULL, -EINVAL);
+		return;
+	}
+
+	req = calloc(1, sizeof(*req));
+	if (!req) {
+		SPDK_ERRLOG("Cannot alloc memory for lvol request pointer\n");
+		cb_fn(cb_arg, NULL, -ENOMEM);
+		return;
+	}
+
+	req->lvol = lvol;
+	req->origlvol = origlvol;
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+	if (lvs->leader || lvs->update_in_progress) {
+		if (!origlvol->update_in_progress && !origlvol->leader) {
+			// add blob to be updated ...
+			update_on_failover = true;
+		}
+	} else {
+		update_blob = true;
+	}
+	spdk_bs_update_snapshot_clone(lvs->blobstore, origblob, snapshot_blob, 
+				origlvol->leader, origlvol->update_in_progress);			 
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+
+	if (update_on_failover) {
+		//TODO check should not send to md thread bcs we already there
+		spdk_lvol_update_on_failover(lvs, origlvol, false);
+	}
+
+	if (update_blob) {
+		// TODO here we will return origblob not snapshot blob
+		spdk_bs_update_snapshot_clone_live(origblob, snapshot_blob);
+	}
+
+	snapshot_clone_update_cb(req, snapshot_blob, 0);
+}
+
+void
+spdk_lvol_update_clone(struct spdk_lvol *lvol,
+			spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg)
+{
+	spdk_bs_update_clone(lvol->blob);
+	cb_fn(cb_arg, lvol, 0);	
 }
 
 void
@@ -1393,7 +1995,7 @@ spdk_lvol_create_clone(struct spdk_lvol *origlvol, const char *clone_name,
 		return;
 	}
 
-	newlvol = lvol_alloc(lvs, clone_name, true, (enum lvol_clear_method)origlvol->clear_method);
+	newlvol = lvol_alloc(lvs, clone_name, true, (enum lvol_clear_method)origlvol->clear_method, NULL);
 	if (!newlvol) {
 		SPDK_ERRLOG("Cannot alloc memory for lvol base pointer\n");
 		free(req);
@@ -1461,6 +2063,150 @@ spdk_lvol_resize(struct spdk_lvol *lvol, uint64_t sz,
 }
 
 static void
+spdk_lvol_chain_cb(void *cb_arg, int bserrno)
+{
+	struct spdk_lvol_req *req = cb_arg;
+	req->cb_fn(req->cb_arg, bserrno);
+	free(req);
+	return;
+}
+
+void
+spdk_lvol_chain(struct spdk_lvol *origlvol, struct spdk_lvol *clone,
+		 spdk_lvol_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_lvol_store *lvs = origlvol->lvol_store;
+	struct spdk_lvol_req *req;
+
+	req = calloc(1, sizeof(*req));
+	if (!req) {
+		SPDK_ERRLOG("Cannot alloc memory for lvol request pointer\n");
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+	req->lvol = NULL;
+
+	spdk_bs_chain_snapshot_clone(origlvol->blob, clone->blob, lvs->leader, lvs->update_in_progress, spdk_lvol_chain_cb, req);
+}
+
+void
+spdk_lvol_set_migration_flag(struct spdk_lvol *lvol)
+{
+	lvol->migration_flag = true;
+	spdk_bs_set_migration_flag_blob(lvol->blob);
+}
+
+static void
+spdk_lvol_convert_cb(void *cb_arg, int bserrno)
+{
+	struct spdk_lvol_req *req = cb_arg;
+	req->lvol->migration_flag = false;
+	req->cb_fn(req->cb_arg, bserrno);
+	free(req);
+	return;
+}
+
+void
+spdk_lvol_convert(struct spdk_lvol *origlvol, spdk_lvol_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_lvol_store *lvs = origlvol->lvol_store;
+	struct spdk_lvol_req *req;
+	bool update = false;
+	req = calloc(1, sizeof(*req));
+	if (!req) {
+		SPDK_ERRLOG("Cannot alloc memory for lvol request pointer\n");
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+	req->lvol = origlvol;
+
+	if (!lvs->leader) {
+		pthread_mutex_lock(&g_lvol_stores_mutex);
+		if (!origlvol->leader && !origlvol->update_in_progress) {
+			origlvol->update_in_progress = true;
+			origlvol->failed_on_update = false;
+			blob_freeze_on_failover(origlvol->blob);
+			update = true;
+		}
+		pthread_mutex_unlock(&g_lvol_stores_mutex);
+		// if we are not leader and update is not in progress, we need to update the blob
+		if (update) {
+			spdk_blob_update_on_failover(origlvol->blob, cb_fn, cb_arg);
+			return;
+		} else {
+			// otherwise just return success
+			if (origlvol->leader) {
+				cb_fn(cb_arg, 0);
+				free(req);
+				return;
+			}
+			SPDK_ERRLOG("Cannot update lvol %s while not leader and update in progress.\n", origlvol->name);
+			cb_fn(cb_arg, -EAGAIN);
+			free(req);
+			return;
+		}
+	} else {
+		spdk_bs_convert_blob(origlvol->blob, lvs->leader, lvs->update_in_progress, spdk_lvol_convert_cb, req);
+	}
+}
+
+void
+spdk_lvol_resize_register(struct spdk_lvol *lvol, uint64_t sz,
+		 spdk_lvol_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_blob *blob = lvol->blob;
+	struct spdk_lvol_store *lvs = lvol->lvol_store;
+
+	uint64_t new_clusters = spdk_divide_round_up(sz, spdk_bs_get_cluster_size(lvs->blobstore));
+
+	int bserrno = spdk_blob_resize_register(blob, new_clusters);
+	cb_fn(cb_arg,  bserrno);
+}
+
+int
+spdk_lvol_register_live(struct spdk_lvol_store *lvs, const char *name, const char *uuid_str, uint64_t blobid,
+		 bool thin_provision, enum lvol_clear_method clear_method, spdk_lvol_op_with_handle_complete cb_fn,
+		 void *cb_arg)
+{
+	struct spdk_lvol_with_handle_req *req;
+	struct spdk_lvol *lvol;
+	int rc;
+
+	if (lvs == NULL) {
+		SPDK_ERRLOG("lvol store does not exist\n");
+		return -EINVAL;
+	}
+
+	rc = lvs_verify_lvol_name(lvs, name);
+	if (rc < 0) {
+		return rc;
+	}
+
+	req = calloc(1, sizeof(*req));
+	if (!req) {
+		SPDK_ERRLOG("Cannot alloc memory for lvol request pointer\n");
+		return -ENOMEM;
+	}
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+
+	lvol = lvol_alloc(lvs, name, thin_provision, clear_method, uuid_str);
+	if (!lvol) {
+		free(req);
+		SPDK_ERRLOG("Cannot alloc memory for lvol base pointer\n");
+		return -ENOMEM;
+	}
+
+	req->lvol = lvol;
+	lvol_create_cb((void *)req, blobid, 0);	
+	return 0;	
+}
+
+static void
 lvol_set_read_only_cb(void *cb_arg, int lvolerrno)
 {
 	struct spdk_lvol_req *req = cb_arg;
@@ -1491,6 +2237,7 @@ static void
 lvol_rename_cb(void *cb_arg, int lvolerrno)
 {
 	struct spdk_lvol_req *req = cb_arg;
+	struct spdk_blob *blob = req->lvol->blob;
 
 	if (lvolerrno != 0) {
 		SPDK_ERRLOG("Lvol rename operation failed\n");
@@ -1498,6 +2245,7 @@ lvol_rename_cb(void *cb_arg, int lvolerrno)
 		snprintf(req->lvol->name, sizeof(req->lvol->name), "%s", req->name);
 	}
 
+	spdk_blob_set_md_ro(blob, req->md_ro);
 	req->cb_fn(req->cb_arg, lvolerrno);
 	free(req);
 }
@@ -1537,15 +2285,23 @@ spdk_lvol_rename(struct spdk_lvol *lvol, const char *new_name,
 	req->cb_arg = cb_arg;
 	req->lvol = lvol;
 	snprintf(req->name, sizeof(req->name), "%s", new_name);
+	req->md_ro = spdk_blob_get_md_ro(blob);
 
 	rc = spdk_blob_set_xattr(blob, "name", new_name, strlen(new_name) + 1);
 	if (rc < 0) {
+		spdk_blob_set_md_ro(blob, req->md_ro);
 		free(req);
 		cb_fn(cb_arg, rc);
 		return;
 	}
 
-	spdk_blob_sync_md(blob, lvol_rename_cb, req);
+	if (lvol->lvol_store->leader) {
+		spdk_blob_sync_md(blob, lvol_rename_cb, req);
+		return;
+	} else {
+		spdk_blob_set_clean(blob);
+		lvol_rename_cb(req, 0);
+	}
 }
 
 void
@@ -1570,9 +2326,164 @@ spdk_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_
 
 	if (lvol->ref_count != 0) {
 		SPDK_ERRLOG("Cannot destroy lvol %s because it is still open\n", lvol->unique_id);
+		lvol->deletion_failed = true;
 		cb_fn(cb_arg, -EBUSY);
 		return;
 	}
+
+	req = calloc(1, sizeof(*req));
+	if (!req) {
+		SPDK_ERRLOG("Cannot alloc memory for lvol request pointer\n");
+		lvol->deletion_failed = true;
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+	req->lvol = lvol;
+	bs = lvol->lvol_store->blobstore;
+
+	rc = spdk_blob_get_clones(lvs->blobstore, lvol->blob_id, &clone_id, &count);
+	if (rc == 0 && count == 1) {
+		req->clone_lvol = lvs_get_lvol_by_blob_id(lvs, clone_id);
+	} else if (rc == -ENOMEM) {
+		SPDK_INFOLOG(lvol, "lvol %s: cannot destroy: has %" PRIu64 " clones\n",
+			     lvol->unique_id, count);
+		free(req);
+		assert(count > 1);
+		lvol->deletion_failed = true;
+		cb_fn(cb_arg, -EBUSY);
+		return;
+	}
+
+	lvol->action_in_progress = true;
+	if (lvol->hublvol || strcmp("hublvol", lvol->name) == 0) {
+		lvol_delete_blob_cb(req , 0);
+		return;
+	}
+
+	if (lvol->lvol_store->leader) {
+		spdk_bs_delete_blob(bs, lvol->blob_id, lvol_delete_blob_cb, req);
+	} else {
+		SPDK_NOTICELOG("Deleting tmpblob 0x%" PRIx64 " on failover.\n", lvol->blob_id);
+		// TODO add check for snapshots and clons
+		pthread_mutex_lock(&g_lvol_stores_mutex);
+		spdk_bs_delete_blob_non_leader(bs, lvol->tmp_blob);
+		pthread_mutex_unlock(&g_lvol_stores_mutex);
+		lvol_delete_blob_cb(req , 0);
+	}
+}
+
+static void
+lvol_update_async_delete(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg)
+{
+	bool update = false;
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+	if (!lvol->leader && !lvol->update_in_progress) {
+		lvol->update_in_progress = true;
+		lvol->failed_on_update = false;
+		blob_freeze_on_failover(lvol->blob);
+		update = true;
+	}
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+	// if we are not leader and update is not in progress, we need to update the blob
+	if (update) {
+		spdk_blob_update_on_failover(lvol->blob, cb_fn, cb_arg);
+		return;
+	}
+	//TODO set poller the activite if the lvol update is in progress
+	SPDK_NOTICELOG("lvol %s is already updated, no need to update again.\n", lvol->unique_id);
+	// if we are leader or update is in progress
+	cb_fn(cb_arg, 0);
+}
+
+static void
+clone_lvol_update_delete_async_cpl(void *cb_arg, int lvolerrno)
+{
+	struct spdk_lvol_req *req = cb_arg;
+	struct spdk_lvol *clone_lvol = req->clone_lvol;
+	struct spdk_lvol *lvol = req->lvol;
+
+	if (lvolerrno < 0) {
+		SPDK_ERRLOG("Could not update clone lvol for async delete uuid %s name %s .\n", clone_lvol->unique_id, clone_lvol->name);
+		clone_lvol->failed_on_update = true;
+		req->cb_fn(req->cb_arg, ERR_UPDATE_FAILED);
+		free(req);
+		return;
+	}
+
+	SPDK_NOTICELOG("update clone lvol for async delete uuid %s name %s done.\n", clone_lvol->unique_id, clone_lvol->name);
+	if (!clone_lvol->leader) {
+		spdk_lvol_set_leader(clone_lvol);
+	}
+	spdk_lvol_destroy_async(lvol, req->cb_fn, req->cb_arg);
+	free(req);
+}
+
+static void
+origlvol_update_delete_async_cpl(void *cb_arg, int lvolerrno)
+{
+	struct spdk_lvol_req *req = cb_arg;
+	struct spdk_lvol *lvol = req->lvol;
+	struct spdk_lvol_store *lvs = lvol->lvol_store;
+	spdk_blob_id	clone_id;
+
+	if (lvolerrno < 0) {
+		SPDK_ERRLOG("Could not update origlvol for async delete uuid %s name %s .\n", lvol->unique_id, lvol->name);
+		lvol->failed_on_update = true;
+		req->cb_fn(req->cb_arg, ERR_UPDATE_FAILED);
+		free(req);
+		return;
+	}
+
+	SPDK_NOTICELOG("update origlvol for async delete uuid %s name %s done.\n", lvol->unique_id, lvol->name);
+
+	if (!lvol->leader) {
+		spdk_lvol_set_leader(lvol);
+	}
+	// check if we have a clone lvol
+	if (req->clone_lvol) {
+		if (!req->clone_lvol->leader) {
+			// we have a clone lvol, so we need to update it
+			SPDK_NOTICELOG("Updating clone lvol %s for lvol %s\n", req->clone_lvol->unique_id, lvol->unique_id);
+			lvol_update_async_delete(req->clone_lvol, clone_lvol_update_delete_async_cpl, req);
+			return;
+		}
+	} else {
+		clone_id = bs_get_xattr_removal(lvol->blob);
+		if (clone_id != SPDK_BLOBID_INVALID) {
+			SPDK_NOTICELOG("snapshot %s was in delete before - corrupted snapblob in primary mode - clone %" PRIu64 "\n", lvol->unique_id, clone_id);
+			req->clone_lvol = lvs_get_lvol_by_blob_id(lvs, clone_id);
+			if (req->clone_lvol && !req->clone_lvol->leader) {
+				lvol_update_async_delete(req->clone_lvol, clone_lvol_update_delete_async_cpl, req);
+				return;
+			}
+		}
+	}
+	spdk_lvol_destroy_async(lvol, req->cb_fn, req->cb_arg);
+	free(req);
+}
+
+void
+spdk_lvol_destroy_async(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_lvol_req *req;
+	struct spdk_blob_store *bs;
+	struct spdk_lvol_store	*lvs;
+	spdk_blob_id	clone_id;
+	size_t		count = 1;
+	int		rc;
+
+	assert(cb_fn != NULL);
+
+	if (lvol == NULL) {
+		SPDK_ERRLOG("lvol does not exist\n");
+		cb_fn(cb_arg, -ENODEV);
+		return;
+	}
+
+	lvs = lvol->lvol_store;
 
 	req = calloc(1, sizeof(*req));
 	if (!req) {
@@ -1598,9 +2509,72 @@ spdk_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_
 		return;
 	}
 
-	lvol->action_in_progress = true;
+	if (!lvs->leader) {
+		SPDK_ERRLOG("lvol %s: cannot destroy: due to leadership change\n", lvol->unique_id);
+		free(req);
+		cb_fn(cb_arg, ERR_LEADERSHIP_CHANGED);
+		return;
+	}
 
-	spdk_bs_delete_blob(bs, lvol->blob_id, lvol_delete_blob_cb, req);
+	if (lvol->leader) {
+		lvol->action_in_progress = true;
+		spdk_bs_delete_blob_async(bs, lvol->blob, lvol_delete_async_cb, req);
+		return;
+	}
+	lvol_update_async_delete(req->lvol, origlvol_update_delete_async_cpl, req);
+}
+
+static void
+lvolstore_cleanup_cb(void *cb_arg, int lvolerrno)
+{
+	struct spdk_lvs_req *req = cb_arg;
+	struct spdk_lvol_store *lvs = req->lvol_store;
+
+	if (lvolerrno < 0) {
+		SPDK_ERRLOG("Could not cleanup cluster for lvolstore name %s error %d.\n", lvs->name, lvolerrno);
+	} else {
+		SPDK_NOTICELOG("Lvolstore name %s cleanup clusters done.\n", lvs->name);
+	}
+
+	free(req);
+	return;
+}
+
+void
+spdk_lvolsotre_cleanup(struct spdk_lvol_store *lvs, spdk_lvs_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_blob_store *bs = lvs->blobstore;
+	struct spdk_lvs_req *req;
+
+	assert(cb_fn != NULL);
+
+	if (lvs == NULL) {
+		SPDK_ERRLOG("lvolstore does not exist\n");
+		cb_fn(cb_arg, -ENODEV);
+		return;
+	}
+
+	req = calloc(1, sizeof(*req));
+	if (req == NULL) {
+		SPDK_ERRLOG("Cannot alloc memory for request structure\n");
+		if (cb_fn) {
+			cb_fn(cb_arg, -ENOMEM);
+		}
+		return;
+	}
+
+	req->lvol_store = lvs;
+
+	if (!lvs->leader) {
+		SPDK_ERRLOG("lvolstore name %s: cannot destroy: due to leadership change.\n", lvs->name);
+		cb_fn(cb_arg, ERR_LEADERSHIP_CHANGED);
+		free(req);
+		return;
+	}
+
+	SPDK_NOTICELOG("Cleanup clusters for lvolstore name %s start.\n", lvs->name);
+	spdk_bs_cleanup(bs, lvolstore_cleanup_cb, req);
+	cb_fn(cb_arg, 0);
 }
 
 void
@@ -1765,6 +2739,232 @@ spdk_lvs_grow_live(struct spdk_lvol_store *lvs, spdk_lvs_op_complete cb_fn, void
 	req->lvol_store = lvs;
 
 	spdk_bs_grow_live(lvs->blobstore, lvs_grow_live_cb, req);
+}
+
+static void
+lvs_apply_cb(void *cb_arg, int lvolerrno)
+{
+	struct spdk_lvs_req *req = (struct spdk_lvs_req *)cb_arg;
+
+	if (req->cb_fn) {
+		req->cb_fn(req->cb_arg, lvolerrno);
+	}
+	free(req);
+	return;
+}
+
+void
+spdk_lvs_apply(struct spdk_lvol_store *lvs, spdk_lvs_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_lvs_req *req;
+
+	req = calloc(1, sizeof(*req));
+	if (req == NULL) {
+		SPDK_ERRLOG("Cannot alloc memory for request structure\n");
+		if (cb_fn) {
+			cb_fn(cb_arg, -ENOMEM);
+		}
+		return;
+	}
+
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+	req->lvol_store = lvs;
+	assert(lvs->leader == true);
+	if (!lvs->leader) {
+		SPDK_ERRLOG("lvolstore %s: cannot apply: due to  not in leadership state.\n", lvs->name);
+		cb_fn(cb_arg, ERR_LEADERSHIP_CHANGED);
+		free(req);
+		return;
+	}
+	spdk_bs_apply(lvs->blobstore, lvs_apply_cb, req);
+}
+
+static void
+lvs_update_live_cb(void *cb_arg, int lvolerrno)
+{
+	struct spdk_lvs_req *req = (struct spdk_lvs_req *)cb_arg;
+
+	if (req->cb_fn) {
+		req->cb_fn(req->cb_arg, lvolerrno);
+	}
+	free(req);
+	return;
+}
+
+void
+spdk_lvs_update_live(struct spdk_lvol_store *lvs, uint64_t id, spdk_lvs_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_lvs_req *req;
+
+	req = calloc(1, sizeof(*req));
+	if (req == NULL) {
+		SPDK_ERRLOG("Cannot alloc memory for request structure\n");
+		if (cb_fn) {
+			cb_fn(cb_arg, -ENOMEM);
+		}
+		return;
+	}
+
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+	req->lvol_store = lvs;
+	assert(lvs->leader == false);
+	spdk_bs_update_live(lvs->blobstore, false, id, lvs_update_live_cb, req);
+}
+
+static void
+lvol_update_on_failover_cpl(void *cb_arg, int lvolerrno)
+{
+	struct spdk_lvol_update_on_failover_req *req = cb_arg;
+	struct spdk_lvol *lvol = req->lvol;	
+	if (lvolerrno < 0) {
+		SPDK_ERRLOG("Cannot update lvol on failover blob 0x%" PRIx64 "\n", lvol->blob_id);
+		//remember call function to drop the IO for this lvol
+		//change the state to drop;
+		lvol->failed_on_update = true;
+		free(req);
+		return;		
+	}
+	spdk_lvol_set_leader(lvol);
+	SPDK_NOTICELOG("Update done: blob 0x%" PRIx64 "\n", lvol->blob_id);
+	
+	free(req);
+}
+
+static void
+lvol_update_failed_cpl(void *cb_arg, int lvolerrno)
+{
+	struct spdk_lvol *lvol = cb_arg;
+	spdk_lvol_set_leader_failed_on_update(lvol);
+	if (lvolerrno < 0) {
+		SPDK_ERRLOG("Cannot unfreeze on filed update on failover blob 0x%" PRIx64 "\n", lvol->blob_id);
+		return;
+	}
+	SPDK_NOTICELOG("Unfreezed on filed update on failover blob 0x%" PRIx64 "\n", lvol->blob_id);
+}
+
+void
+lvol_update_on_failover(struct spdk_lvol_store *lvs, struct spdk_lvol *lvol, bool send_msg)
+{
+
+	struct spdk_lvol_update_on_failover_req *req;
+
+	req = calloc(1, sizeof(*req));
+	if (req == NULL) {
+		SPDK_ERRLOG("Cannot alloc memory for request structure.\n");
+		// change the state to drop incoming IO;
+		// we should call the cleanup
+		lvol->failed_on_update = true;
+		return;
+	}
+
+	req->cb_arg = lvol;
+	req->lvol_store = lvs;
+	req->lvol = lvol;
+	SPDK_NOTICELOG("Update start: blob 0x%" PRIx64 "\n", lvol->blob_id);
+	if (!send_msg) {
+		spdk_blob_update_on_failover(lvol->blob, lvol_update_on_failover_cpl, req);
+	} else {
+		// we should send msg to spdk_blob_update_on_failover on md thread
+		spdk_blob_update_on_failover_send_msg(lvol->blob, lvol_update_on_failover_cpl, req);
+	}
+}
+
+static void
+lvs_update_on_failover_cpl(void *cb_arg, int lvolerrno)
+{
+	struct spdk_lvs_req *req = (struct spdk_lvs_req *)cb_arg;
+	struct spdk_lvol_store *lvs = req->lvol_store;
+	struct spdk_lvol *lvol, *tmp;
+	if (lvolerrno == 0) {
+		spdk_lvs_set_leader(lvs, true);
+		lvs->timeout_trigger = 0;
+		SPDK_NOTICELOG("Update lvolstore done.\n");	
+		free(req);
+		TAILQ_FOREACH_SAFE(lvol, &lvs->pending_update_lvols, entry_to_update, tmp) {
+			TAILQ_REMOVE(&lvs->pending_update_lvols, lvol, entry_to_update);
+			assert(lvol->update_in_progress == true);		
+			// still in md thread so we can call the load function
+			lvol_update_on_failover(lvs, lvol, false);
+		}
+		return;
+	}
+
+	SPDK_ERRLOG("Cannot update lvolstore on failover ...\n");
+	if (lvolerrno == -ENOTCONN || (lvolerrno != 0 && lvs->timeout_trigger == 1)) {
+    	SPDK_ERRLOG("Failed to update lvolstore during failover due to distrib-level functionality.\n");
+    	SPDK_ERRLOG("Forcing application shutdown via abort.\n");
+		// Ensure all log messages are flushed
+    	fflush(stderr);
+		abort();
+	}	
+	spdk_lvs_set_failed_on_update(lvs, true);
+	//remember call function to drop the IO for this lvol
+	TAILQ_FOREACH_SAFE(lvol, &lvs->pending_update_lvols, entry_to_update, tmp) {
+		TAILQ_REMOVE(&lvs->pending_update_lvols, lvol, entry_to_update);
+		assert(lvol->update_in_progress == true);
+		lvol->failed_on_update = true;
+		spdk_blob_update_failed_cleanup(lvol->blob, lvol_update_failed_cpl, lvol);		
+	}
+	free(req);
+	return;	
+}
+
+static int
+spdk_lvs_update_on_failover_poller(void *cb_arg)
+{
+	struct spdk_lvs_req *req = cb_arg;
+	spdk_poller_unregister(&req->poller);
+	SPDK_NOTICELOG("Update lvolstore starting.... read super block.\n");
+	spdk_bs_update_on_failover(req->lvol_store->blobstore, lvs_update_on_failover_cpl, req);
+	return -1;
+}
+
+
+void
+spdk_lvol_update_on_failover(struct spdk_lvol_store *lvs, struct spdk_lvol *lvol, bool send_md_thread)
+{
+	bool update = false;
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+
+	if (lvs->node_role != NODE_PRIMARY && !lvs->skip_redirecting && !lvs->leader) {
+		pthread_mutex_unlock(&g_lvol_stores_mutex);
+		return;
+	}
+
+	if (!lvol->update_in_progress) {
+		assert(lvol->leader == false);
+		lvol->update_in_progress = true;
+		if (lvs->retry_on_update > 3) {
+			SPDK_ERRLOG("Update lvolstore reached its limite.\n");
+			lvol->failed_on_update = true;
+			pthread_mutex_unlock(&g_lvol_stores_mutex);
+			return;
+		}
+
+		if (lvs->failed_on_update) {
+			lvol->failed_on_update = true;
+			lvol->update_in_progress = false;
+			pthread_mutex_unlock(&g_lvol_stores_mutex);
+			return;
+		} else {
+			lvol->failed_on_update = false;
+		}
+
+		blob_freeze_on_failover(lvol->blob);
+		if (lvs->leader) {
+			update = true;
+		} else {
+			assert(lvs->update_in_progress == true);
+			TAILQ_INSERT_TAIL(&lvs->pending_update_lvols, lvol, entry_to_update);
+			// add to queue to process after lvs get the leadership
+		}
+	}
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+	if (update) {
+		lvol_update_on_failover(lvs, lvol, send_md_thread);
+	}	
 }
 
 void
@@ -2206,6 +3406,3971 @@ spdk_lvol_get_by_uuid(const struct spdk_uuid *uuid)
 
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
 	return NULL;
+}
+
+bool
+spdk_lvs_nonleader_timeout(struct spdk_lvol_store *lvs)
+{
+	bool state = false;
+
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+
+	if (!lvs->leader) {
+		uint64_t timeout_ticks = spdk_get_ticks_hz() * 10;
+		uint64_t current_time = spdk_get_ticks();
+		if (current_time - lvs->leadership_timeout < timeout_ticks)	{
+			state = true;
+		} else {
+			lvs->timeout_trigger = 0;
+			spdk_bs_set_leader(lvs->blobstore, true);
+		}
+	}
+
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+	return state;
+}
+
+static void 
+block_port(int port) {
+    // Construct the iptables command dynamically based on the input port    
+	if (port != 0) {
+		if (spdk_nvmf_port_block(port, false)) {
+			SPDK_NOTICELOG("RDMA Port %d has been blocked successfully.\n", port);
+		} else {
+			SPDK_ERRLOG("RDMA Error blocking port %d.\n", port);
+		}
+	}
+}
+
+static void 
+add_reject_hublvol_port(int port) {
+    // Construct the iptables command dynamically based on the input port    
+	if (port != 0) {
+		if (spdk_nvmf_port_block(port, true)) {
+			SPDK_NOTICELOG("RDMA Port %d for hublvol has been rejected successfully.\n", port);
+		} else {
+			SPDK_ERRLOG("RDMA Error rejecting port %d.\n", port);
+		}
+	}
+}
+
+static void 
+remove_reject_hublvol_port(int port) {
+    // Construct the iptables command dynamically based on the input port    
+	if (port != 0) {
+		if (spdk_nvmf_port_unblock(port)) {
+			SPDK_NOTICELOG("RDMA Port %d has been removed successfully.\n", port);
+		} else {
+			SPDK_ERRLOG("RDMA Error removing port %d.\n", port);
+		}
+	}
+}
+
+void
+spdk_lvs_store_hublvol_channel(struct spdk_lvol_store *lvs, struct spdk_io_channel *channel)
+{
+    struct spdk_hublvol_channels *hublvol_ch;
+
+    pthread_mutex_lock(&g_lvol_stores_mutex);
+
+    TAILQ_FOREACH(hublvol_ch, &lvs->hublvol_channels, entry) {
+        if (hublvol_ch->ch == channel) {
+            pthread_mutex_unlock(&g_lvol_stores_mutex);
+            return;
+        }
+    }
+
+    hublvol_ch = calloc(1, sizeof(*hublvol_ch));
+    if (!hublvol_ch) {
+        SPDK_ERRLOG("Cannot allocate memory for hublvol_ch.\n");
+        pthread_mutex_unlock(&g_lvol_stores_mutex);
+        return;
+    }
+
+    hublvol_ch->ch = channel;
+    hublvol_ch->thread = spdk_get_thread();
+    TAILQ_INSERT_TAIL(&lvs->hublvol_channels, hublvol_ch, entry);
+
+    pthread_mutex_unlock(&g_lvol_stores_mutex);
+}
+
+bool
+spdk_lvs_queued_rsp(struct spdk_lvol_store *lvs, struct spdk_bdev_io *bdev_io)
+{
+	struct spdk_pending_iorsp *qrsp;
+	pthread_mutex_lock(&g_lvs_queue_mutex);
+	if (lvs->queue_failed_rsp) {
+		qrsp = calloc(1, sizeof(*qrsp));
+		if (!qrsp) {
+			SPDK_ERRLOG("Cannot allocate memory for qrsp.\n");
+			pthread_mutex_unlock(&g_lvs_queue_mutex);
+			return false;
+		}
+		qrsp->bdev_io = bdev_io;
+		qrsp->thread = spdk_get_thread();
+		TAILQ_INSERT_TAIL(&lvs->pending_iorsp, qrsp, entry);
+		pthread_mutex_unlock(&g_lvs_queue_mutex);
+		return true;
+	}
+	pthread_mutex_unlock(&g_lvs_queue_mutex);
+	return false;
+}
+
+static void
+lvol_op_comp_dequeue(void *cb_arg)
+{
+	struct spdk_bdev_io *bdev_io = cb_arg;
+	struct spdk_lvol *lvol = bdev_io->bdev->ctxt;
+	struct spdk_lvol_store *lvs = lvol->lvol_store;
+	uint64_t offset = bdev_io->u.bdev.offset_blocks;
+	if (lvol->hublvol) {
+		lvol = lvs->lvol_map.lvol[offset >> 48];
+	}
+
+	SPDK_NOTICELOG("Unfreeze failed IO blob: %" PRIu64 " LBA: %" PRIu64 " CNT %" PRIu64 " type %d \n",
+				lvol->blob_id, offset, bdev_io->u.bdev.num_blocks, bdev_io->type);
+
+	spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+}
+
+static void
+spdk_lvs_dequeu_rsp(struct spdk_lvol_store *lvs)
+{
+	struct spdk_pending_iorsp *qrsp, *tmp;
+	TAILQ_FOREACH_SAFE(qrsp, &lvs->pending_iorsp, entry, tmp) {
+		assert(qrsp != NULL);
+		TAILQ_REMOVE(&lvs->pending_iorsp, qrsp, entry); // Remove it from the queue.
+		spdk_thread_send_msg(qrsp->thread, lvol_op_comp_dequeue, qrsp->bdev_io);
+		free(qrsp);
+	}
+}
+
+static int
+spdk_lvs_remove_rules_poller(void *cb_arg)
+{
+	struct spdk_lvs_req *req = cb_arg;
+	struct spdk_lvol_store *lvs = req->lvol_store;
+	spdk_poller_unregister(&req->poller);
+	remove_reject_hublvol_port(lvs->hublvol_port);
+	free(req);
+	return -1;
+}
+
+static void
+spdk_lvs_unfreeze_on_conflict(struct spdk_lvol_store *lvs)
+{
+	struct spdk_lvol *lvol;
+	struct spdk_lvs_req *req;
+
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+	block_port(lvs->subsystem_port);
+
+	if (lvs->node_role != NODE_TERTIARY && lvs->hublvol_port != 0) {
+
+		if (lvs->on_failed_rsp) {
+			lvs->on_failed_rsp = false;
+			block_port(lvs->hublvol_port);
+		} else {
+			add_reject_hublvol_port(lvs->hublvol_port);
+		}
+
+		req = calloc(1, sizeof(*req));
+		if (req == NULL) {
+			SPDK_ERRLOG("Cannot alloc memory for request structure\n");		
+			// in this case we should not wait for the IO inflyight
+			remove_reject_hublvol_port(lvs->hublvol_port);
+		} else {
+			req->lvol_store = lvs;
+			req->poller = spdk_poller_register(spdk_lvs_remove_rules_poller, req, 10000000); // Delay of 10s
+		}
+	}
+
+	pthread_mutex_lock(&g_lvs_queue_mutex);
+	lvs->queue_failed_rsp = false;
+	pthread_mutex_unlock(&g_lvs_queue_mutex);
+
+	lvs->update_in_progress = false;
+	lvs->failed_on_update = false;
+	lvs->leadership_timeout = spdk_get_ticks();
+	lvs->timeout_trigger = 1;
+	lvs->leader = false;
+
+	spdk_bs_set_leader(lvs->blobstore, false);
+
+	TAILQ_FOREACH(lvol, &lvs->lvols, link) {
+		lvol->leader = false;
+		lvol->update_in_progress = false;
+	}
+
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+	spdk_lvs_dequeu_rsp(lvs);
+
+	SPDK_NOTICELOG("Starting unfreeze the lvols.\n");
+	spdk_lvs_unfreeze_on_conflict_msg(lvs->blobstore);
+}
+
+static int
+spdk_lvs_unfreeze_on_conflict_poller(void *cb_arg)
+{
+	struct spdk_lvs_req *req = cb_arg;
+	struct spdk_lvol_store *lvs = req->lvol_store;
+	spdk_poller_unregister(&req->poller);
+	spdk_lvs_unfreeze_on_conflict(lvs);
+	free(req);
+	return -1;
+}
+
+static void
+spdk_lvs_conflict_signal(void *arg, int errorno) {
+	struct spdk_lvol_store *lvs = arg;
+	struct spdk_lvs_req *req;
+
+	req = calloc(1, sizeof(*req));
+	if (req == NULL) {
+		SPDK_ERRLOG("Cannot alloc memory for request structure\n");		
+		// in this case we should not wait for the IO inflyight
+		spdk_lvs_unfreeze_on_conflict(lvs);
+		return;
+	}
+
+	req->cb_fn = NULL;
+	req->cb_arg = NULL;
+	req->lvol_store = lvs;
+	SPDK_NOTICELOG("Lvolstore on conflict set poller.\n");
+	req->poller = spdk_poller_register(spdk_lvs_unfreeze_on_conflict_poller, req, 50000); // Delay of 50ms
+}
+
+int
+spdk_lvs_change_leader_state(uint64_t groupid)
+{
+	struct spdk_lvol_store *lvs;
+	struct spdk_lvol *lvol;
+	struct spdk_lvs_req *req;
+	int rc = 0;
+	SPDK_NOTICELOG("Attempting to change leadership state internally groupid %" PRIu64 ".\n", groupid);
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+	/*
+	 * groupid == 0 is the network-outage path: the JC lost quorum and called
+	 * api_bdev_distrib_set_non_leader() with no jm_vuid (alg_journal.cpp
+	 * network-outage detection). In that case block ALL of this node's LVS
+	 * ports regardless of role/leadership -- leadership can move during the
+	 * outage (e.g. the primary goes offline while partitioned, so the
+	 * secondary becomes the new leader on recovery), so a follower's port
+	 * must be blocked too. For non-leaders the leadership-drop below is a
+	 * no-op; the freeze + block_port + hublvol-port reject still run, which
+	 * is the intended "same as leader" behaviour on outage. Non-zero groupid
+	 * (writer-conflict / targeted JC signal) stays leader-only, unchanged.
+	 */
+	TAILQ_FOREACH(lvs, &g_lvol_stores, link) {
+		if ((lvs->groupid == groupid || groupid == 0) && (lvs->leader || groupid == 0)) {
+			lvs->queue_failed_rsp = true;
+			if (spdk_blob_freeze_on_conflict_send_msg(lvs->blobstore,
+					spdk_lvs_conflict_signal, lvs)) {
+				block_port(lvs->subsystem_port);
+
+				if (lvs->node_role != NODE_TERTIARY && lvs->hublvol_port != 0) {
+					add_reject_hublvol_port(lvs->hublvol_port);
+					req = calloc(1, sizeof(*req));
+					if (req == NULL) {
+						SPDK_ERRLOG("Cannot alloc memory for request structure\n");		
+						// in this case we should not wait for the IO inflyight
+						remove_reject_hublvol_port(lvs->hublvol_port);
+					} else {
+						req->lvol_store = lvs;
+						req->poller = spdk_poller_register(spdk_lvs_remove_rules_poller, req, 10000000); // Delay of 10s
+					}
+				}
+
+				pthread_mutex_lock(&g_lvs_queue_mutex);
+				lvs->queue_failed_rsp = false;
+				pthread_mutex_unlock(&g_lvs_queue_mutex);
+
+				lvs->update_in_progress = false;
+				lvs->failed_on_update = false;
+				lvs->leadership_timeout = spdk_get_ticks();
+				lvs->timeout_trigger = 1;
+				lvs->leader = false;
+
+				spdk_bs_set_leader(lvs->blobstore, false);
+
+				TAILQ_FOREACH(lvol, &lvs->lvols, link) {
+					lvol->leader = false;
+					lvol->update_in_progress = false;
+				}
+
+				spdk_lvs_dequeu_rsp(lvs);
+			}
+			SPDK_NOTICELOG("Leadership state changed internally to false for lvs %s. Timeout has been set.\n", node_role_to_string(lvs->node_role));
+			rc = 1;
+		}
+	}
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+	return rc;
+}
+
+int
+spdk_lvs_queued_failed_IO(struct spdk_lvol_store *lvs)
+{
+	struct spdk_lvol *lvol;
+	struct spdk_lvs_req *req;
+	int rc = 0;
+	SPDK_NOTICELOG("Queued failed IO and change leadership state internally groupid %" PRIu64 ".\n", lvs->groupid);
+
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+
+	pthread_mutex_lock(&g_lvs_queue_mutex);
+
+	if (lvs->queue_failed_rsp || lvs->timeout_trigger == 1) {
+		pthread_mutex_unlock(&g_lvs_queue_mutex);
+		pthread_mutex_unlock(&g_lvol_stores_mutex);
+		return 0;
+	}
+
+	lvs->on_failed_rsp = true;
+	lvs->queue_failed_rsp = true;
+
+	pthread_mutex_unlock(&g_lvs_queue_mutex);
+
+	if (spdk_blob_freeze_on_conflict_send_msg(lvs->blobstore, spdk_lvs_conflict_signal, lvs)) {
+
+		block_port(lvs->subsystem_port);
+
+		if (lvs->node_role != NODE_TERTIARY && lvs->hublvol_port != 0) {
+
+			block_port(lvs->hublvol_port);
+
+			req = calloc(1, sizeof(*req));
+			if (req == NULL) {
+				SPDK_ERRLOG("Cannot alloc memory for request structure\n");
+				// in this case we should not wait for the IO inflyight
+				remove_reject_hublvol_port(lvs->hublvol_port);
+			} else {
+				req->lvol_store = lvs;
+				req->poller = spdk_poller_register(spdk_lvs_remove_rules_poller, req, 10000000); // Delay of 10s
+			}
+		}
+
+		pthread_mutex_lock(&g_lvs_queue_mutex);
+		lvs->queue_failed_rsp = false;
+		pthread_mutex_unlock(&g_lvs_queue_mutex);
+
+		lvs->update_in_progress = false;
+		lvs->failed_on_update = false;
+		lvs->leadership_timeout = spdk_get_ticks();
+		lvs->timeout_trigger = 1;
+		lvs->leader = false;
+
+		spdk_bs_set_leader(lvs->blobstore, false);
+
+		TAILQ_FOREACH(lvol, &lvs->lvols, link) {
+			lvol->leader = false;
+			lvol->update_in_progress = false;
+		}
+
+		spdk_lvs_dequeu_rsp(lvs);
+	}
+	SPDK_NOTICELOG("Queued failed IO and Leadership state changed internally to false for lvs %s. Timeout has been set.\n", node_role_to_string(lvs->node_role));
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+	return rc;
+}
+
+void
+spdk_abort_node(void)
+{
+    SPDK_ERRLOG("Failed to recover the state of remote bdevs due to distrib-level functionality.\n");
+    SPDK_ERRLOG("Forcing application shutdown via abort.\n");
+	// Ensure all log messages are flushed
+    fflush(stderr);
+	abort();
+	return;
+}
+
+bool
+spdk_lvs_trigger_leadership_switch(uint64_t *groupid)
+{
+	struct spdk_lvol_store *lvs;
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+		TAILQ_FOREACH(lvs, &g_lvol_stores, link) {
+			if (lvs->update_in_progress && !lvs->trigger_leader_sent) {
+				*groupid = lvs->groupid;
+				lvs->trigger_leader_sent = true;
+				SPDK_NOTICELOG("Leadership changed due to receive new IO. group id: %" PRIu64 ". \n", lvs->groupid);
+				pthread_mutex_unlock(&g_lvol_stores_mutex);
+				return true;
+			}
+
+			if (lvs->special_send_signal) {
+				*groupid = lvs->groupid;
+				lvs->special_send_signal = false;
+				SPDK_NOTICELOG("send special signal Leadership change from management. group id: %" PRIu64 ". \n", lvs->groupid);
+			}
+		}
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+	return false;
+}
+
+void
+spdk_lvs_set_signal_switch(struct spdk_lvol_store *lvs)
+{
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+		if (!lvs->update_in_progress && !lvs->leader) {
+			if (!lvs->special_send_signal) {
+				lvs->special_send_signal = true;
+				SPDK_NOTICELOG("set special signal Leadership change from management. group id: %" PRIu64 ". \n", lvs->groupid);
+			}
+		}
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+}
+
+int
+spdk_lvs_IO_redirect(void *cb_arg)
+{
+	struct spdk_lvol_store *lvs = cb_arg;
+	if (lvs->node_role != NODE_PRIMARY) {
+		uint64_t current = lvs->current_io > lvs->total_io ? lvs->current_io - lvs->total_io : lvs->total_io - lvs->current_io;
+		SPDK_NOTICELOG("IO redirect CNT %s: t[%" PRIu64 "] c[%" PRIu64 "] f[%" PRIu64 "] tc[%" PRIu64 "]\n",
+				lvs->node_role == NODE_SECONDARY ? "SECONDARY" : "TERTIARY", lvs->total_io, current, lvs->hub_dev.redirected_io_count, lvs->current_io_t);
+		lvs->total_io += current;
+	}
+	return 0;
+}
+
+int
+spdk_lvs_IO_hublvol(void *cb_arg)
+{
+	struct spdk_lvol_store *lvs = cb_arg;
+	if (lvs->node_role == NODE_PRIMARY) {
+		uint64_t current = lvs->current_io > lvs->total_io ? lvs->current_io - lvs->total_io : lvs->total_io - lvs->current_io;
+		SPDK_NOTICELOG("IO hublvol CNT: t[%" PRIu64 "] c[%" PRIu64 "] tc[%" PRIu64 "]\n",
+			 lvs->total_io, current, lvs->current_io_t);
+		lvs->total_io += current;
+	}
+	return 0;
+}
+
+static void
+spdk_delayed_close_hub_bdev(void *arg)
+{
+	struct spdk_lvol_store *lvs = arg;
+	struct spdk_hublvol_channels *hublvol_ch, *tmp;
+	if (lvs->hub_dev.desc) {
+		spdk_bdev_close(lvs->hub_dev.desc);
+		lvs->hub_dev.desc = NULL;
+	}
+
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+	TAILQ_FOREACH_SAFE(hublvol_ch, &lvs->hublvol_channels, entry, tmp) {
+		if (hublvol_ch) {
+			TAILQ_REMOVE(&lvs->hublvol_channels, hublvol_ch, entry);
+			free(hublvol_ch);
+		}
+	}
+	lvs->hub_dev.drain_in_action = false;
+	lvs->hub_dev.dev_in_remove = false;
+	pthread_mutex_unlock(&g_lvol_stores_mutex);	
+	spdk_lvs_open_hub_bdev(lvs);
+}
+
+static void
+spdk_trigger_failover_cpl(void *cb_arg, int bserrno) {
+	struct spdk_lvol_store *lvs = cb_arg;
+	spdk_delayed_close_hub_bdev(lvs);
+}
+
+static int
+spdk_wait_for_redirected_io_cleanup(void *arg)
+{
+	struct spdk_lvol_store *lvs = arg;
+    struct spdk_hublvol_channels *hub_ch_list = NULL;
+    struct spdk_hublvol_channels *hublvol_ch = NULL;
+	int len = 0;
+
+	if (__atomic_load_n(&lvs->hub_dev.redirected_io_count, __ATOMIC_SEQ_CST) == 0) {
+		SPDK_NOTICELOG("All redirected I/Os completed. Proceeding to cleanup.\n");
+		TAILQ_FOREACH(hublvol_ch, &lvs->hublvol_channels, entry) {
+			len++;
+		}
+
+		if (len > 0) {
+			hub_ch_list = calloc(len, sizeof(*hub_ch_list));
+			if (!hub_ch_list) {
+				SPDK_ERRLOG("Cannot allocate memory for hub_ch_list.\n");
+				return SPDK_POLLER_BUSY;
+			}
+		}
+
+		spdk_poller_unregister(&lvs->hub_dev.cleanup_poller);
+		lvs->hub_dev.cleanup_poller = NULL;
+		spdk_poller_unregister(&lvs->redirect_poller);
+		lvs->redirect_poller = NULL;
+
+		if (len == 0) {
+            /* Nothing to drain — call completion directly */
+			SPDK_NOTICELOG("hublvol channels: Nothing to drain — call completion directly.\n");
+            spdk_trigger_failover_cpl(lvs, 0);
+            return -1;
+        }
+
+		/* fill */
+		size_t idx = 0;
+		TAILQ_FOREACH(hublvol_ch, &lvs->hublvol_channels, entry) {
+			hub_ch_list[idx].ch = hublvol_ch->ch;
+			hub_ch_list[idx].thread = hublvol_ch->thread;
+			idx++;
+		}
+
+		spdk_bs_drain_channel_queued(lvs->blobstore, hub_ch_list, len, spdk_trigger_failover_cpl, lvs);
+		return -1;
+	}
+
+	SPDK_NOTICELOG("Waiting for %lu redirected I/Os to finish.\n",
+		__atomic_load_n(&lvs->hub_dev.redirected_io_count, __ATOMIC_SEQ_CST));
+
+	return SPDK_POLLER_BUSY;
+}
+
+static void
+spdk_trigger_failover_msg(void *arg)
+{
+	struct spdk_lvol_store *lvs = arg;
+	if (!lvs->hub_dev.cleanup_poller) {
+		lvs->hub_dev.cleanup_poller = spdk_poller_register(
+			spdk_wait_for_redirected_io_cleanup, lvs, 200000 );// check every 200ms
+	}
+}
+
+static void
+spdk_lvs_hub_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev,
+			     void *event_ctx)
+{
+	struct spdk_lvol_store *lvs = event_ctx;
+	switch (type) {
+	case SPDK_BDEV_EVENT_REMOVE:
+		SPDK_NOTICELOG("Receive remove event from callback. \n");
+		spdk_change_redirect_state(lvs, true);
+		break;
+	default:
+		SPDK_NOTICELOG("Unsupported bdev event: type %d\n", type);
+		break;
+	}
+}
+
+static void
+find_thread_fn(void *arg)
+{
+    struct spdk_lvol_store *lvs = arg;
+    struct spdk_thread *t = spdk_get_thread();
+    const char *name = spdk_thread_get_name(t);	
+	// SPDK_NOTICELOG("target thread name is: %s\n", name);
+    if (strncmp(name, "nvmf_tgt_poll_group_", 20) == 0) {
+		// Found the target thread, store it in the context
+		struct spdk_io_channel *channel = spdk_bdev_get_io_channel(lvs->hub_dev.desc);
+		if (channel) {
+			SPDK_NOTICELOG("Found target thread: %s channel %p\n", name, channel);
+			spdk_lvs_store_hublvol_channel(lvs, channel);
+		}
+    }
+}
+
+static void
+find_thread_complete(void *arg)
+{
+	return;
+}
+
+void
+spdk_lvs_open_hub_bdev(void *cb_arg) {
+	struct spdk_lvol_store *lvs = cb_arg;
+	int rc = 0;
+	if (lvs->node_role == NODE_PRIMARY) {
+		SPDK_ERRLOG("Lvolstore %s: is on the primary node and does not need hub bdev.\n", lvs->name);
+		return;
+	}
+
+	if (lvs->node_role != NODE_PRIMARY) {
+		pthread_mutex_lock(&g_lvol_stores_mutex);
+		if (lvs->hub_dev.state == HUBLVOL_CONNECTING_IN_PROCCESS ||
+		 	lvs->hub_dev.state == HUBLVOL_CONNECTED) {
+				pthread_mutex_unlock(&g_lvol_stores_mutex);
+				return;
+		}
+		SPDK_NOTICELOG("start to recreate the desc from hub dev.\n");
+		lvs->hub_dev.state = HUBLVOL_CONNECTING_IN_PROCCESS;
+		if (!lvs->redirect_poller) {
+			lvs->redirect_poller = spdk_poller_register(
+			spdk_lvs_IO_redirect, lvs, 1000000 );
+		}
+		pthread_mutex_unlock(&g_lvol_stores_mutex);
+ 		// connect to the remote_bdev
+		rc = spdk_bdev_open_ext(lvs->remote_bdev, true, spdk_lvs_hub_bdev_event_cb, lvs, &lvs->hub_dev.desc);
+		if (rc != 0) {
+			SPDK_ERRLOG("Lvolstore %s: hub bdev %s cannot be opened, error=%d\n",
+					lvs->name, lvs->remote_bdev, rc);
+			lvs->hub_dev.desc = NULL;
+			goto err;
+		}
+
+    	spdk_for_each_thread(find_thread_fn, lvs, find_thread_complete);
+
+		pthread_mutex_lock(&g_lvol_stores_mutex);
+		lvs->skip_redirecting = false;
+		lvs->hub_dev.state = HUBLVOL_CONNECTED;
+		pthread_mutex_unlock(&g_lvol_stores_mutex);	
+		return;
+ 	}
+err:
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+	lvs->skip_redirecting = true;
+	lvs->hub_dev.state = HUBLVOL_CONNECTED_FAILED;
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+}
+
+
+void
+spdk_change_redirect_state(struct spdk_lvol_store *lvs, bool disconnected) {
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+	if (!lvs->skip_redirecting && !lvs->hub_dev.drain_in_action) {
+		SPDK_NOTICELOG("process the failover op.\n");
+		lvs->skip_redirecting = true;
+		lvs->hub_dev.drain_in_action = true;
+	}
+
+	if (disconnected && lvs->hub_dev.state == HUBLVOL_CONNECTED) {
+		SPDK_NOTICELOG("change device connect state.\n");
+		lvs->hub_dev.state = HUBLVOL_NOT_CONNECTED;
+		lvs->hub_dev.dev_in_remove = true;
+	}
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+
+	if (lvs->hub_dev.dev_in_remove) {
+		spdk_thread_send_msg(lvs->hub_dev.thread, spdk_trigger_failover_msg, lvs);
+	}
+}
+
+void
+spdk_lvs_set_opts(struct spdk_lvol_store *lvs, uint64_t groupid, uint64_t port, uint64_t hublvol_port, char *role)
+{
+	SPDK_NOTICELOG("Set groupid %" PRIu64 " and port %" PRIu64 " to the lvolstore %s.\n", groupid, port, role);
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+	lvs->groupid = groupid;
+	lvs->subsystem_port = port;
+	lvs->hublvol_port = hublvol_port;
+	lvs->node_role = node_role_from_string(role);
+	spdk_bs_set_role(lvs->blobstore, lvs->node_role);
+
+	if (lvs->node_role == NODE_PRIMARY) {
+		if (!lvs->hublvol_poller) {
+			lvs->hublvol_poller = spdk_poller_register(
+			spdk_lvs_IO_hublvol, lvs, 1000000);
+		}
+	}
+
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+	return;
+}
+
+static int
+spdk_wait_for_pg_io_cleanup_poller(void *arg) {
+	struct remote_lvol_info *rmt_lvol = arg;
+	struct spdk_lvs_poll_group *lpg = rmt_lvol->group;
+	struct spdk_transfer_dev *tdev = rmt_lvol->tdev;
+
+	if (rmt_lvol->outstanding_io > 0) {
+		return SPDK_POLLER_BUSY;
+	}
+
+	SPDK_NOTICELOG("destroy channel lvol in poller: 3.\n");
+	spdk_poller_unregister(&rmt_lvol->cleanup_poller);
+	rmt_lvol->cleanup_poller = NULL;
+	spdk_put_io_channel(rmt_lvol->channel);
+	rmt_lvol->channel = NULL;
+	tdev->pg[lpg->id]--;
+	free(rmt_lvol);
+	return -1;
+}
+
+static void
+spdk_wait_for_pg_io_cleanup(void *arg) {
+	struct remote_lvol_info *rmt_lvol, *tmp;
+	struct spdk_transfer_dev *tdev = arg;
+	struct spdk_lvs_poll_group *lpg = NULL;
+	struct remote_dev_info *rdi, *tmp_tdev;
+	// SPDK_NOTICELOG("destroy lvol in poller: 1.\n");
+
+	TAILQ_FOREACH(lpg, &g_lvs_poll_groups, entry) {
+		if (lpg->thread != spdk_get_thread()) {
+			continue;
+		}
+		break;
+	}
+
+	if (!lpg) {
+		SPDK_ERRLOG("Cannot find the poll group for the current thread.\n");
+		return;
+	}
+
+	// remove base channel
+	TAILQ_FOREACH_SAFE(rdi, &lpg->ch_tdev, entry, tmp_tdev) {
+		if (rdi->tdev == tdev) {
+			spdk_put_io_channel(rdi->tdev_channel);
+			tdev->pg[lpg->id]--;
+			TAILQ_REMOVE(&lpg->ch_tdev, rdi, entry);
+			free(rdi);
+			break;
+		}
+	}
+
+	if (TAILQ_EMPTY(&lpg->rmt_lvols)) {
+		// should not happens
+		if (tdev->pg[lpg->id] > 0) {
+			SPDK_ERRLOG("should not happens on remvoe event have reference to channel %s for pg %s.\n", tdev->bdev_name, lpg->thread_name);
+			tdev->pg[lpg->id] = 0;
+		}
+		return;
+	}
+
+	TAILQ_FOREACH_SAFE(rmt_lvol , &lpg->rmt_lvols, entry, tmp) {
+		if (rmt_lvol->tdev != tdev) {
+			continue;
+		}
+
+		rmt_lvol->status = false;
+		if (rmt_lvol->outstanding_io > 0) {
+			SPDK_NOTICELOG("Waiting for %lu I/Os to finish for pg %s.\n", rmt_lvol->outstanding_io, lpg->thread_name);
+			TAILQ_REMOVE(&lpg->rmt_lvols, rmt_lvol, entry);
+			if (rmt_lvol->abort_inflight_poller) {
+				continue;
+			}
+			rmt_lvol->cleanup_poller = spdk_poller_register(
+				spdk_wait_for_pg_io_cleanup_poller, rmt_lvol, 200000);// check every 200ms			
+		} else {
+			// SPDK_NOTICELOG("destroy channel lvol in poller: 2.\n");
+			// dont remove the rmt lvol from the list here, just set the status to false, and it will be removed when the task is destroyed
+			spdk_put_io_channel(rmt_lvol->channel);
+			rmt_lvol->channel = NULL;
+			tdev->pg[lpg->id]--;
+		}
+	}
+}
+
+static void
+spdk_wait_for_tdev_cleanup_cpl(void *arg)
+{
+	struct spdk_transfer_dev *tdev = arg;
+	struct spdk_lvol_store *lvs = tdev->lvs;	
+	SPDK_NOTICELOG("destroy desc lvol in poller.\n");	
+	TAILQ_REMOVE(&lvs->transfer_devs, tdev, entry);
+	spdk_bdev_close(tdev->desc);
+	free(tdev);
+}
+
+static void
+spdk_tdev_drain_remaining_channels(void *cb_arg) {
+	struct spdk_transfer_dev *tdev = cb_arg;
+	struct spdk_hublvol_channels *hub_channel = tdev->current_channel;	
+	int safety = 0;
+	while (spdk_io_channel_get_ref_count(hub_channel->ch) > 1) {
+		// SPDK_NOTICELOG("5 Hublvol channel %p ref count %d.\n", ctx->channel, spdk_io_channel_get_ref_count(ctx->channel));
+		spdk_put_io_channel(hub_channel->ch);
+		if (++safety > 1024) {
+			SPDK_WARNLOG("Too many spdk_put_io_channel iterations for ch %p, breaking.\n", hub_channel->ch);
+			break;
+		}
+	}
+	spdk_put_io_channel(hub_channel->ch);
+	free(hub_channel);
+	tdev->current_channel = NULL;
+	if (TAILQ_EMPTY(&tdev->redirect_channels)) {
+		spdk_thread_send_msg(tdev->thread, spdk_wait_for_tdev_cleanup_cpl, tdev);
+		return;
+	}
+
+	hub_channel = TAILQ_FIRST(&tdev->redirect_channels);
+	tdev->current_channel = hub_channel;
+	TAILQ_REMOVE(&tdev->redirect_channels, hub_channel, entry);
+	spdk_thread_send_msg(hub_channel->thread, spdk_tdev_drain_remaining_channels, tdev);
+}
+
+static int
+spdk_wait_tdev_redirect_io_cleanup(void *arg) {
+	struct spdk_transfer_dev *tdev = arg;
+	struct spdk_hublvol_channels *hub_channel;
+
+	if (__atomic_load_n(&tdev->redirected_io_count, __ATOMIC_SEQ_CST) == 0) {
+		SPDK_NOTICELOG("All redirected I/Os migration completed. Proceeding to cleanup.\n");
+		hub_channel = TAILQ_FIRST(&tdev->redirect_channels);
+		tdev->current_channel = hub_channel;
+		TAILQ_REMOVE(&tdev->redirect_channels, hub_channel, entry);
+		spdk_thread_send_msg(hub_channel->thread, spdk_tdev_drain_remaining_channels, tdev);
+		spdk_poller_unregister(&tdev->cleanup_poller);
+		tdev->cleanup_poller = NULL;
+		return -1;
+	}
+
+	SPDK_NOTICELOG("Waiting for %lu redirected I/Os migration to finish.\n",
+		__atomic_load_n(&tdev->redirected_io_count, __ATOMIC_SEQ_CST));
+	return SPDK_POLLER_BUSY;
+}
+
+static int
+spdk_wait_for_tdev_io_cleanup(void *arg)
+{
+	struct spdk_transfer_dev *tdev = arg;
+	struct spdk_lvol_store *lvs = tdev->lvs;
+	// SPDK_NOTICELOG("destroy lvol in md thread: 5.\n");
+	for (uint32_t i = 0; i < g_lvs_num_pgs; i++) {
+		if(tdev->pg[i]) {
+			return SPDK_POLLER_BUSY;
+		}
+	}
+
+	spdk_poller_unregister(&tdev->cleanup_poller);
+	tdev->cleanup_poller = NULL;
+	if (!TAILQ_EMPTY(&tdev->redirect_channels)) {
+		tdev->cleanup_poller = spdk_poller_register(
+				spdk_wait_tdev_redirect_io_cleanup, tdev, 200000);// check every 200ms
+		return -1;
+	}
+	SPDK_NOTICELOG("destroy desc lvol in poller.\n");	
+	TAILQ_REMOVE(&lvs->transfer_devs, tdev, entry);
+	spdk_bdev_close(tdev->desc);
+	free(tdev);
+	return -1;
+}
+
+static void
+spdk_change_rmt_lvol_state(struct spdk_lvol_store *lvs, struct spdk_transfer_dev *tdev) {
+	struct spdk_lvs_poll_group *lpg;
+
+	if (!tdev->drain_in_action) {
+		tdev->drain_in_action = true;
+	}
+
+	tdev->state = HUBLVOL_NOT_CONNECTED;
+	tdev->dev_in_remove = true;
+
+	if (!tdev->cleanup_poller) {
+		TAILQ_FOREACH(lpg, &g_lvs_poll_groups, entry) {
+			spdk_thread_send_msg(lpg->thread, spdk_wait_for_pg_io_cleanup, tdev);
+		}
+		tdev->cleanup_poller = spdk_poller_register(
+			spdk_wait_for_tdev_io_cleanup, tdev, 200000);// check every 200ms
+	}
+}
+
+static void
+set_req_status_and_queued(struct spdk_lvs_xfer_req *req, enum xfer_req_status status)
+{
+	struct remote_lvol_info *rmt = req->rmt_lvol;
+
+	if (rmt->outstanding_io == 0) {
+		SPDK_ERRLOG("outstanding_io underflow\n");
+		assert(false);
+	} else {
+		rmt->outstanding_io--;
+	}
+
+	req->status = status;
+	if (spdk_ring_enqueue(rmt->free_ring, (void **)&req, 1, NULL) != 1) {
+		SPDK_ERRLOG("free_ring full while handling write submit failure\n");
+		assert(false);
+	}
+}
+
+static void
+complete_op_cb(struct spdk_bdev_io *bdev_io, bool success, void *arg)
+{
+	struct spdk_lvs_xfer_req *req = arg;
+	struct remote_lvol_info *rmt_lvol = req->rmt_lvol;
+
+	if (!success) {
+		SPDK_ERRLOG("Remote write I/O failed at offset: %" PRIu64 " len: %" PRIu64 "\n",
+				req->offset, req->len);
+		// we should destory the channel here we should check the cnt;
+		rmt_lvol->status = false;
+
+	}
+
+	/* complete local IO */
+	req->status = success ? XFER_REQ_STATUS_DONE : XFER_REQ_STATUS_FAILED;
+
+	if (!rmt_lvol->status) {
+		req->status = XFER_REQ_STATUS_FAILED;
+	}
+
+    spdk_bdev_free_io(bdev_io);
+
+	/* recycle task */
+	// SPDK_NOTICELOG("2- Remote write I/O offset: %" PRIu64 " action: %" PRIu64 "\n", req->offset, req->action);
+	set_req_status_and_queued(req, req->status);
+}
+
+static int submit_rw_reqs_remote(struct spdk_lvs_xfer_req *req);
+static int submit_rw_reqs_local(struct spdk_lvs_xfer_req *req);
+
+static void
+remote_op_comp(struct spdk_bdev_io *bdev_io, bool success, void *arg)
+{
+	struct spdk_lvs_xfer_req *req = arg;
+
+	spdk_bdev_free_io(bdev_io);
+
+	if (!success) {
+		SPDK_ERRLOG("Remote read I/O failed at offset: %" PRIu64 " len: %" PRIu64 "\n",
+				req->offset, req->len);
+		set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
+		return;
+	}
+
+	assert(req->action == REQ_ACTION_COPY_RECOVER);
+	submit_rw_reqs_local(req);
+
+}
+
+static void
+fragment_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct spdk_lvs_xfer_req *req = cb_arg;
+
+	if (!success) {
+		/* set aggregated status once (first error) */
+		SPDK_ERRLOG("Remote write I/O offset: %" PRIu64 " len: %" PRIu64 " frag: %d failed.\n", req->offset, req->len, req->fragments_outstanding);
+		req->aggregated_status = -EIO;
+	}
+
+	spdk_bdev_free_io(bdev_io);
+
+	/* decrement outstanding fragments */
+	req->fragments_outstanding--;
+	// SPDK_NOTICELOG("2- Remote write I/O offset: %" PRIu64 " len: %" PRIu64 " frag: %d t %p\n", req->offset, req->len, req->fragments_outstanding, spdk_get_thread());
+
+	/* if this was the last fragment, do final work and recycle req */
+	if (req->fragments_outstanding == 0) {
+		SPDK_NOTICELOG("3- Remote write I/O src: %" PRIu64 ", dst: %" PRIu64 " len: %" PRIu64 " frag: %d t %p\n", req->offset, req->dst_offset, req->len, req->fragments_outstanding, spdk_get_thread());
+		/* final aggregated status */
+		int st = req->aggregated_status;
+		if (st != 0) {
+			req->status = XFER_REQ_STATUS_FAILED;
+		} else {
+			req->status = XFER_REQ_STATUS_DONE;
+		}
+
+		set_req_status_and_queued(req,  req->status);
+	}
+}
+
+static int
+submit_req_fragments(struct spdk_lvs_xfer_req *req, struct remote_lvol_info *rmt)
+{
+	struct spdk_bdev_desc *desc = rmt->desc;
+	struct spdk_io_channel *ch = rmt->channel;
+	uint32_t blocklen = spdk_bdev_get_block_size(spdk_bdev_desc_get_bdev(desc));
+	uint64_t max_bytes = 16 * 0x1000;
+	uint32_t max_blocks = max_bytes / blocklen;
+	if (max_blocks == 0) {
+		max_blocks = 1;
+	}
+
+	uint32_t remaining = req->len;
+	uint64_t lba = req->dst_offset;
+	uint8_t *payload = (uint8_t *)req->payload;
+	req->fragments_outstanding = 0;
+	req->aggregated_status = 0;
+
+	while (remaining > 0) {
+		uint32_t frag_blocks = (remaining > max_blocks) ? max_blocks : remaining;
+		uint8_t *frag_payload = payload + ( (req->len - remaining) * blocklen );
+
+		/* increment fragments counter before submit */
+		req->fragments_outstanding++;
+		// SPDK_NOTICELOG("1- Remote write I/O offset: %" PRIu64 " len: %" PRIu64 " frag: %d t %p\n", req->offset, req->len, req->fragments_outstanding, spdk_get_thread());
+		int rc = spdk_bdev_write_blocks(desc, ch, frag_payload, lba, frag_blocks,
+										fragment_write_cb, req);
+		if (rc != 0) {
+			/* synchronous failure - decrement fragments counter and record error */
+			req->fragments_outstanding--;
+			req->aggregated_status = -EIO;
+			/* handle rc: may want to abort remaining fragments -> but we'll
+			 * record failure and let outstanding fragments finish or cancel */
+			SPDK_ERRLOG("sync write submit failed rc=%d lba=%"PRIu64" blocks=%u\n", rc, lba, frag_blocks);
+			return rc;
+		}
+
+		/* advance */
+		remaining -= frag_blocks;
+		lba += frag_blocks;
+	}
+
+	return 0;
+}
+
+static int
+submit_rw_reqs_remote(struct spdk_lvs_xfer_req *req)
+{
+	struct remote_lvol_info *rmt = req->rmt_lvol;
+	struct spdk_io_channel *_ch = rmt->channel;
+	int rc = 0, rc_local = 0;
+
+	switch (req->action)
+	{
+		case REQ_ACTION_COPY_BACKUP:
+			// read from local and write to remote
+			if (req->xfer->type == XFER_REPLICATE_SNAPSHOT) {
+				rc = submit_req_fragments(req, req->rmt_lvol);
+				if (rc != 0) {
+					/* synchronous failure: decrement outstanding and recycle req */
+					if (req->fragments_outstanding == 0) {
+						set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
+					}
+				}
+			} else {
+				rc = spdk_bdev_write_blocks(rmt->desc, _ch, req->payload, 
+										req->dst_offset, req->len, complete_op_cb, req);
+				if (rc != 0) {
+					/* synchronous failure: decrement outstanding and recycle req */
+					set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
+				}
+			}
+			break;
+		case REQ_ACTION_COPY_RECOVER:
+			rc = spdk_bdev_read_blocks(rmt->desc, _ch, req->payload, 
+									req->dst_offset, req->len, remote_op_comp, req);
+			if (rc != 0) {
+				/* synchronous failure: decrement outstanding and recycle req */
+				set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
+			}
+			break;
+		default:
+			rc_local = -EINVAL;
+			break;
+	}
+	return rc_local;
+}
+
+static void
+local_op_comp(void *cb_arg, int bserrno)
+{
+	struct spdk_lvs_xfer_req *req = cb_arg;
+
+	if (bserrno != 0) {		
+		SPDK_ERRLOG("Local I/O failed at offset: %" PRIu64 " len: %" PRIu64 "\n",
+				req->offset, req->len);
+		set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
+		return;
+	}
+
+	switch (req->action)
+	{
+		case REQ_ACTION_COPY_BACKUP:
+			// read from local and write to remote
+			submit_rw_reqs_remote(req);
+			break;
+		case REQ_ACTION_COPY_RECOVER:
+			// read from remote and write to local
+			set_req_status_and_queued(req, XFER_REQ_STATUS_DONE);
+			break;
+		default:
+			SPDK_ERRLOG("Local I/O failed at offset: %" PRIu64 " len: %" PRIu64 " due to invalid action\n",
+				req->offset, req->len);
+			set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
+			break;
+	}
+
+}
+
+static void
+fragment_read_cb(void *cb_arg, int bserrno)
+{
+	struct spdk_lvs_xfer_req *req = cb_arg;
+
+	if (bserrno != 0) {
+		SPDK_ERRLOG("Local read fragment failed at offset: %" PRIu64 " len: %" PRIu64 " frag: %d\n",
+				req->offset, req->len, req->fragments_outstanding);
+		req->aggregated_status = -EIO;
+	}
+
+	req->fragments_outstanding--;
+
+	if (req->fragments_outstanding == 0) {
+		if (req->aggregated_status != 0) {
+			set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
+			return;
+		}
+		/* whole payload filled: continue exactly where the monolithic
+		 * read's completion used to go */
+		local_op_comp(req, 0);
+	}
+}
+
+static int
+submit_read_fragments(struct spdk_lvs_xfer_req *req)
+{
+	struct spdk_lvs_xfer *xfer = req->xfer;
+	struct spdk_io_channel *md_ch = req->rmt_lvol->md_channel;
+	uint64_t max_bytes = 16 * 0x1000;	/* same 64 KiB unit as the write fragments */
+	uint64_t frag_pages = max_bytes / xfer->page_size;
+	uint64_t remaining, offset;
+	uint8_t *payload = (uint8_t *)req->payload;
+
+	if (frag_pages == 0) {
+		frag_pages = 1;
+	}
+
+	/* Fill the payload with PARALLEL 64 KiB reads instead of one monolithic
+	 * cluster-sized read: a single 2 MiB spdk_blob_io_read serialized the whole
+	 * read phase per cluster, so read latency added linearly to every cluster
+	 * even when the window held plenty of them. Pre-count the fragments so an
+	 * early completion cannot observe outstanding==0 mid-submission. */
+	req->aggregated_status = 0;
+	req->fragments_outstanding = (int)((req->len + frag_pages - 1) / frag_pages);
+
+	remaining = req->len;
+	offset = req->offset;
+	while (remaining > 0) {
+		uint64_t n = (remaining > frag_pages) ? frag_pages : remaining;
+
+		spdk_blob_io_read(xfer->lvol->blob, md_ch,
+				  payload + ((req->len - remaining) * xfer->page_size),
+				  offset, n, fragment_read_cb, req);
+		offset += n;
+		remaining -= n;
+	}
+	return 0;
+}
+
+static int
+submit_rw_reqs_local(struct spdk_lvs_xfer_req *req)
+{
+	struct remote_lvol_info *rmt = req->rmt_lvol;
+	struct spdk_io_channel *md_ch = rmt->md_channel;
+	struct spdk_lvs_xfer *xfer = req->xfer;
+	int rc = 0;
+	switch (req->action)
+	{
+		case REQ_ACTION_COPY_BACKUP:
+			// read from local (fragmented, parallel) and write to remote
+			return submit_read_fragments(req);
+		case REQ_ACTION_COPY_RECOVER:
+			// read from remote and write to local
+			spdk_blob_io_write(xfer->lvol->blob, md_ch, req->payload, req->offset,
+								req->len, local_op_comp, req);
+			break;
+		default:
+			rc = -EINVAL;
+			break;
+	}
+	return rc;
+}
+
+static int
+helper_xfer_poller(void *arg)
+{
+	struct spdk_lvs_poll_group *lpg = arg;
+	struct remote_lvol_info *rmt_lvol;
+	struct spdk_lvs_xfer_req *req;
+	int rc, count = 0;
+	TAILQ_FOREACH(rmt_lvol, &lpg->rmt_lvols, entry) {
+		/* Drain the ring, do not take ONE request per 200us tick: with the
+		 * dispatcher now filling the whole window per tick, a single-dequeue
+		 * here would re-serialize everything it batched. The ring is bounded
+		 * by cluster_batch, so a full drain is a bounded amount of work. */
+		while (spdk_ring_dequeue(rmt_lvol->ready_ring, (void **)&req, 1) != 0) {
+		rc = 0;
+
+		count++;
+		rmt_lvol->outstanding_io++;
+		req->rmt_lvol = rmt_lvol;
+		req->status = XFER_REQ_STATUS_IN_FLIGHT;
+
+		if (rmt_lvol->desc == NULL || rmt_lvol->channel == NULL || !rmt_lvol->status) {
+			set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
+			continue;
+		}
+
+		switch (rmt_lvol->type) {
+			case XFER_MIGRATE_SNAPSHOT:
+				rc = spdk_bdev_write_blocks(rmt_lvol->desc, rmt_lvol->channel, req->payload,
+					 						req->dst_offset, req->len, complete_op_cb, req);
+				if (rc != 0) {
+					/* synchronous failure: decrement outstanding and recycle req */
+					set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
+				}
+				break;				
+			case XFER_REPLICATE_SNAPSHOT:
+				//TODO read and write with the helper core 
+				// SPDK_NOTICELOG("1- Remote write I/O offset: %" PRIu64 " len: %" PRIu64 "\n", req->offset, req->len);
+				rc = submit_rw_reqs_local(req);
+				if (rc != 0) {
+					/* synchronous failure: decrement outstanding and recycle req */
+					set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
+				}
+				break;
+			case XFER_S3_BACKUP:
+			case XFER_S3_MERGE:
+			case XFER_S3_RECOVER:
+				switch (req->action) {
+					case REQ_ACTION_READ:
+						rc = spdk_bdev_read_blocks(rmt_lvol->desc, rmt_lvol->channel,
+											req->payload, req->dst_offset, req->len, complete_op_cb, req);
+						break;
+					case REQ_ACTION_WRITE:					
+						rc = spdk_bdev_write_blocks(rmt_lvol->desc, rmt_lvol->channel,
+											req->payload, req->dst_offset, req->len, complete_op_cb, req);
+						break;
+					case REQ_ACTION_SWAP:
+						rc = spdk_bdev_copy_blocks(rmt_lvol->desc, rmt_lvol->channel,
+										   req->dst_offset, req->offset, req->len, complete_op_cb, req);
+						break;
+					case REQ_ACTION_UNMAP:
+						rc = spdk_bdev_unmap_blocks(rmt_lvol->desc, rmt_lvol->channel,
+											req->dst_offset, req->len, complete_op_cb, req);
+						break;
+					case REQ_ACTION_COPY_BACKUP:
+						rc = submit_rw_reqs_local(req);
+						break;
+					case REQ_ACTION_COPY_RECOVER:
+						rc = submit_rw_reqs_remote(req);
+						break;
+					default:
+						rc = -EINVAL;
+						break;
+				}
+
+				if (rc != 0) {
+					/* synchronous failure: decrement outstanding and recycle req */
+					set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
+				}
+				break;
+			default:
+				SPDK_ERRLOG("Unknown transfer type %d\n", rmt_lvol->type);
+				set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
+				break;
+		}
+		}
+	}
+    return count ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
+}
+
+enum freeze_io_result
+spdk_lvol_freeze_io(struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io, spdk_lvol_op_migrate_complete cb_fn)
+{
+	struct spdk_migrate_io *migrate_io;
+	migrate_io = calloc(1, sizeof(*migrate_io));
+	if (migrate_io == NULL) {
+		SPDK_ERRLOG("Cannot allocate memory for migrate_io.\n");
+		return FREEZE_IO_NOMEM;
+	}
+
+	migrate_io->bdev_io = bdev_io;
+	migrate_io->thread = spdk_get_thread();
+	migrate_io->ch = ch;
+	migrate_io->cb_fn = cb_fn;
+
+	pthread_mutex_lock(&g_lvs_queue_mutex);
+	if (!lvol->freezed) {
+		pthread_mutex_unlock(&g_lvs_queue_mutex);
+		free(migrate_io);
+		return FREEZE_IO_NOT_FROZEN;
+	}
+
+	TAILQ_INSERT_TAIL(&lvol->redirect_migrate_io, migrate_io, entry);
+	pthread_mutex_unlock(&g_lvs_queue_mutex);
+	return FREEZE_IO_QUEUED;
+}
+
+void
+spdk_tdev_store_hublvol_channel(struct spdk_transfer_dev *tdev, struct spdk_io_channel *channel)
+{
+	struct spdk_hublvol_channels *hublvol_ch;
+
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+
+	TAILQ_FOREACH(hublvol_ch, &tdev->redirect_channels, entry) {
+		if (hublvol_ch->ch == channel) {
+			pthread_mutex_unlock(&g_lvol_stores_mutex);
+			return;
+		}
+	}
+
+	hublvol_ch = calloc(1, sizeof(*hublvol_ch));
+	if (!hublvol_ch) {
+		SPDK_ERRLOG("Cannot allocate memory for hublvol_ch.\n");
+		pthread_mutex_unlock(&g_lvol_stores_mutex);
+		return;
+	}
+
+	hublvol_ch->ch = channel;
+	hublvol_ch->thread = spdk_get_thread();
+	TAILQ_INSERT_TAIL(&tdev->redirect_channels, hublvol_ch, entry);
+
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+}
+
+struct spdk_io_channel *
+spdk_tdev_get_hub_channel(struct spdk_transfer_dev *tdev, struct spdk_thread *thread) {
+	struct spdk_hublvol_channels *hublvol_ch;    
+
+	TAILQ_FOREACH(hublvol_ch, &tdev->redirect_channels, entry) {
+		if (hublvol_ch->thread == thread) {
+			return hublvol_ch->ch;
+		}
+	}
+	return NULL;
+}
+
+static void
+spdk_migration_open_channel_on_threads(void *arg)
+{
+	struct spdk_lvol *lvol = arg;
+	struct spdk_transfer_dev *tdev = lvol->tdev;
+	struct spdk_thread *t = spdk_get_thread();
+	const char *name = spdk_thread_get_name(t);	
+	// SPDK_NOTICELOG("target thread name is: %s\n", name);
+	if (strncmp(name, "nvmf_tgt_poll_group_", 20) == 0) {
+		// Found the target thread, store it in the context
+		struct spdk_io_channel *channel = spdk_bdev_get_io_channel(tdev->desc);
+		if (channel) {
+			SPDK_NOTICELOG("Found target thread: %s channel %p\n", name, channel);
+			spdk_tdev_store_hublvol_channel(tdev, channel);
+		}
+	}
+}
+
+void
+spdk_lvol_rediret_io_change_state(struct spdk_lvol *lvol)
+{	
+	pthread_mutex_lock(&g_lvs_queue_mutex);
+	lvol->redirect_failed = true;	
+	pthread_mutex_unlock(&g_lvs_queue_mutex);
+}
+
+static void
+spdk_lvol_unfreeze_io(void *arg)
+{
+	struct spdk_lvol *lvol = arg;
+	pthread_mutex_lock(&g_lvs_queue_mutex);
+	lvol->freezed = false;
+	pthread_mutex_unlock(&g_lvs_queue_mutex);
+	struct spdk_migrate_io *migrate_io, *tmp;
+	TAILQ_FOREACH_SAFE(migrate_io, &lvol->redirect_migrate_io, entry, tmp) {
+		assert(migrate_io != NULL);
+		TAILQ_REMOVE(&lvol->redirect_migrate_io, migrate_io, entry); // Remove it from the queue.
+		spdk_thread_send_msg(migrate_io->thread, migrate_io->cb_fn, migrate_io);
+	}
+	return;
+}
+
+static void
+spdk_xfer_sync_mode(struct spdk_lvs_xfer *xfer)
+{
+	struct spdk_lvol *lvol = xfer->lvol;
+	int rc = 0;
+	if (lvol->transfer_status == XFER_DONE) {
+		lvol->redirect_io = true;
+		spdk_for_each_thread(spdk_migration_open_channel_on_threads, lvol, spdk_lvol_unfreeze_io);
+	} else {
+		lvol->redirect_io = false;
+		spdk_lvol_unfreeze_io(lvol);
+		rc = -1;
+	}
+	
+	if (xfer->num_sub_tasks > 0 && xfer->list_task[0] != xfer) {
+		return;
+	}
+
+	xfer->cb_fn(xfer->cb_arg, lvol, rc);
+	return;
+}
+
+static void
+read_complete_cb(void *arg, int rc)
+{
+    struct spdk_lvs_xfer_req *req = arg;
+    struct spdk_lvs_xfer *xfer = req->xfer;
+
+    if (rc) {
+		SPDK_ERRLOG("in md poller Read I/O failed at offset: %" PRIu64 " len: %" PRIu64 "\n",
+				req->offset, req->len);
+        xfer->state = XFER_STATE_FAILED;
+		req->status = XFER_REQ_STATUS_FAILED;
+		if (xfer->outstanding_io > 0) {
+			xfer->outstanding_io--;
+		}
+
+		if (xfer->idx > 0) {
+			xfer->idx--;
+		}
+		
+		if (spdk_ring_enqueue(xfer->free_ring, (void **)&req, 1, NULL) != 1) {
+            SPDK_ERRLOG("free_ring full in read_complete_cb\n");
+            assert(false);
+        }
+        return;
+    }
+
+	req->status = XFER_REQ_STATUS_READY;
+
+    /* enqueue for transfer; if ready_ring is full, return req to free_ring or retry */
+    if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
+        SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
+		assert(false);
+	}
+}
+
+static void
+xfer_abort_cpl(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	spdk_bdev_free_io(bdev_io);
+}
+
+/*
+ * Best-effort: nudge any req still mid-flight for this rmt_lvol so the drain below
+ * resolves faster. A req that already moved past the S3-GET leg (e.g. into the local
+ * blobstore write) has no matching bdev_io here and spdk_bdev_abort() is a harmless
+ * no-op for it; it will still complete and drain on its own via outstanding_io.
+ */
+static void
+abort_inflight_reqs_for_rmt_lvol(struct spdk_lvs_xfer *xfer, struct remote_lvol_info *rmt_lvol)
+{
+	if (rmt_lvol->desc == NULL || rmt_lvol->channel == NULL) {
+		return;
+	}
+
+	for (int i = 0; i < xfer->cluster_batch; i++) {
+		struct spdk_lvs_xfer_req *req = &xfer->reqs[i];
+
+		if (req->rmt_lvol == rmt_lvol && req->status == XFER_REQ_STATUS_IN_FLIGHT) {
+			spdk_bdev_abort(rmt_lvol->desc, rmt_lvol->channel, req, xfer_abort_cpl, NULL);
+		}
+	}
+}
+
+/*
+ * Mirrors spdk_wait_for_pg_io_cleanup_poller (device-remove path): defers
+ * put_io_channel/free(rmt_lvol) until outstanding_io drains to zero. Additionally clears
+ * xfer->pg[lpg->id], which spdk_delete_rmt_lvol_pg deferred to this poller instead of
+ * clearing immediately, so destroy_xfer_task_tmo cannot free reqs/pdus/rings while this
+ * rmt_lvol's IO is still in flight.
+ */
+static int
+spdk_wait_for_xfer_pg_io_cleanup_poller(void *arg)
+{
+	struct remote_lvol_info *rmt_lvol = arg;
+	struct spdk_lvs_poll_group *lpg = rmt_lvol->group;
+	struct spdk_lvs_xfer *xfer = rmt_lvol->xfer_task;
+
+	if (rmt_lvol->outstanding_io > 0) {
+		return SPDK_POLLER_BUSY;
+	}
+
+	spdk_poller_unregister(&rmt_lvol->abort_inflight_poller);
+	rmt_lvol->abort_inflight_poller = NULL;
+
+	if (rmt_lvol->channel) {
+		spdk_put_io_channel(rmt_lvol->channel);
+		rmt_lvol->channel = NULL;
+		if (rmt_lvol->tdev->pg[lpg->id] > 0) {
+			rmt_lvol->tdev->pg[lpg->id]--;
+		}
+	}
+
+	free(rmt_lvol);
+	xfer->pg[lpg->id] = false;
+	return -1;
+}
+
+static void
+spdk_delete_rmt_lvol_pg(void *arg) {
+	struct spdk_lvs_xfer *xfer = arg;
+	struct spdk_lvs_poll_group *lpg = NULL;
+	struct remote_lvol_info *rmt_lvol, *tmp;
+
+	TAILQ_FOREACH(lpg, &g_lvs_poll_groups, entry) {
+		if (lpg->thread != spdk_get_thread()) {
+			continue;
+		}
+		break;
+	}
+
+	if (!lpg) {
+		SPDK_ERRLOG("Cannot find the poll group for the current thread.\n");
+		return;
+	}
+
+	TAILQ_FOREACH_SAFE(rmt_lvol, &lpg->rmt_lvols, entry, tmp) {
+		if (rmt_lvol->xfer_task != xfer) {
+			continue;
+		}
+
+		// if the poller is already set, it means the channel is in cleaning up progress,
+		// skip it to avoid duplicate cleanup		
+		if (rmt_lvol->cleanup_poller) {
+			continue;
+		}
+		SPDK_NOTICELOG("destroy rmt lvol and transfer task ---: 2.\n");
+
+		TAILQ_REMOVE(&lpg->rmt_lvols, rmt_lvol, entry);
+		rmt_lvol->status = false;
+
+		if (rmt_lvol->outstanding_io > 0) {
+			SPDK_NOTICELOG("Waiting for %lu I/Os to finish for pg %s (xfer teardown).\n",
+					rmt_lvol->outstanding_io, lpg->thread_name);
+			abort_inflight_reqs_for_rmt_lvol(xfer, rmt_lvol);
+			rmt_lvol->abort_inflight_poller = spdk_poller_register(
+				spdk_wait_for_xfer_pg_io_cleanup_poller, rmt_lvol, 200000); // check every 200ms
+			return;
+		}
+
+		if (rmt_lvol->channel) {
+			spdk_put_io_channel(rmt_lvol->channel);
+			if (rmt_lvol->tdev->pg[lpg->id] > 0) {
+				rmt_lvol->tdev->pg[lpg->id]--;
+			}
+		}
+		
+		free(rmt_lvol);
+		break;
+	}
+	xfer->pg[lpg->id] = false;
+}
+
+static int
+destroy_xfer_task_tmo(void *arg) {
+	struct spdk_lvs_xfer *xfer = arg;
+
+	for (uint32_t i = 0; i < g_lvs_num_pgs; i++) {
+		if (xfer->pg[i]) {
+			return SPDK_POLLER_BUSY;
+		}
+	}
+
+	SPDK_NOTICELOG("Destroy Transfer task %s lvol %s s3_id %d .\n", xfer_type_to_string(xfer->type),
+	 				xfer->lvol ? xfer->lvol->name : "NULL", xfer->s3_id);
+
+	spdk_poller_unregister(&xfer->tmo_poller);
+	xfer->tmo_poller = NULL;
+	spdk_dma_free(xfer->pdus);
+	free(xfer->reqs);
+	spdk_ring_free(xfer->free_ring);
+	spdk_ring_free(xfer->ready_ring);
+	if (xfer->chain)
+		free(xfer->chain);
+	if (xfer->clusters)
+		free(xfer->clusters);
+	if (xfer->chain_s3_ids)
+		free(xfer->chain_s3_ids);
+	if (xfer->old_clusters)
+		free(xfer->old_clusters);
+	free(xfer);
+	return -1;
+}
+
+static void
+destroy_xfer_task(struct spdk_lvs_xfer *xfer) {
+	struct spdk_lvs_poll_group *lpg;
+
+	if (xfer->num_sub_tasks > 0) {
+		xfer->waiting_for_sub_tasks = true;
+		if (xfer->state == XFER_STATE_FAILED) {
+			SPDK_ERRLOG("Sub task failed for migration of lvol %s\n", xfer->lvol->name);
+			for (int i = 0; i < xfer->num_sub_tasks; i++) {
+				if(xfer->list_task[i]->state != XFER_STATE_FAILED) {
+					xfer->list_task[i]->state = XFER_STATE_FAILED;
+				}
+			}
+		}
+	} else {
+		TAILQ_REMOVE(&g_lvs_xfer_tasks, xfer, entry);
+	}
+
+	if (xfer->lvol && xfer->lvol->transfer_status != XFER_DONE) {
+		xfer->lvol->transfer_status = XFER_FAILED;
+	}
+
+	if (XFER_S3_MERGE == xfer->type) {
+		SPDK_NOTICELOG("Transfer lvol %d %s task: status %s finished.\n", xfer->s3_id,
+					xfer_type_to_string(xfer->type),
+					xfer->state == XFER_STATE_DONE ? "DONE" : "FAILED");
+	} else {
+		SPDK_NOTICELOG("Transfer lvol %s %s task: last offset %" PRIu64 " status %s finished.\n", xfer->lvol->name,
+					xfer_type_to_string(xfer->type), xfer->lvol->last_offset,
+					xfer_result_type_to_string(xfer->lvol->transfer_status));
+	}
+
+	if (xfer->final_step && xfer->cb_fn &&
+		(xfer->num_sub_tasks == 0 || xfer->lvol->transfer_status == XFER_FAILED)) {
+		spdk_xfer_sync_mode(xfer);
+	}
+
+	// send msg to the lpg to NULL thier rings pointers in the rmt
+	TAILQ_FOREACH(lpg, &g_lvs_poll_groups, entry) {
+		xfer->pg[lpg->id] = true;
+		spdk_thread_send_msg(lpg->thread, spdk_delete_rmt_lvol_pg, xfer);
+	}
+
+	if (xfer->num_sub_tasks > 0) {
+		return;
+	}
+	
+	xfer->tmo_poller = spdk_poller_register(
+				destroy_xfer_task_tmo, xfer, 200000);// do it after 200ms
+}
+
+static void
+destroy_parent_xfer_task(struct spdk_lvs_xfer *xfer)
+{
+	struct spdk_lvs_xfer **list_task;
+	struct spdk_lvs_xfer *sub_xfer;
+	bool batch_failed = false;
+
+	TAILQ_REMOVE(&g_lvs_xfer_tasks, xfer, entry);
+
+	list_task = xfer->list_task;
+
+	for (int i = 0; i < xfer->num_sub_tasks; i++) {
+		sub_xfer = list_task[i];
+
+		if (sub_xfer->state == XFER_STATE_FAILED ||
+			(sub_xfer->lvol != NULL && sub_xfer->lvol->transfer_status == XFER_FAILED)) {
+			batch_failed = true;
+			break;
+		}
+	}
+
+	SPDK_NOTICELOG("Batch transfer with parent lvol %s, type %s, status %s finished.\n",
+		       xfer->lvol ? xfer->lvol->name : "NULL",
+		       xfer_type_to_string(xfer->type),
+		       batch_failed ? "FAILED" : "DONE");
+
+	for (int i = xfer->num_sub_tasks; i > 0; i--) {
+		sub_xfer = list_task[i - 1];
+
+		/*
+		 * Tasks that failed were already unfrozen by
+		 * destroy_xfer_task(). Tasks that completed successfully
+		 * remained frozen while waiting for the rest of the batch.
+		 */
+		if (sub_xfer->lvol != NULL && sub_xfer->lvol->transfer_status == XFER_DONE) {
+			if (batch_failed) {
+				sub_xfer->state = XFER_STATE_FAILED;
+				sub_xfer->lvol->transfer_status = XFER_FAILED;
+			}
+			SPDK_NOTICELOG("call sync for lvol %s, id %" PRIx64 ", status %s finished.\n",
+				sub_xfer->lvol ? sub_xfer->lvol->name : "NULL",
+				sub_xfer->lvol->blob_id, xfer_result_type_to_string(sub_xfer->lvol->transfer_status));
+			spdk_xfer_sync_mode(sub_xfer);
+		}
+
+		sub_xfer->list_task = NULL;
+		sub_xfer->num_sub_tasks = 0;
+
+		sub_xfer->tmo_poller = spdk_poller_register(
+			destroy_xfer_task_tmo, sub_xfer, 200000);
+	}
+
+	free(list_task);
+}
+
+
+static int
+xfer_fill_queue(struct spdk_lvs_xfer *xfer, int initial) {
+
+	for (int i = 0; i < xfer->cluster_batch; i++) {
+		struct spdk_lvs_xfer_req *req;
+		if (spdk_ring_dequeue(xfer->free_ring, (void **)&req, 1) == 0) {
+			break;
+		}
+	}
+
+	for (int i = 0; i < initial; i++) {
+		struct spdk_lvs_xfer_req *req = &xfer->reqs[i];
+		req->action = REQ_ACTION_NONE;
+		req->status = XFER_REQ_STATUS_NONE;
+		if (spdk_ring_enqueue(xfer->free_ring, (void **)&req, 1, NULL) != 1) {
+			break;
+		}
+	}
+
+	xfer->idx = 0;
+	xfer->success_cnt = 0;
+	xfer->timeout = spdk_get_ticks();
+	return 0;
+}
+
+static int
+xfer_wait_outstanding_io(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req **preq) {
+	uint64_t current_time = spdk_get_ticks();
+	uint64_t timeout_ticks = spdk_get_ticks_hz() * 8;
+
+	if (spdk_ring_dequeue(xfer->free_ring, (void **)preq, 1) == 0) {
+		if (current_time - xfer->timeout > timeout_ticks) {// in timeout consider outstanding io
+			if (xfer->outstanding_io == 0) {
+				xfer->lvol->transfer_status = XFER_FAILED;
+				xfer->state = XFER_STATE_FAILED;
+			} else {
+				// print current outstanding io timeout error
+				SPDK_ERRLOG("Task transfer timeout with outstanding io %u\n", xfer->outstanding_io);
+			}
+			return 0;
+		}
+		return -1;
+	}
+
+	xfer->timeout = current_time;
+	struct spdk_lvs_xfer_req *req = *preq;
+	if ((req->status == XFER_REQ_STATUS_FAILED || req->status == XFER_REQ_STATUS_DONE) && xfer->outstanding_io > 0) {
+		xfer->outstanding_io--;
+		if (xfer->outstanding_io == 0) {
+			return 0;
+		}
+	}
+	return -1;
+}
+
+static int
+xfer_status_check(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req **preq, uint32_t count, enum xfer_state next_state, int initial) {
+	uint64_t current_time = spdk_get_ticks();
+	uint64_t timeout_ticks = spdk_get_ticks_hz() * 8;
+
+	if (xfer->success_cnt != 0 && count == xfer->success_cnt) {
+		xfer->state = next_state;
+		xfer_fill_queue(xfer, initial);
+		return -1;
+	}
+
+	if (xfer->lvol && xfer->lvol->transfer_status == XFER_FAILED) {
+		xfer->state = XFER_STATE_FAILED;
+		return -1;
+	}
+
+	if (spdk_ring_dequeue(xfer->free_ring, (void **)preq, 1) == 0) {
+		if (current_time - xfer->timeout > timeout_ticks) {// in timeout consider outstanding io
+			if (xfer->outstanding_io == 0) {
+				if (xfer->lvol) {
+					xfer->lvol->transfer_status = XFER_FAILED;
+				}
+				xfer->state = XFER_STATE_FAILED;
+			} else {
+				xfer->timeout_cnt++;
+				if (xfer->timeout_cnt == 1) {
+					SPDK_ERRLOG("S3 transfer timeout with outstanding io %u, state %d\n", xfer->outstanding_io, xfer->state);
+				}
+				if (xfer->timeout_cnt >= 3) {
+					SPDK_ERRLOG("S3 transfer failed after %u timeouts, outstanding io %u, state %d\n",
+						xfer->timeout_cnt, xfer->outstanding_io, xfer->state);
+					if (xfer->lvol) {
+						xfer->lvol->transfer_status = XFER_FAILED;
+					}
+					xfer->state = XFER_STATE_FAILED;
+				}
+			}
+		}
+		return -1;
+	}
+
+	xfer->timeout = current_time;
+	struct spdk_lvs_xfer_req *req = *preq;
+	if ((req->status == XFER_REQ_STATUS_FAILED || req->status == XFER_REQ_STATUS_DONE) && xfer->outstanding_io > 0) {
+		xfer->outstanding_io--;
+	}
+
+	if (req->status == XFER_REQ_STATUS_FAILED) {
+		if (xfer->lvol) {
+			xfer->lvol->transfer_status = XFER_FAILED;
+		}
+		xfer->state = XFER_STATE_FAILED;
+		return -1;
+	}
+
+	if (req->status == XFER_REQ_STATUS_DONE) {
+		xfer->success_cnt++;
+	}
+
+	return 0;
+}
+
+static int
+xfer_replication(struct spdk_lvs_xfer *xfer) {
+	struct spdk_lvs_xfer_req *req;
+	bool is_allocate = false;
+	enum xfer_state  next_state;
+	int count = 0, rc, next_cnt;
+
+	switch (xfer->state)
+	{
+		case XFER_STATE_NONE:
+			struct spdk_lvol *lvol = xfer->lvol;
+			prepare_s3_clusters(lvol->blob, xfer->clusters, xfer->num_clusters);
+			xfer->state = XFER_STATE_TRANSFER_CLUSTERS;
+			xfer_fill_queue(xfer, xfer->cluster_batch);
+			if (xfer->lvol->last_offset != 0) {
+				xfer->hold_idx = xfer->lvol->last_offset / xfer->page_per_cluster;
+				if (xfer->hold_idx >= xfer->num_clusters) {
+					xfer->state = XFER_STATE_DONE;
+				}
+			}
+			break;
+
+		case XFER_STATE_TRANSFER_CLUSTERS:
+			next_state = xfer->final_step ? XFER_STATE_SIGNAL_TRANSFER : XFER_STATE_DONE;
+			next_cnt = xfer->final_step ? 1 : 0;
+			/* Fill the WHOLE window each tick, not one cluster per tick.
+			 * The single-shot version dispatched at most one cluster per
+			 * md_xfer_poller period (1ms) -- an artificial ceiling of
+			 * ~1000 clusters/s in the best case, and far less on a reactor
+			 * shared with live IO, where every starved tick is a lost
+			 * dispatch slot. Under fio load the replicate path measured
+			 * ~29 MiB/s per volume against a 345 MiB/s writer (2026-08-21).
+			 * The window stays bounded by the free_ring (cluster_batch), so
+			 * looping until it is empty cannot over-submit. */
+			while (true) {
+				is_allocate = false;
+				rc = xfer_status_check(xfer, &req, xfer->idx, next_state, next_cnt);
+				if (rc != 0) {
+					/* no free request, or the state machine moved on */
+					return count;
+				}
+
+				xfer->lvol->last_offset = req->offset;
+
+				// prepare req
+				memset(req->payload, 0, xfer->page_size * xfer->page_per_cluster);
+				if (xfer->hold_idx < xfer->num_clusters) {
+					for (uint32_t i = xfer->hold_idx; i < xfer->num_clusters; i++) {
+						if (xfer->clusters[i] == 0) {
+							continue;
+						}
+
+						is_allocate = true;
+						req->dst_offset = i * xfer->page_per_cluster;
+						if (xfer->lvol->redirect_map_id != 0) {
+							req->dst_offset = ((uint64_t)(xfer->lvol->redirect_map_id) << 48) | req->dst_offset;
+						}
+
+						req->offset = i * xfer->page_per_cluster;
+						req->len = xfer->page_per_cluster; // 2MB
+						req->action = REQ_ACTION_COPY_BACKUP;
+						req->status = XFER_REQ_STATUS_READY;
+						/* enqueue for transfer; if ready_ring is full, return req to free_ring or retry */
+						if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
+							SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
+							assert(false);
+						}
+
+						xfer->outstanding_io++;
+						xfer->idx++;
+						xfer->hold_idx = i + 1;
+						count++;
+						break;
+					}
+				}
+
+				if (!is_allocate) {
+					if (xfer->idx == 0) {
+						// no clusters to send
+						xfer->state = xfer->final_step ?  XFER_STATE_SIGNAL_TRANSFER : XFER_STATE_DONE;
+						xfer_fill_queue(xfer, xfer->cluster_batch);
+					}
+					/* Tail of the scan: nothing left to enqueue this tick.
+					 * Outstanding IO completes on its own; the success_cnt
+					 * check above transitions the state on a later tick. */
+					return count;
+				}
+			}
+			break;
+
+		case XFER_STATE_SIGNAL_TRANSFER:
+			rc = xfer_status_check(xfer, &req, xfer->idx, XFER_STATE_DONE, 0);
+			if (rc != 0) {
+				return 0;
+			}
+
+			if (!xfer->signal_sent) {
+				memset(req->payload, 0, xfer->page_size * xfer->page_per_cluster);
+				count++;	
+				req->len = 1;
+				req->offset = 0;
+				req->action = REQ_ACTION_WRITE;
+				req->status = XFER_REQ_STATUS_READY;
+				snprintf(req->payload, xfer->page_size, "transfer_task_completed:%s", xfer->len ? xfer->snapshot_name : "none");
+				req->dst_offset = ((uint64_t)(xfer->lvol->redirect_map_id) << 48) | req->offset;
+				xfer->signal_sent = true;
+				if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
+						SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
+						assert(false);
+				}
+				xfer->idx = 1;
+				xfer->outstanding_io++;
+			}
+			break;
+		case XFER_STATE_DONE:
+			xfer->lvol->transfer_status = XFER_DONE;
+			destroy_xfer_task(xfer);
+			return 0;
+
+		case XFER_STATE_FAILED:
+			// should not come here
+			SPDK_ERRLOG("transfer task failed: -----\n");
+			if (xfer->outstanding_io != 0) {
+				//wait until all io done or timeout
+				SPDK_ERRLOG("transfer task failed: ----- but still have outstanding io %d\n", xfer->outstanding_io);
+				rc = xfer_wait_outstanding_io(xfer, &req);
+				if (rc != 0) {
+					return 0;
+				}
+			}
+			destroy_xfer_task(xfer);
+			return 0;
+		default:
+			break;
+
+	}
+	return count;
+}
+
+static int
+xfer_migration(struct spdk_lvs_xfer *xfer) {
+	struct spdk_lvs_xfer_req *req;
+	bool is_allocate = false;
+	enum xfer_state  next_state;
+	int count = 0, rc, next_cnt;
+
+	switch (xfer->state)
+	{
+		case XFER_STATE_NONE:
+			struct spdk_lvol *lvol = xfer->lvol;
+			prepare_s3_clusters(lvol->blob, xfer->clusters, xfer->num_clusters);
+			xfer->state = XFER_STATE_TRANSFER_CLUSTERS;
+			xfer_fill_queue(xfer, xfer->cluster_batch);
+			break;
+
+		case XFER_STATE_TRANSFER_CLUSTERS:
+			is_allocate = false;
+			next_state = xfer->final_step ? XFER_STATE_SIGNAL_TRANSFER : XFER_STATE_DONE;
+			next_cnt = xfer->final_step ? 1 : 0;
+			rc = xfer_status_check(xfer, &req, xfer->idx, next_state, next_cnt);
+			if (rc != 0) {
+				return 0;
+			}
+			
+			// prepare req
+			memset(req->payload, 0, xfer->page_size * 8); // 8 blocks
+			if (xfer->hold_idx < xfer->num_clusters) {
+				for (uint32_t i = xfer->hold_idx; i < xfer->num_clusters; i++) {
+					if (xfer->clusters[i] == 0) {
+						continue;
+					}
+
+					is_allocate = true;
+					req->dst_offset = i * xfer->page_per_cluster;
+					if (xfer->lvol->redirect_map_id != 0) {
+						req->dst_offset = ((uint64_t)(xfer->lvol->redirect_map_id) << 48) | req->dst_offset;
+					}
+
+					req->offset = i * xfer->page_per_cluster;
+					req->len = 8; // 8 blocks
+					req->action = REQ_ACTION_WRITE;
+					req->status = XFER_REQ_STATUS_READY;
+
+					xfer->outstanding_io++;
+					xfer->idx++;
+					xfer->hold_idx = i + 1;
+					count++;
+
+					int rc = spdk_read_cluster_data_xfer(xfer->lvol->blob, req->payload,
+										req->offset, req->len, xfer->type, read_complete_cb, req);
+					if (rc != 0) {
+						/* read failed synchronously; correct outstanding and recycle req */
+						xfer->outstanding_io--;
+						xfer->idx--;
+						if (spdk_ring_enqueue(xfer->free_ring, (void **)&req, 1, NULL) != 1) {
+							SPDK_ERRLOG("free_ring full after read submit failure\n");
+							assert(false);
+						}
+						xfer->state = XFER_STATE_FAILED;
+						return 0;
+					}
+					return count;
+				}
+
+				if (!is_allocate) {
+					if (xfer->idx == 0) {
+						// no clusters to send
+						xfer->state = xfer->final_step ?  XFER_STATE_SIGNAL_TRANSFER : XFER_STATE_DONE;
+						xfer_fill_queue(xfer, xfer->cluster_batch);
+						return 0;
+					}
+				}
+			}
+			break;
+		case XFER_STATE_SIGNAL_TRANSFER:
+			rc = xfer_status_check(xfer, &req, xfer->idx, XFER_STATE_DONE, 0);
+			if (rc != 0) {
+				return 0;
+			}
+
+			if (!xfer->signal_sent) {
+				memset(req->payload, 0, xfer->page_size * 8);
+				count++;	
+				req->len = 1;
+				req->offset = 0;
+				req->action = REQ_ACTION_WRITE;
+				req->status = XFER_REQ_STATUS_READY;
+				snprintf(req->payload, xfer->page_size, "transfer_task_completed:%s", xfer->len ? xfer->snapshot_name : "none");
+				req->dst_offset = ((uint64_t)(xfer->lvol->redirect_map_id) << 48) | req->offset;
+				xfer->signal_sent = true;
+				if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
+						SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
+						assert(false);
+				}
+				xfer->idx = 1;
+				xfer->outstanding_io++;
+			}
+			break;
+		case XFER_STATE_DONE:
+			xfer->lvol->transfer_status = XFER_DONE;
+			destroy_xfer_task(xfer);
+			return 0;
+		case XFER_STATE_FAILED:
+			// should not come here
+			SPDK_ERRLOG("transfer task failed: -----\n");
+			if (xfer->outstanding_io != 0) {
+				//wait until all io done or timeout
+				SPDK_ERRLOG("transfer task failed: ----- but still have outstanding io %d\n", xfer->outstanding_io);
+				rc = xfer_wait_outstanding_io(xfer, &req);
+				if (rc != 0) {
+					return 0;
+				}
+			}
+			destroy_xfer_task(xfer);
+			return 0;
+		default:
+			break;
+
+	}
+	return count;
+}
+
+struct cls_entry{
+	uint32_t index;
+	uint64_t s3_id;
+};
+
+static int
+xfer_s3_backup(struct spdk_lvs_xfer *xfer) {
+	struct spdk_lvs_xfer_req *req;
+	bool is_allocate = false;
+	int count = 0;
+	int rc = 0;
+
+	switch (xfer->state)
+	{
+		case XFER_STATE_NONE:
+			if (xfer->idx < xfer->chain_count) {
+				struct spdk_lvol *lvol = xfer->chain[xfer->idx];
+				prepare_s3_clusters(lvol->blob, xfer->clusters, xfer->num_clusters);
+				xfer->idx++;
+				return 0;
+			}
+			xfer->state = XFER_STATE_TRANSFER_CLUSTERS;
+			xfer_fill_queue(xfer, xfer->cluster_batch);
+			break;
+
+		case XFER_STATE_TRANSFER_CLUSTERS:
+			is_allocate = false;
+			rc = xfer_status_check(xfer, &req, xfer->idx, XFER_STATE_TRANSFER_MD_DATA, xfer->cluster_batch);
+			if (rc != 0) {
+				return 0;
+			}
+
+			// prepare req
+			memset(req->payload, 0, xfer->page_size * xfer->page_per_cluster);
+			if (xfer->hold_idx < xfer->num_clusters) {
+				for (uint32_t i = xfer->hold_idx; i < xfer->num_clusters; i++) {
+					if (xfer->clusters[i] == 0) {
+						continue;
+					}
+
+					is_allocate = true;
+					// 0 + id + 0 + index
+					req->dst_offset = s3_pack_offset(i, xfer->s3_id, false /* mid flag */, false /* MSB flag */);
+					req->offset = i * xfer->page_per_cluster;
+					req->len = xfer->page_per_cluster; // 2MB
+					req->action = REQ_ACTION_COPY_BACKUP;
+					req->status = XFER_REQ_STATUS_READY;
+
+					/* enqueue for transfer; if ready_ring is full, return req to free_ring or retry */
+					if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
+						SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
+						assert(false);
+					}
+
+					xfer->outstanding_io++;
+					xfer->idx++;
+					xfer->hold_idx = i + 1;
+					count++;
+					return count;
+				}
+
+				if (!is_allocate) {
+					if (xfer->idx == 0) {
+						// no clusters to send
+						xfer->state = XFER_STATE_TRANSFER_MD_DATA;
+						xfer_fill_queue(xfer, xfer->cluster_batch);
+						return 0;
+					}
+				}
+			}
+			break;
+
+		case XFER_STATE_TRANSFER_MD_DATA:
+			is_allocate = false;
+			rc = xfer_status_check(xfer, &req, xfer->num_extent_pages, XFER_STATE_TRANSFER_ROOT_MD, 1);
+			if (rc != 0) {
+				return 0;
+			}
+
+			memset(req->payload, 0, xfer->page_size * xfer->page_per_cluster);
+			uint32_t *idx_out = (uint32_t *)req->payload;
+			uint32_t max_idx = (xfer->page_size * xfer->page_per_cluster) / sizeof(uint32_t);
+			req->len = 0;
+			// prepare req
+			if (xfer->idx < xfer->num_clusters) {
+				for (uint32_t i = xfer->idx; i < xfer->num_clusters; i++) {
+					xfer->idx++;
+					if (xfer->clusters[i] == 0) {
+						continue;
+					}
+
+					is_allocate = true;
+					idx_out[req->len++] = (uint32_t)i;
+
+					if (req->len == max_idx) {
+						break;
+					}
+				}
+
+				if (!is_allocate) {
+					req->len = xfer->page_per_cluster;
+					if (xfer->num_extent_pages == 0) {
+						// no more md to send
+						xfer->state = XFER_STATE_TRANSFER_ROOT_MD;
+						xfer_fill_queue(xfer, 1);
+						return 0;
+					}
+					break;
+				}
+
+				xfer->num_extent_pages++;
+				// 0 + id + 1 + index
+				req->dst_offset = s3_pack_offset(xfer->num_extent_pages, xfer->s3_id, true /* mid flag */, false);
+				req->len = xfer->page_per_cluster; // 2MB
+				req->action = REQ_ACTION_WRITE;
+				req->status = XFER_REQ_STATUS_READY;
+				xfer->outstanding_io++;
+				
+				/* enqueue for transfer; if ready_ring is full, return req to free_ring or retry */
+				if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
+					SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
+					assert(false);
+				}				
+				count++;
+			}
+			break;
+		case XFER_STATE_TRANSFER_ROOT_MD:
+			rc = xfer_status_check(xfer, &req, xfer->idx, XFER_STATE_DONE, 0);
+			if (rc != 0) {
+				return 0;
+			}
+
+			if (xfer->idx == 1 ) {
+				// all done
+				break;
+			}
+			xfer->idx++;
+			// prepare req
+			memset(req->payload, 0, xfer->page_size * xfer->page_per_cluster);
+			uint8_t *p = req->payload;
+
+			memcpy(p, &xfer->num_extent_pages, sizeof(uint32_t));
+			p += sizeof(uint32_t);
+
+			memcpy(p, &xfer->num_clusters, sizeof(uint32_t));
+			p += sizeof(uint32_t);
+			uint32_t geometry = spdk_blob_get_geometry(xfer->lvol->blob);
+			memcpy(p, &geometry, sizeof(uint32_t));
+			p += sizeof(uint32_t);
+
+			memcpy(p, &xfer->s3_id, sizeof(uint32_t));
+			p += sizeof(uint32_t);
+
+			memset(p, 0, SPDK_LVOL_NAME_MAX);
+			strncpy((char *)p, xfer->lvol->name, SPDK_LVOL_NAME_MAX);
+			p += SPDK_LVOL_NAME_MAX;
+
+			memset(p, 0, SPDK_UUID_STRING_LEN);
+			memcpy(p, xfer->lvol->uuid_str, SPDK_UUID_STRING_LEN);
+			p += SPDK_UUID_STRING_LEN;
+
+			// 0 + id + 1 + 0
+			req->dst_offset = s3_pack_offset(0, xfer->s3_id, true /* mid flag */, false);
+			req->len = xfer->page_per_cluster; // 2MB
+			req->action = REQ_ACTION_WRITE;
+			req->status = XFER_REQ_STATUS_READY;
+			xfer->outstanding_io++;
+
+			/* enqueue for transfer; if ready_ring is full, return req to free_ring or retry */
+			if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
+				SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
+				assert(false);
+			}
+			count++;
+			break;
+
+		case XFER_STATE_DONE:
+			xfer->lvol->transfer_status = XFER_DONE;
+			destroy_xfer_task(xfer);
+			return 0;
+
+		case XFER_STATE_FAILED:
+			// should not come here
+			SPDK_ERRLOG("S3 transfer task failed: -----\n");
+			if (xfer->outstanding_io != 0) {
+				//wait until all io done or timeout
+				SPDK_ERRLOG("S3 transfer task failed: ----- but still have outstanding io %d\n", xfer->outstanding_io);
+				rc = xfer_wait_outstanding_io(xfer, &req);
+				if (rc != 0) {
+					return 0;
+				}
+			}
+			destroy_xfer_task(xfer);
+			return 0;
+	
+	default:
+		break;
+	}
+	return count;
+}
+
+static int
+xfer_s3_merge(struct spdk_lvs_xfer *xfer) {
+	struct spdk_lvs_xfer_req *req;
+	int count = 0;
+	int rc = 0;
+
+	switch (xfer->state)
+	{
+		case XFER_STATE_NONE:
+			xfer->state = XFER_STATE_READ_ROOT_MD;
+			xfer_fill_queue(xfer, 1);
+			break;
+		case XFER_STATE_READ_ROOT_MD:
+			rc = xfer_status_check(xfer, &req, xfer->idx, XFER_STATE_READ_EXTENT_MD, xfer->cluster_batch);
+			if (rc != 0) {
+				return 0;
+			}
+
+			if (xfer->idx == 1 && (req->action == REQ_ACTION_READ && req->status == XFER_REQ_STATUS_DONE)) {
+				// all done
+				// parse root md
+				uint8_t *p = req->payload;
+				memcpy(&xfer->num_extent_pages, p, sizeof(uint32_t));
+				p += sizeof(uint32_t);
+
+				memcpy(&xfer->num_clusters, p, sizeof(uint32_t));
+				p += sizeof(uint32_t);
+
+				// allocate clusters array and the old clusters array
+				xfer->clusters = calloc(xfer->num_clusters, sizeof(uint64_t));
+				if (xfer->clusters == NULL) {
+					SPDK_ERRLOG("Failed to allocate clusters array for merge S3\n");
+					xfer->state = XFER_STATE_FAILED;
+					return 0;
+				}
+				
+				SPDK_NOTICELOG("Merge S3 Root MD: extent pages %u clusters %u s3 id %u\n",
+								xfer->num_extent_pages, xfer->num_clusters, xfer->s3_id);
+
+				if (xfer->num_extent_pages == 0) {
+					// no extent md to read
+					xfer->state = XFER_STATE_READ_ROOT_MD_2;
+					xfer_fill_queue(xfer, 1);
+					return 0;
+				}
+
+				xfer->state = XFER_STATE_READ_EXTENT_MD;
+				xfer_fill_queue(xfer, xfer->cluster_batch);
+				return 0;
+			}
+
+			memset(req->payload, 0, xfer->page_size * xfer->page_per_cluster);
+			req->dst_offset = s3_pack_offset(0, xfer->s3_id, true /* mid flag */, false);
+			req->len = xfer->page_per_cluster; // 2MB
+			req->action = REQ_ACTION_READ;
+			req->status = XFER_REQ_STATUS_READY;
+
+			/* enqueue for transfer; if ready_ring is full, return req to free_ring or retry */
+			if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
+				SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
+				assert(false);
+			}
+
+			xfer->outstanding_io++;
+			xfer->idx++;
+			count++;
+			break;
+		case XFER_STATE_READ_EXTENT_MD:
+			rc = xfer_status_check(xfer, &req, xfer->num_extent_pages, XFER_STATE_READ_ROOT_MD_2, 1);
+			if (rc != 0) {
+				return 0;
+			}
+			int cnt = 0;
+			if (xfer->idx != 0 && (req->action == REQ_ACTION_READ && req->status == XFER_REQ_STATUS_DONE)) {
+				// read done, parse extent md
+				uint32_t *idx_in = (uint32_t *)req->payload;
+				uint32_t entries = (xfer->page_size * xfer->page_per_cluster) / sizeof(uint32_t);
+				for (uint32_t j = 0; j < entries; j++) {
+					if (j != 0 && idx_in[j] == 0) {
+						break;
+					}
+
+					if (!(idx_in[j] < xfer->num_clusters)) {
+						break;
+					}
+					cnt++;
+					xfer->clusters[idx_in[j]] = s3_pack_offset(idx_in[j], xfer->s3_id, false /* mid flag */, false /* MSB flag */);
+				}
+				SPDK_NOTICELOG("Merge S3 MD extent pages %d clusters %u s3 id %u\n",
+								cnt, xfer->num_clusters, xfer->s3_id);
+				req->action = REQ_ACTION_NONE;
+				req->status = XFER_REQ_STATUS_NONE;
+			}
+
+			if (xfer->idx < xfer->num_extent_pages) {
+				// prepare req
+				memset(req->payload, 0, xfer->page_size * xfer->page_per_cluster);
+				req->dst_offset = s3_pack_offset(xfer->idx + 1, xfer->s3_id, true /* mid flag */, false);
+				req->len = xfer->page_per_cluster; // 2MB
+				req->action = REQ_ACTION_READ;
+				req->status = XFER_REQ_STATUS_READY;
+
+				/* enqueue for transfer; if ready_ring is full, return req to free_ring or retry */
+				if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
+					SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
+					assert(false);
+				}
+
+				xfer->outstanding_io++;
+				xfer->idx++;
+				count++;
+				return count;
+			}
+			break;
+
+		case XFER_STATE_READ_ROOT_MD_2:
+			rc = xfer_status_check(xfer, &req, xfer->idx, XFER_STATE_READ_EXTENT_MD_2, xfer->cluster_batch);
+			if (rc != 0) {
+				return 0;
+			}
+
+			if (xfer->idx == 1 && (req->action == REQ_ACTION_READ && req->status == XFER_REQ_STATUS_DONE)) {
+				// parse root md
+				uint8_t *p = req->payload;
+				memcpy(&xfer->old_num_extent_pages, p, sizeof(uint32_t));
+				p += sizeof(uint32_t);
+				memcpy(&xfer->old_num_clusters, p, sizeof(uint32_t));
+				p += sizeof(uint32_t);
+
+				xfer->old_clusters = calloc(xfer->old_num_clusters, sizeof(uint64_t));
+				if (xfer->old_clusters == NULL) {
+					SPDK_ERRLOG("Failed to allocate old clusters array for merge S3\n");
+					free(xfer->clusters);
+					xfer->state = XFER_STATE_FAILED;
+					return 0;
+				}
+
+				SPDK_NOTICELOG("Merge S3 Root MD2: extent pages %u clusters %u s3 id %u\n",
+								xfer->old_num_extent_pages, xfer->old_num_clusters, xfer->old_s3_id);
+
+				if (xfer->old_num_extent_pages == 0) {
+					// no extent md to read
+					xfer->state = XFER_STATE_DELETE;
+					xfer_fill_queue(xfer, xfer->cluster_batch);
+					return 0;
+				}
+
+				xfer->state = XFER_STATE_READ_EXTENT_MD_2;
+				xfer_fill_queue(xfer, xfer->cluster_batch);
+				return 0;
+			}
+
+			memset(req->payload, 0, xfer->page_size * xfer->page_per_cluster);
+			req->dst_offset = s3_pack_offset(0, xfer->old_s3_id, true /* mid flag */, false);
+			req->len = xfer->page_per_cluster; // 2MB
+			req->action = REQ_ACTION_READ;
+			req->status = XFER_REQ_STATUS_READY;
+
+			/* enqueue for transfer; if ready_ring is full, return req to free_ring or retry */
+			if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
+				SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
+				assert(false);
+			}
+
+			xfer->outstanding_io++;
+			xfer->idx++;
+			count++;
+			break;
+
+		case XFER_STATE_READ_EXTENT_MD_2:
+			rc = xfer_status_check(xfer, &req, xfer->old_num_extent_pages, XFER_STATE_SWAP_CLUSTERS, xfer->cluster_batch);
+			if (rc != 0) {
+				return 0;
+			}
+
+			if (xfer->idx != 0 && (req->action == REQ_ACTION_READ && req->status == XFER_REQ_STATUS_DONE)) {
+				// read done, parse extent md
+				uint32_t *idx_in = (uint32_t *)req->payload;
+				uint32_t entries = (xfer->page_size * xfer->page_per_cluster) / sizeof(uint32_t);
+				int cnt =0;
+				for (uint32_t j = 0; j < entries; j++) {
+					if (j != 0 && idx_in[j] == 0) {
+						break;
+					}
+
+					if (!(idx_in[j] < xfer->old_num_clusters)) {
+						break;
+					}
+					cnt++;
+					xfer->old_clusters[idx_in[j]] = s3_pack_offset(idx_in[j], xfer->old_s3_id, false /* mid flag */, false /* MSB flag */);
+				}
+
+				SPDK_NOTICELOG("Merge S3 MD extent pages %d clusters %u s3 id %u\n",
+								cnt, xfer->old_num_clusters, xfer->old_s3_id);
+				req->action = REQ_ACTION_NONE;
+				req->status = XFER_REQ_STATUS_NONE;
+			}
+
+			if (xfer->idx < xfer->old_num_extent_pages) {
+				// prepare req
+				memset(req->payload, 0, xfer->page_size * xfer->page_per_cluster);
+				req->dst_offset = s3_pack_offset(xfer->idx + 1, xfer->old_s3_id, true /* mid flag */, false);
+				req->len = xfer->page_per_cluster; // 2MB it should be page_size * page_per_cluster
+				req->action = REQ_ACTION_READ;
+				req->status = XFER_REQ_STATUS_READY;
+
+				/* enqueue for transfer; if ready_ring is full, return req to free_ring or retry */
+				if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
+					SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
+					assert(false);
+				}
+
+				xfer->outstanding_io++;
+				xfer->idx++;
+				count++;
+				return count;
+			}
+			break;
+		case XFER_STATE_SWAP_CLUSTERS:
+			rc = xfer_status_check(xfer, &req, xfer->idx, XFER_STATE_TRANSFER_MD_DATA, xfer->cluster_batch);
+			if (rc != 0) {
+				return 0;
+			}
+
+			// swap clusters arrays
+			for (uint32_t i = xfer->hold_idx; i < xfer->num_clusters && i < xfer->old_num_clusters; i++) {
+				xfer->hold_idx++;
+				// need to swap
+				if (xfer->clusters[i] == 0 && xfer->old_clusters[i] != 0) {
+					xfer->clusters[i] = xfer->old_clusters[i];
+					if (!xfer->persist_swap) {
+						xfer->persist_swap = true;
+						xfer->num_extent_pages = 0;
+					}
+					// SPDK_NOTICELOG("Merge S3 SWAP: cluster index %u, idx %u\n", i, xfer->idx);
+
+					// prepare req
+					req->dst_offset = s3_pack_offset(i, xfer->s3_id, false /* mid flag */, false);
+					req->offset = xfer->old_clusters[i];
+					req->len = xfer->page_per_cluster; // 2MB
+					req->action = REQ_ACTION_SWAP;
+					req->status = XFER_REQ_STATUS_READY;
+
+					/* enqueue for transfer; if ready_ring is full, return req to free_ring or retry */
+					if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
+						SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
+						assert(false);
+					}
+					xfer->outstanding_io++;
+					xfer->idx++;
+					count++;
+					return count;
+				}
+			}
+
+			if (!xfer->persist_swap) {
+				xfer->hold_idx = 0;
+				// no need to persist the swapped clusters
+				SPDK_NOTICELOG("No persist swapped clusters to S3 id %u\n", xfer->s3_id);
+				xfer->state = XFER_STATE_DELETE;
+				xfer_fill_queue(xfer, xfer->cluster_batch);
+				return 0;
+			}
+			break;
+
+		case XFER_STATE_TRANSFER_MD_DATA:
+			bool is_allocate = false;
+			xfer->hold_idx = 0;
+			rc = xfer_status_check(xfer, &req, xfer->num_extent_pages, XFER_STATE_DELETE, xfer->cluster_batch);
+			if (rc != 0) {
+				return 0;
+			}
+
+			memset(req->payload, 0, xfer->page_size * xfer->page_per_cluster);
+			uint32_t *idx_out = (uint32_t *)req->payload;
+			uint32_t max_idx = (xfer->page_size * xfer->page_per_cluster) / sizeof(uint32_t);
+			req->len = 0;
+			// prepare req
+			if (xfer->idx < xfer->num_clusters) {
+				for (uint32_t i = xfer->idx; i < xfer->num_clusters; i++) {
+					xfer->idx++;
+					if (xfer->clusters[i] == 0) {
+						continue;
+					}
+
+					is_allocate = true;
+					idx_out[req->len++] = (uint32_t)i;
+
+					if (req->len == max_idx) {
+						break;
+					}
+				}
+
+				if (!is_allocate) {
+					req->len = xfer->page_per_cluster;
+					if (xfer->num_extent_pages == 0) {
+						// no more md to send
+						xfer->state = XFER_STATE_DELETE;
+						xfer_fill_queue(xfer, xfer->cluster_batch);
+						return 0;
+					}
+					break;
+				}
+
+				xfer->num_extent_pages++;
+				// 0 + id + 1 + index
+				req->dst_offset = s3_pack_offset(xfer->num_extent_pages, xfer->s3_id, true /* mid flag */, false);
+				req->len = xfer->page_per_cluster; // 2MB
+				req->action = REQ_ACTION_WRITE;
+				req->status = XFER_REQ_STATUS_READY;
+				xfer->outstanding_io++;
+				
+				/* enqueue for transfer; if ready_ring is full, return req to free_ring or retry */
+				if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
+					SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
+					assert(false);
+				}				
+				count++;
+			}
+			break;
+		case XFER_STATE_DELETE:
+			rc = xfer_status_check(xfer, &req, xfer->idx, XFER_STATE_DONE, 0);
+			if (rc != 0) {
+				return 0;
+			}
+			//xfer->old_num_extent_pages + 1 number extent page plus root md
+			for (uint32_t i = xfer->idx; i < xfer->old_num_extent_pages + 1; i++) {
+				req->dst_offset = s3_pack_offset(i, xfer->old_s3_id, true /* mid flag */, false);
+				req->len = xfer->page_per_cluster; // 2MB
+				req->action = REQ_ACTION_UNMAP;
+				req->status = XFER_REQ_STATUS_READY;
+				xfer->idx++;
+				xfer->outstanding_io++;
+
+				/* enqueue for transfer; if ready_ring is full, return req to free_ring or retry */
+				if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
+					SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
+					assert(false);
+				}
+
+				return ++count;
+			}
+
+			for (uint32_t i = xfer->hold_idx; i < xfer->old_num_clusters; i++) {
+				xfer->hold_idx++;
+				// need to swap
+				if (xfer->old_clusters[i] != 0) {
+					req->dst_offset = s3_pack_offset(i, xfer->old_s3_id, false /* mid flag */, false);
+					req->len = xfer->page_per_cluster; // 2MB
+					req->action = REQ_ACTION_UNMAP;
+					req->status = XFER_REQ_STATUS_READY;
+					xfer->idx++;
+					xfer->outstanding_io++;
+
+					/* enqueue for transfer; if ready_ring is full, return req to free_ring or retry */
+					if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
+						SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
+						assert(false);
+					}
+					return ++count;
+				}
+			}
+			break;
+		case XFER_STATE_DONE:
+			// xfer->lvol->transfer_status = XFER_DONE;
+			//TODO we can start delete old s3 data here
+			// we have old_s3_id and old_num_clusters and old_num_extent_pages
+			// but for safety we can do it outside
+			destroy_xfer_task(xfer);			
+			return 0;
+
+		case XFER_STATE_FAILED:
+			// should not come here
+			SPDK_ERRLOG("S3 transfer task failed: -----\n");
+			if (xfer->outstanding_io != 0) {
+				//wait until all io done or timeout
+				SPDK_ERRLOG("S3 transfer task failed: ----- but still have outstanding io %d\n", xfer->outstanding_io);
+				rc = xfer_wait_outstanding_io(xfer, &req);
+				if (rc != 0) {
+					return 0;
+				}
+			}
+			destroy_xfer_task(xfer);
+			return 0;
+
+	default:
+		break;
+	}
+	return count;
+}
+
+static int
+xfer_s3_recovery(struct spdk_lvs_xfer *xfer) {
+	struct spdk_lvs_xfer_req *req;
+	int count = 0;
+	int rc = 0;
+
+	switch (xfer->state)
+	{
+		case XFER_STATE_NONE:
+			xfer->state = XFER_STATE_READ_ROOT_MD;
+			xfer_fill_queue(xfer, 1);
+			break;
+		case XFER_STATE_NEXT_S3_ID:
+			xfer->hold_idx++;
+			if (xfer->hold_idx < xfer->chain_count) {
+				xfer->state = XFER_STATE_READ_ROOT_MD;
+				xfer_fill_queue(xfer, 1);
+				return 0;
+			}
+			xfer->state = XFER_STATE_RECOVER_CLUSTERS;
+			xfer->hold_idx = 0;
+			xfer_fill_queue(xfer, xfer->cluster_batch);
+			break;
+		case XFER_STATE_READ_ROOT_MD:
+			rc = xfer_status_check(xfer, &req, xfer->idx, XFER_STATE_READ_EXTENT_MD, xfer->cluster_batch);
+			if (rc != 0) {
+				return 0;
+			}
+
+			if (xfer->idx == 1 && (req->action == REQ_ACTION_READ && req->status == XFER_REQ_STATUS_DONE)) {
+				// read done - parse root md
+				uint8_t *p = req->payload;
+				memcpy(&xfer->num_extent_pages, p, sizeof(uint32_t));
+				p += sizeof(uint32_t);
+
+				memcpy(&xfer->old_num_clusters, p, sizeof(uint32_t));
+				p += sizeof(uint32_t);
+				
+				SPDK_NOTICELOG("Merge S3 Root MD: extent pages %u clusters %u s3 id %u\n",
+								xfer->num_extent_pages, xfer->num_clusters, xfer->s3_id);
+
+				if (xfer->num_extent_pages == 0) {
+					// no extent md to read
+					xfer->state = XFER_STATE_NEXT_S3_ID;
+					xfer_fill_queue(xfer, 0);
+					return 0;
+				}
+
+				xfer->state = XFER_STATE_READ_EXTENT_MD;
+				xfer_fill_queue(xfer, xfer->cluster_batch);
+				return 0;
+			}
+
+			memset(req->payload, 0, xfer->page_size * xfer->page_per_cluster);
+			req->dst_offset = s3_pack_offset(0, xfer->chain_s3_ids[xfer->hold_idx], true /* mid flag */, false);
+			req->len = xfer->page_per_cluster; // 2MB
+			req->action = REQ_ACTION_READ;
+			req->status = XFER_REQ_STATUS_READY;
+
+			/* enqueue for transfer; if ready_ring is full, return req to free_ring or retry */
+			if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
+				SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
+				assert(false);
+			}
+
+			xfer->outstanding_io++;
+			xfer->idx++;
+			count++;
+			break;
+		case XFER_STATE_READ_EXTENT_MD:
+			rc = xfer_status_check(xfer, &req, xfer->num_extent_pages, XFER_STATE_NEXT_S3_ID, 1);
+			if (rc != 0) {
+				return 0;
+			}
+
+			if (xfer->idx != 0 && (req->action == REQ_ACTION_READ && req->status == XFER_REQ_STATUS_DONE)) {
+				// read done, parse extent md
+				uint32_t *idx_in = (uint32_t *)req->payload;
+				uint32_t entries = (xfer->page_size * xfer->page_per_cluster) / sizeof(uint32_t);
+				for (uint32_t j = 0; j < entries; j++) {
+					if (j != 0 && idx_in[j] == 0) {
+						break;
+					}
+
+					if (!((idx_in[j] < xfer->old_num_clusters) && (idx_in[j] < xfer->num_clusters))) {
+						break;
+					}
+
+					if (xfer->clusters[idx_in[j]] != 0) {
+						continue;
+					}
+
+					xfer->clusters[idx_in[j]] = s3_pack_offset(idx_in[j], xfer->chain_s3_ids[xfer->hold_idx], false /* mid flag */, false /* MSB flag */);
+				}
+				req->action = REQ_ACTION_NONE;
+				req->status = XFER_REQ_STATUS_NONE;
+			}
+
+			if (xfer->idx < xfer->num_extent_pages) {
+				// prepare req
+				memset(req->payload, 0, xfer->page_size * xfer->page_per_cluster);
+				req->dst_offset = s3_pack_offset(xfer->idx + 1, xfer->chain_s3_ids[xfer->hold_idx], true /* mid flag */, false);
+				req->len = xfer->page_per_cluster; // 2MB
+				req->action = REQ_ACTION_READ;
+				req->status = XFER_REQ_STATUS_READY;
+
+				/* enqueue for transfer; if ready_ring is full, return req to free_ring or retry */
+				if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
+					SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
+					assert(false);
+				}
+
+				xfer->outstanding_io++;
+				xfer->idx++;
+				count++;
+				return count;
+			}
+			break;
+		case XFER_STATE_RECOVER_CLUSTERS:
+			rc = xfer_status_check(xfer, &req, xfer->idx, XFER_STATE_DONE, 0);
+			if (rc != 0) {
+				return 0;
+			}
+
+			// recover clusters arrays
+			for (uint32_t i = xfer->hold_idx; i < xfer->num_clusters; i++) {
+				xfer->hold_idx++;
+				// need to recover
+				if (xfer->clusters[i] != 0) {
+					// prepare req
+					xfer->persist_swap = true;
+					memset(req->payload, 0, xfer->page_size * xfer->page_per_cluster);
+					req->dst_offset = xfer->clusters[i];
+					req->offset = i * xfer->page_per_cluster;
+					req->len = xfer->page_per_cluster; // 2MB
+					req->action = REQ_ACTION_COPY_RECOVER;
+					req->status = XFER_REQ_STATUS_READY;
+
+					/* enqueue for transfer; if ready_ring is full, return req to free_ring or retry */
+					if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
+						SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
+						assert(false);
+					}
+					xfer->outstanding_io++;
+					xfer->idx++;
+					count++;
+					return count;
+				}
+			}
+
+			if (!xfer->persist_swap) {
+				xfer->hold_idx = 0;
+				// no need to persist the swapped clusters
+				SPDK_NOTICELOG("No persist clusters from S3 id %u\n", xfer->s3_id);
+				xfer->state = XFER_STATE_DONE;
+				xfer_fill_queue(xfer, 0);
+				return 0;
+			}
+			break;
+		case XFER_STATE_DONE:
+			xfer->lvol->transfer_status = XFER_DONE;
+			destroy_xfer_task(xfer);
+			return 0;
+
+		case XFER_STATE_FAILED:
+			// should not come here
+			SPDK_ERRLOG("S3 transfer task failed: -----\n");
+			if (xfer->outstanding_io != 0) {
+				//wait until all io done or timeout
+				SPDK_ERRLOG("S3 transfer task failed: ----- but still have outstanding io %d\n", xfer->outstanding_io);
+				rc = xfer_wait_outstanding_io(xfer, &req);
+				if (rc != 0) {
+					return 0;
+				}
+			}
+			destroy_xfer_task(xfer);
+			return 0;
+
+	default:
+		break;
+	}
+	return count;
+}
+
+
+static int
+md_xfer_poller(void *cb_arg)
+{
+	struct spdk_lvs_xfer *xfer, *tmp;
+	struct spdk_lvs_xfer *sub_xfer;	
+	int count = 0;
+	TAILQ_FOREACH_SAFE(xfer, &g_lvs_xfer_tasks, entry, tmp) {
+		int sub_count = 0;
+		switch (xfer->type)
+		{
+			case XFER_REPLICATE_SNAPSHOT:
+				count += xfer_replication(xfer);
+				break;
+			case XFER_MIGRATE_SNAPSHOT:
+				if (xfer->num_sub_tasks > 0) {
+					for (int i = 0; i < xfer->num_sub_tasks; i++) {
+						sub_xfer = xfer->list_task[i];
+						if (sub_xfer->waiting_for_sub_tasks) {
+							// waiting for sub tasks to finish
+							sub_count++;
+							continue;
+						} else {
+							count += xfer_migration(sub_xfer);
+						}
+					}
+					if (sub_count == xfer->num_sub_tasks) {
+						// all sub tasks done, we can delete the main task
+						destroy_parent_xfer_task(xfer);
+					}
+				} else {
+					count += xfer_migration(xfer);
+				}
+				break;
+			case XFER_S3_BACKUP:
+				count += xfer_s3_backup(xfer);
+				break;
+			case XFER_S3_MERGE:
+				count += xfer_s3_merge(xfer);
+				break;
+			case XFER_S3_RECOVER:
+				count += xfer_s3_recovery(xfer);
+				break;
+			default:
+				break;
+		}
+	}
+    return count ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
+}
+
+struct lvs_channel_info {
+	struct spdk_lvs_poll_group *lpg;
+	int idx;
+};
+
+static void
+spdk_put_md_channel_poll_group(void *ctx)
+{
+	struct lvs_channel_info *info = ctx;
+	struct spdk_lvs_poll_group *lpg = info->lpg;
+	struct spdk_io_channel *md_channel;
+	int idx = info->idx;
+	int last_idx;
+
+	assert(spdk_get_thread() == lpg->thread);
+	assert(idx >= 0);
+	assert(idx < lpg->lvs_cnt);
+
+	md_channel = lpg->lvs_info[idx].md_channel;
+	if (md_channel != NULL) {
+		spdk_put_io_channel(md_channel);
+	}
+
+	/*
+	 * Keep lvs_info[] compact by moving the last active entry into
+	 * the slot being removed.
+	 */
+	last_idx = lpg->lvs_cnt - 1;
+
+	if (idx != last_idx) {
+		lpg->lvs_info[idx] = lpg->lvs_info[last_idx];
+	}
+
+	memset(&lpg->lvs_info[last_idx], 0, sizeof(lpg->lvs_info[last_idx]));
+
+	lpg->lvs_cnt--;
+
+	free(info);
+}
+
+bool
+spdk_unload_lvs_poll_group(struct spdk_lvol_store *lvs)
+{
+	struct spdk_lvs_poll_group *lpg;
+	struct lvs_channel_info *info;
+	struct spdk_lvs_xfer *xfer;
+
+	TAILQ_FOREACH(lpg, &g_lvs_poll_groups, entry) {
+		for (int i = 0; i < lpg->lvs_cnt; i++) {
+			if (lpg->lvs_info[i].lvs == lvs && lpg->lvs_info[i].status) {
+				info = calloc(1, sizeof(*info));
+				if (!info) {
+					SPDK_ERRLOG("Not enough memory to allocate ctx to return poll groups channel in lvs.\n");
+					continue;
+				}
+				info->lpg = lpg;
+				info->idx = i;
+				lpg->lvs_info[i].status = false;
+				spdk_thread_send_msg(lpg->thread, spdk_put_md_channel_poll_group, info);
+			}
+		}
+	}
+
+	TAILQ_FOREACH(xfer, &g_lvs_xfer_tasks, entry) {
+		if (xfer->lvol && xfer->lvol->lvol_store == lvs) {
+			SPDK_NOTICELOG("Transfer task already exists for lvs %s.\n", lvs->name);
+			return true;
+		}
+	}
+
+	return false;
+
+}
+
+static void
+spdk_lvs_create_poll_group_done(void *ctx)
+{
+	struct spdk_lvs_poll_group *lpg = ctx;
+
+	if (!lpg) {
+		SPDK_ERRLOG("Failed to create lvs poll group\n");
+		/* Change the state to error but wait for completions from all other threads */
+		return;
+	}
+
+	TAILQ_INSERT_TAIL(&g_lvs_poll_groups, lpg, entry);
+	g_lvs_num_pgs++;
+	if (g_lvs_num_pgs == spdk_cpuset_count(g_helper_set)) {
+		SPDK_NOTICELOG("Created %u lvs poll groups\n", g_lvs_num_pgs);		
+	}
+}
+
+static void
+spdk_lvs_create_poll_group(void *ctx)
+{
+	struct spdk_lvs_poll_group *lpg;
+	// struct spdk_lvol_store *lvs = ctx;
+
+	lpg = calloc(1, sizeof(*lpg));
+	if (!lpg) {
+		SPDK_ERRLOG("Not enough memory to allocate poll groups in lvs.\n");
+		spdk_thread_send_msg(g_lvs_md_thread, spdk_lvs_create_poll_group_done, NULL);
+		return;
+	}
+
+	lpg->thread = spdk_get_thread();
+	lpg->thread_name = spdk_thread_get_name(lpg->thread);
+	TAILQ_INIT(&lpg->rmt_lvols);
+	TAILQ_INIT(&lpg->ch_tdev);
+	// lpg->md_thread = g_lvs_md_thread;
+	const char *suffix = strrchr(lpg->thread_name, '_'); // find last '_'
+	lpg->id =  atoi(suffix + 1);
+	SPDK_NOTICELOG("Create new thread %s for lvolstore with id %d t %p md %p.\n", lpg->thread_name, lpg->id, spdk_get_thread(), g_lvs_md_thread);
+	spdk_thread_send_msg(g_lvs_md_thread, spdk_lvs_create_poll_group_done, lpg);
+}
+
+static void
+spdk_lvs_create_poll_groups(struct spdk_lvol_store *lvs)
+{
+	uint32_t cpu, count = 0;
+	char thread_name[32];
+	struct spdk_thread *thread;
+
+	g_lvs_md_thread = spdk_get_thread();
+	assert(g_lvs_md_thread != NULL);
+	SPDK_NOTICELOG("Create new thread t %p md %p.\n", spdk_get_thread(), g_lvs_md_thread);
+	SPDK_ENV_FOREACH_CORE(cpu) {
+		if (g_helper_set && !spdk_cpuset_get_cpu(g_helper_set, cpu)) {
+			continue;
+		}
+		snprintf(thread_name, sizeof(thread_name), "lvs_poll_group_%03u", count++);
+		
+		thread = spdk_thread_create(thread_name, g_helper_set);
+		assert(thread != NULL);
+		// add condition here for case that thread not created
+
+		spdk_thread_send_msg(thread, spdk_lvs_create_poll_group, lvs);
+	}
+
+	//for destroy the thread
+	// spdk_thread_exit(spdk_get_thread());
+}
+
+static int
+spdk_lvs_is_subset_of_env_core_mask(const struct spdk_cpuset *set)
+{
+	uint32_t i, tmp_counter = 0;
+
+	SPDK_ENV_FOREACH_CORE(i) {
+		if (spdk_cpuset_get_cpu(set, i)) {
+			++tmp_counter;
+		}
+	}
+	return spdk_cpuset_count(set) - tmp_counter;
+}
+
+int
+spdk_lvs_poll_group_options(char *mask)
+{
+	int ret = 0;
+	if (!(g_helper_set = spdk_cpuset_alloc())) {
+		SPDK_ERRLOG("Unable to allocate a poll groups mask object in lvs_decode_poll_groups_mask.\n");
+		return -ENOMEM;
+	}
+
+	if (g_helper_set != NULL && mask != NULL) {
+		ret = spdk_cpuset_parse(g_helper_set, mask);
+		if (ret == 0) {
+			if (spdk_lvs_is_subset_of_env_core_mask(g_helper_set) != 0) {
+				SPDK_ERRLOG("cpumask 0x%s is out of range\n", spdk_cpuset_fmt(g_helper_set));
+				return -EINVAL;
+			}
+		} else {
+			SPDK_ERRLOG("Invalid cpumask\n");
+			return -EINVAL;
+		}
+	}
+
+	if (spdk_cpuset_count(g_helper_set) == 0) {
+		SPDK_ERRLOG("No helper core is set.\n");
+		return -EINVAL;
+	}
+
+	spdk_lvs_create_poll_groups(NULL);
+	return 0;
+}
+
+static void
+spdk_lvs_rmt_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev,
+			     void *event_ctx)
+{
+	struct spdk_transfer_dev *tdev = event_ctx;
+	switch (type) {
+	case SPDK_BDEV_EVENT_REMOVE:
+		SPDK_NOTICELOG("Receive remove event from callback tdev %s.\n", tdev->bdev_name);
+		spdk_change_rmt_lvol_state(tdev->lvs, tdev);
+		break;
+	default:
+		SPDK_NOTICELOG("Unsupported bdev event: type %d\n", type);
+		break;
+	}
+}
+
+void
+spdk_lvs_rmt_bdev_remove(struct spdk_transfer_dev *tdev)
+{
+	SPDK_NOTICELOG("Hotplug removal for tdev %s.\n", tdev->bdev_name);
+	spdk_change_rmt_lvol_state(tdev->lvs, tdev);
+}
+
+static struct spdk_transfer_dev *
+spdk_check_rmt_bdev(const char *name, struct spdk_lvol_store *lvs)
+{
+	struct spdk_transfer_dev *tdev;
+	bool bdev_found = false;
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+	TAILQ_FOREACH(tdev, &lvs->transfer_devs, entry) {
+		if (strcmp(tdev->bdev_name, name) == 0) {
+			bdev_found = true;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+	if (bdev_found) {
+		return tdev;
+	}
+	return NULL;
+}
+
+static struct spdk_transfer_dev *
+spdk_find_s3_bdev(struct spdk_lvol_store *lvs)
+{
+	struct spdk_transfer_dev *tdev;
+	bool bdev_found = false;
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+	TAILQ_FOREACH(tdev, &lvs->transfer_devs, entry) {
+		if (tdev->is_s3) {
+			bdev_found = true;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+	if (bdev_found) {
+		return tdev;
+	}
+	return NULL;
+}
+
+struct spdk_transfer_dev *
+spdk_open_rmt_bdev(const char *name, struct spdk_lvol_store *lvs, bool is_s3)
+{
+	struct spdk_transfer_dev *tdev;
+	int rc = 0;
+
+	tdev = spdk_check_rmt_bdev(name, lvs);
+	if (tdev) {
+		SPDK_NOTICELOG("The remote bdev already opened.\n");
+		return tdev;
+	}
+
+	tdev = calloc(1, sizeof(*tdev));
+	if (!tdev) {
+		SPDK_ERRLOG("Cannot allocate memory for transfer device.\n");
+		return NULL;
+	}
+
+	snprintf(tdev->bdev_name, sizeof(tdev->bdev_name), "%s", name);
+	tdev->is_s3 = is_s3;
+	tdev->lvs = lvs;
+	tdev->thread = spdk_get_thread();
+	TAILQ_INIT(&tdev->redirect_channels);
+	rc = spdk_bdev_open_ext(tdev->bdev_name, true, spdk_lvs_rmt_bdev_event_cb, tdev, &tdev->desc);
+	if (rc != 0) {
+		SPDK_ERRLOG("Failed to open remote bdev %s.\n", tdev->bdev_name);
+		free(tdev);
+		return NULL;
+	}
+	tdev->state = HUBLVOL_CONNECTED;
+	TAILQ_INSERT_TAIL(&lvs->transfer_devs, tdev, entry);
+	return tdev;
+}
+
+static int
+spdk_lvs_create_base_channel_pg(struct spdk_lvs_poll_group *lpg, struct spdk_transfer_dev *tdev) {
+
+	struct remote_dev_info *rdi = NULL;
+
+	TAILQ_FOREACH(rdi, &lpg->ch_tdev, entry) {
+		if (rdi->tdev == tdev) {
+			return 0;
+		}
+	}
+
+	rdi = calloc(1, sizeof(*rdi));
+	if (!rdi) {
+		return -1;
+	}
+	//open the base channel in this lines so on the destroing the task and put the rmt channel if we want to use the tdev again we can do it
+	//without facing duplicate issue with nvmf
+	rdi->tdev = tdev;
+	rdi->tdev_channel = spdk_bdev_get_io_channel(tdev->desc);
+	if (!rdi->tdev_channel) {
+		SPDK_ERRLOG("Cannot get base io channel for remote bdev %s.\n", tdev->bdev_name ? tdev->bdev_name : "s3 backup task");
+		free(rdi);
+		return -1;
+	}
+
+	TAILQ_INSERT_TAIL(&lpg->ch_tdev, rdi, entry);
+	tdev->pg[lpg->id]++;
+	return 0;
+}
+
+static void
+spdk_lvs_add_rmt_bdev_to_poll_group(void *arg) {
+	struct remote_lvol_info *rmt_lvol = (struct remote_lvol_info *)(uintptr_t)arg;
+	struct spdk_lvs_poll_group *lpg = rmt_lvol->group;
+	struct spdk_transfer_dev *tdev = rmt_lvol->tdev;
+	bool found = false;
+
+	if (spdk_lvs_create_base_channel_pg(lpg, tdev) < 0) {
+		SPDK_ERRLOG("rmt-lvol Cannot get io channel for remote bdev %s.\n", tdev->bdev_name ? tdev->bdev_name : "s3 backup task");
+		rmt_lvol->xfer_task->state = XFER_STATE_FAILED;
+		free(rmt_lvol);
+		return;
+	}
+
+	rmt_lvol->channel = spdk_bdev_get_io_channel(rmt_lvol->desc);
+	if (!rmt_lvol->channel) {
+		// we should some how handl the error here
+		SPDK_ERRLOG("rmt-lvol Cannot get io channel for remote bdev %s.\n", tdev->bdev_name ? tdev->bdev_name : "s3 backup task");
+		rmt_lvol->xfer_task->state = XFER_STATE_FAILED;
+		free(rmt_lvol);
+		return;
+	}
+
+	if (rmt_lvol->xfer_task->lvol && !rmt_lvol->md_channel) {
+		for (int i = 0; i < lpg->lvs_cnt; i++) {
+			if (lpg->lvs_info[i].lvs == tdev->lvs) {
+				if (!lpg->lvs_info[i].md_channel) {
+					lpg->lvs_info[i].md_channel = spdk_bs_alloc_io_channel(lpg->lvs_info[i].lvs->blobstore);
+					lpg->lvs_info[i].status = true;
+				}
+				rmt_lvol->md_channel = lpg->lvs_info[i].md_channel;
+				found = true;
+			}
+		}
+
+		if (!found) {
+			int idx = lpg->lvs_cnt;
+			lpg->lvs_info[idx].lvs = tdev->lvs;
+			lpg->lvs_info[idx].md_channel = spdk_bs_alloc_io_channel(lpg->lvs_info[idx].lvs->blobstore);
+			if (!lpg->lvs_info[idx].md_channel) {
+				SPDK_ERRLOG("Failed to get md IO channel.\n");				
+				spdk_put_io_channel(rmt_lvol->channel);
+				lpg->lvs_info[idx].lvs = NULL;
+				rmt_lvol->channel = NULL;
+				rmt_lvol->xfer_task->state = XFER_STATE_FAILED;
+				free(rmt_lvol);
+				return;
+			}
+			lpg->lvs_info[idx].status = true;
+			rmt_lvol->md_channel = lpg->lvs_info[idx].md_channel;
+			lpg->lvs_cnt++;
+		}
+	}
+
+	rmt_lvol->status = true;
+	tdev->pg[lpg->id]++;
+	TAILQ_INSERT_TAIL(&lpg->rmt_lvols, rmt_lvol, entry);
+	return;
+}
+
+static void
+spdk_create_poller(void *arg) {
+	struct spdk_lvs_poll_group *lpg = arg;
+	if (g_pg_xfer_poller[lpg->id]) {
+		// SPDK_NOTICELOG("The lpg id: %d poller for transfer task already exists.\n", lpg->id);
+		return;
+	}
+	g_pg_xfer_poller[lpg->id] = spdk_poller_register(helper_xfer_poller, lpg, 200);
+}
+
+static int
+spdk_lvol_create_backup_task(struct spdk_lvs_xfer *task, struct spdk_transfer_dev *tdev) {
+
+	struct spdk_lvs_xfer_req *req;
+	struct spdk_lvs_poll_group *lpg;
+	int s_elements_payload = 0;
+
+	s_elements_payload = spdk_bs_get_cluster_size(tdev->lvs->blobstore);
+
+	if (task->type == XFER_MIGRATE_SNAPSHOT) {
+		s_elements_payload = task->page_size * 8; // 8 block per cluster transfer for migration
+	}
+
+	task->free_ring  = spdk_ring_create(SPDK_RING_TYPE_MP_MC, task->cluster_batch, SPDK_ENV_SOCKET_ID_ANY);
+	if (!task->free_ring) {
+		SPDK_ERRLOG("Unable to allocate rings on transfer task for lvol %d\n", task->s3_id);
+		goto error;
+	}
+
+    task->ready_ring = spdk_ring_create(SPDK_RING_TYPE_MP_MC, task->cluster_batch, SPDK_ENV_SOCKET_ID_ANY);
+	if (!task->ready_ring) {
+		SPDK_ERRLOG("Unable to allocate rings on transfer task for lvol %d\n", task->s3_id);
+		goto error;
+	}
+
+	task->reqs = calloc(task->cluster_batch, sizeof(*task->reqs));
+	if (!task->reqs) {
+		SPDK_ERRLOG("Unable to allocate reqs on xfer task for lvol %d\n", task->s3_id);
+		goto error;
+	}
+
+	task->pdus = spdk_dma_zmalloc(task->cluster_batch * s_elements_payload, 0x1000, NULL);
+	if (!task->pdus) {
+		SPDK_ERRLOG("Unable to allocate pdu pool on transfer task for lvol %d.\n", task->s3_id);
+		goto error;
+	}
+
+	for (int i = 0; i < task->cluster_batch; i++) {
+        task->reqs[i].payload =  task->pdus + (i * s_elements_payload);
+        task->reqs[i].len = s_elements_payload / task->page_size; // in page unit
+		task->reqs[i].xfer = task;
+		task->reqs[i].type = task->type;
+		req = &task->reqs[i];
+		req->status = XFER_REQ_STATUS_NONE;
+    }
+
+	// insert tdev to all helper cores and open channels	
+	TAILQ_FOREACH(lpg, &g_lvs_poll_groups, entry) {
+		struct remote_lvol_info *rmt_lvol = calloc(1, sizeof(*rmt_lvol));
+		if (!rmt_lvol) {
+			SPDK_ERRLOG("Cannot allocate memory for remote lvol info.\n");
+			task->state = XFER_STATE_FAILED;
+			if (task->lvol) {
+				task->lvol->transfer_status = XFER_FAILED;
+			}
+			break;
+		}
+		rmt_lvol->desc = tdev->desc;
+		rmt_lvol->tdev = tdev;
+		rmt_lvol->free_ring = task->free_ring;
+		rmt_lvol->ready_ring = task->ready_ring;
+		rmt_lvol->type = task->type;
+		rmt_lvol->xfer_task = task;
+		rmt_lvol->group = lpg;
+		spdk_thread_send_msg(lpg->thread, spdk_lvs_add_rmt_bdev_to_poll_group, rmt_lvol);
+	}
+	
+
+	SPDK_NOTICELOG("Transfer task %d %s task started.\n", task->s3_id,
+		 			xfer_type_to_string(task->type));
+
+	if (task->lvol) {
+		task->lvol->transfer_status = XFER_IN_PROGRESS;
+	}
+
+	TAILQ_FOREACH(lpg, &g_lvs_poll_groups, entry) {
+		spdk_thread_send_msg(lpg->thread, spdk_create_poller, lpg);
+	}
+
+	if (!g_xfer_md_poller) {
+		g_xfer_md_poller = spdk_poller_register(md_xfer_poller, NULL, 1000);
+	}
+
+	return 0;
+
+error:
+	spdk_dma_free(task->pdus);
+	free(task->reqs);
+	spdk_ring_free(task->free_ring);
+	spdk_ring_free(task->ready_ring);
+	if (task->chain)
+		free(task->chain);
+	if (task->clusters)
+		free(task->clusters);
+	if (task->chain_s3_ids)
+		free(task->chain_s3_ids);
+	free(task);
+	return -ENOMEM;
+}
+
+static int spdk_lvol_transfer_delay(void *ctx);
+
+static void 
+spdk_lvol_transfer_delay_cb(void *ctx, int rc) {
+	struct spdk_lvs_xfer *xfer = ctx;
+	struct spdk_lvs_xfer *sub_xfer;
+	
+	if (rc == 0) {
+		if (xfer->num_sub_tasks > 0 && xfer->idx < (uint32_t)xfer->num_sub_tasks - 1) {
+			xfer->idx++;
+			sub_xfer = xfer->list_task[xfer->idx];
+			blob_check_io_inflaight(sub_xfer->lvol->blob, spdk_lvol_transfer_delay_cb, xfer);
+			return;
+		}
+		xfer->idx = 0;
+		TAILQ_INSERT_TAIL(&g_lvs_xfer_tasks, xfer, entry);
+	} else {
+		SPDK_NOTICELOG("Transfer lvol %s %s task: last offset %" PRIu64 " status %s still has IO inflight.\n", xfer->lvol->name,
+		 			xfer_type_to_string(xfer->type), xfer->lvol->last_offset,
+					xfer_result_type_to_string(xfer->lvol->transfer_status));
+		xfer->tmo_poller =  spdk_poller_register(spdk_lvol_transfer_delay, xfer, 50000);// 50ms
+	}
+}
+
+static int 
+spdk_lvol_transfer_delay(void *ctx) {
+	struct spdk_lvs_xfer *xfer = ctx;
+	spdk_poller_unregister(&xfer->tmo_poller);
+	xfer->tmo_poller = NULL;
+	blob_check_io_inflaight(xfer->lvol->blob, spdk_lvol_transfer_delay_cb, xfer);
+	return -1;
+}
+
+int
+spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_batch, enum xfer_type type,
+				struct spdk_transfer_dev *tdev, const char *snapshot_name, uint32_t lvol_id,
+				spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg) {
+	struct spdk_lvs_xfer *xfer, *task;	
+	struct spdk_lvol_store *lvs = lvol->lvol_store;	
+	int rc;
+	// if (!lvs->leader) {
+	// 	SPDK_ERRLOG("Lvolstore %s: is not leader.\n", lvs->name);
+	// 	return -EINVAL;
+	// }
+
+	if (!tdev || !tdev->desc || tdev->dev_in_remove) {
+		SPDK_ERRLOG("Lvolstore %s: invalid transfer device for %s.\n", lvs->name, xfer_type_to_string(type));
+		return -EINVAL;
+	}
+
+	TAILQ_FOREACH(xfer, &g_lvs_xfer_tasks, entry) {
+		if (xfer->lvol == lvol) {
+			SPDK_NOTICELOG("The same transfer task already exists.\n");
+			return -EEXIST;
+		}
+	}
+
+	task = calloc(1, sizeof(*task));
+	if (!task) {
+		SPDK_ERRLOG("Cannot allocate memory for transfer structure task.\n");
+		return -ENOMEM;
+	}
+	task->chain	= NULL;
+	task->clusters = NULL;
+	task->chain_s3_ids = NULL;
+	task->old_clusters = NULL;
+	task->lvol = lvol;
+	lvol->last_offset = offset;
+	task->current_offset = offset;
+	task->cluster_batch = cluster_batch;
+	task->type = type;
+	task->cb_fn = cb_fn;
+	task->cb_arg = cb_arg;
+	task->state = XFER_STATE_NONE;
+	
+
+	task->page_size = spdk_bs_get_page_size(lvol->lvol_store->blobstore);
+	task->page_per_cluster = spdk_bs_get_cluster_size(lvol->lvol_store->blobstore) / task->page_size;
+
+	if (snapshot_name) {
+		task->len = snprintf(task->snapshot_name, sizeof(task->snapshot_name), "%s", snapshot_name);
+		task->final_step = true;
+		task->signal_sent = false;
+	} else {
+		task->len = 0;
+		task->final_step = false;
+	}
+
+	task->num_clusters = spdk_blob_get_num_clusters(lvol->blob);
+	task->clusters = calloc(task->num_clusters, sizeof(uint64_t));
+	if (!task->clusters) {
+		SPDK_ERRLOG("Cannot allocate memory for transfer clusters array.\n");
+		free(task);
+		return -ENOMEM;
+	}
+
+	// rememeber
+	// if (type == XFER_MIGRATE_SNAPSHOT) {
+	// 	//TODO: in case we have cluster size more than 2MB 
+	// 	if (task->page_per_cluster > 512) {
+	// 		extent = (task->page_per_cluster / 512) / ((spdk_blob_get_geometry(lvol->blob) & 0x3) + 1);
+	// 	}
+	// }
+
+	lvol->redirect_map_id = lvol_id;
+	lvol->tdev = tdev;
+
+	rc = spdk_lvol_create_backup_task(task, tdev);
+	if (rc != 0) {
+		return rc;
+	}
+
+	//freezing the lvol for incoming io here
+	//TODO: put some delay for stating the migration bcs may we have inflight IO
+	if (task->final_step) {
+		lvol->freezed = true;
+	}
+	
+	SPDK_NOTICELOG("Transfer lvol %s %s task: last offset %" PRIu64 " status %s start.\n", task->lvol->name,
+		 			xfer_type_to_string(task->type), task->lvol->last_offset,
+					xfer_result_type_to_string(task->lvol->transfer_status));
+	task->tmo_poller =  spdk_poller_register(spdk_lvol_transfer_delay, task, 50000);// 50ms
+	// TAILQ_INSERT_TAIL(&g_lvs_xfer_tasks, task, entry);
+	return 0;
+}
+
+int
+spdk_lvol_batch_transfer(uint32_t cluster_batch, enum xfer_type type, struct spdk_transfer_dev *tdev,
+				struct spdk_lvol **batch_lvols, int num_lvols,
+				char **batch_snapshots, int num_snapshots,
+				uint32_t *batch_lvol_ids, int num_lvol_ids,
+				spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg) {
+	struct spdk_lvs_xfer *xfer, *task;
+	
+	struct spdk_lvol_store *lvs;
+	struct spdk_lvol *lvol;
+	char *snapshot_name;
+	uint32_t lvol_id;
+	struct spdk_lvs_xfer **list_xfer;
+	int rc = -ENOMEM, created_tasks = 0;
+	// if (!lvs->leader) {
+	// 	SPDK_ERRLOG("Lvolstore %s: is not leader.\n", lvs->name);
+	// 	return -EINVAL;
+	// }	
+	if (num_lvols <= 0 || batch_lvols == NULL ||
+    	batch_snapshots == NULL || batch_lvol_ids == NULL ||
+    	num_snapshots != num_lvols || num_lvol_ids != num_lvols) {
+		return -EINVAL;
+	}
+
+	lvs = batch_lvols[0]->lvol_store;
+	if (!tdev || !tdev->desc || tdev->dev_in_remove) {
+		SPDK_ERRLOG("Lvolstore %s: invalid transfer device for %s.\n", lvs->name, xfer_type_to_string(type));
+		return -EINVAL;
+	}
+
+	struct spdk_lvs_xfer *list_task[num_lvols];
+
+	TAILQ_FOREACH(xfer, &g_lvs_xfer_tasks, entry) {
+		for (int i = 0; i < num_lvols; i++) {
+			if (xfer->lvol == batch_lvols[i]) {
+				SPDK_NOTICELOG("The same transfer task already exists.\n");
+				return -EEXIST;
+			}
+		}
+	}
+
+	list_xfer = calloc(num_lvols, sizeof(*list_xfer));
+	if (list_xfer == NULL) {
+		SPDK_ERRLOG("Cannot allocate the batch task list.\n");
+		return -ENOMEM;
+	}
+
+	for (int i = 0; i < num_lvols; i++) {
+		lvol = batch_lvols[i];
+		snapshot_name = batch_snapshots[i];
+		lvol_id = batch_lvol_ids[i];
+
+		task = calloc(1, sizeof(*task));
+		if (!task) {
+			SPDK_ERRLOG("Cannot allocate memory for transfer structure task.\n");
+			created_tasks = i;
+			goto error;
+		}
+		list_task[i] = task;
+		task->list_task = list_xfer;
+		task->num_sub_tasks = num_lvols;
+		task->chain	= NULL;
+		task->clusters = NULL;
+		task->chain_s3_ids = NULL;
+		task->old_clusters = NULL;
+		task->lvol = lvol;
+		lvol->last_offset = 0;
+		task->current_offset = 0;
+		task->cluster_batch = cluster_batch;
+		task->type = type;
+		task->cb_fn = cb_fn;
+		task->cb_arg = cb_arg;
+		task->state = XFER_STATE_NONE;
+		
+
+		task->page_size = spdk_bs_get_page_size(lvol->lvol_store->blobstore);
+		task->page_per_cluster = spdk_bs_get_cluster_size(lvol->lvol_store->blobstore) / task->page_size;
+
+		if (snapshot_name) {
+			task->len = snprintf(task->snapshot_name, sizeof(task->snapshot_name), "%s", snapshot_name);
+			task->final_step = true;
+			task->signal_sent = false;
+		} else {
+			task->len = 0;
+			task->final_step = false;
+		}
+
+		task->num_clusters = spdk_blob_get_num_clusters(lvol->blob);
+		task->clusters = calloc(task->num_clusters, sizeof(uint64_t));
+		if (!task->clusters) {
+			SPDK_ERRLOG("Cannot allocate memory for transfer clusters array.\n");
+			free(task);
+			created_tasks = i;
+			goto error;
+		}
+
+
+		lvol->redirect_map_id = lvol_id;
+		lvol->tdev = tdev;
+
+		rc = spdk_lvol_create_backup_task(task, tdev);
+		if (rc != 0) {
+			created_tasks = i;
+			goto error;
+		}
+
+		// SPDK_NOTICELOG("Transfer lvol %s %s task: last offset %" PRIu64 " status %s start.\n", task->lvol->name,
+		// 				xfer_type_to_string(task->type), task->lvol->last_offset,
+		// 				xfer_result_type_to_string(task->lvol->transfer_status));
+	}
+
+	for (int i = 0; i < num_lvols; i++) {
+		list_task[i]->lvol->freezed = true;
+		for (int j = 0; j < num_lvols; j++) {
+			list_task[i]->list_task[j] = list_task[j];
+		}
+	}
+	list_task[0]->tmo_poller =  spdk_poller_register(spdk_lvol_transfer_delay, list_task[0], 100000);// 50ms
+	// TAILQ_INSERT_TAIL(&g_lvs_xfer_tasks, list_task[0], entry);
+	return 0;
+error:
+	if (created_tasks <= 0) {
+		free(list_xfer);
+		return rc;
+	}
+
+	for (int i = 0; i < created_tasks; i++) {
+		list_task[i]->state = XFER_STATE_FAILED;
+		list_task[i]->num_sub_tasks = created_tasks;
+		for (int j = 0; j < created_tasks; j++) {
+			list_task[i]->list_task[j] = list_task[j];
+		}
+	}
+	TAILQ_INSERT_TAIL(&g_lvs_xfer_tasks, list_task[0], entry);
+	return 0;
+}
+
+//TODO: we assign the tdev to the lvs and if we want to use this tdev for another lvolstore we should check if the tdev is already used by to another lvolstore or not
+// bcs we cannot open the same tdev for two lvolstore at the same time
+int
+spdk_lvol_s3_backup(struct spdk_lvol *lvol, uint32_t cluster_batch,
+				struct spdk_lvol **chain_snapshots, int num_snapshots, uint32_t s3_id) {
+	struct spdk_transfer_dev *tdev;
+	struct spdk_lvs_xfer *xfer, *task;
+	int rc;
+
+	TAILQ_FOREACH(xfer, &g_lvs_xfer_tasks, entry) {
+		if (xfer->s3_id == s3_id) {
+			SPDK_NOTICELOG("The same transfer task already exists.\n");
+			return -EEXIST;
+		}
+	}
+
+	tdev = spdk_find_s3_bdev(lvol->lvol_store);
+	if (!tdev) {
+		SPDK_ERRLOG("Cannot find S3 transfer device.\n");
+		return -EINVAL;
+	}
+
+	task = calloc(1, sizeof(*task));
+	if (!task) {
+		SPDK_ERRLOG("Cannot allocate memory for transfer structure task.\n");
+		return -ENOMEM;
+	}
+	task->chain	= NULL;
+	task->clusters = NULL;
+	task->chain_s3_ids = NULL;
+	task->old_clusters = NULL;
+	task->lvol = lvol;
+	task->lvol->transfer_status = XFER_NONE;
+	task->cluster_batch = cluster_batch;
+	task->type = XFER_S3_BACKUP;
+	task->state = XFER_STATE_NONE;
+	task->chain_count = num_snapshots;
+	task->s3_id = s3_id;
+	task->timeout = spdk_get_ticks();
+
+	task->chain = calloc(num_snapshots, sizeof(struct spdk_lvol *));
+	if (!task->chain) {
+		SPDK_ERRLOG("Cannot allocate memory for transfer clusters array.\n");
+		free(task);
+		return -ENOMEM;
+	}
+
+	for (int i = 0; i < num_snapshots; i++) {
+		task->chain[i] = chain_snapshots[i];
+		// SPDK_NOTICELOG("s3_id[%zu]=%u\n", i, s3_ids_chain[i]);
+	}
+
+	task->page_size = spdk_bs_get_page_size(lvol->lvol_store->blobstore);
+	task->page_per_cluster = spdk_bs_get_cluster_size(lvol->lvol_store->blobstore) / task->page_size;
+
+	task->num_clusters = spdk_blob_get_num_clusters(lvol->blob);
+	task->clusters = calloc(task->num_clusters, sizeof(uint64_t));
+	if (!task->clusters) {
+		SPDK_ERRLOG("Cannot allocate memory for transfer clusters array.\n");
+		free(task->chain);
+		free(task);
+		return -ENOMEM;
+	}
+
+	rc = spdk_lvol_create_backup_task(task, tdev);
+	if (rc != 0) {
+		return rc;
+	}
+	TAILQ_INSERT_TAIL(&g_lvs_xfer_tasks, task, entry);
+	return 0;
+}
+
+int
+spdk_lvol_s3_merge(struct spdk_lvol_store *lvs, uint32_t s3_id, uint32_t old_s3_id, uint32_t cluster_batch) {
+	struct spdk_transfer_dev *tdev;
+	struct spdk_lvs_xfer *xfer, *task;
+	int rc;
+
+	TAILQ_FOREACH(xfer, &g_lvs_xfer_tasks, entry) {
+		if (xfer->s3_id == s3_id && xfer->old_s3_id == old_s3_id) {
+			SPDK_NOTICELOG("The same transfer task already exists.\n");
+			return -EEXIST;
+		}
+	}
+
+	tdev = spdk_find_s3_bdev(lvs);
+	if (!tdev) {
+		SPDK_ERRLOG("Cannot find S3 transfer device.\n");
+		return -EINVAL;
+	}
+
+	task = calloc(1, sizeof(*task));
+	if (!task) {
+		SPDK_ERRLOG("Cannot allocate memory for transfer structure task.\n");
+		return -ENOMEM;
+	}
+	task->chain	= NULL;
+	task->clusters = NULL;
+	task->chain_s3_ids = NULL;
+	task->old_clusters = NULL;
+	task->lvol = NULL;
+	task->cluster_batch = cluster_batch;
+	task->type = XFER_S3_MERGE;
+	task->state = XFER_STATE_NONE;
+
+	task->s3_id = s3_id;
+	task->old_s3_id = old_s3_id;
+	task->timeout = spdk_get_ticks();
+
+	task->page_size = spdk_bs_get_page_size(lvs->blobstore);
+	task->page_per_cluster = spdk_bs_get_cluster_size(lvs->blobstore) / task->page_size;
+
+	rc = spdk_lvol_create_backup_task(task, tdev);
+	if (rc != 0) {
+		return rc;
+	}
+	TAILQ_INSERT_TAIL(&g_lvs_xfer_tasks, task, entry);
+	return 0;
+}
+
+int
+spdk_lvol_s3_recovery(struct spdk_lvol *lvol, uint32_t cluster_batch,
+				uint32_t *chain_s3_ids, uint32_t num_s3_ids) {
+	struct spdk_transfer_dev *tdev;
+	struct spdk_lvs_xfer *xfer, *task;
+	int rc;
+
+	TAILQ_FOREACH(xfer, &g_lvs_xfer_tasks, entry) {
+		if (xfer->lvol == lvol) {
+			SPDK_NOTICELOG("The same transfer task already exists.\n");
+			return -EEXIST;
+		}
+	}
+
+	tdev = spdk_find_s3_bdev(lvol->lvol_store);
+	if (!tdev) {
+		SPDK_ERRLOG("Cannot find S3 transfer device.\n");
+		return -EINVAL;
+	}
+
+	task = calloc(1, sizeof(*task));
+	if (!task) {
+		SPDK_ERRLOG("Cannot allocate memory for transfer structure task.\n");
+		return -ENOMEM;
+	}
+	task->chain	= NULL;
+	task->clusters = NULL;
+	task->chain_s3_ids = NULL;
+	task->old_clusters = NULL;
+	task->lvol = lvol;
+	task->lvol->transfer_status = XFER_NONE;
+	task->cluster_batch = cluster_batch;
+	task->type = XFER_S3_RECOVER;
+	task->state = XFER_STATE_NONE;
+	task->s3_id = chain_s3_ids[0];
+
+	task->chain_s3_ids = calloc(num_s3_ids, sizeof(uint32_t));
+	if (!task->chain_s3_ids) {
+		SPDK_ERRLOG("Cannot allocate memory for transfer clusters array.\n");		
+		free(task);
+		return -ENOMEM;
+	}
+
+	for (size_t i = 0; i < num_s3_ids; i++) {
+		task->chain_s3_ids[i] = chain_s3_ids[i];
+		// SPDK_NOTICELOG("s3_id[%zu]=%u\n", i, s3_ids_chain[i]);
+	}
+
+	task->chain_count = num_s3_ids;
+	task->timeout = spdk_get_ticks();
+
+	task->page_size = spdk_bs_get_page_size(lvol->lvol_store->blobstore);
+	task->page_per_cluster = spdk_bs_get_cluster_size(lvol->lvol_store->blobstore) / task->page_size;
+
+	task->num_clusters = spdk_blob_get_num_clusters(lvol->blob);
+	task->clusters = calloc(task->num_clusters, sizeof(uint64_t));
+	if (!task->clusters) {
+		SPDK_ERRLOG("Cannot allocate memory for transfer clusters array.\n");
+		free(task->chain_s3_ids);
+		free(task);
+		return -ENOMEM;
+	}
+
+	rc = spdk_lvol_create_backup_task(task, tdev);
+	if (rc != 0) {
+		return rc;
+	}
+
+	TAILQ_INSERT_TAIL(&g_lvs_xfer_tasks, task, entry);
+	return 0;
+}
+
+void
+spdk_lvs_connect_hublvol(struct spdk_lvol_store *lvs, const char *remote_bdev)
+{
+	SPDK_NOTICELOG("Connect remote hublvol %s.\n", remote_bdev);
+	snprintf(lvs->remote_bdev, sizeof(lvs->remote_bdev), "%s", remote_bdev);
+	lvs->hub_dev.thread = spdk_get_thread();
+	
+	if (lvs->hub_dev.state != HUBLVOL_CONNECTED || lvs->hub_dev.state != HUBLVOL_CONNECTING_IN_PROCCESS) {
+		if (!lvs->hub_dev.dev_in_remove) {
+			spdk_thread_send_msg(lvs->hub_dev.thread, spdk_lvs_open_hub_bdev, lvs);
+		}
+	}
+	return;
+}
+
+void
+spdk_lvs_set_read_only(struct spdk_lvol_store *lvs, bool status)
+{
+	SPDK_NOTICELOG("Set lvostore read_only %s.\n", status ? "true" : "false");
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+	lvs->read_only = status;
+	spdk_bs_set_read_only(lvs->blobstore, status);
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+	return;
+}
+
+void
+spdk_lvs_check_active_process(struct spdk_lvol_store *lvs, struct spdk_lvol *lvol, uint8_t type)
+{
+	struct spdk_lvs_req *req;
+
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+
+	if (lvs->node_role != NODE_PRIMARY && !lvs->skip_redirecting) {
+		pthread_mutex_unlock(&g_lvol_stores_mutex);
+		return;
+	}
+
+	if (!lvs->update_in_progress && lvs->retry_on_update <= 3) {
+		req = calloc(1, sizeof(*req));
+		if (req == NULL) {
+			SPDK_ERRLOG("Cannot alloc memory for request structure\n");
+			pthread_mutex_unlock(&g_lvol_stores_mutex);
+			return;
+		}
+
+		req->cb_fn = NULL;
+		req->cb_arg = NULL;
+		req->lvol_store = lvs;
+		lvs->update_in_progress = true;
+		lvs->failed_on_update = false;
+		lvs->trigger_leader_sent = false;
+		lvs->retry_on_update++;
+		spdk_bs_set_leader(lvs->blobstore, true);
+		SPDK_NOTICELOG("Lvolstore %s failover set poller - trigger refresh: %" PRIu64 " t %d \n", node_role_to_string(lvs->node_role), lvol->blob_id, type);
+		req->poller = spdk_poller_register(spdk_lvs_update_on_failover_poller, req, 500000); // Delay of 500ms
+	}
+
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+	return;
+}
+
+void
+spdk_lvs_set_leader(struct spdk_lvol_store *lvs, bool leader)
+{
+
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+
+	lvs->leader = leader;
+	lvs->update_in_progress = false;
+	lvs->retry_on_update = 0;
+
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+}
+
+void
+spdk_lvs_set_failed_on_update(struct spdk_lvol_store *lvs, bool state)
+{
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+
+	lvs->failed_on_update = state;
+	lvs->update_in_progress = false;
+
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+}
+
+void
+spdk_lvol_set_leader(struct spdk_lvol *lvol)
+{
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+	lvol->leader = true;
+	lvol->failed_on_update = false;
+	lvol->update_in_progress = false;
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+}
+
+void
+spdk_lvol_set_leader_failed_on_update(struct spdk_lvol *lvol)
+{
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+	lvol->leader = false;
+	lvol->failed_on_update = true;
+	lvol->update_in_progress = false;
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+}
+
+void
+spdk_set_leader_all(struct spdk_lvol_store *t_lvs, bool lvs_leader, bool bs_nonleadership)
+{
+	struct spdk_lvol_store *lvs;
+	struct spdk_lvol_store *tmp_lvs = NULL;
+	struct spdk_lvol *lvol;	
+	SPDK_NOTICELOG("Lvs %s leader state changed via RPC to %s and bs_nonleader to %s.\n", node_role_to_string(t_lvs->node_role),
+                lvs_leader ? "true" : "false",
+                bs_nonleadership ? "true" : "false");
+
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+
+	TAILQ_FOREACH(lvs, &g_lvol_stores, link) {
+		if (t_lvs == lvs) {			
+			lvs->update_in_progress = false;
+
+			spdk_bs_set_leader(lvs->blobstore, !bs_nonleadership);
+
+			TAILQ_FOREACH(lvol, &lvs->lvols, link) {
+				lvol->leader = lvs_leader;
+				lvol->update_in_progress = false;
+			}
+
+			if (!lvs_leader && lvs->node_role != NODE_PRIMARY ) {
+				tmp_lvs = lvs;
+				if (lvs->hub_dev.state == HUBLVOL_CONNECTED) {
+					SPDK_NOTICELOG("enable redirect IO mode.\n");
+					lvs->skip_redirecting = false;
+					lvs->hub_dev.drain_in_action = false;
+				}
+			}
+			lvs->leader = lvs_leader;
+		}
+	}
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+
+	if (tmp_lvs) {
+		if (tmp_lvs->hub_dev.state != HUBLVOL_CONNECTED) {
+			if (!tmp_lvs->hub_dev.drain_in_action && !tmp_lvs->hub_dev.dev_in_remove) {
+				SPDK_NOTICELOG("try to reconnect hub dev and enable redirect IO mode.\n");
+				spdk_lvs_open_hub_bdev(tmp_lvs);
+			}
+		}
+	}
+}
+
+void
+spdk_block_data_port(struct spdk_lvol_store *lvs)
+{
+	SPDK_NOTICELOG("Lvs_leader block the port %d via RPC.\n", lvs->subsystem_port);
+	block_port(lvs->subsystem_port);	
 }
 
 struct spdk_lvol *

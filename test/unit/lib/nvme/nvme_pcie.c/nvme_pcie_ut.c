@@ -30,6 +30,9 @@ DEFINE_STUB(nvme_ctrlr_submit_admin_request, int, (struct spdk_nvme_ctrlr *ctrlr
 
 DEFINE_STUB(nvme_ctrlr_proc_get_devhandle, struct spdk_pci_device *,
 	    (struct spdk_nvme_ctrlr *ctrlr), NULL);
+DEFINE_STUB(spdk_nvme_ctrlr_get_numa_id, int32_t, (struct spdk_nvme_ctrlr *ctrlr),
+	    SPDK_ENV_NUMA_ID_ANY);
+
 DEFINE_STUB(spdk_pci_device_unmap_bar, int, (struct spdk_pci_device *dev, uint32_t bar, void *addr),
 	    0);
 DEFINE_STUB(spdk_pci_device_attach, int, (struct spdk_pci_driver *driver, spdk_pci_enum_cb enum_cb,
@@ -49,6 +52,11 @@ DEFINE_STUB_V(spdk_pci_unregister_error_handler, (spdk_pci_error_handler sighand
 DEFINE_STUB(spdk_pci_enumerate, int,
 	    (struct spdk_pci_driver *driver, spdk_pci_enum_cb enum_cb, void *enum_ctx),
 	    -1);
+DEFINE_STUB(spdk_pci_device_enable_interrupts, int, (struct spdk_pci_device *dev,
+		uint32_t efd_count), 0);
+DEFINE_STUB(spdk_pci_device_disable_interrupts, int, (struct spdk_pci_device *dev), 0);
+DEFINE_STUB(spdk_pci_device_get_interrupt_efd_by_index, int, (struct spdk_pci_device *dev,
+		uint32_t index), 0);
 
 SPDK_LOG_REGISTER_COMPONENT(nvme)
 

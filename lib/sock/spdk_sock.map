@@ -5,9 +5,10 @@
 	spdk_sock_get_default_opts;
 	spdk_sock_getaddr;
 	spdk_sock_get_interface_name;
-	spdk_sock_get_numa_socket_id;
+	spdk_sock_get_numa_id;
 	spdk_sock_connect;
 	spdk_sock_connect_ext;
+	spdk_sock_connect_async;
 	spdk_sock_listen;
 	spdk_sock_listen_ext;
 	spdk_sock_accept;
@@ -42,8 +43,13 @@
 	spdk_sock_group_register_interrupt;
 	spdk_sock_group_unregister_interrupt;
 
-	# internal function in spdk_internal/sock.h
+	# internal function in spdk_internal/sock_module.h
 	spdk_net_impl_register;
+	spdk_sock_posix_fd_create;
+	spdk_sock_posix_fd_connect;
+	spdk_sock_posix_fd_connect_async;
+	spdk_sock_posix_fd_connect_poll_async;
+	spdk_sock_posix_getaddrinfo;
 	spdk_sock_group_get_buf;
 	spdk_sock_map_insert;
 	spdk_sock_map_release;

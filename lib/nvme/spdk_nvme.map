@@ -21,9 +21,11 @@
 	spdk_nvme_prchk_flags_str;
 
 	spdk_nvme_probe;
+	spdk_nvme_probe_ext;
 	spdk_nvme_connect;
 	spdk_nvme_connect_async;
 	spdk_nvme_probe_async;
+	spdk_nvme_probe_async_ext;
 	spdk_nvme_probe_poll_async;
 	spdk_nvme_detach;
 	spdk_nvme_detach_async;
@@ -56,6 +58,8 @@
 	spdk_nvme_ctrlr_get_pmrsz;
 	spdk_nvme_ctrlr_get_num_ns;
 	spdk_nvme_ctrlr_get_pci_device;
+	spdk_nvme_ctrlr_get_numa_id;
+	spdk_nvme_ctrlr_get_id;
 	spdk_nvme_ctrlr_get_max_xfer_size;
 	spdk_nvme_ctrlr_get_max_sges;
 	spdk_nvme_ctrlr_is_active_ns;
@@ -71,6 +75,7 @@
 	spdk_nvme_ctrlr_connect_io_qpair;
 	spdk_nvme_ctrlr_disconnect_io_qpair;
 	spdk_nvme_ctrlr_reconnect_io_qpair;
+	spdk_nvme_ctrlr_get_admin_qp_fd;
 	spdk_nvme_ctrlr_get_admin_qp_failure_reason;
 	spdk_nvme_ctrlr_free_io_qpair;
 	spdk_nvme_ctrlr_io_cmd_raw_no_payload_build;
@@ -115,9 +120,11 @@
 	spdk_nvme_ctrlr_alloc_qid;
 	spdk_nvme_ctrlr_free_qid;
 	spdk_nvme_ctrlr_set_remove_cb;
+	spdk_nvme_ctrlr_set_keys;
 	spdk_nvme_ctrlr_get_memory_domains;
 	spdk_nvme_ctrlr_get_discovery_log_page;
 	spdk_nvme_ctrlr_get_registers;
+	spdk_nvme_ctrlr_authenticate;
 
 	spdk_nvme_poll_group_create;
 	spdk_nvme_poll_group_add;
@@ -126,6 +133,10 @@
 	spdk_nvme_poll_group_process_completions;
 	spdk_nvme_poll_group_all_connected;
 	spdk_nvme_poll_group_get_ctx;
+	spdk_nvme_poll_group_wait;
+	spdk_nvme_poll_group_get_fd;
+	spdk_nvme_poll_group_get_fd_group;
+	spdk_nvme_poll_group_set_interrupt_callback;
 
 	spdk_nvme_ns_get_data;
 	spdk_nvme_ns_get_id;
@@ -189,9 +200,11 @@
 	spdk_nvme_qpair_print_command;
 	spdk_nvme_qpair_print_completion;
 	spdk_nvme_qpair_get_id;
+	spdk_nvme_qpair_get_fd;
 	spdk_nvme_qpair_get_num_outstanding_reqs;
 	spdk_nvme_qpair_set_abort_dnr;
 	spdk_nvme_qpair_is_connected;
+	spdk_nvme_qpair_authenticate;
 
 	spdk_nvme_print_command;
 	spdk_nvme_print_completion;

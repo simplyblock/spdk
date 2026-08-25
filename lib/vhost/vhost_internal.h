@@ -17,6 +17,7 @@
 #include "spdk/util.h"
 #include "spdk/rpc.h"
 #include "spdk/config.h"
+#include "spdk/tree.h"
 
 #define SPDK_VHOST_MAX_VQUEUES	256
 #define SPDK_VHOST_MAX_VQ_SIZE	1024
@@ -111,8 +112,6 @@ struct spdk_vhost_virtqueue {
 	uint32_t vring_idx;
 
 	struct spdk_vhost_session *vsession;
-	/* Polling group private thread context */
-	void *poll_group;
 
 	struct spdk_interrupt *intr;
 } __attribute((aligned(SPDK_CACHE_LINE_SIZE)));
@@ -213,7 +212,7 @@ struct spdk_vhost_dev {
 	/* Context passed from transport */
 	void *ctxt;
 
-	TAILQ_ENTRY(spdk_vhost_dev) tailq;
+	RB_ENTRY(spdk_vhost_dev) node;
 };
 
 static inline struct spdk_vhost_user_dev *
@@ -508,6 +507,7 @@ int vhost_user_dev_create(struct spdk_vhost_dev *vdev, const char *name,
 int vhost_user_dev_init(struct spdk_vhost_dev *vdev, const char *name,
 			struct spdk_cpuset *cpumask, const struct spdk_vhost_user_dev_backend *user_backend);
 int vhost_user_dev_start(struct spdk_vhost_dev *vdev);
+bool vhost_user_dev_busy(struct spdk_vhost_dev *vdev);
 int vhost_user_dev_unregister(struct spdk_vhost_dev *vdev);
 int vhost_user_init(void);
 void vhost_user_fini(spdk_vhost_fini_cb vhost_cb);

@@ -3,7 +3,7 @@ function install_qat() {
 		install yasm
 	fi
 
-	install libnl3 libnl3-devel || install libnl-3-200 libnl-3-dev
+	install libnl3 libnl3-devel || install libnl-3-200 libnl-3-dev libnl-genl-3-dev
 
 	in_syms() {
 		local syms
@@ -311,14 +311,31 @@ function install_igb_uio() {
 function install_irdma() {
 	local RDMA_CORE_VERSION=51.0
 	local RDMA_CORE=https://github.com/linux-rdma/rdma-core/releases/download/v$RDMA_CORE_VERSION/rdma-core-$RDMA_CORE_VERSION.tar.gz
+	local packages=() hint=""
 
-	if [[ $ID != fedora ]]; then
-		echo "Installation of the irdma can be attempted only on Fedora"
-		return 0
-	fi
-
-	# Install extra dependencies needed by the rdma-core
-	install ninja-build pandoc perl-generators valgrind-devel python-docutils libnl3 libnl3-devel python3-Cython
+	case "$ID" in
+		fedora)
+			install \
+				ninja-build \
+				pandoc \
+				perl-generators \
+				valgrind-devel \
+				python-docutils \
+				libnl3 \
+				libnl3-devel \
+				python3-Cython
+				;;
+		debian | ubuntu)
+			install \
+				debhelper \
+				dh-python \
+				python3-docutils
+			;;
+		*)
+			echo "irdma installation not supported under $ID" >&2
+			return 0
+			;;
+	esac
 
 	rm -rf "$GIT_REPOS/irdma-$IRDMA_VERSION"
 	rm -rf "$GIT_REPOS/rdma-core-$RDMA_CORE_VERSION"
@@ -328,6 +345,11 @@ function install_irdma() {
 	if ge "$kernel_ver" 6.10; then
 		patch --dir="$GIT_REPOS/irdma-$IRDMA_VERSION" -p1  \
 			< "$rootdir/test/common/config/pkgdep/patches/irdma/0001-ip_route_output.patch"
+	fi
+
+	if ge "$kernel_ver" 6.11; then
+		patch --dir="$GIT_REPOS/irdma-$IRDMA_VERSION" -p1  \
+			< "$rootdir/test/common/config/pkgdep/patches/irdma/0001-uverbs_attr.patch"
 	fi
 
 	[[ -e $GIT_REPOS/irdma-$IRDMA_VERSION/build.sh ]]
@@ -346,44 +368,59 @@ function install_irdma() {
 	patch --dir="$GIT_REPOS/rdma-core-$RDMA_CORE_VERSION" -p2 \
 		< "$GIT_REPOS/irdma-$IRDMA_VERSION/libirdma-$RDMA_CORE_VERSION.patch"
 
-	# Note that paths and the name of the package are hardcoded into .spec, hence they need to stay like this.
-	[[ -e $GIT_REPOS/rdma-core-$RDMA_CORE_VERSION/redhat/rdma-core.spec ]]
-	mkdir -p "$HOME/rpmbuild/"{SOURCES,SPECS}
-	cp "$GIT_REPOS/rdma-core-$RDMA_CORE_VERSION/redhat/rdma-core.spec" "$HOME/rpmbuild/SPECS"
+	case "$ID" in
+		fedora)
+			[[ -e $GIT_REPOS/rdma-core-$RDMA_CORE_VERSION/redhat/rdma-core.spec ]]
+			# Note that paths and the name of the package are hardcoded into .spec, hence they need
+			# to stay like this.
+			mkdir -p "$HOME/rpmbuild/"{SOURCES,SPECS}
+			cp "$GIT_REPOS/rdma-core-$RDMA_CORE_VERSION/redhat/rdma-core.spec" "$HOME/rpmbuild/SPECS"
 
-	# Re-package the source
-	tar -czf "$HOME/rpmbuild/SOURCES/rdma-core-$RDMA_CORE_VERSION.tar.gz" -C "$GIT_REPOS" "rdma-core-$RDMA_CORE_VERSION"
+			# Re-package the source
+			tar -czf "$HOME/rpmbuild/SOURCES/rdma-core-$RDMA_CORE_VERSION.tar.gz" \
+				-C "$GIT_REPOS" "rdma-core-$RDMA_CORE_VERSION"
 
-	# Build the rpms
-	(
-		cd "$HOME/rpmbuild/SPECS"
-		# Make sure stock ninja-build is used
-		PATH="/usr/bin:$PATH" rpmbuild -ba rdma-core.spec
-	)
+			# Build the rpms
+			(
+				cd "$HOME/rpmbuild/SPECS"
+				# Make sure stock ninja-build is used
+				PATH="/usr/bin:$PATH" rpmbuild -ba rdma-core.spec
+			)
 
-	# Now, don't install the packages since this will, most likely, conflict with packages already installed
-	# in the system. Instead, simply inform user what the next step is and note what potential issues it may
-	# have with the installation.
+			packages=("$HOME/rpmbuild/RPMS/x86_64/"*.rpm)
+			hint="$package_manager install [--allowerasing] $HOME/rpmbuild/RPMS/x86_64/*.rpm"
+			;;
+		debian | ubuntu)
+			[[ -e $GIT_REPOS/rdma-core-$RDMA_CORE_VERSION/debian/control ]]
 
-	shopt -s nullglob
-	local rpms=("$HOME/rpmbuild/RPMS/x86_64/"*.rpm)
-	shopt -u nullglob
-	((${#rpms[@]} > 0))
+			# Build the debs
+			(
+				cd "$GIT_REPOS/rdma-core-$RDMA_CORE_VERSION"
+				dh clean --with python3,systemd --builddirectory=build-deb
+				dh build --with systemd --builddirectory=build-deb
+				dh binary --with systemd --builddirectory=build-deb
+			)
+
+			packages=("$GIT_REPOS/"*.deb)
+			hint="dpkg --install $GIT_REPOS/*.deb"
+			;;
+	esac
+
+	((${#packages[@]} > 0)) || return 1
 
 	cat <<-EOF
 
 		INFO: rdma-core-$RDMA_CORE_VERSION was successfully built, following packages are
 		available for installation:
 
-		$(printf '  - %s\n' "${rpms[@]##*/}")
+		$(printf '  - %s\n' "${packages[@]##*/}")
 
 		Note that installing the above packages may raise conflicts with their
 		potentially newer versions already installed on the system. Dependent
 		packages may be uninstalled during the process as well. Please, run the
 		following command to finish the installation:
 
-		  $package_manager install [--allowerasing] $HOME/rpmbuild/RPMS/x86_64/*.rpm
-
+		  $hint
 	EOF
 }
 
@@ -403,36 +440,64 @@ function install_ice() {
 			< "$rootdir/test/common/config/pkgdep/patches/ice/0001-xsk_buff_dma.patch"
 	fi
 
+	if ge "$kernel_ver" 6.11; then
+		patch --dir="$GIT_REPOS/ice-$ICE_VERSION" -p1  \
+			< "$rootdir/test/common/config/pkgdep/patches/ice/0001-kernel_ethtool_ts_info.patch"
+		patch --dir="$GIT_REPOS/ice-$ICE_VERSION" -p1  \
+			< "$rootdir/test/common/config/pkgdep/patches/ice/0001-ptp.patch"
+	fi
+
 	(
 		cd "$GIT_REPOS/ice-$ICE_VERSION/src"
 		sudo make -j"$(nproc)" install
 	)
 }
 
-function install_lcov() {
-	local lcov_version=v1.15
+function install_libbpf() {
+	local libbpf_version=v1.4.5
 
-	install perl-IO-Compress || install perl-modules
+	rm -rf "$GIT_REPOS/libbpf"
+	git clone "$GIT_REPO_LIBBPF" --branch "$libbpf_version" "$GIT_REPOS/libbpf"
 
-	rm -rf /usr/src/lcov
-	sudo git clone "$GIT_REPO_LCOV" --branch "$lcov_version" /usr/src/lcov
-	(cd /usr/src/lcov; sudo make install)
+	make -C "$GIT_REPOS/libbpf/src" -j install
+	# install target doesn't include the kernel header files
+	make -C "$GIT_REPOS/libbpf/src" install_uapi_headers
 }
 
 function install_bpftrace() {
-	local deps=() bcc_rev
+	local deps_fedora=() deps_ubuntu=() bcc_rev
 
-	deps+=(cereal-devel)
-	deps+=(clang-devel)
-	deps+=(cmake)
-	deps+=(dwarves)
-	deps+=(gmock-devel)
-	deps+=(gtest-devel)
-	deps+=(llvm-devel)
-	deps+=(bcc-devel)
-	deps+=(libbpf-devel)
+	deps_fedora+=(cereal-devel)
+	deps_fedora+=(clang-devel)
+	deps_fedora+=(dwarves)
+	deps_fedora+=(gmock-devel)
+	deps_fedora+=(gtest-devel)
+	deps_fedora+=(llvm-devel)
+	deps_fedora+=(bcc-devel)
+	deps_fedora+=(libbpf-devel)
+
+	deps_ubuntu+=(libcereal-dev)
+	deps_ubuntu+=(libclang-dev)
+	deps_ubuntu+=(llvm-dev)
+	# Under jammy (2204) the libbpf version is not compatible with the version of
+	# bpftrace that we are using. Instead, we are going to provide our own build
+	# of libbpf, including both up-to-date bpf.h and linux/bpf.h.
+	[[ $VERSION_CODENAME == jammy ]] || deps_ubuntu+=(libbpf-dev)
+	deps_ubuntu+=(libbpfcc-dev)
+	deps_ubuntu+=(libelf-dev)
+	deps_ubuntu+=(binutils-dev)
+
+	local -n deps="deps_$ID"
+
+	((${#deps[@]} > 0)) || return 1
+
+	deps+=(clang cmake)
 
 	install "${deps[@]}"
+
+	if [[ $VERSION_CODENAME == jammy ]]; then
+		install_libbpf
+	fi
 
 	rm -rf $GIT_REPOS/bpftrace
 
@@ -492,17 +557,16 @@ function install_sources() {
 			install_nvmecli_plugin
 			install_qat
 			install_rocksdb
-			install_flamegraph
 			install_qemu
 			install_igb_uio
 			install_ice
-			install_lcov
 			install_bpftrace
 			install_doxygen
 		)
 		install_extra_pkgs
 	fi
 	sources+=(install_fio)
+	sources+=(install_flamegraph)
 	sources+=(install_vagrant)
 	sources+=(install_ittapi)
 
@@ -547,8 +611,6 @@ export GIT_REPO_DPDK_KMODS
 export IRDMA_DRIVER
 : ${ICE_DRIVER="https://sourceforge.net/projects/e1000/files/ice%20stable/$ICE_VERSION/ice-$ICE_VERSION.tar.gz"}
 export ICE_DRIVER
-: ${GIT_REPO_LCOV=https://github.com/linux-test-project/lcov}
-export GIT_REPO_LCOV
 : ${GIT_REPO_BCC=https://github.com/iovisor/bcc.git}
 export GIT_REPO_BCC
 : ${GIT_REPO_BPFTRACE=https://github.com/iovisor/bpftrace.git}
@@ -559,6 +621,8 @@ export GIT_REPO_NVME_CLI
 export GIT_REPO_ITTAPI
 : ${GIT_REPO_DOXYGEN="https://github.com/doxygen/doxygen"}
 export GIT_REPO_DOXYGEN
+: ${GIT_REPO_LIBBPF="https://github.com/libbpf/libbpf"}
+export GIT_REPO_LIBBPF
 
 GIT_REPOS=${GIT_REPOS:-$HOME}
 

@@ -25,6 +25,8 @@
 #include "spdk/sock.h"
 #include "spdk/zipf.h"
 #include "spdk/nvmf.h"
+#include "spdk/keyring.h"
+#include "spdk/module/keyring/file.h"
 
 #ifdef SPDK_CONFIG_URING
 #include <liburing.h>
@@ -243,6 +245,7 @@ static uint64_t g_elapsed_time_in_usec;
 static int g_warmup_time_in_sec;
 static uint32_t g_max_completions;
 static uint32_t g_disable_sq_cmb;
+static bool g_enable_interrupt;
 static bool g_use_uring;
 static bool g_warn;
 static bool g_header_digest;
@@ -267,7 +270,7 @@ static char *g_sock_threshold_impl;
 static uint8_t g_transport_tos = 0;
 
 static uint32_t g_rdma_srq_size;
-uint8_t *g_psk = NULL;
+static struct spdk_key *g_psk = NULL;
 
 /* When user specifies -Q, some error messages are rate limited.  When rate
  * limited, we only print the error message every g_quiet_count times the
@@ -343,30 +346,6 @@ perf_set_sock_opts(const char *impl_name, const char *field, uint32_t val, const
 		sock_opts.tls_version = val;
 	} else if (strcmp(field, "ktls") == 0) {
 		sock_opts.enable_ktls = val;
-	} else if (strcmp(field, "psk_path") == 0) {
-		if (!valstr) {
-			fprintf(stderr, "No socket opts value specified\n");
-			return;
-		}
-		g_psk = calloc(1, SPDK_TLS_PSK_MAX_LEN + 1);
-		if (g_psk == NULL) {
-			fprintf(stderr, "Failed to allocate memory for psk\n");
-			return;
-		}
-		FILE *psk_file = fopen(valstr, "r");
-		if (psk_file == NULL) {
-			fprintf(stderr, "Could not open PSK file\n");
-			return;
-		}
-		if (fscanf(psk_file, "%" SPDK_STRINGIFY(SPDK_TLS_PSK_MAX_LEN) "s", g_psk) != 1) {
-			fprintf(stderr, "Could not retrieve PSK from file\n");
-			fclose(psk_file);
-			return;
-		}
-		if (fclose(psk_file)) {
-			fprintf(stderr, "Failed to close PSK file\n");
-			return;
-		}
 	} else if (strcmp(field, "zerocopy_threshold") == 0) {
 		sock_opts.zerocopy_threshold = val;
 	} else {
@@ -825,15 +804,20 @@ static void io_complete(void *ctx, const struct spdk_nvme_cpl *cpl);
 static void
 nvme_setup_payload(struct perf_task *task, uint8_t pattern)
 {
+	struct spdk_nvme_ctrlr *ctrlr;
 	uint32_t max_io_size_bytes, max_io_md_size;
+	int32_t numa_id;
 	void *buf;
 	int rc;
+
+	ctrlr = task->ns_ctx->entry->u.nvme.ctrlr;
+	numa_id = spdk_nvme_ctrlr_get_numa_id(ctrlr);
 
 	/* maximum extended lba format size from all active namespace,
 	 * it's same with g_io_size_bytes for namespace without metadata.
 	 */
 	max_io_size_bytes = g_io_size_bytes + g_max_io_md_size * g_max_io_size_blocks;
-	buf = spdk_dma_zmalloc(max_io_size_bytes, g_io_align, NULL);
+	buf = spdk_dma_zmalloc_socket(max_io_size_bytes, g_io_align, NULL, numa_id);
 	if (buf == NULL) {
 		fprintf(stderr, "task->buf spdk_dma_zmalloc failed\n");
 		exit(1);
@@ -973,8 +957,12 @@ nvme_check_io(struct ns_worker_ctx *ns_ctx)
 {
 	int64_t rc;
 
-	rc = spdk_nvme_poll_group_process_completions(ns_ctx->u.nvme.group, g_max_completions,
-			perf_disconnect_cb);
+	if (g_enable_interrupt) {
+		rc = spdk_nvme_poll_group_wait(ns_ctx->u.nvme.group, perf_disconnect_cb);
+	} else {
+		rc = spdk_nvme_poll_group_process_completions(ns_ctx->u.nvme.group, g_max_completions,
+				perf_disconnect_cb);
+	}
 	if (rc < 0) {
 		fprintf(stderr, "NVMe io qpair process completion error\n");
 		ns_ctx->status = 1;
@@ -1036,7 +1024,8 @@ nvme_init_ns_worker_ctx(struct ns_worker_ctx *ns_ctx)
 	if (opts.io_queue_requests < entry->num_io_requests) {
 		opts.io_queue_requests = entry->num_io_requests;
 	}
-	opts.delay_cmd_submit = true;
+
+	opts.delay_cmd_submit = g_enable_interrupt ? false : true;
 	opts.create_only = true;
 
 	ctrlr_opts = spdk_nvme_ctrlr_get_opts(entry->u.nvme.ctrlr);
@@ -1487,7 +1476,7 @@ register_ctrlr(struct spdk_nvme_ctrlr *ctrlr, struct trid_entry *trid_entry)
 static inline void
 submit_single_io(struct perf_task *task)
 {
-	uint64_t		offset_in_ios;
+	uint64_t		rand_value, offset_in_ios;
 	int			rc;
 	struct ns_worker_ctx	*ns_ctx = task->ns_ctx;
 	struct ns_entry		*entry = ns_ctx->entry;
@@ -1497,7 +1486,14 @@ submit_single_io(struct perf_task *task)
 	if (entry->zipf) {
 		offset_in_ios = spdk_zipf_generate(entry->zipf);
 	} else if (g_is_random) {
-		offset_in_ios = rand_r(&entry->seed) % entry->size_in_ios;
+		/* rand_r() returns int, so we need to use two calls to ensure
+		 * we get a large enough value to cover a very large block
+		 * device.
+		 */
+		rand_value = (uint64_t)rand_r(&entry->seed) *
+			     ((uint64_t)RAND_MAX + 1) +
+			     rand_r(&entry->seed);
+		offset_in_ios = rand_value % entry->size_in_ios;
 	} else {
 		offset_in_ios = ns_ctx->offset_in_ios++;
 		if (ns_ctx->offset_in_ios == entry->size_in_ios) {
@@ -1621,9 +1617,8 @@ allocate_task(struct ns_worker_ctx *ns_ctx, int queue_depth)
 		exit(1);
 	}
 
-	ns_ctx->entry->fn_table->setup_payload(task, queue_depth % 8 + 1);
-
 	task->ns_ctx = ns_ctx;
+	ns_ctx->entry->fn_table->setup_payload(task, queue_depth % 8 + 1);
 
 	return task;
 }
@@ -1949,6 +1944,7 @@ usage(char *program_name)
 	printf("\t\t Example: -b 0000:d8:00.0 -b 0000:d9:00.0\n");
 	printf("\t-V, --enable-vmd enable VMD enumeration\n");
 	printf("\t-D, --disable-sq-cmb disable submission queue in controller memory buffer, default: enabled\n");
+	printf("\t-E, --enable-interrupt enable interrupts on completion queue, default: disabled\n");
 	printf("\n");
 
 	printf("==== TCP OPTIONS ====\n\n");
@@ -2401,7 +2397,38 @@ parse_metadata(const char *metacfg_str)
 	return 0;
 }
 
-#define PERF_GETOPT_SHORT "a:b:c:d:e:ghi:lmo:q:r:k:s:t:w:z:A:C:DF:GHILM:NO:P:Q:RS:T:U:VZ:"
+static void
+free_key(struct spdk_key **key)
+{
+	if (*key == NULL) {
+		return;
+	}
+
+	spdk_keyring_put_key(*key);
+	spdk_keyring_file_remove_key(spdk_key_get_name(*key));
+	*key = NULL;
+}
+
+static struct spdk_key *
+alloc_key(const char *name, const char *path)
+{
+	struct spdk_key *key;
+	int rc;
+
+	rc = spdk_keyring_file_add_key(name, path);
+	if (rc != 0) {
+		return NULL;
+	}
+
+	key = spdk_keyring_get_key(name);
+	if (key == NULL) {
+		return NULL;
+	}
+
+	return key;
+}
+
+#define PERF_GETOPT_SHORT "a:b:c:d:e:ghi:lmo:q:r:k:s:t:w:z:A:C:DEF:GHILM:NO:P:Q:RS:T:U:VZ:"
 
 static const struct option g_perf_cmdline_opts[] = {
 #define PERF_WARMUP_TIME	'a'
@@ -2446,6 +2473,8 @@ static const struct option g_perf_cmdline_opts[] = {
 	{"max-completion-per-poll",			required_argument,	NULL, PERF_MAX_COMPLETIONS_PER_POLL},
 #define PERF_DISABLE_SQ_CMB	'D'
 	{"disable-sq-cmb",			no_argument,	NULL, PERF_DISABLE_SQ_CMB},
+#define PERF_ENABLE_INTERRUPT	'E'
+	{"enable-interrupt",			no_argument,	NULL, PERF_ENABLE_INTERRUPT},
 #define PERF_ZIPF		'F'
 	{"zipf",				required_argument,	NULL, PERF_ZIPF},
 #define PERF_ENABLE_DEBUG	'G'
@@ -2664,6 +2693,9 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 		case PERF_DISABLE_SQ_CMB:
 			g_disable_sq_cmb = 1;
 			break;
+		case PERF_ENABLE_INTERRUPT:
+			g_enable_interrupt = 1;
+			break;
 		case PERF_ENABLE_DEBUG:
 #ifndef DEBUG
 			fprintf(stderr, "%s must be configured with --enable-debug for -G flag\n",
@@ -2729,7 +2761,12 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 			break;
 		case PERF_PSK_PATH:
 			ssl_used = true;
-			perf_set_sock_opts("ssl", "psk_path", 0, optarg);
+			free_key(&g_psk);
+			g_psk = alloc_key("perf-psk", optarg);
+			if (g_psk == NULL) {
+				fprintf(stderr, "Unable to set PSK at %s\n", optarg);
+				return 1;
+			}
 			break;
 		case PERF_PSK_IDENTITY:
 			ssl_used = true;
@@ -2957,6 +2994,9 @@ probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 		if (g_no_shn_notification) {
 			opts->no_shn_notification = true;
 		}
+		if (g_enable_interrupt) {
+			opts->enable_interrupts = true;
+		}
 	}
 
 	if (trid->trtype != trid_entry->trid.trtype &&
@@ -2970,15 +3010,12 @@ probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	opts->header_digest = g_header_digest;
 	opts->data_digest = g_data_digest;
 	opts->keep_alive_timeout_ms = g_keep_alive_timeout_in_ms;
+	opts->tls_psk = g_psk;
 	memcpy(opts->hostnqn, trid_entry->hostnqn, sizeof(opts->hostnqn));
 
 	opts->transport_tos = g_transport_tos;
 	if (opts->num_io_queues < g_num_workers * g_nr_io_queues_per_ns) {
 		opts->num_io_queues = g_num_workers * g_nr_io_queues_per_ns;
-	}
-
-	if (g_psk != NULL) {
-		memcpy(opts->psk, g_psk, strlen(g_psk));
 	}
 
 	return true;
@@ -3012,6 +3049,13 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 		printf("Attached to NVMe Controller at %s [%04x:%04x]\n",
 		       trid->traddr,
 		       pci_id.vendor_id, pci_id.device_id);
+
+		if (g_enable_interrupt && !opts->enable_interrupts) {
+			fprintf(stderr, "Couldn't enable interrupts on NVMe controller at %s [%04x:%04x]\n",
+				trid->traddr,
+				pci_id.vendor_id, pci_id.device_id);
+			return;
+		}
 	}
 
 	register_ctrlr(ctrlr, trid_entry);
@@ -3225,7 +3269,7 @@ main(int argc, char **argv)
 	opts.pci_allowed = g_allowed_pci_addr;
 	rc = parse_args(argc, argv, &opts);
 	if (rc != 0 || rc == HELP_RETURN_CODE) {
-		free(g_psk);
+		free_key(&g_psk);
 		if (rc == HELP_RETURN_CODE) {
 			return 0;
 		}
@@ -3237,14 +3281,24 @@ main(int argc, char **argv)
 	rc = pthread_mutex_init(&g_stats_mutex, NULL);
 	if (rc != 0) {
 		fprintf(stderr, "Failed to init mutex\n");
-		free(g_psk);
+		free_key(&g_psk);
 		return -1;
 	}
 	if (spdk_env_init(&opts) < 0) {
 		fprintf(stderr, "Unable to initialize SPDK env\n");
 		unregister_trids();
 		pthread_mutex_destroy(&g_stats_mutex);
-		free(g_psk);
+		free_key(&g_psk);
+		return -1;
+	}
+
+	rc = spdk_keyring_init();
+	if (rc != 0) {
+		fprintf(stderr, "Unable to initialize keyring: %s\n", spdk_strerror(-rc));
+		unregister_trids();
+		pthread_mutex_destroy(&g_stats_mutex);
+		free_key(&g_psk);
+		spdk_env_fini();
 		return -1;
 	}
 
@@ -3353,9 +3407,9 @@ cleanup:
 	unregister_controllers();
 	unregister_workers();
 
+	free_key(&g_psk);
+	spdk_keyring_cleanup();
 	spdk_env_fini();
-
-	free(g_psk);
 
 	pthread_mutex_destroy(&g_stats_mutex);
 

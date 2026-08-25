@@ -18,8 +18,11 @@
 	spdk_for_each_bdev;
 	spdk_for_each_bdev_leaf;
 	spdk_bdev_open_ext;
+	spdk_bdev_open_ext_v2;
+	spdk_bdev_open_opts_init;
 	spdk_bdev_open_async;
 	spdk_bdev_close;
+	spdk_bdev_get_numa_id;
 	spdk_bdev_desc_get_bdev;
 	spdk_bdev_set_timeout;
 	spdk_bdev_io_type_supported;
@@ -47,6 +50,14 @@
 	spdk_bdev_get_dif_pi_format;
 	spdk_bdev_is_dif_head_of_md;
 	spdk_bdev_is_dif_check_enabled;
+	spdk_bdev_desc_get_block_size;
+	spdk_bdev_desc_get_md_size;
+	spdk_bdev_desc_is_md_interleaved;
+	spdk_bdev_desc_is_md_separate;
+	spdk_bdev_desc_get_dif_type;
+	spdk_bdev_desc_get_dif_pi_format;
+	spdk_bdev_desc_is_dif_head_of_md;
+	spdk_bdev_desc_is_dif_check_enabled;
 	spdk_bdev_get_current_qd;
 	spdk_bdev_get_qd;
 	spdk_bdev_get_qd_sampling_period;
@@ -114,6 +125,7 @@
 	spdk_bdev_get_max_copy;
 	spdk_bdev_copy_blocks;
 	spdk_bdev_get_nvme_ctratt;
+	spdk_bdev_get_nvme_nsid;
 	spdk_bdev_get_io_type_name;
 	spdk_bdev_get_io_type;
 
@@ -180,6 +192,7 @@
 	spdk_bdev_unquiesce;
 	spdk_bdev_quiesce_range;
 	spdk_bdev_unquiesce_range;
+	spdk_bdev_io_hide_metadata;
 
 	# Public functions in bdev_zone.h
 	spdk_bdev_get_zone_size;

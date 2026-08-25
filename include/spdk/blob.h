@@ -35,6 +35,8 @@
 
 #include "spdk/stdinc.h"
 #include "spdk/assert.h"
+#include "spdk/priority_class.h"
+#include "spdk/queue.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -44,6 +46,14 @@ typedef uint64_t spdk_blob_id;
 #define SPDK_BLOBID_INVALID		(uint64_t)-1
 #define SPDK_BLOBID_EXTERNAL_SNAPSHOT	(uint64_t)-2
 #define SPDK_BLOBSTORE_TYPE_LENGTH 16
+#define ERR_LEADERSHIP_CHANGED  -35
+#define ERR_UPDATE_FAILED  -36
+
+enum freeze_io_result {
+	FREEZE_IO_QUEUED,
+	FREEZE_IO_NOT_FROZEN,
+	FREEZE_IO_NOMEM,
+};
 
 enum blob_clear_method {
 	BLOB_CLEAR_WITH_DEFAULT,
@@ -52,10 +62,77 @@ enum blob_clear_method {
 	BLOB_CLEAR_WITH_WRITE_ZEROES,
 };
 
+enum hublvol_state {
+	HUBLVOL_NOT_CONNECTED,
+	HUBLVOL_CONNECTING_IN_PROCCESS,
+	HUBLVOL_CONNECTED,
+	HUBLVOL_CONNECTED_FAILED,
+	HUBLVOL_DISCONNECTED,
+};
+
 enum bs_clear_method {
 	BS_CLEAR_WITH_UNMAP,
 	BS_CLEAR_WITH_WRITE_ZEROES,
 	BS_CLEAR_WITH_NONE,
+};
+
+enum xfer_type {
+	XFER_TYPE_NONE = 0,
+	XFER_REPLICATE_SNAPSHOT,
+	XFER_MIGRATE_SNAPSHOT,
+	XFER_S3_BACKUP,
+	XFER_S3_RECOVER,
+	XFER_S3_MERGE,
+};
+
+enum xfer_state {
+	XFER_STATE_NONE = 0,
+	XFER_STATE_PREPARE,
+	XFER_STATE_TRANSFER_CLUSTERS,
+	XFER_STATE_SIGNAL_TRANSFER,
+	XFER_STATE_TRANSFER_MD_DATA,
+	XFER_STATE_READ_EXTENT_MD,
+	XFER_STATE_READ_EXTENT_MD_2,
+	XFER_STATE_TRANSFER_ROOT_MD,
+	XFER_STATE_READ_ROOT_MD,
+	XFER_STATE_READ_ROOT_MD_2,
+	XFER_STATE_SWAP_CLUSTERS,
+	XFER_STATE_DELETE,
+	XFER_STATE_NEXT_S3_ID,
+	XFER_STATE_RECOVER_CLUSTERS,
+	XFER_STATE_DONE,
+	XFER_STATE_FAILED,
+};
+
+enum req_action {
+	REQ_ACTION_NONE = 0,
+	REQ_ACTION_READ, 			// read from s3
+	REQ_ACTION_WRITE,			// write to s3
+	REQ_ACTION_UNMAP,			// unmap in s3 level
+	REQ_ACTION_COPY_RECOVER,	// read from s3 and write in blob level
+	REQ_ACTION_COPY_BACKUP,		// read from blob and write in s3 level
+	REQ_ACTION_SWAP,			// copy in s3 level
+};
+
+enum xfer_req_status {
+	XFER_REQ_STATUS_NONE = 0,
+	XFER_REQ_STATUS_READY,
+	XFER_REQ_STATUS_DONE,
+	XFER_REQ_STATUS_FAILED,
+	XFER_REQ_STATUS_IN_FLIGHT,
+};
+
+typedef enum {
+    NODE_PRIMARY = 0,
+    NODE_SECONDARY,
+    NODE_TERTIARY,
+    NODE_ROLE_UNKNOWN
+} node_role_t;
+
+struct spdk_hublvol_channels {
+	struct spdk_io_channel *ch;
+	struct spdk_thread	*thread;
+	TAILQ_ENTRY(spdk_hublvol_channels)	entry;
 };
 
 struct spdk_blob_store;
@@ -64,6 +141,8 @@ struct spdk_io_channel;
 struct spdk_blob;
 struct spdk_xattr_names;
 
+
+typedef void (*spdk_bs_loaded_blob_fn)(void *ctx, struct spdk_blob *blob, int bserrno);
 /**
  * Blobstore operation completion callback.
  *
@@ -150,6 +229,9 @@ typedef int (*spdk_bs_esnap_dev_create)(void *bs_ctx, void *blob_ctx, struct spd
 					const void *esnap_id, uint32_t id_size,
 					struct spdk_bs_dev **bs_dev);
 
+typedef void (*spdk_drain_op_submit_handle)(void *cb, void *bdev_io);
+typedef void (*spdk_drain_op_cpl)(void *cb_arg, int bserrno);
+
 /**
  * Blob shallow copy status callback.
  *
@@ -180,6 +262,15 @@ struct spdk_blob_ext_io_opts {
 } __attribute__((packed));
 SPDK_STATIC_ASSERT(sizeof(struct spdk_blob_ext_io_opts) == 32, "Incorrect size");
 
+struct spdk_bs_io_opts {
+	/** Priority class for IOs submitted on this channel */
+	uint8_t priority;
+	/** Geometry ID for IOs submitted on this channel */
+	uint8_t geometry;
+	/** Special IO flag for IOs submitted on this channel */
+	uint8_t special_io;
+} __attribute__((packed));
+
 struct spdk_bs_dev {
 	/* Create a new channel which is a software construct that is used
 	 * to submit I/O. */
@@ -196,44 +287,44 @@ struct spdk_bs_dev {
 
 	void (*read)(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
 		     uint64_t lba, uint32_t lba_count,
-		     struct spdk_bs_dev_cb_args *cb_args);
+		     struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts);
 
 	void (*write)(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
 		      uint64_t lba, uint32_t lba_count,
-		      struct spdk_bs_dev_cb_args *cb_args);
+		      struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts);
 
 	void (*readv)(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		      struct iovec *iov, int iovcnt,
 		      uint64_t lba, uint32_t lba_count,
-		      struct spdk_bs_dev_cb_args *cb_args);
+		      struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts);
 
 	void (*writev)(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		       struct iovec *iov, int iovcnt,
 		       uint64_t lba, uint32_t lba_count,
-		       struct spdk_bs_dev_cb_args *cb_args);
+		       struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts);
 
 	void (*readv_ext)(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 			  struct iovec *iov, int iovcnt,
 			  uint64_t lba, uint32_t lba_count,
 			  struct spdk_bs_dev_cb_args *cb_args,
-			  struct spdk_blob_ext_io_opts *ext_io_opts);
+			  struct spdk_blob_ext_io_opts *ext_io_opts, struct spdk_bs_io_opts *bs_io_opts);
 
 	void (*writev_ext)(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 			   struct iovec *iov, int iovcnt,
 			   uint64_t lba, uint32_t lba_count,
 			   struct spdk_bs_dev_cb_args *cb_args,
-			   struct spdk_blob_ext_io_opts *ext_io_opts);
+			   struct spdk_blob_ext_io_opts *ext_io_opts, struct spdk_bs_io_opts *bs_io_opts);
 
 	void (*flush)(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		      struct spdk_bs_dev_cb_args *cb_args);
 
 	void (*write_zeroes)(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 			     uint64_t lba, uint64_t lba_count,
-			     struct spdk_bs_dev_cb_args *cb_args);
+			     struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts);
 
 	void (*unmap)(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		      uint64_t lba, uint64_t lba_count,
-		      struct spdk_bs_dev_cb_args *cb_args);
+		      struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts);
 
 	struct spdk_bdev *(*get_base_bdev)(struct spdk_bs_dev *dev);
 
@@ -254,7 +345,7 @@ struct spdk_bs_dev {
 
 	void (*copy)(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		     uint64_t dst_lba, uint64_t src_lba, uint64_t lba_count,
-		     struct spdk_bs_dev_cb_args *cb_args);
+		     struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts);
 
 	bool (*is_degraded)(struct spdk_bs_dev *dev);
 
@@ -360,6 +451,73 @@ void spdk_bs_grow_live(struct spdk_blob_store *bs,
 		       spdk_bs_op_complete cb_fn, void *cb_arg);
 
 /**
+ * update a blobstore according to bit array synced.
+ * Can be used on loaded blobstore, even with opened blobs.
+ *
+ * \param bs blobstore to update.
+ * \param cb_fn Called when the updating is complete.
+ * \param cb_arg Argument passed to function cb_fn.
+ */
+void spdk_bs_update_live(struct spdk_blob_store *bs, bool failover, uint64_t id,
+		       spdk_bs_op_complete cb_fn, void *cb_arg);
+void spdk_bs_apply(struct spdk_blob_store *bs, spdk_blob_op_complete cb_fn, void *cb_arg);
+int spdk_bs_dump_tree(struct spdk_blob *blob, uint64_t *ids, int *id_count, uint64_t *tparent_id,
+	 				int *child_count, bool *tsnapshot, bool *thas_clone);
+
+void spdk_blob_failover_unfreaze(struct spdk_blob *blob, 
+				spdk_blob_op_complete cb_fn, void *cb_arg);
+
+void spdk_snapshot_freeze_blob(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
+int spdk_blob_get_freeze_cnt(struct spdk_blob *blob);
+
+void spdk_blob_unfreeze_cleanup(struct spdk_blob *blob,
+				 spdk_blob_op_with_id_complete cb_fn, void *cb_arg);
+
+void blob_freeze_on_failover(struct spdk_blob *blob);
+
+void spdk_blob_update_failed_cleanup(struct spdk_blob *blob,
+				 spdk_blob_op_complete cb_fn, void *cb_arg);
+
+void spdk_bs_set_leader(struct spdk_blob_store *bs, bool state);
+void spdk_bs_set_role(struct spdk_blob_store *bs, node_role_t role);
+node_role_t node_role_from_string(const char *str);
+const char *node_role_to_string(node_role_t role);
+void spdk_bs_set_read_only(struct spdk_blob_store *bs, bool state);
+void prepare_s3_clusters(struct spdk_blob* blob, uint64_t *clusters, uint32_t num_clusters);
+bool spdk_blob_get_offset_allocate(struct spdk_blob *blob, uint64_t offset);
+bool spdk_blob_check_offset_valid(struct spdk_blob *blob, uint64_t offset, uint64_t length);
+int spdk_read_cluster_data_xfer(struct spdk_blob *blob, void *buf, uint64_t offset, 
+			uint64_t length, enum xfer_type type, spdk_blob_op_complete cb_fn, void *cb_arg);
+void spdk_bs_chain_snapshot_clone(struct spdk_blob *origblob, struct spdk_blob *clone,
+				 bool leader, bool update_in_progress,
+			    spdk_blob_op_complete cb_fn, void *cb_arg);
+void spdk_bs_convert_blob(struct spdk_blob *origblob, bool leader, bool update_in_progress,
+			    spdk_blob_op_complete cb_fn, void *cb_arg);
+void spdk_bs_set_migration_flag_blob(struct spdk_blob *blob);
+bool spdk_bs_get_migration_flag_blob(struct spdk_blob *blob);
+void blob_check_io_inflaight(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
+/**
+ * update a blobstore according to bit array synced.
+ * Can be used on loaded blobstore, even with opened blobs.
+ *
+ * \param bs blobstore to update.
+ * \param cb_fn Called when the updating is complete.
+ * \param cb_arg Argument passed to function cb_fn.
+ */
+void
+spdk_bs_update_on_failover(struct spdk_blob_store *bs,
+		       spdk_bs_op_complete cb_fn, void *cb_arg);
+
+void spdk_blob_update_on_failover(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
+
+void spdk_blob_update_on_failover_send_msg(struct spdk_blob *blob,
+				spdk_blob_op_complete cb_fn, void *cb_arg);
+
+int spdk_blob_freeze_on_conflict_send_msg(struct spdk_blob_store *bs,
+		  spdk_blob_op_complete cb_fn, void *cb_arg);
+
+void spdk_lvs_unfreeze_on_conflict_msg(struct spdk_blob_store *bs);
+/**
  * Initialize a blobstore on the given device.
  *
  * \param dev Blobstore block device.
@@ -384,6 +542,8 @@ typedef void (*spdk_bs_dump_print_xattr)(FILE *fp, const char *bstype, const cha
  */
 void spdk_bs_dump(struct spdk_bs_dev *dev, FILE *fp, spdk_bs_dump_print_xattr print_xattr_fn,
 		  spdk_bs_op_complete cb_fn, void *cb_arg);
+
+void spdk_bs_dumpv2(struct spdk_blob_store *bs, FILE *fp, spdk_bs_op_complete cb_fn, void *cb_arg);
 /**
  * Destroy the blobstore.
  *
@@ -483,6 +643,42 @@ uint64_t spdk_bs_total_data_cluster_count(struct spdk_blob_store *bs);
  * \return blob id.
  */
 spdk_blob_id spdk_blob_get_id(struct spdk_blob *blob);
+
+/**
+ * Get the blob map id.
+ *
+ * \param blob Blob struct to query.
+ *
+ * \return map id.
+ */
+uint16_t spdk_blob_get_map_id(struct spdk_blob *blob);
+
+/**
+ * Get the geometry of the blob.
+ *
+ * \param blob Blob struct to query.
+ *
+ * \return geometry.
+ */
+uint8_t spdk_blob_get_geometry(struct spdk_blob *blob);
+
+/**
+ * Get the bs md thread.
+ *
+ * \param bs Blobstore struct to query.
+ *
+ * \return md thread.
+ */
+struct spdk_thread * spdk_bs_get_md_thread(struct spdk_blob_store *bs);
+
+/**
+ * Get the blob open ref.
+ *
+ * \param blob Blob struct to query.
+ *
+ * \return blob open ref.
+ */
+uint32_t spdk_blob_get_open_ref(struct spdk_blob *blob);
 
 /**
  * Get the number of pages allocated to the blob.
@@ -597,8 +793,9 @@ struct spdk_blob_opts {
 	 * The size of data referenced by esnap_id, in bytes.
 	 */
 	uint64_t esnap_id_len;
+	uint8_t geometry; /* Geometry info for lvol */
 };
-SPDK_STATIC_ASSERT(sizeof(struct spdk_blob_opts) == 80, "Incorrect size");
+SPDK_STATIC_ASSERT(sizeof(struct spdk_blob_opts) == 88, "Incorrect size");
 
 /**
  * Initialize a spdk_blob_opts structure to the default blob option values.
@@ -631,6 +828,11 @@ void spdk_bs_create_blob_ext(struct spdk_blob_store *bs, const struct spdk_blob_
 void spdk_bs_create_blob(struct spdk_blob_store *bs,
 			 spdk_blob_op_with_id_complete cb_fn, void *cb_arg);
 
+struct spdk_blob *
+spdk_bs_copy_blob(struct spdk_blob_store *bs, struct spdk_blob	*blob);
+
+int spdk_bs_delete_blob_non_leader(struct spdk_blob_store *bs, struct spdk_blob	*blob);
+
 /**
  * Create a read-only snapshot of specified blob with provided options.
  * This will automatically sync specified blob.
@@ -649,6 +851,14 @@ void spdk_bs_create_blob(struct spdk_blob_store *bs,
 void spdk_bs_create_snapshot(struct spdk_blob_store *bs, spdk_blob_id blobid,
 			     const struct spdk_blob_xattr_opts *snapshot_xattrs,
 			     spdk_blob_op_with_id_complete cb_fn, void *cb_arg);
+				 
+void spdk_bs_update_snapshot_clone(struct spdk_blob_store *bs, 
+			struct spdk_blob *origblob, struct spdk_blob *newblob,
+			bool leader, bool update_in_progress);
+
+void spdk_bs_update_snapshot_clone_live(struct spdk_blob *origblob, struct spdk_blob *newblob);
+
+void spdk_bs_update_clone(struct spdk_blob *clone);
 
 /**
  * Create a clone of specified read-only blob.
@@ -695,6 +905,7 @@ int spdk_blob_get_clones(struct spdk_blob_store *bs, spdk_blob_id blobid, spdk_b
  * \return blob id of parent blob or SPDK_BLOBID_INVALID if have no parent
  */
 spdk_blob_id spdk_blob_get_parent_snapshot(struct spdk_blob_store *bs, spdk_blob_id blobid);
+spdk_blob_id bs_get_xattr_removal(struct spdk_blob *blob);
 
 /**
  * Get the id used to access the esnap clone's parent.
@@ -765,6 +976,10 @@ bool spdk_blob_is_esnap_clone(const struct spdk_blob *blob);
  */
 void spdk_bs_delete_blob(struct spdk_blob_store *bs, spdk_blob_id blobid,
 			 spdk_blob_op_complete cb_fn, void *cb_arg);
+void spdk_bs_delete_blob_async(struct spdk_blob_store *bs, struct spdk_blob *blob,
+		    spdk_blob_op_complete cb_fn, void *cb_arg);
+void spdk_bs_cleanup(struct spdk_blob_store *bs,
+		    spdk_bs_op_complete cb_fn, void *cb_arg);
 
 /**
  * Allocate all clusters in this blob. Data for allocated clusters is copied
@@ -900,6 +1115,13 @@ void spdk_blob_open_opts_init(struct spdk_blob_open_opts *opts, size_t opts_size
 void spdk_bs_open_blob(struct spdk_blob_store *bs, spdk_blob_id blobid,
 		       spdk_blob_op_with_handle_complete cb_fn, void *cb_arg);
 
+void spdk_bs_open_blob_on_failover(struct spdk_blob_store *bs, spdk_blob_id blobid,
+		  spdk_blob_op_with_handle_complete cb_fn, void *cb_arg);
+
+void
+spdk_bs_open_blob_on_examine(struct spdk_blob_store *bs, spdk_blob_id blobid,
+		  spdk_blob_op_with_handle_complete cb_fn, void *cb_arg);
+
 /**
  * Open a blob from the given blobstore with additional options.
  *
@@ -912,6 +1134,13 @@ void spdk_bs_open_blob(struct spdk_blob_store *bs, spdk_blob_id blobid,
 void spdk_bs_open_blob_ext(struct spdk_blob_store *bs, spdk_blob_id blobid,
 			   struct spdk_blob_open_opts *opts, spdk_blob_op_with_handle_complete cb_fn, void *cb_arg);
 
+void spdk_bs_create_hubblob(struct spdk_blob_store *bs, const struct spdk_blob_opts *opts,
+	       spdk_blob_op_with_handle_complete cb_fn, void *cb_arg);
+
+void spdk_bs_open_blob_without_reference(struct spdk_blob_store *bs, spdk_blob_id blobid,
+		  struct spdk_blob_open_opts *opts, spdk_blob_op_with_handle_complete cb_fn, void *cb_arg);
+
+int spdk_bs_for_each_loaded_blob(struct spdk_blob_store *bs, spdk_bs_loaded_blob_fn fn, void *cb_arg);
 /**
  * Resize a blob to 'sz' clusters. These changes are not persisted to disk until
  * spdk_bs_md_sync_blob() is called.
@@ -925,6 +1154,10 @@ void spdk_bs_open_blob_ext(struct spdk_blob_store *bs, spdk_blob_id blobid,
  */
 void spdk_blob_resize(struct spdk_blob *blob, uint64_t sz, spdk_blob_op_complete cb_fn,
 		      void *cb_arg);
+			  
+void spdk_blob_resize_unfreeze(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
+			  
+int spdk_blob_resize_register(struct spdk_blob *blob, uint64_t sz);
 
 /**
  * Set blob as read only.
@@ -970,6 +1203,11 @@ struct spdk_io_channel *spdk_bs_alloc_io_channel(struct spdk_blob_store *bs);
  * \param channel I/O channel to free.
  */
 void spdk_bs_free_io_channel(struct spdk_io_channel *channel);
+
+struct spdk_io_channel	*spdk_bs_get_hub_channel(struct spdk_io_channel *ch);
+bool spdk_bs_set_hub_channel(struct spdk_io_channel *ch, struct spdk_io_channel *hub_ch, void *desc);
+void spdk_bs_drain_channel_queued(struct spdk_blob_store *bs, struct spdk_hublvol_channels *ch_list,
+                             int count, spdk_drain_op_cpl cb_fn, void *cb_arg);
 
 /**
  * Write data to a blob.
@@ -1053,7 +1291,11 @@ void spdk_blob_io_writev_ext(struct spdk_blob *blob, struct spdk_io_channel *cha
 			     struct iovec *iov, int iovcnt, uint64_t offset, uint64_t length,
 			     spdk_blob_op_complete cb_fn, void *cb_arg,
 			     struct spdk_blob_ext_io_opts *io_opts);
+void
+spdk_add_stat_ext(struct spdk_io_channel *channel);
 
+void
+spdk_sub_stat_ext(struct spdk_io_channel *channel);
 /**
  * Read 'length' io_units starting at 'offset' io_units into the blob into the memory
  * described by 'iov'. Accepts extended IO request options
@@ -1118,6 +1360,12 @@ void spdk_blob_io_write_zeroes(struct spdk_blob *blob, struct spdk_io_channel *c
 void spdk_bs_iter_first(struct spdk_blob_store *bs,
 			spdk_blob_op_with_handle_complete cb_fn, void *cb_arg);
 
+void spdk_bs_iter_first_without_close(struct spdk_blob_store *bs,
+		   spdk_blob_op_with_handle_complete cb_fn, void *cb_arg);
+
+void spdk_bs_iter_next_without_close(struct spdk_blob_store *bs, struct spdk_blob *blob,
+		  spdk_blob_op_with_handle_complete cb_fn, void *cb_arg);
+
 /**
  * Get the next blob by using the current blob. The obtained blob will be passed
  * to the callback function.
@@ -1149,6 +1397,30 @@ void spdk_bs_iter_next(struct spdk_blob_store *bs, struct spdk_blob *blob,
  */
 int spdk_blob_set_xattr(struct spdk_blob *blob, const char *name, const void *value,
 			uint16_t value_len);
+
+/**
+ * Get md ro flag for the given blob and set it the flag to false.
+ *
+ * \param blob Blob to set attribute.
+ *
+ * \return true if the blob is read-only, false otherwise.
+ */
+bool spdk_blob_get_md_ro(struct spdk_blob *blob);
+
+/**
+ * Set md ro flag for the given blob.
+ *
+ * \param blob Blob to set attribute.
+ * \param md_ro Value of md ro flag.
+ */
+void spdk_blob_set_md_ro(struct spdk_blob *blob, bool md_ro);
+
+/**
+ * Set the blob as clean.
+ *
+ * \param blob Blob to set attribute.
+ */
+void spdk_blob_set_clean(struct spdk_blob *blob);
 
 /**
  * Remove the extended attribute from the given blob.
@@ -1256,6 +1528,12 @@ struct spdk_bs_dev *spdk_blob_get_esnap_bs_dev(const struct spdk_blob *blob);
  * \return true if the blob or any snapshots upon which it depends are degraded, else false.
  */
 bool spdk_blob_is_degraded(const struct spdk_blob *blob);
+
+/* Sets the upper NBITS_PRIORITY_CLASS bits of all future logical block addresses to the parent 
+lvol's priority class bits. These bits must be cleared when the I/O reaches the lvolstore and added 
+again when it exits the lvolstore so that no internal lvolstore operation sees these bits.
+*/
+void spdk_blob_set_io_priority_class(struct spdk_blob *blob, int priority_class);
 
 #ifdef __cplusplus
 }

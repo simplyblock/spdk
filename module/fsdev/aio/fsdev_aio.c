@@ -24,6 +24,7 @@
 #define DEFAULT_WRITEBACK_CACHE true
 #define DEFAULT_MAX_WRITE 0x00020000
 #define DEFAULT_XATTR_ENABLED false
+#define DEFAULT_SKIP_RW false
 #define DEFAULT_TIMEOUT_MS 0 /* to prevent the attribute caching */
 
 #ifdef SPDK_CONFIG_HAVE_STRUCT_STAT_ST_ATIM
@@ -95,12 +96,14 @@ struct spdk_fsdev_file_object {
 
 struct aio_fsdev {
 	struct spdk_fsdev fsdev;
+	struct spdk_fsdev_mount_opts mount_opts;
 	char *root_path;
 	int proc_self_fd;
 	pthread_mutex_t mutex;
 	struct spdk_fsdev_file_object *root;
 	TAILQ_ENTRY(aio_fsdev) tailq;
 	bool xattr_enabled;
+	bool skip_rw;
 };
 
 struct aio_fsdev_io {
@@ -113,6 +116,7 @@ struct aio_io_channel {
 	struct spdk_poller *poller;
 	struct spdk_aio_mgr *mgr;
 	TAILQ_HEAD(, aio_fsdev_io) ios_in_progress;
+	TAILQ_HEAD(, aio_fsdev_io) ios_to_complete;
 };
 
 static TAILQ_HEAD(, aio_fsdev) g_aio_fsdev_head = TAILQ_HEAD_INITIALIZER(
@@ -355,6 +359,40 @@ utimensat_empty(struct aio_fsdev *vfsdev, struct spdk_fsdev_file_object *fobject
 	return res;
 }
 
+static void
+fsdev_free_leafs(struct spdk_fsdev_file_object *fobject, bool unref_fobject)
+{
+	while (!TAILQ_EMPTY(&fobject->handles)) {
+		struct spdk_fsdev_file_handle *fhandle = TAILQ_FIRST(&fobject->handles);
+		file_handle_delete(fhandle);
+#ifdef __clang_analyzer__
+		/*
+		 * scan-build fails to comprehend that file_handle_delete() removes the fhandle
+		 * from the queue, so it thinks it's remained accessible and throws the "Use of
+		 * memory after it is freed" error here.
+		 * The loop below "teaches" the scan-build that the freed fhandle is not on the
+		 * list anymore and supresses the error in this way.
+		 */
+		struct spdk_fsdev_file_handle *tmp;
+		TAILQ_FOREACH(tmp, &fobject->handles, link) {
+			assert(tmp != fhandle);
+		}
+#endif
+	}
+
+	while (!TAILQ_EMPTY(&fobject->leafs)) {
+		struct spdk_fsdev_file_object *leaf_fobject = TAILQ_FIRST(&fobject->leafs);
+		fsdev_free_leafs(leaf_fobject, true);
+	}
+
+	if (fobject->refcount && unref_fobject) {
+		/* if still referenced - zero refcount */
+		int res = file_object_unref(fobject, fobject->refcount);
+		assert(res == 0);
+		UNUSED(res);
+	}
+}
+
 static int
 lo_getattr(struct spdk_io_channel *ch, struct spdk_fsdev_io *fsdev_io)
 {
@@ -402,7 +440,7 @@ lo_opendir(struct spdk_io_channel *ch, struct spdk_fsdev_io *fsdev_io)
 	}
 
 	fhandle = file_handle_create(fobject, fd);
-	if (fd == -1) {
+	if (fhandle == NULL) {
 		error = -ENOMEM;
 		SPDK_ERRLOG("file_handle_create failed for " FOBJECT_FMT " (err=%d)\n", FOBJECT_ARGS(fobject),
 			    error);
@@ -453,16 +491,66 @@ lo_releasedir(struct spdk_io_channel *ch, struct spdk_fsdev_io *fsdev_io)
 		return -EINVAL;
 	}
 
-	file_handle_delete(fhandle);
-
-	/*
-	 * scan-build doesn't understand that we only print the value of an already
-	 * freed pointer and falsely reports "Use of memory after it is freed" here.
-	 */
-#ifndef __clang_analyzer__
 	SPDK_DEBUGLOG(fsdev_aio, "RELEASEDIR succeeded for " FOBJECT_FMT " (fh=%p)\n",
 		      FOBJECT_ARGS(fobject), fhandle);
-#endif
+
+	file_handle_delete(fhandle);
+
+	return 0;
+}
+
+static int
+lo_set_mount_opts(struct aio_fsdev *vfsdev, struct spdk_fsdev_mount_opts *opts)
+{
+	assert(opts != NULL);
+	assert(opts->opts_size != 0);
+
+	UNUSED(vfsdev);
+
+	if (opts->opts_size > offsetof(struct spdk_fsdev_mount_opts, max_write)) {
+		/* Set the value the aio fsdev was created with */
+		opts->max_write = vfsdev->mount_opts.max_write;
+	}
+
+	if (opts->opts_size > offsetof(struct spdk_fsdev_mount_opts, writeback_cache_enabled)) {
+		if (vfsdev->mount_opts.writeback_cache_enabled) {
+			/* The writeback_cache_enabled was enabled upon creation => we follow the opts */
+			vfsdev->mount_opts.writeback_cache_enabled = opts->writeback_cache_enabled;
+		} else {
+			/* The writeback_cache_enabled was disabled upon creation => we reflect it in the opts */
+			opts->writeback_cache_enabled = false;
+		}
+	}
+
+	/* The AIO doesn't apply any additional restrictions, so we just accept the requested opts */
+	SPDK_DEBUGLOG(fsdev_aio,
+		      "aio filesystem %s: opts updated: max_write=%" PRIu32 ", writeback_cache=%" PRIu8 "\n",
+		      vfsdev->fsdev.name, vfsdev->mount_opts.max_write, vfsdev->mount_opts.writeback_cache_enabled);
+
+	return 0;
+}
+
+static int
+lo_mount(struct spdk_io_channel *ch, struct spdk_fsdev_io *fsdev_io)
+{
+	struct aio_fsdev *vfsdev = fsdev_to_aio_fsdev(fsdev_io->fsdev);
+	struct spdk_fsdev_mount_opts *in_opts = &fsdev_io->u_in.mount.opts;
+
+	fsdev_io->u_out.mount.opts = *in_opts;
+	lo_set_mount_opts(vfsdev, &fsdev_io->u_out.mount.opts);
+	file_object_ref(vfsdev->root);
+	fsdev_io->u_out.mount.root_fobject = vfsdev->root;
+
+	return 0;
+}
+
+static int
+lo_umount(struct spdk_io_channel *ch, struct spdk_fsdev_io *fsdev_io)
+{
+	struct aio_fsdev *vfsdev = fsdev_to_aio_fsdev(fsdev_io->fsdev);
+
+	fsdev_free_leafs(vfsdev->root, false);
+	file_object_unref(vfsdev->root, 1); /* reference by mount */
 
 	return 0;
 }
@@ -502,6 +590,7 @@ lo_do_lookup(struct aio_fsdev *vfsdev, struct spdk_fsdev_file_object *parent_fob
 	fobject = lo_find_leaf_unsafe(parent_fobject, stat.st_ino, stat.st_dev);
 	if (fobject) {
 		close(newfd);
+		newfd = -1;
 		file_object_ref(fobject); /* reference by a lo_do_lookup caller */
 	} else {
 		fobject = file_object_create_unsafe(parent_fobject, newfd, stat.st_ino, stat.st_dev, stat.st_mode);
@@ -519,7 +608,9 @@ lo_do_lookup(struct aio_fsdev *vfsdev, struct spdk_fsdev_file_object *parent_fob
 		if (res) {
 			SPDK_ERRLOG("fill_attr(%s) failed with %d\n", name, res);
 			file_object_unref(fobject, 1);
-			close(newfd);
+			if (newfd != -1) {
+				close(newfd);
+			}
 			return res;
 		}
 	}
@@ -726,7 +817,7 @@ update_open_flags(struct aio_fsdev *vfsdev, uint32_t flags)
 	 * With writeback cache, kernel may send read requests even
 	 * when userspace opened write-only
 	 */
-	if (vfsdev->fsdev.opts.writeback_cache_enabled && (flags & O_ACCMODE) == O_WRONLY) {
+	if (vfsdev->mount_opts.writeback_cache_enabled && (flags & O_ACCMODE) == O_WRONLY) {
 		flags &= ~O_ACCMODE;
 		flags |= O_RDWR;
 	}
@@ -739,7 +830,7 @@ update_open_flags(struct aio_fsdev *vfsdev, uint32_t flags)
 	 * we just accept that. A more rigorous filesystem may want
 	 * to return an error here
 	 */
-	if (vfsdev->fsdev.opts.writeback_cache_enabled && (flags & O_APPEND)) {
+	if (vfsdev->mount_opts.writeback_cache_enabled && (flags & O_APPEND)) {
 		flags &= ~O_APPEND;
 	}
 
@@ -1029,10 +1120,11 @@ lo_release(struct spdk_io_channel *ch, struct spdk_fsdev_io *fsdev_io)
 		return -EINVAL;
 	}
 
-	file_handle_delete(fhandle);
-
 	SPDK_DEBUGLOG(fsdev_aio, "RELEASE succeeded for " FOBJECT_FMT " fh=%p)\n",
 		      FOBJECT_ARGS(fobject), fhandle);
+
+	file_handle_delete(fhandle);
+
 	return 0;
 }
 
@@ -1083,6 +1175,20 @@ lo_read(struct spdk_io_channel *_ch, struct spdk_fsdev_io *fsdev_io)
 	if (!outcnt || !outvec) {
 		SPDK_ERRLOG("bad outvec: iov=%p outcnt=%" PRIu32 "\n", outvec, outcnt);
 		return -EINVAL;
+	}
+
+	if (vfsdev->skip_rw) {
+		uint32_t i;
+
+		fsdev_io->u_out.read.data_size = 0;
+
+		for (i = 0; i < outcnt; i++, outvec++) {
+			fsdev_io->u_out.read.data_size += outvec->iov_len;
+		}
+
+		TAILQ_INSERT_TAIL(&ch->ios_to_complete, vfsdev_io, link);
+
+		return IO_STATUS_ASYNC;
 	}
 
 	vfsdev_io->aio = spdk_aio_mgr_read(ch->mgr, lo_read_cb, fsdev_io, fhandle->fd, offs, size, outvec,
@@ -1142,6 +1248,19 @@ lo_write(struct spdk_io_channel *_ch, struct spdk_fsdev_io *fsdev_io)
 	if (!incnt || !invec) { /* there should be at least one iovec with data */
 		SPDK_ERRLOG("bad invec: iov=%p cnt=%" PRIu32 "\n", invec, incnt);
 		return -EINVAL;
+	}
+
+	if (vfsdev->skip_rw) {
+		uint32_t i;
+
+		fsdev_io->u_out.write.data_size = 0;
+		for (i = 0; i < incnt; i++, invec++) {
+			fsdev_io->u_out.write.data_size += invec->iov_len;
+		}
+
+		TAILQ_INSERT_TAIL(&ch->ios_to_complete, vfsdev_io, link);
+
+		return IO_STATUS_ASYNC;
 	}
 
 	vfsdev_io->aio = spdk_aio_mgr_write(ch->mgr, lo_write_cb, fsdev_io,
@@ -1975,11 +2094,23 @@ lo_abort(struct spdk_io_channel *_ch, struct spdk_fsdev_io *fsdev_io)
 static int
 aio_io_poll(void *arg)
 {
+	struct aio_fsdev_io *vfsdev_io, *tmp;
 	struct aio_io_channel *ch = arg;
+	int res = SPDK_POLLER_IDLE;
 
-	spdk_aio_mgr_poll(ch->mgr);
+	if (spdk_aio_mgr_poll(ch->mgr)) {
+		res = SPDK_POLLER_BUSY;
+	}
 
-	return SPDK_POLLER_IDLE;
+	TAILQ_FOREACH_SAFE(vfsdev_io, &ch->ios_to_complete, link, tmp) {
+		struct spdk_fsdev_io *fsdev_io = aio_to_fsdev_io(vfsdev_io);
+
+		TAILQ_REMOVE(&ch->ios_to_complete, vfsdev_io, link);
+		spdk_fsdev_io_complete(fsdev_io, 0);
+		res = SPDK_POLLER_BUSY;
+	}
+
+	return res;
 }
 
 static int
@@ -1996,6 +2127,7 @@ aio_fsdev_create_cb(void *io_device, void *ctx_buf)
 
 	ch->poller = SPDK_POLLER_REGISTER(aio_io_poll, ch, 0);
 	TAILQ_INIT(&ch->ios_in_progress);
+	TAILQ_INIT(&ch->ios_to_complete);
 
 	SPDK_DEBUGLOG(fsdev_aio, "Created aio fsdev IO channel: thread %s, thread id %" PRIu64
 		      "\n",
@@ -2081,40 +2213,6 @@ fsdev_aio_free(struct aio_fsdev *vfsdev)
 	free(vfsdev);
 }
 
-static void
-fsdev_free_leafs(struct spdk_fsdev_file_object *fobject)
-{
-	while (!TAILQ_EMPTY(&fobject->handles)) {
-		struct spdk_fsdev_file_handle *fhandle = TAILQ_FIRST(&fobject->handles);
-		file_handle_delete(fhandle);
-#ifdef __clang_analyzer__
-		/*
-		 * scan-build fails to comprehend that file_handle_delete() removes the fhandle
-		 * from the queue, so it thinks it's remained accessible and throws the "Use of
-		 * memory after it is freed" error here.
-		 * The loop below "teaches" the scan-build that the freed fhandle is not on the
-		 * list anymore and supresses the error in this way.
-		 */
-		struct spdk_fsdev_file_handle *tmp;
-		TAILQ_FOREACH(tmp, &fobject->handles, link) {
-			assert(tmp != fhandle);
-		}
-#endif
-	}
-
-	while (!TAILQ_EMPTY(&fobject->leafs)) {
-		struct spdk_fsdev_file_object *leaf_fobject = TAILQ_FIRST(&fobject->leafs);
-		fsdev_free_leafs(leaf_fobject);
-	}
-
-	if (fobject->refcount) {
-		/* if still referenced - zero refcount */
-		int res = file_object_unref(fobject, fobject->refcount);
-		assert(res == 0);
-		UNUSED(res);
-	}
-}
-
 static int
 fsdev_aio_destruct(void *ctx)
 {
@@ -2122,7 +2220,7 @@ fsdev_aio_destruct(void *ctx)
 
 	TAILQ_REMOVE(&g_aio_fsdev_head, vfsdev, tailq);
 
-	fsdev_free_leafs(vfsdev->root);
+	fsdev_free_leafs(vfsdev->root, true);
 	vfsdev->root = NULL;
 
 	pthread_mutex_destroy(&vfsdev->mutex);
@@ -2134,6 +2232,8 @@ fsdev_aio_destruct(void *ctx)
 typedef int (*fsdev_op_handler_func)(struct spdk_io_channel *ch, struct spdk_fsdev_io *fsdev_io);
 
 static fsdev_op_handler_func handlers[] = {
+	[SPDK_FSDEV_IO_MOUNT] = lo_mount,
+	[SPDK_FSDEV_IO_UMOUNT] = lo_umount,
 	[SPDK_FSDEV_IO_LOOKUP] = lo_lookup,
 	[SPDK_FSDEV_IO_FORGET] = lo_forget,
 	[SPDK_FSDEV_IO_GETATTR] = lo_getattr,
@@ -2188,39 +2288,6 @@ fsdev_aio_get_io_channel(void *ctx)
 	return spdk_get_io_channel(&g_aio_fsdev_head);
 }
 
-static int
-fsdev_aio_negotiate_opts(void *ctx, struct spdk_fsdev_open_opts *opts)
-{
-	struct aio_fsdev *vfsdev = ctx;
-
-	assert(opts != 0);
-	assert(opts->opts_size != 0);
-
-	UNUSED(vfsdev);
-
-	if (opts->opts_size > offsetof(struct spdk_fsdev_open_opts, max_write)) {
-		/* Set the value the aio fsdev was created with */
-		opts->max_write = vfsdev->fsdev.opts.max_write;
-	}
-
-	if (opts->opts_size > offsetof(struct spdk_fsdev_open_opts, writeback_cache_enabled)) {
-		if (vfsdev->fsdev.opts.writeback_cache_enabled) {
-			/* The writeback_cache_enabled was enabled upon creation => we follow the opts */
-			vfsdev->fsdev.opts.writeback_cache_enabled = opts->writeback_cache_enabled;
-		} else {
-			/* The writeback_cache_enabled was disabled upon creation => we reflect it in the opts */
-			opts->writeback_cache_enabled = false;
-		}
-	}
-
-	/* The AIO doesn't apply any additional restrictions, so we just accept the requested opts */
-	SPDK_DEBUGLOG(fsdev_aio,
-		      "aio filesystem %s: opts updated: max_write=%" PRIu32 ", writeback_cache=%" PRIu8 "\n",
-		      vfsdev->fsdev.name, vfsdev->fsdev.opts.max_write, vfsdev->fsdev.opts.writeback_cache_enabled);
-
-	return 0;
-}
-
 static void
 fsdev_aio_write_config_json(struct spdk_fsdev *fsdev, struct spdk_json_write_ctx *w)
 {
@@ -2233,8 +2300,9 @@ fsdev_aio_write_config_json(struct spdk_fsdev *fsdev, struct spdk_json_write_ctx
 	spdk_json_write_named_string(w, "root_path", vfsdev->root_path);
 	spdk_json_write_named_bool(w, "enable_xattr", vfsdev->xattr_enabled);
 	spdk_json_write_named_bool(w, "enable_writeback_cache",
-				   !!vfsdev->fsdev.opts.writeback_cache_enabled);
-	spdk_json_write_named_uint32(w, "max_write", vfsdev->fsdev.opts.max_write);
+				   !!vfsdev->mount_opts.writeback_cache_enabled);
+	spdk_json_write_named_uint32(w, "max_write", vfsdev->mount_opts.max_write);
+	spdk_json_write_named_bool(w, "skip_rw", vfsdev->skip_rw);
 	spdk_json_write_object_end(w); /* params */
 	spdk_json_write_object_end(w);
 }
@@ -2243,7 +2311,6 @@ static const struct spdk_fsdev_fn_table aio_fn_table = {
 	.destruct		= fsdev_aio_destruct,
 	.submit_request		= fsdev_aio_submit_request,
 	.get_io_channel		= fsdev_aio_get_io_channel,
-	.negotiate_opts		= fsdev_aio_negotiate_opts,
 	.write_config_json	= fsdev_aio_write_config_json,
 };
 
@@ -2303,6 +2370,7 @@ spdk_fsdev_aio_get_default_opts(struct spdk_fsdev_aio_opts *opts)
 	opts->xattr_enabled = DEFAULT_XATTR_ENABLED;
 	opts->writeback_cache_enabled = DEFAULT_WRITEBACK_CACHE;
 	opts->max_write = DEFAULT_MAX_WRITE;
+	opts->skip_rw = DEFAULT_SKIP_RW;
 }
 
 int
@@ -2367,15 +2435,17 @@ spdk_fsdev_aio_create(struct spdk_fsdev **fsdev, const char *name, const char *r
 		return rc;
 	}
 
-	vfsdev->fsdev.opts.writeback_cache_enabled = opts->writeback_cache_enabled;
-	vfsdev->fsdev.opts.max_write = opts->max_write;
+	vfsdev->mount_opts.writeback_cache_enabled = DEFAULT_WRITEBACK_CACHE;
+	vfsdev->mount_opts.max_write = DEFAULT_MAX_WRITE;
+
+	vfsdev->skip_rw = opts->skip_rw;
 
 	*fsdev = &(vfsdev->fsdev);
 	TAILQ_INSERT_TAIL(&g_aio_fsdev_head, vfsdev, tailq);
 	SPDK_DEBUGLOG(fsdev_aio, "Created aio filesystem %s (xattr_enabled=%" PRIu8 " writeback_cache=%"
-		      PRIu8 " max_write=%" PRIu32 ")\n",
-		      vfsdev->fsdev.name, vfsdev->xattr_enabled, vfsdev->fsdev.opts.writeback_cache_enabled,
-		      vfsdev->fsdev.opts.max_write);
+		      PRIu8 " max_write=%" PRIu32 " skip_rw=%" PRIu8 ")\n",
+		      vfsdev->fsdev.name, vfsdev->xattr_enabled, vfsdev->mount_opts.writeback_cache_enabled,
+		      vfsdev->mount_opts.max_write, vfsdev->skip_rw);
 	return rc;
 }
 void

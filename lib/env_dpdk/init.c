@@ -6,7 +6,7 @@
 #include "spdk/stdinc.h"
 
 #include "env_internal.h"
-
+#include <numa.h>
 #include "spdk/version.h"
 #include "spdk/env_dpdk.h"
 #include "spdk/log.h"
@@ -23,6 +23,7 @@
 #define SPDK_ENV_DPDK_DEFAULT_NAME		"spdk"
 #define SPDK_ENV_DPDK_DEFAULT_SHM_ID		-1
 #define SPDK_ENV_DPDK_DEFAULT_MEM_SIZE		-1
+#define SPDK_ENV_DPDK_DEFAULT_NUMA_NODE		-1
 #define SPDK_ENV_DPDK_DEFAULT_MAIN_CORE		-1
 #define SPDK_ENV_DPDK_DEFAULT_MEM_CHANNEL	-1
 #define SPDK_ENV_DPDK_DEFAULT_CORE_MASK		"0x1"
@@ -106,11 +107,14 @@ spdk_env_opts_init(struct spdk_env_opts *opts)
 	opts->main_core = SPDK_ENV_DPDK_DEFAULT_MAIN_CORE;
 	opts->mem_channel = SPDK_ENV_DPDK_DEFAULT_MEM_CHANNEL;
 	opts->base_virtaddr = SPDK_ENV_DPDK_DEFAULT_BASE_VIRTADDR;
+	opts->numa_node = SPDK_ENV_DPDK_DEFAULT_NUMA_NODE; /* limit numa node disabled */
 
 #define SET_FIELD(field, value) \
 	if (offsetof(struct spdk_env_opts, field) + sizeof(opts->field) <= opts->opts_size) { \
 		opts->field = value; \
 	}
+
+	SET_FIELD(enforce_numa, false);
 
 #undef SET_FIELD
 }
@@ -212,6 +216,49 @@ get_iommu_width(void)
 
 #endif
 
+static char *
+build_socket_mem_arg(int target_node, int mem_size)
+{
+	char *buf, *p;
+	size_t len;
+	int i, max_node;
+
+	if (numa_available() < 0) {
+		fprintf(stderr, "NUMA not available\n");
+		return NULL;
+	}
+
+	max_node = numa_max_node();
+
+	if (target_node < 0 || target_node > max_node) {
+		fprintf(stderr, "Invalid numa_node=%d (max=%d)\n",
+		        target_node, max_node);
+		// return NULL;
+	}
+
+	/* "--socket-mem=" + each node entry */
+	len = strlen("--socket-mem=") + (max_node + 1) * 32;
+	buf = calloc(1, len);
+	if (buf == NULL) {
+		return NULL;
+	}
+
+	p = buf;
+	p += snprintf(p, len - (p - buf), "--socket-mem=");
+
+	for (i = 0; i <= max_node; i++) {
+		int val = (i == target_node) ? mem_size : 0;
+
+		p += snprintf(p, len - (p - buf), "%d", val);
+
+		if (i != max_node) {
+			p += snprintf(p, len - (p - buf), ",");
+		}
+	}
+
+	return buf;
+}
+
 static int
 build_eal_cmdline(const struct spdk_env_opts *opts)
 {
@@ -294,15 +341,33 @@ build_eal_cmdline(const struct spdk_env_opts *opts)
 
 	/* set the memory size */
 	if (opts->mem_size >= 0) {
-		args = push_arg(args, &argcount, _sprintf_alloc("-m %d", opts->mem_size));
-		if (args == NULL) {
-			return -1;
+		if (!no_huge && opts->numa_node >= 0) {
+			char *numa_mem = build_socket_mem_arg(opts->numa_node, opts->mem_size);
+			if (numa_mem == NULL) {
+				fprintf(stderr, "Failed to build --socket-mem\n");
+				free_args(args, argcount);
+				return -1;
+			}
+
+			args = push_arg(args, &argcount, numa_mem);
+			if (args == NULL) {
+				return -1;
+			}
+		} else {
+			args = push_arg(args, &argcount, _sprintf_alloc("-m %d", opts->mem_size));
+			if (args == NULL) {
+				return -1;
+			}
 		}
 	}
 
 	/* set no huge pages */
 	if (opts->no_huge) {
 		mem_disable_huge_pages();
+	}
+
+	if (opts->enforce_numa) {
+		mem_enforce_numa();
 	}
 
 	/* set the main core */
@@ -541,8 +606,9 @@ build_eal_cmdline(const struct spdk_env_opts *opts)
 #endif
 
 	if (opts->env_context) {
+		char *sp = NULL;
 		char *ptr = strdup(opts->env_context);
-		char *tok = strtok(ptr, " \t");
+		char *tok = strtok_r(ptr, " \t", &sp);
 
 		/* DPDK expects each argument as a separate string in the argv
 		 * array, so we need to tokenize here in case the caller
@@ -550,7 +616,7 @@ build_eal_cmdline(const struct spdk_env_opts *opts)
 		 */
 		while (tok != NULL) {
 			args = push_arg(args, &argcount, strdup(tok));
-			tok = strtok(NULL, " \t");
+			tok = strtok_r(NULL, " \t", &sp);
 		}
 
 		free(ptr);
@@ -609,6 +675,9 @@ env_copy_opts(struct spdk_env_opts *opts, const struct spdk_env_opts *opts_user,
 	if (offsetof(struct spdk_env_opts, field) + sizeof(opts->field) <= user_opts_size) { \
 		opts->field = opts_user->field; \
 	}
+
+	SET_FIELD(enforce_numa);
+	SET_FIELD(numa_node);
 
 #undef SET_FIELD
 }

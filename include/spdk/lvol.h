@@ -14,6 +14,7 @@
 #include "spdk/stdinc.h"
 #include "spdk/blob.h"
 #include "spdk/uuid.h"
+#include "spdk/bdev_module.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -22,6 +23,7 @@ extern "C" {
 struct spdk_bs_dev;
 struct spdk_lvol_store;
 struct spdk_lvol;
+struct spdk_lvs_xfer;
 
 enum lvol_clear_method {
 	LVOL_CLEAR_WITH_DEFAULT = BLOB_CLEAR_WITH_DEFAULT,
@@ -117,6 +119,12 @@ typedef void (*spdk_lvol_op_with_handle_complete)(void *cb_arg, struct spdk_lvol
 typedef void (*spdk_lvol_op_complete)(void *cb_arg, int lvolerrno);
 
 /**
+ * Callback definition for lvol operations without handle to lvol.
+ *
+ * \param cb_arg Custom arguments
+ */
+typedef void (*spdk_lvol_op_migrate_complete)(void *cb_arg);
+/**
  * Callback definition for spdk_lvol_iter_clones.
  *
  * \param lvol An iterated lvol.
@@ -163,6 +171,9 @@ void spdk_lvs_rename(struct spdk_lvol_store *lvs, const char *new_name,
  */
 int spdk_lvs_unload(struct spdk_lvol_store *lvol_store,
 		    spdk_lvs_op_complete cb_fn, void *cb_arg);
+struct spdk_transfer_dev;
+void spdk_lvs_rmt_bdev_remove(struct spdk_transfer_dev *tdev);
+bool spdk_unload_lvs_poll_group(struct spdk_lvol_store *lvs);
 
 /**
  * Destroy lvolstore.
@@ -193,7 +204,10 @@ int spdk_lvs_destroy(struct spdk_lvol_store *lvol_store,
  */
 int spdk_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz,
 		     bool thin_provisioned, enum lvol_clear_method clear_method,
-		     spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
+		     uint8_t geometry, spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
+
+int spdk_lvol_create_hublvol(struct spdk_lvol_store *lvs, const char *name, spdk_lvol_op_with_handle_complete cb_fn,
+ 				void *cb_arg);
 /**
  * Create snapshot of given lvol.
  *
@@ -204,6 +218,13 @@ int spdk_lvol_create(struct spdk_lvol_store *lvs, const char *name, uint64_t sz,
  */
 void spdk_lvol_create_snapshot(struct spdk_lvol *lvol, const char *snapshot_name,
 			       spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
+			
+void spdk_lvol_update_snapshot_clone(struct spdk_lvol *lvol, 
+			struct spdk_lvol *origlvol, 
+			spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
+			
+void spdk_lvol_update_clone(struct spdk_lvol *lvol,
+			spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
 
 /**
  * Create clone of given snapshot.
@@ -238,6 +259,8 @@ int spdk_lvol_create_esnap_clone(const void *esnap_id, uint32_t id_len, uint64_t
 				 struct spdk_lvol_store *lvs, const char *clone_name,
 				 spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
 
+int spdk_lvol_copy_blob(struct spdk_lvol *lvol);
+
 /**
  * Rename lvol with new_name.
  *
@@ -264,6 +287,8 @@ bool spdk_lvol_deletable(struct spdk_lvol *lvol);
  * \param cb_arg Completion callback custom arguments.
  */
 void spdk_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg);
+void spdk_lvol_destroy_async(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg);
+void spdk_lvolsotre_cleanup(struct spdk_lvol_store *lvs, spdk_lvs_op_complete cb_fn, void *cb_arg);
 
 /**
  * Close lvol, but information is kept on lvolstore.
@@ -281,7 +306,7 @@ void spdk_lvol_close(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *
  *
  * \param lvol Handle to lvol.
  * \param cb_fn Function to call for each lvol that clones this lvol.
- * \param cb_arg Context to pass with cb_fn.
+ * \param cb_arg Context to pass wtih cb_fn.
  * \return -ENOMEM if memory allocation failed, non-zero return from cb_fn(), or 0.
  */
 int spdk_lvol_iter_immediate_clones(struct spdk_lvol *lvol, spdk_lvol_iter_cb cb_fn, void *cb_arg);
@@ -294,11 +319,81 @@ int spdk_lvol_iter_immediate_clones(struct spdk_lvol *lvol, spdk_lvol_iter_cb cb
  */
 struct spdk_lvol *spdk_lvol_get_by_uuid(const struct spdk_uuid *uuid);
 
+void spdk_lvol_update_on_failover(struct spdk_lvol_store *lvs, struct spdk_lvol *lvol, bool send_md_thread);
+void lvol_update_on_failover(struct spdk_lvol_store *lvs, struct spdk_lvol *lvol, bool send_msg);
+void spdk_lvs_update_on_failover(struct spdk_lvol_store *lvs);
+void spdk_lvs_check_active_process(struct spdk_lvol_store *lvs, struct spdk_lvol *lvol, uint8_t type);
+bool spdk_lvs_nonleader_timeout(struct spdk_lvol_store *lvs);
+int spdk_lvs_change_leader_state(uint64_t groupid);
+int spdk_lvs_queued_failed_IO(struct spdk_lvol_store *lvs);
+void spdk_abort_node(void);
+bool spdk_lvs_trigger_leadership_switch(uint64_t *groupid);
+bool spdk_lvs_queued_rsp(struct spdk_lvol_store *lvs, struct spdk_bdev_io *bdev_io);
+void spdk_lvs_set_opts(struct spdk_lvol_store *lvs, uint64_t groupid, uint64_t port, uint64_t hublvol_port, char *role);
+void spdk_lvs_set_signal_switch(struct spdk_lvol_store *lvs);
+void spdk_lvs_open_hub_bdev(void * cb_arg);
+void spdk_lvs_connect_hublvol(struct spdk_lvol_store *lvs, const char *remote_bdev);
+void spdk_lvs_set_read_only(struct spdk_lvol_store *lvs, bool status);
+void spdk_lvs_set_failed_on_update(struct spdk_lvol_store *lvs, bool state);
+int spdk_lvs_IO_redirect(void * cb_arg);
+int spdk_lvs_IO_hublvol(void *cb_arg);
+
+int spdk_lvs_poll_group_options(char *mask);
+struct spdk_transfer_dev *spdk_open_rmt_bdev(const char *name, struct spdk_lvol_store *lvs, bool is_s3);
+int spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_batch,
+				enum xfer_type type, struct spdk_transfer_dev *tdev, const char *snapshot_name,
+				uint32_t lvol_id, spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
+int spdk_lvol_batch_transfer(uint32_t cluster_batch, enum xfer_type type, struct spdk_transfer_dev *tdev,
+				struct spdk_lvol **batch_lvols, int num_lvols, char **batch_snapshots, int num_snapshots,
+				uint32_t *batch_lvol_ids, int num_lvol_ids, spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
+
+int spdk_lvol_s3_backup(struct spdk_lvol *lvol, uint32_t cluster_batch,
+				struct spdk_lvol **chain_snapshots, int num_snapshots, uint32_t s3_id);
+int spdk_lvol_s3_merge(struct spdk_lvol_store *lvs, uint32_t s3_id,
+				uint32_t old_s3_id, uint32_t cluster_batch);
+int spdk_lvol_s3_recovery(struct spdk_lvol *lvol, uint32_t cluster_batch,
+				uint32_t *chain_s3_ids, uint32_t num_s3_ids);
+void spdk_lvol_chain(struct spdk_lvol *origlvol, struct spdk_lvol *clone,
+		 spdk_lvol_op_complete cb_fn, void *cb_arg);
+void spdk_lvol_convert(struct spdk_lvol *origlvol, spdk_lvol_op_complete cb_fn, void *cb_arg);
+void spdk_lvol_set_migration_flag(struct spdk_lvol *lvol);
+enum freeze_io_result spdk_lvol_freeze_io(struct spdk_lvol *lvol, struct spdk_io_channel *ch, 
+				struct spdk_bdev_io *bdev_io, spdk_lvol_op_migrate_complete cb_fn);
+void spdk_tdev_store_hublvol_channel(struct spdk_transfer_dev *tdev, struct spdk_io_channel *channel);
+struct spdk_io_channel * spdk_tdev_get_hub_channel(struct spdk_transfer_dev *tdev, struct spdk_thread *thread);
+void spdk_lvol_rediret_io_change_state(struct spdk_lvol *lvol);
+/**
+ * Get the lvol that has a particular UUID.
+ *
+ * \param uuid The lvs's UUID.
+ * \param leader The lvs's flag to set as leader or non leader.
+ * \return A pointer to the requested lvol on success, else NULL.
+ */
+void spdk_lvs_set_leader(struct spdk_lvol_store *lvs, bool leader);
+void spdk_lvol_set_leader_failed_on_update(struct spdk_lvol *lvol);
+
+/**
+ * Get the lvol that has a particular UUID.
+ *
+ * \param uuid The lvol's UUID.
+ * \param leader The lvs's flag to set as leader or non leader.
+ * \return A pointer to the requested lvol on success, else NULL.
+ */
+void spdk_lvol_set_leader(struct spdk_lvol *lvol);
+
+/**
+ * set the leadership for all lvs and lvol.
+ *
+ * \param leader The lvs's flag to set as leader or non leader.
+ */
+void spdk_set_leader_all(struct spdk_lvol_store *t_lvs, bool lvs_leader, bool bs_leadership);
+void spdk_block_data_port(struct spdk_lvol_store *lvs);
+
 /**
  * Get the lvol that has the specified name in the specified lvolstore.
  *
  * \param lvs_name Name of the lvolstore.
- * \param lvol_name Name of the lvol.
+ * \param lvol_name Name ofthe lvol.
  * \return A pointer to the requested lvol on success, else NULL.
  */
 struct spdk_lvol *spdk_lvol_get_by_names(const char *lvs_name, const char *lvol_name);
@@ -325,7 +420,7 @@ void spdk_lvs_load(struct spdk_bs_dev *bs_dev, spdk_lvs_op_with_handle_complete 
 /**
  * Load lvolstore from the given blobstore device with options.
  *
- * If lvs_opts is not NULL, it should be initialized with spdk_lvs_opts_init().
+ * If lvs_opts is not NULL, it should be initalized with spdk_lvs_opts_init().
  *
  * \param bs_dev Pointer to the blobstore device.
  * \param lvs_opts lvolstore options.
@@ -356,6 +451,10 @@ void spdk_lvs_grow(struct spdk_bs_dev *bs_dev, spdk_lvs_op_with_handle_complete 
  */
 void spdk_lvs_grow_live(struct spdk_lvol_store *lvs, spdk_lvs_op_complete cb_fn, void *cb_arg);
 
+void spdk_lvs_update_live(struct spdk_lvol_store *lvs, uint64_t id, spdk_lvs_op_complete cb_fn, void *cb_arg);
+
+void spdk_lvs_apply(struct spdk_lvol_store *lvs, spdk_lvs_op_complete cb_fn, void *cb_arg);
+void lvs_print_lvols_info(struct spdk_lvol_store *lvs, struct spdk_json_write_ctx *w);
 /**
  * Open a lvol.
  *

@@ -99,9 +99,8 @@ reactor_run(void)
 		spdk_thread_poll(thread, 0, 0);
 
 		/* spdk_unlikely() is a branch prediction macro. Here it means the
-		 * thread should not be exited and idle, but it is still possible. */
-		if (spdk_unlikely(spdk_thread_is_exited(thread) &&
-				  spdk_thread_is_idle(thread))) {
+		 * thread should not be exited, but it is still possible. */
+		if (spdk_unlikely(spdk_thread_is_exited(thread))) {
 			spdk_thread_destroy(thread);
 		} else {
 			spdk_ring_enqueue(reactor->threads, (void **)&lw_thread, 1, NULL);
@@ -199,7 +198,7 @@ init_reactor(void)
 
 	g_main_reactor.core = main_core;
 
-	g_main_reactor.threads = spdk_ring_create(SPDK_RING_TYPE_MP_SC, 1024, SPDK_ENV_SOCKET_ID_ANY);
+	g_main_reactor.threads = spdk_ring_create(SPDK_RING_TYPE_MP_SC, 1024, SPDK_ENV_NUMA_ID_ANY);
 	if (!g_main_reactor.threads) {
 		fprintf(stderr, "ERROR: Failed to alloc thread ring!\n");
 		rc = -ENOMEM;

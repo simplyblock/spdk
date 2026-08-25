@@ -17,6 +17,7 @@
 
 #include "spdk/bdev.h"
 #include "spdk/bdev_zone.h"
+#include "spdk/log.h"
 #include "spdk/queue.h"
 #include "spdk/scsi_spec.h"
 #include "spdk/thread.h"
@@ -611,6 +612,11 @@ struct spdk_bdev {
 	 */
 	union spdk_bdev_nvme_ctratt ctratt;
 
+	/**
+	 * NVMe namespace ID.
+	 */
+	uint32_t nsid;
+
 	/* Upon receiving a reset request, this is the amount of time in seconds
 	 * to wait for all I/O to complete before moving forward with the reset.
 	 * If all I/O completes prior to this time out, the reset will be skipped.
@@ -629,6 +635,16 @@ struct spdk_bdev {
 	 * If this parameter remains equal to zero, the bdev reset will be forcefully
 	 * sent down to the device, without any delays and waiting for outstanding IO. */
 	uint16_t reset_io_drain_timeout;
+
+	struct {
+		/** Is numa.id valid? Needed to know whether numa.id == 0 was
+		 *  explicitly set by bdev module or implicitly set when
+		 *  calloc()'ing the structure.
+		 */
+		uint32_t id_valid : 1;
+		/** NUMA node ID for the bdev */
+		int32_t id : 31;
+	} numa;
 
 	/**
 	 * Pointer to the bdev module that registered this bdev.
@@ -714,6 +730,9 @@ struct spdk_bdev {
 
 		/** points to a reset bdev_io if one is in progress. */
 		struct spdk_bdev_io *reset_in_progress;
+
+		/** List of reset bdev_ios that are not submitted to the underlying device. */
+		bdev_io_tailq_t		queued_resets;
 
 		/** poller for tracking the queue_depth of a device, NULL if not tracking */
 		struct spdk_poller *qd_poller;
@@ -856,6 +875,12 @@ struct spdk_bdev_io_block_params {
 		/** Starting source offset (in blocks) of the bdev for copy I/O. */
 		uint64_t src_offset_blocks;
 	} copy;
+
+	/** DIF context */
+	struct spdk_dif_ctx dif_ctx;
+
+	/** DIF error information */
+	struct spdk_dif_error dif_err;
 };
 
 struct spdk_bdev_io_reset_params {
@@ -919,20 +944,6 @@ struct spdk_bdev_io_internal_fields {
 	/** The bdev I/O channel that this was handled on. */
 	struct spdk_bdev_channel *ch;
 
-	uint8_t	reserved[8];
-
-	/** The bdev descriptor that was used when submitting this I/O. */
-	struct spdk_bdev_desc *desc;
-
-	/** User function that will be called when this completes */
-	spdk_bdev_io_completion_cb cb;
-
-	/** Context that will be passed to the completion callback */
-	void *caller_ctx;
-
-	/** Current tsc at submit time. Used to calculate latency at completion. */
-	uint64_t submit_tsc;
-
 	union {
 		struct {
 
@@ -948,10 +959,36 @@ struct spdk_bdev_io_internal_fields {
 			/** Whether ptr in the buf data structure is valid */
 			uint8_t has_buf				: 1;
 
-			uint8_t reserved			: 4;
+			/** Whether the bounce_buf data structure is valid */
+			uint8_t has_bounce_buf			: 1;
+
+			/** Whether we are currently inside the submit request call */
+			uint8_t in_submit_request		: 1;
+
+			uint8_t reserved			: 2;
 		};
 		uint8_t raw;
 	} f;
+
+	/** Status for the IO */
+	int8_t status;
+
+	/** Retry state (resubmit, re-pull, re-push, etc.) */
+	uint8_t retry_state;
+
+	uint8_t	reserved[5];
+
+	/** The bdev descriptor that was used when submitting this I/O. */
+	struct spdk_bdev_desc *desc;
+
+	/** User function that will be called when this completes */
+	spdk_bdev_io_completion_cb cb;
+
+	/** Context that will be passed to the completion callback */
+	void *caller_ctx;
+
+	/** Current tsc at submit time. Used to calculate latency at completion. */
+	uint64_t submit_tsc;
 
 	/** Entry to the list io_submitted of struct spdk_bdev_channel */
 	TAILQ_ENTRY(spdk_bdev_io) ch_link;
@@ -984,20 +1021,6 @@ struct spdk_bdev_io_internal_fields {
 		int aio_result;
 	} error;
 
-	/**
-	 * Set to true while the bdev module submit_request function is in progress.
-	 *
-	 * This is used to decide whether spdk_bdev_io_complete() can complete the I/O directly
-	 * or if completion must be deferred via an event.
-	 */
-	bool in_submit_request;
-
-	/** Status for the IO */
-	int8_t status;
-
-	/** Retry state (resubmit, re-pull, re-push, etc.) */
-	uint8_t retry_state;
-
 	struct {
 		/** stored user callback in case we split the I/O and use a temporary callback */
 		spdk_bdev_io_completion_cb stored_user_cb;
@@ -1021,11 +1044,13 @@ struct spdk_bdev_io_internal_fields {
 	} buf;
 
 	/** if the request is double buffered, store original request iovs here */
-	struct iovec  bounce_iov;
-	struct iovec  bounce_md_iov;
-	struct iovec  orig_md_iov;
-	struct iovec *orig_iovs;
-	int           orig_iovcnt;
+	struct {
+		struct iovec  iov;
+		struct iovec  md_iov;
+		struct iovec  orig_md_iov;
+		struct iovec *orig_iovs;
+		int           orig_iovcnt;
+	} bounce_buf;
 
 	/** Callback for when the aux buf is allocated */
 	spdk_bdev_io_get_aux_buf_cb get_aux_buf_cb;
@@ -1067,14 +1092,20 @@ struct spdk_bdev_io {
 	/** Enumerated value representing the I/O type. */
 	uint8_t type;
 
+	uint8_t reserved0;
+
 	/** Number of IO submission retries */
 	uint16_t num_retries;
+
+	uint32_t reserved1;
 
 	/** A single iovec element for use by this bdev_io. */
 	struct iovec iov;
 
 	/** Array of iovecs used for I/O splitting. */
 	struct iovec child_iov[SPDK_BDEV_IO_NUM_CHILD_IOV];
+
+	uint8_t reserved2[32];
 
 	/** Parameters filled in by the user */
 	union {
@@ -1084,6 +1115,8 @@ struct spdk_bdev_io {
 		struct spdk_bdev_io_nvme_passthru_params nvme_passthru;
 		struct spdk_bdev_io_zone_mgmt_params zone_mgmt;
 	} u;
+
+	uint8_t reserved3[40];
 
 	/**
 	 *  Fields that are used internally by the bdev subsystem.  Bdev modules
@@ -1098,6 +1131,8 @@ struct spdk_bdev_io {
 
 	/* No members may be added after driver_ctx! */
 };
+SPDK_STATIC_ASSERT(offsetof(struct spdk_bdev_io, driver_ctx) % SPDK_CACHE_LINE_SIZE == 0,
+		   "driver_ctx not cache line aligned");
 
 /**
  * Register a new bdev.
@@ -1374,6 +1409,15 @@ struct spdk_io_channel *spdk_bdev_io_get_io_channel(struct spdk_bdev_io *bdev_io
  * \return The submit_tsc of the specified bdev I/O.
  */
 uint64_t spdk_bdev_io_get_submit_tsc(struct spdk_bdev_io *bdev_io);
+
+/**
+ * Query if metadata is hidden from the bdev I/O.
+ *
+ * \param bdev_io The bdev I/O to query.
+ *
+ * \return true if metadata is hidden from the bdev I/O, or false otherwise.
+ */
+bool spdk_bdev_io_hide_metadata(struct spdk_bdev_io *bdev_io);
 
 /**
  * Resize for a bdev.
@@ -1760,11 +1804,6 @@ void spdk_bdev_add_io_stat(struct spdk_bdev_io_stat *total, struct spdk_bdev_io_
  * \param w JSON write context.
  */
 void spdk_bdev_dump_io_stat_json(struct spdk_bdev_io_stat *stat, struct spdk_json_write_ctx *w);
-
-enum spdk_bdev_reset_stat_mode {
-	SPDK_BDEV_RESET_STAT_ALL,
-	SPDK_BDEV_RESET_STAT_MAXMIN,
-};
 
 /**
  * Reset I/O statistics structure.

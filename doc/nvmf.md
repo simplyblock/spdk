@@ -1,7 +1,7 @@
 # NVMe over Fabrics Target {#nvmf}
 
 @sa @ref nvme_fabrics_host
-@sa @ref nvmf_tgt_tracepoints
+@sa @ref tracepoints
 
 ## NVMe-oF Target Getting Started Guide {#nvmf_getting_started}
 
@@ -267,7 +267,7 @@ nvme disconnect -n "nqn.2016-06.io.spdk:cnode1"
 ## Enabling NVMe-oF target tracepoints for offline analysis and debug {#nvmf_trace}
 
 SPDK has a tracing framework for capturing low-level event information at runtime.
-@ref nvmf_tgt_tracepoints enable analysis of both performance and application crashes.
+@ref tracepoints enable analysis of both performance and application crashes.
 
 ## Enabling NVMe-oF Multipath
 
@@ -363,6 +363,18 @@ $ scripts/rpc.py nvmf_subsystem_add_host nqn.2024-05.io.spdk:cnode0 nqn.2024-05.
     --dhchap-key key2
 ```
 
+Additionally, it's possible to change the keys while preserving existing connections to a subsystem
+via `nvmf_subsystem_set_keys`.  After that's done, new connections and reauthentication requests
+will be required to use the new keys.
+
+```{.sh}
+$ scripts/rpc.py nvmf_subsystem_add_host nqn.2024-05.io.spdk:cnode0 nqn.2024-05.io.spdk:host0 \
+    --dhchap-key key0 --dhchap-ctrlr-key ctrlr-key0
+# Host nqn.2024-05.io.spdk:host0 connects to subsystem nqn.2024-05.io.spdk:cnode0
+$ scripts/rpc.py nvmf_subsystem_set_keys nqn.2024-05.io.spdk:cnode0 nqn.2024-05.io.spdk:host0 \
+    --dhchap-key key1 --dhchap-ctrlr-key ctrlr-key1
+```
+
 On the host side, the keys are specified when attaching controllers, e.g.:
 
 ```{.sh}
@@ -384,3 +396,8 @@ $ scripts/rpc.py nvmf_set_config --dhchap-digests sha384,sha512 \
 $ scripts/rpc.py bdev_nvme_set_options --dhchap-digests sha384,sha512 \
     --dhchap-dhgroups ffdhe6114,ffdhe8192
 ```
+
+The NVMe specification describes the method for using in-band authentication in conjunction with
+establishing a secure channel (e.g. TLS).  However, that isn't supported currently, so in order to
+perform in-band authentication, hosts must connect over regular listeners (i.e. those that weren't
+created with the `--secure-channel` option).

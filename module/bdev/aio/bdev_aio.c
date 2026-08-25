@@ -64,6 +64,9 @@ struct file_disk {
 	struct spdk_bdev	disk;
 	char			*filename;
 	int			fd;
+#ifdef RWF_NOWAIT
+	bool			use_nowait;
+#endif
 	TAILQ_ENTRY(file_disk)  link;
 	bool			block_size_override;
 	bool			readonly;
@@ -113,6 +116,9 @@ bdev_aio_open(struct file_disk *disk)
 {
 	int fd;
 	int io_flag = disk->readonly ? O_RDONLY : O_RDWR;
+#ifdef RWF_NOWAIT
+	struct stat st;
+#endif
 
 	fd = open(disk->filename, io_flag | O_DIRECT);
 	if (fd < 0) {
@@ -127,6 +133,14 @@ bdev_aio_open(struct file_disk *disk)
 	}
 
 	disk->fd = fd;
+
+#ifdef RWF_NOWAIT
+	/* Some aio operations can block, for example if number outstanding
+	 * I/O exceeds number of block layer tags. But not all files can
+	 * support RWF_NOWAIT flag. So use RWF_NOWAIT on block devices only.
+	 */
+	disk->use_nowait = fstat(fd, &st) == 0 && S_ISBLK(st.st_mode);
+#endif
 
 	return 0;
 }
@@ -198,6 +212,11 @@ bdev_aio_submit_io(enum spdk_bdev_io_type type, struct file_disk *fdisk,
 		io_set_eventfd(iocb, aio_ch->group_ch->efd);
 	}
 	iocb->data = aio_task;
+#ifdef RWF_NOWAIT
+	if (fdisk->use_nowait) {
+		iocb->aio_rw_flags = RWF_NOWAIT;
+	}
+#endif
 	aio_task->len = nbytes;
 	aio_task->ch = aio_ch;
 
@@ -450,11 +469,16 @@ bdev_aio_io_channel_poll(struct bdev_aio_io_channel *io_ch)
 			 * But from libaio.h, io_event.res is defined unsigned long, so
 			 * convert it to signed value for error detection.
 			 */
-			SPDK_ERRLOG("failed to complete aio: rc %"PRId64"\n", events[i].res);
 			res = (int)events[i].res;
 			if (res < 0) {
-				spdk_bdev_io_complete_aio_status(spdk_bdev_io_from_ctx(aio_task), res);
+				if (res == -EAGAIN) {
+					spdk_bdev_io_complete(spdk_bdev_io_from_ctx(aio_task), SPDK_BDEV_IO_STATUS_NOMEM);
+				} else {
+					SPDK_ERRLOG("failed to complete aio: rc %"PRId64"\n", events[i].res);
+					spdk_bdev_io_complete_aio_status(spdk_bdev_io_from_ctx(aio_task), res);
+				}
 			} else {
+				SPDK_ERRLOG("failed to complete aio: rc %"PRId64"\n", events[i].res);
 				spdk_bdev_io_complete(spdk_bdev_io_from_ctx(aio_task), SPDK_BDEV_IO_STATUS_FAILED);
 			}
 		}
@@ -765,6 +789,7 @@ static void
 bdev_aio_write_json_config(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w)
 {
 	struct file_disk *fdisk = bdev->ctxt;
+	const struct spdk_uuid *uuid = spdk_bdev_get_uuid(bdev);
 
 	spdk_json_write_object_begin(w);
 
@@ -778,6 +803,9 @@ bdev_aio_write_json_config(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w
 	spdk_json_write_named_string(w, "filename", fdisk->filename);
 	spdk_json_write_named_bool(w, "readonly", fdisk->readonly);
 	spdk_json_write_named_bool(w, "fallocate", fdisk->fallocate);
+	if (!spdk_uuid_is_null(uuid)) {
+		spdk_json_write_named_uuid(w, "uuid", uuid);
+	}
 	spdk_json_write_object_end(w);
 
 	spdk_json_write_object_end(w);
@@ -831,12 +859,6 @@ bdev_aio_unregister_interrupt(struct bdev_aio_group_channel *ch)
 	ch->efd = -1;
 }
 
-static void
-bdev_aio_poller_set_interrupt_mode(struct spdk_poller *poller, void *cb_arg, bool interrupt_mode)
-{
-	return;
-}
-
 static int
 bdev_aio_group_create_cb(void *io_device, void *ctx_buf)
 {
@@ -855,7 +877,7 @@ bdev_aio_group_create_cb(void *io_device, void *ctx_buf)
 	}
 
 	ch->poller = SPDK_POLLER_REGISTER(bdev_aio_group_poll, ch, 0);
-	spdk_poller_register_interrupt(ch->poller, bdev_aio_poller_set_interrupt_mode, NULL);
+	spdk_poller_register_interrupt(ch->poller, NULL, NULL);
 
 	return 0;
 }
@@ -877,7 +899,7 @@ bdev_aio_group_destroy_cb(void *io_device, void *ctx_buf)
 
 int
 create_aio_bdev(const char *name, const char *filename, uint32_t block_size, bool readonly,
-		bool fallocate)
+		bool fallocate, const struct spdk_uuid *uuid)
 {
 	struct file_disk *fdisk;
 	uint32_t detected_block_size;
@@ -976,6 +998,7 @@ create_aio_bdev(const char *name, const char *filename, uint32_t block_size, boo
 
 	fdisk->disk.blockcnt = disk_size / fdisk->disk.blocklen;
 	fdisk->disk.ctxt = fdisk;
+	spdk_uuid_copy(&fdisk->disk.uuid, uuid);
 
 	fdisk->disk.fn_table = &aio_fn_table;
 

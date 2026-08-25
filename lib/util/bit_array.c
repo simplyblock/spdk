@@ -304,6 +304,50 @@ spdk_bit_array_store_mask(const struct spdk_bit_array *ba, void *mask)
 }
 
 void
+spdk_bit_array_store_mask_one_page(const struct spdk_bit_array *ba, void *mask, uint64_t firstbit, uint64_t lastbit)
+{
+	const uint8_t *src;
+	uint8_t *dst = mask;
+	uint64_t num_bits;
+	uint64_t full_bytes;
+	uint64_t remaining_bits;
+	uint64_t skip_bytes;
+	uint64_t i;
+
+	assert(ba != NULL);
+	assert(mask != NULL);
+	assert(firstbit <= lastbit);
+	assert(lastbit <= spdk_bit_array_capacity(ba));
+
+	/*
+	 * This implementation assumes the source range starts
+	 * on a byte boundary.
+	*/
+	assert((firstbit % CHAR_BIT) == 0);
+
+	src = (const uint8_t *)ba->words;
+
+	num_bits = lastbit - firstbit;
+	full_bytes = num_bits / CHAR_BIT;
+	remaining_bits = num_bits % CHAR_BIT;
+	skip_bytes = firstbit / CHAR_BIT;
+
+	memcpy(dst, src + skip_bytes, full_bytes);
+
+	if (remaining_bits != 0) {
+		dst[full_bytes] = 0;
+
+		for (i = 0; i < remaining_bits; i++) {
+			uint64_t source_bit = firstbit + full_bytes * CHAR_BIT + i;
+
+			if (spdk_bit_array_get(ba, source_bit)) {
+				dst[full_bytes] |= (uint8_t)(1U << i);
+			}
+		}
+	}
+}
+
+void
 spdk_bit_array_load_mask(struct spdk_bit_array *ba, const void *mask)
 {
 	uint32_t size, i;
@@ -442,6 +486,23 @@ spdk_bit_pool_allocate_bit(struct spdk_bit_pool *pool)
 
 	spdk_bit_array_set(pool->array, bit_index);
 	pool->lowest_free_bit = spdk_bit_array_find_first_clear(pool->array, bit_index);
+	pool->free_count--;
+	return bit_index;
+}
+
+uint32_t
+spdk_bit_pool_allocate_specific_bit(struct spdk_bit_pool *pool, uint32_t bit_index)
+{
+
+	if (bit_index == UINT32_MAX) {
+		return UINT32_MAX;
+	}
+
+	spdk_bit_array_set(pool->array, bit_index);
+	if (pool->lowest_free_bit >= bit_index) {
+		pool->lowest_free_bit = spdk_bit_array_find_first_clear(pool->array, bit_index);
+	}
+
 	pool->free_count--;
 	return bit_index;
 }

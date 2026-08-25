@@ -110,12 +110,14 @@ DEFINE_STUB_V(nvmf_transport_listen_dump_trid, (const struct spdk_nvme_transport
 		struct spdk_json_write_ctx *w));
 DEFINE_STUB(spdk_nvme_transport_id_compare, int, (const struct spdk_nvme_transport_id *trid1,
 		const struct spdk_nvme_transport_id *trid2), 0);
-DEFINE_STUB_V(nvmf_update_discovery_log, (struct spdk_nvmf_tgt *tgt, const char *hostnqn));
+DEFINE_STUB_V(spdk_nvmf_send_discovery_log_notice, (struct spdk_nvmf_tgt *tgt,
+		const char *hostnqn));
 DEFINE_STUB(nvmf_nqn_is_valid, bool, (const char *nqn), true);
 DEFINE_STUB(nvmf_nqn_is_discovery, bool, (const char *nqn), true);
 DEFINE_STUB(spdk_key_get_name, const char *, (struct spdk_key *k), NULL);
 DEFINE_STUB(nvmf_qpair_auth_init, int, (struct spdk_nvmf_qpair *q), 0);
 DEFINE_STUB_V(nvmf_qpair_auth_destroy, (struct spdk_nvmf_qpair *q));
+DEFINE_STUB_V(nvmf_tgt_stop_mdns_prr, (struct spdk_nvmf_tgt *tgt));
 
 struct spdk_io_channel {
 	struct spdk_thread		*thread;
@@ -206,7 +208,6 @@ test_nvmf_tgt_create_poll_group(void)
 	CU_ASSERT(TAILQ_FIRST(&tgt.poll_groups) == &group);
 	CU_ASSERT(tgt.num_poll_groups == 1);
 	CU_ASSERT(group.thread == thread);
-	CU_ASSERT(group.poller != NULL);
 
 	nvmf_tgt_destroy_poll_group((void *)&tgt, (void *)&group);
 	CU_ASSERT(TAILQ_EMPTY(&tgt.poll_groups));

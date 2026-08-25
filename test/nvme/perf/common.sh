@@ -4,6 +4,11 @@
 #  All rights reserved.
 #
 source "$rootdir/test/dd/common.sh"
+source "$rootdir/test/scheduler/common.sh"
+
+xtrace_disable
+map_cpus
+xtrace_restore
 
 function discover_bdevs() {
 	local rootdir=$1
@@ -116,10 +121,7 @@ function is_bdf_not_mounted() {
 }
 
 function get_cores() {
-	local cpu_list="$1"
-	for cpu in ${cpu_list//,/ }; do
-		echo $cpu
-	done
+	parse_cpu_list <(echo "$1")
 }
 
 function get_cores_numa_node() {
@@ -199,6 +201,47 @@ function get_disks_on_numa() {
 	echo $disks_on_numa
 }
 
+function set_potential_poll_threads() {
+	local _cpus=("$@") all_fio_cpus=() cpu _cpu poll_thread
+	local -g sqpoll_cpu_threads
+	local node
+
+	# Collect all siblings in case smt is enabled.
+	for cpu in "${_cpus[@]}"; do
+		for _cpu in "${!cpu_siblings[cpu]}"; do
+			all_fio_cpus[_cpu]=$cpu
+		done
+	done
+
+	# Move fio's polling thread to a different cpu. In case smt is enabled, we  try to move it to a completely
+	# different core under the same numa node. Note that we can set sgthread_poll_cpu only to a single cpu -
+	# in case NUMJOBS is > 1 we will have multiple poll threads using that particular cpu. FIXME: what would be
+	# the potential impact here of spamming poll threads like that? In case of higher numjobs, does it make
+	# sense to still use sqthread_poll?
+	#
+	# Here we build list of all potential candidates to hold sqpoll thread. Lists are per node and should hold
+	# all cpus outside of the fio cpus that were requested. So each get_sqthread_poll_cpu() should return a cpu
+	# thread which is guaranteed to be outside of the physical core of each of fio cpus (but still bound to
+	# the same numa node as the fio cpu selected for given job).
+	for cpu in "${cpus[@]}"; do
+		[[ -n ${all_fio_cpus[cpu]} ]] && continue
+		node=${cpu_node_map[cpu]}
+		local -n sqpoll_node=sqpoll_threads_node_$node
+		sqpoll_node+=("$cpu")
+		sqpoll_cpu_threads[node]=sqpoll_threads_node_$node
+	done
+}
+
+function get_sqthread_poll_cpu() {
+	((${#sqpoll_cpu_threads[@]} > 0)) || return 0
+
+	local node=$1 idx=$2
+	local -n node=${sqpoll_cpu_threads[node]}
+
+	# Default to the highest cpu
+	echo "sqthread_poll_cpu=${node[idx]:-${cpus[-1]}}"
+}
+
 function create_fio_config() {
 	local disk_no=$1
 	local plugin=$2
@@ -252,6 +295,11 @@ function create_fio_config() {
 		echo "iodepth_batch_complete=$IO_BATCH_COMPLETE" >> $testdir/config.fio
 	fi
 
+	# shellcheck disable=SC2068
+	if [[ $PLUGIN =~ "uring" || $PLUGIN =~ "xnvme" ]]; then
+		set_potential_poll_threads ${cores[@]//,/ }
+	fi
+
 	for i in "${!cores[@]}"; do
 		local m=0 #Counter of disks per NUMA node
 		local n=0 #Counter of all disks in test
@@ -276,7 +324,8 @@ function create_fio_config() {
 			fio_job_section+=("")
 			fio_job_section+=("[filename${i}]")
 			fio_job_section+=("iodepth=$QD")
-			fio_job_section+=("cpus_allowed=${cores[$i]} #CPU NUMA Node ${cores_numa[$i]}")
+			fio_job_section+=("cpus_allowed=${cores[$i]} #CPU NUMA Node ${cores_numa[$i]} ($FIO_FNAME_STRATEGY)")
+			fio_job_section+=("$(get_sqthread_poll_cpu "${cores_numa[i]}" "$i")")
 		fi
 
 		while [[ "$m" -lt "$total_disks_per_core" ]]; do
@@ -288,6 +337,7 @@ function create_fio_config() {
 					fio_job_section+=("[filename${m}-${cores[$i]}]")
 					fio_job_section+=("iodepth=$QD")
 					fio_job_section+=("cpus_allowed=${cores[$i]} #CPU NUMA Node ${cores_numa[$i]}")
+					fio_job_section+=("$(get_sqthread_poll_cpu "${cores_numa[i]}" "$i")")
 				fi
 
 				if [[ "$plugin" == "spdk-plugin-nvme" ]]; then
@@ -295,7 +345,7 @@ function create_fio_config() {
 				elif [[ "$plugin" == "spdk-plugin-bdev" || "$plugin" == "spdk-plugin-bdev-xnvme" ]]; then
 					fio_job_section+=("filename=${disks[$n]} #NVMe NUMA Node ${disks_numa[$n]}")
 				elif [[ "$plugin" =~ "kernel" ]]; then
-					fio_job_section+=("filename=/dev/${disks[$n]} #NVMe NUMA Node ${disks_numa[$n]}")
+					fio_job_section+=("filename=/dev/${disks[$n]} #NVMe NUMA Node ${disks_numa[$n]} ($FIO_FNAME_STRATEGY)")
 				fi
 				m=$((m + 1))
 

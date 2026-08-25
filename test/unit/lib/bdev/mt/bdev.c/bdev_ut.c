@@ -15,26 +15,9 @@
 
 #include "bdev/bdev.c"
 
-#define BDEV_UT_NUM_THREADS 3
+#include "common/lib/bdev/common_stubs.h"
 
-DEFINE_STUB(spdk_notify_send, uint64_t, (const char *type, const char *ctx), 0);
-DEFINE_STUB(spdk_notify_type_register, struct spdk_notify_type *, (const char *type), NULL);
-DEFINE_STUB_V(spdk_scsi_nvme_translate, (const struct spdk_bdev_io *bdev_io, int *sc, int *sk,
-		int *asc, int *ascq));
-DEFINE_STUB(spdk_memory_domain_get_dma_device_id, const char *, (struct spdk_memory_domain *domain),
-	    "test_domain");
-DEFINE_STUB(spdk_memory_domain_get_dma_device_type, enum spdk_dma_device_type,
-	    (struct spdk_memory_domain *domain), 0);
-DEFINE_STUB_V(spdk_accel_sequence_finish,
-	      (struct spdk_accel_sequence *seq, spdk_accel_completion_cb cb_fn, void *cb_arg));
-DEFINE_STUB_V(spdk_accel_sequence_abort, (struct spdk_accel_sequence *seq));
-DEFINE_STUB_V(spdk_accel_sequence_reverse, (struct spdk_accel_sequence *seq));
-DEFINE_STUB(spdk_accel_append_copy, int,
-	    (struct spdk_accel_sequence **seq, struct spdk_io_channel *ch, struct iovec *dst_iovs,
-	     uint32_t dst_iovcnt, struct spdk_memory_domain *dst_domain, void *dst_domain_ctx,
-	     struct iovec *src_iovs, uint32_t src_iovcnt, struct spdk_memory_domain *src_domain,
-	     void *src_domain_ctx, spdk_accel_step_cb cb_fn, void *cb_arg), 0);
-DEFINE_STUB(spdk_accel_get_memory_domain, struct spdk_memory_domain *, (void), NULL);
+#define BDEV_UT_NUM_THREADS 3
 
 DEFINE_RETURN_MOCK(spdk_memory_domain_pull_data, int);
 int
@@ -592,6 +575,7 @@ put_channel_during_reset(void)
 {
 	struct spdk_io_channel *io_ch;
 	bool done = false;
+	uint32_t num_completed;
 
 	setup_test();
 
@@ -607,7 +591,12 @@ put_channel_during_reset(void)
 	spdk_bdev_reset(g_desc, io_ch, reset_done, &done);
 	spdk_put_io_channel(io_ch);
 	poll_threads();
-	stub_complete_io(g_bdev.io_target, 0);
+
+	/* Complete the reset. */
+	num_completed = stub_complete_io(g_bdev.io_target, 0);
+	CU_ASSERT(num_completed == 1);
+	poll_threads();
+	CU_ASSERT(done == true);
 
 	teardown_test();
 }
@@ -652,21 +641,17 @@ aborted_reset(void)
 	CU_ASSERT(g_bdev.bdev.internal.reset_in_progress != NULL);
 
 	/*
-	 * Now destroy ch1.  This will abort the queued reset.  Check that
-	 *  the second reset was completed with failed status.  Also check
-	 *  that bdev->internal.reset_in_progress != NULL, since the
-	 *  original reset has not been completed yet.  This ensures that
-	 *  the bdev code is correctly noticing that the failed reset is
-	 *  *not* the one that had been submitted to the bdev module.
+	 * Now destroy ch1.  Nothing would really happen because the pending second reset
+	 *  is still holding a reference of ch1.
 	 */
 	set_thread(1);
 	spdk_put_io_channel(io_ch[1]);
 	poll_threads();
-	CU_ASSERT(status2 == SPDK_BDEV_IO_STATUS_FAILED);
+	CU_ASSERT(status2 == SPDK_BDEV_IO_STATUS_PENDING);
 	CU_ASSERT(g_bdev.bdev.internal.reset_in_progress != NULL);
 
 	/*
-	 * Now complete the first reset, verify that it completed with SUCCESS
+	 * Now complete the first reset, verify that both resets completed with SUCCESS
 	 *  status and that bdev->internal.reset_in_progress is also set back to NULL.
 	 */
 	set_thread(0);
@@ -674,8 +659,12 @@ aborted_reset(void)
 	stub_complete_io(g_bdev.io_target, 0);
 	poll_threads();
 	CU_ASSERT(status1 == SPDK_BDEV_IO_STATUS_SUCCESS);
+	CU_ASSERT(status2 == SPDK_BDEV_IO_STATUS_SUCCESS);
 	CU_ASSERT(g_bdev.bdev.internal.reset_in_progress == NULL);
 
+	/*
+	 * Teardown should succeed.
+	 */
 	teardown_test();
 }
 
@@ -1672,6 +1661,66 @@ enomem_multi_io_target(void)
 	spdk_io_device_unregister(&new_io_device, NULL);
 	poll_threads();
 	free(second_bdev);
+	teardown_test();
+}
+
+static void
+enomem_retry_during_abort(void)
+{
+	struct spdk_io_channel *io_ch;
+	struct spdk_bdev_channel *bdev_ch;
+	struct spdk_bdev_shared_resource *shared_resource;
+	struct ut_bdev_channel *ut_ch;
+	const uint32_t IO_ARRAY_SIZE = 16;
+	enum spdk_bdev_io_status status[IO_ARRAY_SIZE], status_reset;
+	uint32_t i;
+	int rc;
+
+	setup_test();
+
+	set_thread(0);
+	io_ch = spdk_bdev_get_io_channel(g_desc);
+	bdev_ch = spdk_io_channel_get_ctx(io_ch);
+	shared_resource = bdev_ch->shared_resource;
+	ut_ch = spdk_io_channel_get_ctx(bdev_ch->channel);
+	ut_ch->avail_cnt = 0;
+
+	/**
+	 * Submit a number of IOs.
+	 * All of these I/Os will queue in nomem_io list due to ut_ch->avail_cnt == 0.
+	 */
+	for (i = 0; i < IO_ARRAY_SIZE; i++) {
+		status[i] = SPDK_BDEV_IO_STATUS_PENDING;
+		rc = spdk_bdev_read_blocks(g_desc, io_ch, NULL, 0, 1, enomem_done, &status[i]);
+		CU_ASSERT(rc == 0);
+	}
+	CU_ASSERT(bdev_io_tailq_cnt(&shared_resource->nomem_io) == IO_ARRAY_SIZE);
+	CU_ASSERT(shared_resource->io_outstanding == 0);
+
+	/* Allow some I/Os to be submitted. */
+	ut_ch->avail_cnt = IO_ARRAY_SIZE / 2;
+
+	/* Submit a reset to abort the I/Os. */
+	status_reset = SPDK_BDEV_IO_STATUS_PENDING;
+	rc = spdk_bdev_reset(g_desc, io_ch, enomem_done, &status_reset);
+	poll_threads();
+	CU_ASSERT(rc == 0);
+
+	/* Complete the reset. */
+	stub_complete_io(g_bdev.io_target, 1);
+	poll_threads();
+	CU_ASSERT(status_reset == SPDK_BDEV_IO_STATUS_SUCCESS);
+
+	/* All I/Os are aborted. */
+	for (i = 0; i < IO_ARRAY_SIZE; i++) {
+		CU_ASSERT(status[i] == SPDK_BDEV_IO_STATUS_FAILED);
+	}
+
+	CU_ASSERT(bdev_io_tailq_cnt(&shared_resource->nomem_io) == 0);
+	CU_ASSERT(shared_resource->io_outstanding == 0);
+
+	spdk_put_io_channel(io_ch);
+	poll_threads();
 	teardown_test();
 }
 
@@ -2745,6 +2794,75 @@ unregister_and_qos_poller(void)
 	teardown_test();
 }
 
+/**
+ * There was a race between reset start and complete:
+ *
+ * 1. reset_1 is completing. It clears bdev->internal.reset_in_progress and sends
+ *    unfreeze_channel messages to remove queued resets of all channels.
+ * 2. reset_2 is starting. As bdev->internal.reset_in_progress has been cleared, it
+ *    is inserted to queued_resets list and starts to freeze channels.
+ * 3. reset_1's unfreeze_channel message removes reset_2 from queued_resets list.
+ * 4. reset_2 finishes freezing channels, but the corresponding bdev_io has gone,
+ *    hence resulting in segmentation fault.
+ *
+ * To fix this,
+ * 1. Do not queue the reset that is submitted to the underlying device.
+ * 2. Queue all other resets in a per-bdev list, so all of them can be completed
+ *    at once.
+ */
+static void
+reset_start_complete_race(void)
+{
+	struct spdk_io_channel *io_ch;
+	bool done_reset_1 = false, done_reset_2 = false;
+	uint32_t num_completed;
+	int rc;
+
+	setup_test();
+	set_thread(0);
+
+	io_ch = spdk_bdev_get_io_channel(g_desc);
+	SPDK_CU_ASSERT_FATAL(io_ch != NULL);
+
+	CU_ASSERT(g_bdev.bdev.internal.reset_in_progress == NULL);
+
+	/**
+	 * Submit reset_1.
+	 */
+	rc = spdk_bdev_reset(g_desc, io_ch, reset_done, &done_reset_1);
+	CU_ASSERT(rc == 0);
+
+	/**
+	 * Poll threads so that reset_1 completes freezing channels and gets submitted to
+	 *  the undelying device.
+	 */
+	poll_threads();
+
+	/**
+	 * Complete reset_1. This will start the unfreezing channel stage of reset_1, but
+	 *  not complete it until next poll_threads.
+	 */
+	num_completed = stub_complete_io(g_bdev.io_target, 0);
+	CU_ASSERT(num_completed == 1);
+
+	/**
+	 * Submit reset_2. It should be queued because reset_1 has not been completed yet.
+	 */
+	rc = spdk_bdev_reset(g_desc, io_ch, reset_done, &done_reset_2);
+	CU_ASSERT(rc == 0);
+
+	/**
+	 * Poll threads. reset_1 completes unfreezing channels, then completes queued reset_2,
+	 *  and finally itself gets completed.
+	 */
+	poll_threads();
+	CU_ASSERT(done_reset_1 == true);
+	CU_ASSERT(done_reset_2 == true);
+
+	spdk_put_io_channel(io_ch);
+	teardown_test();
+}
+
 int
 main(int argc, char **argv)
 {
@@ -2772,6 +2890,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, enomem_multi_bdev);
 	CU_ADD_TEST(suite, enomem_multi_bdev_unregister);
 	CU_ADD_TEST(suite, enomem_multi_io_target);
+	CU_ADD_TEST(suite, enomem_retry_during_abort);
 	CU_ADD_TEST(suite, qos_dynamic_enable);
 	CU_ADD_TEST(suite, bdev_histograms_mt);
 	CU_ADD_TEST(suite, bdev_set_io_timeout_mt);
@@ -2781,6 +2900,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite_wt, spdk_bdev_examine_wt);
 	CU_ADD_TEST(suite, event_notify_and_close);
 	CU_ADD_TEST(suite, unregister_and_qos_poller);
+	CU_ADD_TEST(suite, reset_start_complete_race);
 
 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
 	CU_cleanup_registry();

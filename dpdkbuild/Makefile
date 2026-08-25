@@ -16,6 +16,10 @@ ifeq ($(shell uname -m),aarch64)
 ifeq ($(shell uname -p),unknown)
 # Unknown ARM platform. ARM doesn't do platform=native which is DPDK's default. So change it.
 DPDK_OPTS += -Dplatform=generic
+else
+ifeq ($(shell $(SPDK_ROOT_DIR)/dpdk/config/arm/armv8_machine.py | cut -d' ' -f4),0x0)
+DPDK_OPTS += -Dplatform=generic
+endif
 endif
 endif
 
@@ -48,6 +52,7 @@ endif
 
 ifeq ($(CONFIG_PGO_USE),y)
 DPDK_OPTS += -Db_pgo=use
+DPDK_CFLAGS += -Wno-missing-profile
 endif
 
 ifneq ($(CONFIG_PGO_DIR),)
@@ -63,7 +68,9 @@ DPDK_LIBS = eal ring mempool pci
 DPDK_LIBS += log kvargs telemetry
 # Governor required libs
 DPDK_LIBS += power timer ethdev net
-
+# rte_power drivers
+DPDK_DRIVERS += power/acpi power/amd_pstate power/cppc power/intel_pstate power/intel_uncore \
+		power/kvm_vm
 # common crypto/compress drivers
 ifeq ($(findstring y,$(CONFIG_DPDK_COMPRESSDEV)$(CONFIG_CRYPTO)$(CONFIG_VBDEV_COMPRESS)),y)
 DPDK_DRIVERS += crypto/qat compress/qat common/qat
@@ -77,6 +84,7 @@ endif
 # uadk drivers
 ifeq ($(findstring y,$(CONFIG_DPDK_UADK)),y)
 DPDK_DRIVERS += crypto/uadk
+DPDK_DRIVERS += compress/uadk
 endif
 ifeq ($(CONFIG_CRYPTO),y)
 DPDK_DRIVERS += crypto

@@ -60,20 +60,6 @@ function cleanup() {
 	rm -rf "$tmp_dir"
 }
 
-function configure_raid_bdev() {
-	local raid_level=$1
-	rm -rf $testdir/rpcs.txt
-
-	cat <<- EOL >> $testdir/rpcs.txt
-		bdev_malloc_create 32 $base_blocklen $base_malloc_params -b Base_1
-		bdev_malloc_create 32 $base_blocklen $base_malloc_params -b Base_2
-		bdev_raid_create -z 64 -r $raid_level -b "Base_1 Base_2" -n raid
-	EOL
-	$rootdir/scripts/rpc.py < $testdir/rpcs.txt
-
-	rm -rf $testdir/rpcs.txt
-}
-
 function raid_function_test() {
 	local raid_level=$1
 	local nbd=/dev/nbd0
@@ -84,7 +70,10 @@ function raid_function_test() {
 	echo "Process raid pid: $raid_pid"
 	waitforlisten $raid_pid
 
-	configure_raid_bdev $raid_level
+	$rpc_py bdev_malloc_create 32 $base_blocklen $base_malloc_params -b Base_1
+	$rpc_py bdev_malloc_create 32 $base_blocklen $base_malloc_params -b Base_2
+	$rpc_py bdev_raid_create -z 64 -r $raid_level -b "'Base_1 Base_2'" -n raid
+
 	raid_bdev=$($rpc_py bdev_raid_get_bdevs online | jq -r '.[0]["name"] | select(.)')
 	if [ $raid_bdev = "" ]; then
 		echo "No raid0 device in SPDK app"
@@ -191,19 +180,17 @@ function verify_raid_bdev_process() {
 function verify_raid_bdev_properties() {
 	local raid_bdev_name=$1
 	local raid_bdev_info
-	local base_bdev_info
 	local base_bdev_names
 	local name
+	local cmp_raid_bdev cmp_base_bdev
 
 	raid_bdev_info=$($rpc_py bdev_get_bdevs -b $raid_bdev_name | jq '.[]')
 	base_bdev_names=$(jq -r '.driver_specific.raid.base_bdevs_list[] | select(.is_configured == true).name' <<< "$raid_bdev_info")
+	cmp_raid_bdev=$(jq -r '[.block_size, .md_size, .md_interleave, .dif_type] | join(" ")' <<< "$raid_bdev_info")
 
 	for name in $base_bdev_names; do
-		base_bdev_info=$($rpc_py bdev_get_bdevs -b $name | jq '.[]')
-		[[ $(jq '.block_size' <<< "$raid_bdev_info") == $(jq '.block_size' <<< "$base_bdev_info") ]]
-		[[ $(jq '.md_size' <<< "$raid_bdev_info") == $(jq '.md_size' <<< "$base_bdev_info") ]]
-		[[ $(jq '.md_interleave' <<< "$raid_bdev_info") == $(jq '.md_interleave' <<< "$base_bdev_info") ]]
-		[[ $(jq '.dif_type' <<< "$raid_bdev_info") == $(jq '.dif_type' <<< "$base_bdev_info") ]]
+		cmp_base_bdev=$($rpc_py bdev_get_bdevs -b $name | jq -r '.[] | [.block_size, .md_size, .md_interleave, .dif_type] | join(" ")')
+		[[ "$cmp_raid_bdev" == "$cmp_base_bdev" ]]
 	done
 }
 
@@ -910,6 +897,7 @@ function raid_resize_superblock_test() {
 
 	$rpc_py bdev_passthru_delete pt0
 	$rpc_py bdev_passthru_create -b malloc0 -p pt0
+	$rpc_py bdev_wait_for_examine
 
 	# After the passthru bdev is re-created, the RAID bdev should start from
 	# superblock and its size should be the same as after it was resized.

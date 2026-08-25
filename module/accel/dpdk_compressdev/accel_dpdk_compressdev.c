@@ -42,6 +42,7 @@ static bool g_compressdev_initialized = false;
 #define MBUF_SPLIT		(1UL << DEFAULT_WINDOW_SIZE)
 #define QAT_PMD			"compress_qat"
 #define MLX5_PMD		"mlx5_pci"
+#define UADK_PMD		"compress_uadk"
 #define NUM_MBUFS		65536
 #define POOL_CACHE_SIZE		256
 
@@ -83,6 +84,7 @@ static struct rte_mempool *g_comp_op_mp = NULL;		/* comp operations, must be rte
 static struct rte_mbuf_ext_shared_info g_shinfo = {};	/* used by DPDK mbuf macros */
 static bool g_qat_available = false;
 static bool g_mlx5_pci_available = false;
+static bool g_uadk_available = false;
 
 /* Create shared (between all ops per PMD) compress xforms. */
 static struct rte_comp_xform g_comp_xform = {
@@ -154,7 +156,7 @@ create_compress_dev(uint8_t index)
 	rc = rte_compressdev_configure(cdev_id, &config);
 	if (rc < 0) {
 		SPDK_ERRLOG("Failed to configure compressdev %u\n", cdev_id);
-		goto err;
+		goto err_close;
 	}
 
 	/* Pre-setup all potential qpairs now and assign them in the channel
@@ -176,7 +178,7 @@ create_compress_dev(uint8_t index)
 				SPDK_ERRLOG("Failed to setup queue pair on "
 					    "compressdev %u with error %u\n", cdev_id, rc);
 				rc = -EINVAL;
-				goto err;
+				goto err_close;
 			}
 		}
 	}
@@ -185,7 +187,7 @@ create_compress_dev(uint8_t index)
 	if (rc < 0) {
 		SPDK_ERRLOG("Failed to start device %u: error %d\n",
 			    cdev_id, rc);
-		goto err;
+		goto err_close;
 	}
 
 	if (device->cdev_info.capabilities->comp_feature_flags & RTE_COMP_FF_SHAREABLE_PRIV_XFORM) {
@@ -194,7 +196,7 @@ create_compress_dev(uint8_t index)
 		if (rc < 0) {
 			SPDK_ERRLOG("Failed to create private comp xform device %u: error %d\n",
 				    cdev_id, rc);
-			goto err;
+			goto err_stop;
 		}
 
 		rc = rte_compressdev_private_xform_create(cdev_id, &g_decomp_xform,
@@ -202,11 +204,11 @@ create_compress_dev(uint8_t index)
 		if (rc) {
 			SPDK_ERRLOG("Failed to create private decomp xform device %u: error %d\n",
 				    cdev_id, rc);
-			goto err;
+			goto err_stop;
 		}
 	} else {
 		SPDK_ERRLOG("PMD does not support shared transforms\n");
-		goto err;
+		goto err_stop;
 	}
 
 	/* Build up list of device/qp combinations */
@@ -214,7 +216,7 @@ create_compress_dev(uint8_t index)
 		dev_qp = calloc(1, sizeof(struct comp_device_qp));
 		if (!dev_qp) {
 			rc = -ENOMEM;
-			goto err;
+			goto err_qp;
 		}
 		dev_qp->device = device;
 		dev_qp->qp = i;
@@ -232,13 +234,21 @@ create_compress_dev(uint8_t index)
 		g_mlx5_pci_available = true;
 	}
 
+	if (strcmp(device->cdev_info.driver_name, UADK_PMD) == 0) {
+		g_uadk_available = true;
+	}
+
 	return 0;
 
-err:
+err_qp:
 	TAILQ_FOREACH_SAFE(dev_qp, &g_comp_device_qp, link, tmp_qp) {
 		TAILQ_REMOVE(&g_comp_device_qp, dev_qp, link);
 		free(dev_qp);
 	}
+err_stop:
+	rte_compressdev_stop(cdev_id);
+err_close:
+	rte_compressdev_close(cdev_id);
 	free(device);
 	return rc;
 }
@@ -576,8 +586,10 @@ comp_dev_poller(void *args)
 			if (task->output_size != NULL) {
 				*task->output_size = deq_ops[i]->produced;
 			}
+			status = 0;
 		} else {
 			SPDK_NOTICELOG("Deque status %u\n", status);
+			status = -EIO;
 		}
 
 		spdk_accel_task_complete(task, status);
@@ -678,11 +690,15 @@ _set_pmd(struct compress_io_channel *chan)
 			chan->drv_name = QAT_PMD;
 		} else if (g_mlx5_pci_available) {
 			chan->drv_name = MLX5_PMD;
+		} else if (g_uadk_available) {
+			chan->drv_name = UADK_PMD;
 		}
 	} else if (g_opts == COMPRESS_PMD_QAT_ONLY && g_qat_available) {
 		chan->drv_name = QAT_PMD;
 	} else if (g_opts == COMPRESS_PMD_MLX5_PCI_ONLY && g_mlx5_pci_available) {
 		chan->drv_name = MLX5_PMD;
+	} else if (g_opts == COMPRESS_PMD_UADK_ONLY && g_uadk_available) {
+		chan->drv_name = UADK_PMD;
 	} else {
 		SPDK_ERRLOG("Requested PMD is not available.\n");
 		return false;
@@ -701,6 +717,17 @@ accel_compress_init(void)
 
 	if (!g_compressdev_enable) {
 		return -EINVAL;
+	}
+
+	if (g_opts == COMPRESS_PMD_UADK_ONLY) {
+		char *driver_name = UADK_PMD;
+
+		rc = rte_vdev_init(driver_name, NULL);
+		if (rc) {
+			SPDK_NOTICELOG("Failed to create virtual PMD %s: error %d. "
+				       "Possibly %s is not supported by DPDK library. "
+				       "Keep going...\n", driver_name, rc, driver_name);
+		}
 	}
 
 	rc = accel_init_compress_drivers();
@@ -738,7 +765,7 @@ compress_create_cb(void *io_device, void *ctx_buf)
 	chan->dst_mbufs = spdk_zmalloc(length, 0x40, NULL,
 				       SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
 	if (chan->dst_mbufs == NULL) {
-		free(chan->src_mbufs);
+		spdk_free(chan->src_mbufs);
 		return -ENOMEM;
 	}
 
@@ -815,7 +842,7 @@ accel_compress_get_ctx_size(void)
 static bool
 compress_supports_opcode(enum spdk_accel_opcode opc)
 {
-	if (g_mlx5_pci_available || g_qat_available) {
+	if (g_mlx5_pci_available || g_qat_available || g_uadk_available) {
 		switch (opc) {
 		case SPDK_ACCEL_OPC_COMPRESS:
 		case SPDK_ACCEL_OPC_DECOMPRESS:
@@ -828,6 +855,36 @@ compress_supports_opcode(enum spdk_accel_opcode opc)
 	return false;
 }
 
+static bool
+compress_supports_algo(enum spdk_accel_comp_algo algo)
+{
+	if (algo == SPDK_ACCEL_COMP_ALGO_DEFLATE) {
+		return true;
+	}
+
+	return false;
+}
+
+static int
+compress_get_level_range(enum spdk_accel_comp_algo algo,
+			 uint32_t *min_level, uint32_t *max_level)
+{
+	switch (algo) {
+	case SPDK_ACCEL_COMP_ALGO_DEFLATE:
+		/**
+		 * Hardware compression is set to the highest level by default and
+		 * will not be affected by cover parameters in actual operation.
+		 * This is set to the maximum range.
+		 * */
+		*min_level = 0;
+		*max_level = 0;
+
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
 static struct spdk_io_channel *
 compress_get_io_channel(void)
 {
@@ -836,14 +893,16 @@ compress_get_io_channel(void)
 
 static void accel_compress_exit(void *ctx);
 static struct spdk_accel_module_if g_compress_module = {
-	.module_init		= accel_compress_init,
-	.module_fini		= accel_compress_exit,
-	.write_config_json	= accel_compress_write_config_json,
-	.get_ctx_size		= accel_compress_get_ctx_size,
-	.name			= "dpdk_compressdev",
-	.supports_opcode	= compress_supports_opcode,
-	.get_io_channel		= compress_get_io_channel,
-	.submit_tasks		= compress_submit_tasks
+	.module_init	             = accel_compress_init,
+	.module_fini	             = accel_compress_exit,
+	.write_config_json           = accel_compress_write_config_json,
+	.get_ctx_size	             = accel_compress_get_ctx_size,
+	.name		             = "dpdk_compressdev",
+	.supports_opcode             = compress_supports_opcode,
+	.get_io_channel	             = compress_get_io_channel,
+	.submit_tasks                = compress_submit_tasks,
+	.compress_supports_algo      = compress_supports_algo,
+	.get_compress_level_range    = compress_get_level_range,
 };
 
 void
@@ -861,12 +920,18 @@ _device_unregister_cb(void *io_device)
 
 	while ((device = TAILQ_FIRST(&g_compress_devs))) {
 		TAILQ_REMOVE(&g_compress_devs, device, link);
+		rte_compressdev_stop(device->cdev_id);
+		rte_compressdev_close(device->cdev_id);
 		free(device);
 	}
 
 	while ((dev_qp = TAILQ_FIRST(&g_comp_device_qp))) {
 		TAILQ_REMOVE(&g_comp_device_qp, dev_qp, link);
 		free(dev_qp);
+	}
+
+	if (g_opts == COMPRESS_PMD_UADK_ONLY) {
+		rte_vdev_uninit(UADK_PMD);
 	}
 
 	pthread_mutex_destroy(&g_comp_device_qp_lock);

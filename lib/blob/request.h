@@ -79,6 +79,13 @@ struct spdk_bs_cpl {
 typedef void (*spdk_bs_sequence_cpl)(spdk_bs_sequence_t *sequence,
 				     void *cb_arg, int bserrno);
 
+struct limit {
+	bool 			is_unmap;
+	uint64_t			lba;
+	uint64_t			lba_count;
+	TAILQ_ENTRY(limit) entries;
+};
+
 /* A generic request set. Can be a sequence, batch or a user_op. */
 struct spdk_bs_request_set {
 	struct spdk_bs_cpl      cpl;
@@ -98,6 +105,11 @@ struct spdk_bs_request_set {
 
 	struct spdk_bs_dev_cb_args	cb_args;
 
+	int 	priority_class;
+	uint8_t geometry;
+	uint8_t special_io;
+	struct spdk_blob_store	*bs;
+
 	union {
 		struct {
 			spdk_bs_sequence_cpl    cb_fn;
@@ -109,6 +121,11 @@ struct spdk_bs_request_set {
 			uint32_t		batch_closed;
 			spdk_bs_sequence_cpl	cb_fn;
 			void			*cb_arg;
+			/* unmap io number inflight */
+			bool			is_unmap;
+			uint8_t			geometry;
+			uint8_t			special_io;
+			TAILQ_HEAD(unmap_io_queue, limit) unmap_queue;
 		} batch;
 
 		struct spdk_bs_user_op_args {
@@ -134,6 +151,8 @@ spdk_bs_sequence_t *bs_sequence_start_bs(struct spdk_io_channel *channel,
 
 spdk_bs_sequence_t *bs_sequence_start_blob(struct spdk_io_channel *channel,
 		struct spdk_bs_cpl *cpl, struct spdk_blob *blob);
+spdk_bs_sequence_t *bs_sequence_start_blob_s(struct spdk_io_channel *channel,
+		 struct spdk_bs_cpl *cpl, uint8_t special_io, struct spdk_blob *blob);
 
 spdk_bs_sequence_t *bs_sequence_start_esnap(struct spdk_io_channel *channel,
 		struct spdk_bs_cpl *cpl, struct spdk_blob *blob);
@@ -176,6 +195,8 @@ void bs_user_op_sequence_finish(void *cb_arg, int bserrno);
 
 spdk_bs_batch_t *bs_batch_open(struct spdk_io_channel *channel,
 			       struct spdk_bs_cpl *cpl, struct spdk_blob *blob);
+spdk_bs_batch_t *bs_batch_open_s(struct spdk_io_channel *channel,
+			       struct spdk_bs_cpl *cpl, uint8_t special_io, struct spdk_blob *blob);
 
 void bs_batch_read_bs_dev(spdk_bs_batch_t *batch, struct spdk_bs_dev *bs_dev,
 			  void *payload, uint64_t lba, uint32_t lba_count);
@@ -194,8 +215,11 @@ void bs_batch_write_zeroes_dev(spdk_bs_batch_t *batch,
 
 void bs_batch_close(spdk_bs_batch_t *batch);
 
-spdk_bs_batch_t *bs_sequence_to_batch(spdk_bs_sequence_t *seq,
+spdk_bs_batch_t *bs_sequence_to_batch(spdk_bs_sequence_t *seq, uint8_t geometry,
 				      spdk_bs_sequence_cpl cb_fn,
+				      void *cb_arg);
+spdk_bs_batch_t *bs_sequence_to_batch_s(spdk_bs_sequence_t *seq, uint8_t geometry,
+				      uint8_t special_io, spdk_bs_sequence_cpl cb_fn,
 				      void *cb_arg);
 
 spdk_bs_user_op_t *bs_user_op_alloc(struct spdk_io_channel *channel, struct spdk_bs_cpl *cpl,
