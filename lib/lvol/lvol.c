@@ -20,6 +20,10 @@
 
 #define LVOL_NAME "name"
 
+/* How long a finished merge's result stays queryable via bdev_lvol_s3_merge_stat
+ * before md_xfer_poller() sweeps it. */
+#define LVS_MERGE_RESULT_GRACE_SEC 30
+
 SPDK_LOG_REGISTER_COMPONENT(lvol)
 
 struct spdk_lvs_degraded_lvol_set {
@@ -28,6 +32,22 @@ struct spdk_lvs_degraded_lvol_set {
 	uint32_t				id_len;
 	TAILQ_HEAD(degraded_lvols, spdk_lvol)	lvols;
 	RB_ENTRY(spdk_lvs_degraded_lvol_set)	node;
+};
+
+/*
+ * Outcome of a finished XFER_S3_MERGE task, kept around after the owning
+ * spdk_lvs_xfer is freed. A merge task has no lvol (it operates on two
+ * s3_ids, not a live lvol), so unlike backup/recover it has no lvol->
+ * transfer_status to report through bdev_lvol_transfer_stat. destroy_xfer_task()
+ * writes one of these on completion; bdev_lvol_s3_merge_stat reads it;
+ * md_xfer_poller() sweeps entries older than a grace window.
+ */
+struct spdk_lvs_merge_result {
+	uint32_t				s3_id;
+	uint32_t				old_s3_id;
+	bool					failed;
+	uint64_t				completed_ticks;
+	TAILQ_ENTRY(spdk_lvs_merge_result)	entry;
 };
 
 static TAILQ_HEAD(, spdk_lvol_store) g_lvol_stores = TAILQ_HEAD_INITIALIZER(g_lvol_stores);
@@ -41,6 +61,7 @@ static TAILQ_HEAD(, spdk_lvs_xfer) g_lvs_xfer_tasks = TAILQ_HEAD_INITIALIZER(g_l
 /* Number of freeze-critical (priority) transfers in flight. Written on the
  * md thread, read by the poll-group helper pollers -- atomics, not locks. */
 static int g_priority_xfer_cnt;
+static TAILQ_HEAD(, spdk_lvs_merge_result) g_lvs_merge_results = TAILQ_HEAD_INITIALIZER(g_lvs_merge_results);
 static uint32_t g_lvs_num_pgs = 0;
 static uint32_t g_migration_counter = 0;
 static uint64_t g_migration_timer = 0;
@@ -5215,6 +5236,24 @@ destroy_xfer_task(struct spdk_lvs_xfer *xfer) {
 	}
 
 	if (XFER_S3_MERGE == xfer->type) {
+		/* Merge has no lvol to report status through (see struct comment on
+		 * spdk_lvs_merge_result) — record the outcome here, once, before xfer
+		 * is freed, so bdev_lvol_s3_merge_stat can still answer after the fact.
+		 * Without that record the outcome is unobservable, so a failed
+		 * allocation fails the merge. */
+		struct spdk_lvs_merge_result *result = calloc(1, sizeof(*result));
+		if (result == NULL) {
+			SPDK_ERRLOG("Cannot allocate memory for merge result s3_id %u old_s3_id %u\n",
+				    xfer->s3_id, xfer->old_s3_id);
+			xfer->state = XFER_STATE_FAILED;
+		} else {
+			result->s3_id = xfer->s3_id;
+			result->old_s3_id = xfer->old_s3_id;
+			result->failed = (xfer->state != XFER_STATE_DONE);
+			result->completed_ticks = spdk_get_ticks();
+			TAILQ_INSERT_TAIL(&g_lvs_merge_results, result, entry);
+		}
+
 		SPDK_NOTICELOG("Transfer lvol %d %s task: status %s finished.\n", xfer->s3_id,
 					xfer_type_to_string(xfer->type),
 					xfer->state == XFER_STATE_DONE ? "DONE" : "FAILED");
@@ -6582,6 +6621,22 @@ md_xfer_poller(void *cb_arg)
 		g_migration_counter = 0;
 	}
 
+	/* Sweep g_lvs_merge_results, rate-gated to roughly once a second — this
+	 * poller already runs at a 1ms period for the process lifetime once any
+	 * transfer has started, so this reuses it rather than adding a poller. */
+	static uint64_t last_sweep_ticks = 0;
+	if (current_time - last_sweep_ticks >= spdk_get_ticks_hz()) {
+		last_sweep_ticks = current_time;
+		uint64_t grace_ticks = spdk_get_ticks_hz() * LVS_MERGE_RESULT_GRACE_SEC;
+		struct spdk_lvs_merge_result *result, *result_tmp;
+		TAILQ_FOREACH_SAFE(result, &g_lvs_merge_results, entry, result_tmp) {
+			if (current_time - result->completed_ticks > grace_ticks) {
+				TAILQ_REMOVE(&g_lvs_merge_results, result, entry);
+				free(result);
+			}
+		}
+	}
+
     return count ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
 }
 
@@ -7522,6 +7577,28 @@ spdk_lvol_s3_merge(struct spdk_lvol_store *lvs, uint32_t s3_id, uint32_t old_s3_
 	}
 	TAILQ_INSERT_TAIL(&g_lvs_xfer_tasks, task, entry);
 	return 0;
+}
+
+bool
+spdk_lvol_s3_merge_stat(uint32_t s3_id, uint32_t old_s3_id, enum xfer_state *state) {
+	struct spdk_lvs_xfer *xfer;
+	struct spdk_lvs_merge_result *result;
+
+	TAILQ_FOREACH(xfer, &g_lvs_xfer_tasks, entry) {
+		if (xfer->type == XFER_S3_MERGE && xfer->s3_id == s3_id && xfer->old_s3_id == old_s3_id) {
+			*state = xfer->state;
+			return true;
+		}
+	}
+
+	TAILQ_FOREACH(result, &g_lvs_merge_results, entry) {
+		if (result->s3_id == s3_id && result->old_s3_id == old_s3_id) {
+			*state = result->failed ? XFER_STATE_FAILED : XFER_STATE_DONE;
+			return true;
+		}
+	}
+
+	return false;
 }
 
 int
