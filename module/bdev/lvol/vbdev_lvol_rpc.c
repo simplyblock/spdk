@@ -1020,6 +1020,184 @@ cleanup:
 
 SPDK_RPC_REGISTER("bdev_lvol_snapshot", rpc_bdev_lvol_snapshot, SPDK_RPC_RUNTIME)
 
+/* --- bdev_lvol_snapshot_group ----------------------------------------------
+ * One crash-consistent snapshot per member of a consistency group. All
+ * members must live in the LVS named by "lvs_name". IO on every member is
+ * group-frozen before the first snapshot and unfrozen after the last; a
+ * mid-sequence failure unfreezes everything FIRST and then deletes the
+ * snapshots already taken.
+ *
+ * Params: {"lvs_name": "LVS_1",
+ *          "snapshots": [{"lvol_name": "LVS_1/LVOL_1", "snapshot_name": "S1"}, ...]}
+ * Result: [{"lvol_name": ..., "snapshot_name": ..., "uuid": ...}, ...]
+ */
+struct rpc_group_snap_item {
+	char *lvol_name;
+	char *snapshot_name;
+};
+
+static const struct spdk_json_object_decoder rpc_group_snap_item_decoders[] = {
+	{"lvol_name", offsetof(struct rpc_group_snap_item, lvol_name), spdk_json_decode_string},
+	{"snapshot_name", offsetof(struct rpc_group_snap_item, snapshot_name), spdk_json_decode_string},
+};
+
+#define RPC_GROUP_SNAP_MAX 64
+
+struct rpc_bdev_lvol_snapshot_group {
+	char *lvs_name;
+	size_t count;
+	struct rpc_group_snap_item items[RPC_GROUP_SNAP_MAX];
+};
+
+static int
+rpc_decode_group_snap_item(const struct spdk_json_val *val, void *out)
+{
+	return spdk_json_decode_object(val, rpc_group_snap_item_decoders,
+				       SPDK_COUNTOF(rpc_group_snap_item_decoders), out);
+}
+
+static int
+rpc_decode_group_snap_items(const struct spdk_json_val *val, void *out)
+{
+	struct rpc_bdev_lvol_snapshot_group *req = out;
+
+	return spdk_json_decode_array(val, rpc_decode_group_snap_item,
+				      req->items, RPC_GROUP_SNAP_MAX, &req->count,
+				      sizeof(struct rpc_group_snap_item));
+}
+
+static const struct spdk_json_object_decoder rpc_bdev_lvol_snapshot_group_decoders[] = {
+	{"lvs_name", offsetof(struct rpc_bdev_lvol_snapshot_group, lvs_name), spdk_json_decode_string},
+	{"snapshots", 0, rpc_decode_group_snap_items},
+};
+
+struct rpc_group_snap_ctx {
+	struct spdk_jsonrpc_request *request;
+	struct rpc_bdev_lvol_snapshot_group req;
+	struct vbdev_lvol_group_snap_entry *entries;
+};
+
+static void
+free_rpc_bdev_lvol_snapshot_group(struct rpc_group_snap_ctx *ctx)
+{
+	size_t i;
+
+	free(ctx->req.lvs_name);
+	for (i = 0; i < ctx->req.count; i++) {
+		free(ctx->req.items[i].lvol_name);
+		free(ctx->req.items[i].snapshot_name);
+	}
+	free(ctx->entries);
+	free(ctx);
+}
+
+static void
+rpc_bdev_lvol_snapshot_group_cb(void *cb_arg, struct vbdev_lvol_group_snap_entry *entries,
+				uint32_t count, int lvolerrno)
+{
+	struct rpc_group_snap_ctx *ctx = cb_arg;
+	struct spdk_json_write_ctx *w;
+	uint32_t i;
+
+	if (lvolerrno != 0) {
+		spdk_jsonrpc_send_error_response(ctx->request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 spdk_strerror(-lvolerrno));
+		free_rpc_bdev_lvol_snapshot_group(ctx);
+		return;
+	}
+
+	w = spdk_jsonrpc_begin_result(ctx->request);
+	spdk_json_write_array_begin(w);
+	for (i = 0; i < count; i++) {
+		spdk_json_write_object_begin(w);
+		spdk_json_write_named_string(w, "lvol_name", ctx->req.items[i].lvol_name);
+		spdk_json_write_named_string(w, "snapshot_name", ctx->req.items[i].snapshot_name);
+		spdk_json_write_named_string(w, "uuid",
+					     entries[i].snap ? entries[i].snap->unique_id : "");
+		spdk_json_write_object_end(w);
+	}
+	spdk_json_write_array_end(w);
+	spdk_jsonrpc_end_result(ctx->request, w);
+	free_rpc_bdev_lvol_snapshot_group(ctx);
+}
+
+static void
+rpc_bdev_lvol_snapshot_group(struct spdk_jsonrpc_request *request,
+			     const struct spdk_json_val *params)
+{
+	struct rpc_group_snap_ctx *ctx;
+	struct spdk_bdev *bdev;
+	struct spdk_lvol *lvol;
+	size_t i;
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 spdk_strerror(ENOMEM));
+		return;
+	}
+	ctx->request = request;
+
+	if (spdk_json_decode_object(params, rpc_bdev_lvol_snapshot_group_decoders,
+				    SPDK_COUNTOF(rpc_bdev_lvol_snapshot_group_decoders),
+				    &ctx->req)) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "spdk_json_decode_object failed");
+		free_rpc_bdev_lvol_snapshot_group(ctx);
+		return;
+	}
+
+	if (ctx->req.count == 0) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "snapshots array is empty");
+		free_rpc_bdev_lvol_snapshot_group(ctx);
+		return;
+	}
+
+	ctx->entries = calloc(ctx->req.count, sizeof(*ctx->entries));
+	if (ctx->entries == NULL) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 spdk_strerror(ENOMEM));
+		free_rpc_bdev_lvol_snapshot_group(ctx);
+		return;
+	}
+
+	for (i = 0; i < ctx->req.count; i++) {
+		bdev = spdk_bdev_get_by_name(ctx->req.items[i].lvol_name);
+		if (bdev == NULL) {
+			spdk_jsonrpc_send_error_response_fmt(request, -ENODEV,
+							     "bdev %s does not exist",
+							     ctx->req.items[i].lvol_name);
+			free_rpc_bdev_lvol_snapshot_group(ctx);
+			return;
+		}
+		lvol = vbdev_lvol_get_from_bdev(bdev);
+		if (lvol == NULL) {
+			spdk_jsonrpc_send_error_response_fmt(request, -ENODEV,
+							     "%s is not an lvol",
+							     ctx->req.items[i].lvol_name);
+			free_rpc_bdev_lvol_snapshot_group(ctx);
+			return;
+		}
+		if (strcmp(lvol->lvol_store->name, ctx->req.lvs_name) != 0) {
+			spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+							     "lvol %s is not in lvs %s",
+							     ctx->req.items[i].lvol_name,
+							     ctx->req.lvs_name);
+			free_rpc_bdev_lvol_snapshot_group(ctx);
+			return;
+		}
+		ctx->entries[i].lvol = lvol;
+		ctx->entries[i].snapshot_name = ctx->req.items[i].snapshot_name;
+	}
+
+	vbdev_lvol_create_snapshot_group(ctx->entries, (uint32_t)ctx->req.count,
+					 rpc_bdev_lvol_snapshot_group_cb, ctx);
+}
+
+SPDK_RPC_REGISTER("bdev_lvol_snapshot_group", rpc_bdev_lvol_snapshot_group, SPDK_RPC_RUNTIME)
+
+
 struct rpc_snapshot_register {
 	char *lvol_name;
 	char *snapshot_name;
