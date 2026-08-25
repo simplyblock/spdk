@@ -4961,6 +4961,8 @@ destroy_xfer_task_tmo(void *arg) {
 		free(xfer->chain_s3_ids);
 	if (xfer->old_clusters)
 		free(xfer->old_clusters);
+	if (xfer->ranges)
+		free(xfer->ranges);
 	free(xfer);
 	return -1;
 }
@@ -5189,6 +5191,30 @@ xfer_status_check(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req **preq, u
 	return 0;
 }
 
+static void
+xfer_enqueue_range_req(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req *req,
+		       uint64_t cluster_idx, const struct blob_dirty_range *r)
+{
+	uint64_t pages_per_block = SPDK_BLOB_DIRTY_BLOCK_SZ / xfer->page_size;
+
+	req->offset = cluster_idx * xfer->page_per_cluster + (uint64_t)r->off * pages_per_block;
+	req->len = (uint64_t)r->len * pages_per_block;
+	req->dst_offset = req->offset;
+	if (xfer->lvol->redirect_map_id != 0) {
+		req->dst_offset = ((uint64_t)(xfer->lvol->redirect_map_id) << 48) | req->offset;
+	}
+	req->action = REQ_ACTION_COPY_BACKUP;
+	req->status = XFER_REQ_STATUS_READY;
+	if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
+		SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
+		assert(false);
+	}
+	xfer->lvol->xfer_partial_reqs++;
+	xfer->lvol->xfer_pages_sent += req->len;
+	xfer->outstanding_io++;
+	xfer->idx++;
+}
+
 static int
 xfer_replication(struct spdk_lvs_xfer *xfer) {
 	struct spdk_lvs_xfer_req *req;
@@ -5235,13 +5261,42 @@ xfer_replication(struct spdk_lvs_xfer *xfer) {
 
 				// prepare req
 				memset(req->payload, 0, xfer->page_size * xfer->page_per_cluster);
+				if (xfer->allow_partial && xfer->range_pos < xfer->num_ranges) {
+					/* remaining coalesced ranges of the current cluster */
+					is_allocate = true;
+					xfer_enqueue_range_req(xfer, req, xfer->range_cluster,
+							       &xfer->ranges[xfer->range_pos++]);
+					count++;
+					continue;
+				}
 				if (xfer->hold_idx < xfer->num_clusters) {
 					for (uint32_t i = xfer->hold_idx; i < xfer->num_clusters; i++) {
 						if (xfer->clusters[i] == 0) {
 							continue;
 						}
 
+						if (xfer->allow_partial) {
+							int nr = spdk_blob_dirty_cluster_ranges(
+									xfer->dirty_gen, i, xfer->ranges,
+									spdk_blob_dirty_max_ranges(xfer->dirty_gen));
+							if (nr > 0) {
+								/* bitmap-driven: only the dirty ranges travel */
+								xfer->num_ranges = (uint32_t)nr;
+								xfer->range_pos = 1;
+								xfer->range_cluster = i;
+								is_allocate = true;
+								xfer_enqueue_range_req(xfer, req, i, &xfer->ranges[0]);
+								xfer->hold_idx = i + 1;
+								count++;
+								break;
+							}
+							/* nr <= 0: no bitmap for this cluster (defensive)
+							 * -- transfer it whole below */
+						}
+
 						is_allocate = true;
+						xfer->lvol->xfer_full_clusters++;
+						xfer->lvol->xfer_pages_sent += xfer->page_per_cluster;
 						req->dst_offset = i * xfer->page_per_cluster;
 						if (xfer->lvol->redirect_map_id != 0) {
 							req->dst_offset = ((uint64_t)(xfer->lvol->redirect_map_id) << 48) | req->dst_offset;
@@ -6795,6 +6850,7 @@ spdk_lvol_transfer_delay(void *ctx) {
 int
 spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_batch, enum xfer_type type,
 				struct spdk_transfer_dev *tdev, const char *snapshot_name, uint32_t lvol_id,
+				bool allow_partial,
 				spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg) {
 	struct spdk_lvs_xfer *xfer, *task;	
 	struct spdk_lvol_store *lvs = lvol->lvol_store;	
@@ -6853,6 +6909,38 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
 		SPDK_ERRLOG("Cannot allocate memory for transfer clusters array.\n");
 		free(task);
 		return -ENOMEM;
+	}
+
+	lvol->xfer_partial_reqs = 0;
+	lvol->xfer_full_clusters = 0;
+	lvol->xfer_pages_sent = 0;
+
+	/* Bitmap-driven partial transfer: only when the caller allows it (the
+	 * control plane guarantees the landing volume carries the predecessor's
+	 * content) AND this snapshot's dirty generation tracked every write
+	 * since its epoch began. Anything else -- restarted node, invalidated
+	 * generation, untracked blob -- falls back to full clusters. */
+	if (allow_partial && type == XFER_REPLICATE_SNAPSHOT) {
+		struct blob_dirty_gen *gen = spdk_blob_get_dirty_gen(lvol->blob);
+
+		if (gen != NULL && spdk_blob_dirty_gen_complete(gen)) {
+			task->ranges = calloc(spdk_blob_dirty_max_ranges(gen),
+					      sizeof(struct blob_dirty_range));
+			if (task->ranges != NULL) {
+				task->dirty_gen = gen;
+				task->allow_partial = true;
+				SPDK_NOTICELOG("Transfer lvol %s: dirty-bitmap partial transfer "
+					       "(gen %" PRIu64 ", %" PRIu64 " tracked clusters, "
+					       "%" PRIu64 " dirty bytes)\n",
+					       lvol->name, spdk_blob_dirty_gen_id(gen),
+					       spdk_blob_dirty_gen_tracked(gen),
+					       spdk_blob_dirty_gen_bytes(gen));
+			}
+		} else {
+			SPDK_NOTICELOG("Transfer lvol %s: partial requested but no complete "
+				       "dirty generation -- falling back to full clusters\n",
+				       lvol->name);
+		}
 	}
 
 	// rememeber

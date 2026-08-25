@@ -484,6 +484,32 @@ node_role_t node_role_from_string(const char *str);
 const char *node_role_to_string(node_role_t role);
 void spdk_bs_set_read_only(struct spdk_blob_store *bs, bool state);
 void prepare_s3_clusters(struct spdk_blob* blob, uint64_t *clusters, uint32_t num_clusters);
+
+/* In-memory dirty tracking for partial snapshot replication (lib/blob/blob_dirty.c).
+ * A blob's dirty GENERATION records, at 8 KiB granularity, which blocks were
+ * written since the blob's epoch began (creation or the last snapshot
+ * rotation). Purely in memory: after a restart no generation exists and the
+ * transfer falls back to full clusters. */
+/* dirty-tracking granularity: one bit per this many bytes */
+#define SPDK_BLOB_DIRTY_BLOCK_SZ	(8 * 1024)
+
+struct blob_dirty_gen;
+
+struct blob_dirty_range {
+	uint32_t off;	/* in 8 KiB blocks, relative to the cluster start */
+	uint32_t len;	/* in 8 KiB blocks */
+};
+
+struct blob_dirty_gen *spdk_blob_get_dirty_gen(struct spdk_blob *blob);
+bool spdk_blob_dirty_gen_complete(const struct blob_dirty_gen *gen);
+uint64_t spdk_blob_dirty_gen_id(const struct blob_dirty_gen *gen);
+uint64_t spdk_blob_dirty_gen_tracked(const struct blob_dirty_gen *gen);
+uint64_t spdk_blob_dirty_gen_bytes(const struct blob_dirty_gen *gen);
+uint32_t spdk_blob_dirty_max_ranges(const struct blob_dirty_gen *gen);
+/* Ranges to transfer for one cluster: -1 = no bitmap (send the whole
+ * cluster), otherwise the number of coalesced ranges written to out. */
+int spdk_blob_dirty_cluster_ranges(struct blob_dirty_gen *gen, uint64_t cluster_idx,
+				   struct blob_dirty_range *out, uint32_t max_out);
 bool spdk_blob_get_offset_allocate(struct spdk_blob *blob, uint64_t offset);
 bool spdk_blob_check_offset_valid(struct spdk_blob *blob, uint64_t offset, uint64_t length);
 int spdk_read_cluster_data_xfer(struct spdk_blob *blob, void *buf, uint64_t offset, 
