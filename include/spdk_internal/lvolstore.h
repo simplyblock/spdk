@@ -277,6 +277,18 @@ struct spdk_lvs_xfer {
 	uint32_t idx;
 	bool persist_swap;
 	uint32_t timeout_cnt;
+
+	/* dirty-bitmap partial transfer (see lib/blob/blob_dirty.c). allow_partial
+	 * comes from the RPC; dirty_gen is the snapshot's COMPLETE generation or
+	 * NULL; ranges is a per-cluster scratch array of coalesced transfer
+	 * ranges, walked via range_pos while range_cluster names the cluster
+	 * they belong to. */
+	bool allow_partial;
+	struct blob_dirty_gen *dirty_gen;
+	struct blob_dirty_range *ranges;
+	uint32_t num_ranges;
+	uint32_t range_pos;
+	uint64_t range_cluster;
 };
 
 struct spdk_lvol_store {
@@ -370,6 +382,12 @@ struct spdk_lvol {
 
 	enum xfer_status transfer_status;
 	uint64_t last_offset;
+	/* stats of the most recent transfer: how many requests went out as
+	 * bitmap-driven partial ranges vs whole clusters (dirty-bitmap
+	 * replication; reset when a transfer starts) */
+	uint64_t xfer_partial_reqs;
+	uint64_t xfer_full_clusters;
+	uint64_t xfer_pages_sent;
 	uint64_t current_offset;
 };
 

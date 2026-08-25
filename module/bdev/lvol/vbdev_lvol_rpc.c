@@ -3654,7 +3654,7 @@ rpc_bdev_lvol_transfer_final_step(struct spdk_jsonrpc_request *request,
 	}
 	SPDK_NOTICELOG("Transfering lvol %s in mode %s for final step.\n", req.lvol_name, req.operation);
 
-	rc = spdk_lvol_transfer(lvol, 0, req.cluster_batch, type, tdev, req.snapshot_name, req.lvol_id,
+	rc = spdk_lvol_transfer(lvol, 0, req.cluster_batch, type, tdev, req.snapshot_name, req.lvol_id, false,
 		 											rpc_bdev_lvol_transfer_final_step_cb, request);
 	if (rc < 0) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
@@ -3854,6 +3854,7 @@ struct rpc_bdev_lvol_transfer {
 	uint32_t cluster_batch;
 	char *gateway;
 	char *operation;
+	bool allow_partial;
 };
 
 static void 
@@ -3870,6 +3871,7 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_transfer_decoders[] =
 	{"gateway", offsetof(struct rpc_bdev_lvol_transfer, gateway), spdk_json_decode_string},	
 	{"operation", offsetof(struct rpc_bdev_lvol_transfer, operation), spdk_json_decode_string},
 	{"lvol_id", offsetof(struct rpc_bdev_lvol_transfer, lvol_id), spdk_json_decode_uint32, true},
+	{"allow_partial", offsetof(struct rpc_bdev_lvol_transfer, allow_partial), spdk_json_decode_bool, true},
 };
 
 static void 
@@ -3936,7 +3938,8 @@ rpc_bdev_lvol_transfer(struct spdk_jsonrpc_request *request,
 	}
 	SPDK_NOTICELOG("Transfering lvol %s in %s mode.\n", req.lvol_name, req.operation);
 
-	rc = spdk_lvol_transfer(lvol, req.offset, req.cluster_batch, type, tdev, NULL, req.lvol_id, NULL, NULL);
+	rc = spdk_lvol_transfer(lvol, req.offset, req.cluster_batch, type, tdev, NULL, req.lvol_id,
+				req.allow_partial, NULL, NULL);
 	if (rc < 0) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 spdk_strerror(-rc));
@@ -4009,6 +4012,9 @@ rpc_bdev_lvol_transfer_stat(struct spdk_jsonrpc_request *request,
 		spdk_json_write_named_string(w, "transfer_state", "No process");
 	}
 	spdk_json_write_named_uint64(w, "offset", lvol->last_offset);
+	spdk_json_write_named_uint64(w, "partial_reqs", lvol->xfer_partial_reqs);
+	spdk_json_write_named_uint64(w, "full_clusters", lvol->xfer_full_clusters);
+	spdk_json_write_named_uint64(w, "pages_sent", lvol->xfer_pages_sent);
 	spdk_json_write_object_end(w);
 	// spdk_json_write_array_end(w);
 	spdk_jsonrpc_end_result(request, w);
@@ -4018,6 +4024,73 @@ cleanup:
 }
 
 SPDK_RPC_REGISTER("bdev_lvol_transfer_stat", rpc_bdev_lvol_transfer_stat, SPDK_RPC_RUNTIME)
+
+struct rpc_bdev_lvol_dirty_bitmap_info {
+	char *lvol_name;
+};
+
+static void
+free_rpc_bdev_lvol_dirty_bitmap_info(struct rpc_bdev_lvol_dirty_bitmap_info *req)
+{
+	free(req->lvol_name);
+}
+
+static const struct spdk_json_object_decoder rpc_bdev_lvol_dirty_bitmap_info_decoders[] = {
+	{"lvol_name", offsetof(struct rpc_bdev_lvol_dirty_bitmap_info, lvol_name), spdk_json_decode_string},
+};
+
+/* Inspect the in-memory dirty generation of an lvol/snapshot: whether writes
+ * are being tracked, whether the generation is COMPLETE (a valid basis for a
+ * partial transfer), and how much data it marks dirty. */
+static void
+rpc_bdev_lvol_dirty_bitmap_info(struct spdk_jsonrpc_request *request,
+				const struct spdk_json_val *params)
+{
+	struct rpc_bdev_lvol_dirty_bitmap_info req = {};
+	struct spdk_bdev *bdev;
+	struct spdk_lvol *lvol;
+	struct blob_dirty_gen *gen;
+	struct spdk_json_write_ctx *w;
+
+	if (spdk_json_decode_object(params, rpc_bdev_lvol_dirty_bitmap_info_decoders,
+				    SPDK_COUNTOF(rpc_bdev_lvol_dirty_bitmap_info_decoders),
+				    &req)) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "spdk_json_decode_object failed");
+		goto cleanup;
+	}
+
+	bdev = spdk_bdev_get_by_name(req.lvol_name);
+	if (bdev == NULL) {
+		SPDK_INFOLOG(lvol_rpc, "bdev '%s' does not exist\n", req.lvol_name);
+		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
+		goto cleanup;
+	}
+
+	lvol = vbdev_lvol_get_from_bdev(bdev);
+	if (lvol == NULL) {
+		SPDK_ERRLOG("lvol does not exist\n");
+		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
+		goto cleanup;
+	}
+
+	gen = spdk_blob_get_dirty_gen(lvol->blob);
+
+	w = spdk_jsonrpc_begin_result(request);
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_bool(w, "tracking", gen != NULL);
+	spdk_json_write_named_bool(w, "complete", spdk_blob_dirty_gen_complete(gen));
+	spdk_json_write_named_uint64(w, "gen_id", spdk_blob_dirty_gen_id(gen));
+	spdk_json_write_named_uint64(w, "clusters_tracked", spdk_blob_dirty_gen_tracked(gen));
+	spdk_json_write_named_uint64(w, "dirty_bytes", spdk_blob_dirty_gen_bytes(gen));
+	spdk_json_write_object_end(w);
+	spdk_jsonrpc_end_result(request, w);
+
+cleanup:
+	free_rpc_bdev_lvol_dirty_bitmap_info(&req);
+}
+
+SPDK_RPC_REGISTER("bdev_lvol_dirty_bitmap_info", rpc_bdev_lvol_dirty_bitmap_info, SPDK_RPC_RUNTIME)
 
 struct rpc_bdev_lvol_set_migration_flag {
 	char *lvol_name;
