@@ -4351,8 +4351,7 @@ fragment_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	if (req->fragments_outstanding == 0) {
 		/* DEBUG, not NOTICE: fires once per transferred cluster -- thousands
 		 * of log lines per snapshot, written from the data path. */
-		SPDK_DEBUGLOG(lvol, "Remote write I/O src: %" PRIu64 ", dst: %" PRIu64 " len: %" PRIu64 " t %p
-", req->offset, req->dst_offset, req->len, spdk_get_thread());
+		SPDK_DEBUGLOG(lvol, "Remote write I/O src: %" PRIu64 ", dst: %" PRIu64 " len: %" PRIu64 " t %p\n", req->offset, req->dst_offset, req->len, spdk_get_thread());
 		/* final aggregated status */
 		int st = req->aggregated_status;
 		if (st != 0) {
