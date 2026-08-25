@@ -215,8 +215,17 @@ def main():
             devs.append(nqn_a)
 
             print(f"--- run {run}: writing {DATA_MIB} MiB of urandom", flush=True)
-            sh(f"dd if=/dev/urandom of={dev_a} bs=4M count={DATA_MIB // 4} "
-               f"oflag=direct status=none")
+            # Throttled, chunked fill: an unthrottled multi-GiB dd through the
+            # kernel nvme-tcp loopback hard-hung the whole box twice (instance
+            # reset mid-write, nothing in the journal). 256 MiB direct-IO
+            # chunks with a breather keep the initiator well behind the
+            # target's completion capacity.
+            chunk = 256
+            for off in range(0, DATA_MIB, chunk):
+                n = min(chunk, DATA_MIB - off)
+                sh(f"dd if=/dev/urandom of={dev_a} bs=1M count={n} seek={off} "
+                   f"oflag=direct status=none")
+                time.sleep(0.5)
             sh("sync")
             rpc(SOCK_A, "bdev_lvol_snapshot",
                 {"lvol_name": f"lvsA/{vol}", "snapshot_name": snap})
