@@ -88,10 +88,25 @@ def nvme_dev_for(nqn, nsid):
     raise RuntimeError(f"no kernel device for {nqn} nsid {nsid}")
 
 
+def _pattern_file(byte_hex, len_mb):
+    """Materialize the pattern with python bytes: no shell/tr escape layers.
+
+    The first revision generated patterns with `dd | tr '\0' '\241'`, and the
+    escape survived four quoting layers differently on different rigs -- the
+    harness then blamed the snapshot for content its own writes never put on
+    the device. Bytes written by python are bytes, everywhere.
+    """
+    path = f"/tmp/cg_pat_{byte_hex}_{len_mb}m.bin"
+    if not os.path.exists(path):
+        with open(path, "wb") as f:
+            f.write(bytes([int(byte_hex, 16)]) * (len_mb * MB))
+    return path
+
+
 def write_pattern(dev, byte_hex, offset_mb, len_mb):
-    sh(f"sudo dd if=/dev/zero bs=1M count={len_mb} 2>/dev/null | "
-       f"tr '\\0' '\\{int(byte_hex, 16):03o}' | "
-       f"sudo dd of={dev} bs=1M seek={offset_mb} count={len_mb} oflag=direct conv=notrunc,fsync 2>/dev/null")
+    path = _pattern_file(byte_hex, len_mb)
+    sh(f"sudo dd if={path} of={dev} bs=1M seek={offset_mb} count={len_mb} "
+       f"oflag=direct conv=notrunc,fsync 2>/dev/null")
 
 
 def read_md5(dev, offset_mb, len_mb):
@@ -99,8 +114,7 @@ def read_md5(dev, offset_mb, len_mb):
 
 
 def pattern_md5(byte_hex, len_mb):
-    return sh(f"dd if=/dev/zero bs=1M count={len_mb} 2>/dev/null | "
-              f"tr '\\0' '\\{int(byte_hex, 16):03o}' | md5sum").split()[0]
+    return sh(f"md5sum {_pattern_file(byte_hex, len_mb)}").split()[0]
 
 
 def quick_write_ok(dev, timeout_s=8):
