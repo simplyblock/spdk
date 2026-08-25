@@ -3360,6 +3360,50 @@ cleanup:
 
 SPDK_RPC_REGISTER("bdev_lvol_s3_merge", rpc_bdev_lvol_s3_merge, SPDK_RPC_RUNTIME)
 
+struct rpc_bdev_lvol_s3_merge_stat {
+	uint32_t old_s3_id;
+	uint32_t s3_id;
+};
+
+static const struct spdk_json_object_decoder rpc_bdev_lvol_s3_merge_stat_decoders[] = {
+	{"old_s3_id", offsetof(struct rpc_bdev_lvol_s3_merge_stat, old_s3_id), spdk_json_decode_uint32},
+	{"s3_id", offsetof(struct rpc_bdev_lvol_s3_merge_stat, s3_id), spdk_json_decode_uint32},
+};
+
+static void
+rpc_bdev_lvol_s3_merge_stat(struct spdk_jsonrpc_request *request,
+			     const struct spdk_json_val *params)
+{
+	struct rpc_bdev_lvol_s3_merge_stat req = {};
+	struct spdk_json_write_ctx *w;
+	enum xfer_state state;
+
+	if (spdk_json_decode_object(params, rpc_bdev_lvol_s3_merge_stat_decoders,
+				    SPDK_COUNTOF(rpc_bdev_lvol_s3_merge_stat_decoders),
+				    &req)) {
+		SPDK_INFOLOG(lvol_rpc, "spdk_json_decode_object failed\n");
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "spdk_json_decode_object failed");
+		return;
+	}
+
+	w = spdk_jsonrpc_begin_result(request);
+	spdk_json_write_object_begin(w);
+	if (!spdk_lvol_s3_merge_stat(req.s3_id, req.old_s3_id, &state)) {
+		spdk_json_write_named_string(w, "transfer_state", "No process");
+	} else if (state == XFER_STATE_DONE) {
+		spdk_json_write_named_string(w, "transfer_state", "Done");
+	} else if (state == XFER_STATE_FAILED) {
+		spdk_json_write_named_string(w, "transfer_state", "Failed");
+	} else {
+		spdk_json_write_named_string(w, "transfer_state", "In progress");
+	}
+	spdk_json_write_object_end(w);
+	spdk_jsonrpc_end_result(request, w);
+}
+
+SPDK_RPC_REGISTER("bdev_lvol_s3_merge_stat", rpc_bdev_lvol_s3_merge_stat, SPDK_RPC_RUNTIME)
+
 struct rpc_bdev_lvol_recovery_s3_ids {
 	/* Number of s3 ids */
 	size_t           num;
