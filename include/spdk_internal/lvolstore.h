@@ -177,6 +177,10 @@ struct remote_lvol_info {
 	struct spdk_poller *cleanup_poller;
 	struct spdk_poller *abort_inflight_poller;
 	struct spdk_lvs_xfer *xfer_task;
+	/* Copied from the owning xfer at creation (not derived through xfer_task,
+	 * whose lifetime ends before this entry's cleanup poller runs): requests
+	 * of a freeze-critical FINAL transfer are dispatched before any other. */
+	bool priority;
 	uint64_t outstanding_io;
 	struct spdk_ring *free_ring;     /* tasks available for this snapshot */
     struct spdk_ring *ready_ring;    /* tasks ready to send to remote lvol */
@@ -210,6 +214,11 @@ struct spdk_lvs_poll_group {
 };
 
 
+struct spdk_lvs_xfer_frag {
+	struct spdk_lvs_xfer_req *req;
+	uint32_t idx;
+};
+
 struct spdk_lvs_xfer_req {
 	enum xfer_req_status status;
 	enum xfer_type   type;
@@ -219,6 +228,14 @@ struct spdk_lvs_xfer_req {
 	uint64_t len;
 	void *payload;
 	int fragments_outstanding;
+	/* read->write PIPELINED path (replicate, non-special): each 64 KiB
+	 * fragment's hub write is issued the moment ITS read completes instead
+	 * of after ALL reads -- the request's read and write phases overlap.
+	 * frag_ctx is a per-request array (one slot per possible fragment)
+	 * allocated with the request pool. */
+	int reads_outstanding;
+	int writes_outstanding;
+	struct spdk_lvs_xfer_frag *frag_ctx;
 	int aggregated_status;
 	struct remote_lvol_info *rmt_lvol;
 	struct spdk_lvs_xfer *xfer;
@@ -248,6 +265,15 @@ struct spdk_lvs_xfer {
 	bool pg[20];
 	bool final_step;
 	bool signal_sent;
+	/* Freeze-critical transfer (final migration step / final replication
+	 * delta): dispatched with absolute priority; while one is active, the
+	 * dispatcher pauses refilling every non-priority transfer window. */
+	bool priority;
+	bool priority_counted;
+	/* Special (geometry/spatial) IO cannot be split below the blob cluster:
+	 * the write side sends ONE cluster-sized IO per request instead of
+	 * 64 KiB fragments, and the dirty-bitmap partial path is refused. */
+	bool special_io;
 	TAILQ_ENTRY(spdk_lvs_xfer)	entry;
 
 	uint64_t page_size;
@@ -284,6 +310,8 @@ struct spdk_lvs_xfer {
 	 * ranges, walked via range_pos while range_cluster names the cluster
 	 * they belong to. */
 	bool allow_partial;
+	/* backing storage for every request's frag_ctx slice */
+	struct spdk_lvs_xfer_frag *frag_pool;
 	struct blob_dirty_gen *dirty_gen;
 	struct blob_dirty_range *ranges;
 	uint32_t num_ranges;
