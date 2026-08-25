@@ -60,6 +60,17 @@ def bdev_exists(name):
         return False
 
 
+def bdev_gone(name, timeout_s=10):
+    """Bdev unregistration is asynchronous relative to the RPC response;
+    give the GC a bounded moment instead of asserting the very next call."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if not bdev_exists(name):
+            return True
+        time.sleep(0.5)
+    return False
+
+
 def nvme_dev_for(nqn, nsid):
     """Kernel block device for (subsystem, nsid) via sysfs."""
     for _ in range(30):
@@ -126,6 +137,9 @@ print("=== T1: group snapshot under live IO ===")
 PAT = ["a1", "b2", "c3"]
 for i, dev in enumerate(devs):
     write_pattern(dev, PAT[i], 0, 4)          # distinguishable 4M pattern @0
+    got = read_md5(dev, 0, 4)
+    want = pattern_md5(PAT[i], 4)
+    check(got == want, f"T1 member m{i} pattern write verified", f"{got[:8]} vs {want[:8]}")
 
 # Background writer on member 0 @32M: every write is a full 4K block of one
 # repeating 4-byte counter, so a torn block in the snapshot would show as a
@@ -170,8 +184,13 @@ print(f"  snapshot devices: {sdevs}")
 for i in range(3):
     got = read_md5(sdevs[i], 0, 4)
     want = pattern_md5(PAT[i], 4)
-    check(got == want, f"T1 snapshot gs{i} holds member m{i}'s pre-freeze pattern",
+    ok = got == want
+    check(ok, f"T1 snapshot gs{i} holds member m{i}'s pre-freeze pattern",
           f"{got[:8]} vs {want[:8]}")
+    if not ok:
+        head_s = sh(f"sudo dd if={sdevs[i]} bs=16 count=1 iflag=direct 2>/dev/null | xxd -p", check_rc=False)
+        head_m = sh(f"sudo dd if={devs[i]} bs=16 count=1 iflag=direct 2>/dev/null | xxd -p", check_rc=False)
+        print(f"    diag: snapshot head={head_s} member head={head_m}")
 
 # Torn-state check on the concurrently written region of member 0's snapshot.
 blk = sh(f"sudo dd if={sdevs[0]} bs=4k skip={32 * 256} count=1 iflag=direct 2>/dev/null | xxd -p | tr -d '\\n'")
@@ -194,8 +213,8 @@ try:
 except JSONRPCException as e:
     t2_err = str(e)
 check(t2_err is not None, "T2 group snapshot with colliding name FAILS", (t2_err or "")[:100])
-check(not bdev_exists("cg/t2s0"), "T2 first member's partial snapshot was GARBAGE-COLLECTED")
-check(not bdev_exists("cg/t2s2"), "T2 no snapshot after the failure point exists")
+check(bdev_gone("cg/t2s0"), "T2 first member's partial snapshot was GARBAGE-COLLECTED")
+check(bdev_gone("cg/t2s2", timeout_s=2), "T2 no snapshot after the failure point exists")
 check(bdev_exists("cg/dup"), "T2 the pre-existing cg/dup was not touched")
 for i, dev in enumerate(devs):
     check(quick_write_ok(dev), f"T2 member m{i} accepts writes after the failed call (unfrozen)")
