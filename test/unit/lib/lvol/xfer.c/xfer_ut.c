@@ -250,11 +250,11 @@ xfer_special_io_writes_whole_cluster(void)
 	req->len = xfer->page_per_cluster;
 
 	CU_ASSERT(submit_rw_reqs_local(req) == 0);
-	CU_ASSERT(req->fragments_outstanding == 32);   /* reads stay fragmented */
+	/* special IO: ONE whole-cluster read, not 32 x 64 KiB fragments -- the
+	 * geometry rule applies to the read side too */
+	CU_ASSERT(req->fragments_outstanding == 1);
 
-	for (int i = 0; i < 32; i++) {
-		fragment_read_cb(req, 0);
-	}
+	fragment_read_cb(req, 0);
 	/* ONE whole-cluster write via complete_op_cb -- no write fragments armed */
 	CU_ASSERT(req->fragments_outstanding == 0);
 	CU_ASSERT(req->status != XFER_REQ_STATUS_FAILED);

@@ -4632,6 +4632,13 @@ submit_read_fragments(struct spdk_lvs_xfer_req *req)
 	if (frag_pages == 0) {
 		frag_pages = 1;
 	}
+	/* Special (geometry) IO must not be split below the blob cluster on the
+	 * READ side either: one whole-request read, mirroring the single
+	 * whole-cluster write. Partial transfer is already refused for it, so
+	 * req->len is the full cluster here. */
+	if (xfer->special_io) {
+		frag_pages = req->len;
+	}
 
 	/* Fill the payload with PARALLEL 64 KiB reads instead of one monolithic
 	 * cluster-sized read: a single 2 MiB spdk_blob_io_read serialized the whole
