@@ -1838,8 +1838,8 @@ vbdev_redirect_after_migrate(struct spdk_lvol *lvol, struct spdk_io_channel *ch,
 	uint64_t offset = 0;
 	COMBINE_OFFSET(offset, lvol->redirect_map_id, bdev_io->u.bdev.offset_blocks);
 
-	SPDK_NOTICELOG("IO Migration - freezed blob: %" PRIu64 "  Lba: %" PRIu64 "  Cnt %" PRIu64 "  t %d \n",
-			 				lvol->blob_id, bdev_io->u.bdev.offset_blocks, bdev_io->u.bdev.num_blocks, bdev_io->type);
+	// SPDK_NOTICELOG("IO Migration - freezed blob: %" PRIu64 "  Lba: %" PRIu64 "  Cnt %" PRIu64 "  t %d \n",
+	// 		 				lvol->blob_id, bdev_io->u.bdev.offset_blocks, bdev_io->u.bdev.num_blocks, bdev_io->type);
 	if (tdev->state == HUBLVOL_CONNECTED) {
 		//TODO check the state for channel
 		if (tdev->desc == NULL) {
@@ -2938,7 +2938,7 @@ end:
 		return;
 	}
 	if (lvs->lvols_opened >= lvs->lvol_count) {
-		SPDK_NOTICELOG("Opening lvols finished\n");
+		SPDK_INFOLOG(vbdev_lvol, "Opening lvols finished\n");
 		_vbdev_lvs_examine_done(req, 0);
 	}
 }
@@ -3045,9 +3045,7 @@ _vbdev_lvs_examine_cb(void *arg, struct spdk_lvol_store *lvol_store, int lvserrn
 	} else {
 		/* Open all lvols */
 		TAILQ_FOREACH_SAFE(lvol, &lvol_store->lvols, link, tmp) {
-			// spdk_lvol_open(lvol, _vbdev_lvs_examine_finish, ori_req);
-			lvol->ref_count++;
-			_vbdev_lvs_examine_finish(ori_req, lvol, 0);
+			spdk_lvol_open(lvol, _vbdev_lvs_examine_finish, ori_req);
 		}
 	}
 

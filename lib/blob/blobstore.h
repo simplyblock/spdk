@@ -96,7 +96,6 @@ enum spdk_blob_load_status {
 	SPDK_BLOB_UPDATE_NORMAL,
 	SPDK_BLOB_UPDATE_LIVE,
 	SPDK_BLOB_UPDATE_FAILOVER,
-	SPDK_BLOB_LOAD_EXAMINE,
 };
 
 TAILQ_HEAD(spdk_xattr_tailq, spdk_xattr);
@@ -163,7 +162,6 @@ struct spdk_blob {
 	/* Number of data clusters retrieved from extent table,
 	 * that many have to be read from extent pages. */
 	uint64_t	remaining_clusters_in_et;
-	bool 		examine_flag;
 };
 
 struct spdk_blob_store {
