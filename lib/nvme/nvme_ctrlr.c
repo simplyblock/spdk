@@ -1092,6 +1092,27 @@ spdk_nvme_ctrlr_is_failed(struct spdk_nvme_ctrlr *ctrlr)
 	return ctrlr->is_failed;
 }
 
+bool
+spdk_nvme_ctrlr_is_disconnected(struct spdk_nvme_ctrlr *ctrlr)
+{
+	bool disconnected;
+
+	/* A disconnect that has already run to completion leaves the controller
+	 * parked in NVME_CTRLR_STATE_DISCONNECTED with NVME_TIMEOUT_INFINITE
+	 * (see nvme_ctrlr_disconnect_done()), i.e. no further state transition
+	 * and no error will be reported by
+	 * spdk_nvme_ctrlr_process_admin_completions(). Callers that arm a
+	 * completion callback on the *edge* of the disconnect need to be able to
+	 * see that the edge has already passed, otherwise they wait forever.
+	 */
+	nvme_ctrlr_lock(ctrlr);
+	disconnected = (ctrlr->is_disconnecting == false &&
+			ctrlr->state == NVME_CTRLR_STATE_DISCONNECTED);
+	nvme_ctrlr_unlock(ctrlr);
+
+	return disconnected;
+}
+
 void
 nvme_ctrlr_fail(struct spdk_nvme_ctrlr *ctrlr, bool hot_remove)
 {
