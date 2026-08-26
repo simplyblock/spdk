@@ -351,6 +351,18 @@ int spdk_lvol_s3_backup(struct spdk_lvol *lvol, uint32_t cluster_batch,
 				struct spdk_lvol **chain_snapshots, int num_snapshots, uint32_t s3_id);
 int spdk_lvol_s3_merge(struct spdk_lvol_store *lvs, uint32_t s3_id,
 				uint32_t old_s3_id, uint32_t cluster_batch);
+/*
+ * Look up the status of a merge started via spdk_lvol_s3_merge(), identified
+ * by the same (s3_id, old_s3_id) pair. A merge has no lvol to report status
+ * through (see struct spdk_lvs_merge_result in lib/lvol/lvol.c), so this is
+ * the only way to observe it after the fact.
+ *
+ * Returns false if no matching merge is known (never started, or its result
+ * has already been swept) -- caller should report this as "No process".
+ * Returns true and sets *state otherwise: XFER_STATE_DONE, XFER_STATE_FAILED,
+ * or any other value meaning still in progress.
+ */
+bool spdk_lvol_s3_merge_stat(uint32_t s3_id, uint32_t old_s3_id, enum xfer_state *state);
 int spdk_lvol_s3_recovery(struct spdk_lvol *lvol, uint32_t cluster_batch,
 				uint32_t *chain_s3_ids, uint32_t num_s3_ids);
 void spdk_lvol_chain(struct spdk_lvol *origlvol, struct spdk_lvol *clone,
