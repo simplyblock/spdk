@@ -122,9 +122,8 @@ xfer_background_pauses_while_priority_active(void)
 	CU_ASSERT(xfer->outstanding_io == 0);
 	CU_ASSERT(drain_ready(xfer, NULL, 8) == 0);
 
-	/* the pause keeps the stall clock fresh */
-	uint64_t t = xfer->timeout;
-	CU_ASSERT(t != 0);
+	/* (the stall-clock refresh is not observable here: the harness stubs
+	 * spdk_get_ticks() to 0) */
 
 	__atomic_store_n(&g_priority_xfer_cnt, 0, __ATOMIC_SEQ_CST);
 	CU_ASSERT(xfer_replication(xfer) == 8);
@@ -188,16 +187,25 @@ helper_serves_priority_first_and_exclusively(void)
 	helper_xfer_poller(&lpg);
 	CU_ASSERT(rmt_pr.outstanding_io == 4);         /* priority ring drained */
 	CU_ASSERT(rmt_bg.outstanding_io == 0);         /* background untouched */
-	CU_ASSERT(drain_ready(x_bg, NULL, 4) == 4);    /* still queued */
+
+	/* count the still-queued background requests WITHOUT losing them */
+	{
+		struct spdk_lvs_xfer_req *held[4];
+		uint32_t got = 0;
+
+		while (got < 4 && spdk_ring_dequeue(x_bg->ready_ring,
+						    (void **)&held[got], 1) == 1) {
+			got++;
+		}
+		CU_ASSERT(got == 4);                   /* still queued */
+		for (uint32_t i = 0; i < got; i++) {
+			CU_ASSERT(spdk_ring_enqueue(x_bg->ready_ring,
+						    (void **)&held[i], 1, NULL) == 1);
+		}
+	}
 
 	/* priority window over: background is served again */
 	__atomic_store_n(&g_priority_xfer_cnt, 0, __ATOMIC_SEQ_CST);
-	CU_ASSERT(xfer_replication(x_bg) == 0);        /* free ring is empty now */
-	struct spdk_lvs_xfer_req *req;
-	while (spdk_ring_dequeue(x_bg->free_ring, (void **)&req, 1) == 1) {
-		req->status = XFER_REQ_STATUS_READY;
-		CU_ASSERT(spdk_ring_enqueue(x_bg->ready_ring, (void **)&req, 1, NULL) == 1);
-	}
 	helper_xfer_poller(&lpg);
 	CU_ASSERT(rmt_bg.outstanding_io > 0);
 
