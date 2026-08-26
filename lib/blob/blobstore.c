@@ -10202,14 +10202,7 @@ spdk_bs_update_snapshot_clone(struct spdk_blob_store *bs, struct spdk_blob *orig
 		}
 	}
 
-	if (newblob->parent_id != origblob->parent_id && origblob->parent_id != SPDK_BLOBID_INVALID) {
-		if (origblob->back_bs_dev) {
-			origblob->back_bs_dev->destroy(origblob->back_bs_dev);
-			origblob->back_bs_dev = NULL;
-		}
-	}
-
-	if (leader || update_in_progress) {//TODO best thing to do is to reject the blob creation
+	if (leader || update_in_progress) {
 		SPDK_NOTICELOG("Create snap in failover blob 0x%" PRIx64 " \n", origblob->id);
 		tmpblob.bs = bs;
 		tmpblob.id = origblob->id;
@@ -13060,13 +13053,7 @@ spdk_bs_for_each_loaded_blob(struct spdk_blob_store *bs,
 	page = spdk_bit_array_find_first_set(bs->used_blobids, 0);
 
 	while (page < capacity) {
-
 		blobid = bs_page_to_blobid(page);
-
-		if (bs->super_blob == blobid) {
-			page = spdk_bit_array_find_first_set(bs->used_blobids, page + 1);
-			continue;
-		}
 
 		blob = blob_lookup(bs, blobid);
 		if (blob == NULL) {

@@ -435,22 +435,22 @@ load_lvols_from_loaded_blobs(void *cb_arg, struct spdk_blob *blob, int lvolerrno
 	SPDK_NOTICELOG("Finished loading lvols from loaded blobs\n");
 }
 
-// static void
-// lvs_get_super_blobid_on_examine(void *cb_arg, spdk_blob_id blobid, int lvolerrno) {
-// 	struct spdk_lvs_with_handle_req *req = (struct spdk_lvs_with_handle_req *)cb_arg;
-// 	struct spdk_lvol_store *lvs = req->lvol_store;
-// 	struct spdk_blob_store *bs = lvs->blobstore;
+static void
+lvs_get_super_blobid_on_examine(void *cb_arg, spdk_blob_id blobid, int lvolerrno) {
+	struct spdk_lvs_with_handle_req *req = (struct spdk_lvs_with_handle_req *)cb_arg;
+	struct spdk_lvol_store *lvs = req->lvol_store;
+	struct spdk_blob_store *bs = lvs->blobstore;
 
-// 	if (lvolerrno != 0) {
-// 		SPDK_INFOLOG(lvol, "Could not close super blob2.\n");
-// 		lvs_free(lvs);
-// 		req->lvserrno = -ENODEV;
-// 		spdk_bs_unload(bs, bs_unload_with_error_cb, req);
-// 		return;
-// 	}
+	if (lvolerrno != 0) {
+		SPDK_INFOLOG(lvol, "Could not close super blob2.\n");
+		lvs_free(lvs);
+		req->lvserrno = -ENODEV;
+		spdk_bs_unload(bs, bs_unload_with_error_cb, req);
+		return;
+	}
 
-// 	spdk_bs_open_blob_without_reference(bs, blobid, NULL, load_lvols_from_loaded_blobs, req);
-// }
+	spdk_bs_open_blob_without_reference(bs, blobid, NULL, load_lvols_from_loaded_blobs, req);
+}
 
 static void
 close_super_cb(void *cb_arg, int lvolerrno)
@@ -469,7 +469,7 @@ close_super_cb(void *cb_arg, int lvolerrno)
 
 	/* Start loading lvols */
 	if (req->examine) {
-		load_lvols_from_loaded_blobs(req, NULL, 0);
+		spdk_bs_get_super(bs, lvs_get_super_blobid_on_examine, req);
 		return;
 	}
 	spdk_bs_iter_first(lvs->blobstore, load_next_lvol, req);
@@ -539,10 +539,10 @@ lvs_read_uuid(void *cb_arg, struct spdk_blob *blob, int lvolerrno)
 	}
 
 	lvs->super_blob_id = spdk_blob_get_id(blob);
-	// if (req->examine) {
-	// 	close_super_cb(req, 0);
-	// 	return;
-	// }
+	if (req->examine) {
+		close_super_cb(req, 0);
+		return;
+	}
 	spdk_blob_close(blob, close_super_cb, req);
 }
 
