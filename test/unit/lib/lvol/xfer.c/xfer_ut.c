@@ -14,6 +14,18 @@
 #include "../lvol.c/lvol_ut.c"
 #undef main
 
+/* The transfer path calls into the dirty-bitmap module and the fork's
+ * blobstore freeze probe. blob_dirty.c is self-contained -- link the real
+ * code; the freeze probe is stubbed (no in-flight IO in these tests). */
+#include "blob/blob_dirty.c"
+int blob_check_io_inflaight(struct spdk_blob *blob);
+int
+blob_check_io_inflaight(struct spdk_blob *blob)
+{
+	(void)blob;
+	return 0;
+}
+
 static struct spdk_lvol g_xfer_lvol;
 static struct spdk_lvol_store g_xfer_lvs;
 
