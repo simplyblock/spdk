@@ -4697,7 +4697,19 @@ helper_xfer_poller(void *arg)
 	struct remote_lvol_info *rmt_lvol;
 	struct spdk_lvs_xfer_req *req;
 	int rc, count = 0;
+	bool priority_active =
+		__atomic_load_n(&g_priority_xfer_cnt, __ATOMIC_SEQ_CST) > 0;
+	/* Two passes: freeze-critical transfers first, and while any is active
+	 * the non-priority rings are not touched at all -- the frozen client is
+	 * waiting on every one of these ticks. */
+	for (int pass = 0; pass < 2; pass++) {
+	if (pass == 1 && priority_active) {
+		break;
+	}
 	TAILQ_FOREACH(rmt_lvol, &lpg->rmt_lvols, entry) {
+		if ((pass == 0) != rmt_lvol->priority) {
+			continue;
+		}
 		/* Drain the ring, do not take ONE request per 200us tick: with the
 		 * dispatcher now filling the whole window per tick, a single-dequeue
 		 * here would re-serialize everything it batched. The ring is bounded
