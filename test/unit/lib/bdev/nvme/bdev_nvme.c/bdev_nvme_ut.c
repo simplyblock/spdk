@@ -324,6 +324,12 @@ struct spdk_nvme_ctrlr {
 	bool				is_failed;
 	bool				fail_reset;
 	bool				is_removed;
+	/* Set to model a controller whose disconnect has already run to
+	 * completion, so process_admin_completions() reports no further error.
+	 * Defaults false, which is what every existing test relies on: the
+	 * disconnect completion still arrives through the poll path.
+	 */
+	bool				disconnect_already_complete;
 	struct spdk_nvme_transport_id	trid;
 	TAILQ_HEAD(, spdk_nvme_qpair)	active_io_qpairs;
 	TAILQ_ENTRY(spdk_nvme_ctrlr)	tailq;
@@ -886,6 +892,12 @@ bool
 spdk_nvme_ctrlr_is_failed(struct spdk_nvme_ctrlr *ctrlr)
 {
 	return ctrlr->is_failed;
+}
+
+bool
+spdk_nvme_ctrlr_is_disconnected(struct spdk_nvme_ctrlr *ctrlr)
+{
+	return ctrlr->disconnect_already_complete;
 }
 
 spdk_nvme_qp_failure_reason
