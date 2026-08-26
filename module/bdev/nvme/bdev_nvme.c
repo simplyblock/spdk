@@ -1653,6 +1653,20 @@ bdev_nvme_io_complete(struct nvme_bdev_io *bio, int rc)
 			bio->io_path = NULL;
 
 			if (any_io_path_may_become_available(nbdev_ch)) {
+				/* Deliberately NOT counted against bdev_retry_count. This I/O was
+				 * never submitted: it is waiting for a path, not retrying a failed
+				 * operation, and this queue is what makes a transient path loss
+				 * invisible to the client. Counting it would fail I/O up ~2s into
+				 * any outage (bdev_retry_count=2, 1s requeue), which is exactly what
+				 * the soak requires must NOT happen through a single-NIC outage.
+				 *
+				 * The bound for "no path is ever coming back" belongs at the
+				 * controller: once it is failed or destructed,
+				 * any_io_path_may_become_available() goes false and this completes
+				 * with EIO. On 2026-08-25 that disposition never ran because the
+				 * reset was stranded -- fixed in nvme_ctrlr_disconnect() and by the
+				 * reset backstop, not here.
+				 */
 				bdev_nvme_queue_retry_io(nbdev_ch, bio, 1000ULL);
 				return;
 			}
@@ -1892,6 +1906,45 @@ bdev_nvme_change_adminq_poll_period(struct nvme_ctrlr *nvme_ctrlr, uint64_t new_
 					  nvme_ctrlr, new_period_us);
 }
 
+/* Backstop deadline for the disconnect-wait phase of a reset.
+ *
+ * Deliberately floors well above any healthy disconnect (microseconds to a few
+ * milliseconds) so this never pre-empts a legitimate sequence; it exists only to
+ * convert "stranded forever" into "fails and disposes normally".
+ */
+#define BDEV_NVME_DISCONNECT_WAIT_FLOOR_SEC 30
+
+static void bdev_nvme_run_disconnected_cb(void *ctx);
+
+/* Has a reset been waiting for its disconnect callback for too long?
+ *
+ * Scoped to the disconnect-wait phase ONLY (disconnected_cb still armed). The
+ * teardown fan-out that follows is deliberately not policed here: it parks a
+ * channel iterator in ctrlr_ch->reset_iter (bdev_nvme_reset_destroy_qpair) and
+ * forcing a completion underneath a parked iterator would leave it dangling.
+ * A stuck fan-out therefore still needs its own handling; this covers the phase
+ * where the 2026-08-25 stranding actually occurred.
+ */
+static bool
+bdev_nvme_disconnect_wait_overdue(struct nvme_ctrlr *nvme_ctrlr)
+{
+	uint64_t elapsed, limit;
+
+	if (nvme_ctrlr->disconnected_cb == NULL || nvme_ctrlr->reset_start_tsc == 0 ||
+	    nvme_ctrlr->destruct) {
+		return false;
+	}
+
+	limit = BDEV_NVME_DISCONNECT_WAIT_FLOOR_SEC;
+	if (nvme_ctrlr->opts.ctrlr_loss_timeout_sec > 0 &&
+	    (uint64_t)nvme_ctrlr->opts.ctrlr_loss_timeout_sec > limit) {
+		limit = (uint64_t)nvme_ctrlr->opts.ctrlr_loss_timeout_sec;
+	}
+
+	elapsed = (spdk_get_ticks() - nvme_ctrlr->reset_start_tsc) / spdk_get_ticks_hz();
+	return elapsed >= limit;
+}
+
 static int
 bdev_nvme_poll_adminq(void *arg)
 {
@@ -1900,6 +1953,20 @@ bdev_nvme_poll_adminq(void *arg)
 	nvme_ctrlr_disconnected_cb disconnected_cb;
 
 	assert(nvme_ctrlr != NULL);
+
+	/* The disconnect edge can be missed entirely (see nvme_ctrlr_disconnect):
+	 * once the controller is parked in NVME_CTRLR_STATE_DISCONNECTED,
+	 * spdk_nvme_ctrlr_process_admin_completions() stops returning an error and
+	 * the rc < 0 branch below never runs again. Nothing else watches reset
+	 * duration, so without this the reset — and every bound that is only
+	 * evaluated on its completion — waits forever.
+	 */
+	if (spdk_unlikely(bdev_nvme_disconnect_wait_overdue(nvme_ctrlr))) {
+		NVME_CTRLR_ERRLOG(nvme_ctrlr,
+				  "reset waited too long for the disconnect to complete; forcing the callback.\n");
+		bdev_nvme_run_disconnected_cb(nvme_ctrlr);
+		return SPDK_POLLER_BUSY;
+	}
 
 	rc = spdk_nvme_ctrlr_process_admin_completions(nvme_ctrlr->ctrlr);
 	if (rc < 0) {
@@ -2161,6 +2228,32 @@ bdev_nvme_check_fast_io_fail_timeout(struct nvme_ctrlr *nvme_ctrlr)
 
 static void bdev_nvme_reset_ctrlr_complete(struct nvme_ctrlr *nvme_ctrlr, bool success);
 
+/* Run an armed disconnected_cb from a fresh call stack.
+ *
+ * Used when the disconnect completed before we could arm the callback: invoking
+ * cb_fn inline there would re-enter the reset state machine underneath
+ * nvme_ctrlr_disconnect()'s caller, so it is deferred onto the controller's own
+ * thread instead. Runs on nvme_ctrlr->thread, the same thread as
+ * bdev_nvme_poll_adminq(), so the NULL-and-take below cannot race it.
+ */
+static void
+bdev_nvme_run_disconnected_cb(void *ctx)
+{
+	struct nvme_ctrlr *nvme_ctrlr = ctx;
+	nvme_ctrlr_disconnected_cb cb_fn;
+
+	cb_fn = nvme_ctrlr->disconnected_cb;
+	nvme_ctrlr->disconnected_cb = NULL;
+
+	if (cb_fn == NULL) {
+		/* bdev_nvme_poll_adminq() got there first. */
+		return;
+	}
+
+	bdev_nvme_change_adminq_poll_period(nvme_ctrlr, g_opts.nvme_adminq_poll_period_us);
+	cb_fn(nvme_ctrlr);
+}
+
 static void
 nvme_ctrlr_disconnect(struct nvme_ctrlr *nvme_ctrlr, nvme_ctrlr_disconnected_cb cb_fn)
 {
@@ -2179,11 +2272,45 @@ nvme_ctrlr_disconnect(struct nvme_ctrlr *nvme_ctrlr, nvme_ctrlr_disconnected_cb 
 		return;
 	}
 
+	/* A second arming would silently drop the callback already recorded and
+	 * strand whichever sequence armed it. This used to be a bare assert(),
+	 * i.e. undefined behaviour in a release build; fail the reset loudly
+	 * instead so the sequence terminates rather than hanging.
+	 */
+	if (nvme_ctrlr->disconnected_cb != NULL) {
+		NVME_CTRLR_ERRLOG(nvme_ctrlr,
+				  "a disconnect callback is already armed; failing this reset.\n");
+		assert(false);
+		bdev_nvme_reset_ctrlr_complete(nvme_ctrlr, false);
+		return;
+	}
+
 	/* spdk_nvme_ctrlr_disconnect() may complete asynchronously later by polling adminq.
 	 * Set callback here to execute the specified operation after ctrlr is really disconnected.
 	 */
-	assert(nvme_ctrlr->disconnected_cb == NULL);
 	nvme_ctrlr->disconnected_cb = cb_fn;
+
+	/* ...but it may also already have completed, synchronously, before we got
+	 * here — a dead transport tears the admin queue down in the same poll that
+	 * detected it. nvme_ctrlr_disconnect_done() then parks the controller in
+	 * NVME_CTRLR_STATE_DISCONNECTED with NVME_TIMEOUT_INFINITE, after which
+	 * spdk_nvme_ctrlr_process_admin_completions() no longer returns an error,
+	 * so bdev_nvme_poll_adminq() — the only caller of disconnected_cb — never
+	 * fires it. The reset then sits in `resetting` forever: every bound we
+	 * have (ctrlr_loss_timeout, fast_io_fail, the destruct decision) is
+	 * evaluated only on reset completion, and nothing watches reset duration.
+	 * That stranded a remote JM controller for 35 minutes on 2026-08-25 while
+	 * its bdev's I/O requeued once a second, because nvme_ctrlr_is_failed()
+	 * reports false for a controller that is merely `resetting`.
+	 *
+	 * If the edge has already passed, run the callback ourselves.
+	 */
+	if (spdk_nvme_ctrlr_is_disconnected(nvme_ctrlr->ctrlr)) {
+		NVME_CTRLR_INFOLOG(nvme_ctrlr,
+				   "ctrlr was already disconnected; running the callback directly.\n");
+		spdk_thread_send_msg(nvme_ctrlr->thread, bdev_nvme_run_disconnected_cb, nvme_ctrlr);
+		return;
+	}
 
 	/* During disconnection, reduce the period to poll adminq more often. */
 	bdev_nvme_change_adminq_poll_period(nvme_ctrlr, 0);
@@ -3483,7 +3610,6 @@ bdev_nvme_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_i
 		 */
 		nbdev_io->submit_tsc = spdk_get_ticks();
 	}
-
 	spdk_trace_record(TRACE_BDEV_NVME_IO_START, 0, 0, (uintptr_t)nbdev_io, (uintptr_t)bdev_io);
 	nbdev_io->io_path = bdev_nvme_find_io_path(nbdev_ch);
 	if (spdk_unlikely(!nbdev_io->io_path)) {
