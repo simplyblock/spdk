@@ -5111,11 +5111,16 @@ xfer_wait_outstanding_io(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req **
 			if (xfer->outstanding_io == 0) {
 				xfer->lvol->transfer_status = XFER_FAILED;
 				xfer->state = XFER_STATE_FAILED;
-			} else {
-				// print current outstanding io timeout error
-				SPDK_ERRLOG("Task transfer timeout with outstanding io %u\n", xfer->outstanding_io);
+				return 0;
 			}
-			return 0;
+			/*
+			 * Outstanding completions still dereference xfer->reqs and xfer->pdus,
+			 * which destroy_xfer_task frees, so a stall must not be reported to the
+			 * caller as a finished drain. Advancing the stall clock keeps this to one
+			 * report per timeout window rather than one per poller tick.
+			 */
+			SPDK_ERRLOG("Task transfer timeout with outstanding io %u\n", xfer->outstanding_io);
+			xfer->timeout = current_time;
 		}
 		return -1;
 	}
@@ -5156,6 +5161,8 @@ xfer_status_check(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req **preq, u
 				xfer->state = XFER_STATE_FAILED;
 			} else {
 				xfer->timeout_cnt++;
+				/* restart the window, so three strikes span 3 x 8 s rather than three poller ticks */
+				xfer->timeout = current_time;
 				if (xfer->timeout_cnt == 1) {
 					SPDK_ERRLOG("S3 transfer timeout with outstanding io %u, state %d\n", xfer->outstanding_io, xfer->state);
 				}
@@ -5314,15 +5321,14 @@ xfer_replication(struct spdk_lvs_xfer *xfer) {
 
 		case XFER_STATE_FAILED:
 			// should not come here
-			SPDK_ERRLOG("transfer task failed: -----\n");
 			if (xfer->outstanding_io != 0) {
 				//wait until all io done or timeout
-				SPDK_ERRLOG("transfer task failed: ----- but still have outstanding io %d\n", xfer->outstanding_io);
 				rc = xfer_wait_outstanding_io(xfer, &req);
 				if (rc != 0) {
 					return 0;
 				}
 			}
+			SPDK_ERRLOG("transfer task failed: -----\n");
 			destroy_xfer_task(xfer);
 			return 0;
 		default:
@@ -5440,15 +5446,14 @@ xfer_migration(struct spdk_lvs_xfer *xfer) {
 			return 0;
 		case XFER_STATE_FAILED:
 			// should not come here
-			SPDK_ERRLOG("transfer task failed: -----\n");
 			if (xfer->outstanding_io != 0) {
 				//wait until all io done or timeout
-				SPDK_ERRLOG("transfer task failed: ----- but still have outstanding io %d\n", xfer->outstanding_io);
 				rc = xfer_wait_outstanding_io(xfer, &req);
 				if (rc != 0) {
 					return 0;
 				}
 			}
+			SPDK_ERRLOG("transfer task failed: -----\n");
 			destroy_xfer_task(xfer);
 			return 0;
 		default:
@@ -5641,15 +5646,14 @@ xfer_s3_backup(struct spdk_lvs_xfer *xfer) {
 
 		case XFER_STATE_FAILED:
 			// should not come here
-			SPDK_ERRLOG("S3 transfer task failed: -----\n");
 			if (xfer->outstanding_io != 0) {
 				//wait until all io done or timeout
-				SPDK_ERRLOG("S3 transfer task failed: ----- but still have outstanding io %d\n", xfer->outstanding_io);
 				rc = xfer_wait_outstanding_io(xfer, &req);
 				if (rc != 0) {
 					return 0;
 				}
 			}
+			SPDK_ERRLOG("S3 transfer task failed: -----\n");
 			destroy_xfer_task(xfer);
 			return 0;
 	
@@ -6032,15 +6036,14 @@ xfer_s3_merge(struct spdk_lvs_xfer *xfer) {
 
 		case XFER_STATE_FAILED:
 			// should not come here
-			SPDK_ERRLOG("S3 transfer task failed: -----\n");
 			if (xfer->outstanding_io != 0) {
 				//wait until all io done or timeout
-				SPDK_ERRLOG("S3 transfer task failed: ----- but still have outstanding io %d\n", xfer->outstanding_io);
 				rc = xfer_wait_outstanding_io(xfer, &req);
 				if (rc != 0) {
 					return 0;
 				}
 			}
+			SPDK_ERRLOG("S3 transfer task failed: -----\n");
 			destroy_xfer_task(xfer);
 			return 0;
 
@@ -6216,15 +6219,14 @@ xfer_s3_recovery(struct spdk_lvs_xfer *xfer) {
 
 		case XFER_STATE_FAILED:
 			// should not come here
-			SPDK_ERRLOG("S3 transfer task failed: -----\n");
 			if (xfer->outstanding_io != 0) {
 				//wait until all io done or timeout
-				SPDK_ERRLOG("S3 transfer task failed: ----- but still have outstanding io %d\n", xfer->outstanding_io);
 				rc = xfer_wait_outstanding_io(xfer, &req);
 				if (rc != 0) {
 					return 0;
 				}
 			}
+			SPDK_ERRLOG("S3 transfer task failed: -----\n");
 			destroy_xfer_task(xfer);
 			return 0;
 
