@@ -3473,7 +3473,6 @@ rpc_bdev_lvol_s3_recovery(struct spdk_jsonrpc_request *request,
 	struct rpc_bdev_lvol_s3_recovery req = {};
 	struct spdk_lvol *lvol;
 	struct spdk_bdev *lvol_bdev;
-	/* Sized to the decoder's own bound; see the note in s3_backup. */
 	uint32_t s3_ids_chain[RPC_MAX_S3_IDS];
 	int rc = 0;
 
