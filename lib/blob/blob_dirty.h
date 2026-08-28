@@ -52,6 +52,12 @@ struct blob_dirty_cluster {
 struct blob_dirty_gen {
 	uint64_t	gen_id;
 	bool		complete;
+	/* One reference for the owning blob plus one per in-flight transfer
+	 * that captured this generation. The family-cap GC in
+	 * bs_snapshot_origblob_sync_cpl drops the blob's reference while a
+	 * replication task may still be walking the bitmaps, so the last
+	 * holder -- not the blob -- is what actually destroys it. */
+	int		refcnt;
 	uint32_t	cluster_sz;
 	uint32_t	bits_per_cluster;
 	uint32_t	words_per_cluster;
@@ -62,6 +68,9 @@ struct blob_dirty_gen {
 };
 
 struct blob_dirty_gen *blob_dirty_gen_create(uint32_t cluster_sz);
+
+/* Drop the caller's reference; the generation is destroyed when the last one
+ * goes away. Named _free because the owning blob is the common caller. */
 void blob_dirty_gen_free(struct blob_dirty_gen *gen);
 
 /* Something happened this generation cannot represent (e.g. a cluster-freeing

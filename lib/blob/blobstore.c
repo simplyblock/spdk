@@ -2950,6 +2950,11 @@ blob_resize_secondary(struct spdk_blob *blob, uint64_t sz)
 		}
 	}
 
+	/* Same rule as blob_resize(): a shrink is not expressible as a delta. */
+	if (sz < blob->active.num_clusters) {
+		blob_dirty_gen_invalidate(blob->dirty_gen);
+	}
+
 	blob->active.num_clusters = sz;
 	blob->active.num_extent_pages = new_num_ep;
 	
@@ -3068,6 +3073,18 @@ blob_resize(struct spdk_blob *blob, uint64_t sz)
 		if (blob->active.clusters[i] != 0) {
 			blob->active.num_allocated_clusters--;
 		}
+	}
+
+	/* A SHRINK drops clusters out of the blob's map exactly like a
+	 * cluster-freeing unmap does, and a dirty generation cannot express
+	 * "this cluster is gone": a delta built on it would leave the stale
+	 * pre-shrink content on the destination, and a later re-grow would
+	 * reallocate the cluster from the parent with only the new writes
+	 * marked. Growing is safe (the added clusters are unallocated, and the
+	 * transfer only ever visits allocated ones), so only shrinking gives
+	 * up the generation. */
+	if (sz < blob->active.num_clusters) {
+		blob_dirty_gen_invalidate(blob->dirty_gen);
 	}
 
 	blob->active.num_clusters = sz;
@@ -7140,7 +7157,12 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 		cb_fn(cb_arg, NULL, -EINVAL);
 		return;
 	}
-	bs_opts_print(o);
+	/* `o` is optional -- NULL means "use the defaults", which the block
+	 * below relies on. Printing it unconditionally dereferenced NULL and
+	 * crashed every caller that passed no opts. */
+	if (o != NULL) {
+		bs_opts_print(o);
+	}
 	spdk_bs_opts_init(&opts, sizeof(opts));
 	if (o) {
 		if (bs_opts_copy(o, &opts)) {
@@ -8553,7 +8575,18 @@ bs_snapshot_freeze_cpl(void *cb_arg, int rc)
 		return;
 	}
 
-	ctx->frozen = true;
+	/* This path does NOT take the freeze itself -- bs_snapshot_newblob_open_cpl
+	 * calls us directly rather than through blob_freeze_io, because the caller
+	 * is required to already hold one (spdk_lvol_create_snapshot takes it via
+	 * spdk_snapshot_freeze_blob, and a consistency group holds one across all
+	 * its members). The cleanup path unfreezes whatever `frozen` claims, so
+	 * claiming a freeze we never had made blob_unfreeze_io decrement a zero
+	 * refcount. frozen_refcnt is a uint32_t and the assert guarding it is
+	 * compiled out by -DNDEBUG, so it wrapped to ~0u and the blob looked
+	 * frozen for ever: every subsequent write was queued and never executed
+	 * or completed -- silent data loss, and a dirty generation that reported
+	 * no writes at all. Only release a freeze that actually exists. */
+	ctx->frozen = (origblob->frozen_refcnt > 0);
 
 	if (blob_is_esnap_clone(origblob)) {
 		/* Clean up any channels associated with the original blob id because future IO will

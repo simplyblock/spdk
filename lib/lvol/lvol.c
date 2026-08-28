@@ -5119,6 +5119,9 @@ destroy_xfer_task_tmo(void *arg) {
 		free(xfer->old_clusters);
 	if (xfer->ranges)
 		free(xfer->ranges);
+	/* release the pinned dirty generation (no-op when NULL) */
+	spdk_blob_dirty_gen_unref(xfer->dirty_gen);
+	xfer->dirty_gen = NULL;
 	free(xfer);
 	return -1;
 }
@@ -7131,6 +7134,11 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
 					      sizeof(struct blob_dirty_range));
 			if (task->ranges != NULL) {
 				task->dirty_gen = gen;
+				/* Pin it: the family cap in the blob layer frees
+				 * generations older than the two newest
+				 * snapshots, and this task walks the bitmaps
+				 * across many poller ticks. */
+				spdk_blob_dirty_gen_ref(gen);
 				task->allow_partial = true;
 				SPDK_NOTICELOG("Transfer lvol %s: dirty-bitmap partial transfer "
 					       "(gen %" PRIu64 ", %" PRIu64 " tracked clusters, "

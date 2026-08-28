@@ -519,6 +519,11 @@ struct blob_dirty_range {
 };
 
 struct blob_dirty_gen *spdk_blob_get_dirty_gen(struct spdk_blob *blob);
+/* Pin a generation for the lifetime of a transfer task. The snapshot family
+ * cap frees generations older than the two newest snapshots, so a task that
+ * keeps a raw pointer across ticks MUST hold a reference. */
+void spdk_blob_dirty_gen_ref(struct blob_dirty_gen *gen);
+void spdk_blob_dirty_gen_unref(struct blob_dirty_gen *gen);
 bool spdk_blob_dirty_gen_complete(const struct blob_dirty_gen *gen);
 uint64_t spdk_blob_dirty_gen_id(const struct blob_dirty_gen *gen);
 uint64_t spdk_blob_dirty_gen_tracked(const struct blob_dirty_gen *gen);

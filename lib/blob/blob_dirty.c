@@ -23,6 +23,7 @@ blob_dirty_gen_create(uint32_t cluster_sz)
 
 	gen->gen_id = __atomic_add_fetch(&g_blob_dirty_gen_counter, 1, __ATOMIC_SEQ_CST);
 	gen->complete = true;
+	gen->refcnt = 1;	/* the owning blob */
 	gen->cluster_sz = cluster_sz;
 	gen->bits_per_cluster = cluster_sz / BLOB_DIRTY_BLOCK_SZ;
 	gen->words_per_cluster = (gen->bits_per_cluster + 63) / 64;
@@ -40,6 +41,10 @@ blob_dirty_gen_free(struct blob_dirty_gen *gen)
 	uint32_t i;
 
 	if (gen == NULL) {
+		return;
+	}
+	if (__atomic_sub_fetch(&gen->refcnt, 1, __ATOMIC_SEQ_CST) > 0) {
+		/* an in-flight transfer still reads these bitmaps */
 		return;
 	}
 	for (i = 0; i < BLOB_DIRTY_HASH_BUCKETS; i++) {
@@ -185,6 +190,24 @@ bool
 spdk_blob_dirty_gen_complete(const struct blob_dirty_gen *gen)
 {
 	return gen != NULL && __atomic_load_n(&gen->complete, __ATOMIC_SEQ_CST);
+}
+
+/* A transfer task pins the generation it captured: the snapshot family cap
+ * may drop the blob's reference (and NULL the blob's pointer) at any later
+ * snapshot, and the task would otherwise walk freed bitmaps. */
+void
+spdk_blob_dirty_gen_ref(struct blob_dirty_gen *gen)
+{
+	if (gen == NULL) {
+		return;
+	}
+	__atomic_add_fetch(&gen->refcnt, 1, __ATOMIC_SEQ_CST);
+}
+
+void
+spdk_blob_dirty_gen_unref(struct blob_dirty_gen *gen)
+{
+	blob_dirty_gen_free(gen);
 }
 
 uint64_t
