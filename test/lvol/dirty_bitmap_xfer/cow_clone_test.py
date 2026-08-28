@@ -32,9 +32,16 @@ This test exercises exactly that shape:
           is always safe, whereas honouring a stale generation would silently
           drop whatever it failed to record.
 
-Cases A and B deliberately include a delta cluster that was UNALLOCATED in the
-parent, so the COW fill is exercised against real parent data and against a
-hole.
+  case D  the control plane's OWN sequence: it does not create the landing
+          volume with bdev_lvol_clone (it needs add_lvol_ha for the HA pair and
+          the internal=True admission bypass), it creates a fresh volume and
+          attaches the parent with bdev_lvol_add_clone before transferring.
+          That has to end up with the same COW parent, so this asserts the
+          resulting parentage explicitly and not just the bytes.
+
+Cases A, B and D deliberately include a delta cluster that was UNALLOCATED in
+the parent, so the COW fill is exercised against real parent data and against
+a hole.
 
 Run as root (kernel nvme-tcp initiator + hugepages). See cow_clone_run.sh.
 """
@@ -61,6 +68,7 @@ PORT_L2 = "4473"
 PORT_L3 = "4474"
 PORT_L4 = "4475"
 PORT_B = "4476"
+PORT_L5 = "4477"
 
 MIB = 1024 * 1024
 CLUSTER_MIB = CLUSTER_SZ // MIB          # 2
@@ -307,10 +315,69 @@ def main():
         compare(dev_b, dev_l4, "case C (invalidated -> full fallback)",
                 mib=VOLB_MIB)
 
+        # ---------------------------------------------------------------- case D
+        print()
+        print("=== CASE D: the control plane's own sequence -- fresh landing "
+              "volume, then bdev_lvol_add_clone, then the partial transfer")
+        # The control plane does NOT create the landing volume with
+        # bdev_lvol_clone: it keeps add_lvol_ha (which it needs for the HA pair
+        # and the internal=True admission bypass) and attaches the parent
+        # afterwards with bdev_lvol_add_clone. That has to establish the same
+        # COW parent, or a partial transfer into it loses everything outside
+        # the delta -- so assert the parentage explicitly, not just the bytes.
+        dd_8k(dev_a, 6, 0)
+        dd_8k(dev_a, 60, 1)     # a hole in the parent again
+        sh("sync")
+        rpc(SOCK_A, "bdev_lvol_snapshot",
+            {"lvol_name": "lvsA/volA", "snapshot_name": "S5"})
+        info5 = rpc(SOCK_A, "bdev_lvol_dirty_bitmap_info", {"lvol_name": "lvsA/S5"})
+        print(f"    S5 dirty info: {info5}")
+        assert info5["complete"], info5
+
+        rpc(SOCK_B, "bdev_lvol_create",
+            {"lvol_name": "land5", "size_in_mib": VOL_MIB, "lvs_name": "lvsB",
+             "thin_provision": True})
+        # Exactly the JSON the control plane sends. Note rpc_client.py's
+        # bdev_lvol_add_clone(lvol_name, parent_snapshot_name) SWAPS its two
+        # arguments on the way out: the RPC's "lvol_name" is the PARENT and its
+        # "child_name" is the volume being chained under it. Sending them the
+        # other way round fails with EPERM, because it tries to make the
+        # read-only predecessor snapshot into somebody's child.
+        rpc(SOCK_B, "bdev_lvol_add_clone", {"lvol_name": "lvsB/land3",
+                                            "child_name": "lvsB/land5"})
+
+        for name in ("land5", "land3"):
+            b = rpc(SOCK_B, "bdev_get_bdevs", {"name": f"lvsB/{name}"})[0]
+            lv = b.get("driver_specific", {}).get("lvol", {})
+            print(f"    {name}: clone={lv.get('clone')} snapshot={lv.get('snapshot')} "
+                  f"base_snapshot={lv.get('base_snapshot')}")
+        land5 = rpc(SOCK_B, "bdev_get_bdevs", {"name": "lvsB/land5"})[0]
+        land5_lvol = land5.get("driver_specific", {}).get("lvol", {})
+        assert land5_lvol.get("base_snapshot") == "land3", (
+            "bdev_lvol_add_clone(landing, predecessor) did NOT make the landing "
+            "volume a clone of the predecessor -- its base_snapshot is "
+            f"{land5_lvol.get('base_snapshot')!r}. The landing volume has no COW "
+            "parent, so a partial transfer into it would silently lose every "
+            "cluster outside the delta.")
+
+        mid5 = map_id_of(SOCK_B, "lvsB", "land5")
+        nqn_l5 = nvmf_up(SOCK_B, "ccland5", "lvsB/land5", PORT_L5)
+        dev_l5 = host_connect(nqn_l5, PORT_L5)
+        connected.append(nqn_l5)
+        rpc(SOCK_A, "bdev_lvol_transfer",
+            {"lvol_name": "lvsA/S5", "offset": 0, "cluster_batch": 8,
+             "gateway": "cchubrn1", "operation": "replicate", "lvol_id": mid5,
+             "allow_partial": True})
+        st5 = wait_transfer_done(SOCK_A, "lvsA/S5")
+        print(f"    partial transfer stat: {st5}")
+        assert st5["partial_reqs"] > 0 and st5["full_clusters"] == 0, st5
+        compare(dev_a, dev_l5, "case D (control-plane add_clone sequence)")
+
         print()
         print("=== PASS: a partial transfer onto a COW clone is byte-exact; the "
-              "full-transfer fallback is byte-exact; and an invalidated "
-              "generation refuses to go partial at all")
+              "full-transfer fallback is byte-exact; an invalidated "
+              "generation refuses to go partial at all; and the control "
+              "plane's add_clone sequence produces the same COW parent")
     except BaseException as e:
         fail = e
     finally:
