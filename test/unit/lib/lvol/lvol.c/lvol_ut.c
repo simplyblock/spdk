@@ -14,6 +14,25 @@
 #include "common/lib/ut_multithread.c"
 #include "lvol/lvol.c"
 
+/* lvol.c calls into the dirty-bitmap module and the fork's blobstore freeze
+ * probe. blob_dirty.c is self-contained, so link the real code (the transfer
+ * tests need the real coalescing); spdk_blob_get_dirty_gen lives in
+ * blobstore.c, which is not part of this binary, and the freeze probe is a
+ * no-op here (no in-flight IO in unit tests). */
+#include "blob/blob_dirty.c"
+struct blob_dirty_gen *
+spdk_blob_get_dirty_gen(struct spdk_blob *blob)
+{
+	(void)blob;
+	return NULL;               /* no tracked generation in these tests */
+}
+void
+blob_check_io_inflaight(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	(void)blob;
+	cb_fn(cb_arg, 0);          /* no in-flight IO in these tests */
+}
+
 #define DEV_BUFFER_SIZE (64 * 1024 * 1024)
 #define DEV_BUFFER_BLOCKLEN (4096)
 #define DEV_BUFFER_BLOCKCNT (DEV_BUFFER_SIZE / DEV_BUFFER_BLOCKLEN)

@@ -18,6 +18,7 @@
 #include "blob/request.c"
 #include "blob/zeroes.c"
 #include "blob/blob_bs_dev.c"
+#include "blob/blob_dirty.c"
 #include "esnap_dev.c"
 #define BLOCKLEN DEV_BUFFER_BLOCKLEN
 
@@ -9990,6 +9991,506 @@ blob_set_external_parent(void)
 	CU_ASSERT(g_bserrno == 0);
 }
 
+/* ==========================================================================
+ * Dirty-generation rotation for PARTIAL snapshot replication.
+ *
+ * The control plane applies a partial transfer of snapshot S_N onto a clone
+ * of S_{N-1}'s copy. That is only correct if S_N's dirty generation describes
+ * EXACTLY the writes made since S_{N-1} -- no more, no less -- and reports
+ * itself NOT complete whenever tracking was not continuous. Falling back to a
+ * full copy is always safe; shipping an incomplete delta is silent data
+ * corruption, so every ambiguous case must land on "not complete".
+ * ========================================================================== */
+
+static struct blob_dirty_gen *
+dirty_gen(struct spdk_blob *blob)
+{
+	return spdk_blob_get_dirty_gen(blob);
+}
+
+static uint64_t
+dirty_gen_id(struct spdk_blob *blob)
+{
+	return spdk_blob_dirty_gen_id(dirty_gen(blob));
+}
+
+/* Write one whole 8 KiB dirty-tracking block: block `blk` of cluster
+ * `cluster_idx`. Returns the io_unit offset written. */
+static uint64_t
+dirty_write_blk(struct spdk_blob *blob, struct spdk_io_channel *ch,
+		uint64_t cluster_idx, uint32_t blk, uint8_t val)
+{
+	static uint8_t payload[SPDK_BLOB_DIRTY_BLOCK_SZ];
+	uint32_t iu_sz = spdk_bs_get_io_unit_size(blob->bs);
+	uint64_t iu_per_blk = SPDK_BLOB_DIRTY_BLOCK_SZ / iu_sz;
+	uint64_t iu_per_cluster = spdk_bs_get_cluster_size(blob->bs) / iu_sz;
+	uint64_t off = cluster_idx * iu_per_cluster + (uint64_t)blk * iu_per_blk;
+
+	memset(payload, val, sizeof(payload));
+	spdk_blob_io_write(blob, ch, payload, off, iu_per_blk, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	return off;
+}
+
+/* The fork's spdk_bs_create_snapshot() INHERITS a freeze that its caller must
+ * already hold: bs_snapshot_newblob_open_cpl jumps straight into
+ * bs_snapshot_freeze_cpl instead of going through blob_freeze_io, and the
+ * snapshot cleanup path is what releases it again. The only production caller,
+ * spdk_lvol_create_snapshot, takes that freeze with spdk_snapshot_freeze_blob
+ * first (lib/lvol/lvol.c), so a test that calls spdk_bs_create_snapshot bare is
+ * not exercising the production path at all -- it unbalances frozen_refcnt, and
+ * every write after the snapshot is then queued as "frozen" and never runs.
+ * Snapshot through this helper so the dirty-generation assertions describe the
+ * sequence production actually performs. */
+static void
+dirty_create_snapshot(struct spdk_blob_store *bs, struct spdk_blob *blob)
+{
+	spdk_snapshot_freeze_blob(blob, blob_op_complete, NULL);
+	poll_threads();
+	/* the freeze completion reports the resulting refcount, not zero */
+	CU_ASSERT(g_bserrno > 0);
+
+	spdk_bs_create_snapshot(bs, spdk_blob_get_id(blob), NULL,
+				blob_op_with_id_complete, NULL);
+	poll_threads();
+}
+
+/* A geometry whose cluster is not a multiple of the 8 KiB tracking block
+ * cannot be tracked at all: blob_dirty_gen_create refuses it and every
+ * transfer stays full. Nothing to assert beyond that. */
+static bool
+dirty_trackable(struct spdk_blob_store *bs)
+{
+	return spdk_bs_get_cluster_size(bs) % SPDK_BLOB_DIRTY_BLOCK_SZ == 0 &&
+	       SPDK_BLOB_DIRTY_BLOCK_SZ % spdk_bs_get_io_unit_size(bs) == 0;
+}
+
+static void
+blob_dirty_gen_rotation(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob *blob, *snap1, *snap2;
+	struct spdk_io_channel *ch;
+	struct spdk_blob_opts opts;
+	struct blob_dirty_range r[512];
+	spdk_blob_id blobid, snap1id;
+	uint64_t gen_live, gen_s1;
+
+	if (!dirty_trackable(bs)) {
+		CU_ASSERT(true);
+		return;
+	}
+
+	ch = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(ch != NULL);
+
+	/* A thin blob owns no clusters at open, so it starts a COMPLETE
+	 * generation: every cluster it will ever own has its first write
+	 * tracked from here on. */
+	ut_spdk_blob_opts_init(&opts);
+	opts.num_clusters = 10;
+	opts.thin_provision = true;
+	blob = ut_blob_create_and_open(bs, &opts);
+	blobid = spdk_blob_get_id(blob);
+	SPDK_CU_ASSERT_FATAL(dirty_gen(blob) != NULL);
+	CU_ASSERT(spdk_blob_dirty_gen_complete(dirty_gen(blob)));
+	CU_ASSERT(spdk_blob_dirty_gen_tracked(dirty_gen(blob)) == 0);
+	gen_live = dirty_gen_id(blob);
+
+	/* two writes before the first snapshot, in clusters 1 and 4 */
+	dirty_write_blk(blob, ch, 1, 0, 0xA1);
+	dirty_write_blk(blob, ch, 4, 3, 0xA2);
+	CU_ASSERT(spdk_blob_dirty_gen_tracked(dirty_gen(blob)) == 2);
+	CU_ASSERT(spdk_blob_dirty_gen_bytes(dirty_gen(blob)) ==
+		  2 * (uint64_t)SPDK_BLOB_DIRTY_BLOCK_SZ);
+
+	/* ---- S1: the POPULATED generation must travel to the snapshot ---- */
+	dirty_create_snapshot(bs, blob);
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blobid != SPDK_BLOBID_INVALID);
+	snap1id = g_blobid;
+
+	spdk_bs_open_blob(bs, snap1id, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	snap1 = g_blob;
+
+	/* the SAME generation object, not a brand-new empty one: a fresh
+	 * generation here would report "no writes since the previous
+	 * snapshot" and a partial transfer would ship nothing at all */
+	SPDK_CU_ASSERT_FATAL(dirty_gen(snap1) != NULL);
+	gen_s1 = dirty_gen_id(snap1);
+	CU_ASSERT(gen_s1 == gen_live);
+	CU_ASSERT(spdk_blob_dirty_gen_complete(dirty_gen(snap1)));
+	CU_ASSERT(spdk_blob_dirty_gen_tracked(dirty_gen(snap1)) == 2);
+	CU_ASSERT(spdk_blob_dirty_cluster_ranges(dirty_gen(snap1), 1, r, 512) == 1);
+	CU_ASSERT(r[0].off == 0 && r[0].len == 1);
+	CU_ASSERT(spdk_blob_dirty_cluster_ranges(dirty_gen(snap1), 4, r, 512) == 1);
+	CU_ASSERT(r[0].off == 3 && r[0].len == 1);
+
+	/* the clone continues on a FRESH, empty, complete generation */
+	SPDK_CU_ASSERT_FATAL(dirty_gen(blob) != NULL);
+	CU_ASSERT(dirty_gen_id(blob) != gen_s1);
+	CU_ASSERT(spdk_blob_dirty_gen_complete(dirty_gen(blob)));
+	CU_ASSERT(spdk_blob_dirty_gen_tracked(dirty_gen(blob)) == 0);
+	CU_ASSERT(spdk_blob_dirty_gen_bytes(dirty_gen(blob)) == 0);
+
+	/* ---- S2 must contain ONLY the writes made after S1 ---- */
+	dirty_write_blk(blob, ch, 7, 1, 0xB1);
+	dirty_create_snapshot(bs, blob);
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blobid != SPDK_BLOBID_INVALID);
+
+	spdk_bs_open_blob(bs, g_blobid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	snap2 = g_blob;
+
+	SPDK_CU_ASSERT_FATAL(dirty_gen(snap2) != NULL);
+	CU_ASSERT(dirty_gen_id(snap2) != gen_s1);
+	CU_ASSERT(spdk_blob_dirty_gen_complete(dirty_gen(snap2)));
+	CU_ASSERT(spdk_blob_dirty_gen_tracked(dirty_gen(snap2)) == 1);
+	CU_ASSERT(spdk_blob_dirty_gen_bytes(dirty_gen(snap2)) == SPDK_BLOB_DIRTY_BLOCK_SZ);
+	CU_ASSERT(spdk_blob_dirty_cluster_ranges(dirty_gen(snap2), 7, r, 512) == 1);
+	CU_ASSERT(r[0].off == 1 && r[0].len == 1);
+	/* clusters 1 and 4 belong to S1's delta: they must NOT reappear here,
+	 * and their absence means "send the whole cluster" (-1), never
+	 * "nothing to send" */
+	CU_ASSERT(spdk_blob_dirty_cluster_ranges(dirty_gen(snap2), 1, r, 512) == -1);
+	CU_ASSERT(spdk_blob_dirty_cluster_ranges(dirty_gen(snap2), 4, r, 512) == -1);
+
+	/* S1's generation survives one more snapshot (family cap is live plus
+	 * the two newest snapshots) */
+	CU_ASSERT(dirty_gen(snap1) != NULL);
+
+	/* the clone rotated again */
+	CU_ASSERT(spdk_blob_dirty_gen_tracked(dirty_gen(blob)) == 0);
+	CU_ASSERT(spdk_blob_dirty_gen_complete(dirty_gen(blob)));
+
+	spdk_blob_close(snap2, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	spdk_blob_close(snap1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	g_blob = NULL;
+	spdk_bs_free_io_channel(ch);
+	poll_threads();
+}
+
+/* Loading a blobstore leaves every blob the load discovered holding a
+ * reference of its own, on top of the one the caller takes with
+ * spdk_bs_open_blob. A single close therefore leaves the blob in
+ * bs->open_blobs and the suite's spdk_bs_unload refuses with -EBUSY. Drop
+ * every reference so a test that reloads stays self-contained. */
+static void
+dirty_close_reloaded(struct spdk_blob *blob)
+{
+	uint32_t refs = spdk_blob_get_open_ref(blob);
+
+	CU_ASSERT(refs > 0);
+	/* the blob is freed as the last reference goes, so count first */
+	while (refs-- > 0) {
+		spdk_blob_close(blob, blob_op_complete, NULL);
+		poll_threads();
+		CU_ASSERT(g_bserrno == 0);
+	}
+}
+
+/* A blob LOADED from disk with data has no generation at all, so
+ * spdk_blob_dirty_gen_complete() is false and the transfer stays full. A
+ * reloaded blob that owns NO clusters is content-identical to its parent, so
+ * it legitimately starts a fresh complete generation. */
+static void
+blob_dirty_gen_reload_refuses_partial(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob *blob, *empty;
+	struct spdk_io_channel *ch;
+	struct spdk_blob_opts opts;
+	spdk_blob_id blobid, emptyid;
+
+	if (!dirty_trackable(bs)) {
+		CU_ASSERT(true);
+		return;
+	}
+
+	ch = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(ch != NULL);
+
+	ut_spdk_blob_opts_init(&opts);
+	opts.num_clusters = 6;
+	opts.thin_provision = true;
+	blob = ut_blob_create_and_open(bs, &opts);
+	blobid = spdk_blob_get_id(blob);
+	dirty_write_blk(blob, ch, 2, 0, 0xD1);
+	CU_ASSERT(spdk_blob_dirty_gen_tracked(dirty_gen(blob)) == 1);
+	spdk_blob_sync_md(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	/* a second thin blob that stays empty */
+	ut_spdk_blob_opts_init(&opts);
+	opts.num_clusters = 6;
+	opts.thin_provision = true;
+	empty = ut_blob_create_and_open(bs, &opts);
+	emptyid = spdk_blob_get_id(empty);
+	spdk_blob_close(empty, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	g_blob = NULL;
+	spdk_bs_free_io_channel(ch);
+	poll_threads();
+
+	ut_bs_reload(&bs, NULL);
+
+	/* reloaded WITH data: no generation, partial refused */
+	spdk_bs_open_blob(bs, blobid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	blob = g_blob;
+	CU_ASSERT(spdk_blob_get_num_allocated_clusters(blob) > 0);
+	CU_ASSERT(dirty_gen(blob) == NULL);
+	CU_ASSERT(spdk_blob_dirty_gen_complete(dirty_gen(blob)) == false);
+	dirty_close_reloaded(blob);
+	g_blob = NULL;
+
+	/* reloaded with NO clusters: content == parent, so a fresh generation
+	 * is legitimate and complete */
+	spdk_bs_open_blob(bs, emptyid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	blob = g_blob;
+	CU_ASSERT(spdk_blob_get_num_allocated_clusters(blob) == 0);
+	SPDK_CU_ASSERT_FATAL(dirty_gen(blob) != NULL);
+	CU_ASSERT(spdk_blob_dirty_gen_complete(dirty_gen(blob)));
+	CU_ASSERT(spdk_blob_dirty_gen_tracked(dirty_gen(blob)) == 0);
+	dirty_close_reloaded(blob);
+	g_blob = NULL;
+}
+
+/* A cluster-freeing unmap and a SHRINK both drop clusters out of the blob's
+ * map. Neither is expressible as a delta -- a partial transfer would leave
+ * the stale pre-operation content on the destination -- so both must
+ * invalidate the generation. */
+static void
+blob_dirty_gen_freeing_ops_invalidate(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob *blob;
+	struct spdk_io_channel *ch;
+	struct spdk_blob_opts opts;
+	uint32_t iu_sz, iu_per_cluster;
+
+	if (!dirty_trackable(bs)) {
+		CU_ASSERT(true);
+		return;
+	}
+
+	iu_sz = spdk_bs_get_io_unit_size(bs);
+	iu_per_cluster = spdk_bs_get_cluster_size(bs) / iu_sz;
+
+	ch = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(ch != NULL);
+
+	/* --- cluster-freeing unmap (thin, parentless -> zeroes backing) --- */
+	ut_spdk_blob_opts_init(&opts);
+	opts.num_clusters = 8;
+	opts.thin_provision = true;
+	blob = ut_blob_create_and_open(bs, &opts);
+	dirty_write_blk(blob, ch, 3, 0, 0xE1);
+	SPDK_CU_ASSERT_FATAL(dirty_gen(blob) != NULL);
+	CU_ASSERT(spdk_blob_dirty_gen_complete(dirty_gen(blob)));
+
+	spdk_blob_io_unmap(blob, ch, 3 * (uint64_t)iu_per_cluster, iu_per_cluster,
+			   blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(spdk_blob_get_num_allocated_clusters(blob) == 0);
+	/* the generation survives for accounting, it is just not a delta basis */
+	CU_ASSERT(dirty_gen(blob) != NULL);
+	CU_ASSERT(spdk_blob_dirty_gen_complete(dirty_gen(blob)) == false);
+	ut_blob_close_and_delete(bs, blob);
+
+	/* --- a range unmap INSIDE an allocated cluster IS expressible: the
+	 * blocks now read as zeroes and are marked dirty like any other
+	 * modification, so the generation stays complete --- */
+	ut_spdk_blob_opts_init(&opts);
+	opts.num_clusters = 8;
+	opts.thin_provision = true;
+	blob = ut_blob_create_and_open(bs, &opts);
+	dirty_write_blk(blob, ch, 2, 0, 0xE2);
+	dirty_write_blk(blob, ch, 2, 5, 0xE3);
+	spdk_blob_io_unmap(blob, ch, 2 * (uint64_t)iu_per_cluster, 1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(spdk_blob_get_num_allocated_clusters(blob) == 1);
+	CU_ASSERT(spdk_blob_dirty_gen_complete(dirty_gen(blob)));
+	ut_blob_close_and_delete(bs, blob);
+
+	/* --- SHRINK --- */
+	ut_spdk_blob_opts_init(&opts);
+	opts.num_clusters = 8;
+	opts.thin_provision = true;
+	blob = ut_blob_create_and_open(bs, &opts);
+	dirty_write_blk(blob, ch, 1, 0, 0xE4);
+	SPDK_CU_ASSERT_FATAL(dirty_gen(blob) != NULL);
+	CU_ASSERT(spdk_blob_dirty_gen_complete(dirty_gen(blob)));
+
+	/* growing is safe: the added clusters are unallocated and a transfer
+	 * only ever visits allocated ones */
+	spdk_blob_resize(blob, 12, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(spdk_blob_dirty_gen_complete(dirty_gen(blob)));
+
+	/* shrinking is not */
+	spdk_blob_resize(blob, 4, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(dirty_gen(blob) != NULL);
+	CU_ASSERT(spdk_blob_dirty_gen_complete(dirty_gen(blob)) == false);
+	ut_blob_close_and_delete(bs, blob);
+
+	spdk_bs_free_io_channel(ch);
+	poll_threads();
+}
+
+/* write_zeroes to an UNALLOCATED cluster is the one write shape that could
+ * plausibly short-circuit without allocating (and therefore without
+ * marking). In this fork it does not: the cluster is allocated and the
+ * operation is re-executed through the single tracking point, so the zeroed
+ * blocks are marked dirty and travel in the delta. */
+static void
+blob_dirty_gen_write_zeroes_tracked(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob *blob;
+	struct spdk_io_channel *ch;
+	struct spdk_blob_opts opts;
+	struct blob_dirty_range r[512];
+	uint32_t iu_sz, iu_per_cluster, iu_per_blk;
+
+	if (!dirty_trackable(bs)) {
+		CU_ASSERT(true);
+		return;
+	}
+
+	iu_sz = spdk_bs_get_io_unit_size(bs);
+	iu_per_cluster = spdk_bs_get_cluster_size(bs) / iu_sz;
+	iu_per_blk = SPDK_BLOB_DIRTY_BLOCK_SZ / iu_sz;
+
+	ch = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(ch != NULL);
+
+	ut_spdk_blob_opts_init(&opts);
+	opts.num_clusters = 8;
+	opts.thin_provision = true;
+	blob = ut_blob_create_and_open(bs, &opts);
+	SPDK_CU_ASSERT_FATAL(dirty_gen(blob) != NULL);
+	CU_ASSERT(spdk_blob_get_num_allocated_clusters(blob) == 0);
+
+	spdk_blob_io_write_zeroes(blob, ch, 5 * (uint64_t)iu_per_cluster + iu_per_blk,
+				  iu_per_blk, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	/* the cluster WAS allocated: the write is real and must be tracked */
+	CU_ASSERT(spdk_blob_get_num_allocated_clusters(blob) == 1);
+	CU_ASSERT(spdk_blob_dirty_gen_complete(dirty_gen(blob)));
+	CU_ASSERT(spdk_blob_dirty_gen_tracked(dirty_gen(blob)) == 1);
+	CU_ASSERT(spdk_blob_dirty_cluster_ranges(dirty_gen(blob), 5, r, 512) == 1);
+	CU_ASSERT(r[0].off == 1 && r[0].len == 1);
+
+	ut_blob_close_and_delete(bs, blob);
+	spdk_bs_free_io_channel(ch);
+	poll_threads();
+}
+
+/* Inflate allocates clusters by COPYING the parent's content, so it changes
+ * nothing an already-synced destination does not already have. It also has to
+ * close and reopen the blob, and a blob reopened with data gets no generation,
+ * so the outcome is that partial transfers are refused afterwards. Either way
+ * inflate can never make a delta look smaller than it is. */
+static void
+blob_dirty_gen_inflate_is_safe(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob *blob;
+	struct spdk_io_channel *ch;
+	struct spdk_blob_opts opts;
+	struct blob_dirty_range r[512];
+	spdk_blob_id blobid;
+
+	if (!dirty_trackable(bs)) {
+		CU_ASSERT(true);
+		return;
+	}
+
+	ch = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(ch != NULL);
+
+	ut_spdk_blob_opts_init(&opts);
+	opts.num_clusters = 5;
+	opts.thin_provision = true;
+	blob = ut_blob_create_and_open(bs, &opts);
+	blobid = spdk_blob_get_id(blob);
+	dirty_write_blk(blob, ch, 0, 0, 0xF1);
+
+	dirty_create_snapshot(bs, blob);
+	CU_ASSERT(g_bserrno == 0);
+
+	/* fresh generation on the clone after the rotation */
+	SPDK_CU_ASSERT_FATAL(dirty_gen(blob) != NULL);
+	CU_ASSERT(spdk_blob_dirty_gen_tracked(dirty_gen(blob)) == 0);
+	dirty_write_blk(blob, ch, 3, 2, 0xF2);
+	CU_ASSERT(spdk_blob_dirty_gen_tracked(dirty_gen(blob)) == 1);
+
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	g_blob = NULL;
+
+	spdk_bs_inflate_blob(bs, ch, blobid, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	spdk_bs_open_blob(bs, blobid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	blob = g_blob;
+
+	/* Inflate allocated every cluster -- and performing it required CLOSING
+	 * the blob. A blob reopened WITH data deliberately gets no generation
+	 * at all (bs_open_blob_cpl only starts a tracking epoch for a writable
+	 * blob that owns no clusters yet), so inflate cannot leave a stale
+	 * generation looking usable: every range query answers -1, "send the
+	 * whole cluster", and the transfer stays full. That is the safe verdict,
+	 * and it is the one that matters -- biasing to a full transfer is always
+	 * correct, whereas an under-reported delta is silent corruption. */
+	CU_ASSERT(spdk_blob_get_num_allocated_clusters(blob) == 5);
+	CU_ASSERT(dirty_gen(blob) == NULL);
+	CU_ASSERT(spdk_blob_dirty_gen_complete(dirty_gen(blob)) == false);
+	CU_ASSERT(spdk_blob_dirty_cluster_ranges(dirty_gen(blob), 3, r, 512) == -1);
+	CU_ASSERT(spdk_blob_dirty_cluster_ranges(dirty_gen(blob), 0, r, 512) == -1);
+
+	ut_blob_close_and_delete(bs, blob);
+	spdk_bs_free_io_channel(ch);
+	poll_threads();
+}
+
 static void
 suite_bs_setup(void)
 {
@@ -10205,6 +10706,12 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite_bs, blob_delete);
 		CU_ADD_TEST(suite_bs, blob_resize_test);
 		CU_ADD_TEST(suite_bs, blob_resize_thin_test);
+		/* dirty-generation rotation for partial snapshot replication */
+		CU_ADD_TEST(suite_bs, blob_dirty_gen_rotation);
+		CU_ADD_TEST(suite_bs, blob_dirty_gen_reload_refuses_partial);
+		CU_ADD_TEST(suite_bs, blob_dirty_gen_freeing_ops_invalidate);
+		CU_ADD_TEST(suite_bs, blob_dirty_gen_write_zeroes_tracked);
+		CU_ADD_TEST(suite_bs, blob_dirty_gen_inflate_is_safe);
 		CU_ADD_TEST(suite, blob_read_only);
 		CU_ADD_TEST(suite_bs, channel_ops);
 		CU_ADD_TEST(suite_bs, blob_super);

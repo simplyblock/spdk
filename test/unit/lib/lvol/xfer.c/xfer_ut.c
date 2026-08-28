@@ -14,22 +14,8 @@
 #include "../lvol.c/lvol_ut.c"
 #undef main
 
-/* The transfer path calls into the dirty-bitmap module and the fork's
- * blobstore freeze probe. blob_dirty.c is self-contained -- link the real
- * code; the freeze probe is stubbed (no in-flight IO in these tests). */
-#include "blob/blob_dirty.c"
-struct blob_dirty_gen *
-spdk_blob_get_dirty_gen(struct spdk_blob *blob)
-{
-	(void)blob;
-	return NULL;               /* no tracked generation in these tests */
-}
-void
-blob_check_io_inflaight(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
-{
-	(void)blob;
-	cb_fn(cb_arg, 0);          /* no in-flight IO in these tests */
-}
+/* blob_dirty.c and the dirty-gen / freeze-probe stubs now come from
+ * lvol_ut.c, which this file includes wholesale. */
 
 static struct spdk_lvol g_xfer_lvol;
 static struct spdk_lvol_store g_xfer_lvs;
