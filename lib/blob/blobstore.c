@@ -11446,7 +11446,7 @@ clone_update_delete_sync_cpl(void *cb_arg, int lvolerrno)
 	}
 
 out:
-	bs_print_snapshot_tree(clone->bs);
+	// bs_print_snapshot_tree(clone->bs);
 	free(ctx);
 }
 
