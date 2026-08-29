@@ -3803,6 +3803,8 @@ spdk_lvs_trigger_leadership_switch(uint64_t *groupid)
 				*groupid = lvs->groupid;
 				lvs->special_send_signal = false;
 				SPDK_NOTICELOG("send special signal Leadership change from management. group id: %" PRIu64 ". \n", lvs->groupid);
+				pthread_mutex_unlock(&g_lvol_stores_mutex);
+				return true;
 			}
 		}
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
