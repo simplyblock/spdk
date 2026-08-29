@@ -599,6 +599,8 @@ void spdk_bs_get_super(struct spdk_blob_store *bs,
  */
 uint64_t spdk_bs_get_cluster_size(struct spdk_blob_store *bs);
 
+void spdk_bs_get_snapshot_tree(struct spdk_blob_store *bs);
+
 /**
  * Get the page size in bytes. This is the write and read granularity of blobs.
  *
