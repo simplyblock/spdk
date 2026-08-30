@@ -54,7 +54,7 @@ DEFINE_STUB_V(spdk_blob_io_read, (struct spdk_blob *blob, struct spdk_io_channel
 DEFINE_STUB_V(spdk_blob_io_write, (struct spdk_blob *blob, struct spdk_io_channel *channel,
 		   void *payload, uint64_t offset, uint64_t length,
 		   spdk_blob_op_complete cb_fn, void *cb_arg));
-DEFINE_STUB_V(prepare_s3_clusters, (struct spdk_blob* blob, uint64_t *clusters, uint32_t num_clusters));
+DEFINE_STUB_V(prepare_s3_clusters, (struct spdk_blob* blob, uint64_t *clusters, uint32_t num_clusters, int *count));
 
 DEFINE_STUB(spdk_bs_for_each_loaded_blob, int,(struct spdk_blob_store *bs,
 			     spdk_bs_loaded_blob_fn fn, void *cb_arg), 0);

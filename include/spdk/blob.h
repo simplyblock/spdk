@@ -483,7 +483,7 @@ void spdk_bs_set_role(struct spdk_blob_store *bs, node_role_t role);
 node_role_t node_role_from_string(const char *str);
 const char *node_role_to_string(node_role_t role);
 void spdk_bs_set_read_only(struct spdk_blob_store *bs, bool state);
-void prepare_s3_clusters(struct spdk_blob* blob, uint64_t *clusters, uint32_t num_clusters);
+void prepare_s3_clusters(struct spdk_blob* blob, uint64_t *clusters, uint32_t num_clusters, int *count);
 bool spdk_blob_get_offset_allocate(struct spdk_blob *blob, uint64_t offset);
 bool spdk_blob_check_offset_valid(struct spdk_blob *blob, uint64_t offset, uint64_t length);
 int spdk_read_cluster_data_xfer(struct spdk_blob *blob, void *buf, uint64_t offset, 

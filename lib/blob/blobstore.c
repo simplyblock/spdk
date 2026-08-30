@@ -15225,15 +15225,18 @@ spdk_read_cluster_data_xfer(struct spdk_blob *blob, void *buf, uint64_t offset, 
 }
 
 void
-prepare_s3_clusters(struct spdk_blob* blob, uint64_t *clusters, uint32_t num_clusters)
+prepare_s3_clusters(struct spdk_blob* blob, uint64_t *clusters, uint32_t num_clusters, int *count)
 {
 	uint64_t i;
+	int fill_cluster_count = 0;
 	/* Copy child snapshot map to base snapshot map (only unallocated clusters in the target snapshot) */
 	for (i = 0; i < blob->active.num_clusters && i < num_clusters; i++) {
 		if (blob->active.clusters[i] != 0 && clusters[i] == 0) {
 			clusters[i] = blob->active.clusters[i];
+			fill_cluster_count++;
 		}
 	}
+	*count = fill_cluster_count;
 }
 
 void
