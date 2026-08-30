@@ -39,6 +39,8 @@ static struct spdk_cpuset *g_helper_set = NULL;
 static TAILQ_HEAD(, spdk_lvs_poll_group) g_lvs_poll_groups = TAILQ_HEAD_INITIALIZER(g_lvs_poll_groups);
 static TAILQ_HEAD(, spdk_lvs_xfer) g_lvs_xfer_tasks = TAILQ_HEAD_INITIALIZER(g_lvs_xfer_tasks);
 static uint32_t g_lvs_num_pgs = 0;
+static uint32_t g_migration_counter = 0;
+static uint32_t g_migration_timer = 0;
 static struct spdk_poller *g_pg_xfer_poller[20] = {NULL};
 static struct spdk_poller *g_xfer_md_poller = NULL;
 
@@ -5202,7 +5204,7 @@ xfer_replication(struct spdk_lvs_xfer *xfer) {
 	{
 		case XFER_STATE_NONE:
 			struct spdk_lvol *lvol = xfer->lvol;
-			prepare_s3_clusters(lvol->blob, xfer->clusters, xfer->num_clusters);
+			prepare_s3_clusters(lvol->blob, xfer->clusters, xfer->num_clusters, &count);
 			xfer->state = XFER_STATE_TRANSFER_CLUSTERS;
 			xfer_fill_queue(xfer, xfer->cluster_batch);
 			if (xfer->lvol->last_offset != 0) {
@@ -5332,8 +5334,7 @@ xfer_replication(struct spdk_lvs_xfer *xfer) {
 
 static int
 xfer_migration(struct spdk_lvs_xfer *xfer) {
-	struct spdk_lvs_xfer_req *req;
-	bool is_allocate = false;
+	struct spdk_lvs_xfer_req *req;	
 	enum xfer_state  next_state;
 	int count = 0, rc, next_cnt;
 
@@ -5341,29 +5342,34 @@ xfer_migration(struct spdk_lvs_xfer *xfer) {
 	{
 		case XFER_STATE_NONE:
 			struct spdk_lvol *lvol = xfer->lvol;
-			prepare_s3_clusters(lvol->blob, xfer->clusters, xfer->num_clusters);
+			prepare_s3_clusters(lvol->blob, xfer->clusters, xfer->num_clusters, &count);
+			SPDK_NOTICELOG("Number clusters %u to migrate and total clusters %" PRIu32 " for lvol %s\n", count, xfer->num_clusters, lvol->name);
 			xfer->state = XFER_STATE_TRANSFER_CLUSTERS;
 			xfer_fill_queue(xfer, xfer->cluster_batch);
 			break;
 
 		case XFER_STATE_TRANSFER_CLUSTERS:
-			is_allocate = false;
 			next_state = xfer->final_step ? XFER_STATE_SIGNAL_TRANSFER : XFER_STATE_DONE;
 			next_cnt = xfer->final_step ? 1 : 0;
-			rc = xfer_status_check(xfer, &req, xfer->idx, next_state, next_cnt);
-			if (rc != 0) {
-				return 0;
-			}
-			
-			// prepare req
-			memset(req->payload, 0, xfer->page_size * 8); // 8 blocks
-			if (xfer->hold_idx < xfer->num_clusters) {
+			while (true) {
+				rc = xfer_status_check(xfer, &req, xfer->idx, next_state, next_cnt);
+				if (rc != 0) {
+					return count;
+				}
+
+				if (xfer->hold_idx >= xfer->num_clusters) {
+					return 0;
+				}
+
+				// prepare req
+				memset(req->payload, 0, xfer->page_size * 8); // 8 blocks
+
 				for (uint32_t i = xfer->hold_idx; i < xfer->num_clusters; i++) {
 					if (xfer->clusters[i] == 0) {
+						xfer->hold_idx = i + 1;
 						continue;
 					}
 
-					is_allocate = true;
 					req->dst_offset = i * xfer->page_per_cluster;
 					if (xfer->lvol->redirect_map_id != 0) {
 						req->dst_offset = ((uint64_t)(xfer->lvol->redirect_map_id) << 48) | req->dst_offset;
@@ -5379,7 +5385,7 @@ xfer_migration(struct spdk_lvs_xfer *xfer) {
 					xfer->hold_idx = i + 1;
 					count++;
 
-					int rc = spdk_read_cluster_data_xfer(xfer->lvol->blob, req->payload,
+					rc = spdk_read_cluster_data_xfer(xfer->lvol->blob, req->payload,
 										req->offset, req->len, xfer->type, read_complete_cb, req);
 					if (rc != 0) {
 						/* read failed synchronously; correct outstanding and recycle req */
@@ -5390,20 +5396,19 @@ xfer_migration(struct spdk_lvs_xfer *xfer) {
 							assert(false);
 						}
 						xfer->state = XFER_STATE_FAILED;
-						return 0;
+						return count;
 					}
-					return count;
+					break;
 				}
 
-				if (!is_allocate) {
-					if (xfer->idx == 0) {
-						// no clusters to send
-						xfer->state = xfer->final_step ?  XFER_STATE_SIGNAL_TRANSFER : XFER_STATE_DONE;
-						xfer_fill_queue(xfer, xfer->cluster_batch);
-						return 0;
-					}
+				if (xfer->idx == 0) {
+					// no clusters to send
+					xfer->state = next_state;
+					xfer_fill_queue(xfer, next_cnt);
+					return count;
 				}
 			}
+
 			break;
 		case XFER_STATE_SIGNAL_TRANSFER:
 			rc = xfer_status_check(xfer, &req, xfer->idx, XFER_STATE_DONE, 0);
@@ -5470,7 +5475,7 @@ xfer_s3_backup(struct spdk_lvs_xfer *xfer) {
 		case XFER_STATE_NONE:
 			if (xfer->idx < xfer->chain_count) {
 				struct spdk_lvol *lvol = xfer->chain[xfer->idx];
-				prepare_s3_clusters(lvol->blob, xfer->clusters, xfer->num_clusters);
+				prepare_s3_clusters(lvol->blob, xfer->clusters, xfer->num_clusters, &count);
 				xfer->idx++;
 				return 0;
 			}
@@ -6253,6 +6258,7 @@ md_xfer_poller(void *cb_arg)
 							continue;
 						} else {
 							count += xfer_migration(sub_xfer);
+							g_migration_counter += count;
 						}
 					}
 					if (sub_count == xfer->num_sub_tasks) {
@@ -6276,6 +6282,15 @@ md_xfer_poller(void *cb_arg)
 				break;
 		}
 	}
+
+	uint64_t current_time = spdk_get_ticks();
+
+	if (g_migration_counter > 0 && (current_time - g_migration_timer > spdk_get_ticks_hz())) {
+		SPDK_NOTICELOG("Number IO per seconds %" PRIu32 "\n", g_migration_counter);
+		g_migration_timer = current_time;
+		g_migration_counter = 0;
+	}
+
     return count ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
 }
 
