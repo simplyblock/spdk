@@ -40,7 +40,7 @@ static TAILQ_HEAD(, spdk_lvs_poll_group) g_lvs_poll_groups = TAILQ_HEAD_INITIALI
 static TAILQ_HEAD(, spdk_lvs_xfer) g_lvs_xfer_tasks = TAILQ_HEAD_INITIALIZER(g_lvs_xfer_tasks);
 static uint32_t g_lvs_num_pgs = 0;
 static uint32_t g_migration_counter = 0;
-static uint32_t g_migration_timer = 0;
+static uint64_t g_migration_timer = 0;
 static struct spdk_poller *g_pg_xfer_poller[20] = {NULL};
 static struct spdk_poller *g_xfer_md_poller = NULL;
 
@@ -6239,7 +6239,8 @@ static int
 md_xfer_poller(void *cb_arg)
 {
 	struct spdk_lvs_xfer *xfer, *tmp;
-	struct spdk_lvs_xfer *sub_xfer;	
+	struct spdk_lvs_xfer *sub_xfer;
+	int migration_count = 0;
 	int count = 0;
 	TAILQ_FOREACH_SAFE(xfer, &g_lvs_xfer_tasks, entry, tmp) {
 		int sub_count = 0;
@@ -6257,8 +6258,9 @@ md_xfer_poller(void *cb_arg)
 							sub_count++;
 							continue;
 						} else {
-							count += xfer_migration(sub_xfer);
-							g_migration_counter += count;
+							migration_count = xfer_migration(sub_xfer);
+							count += migration_count;
+							g_migration_counter += migration_count;
 						}
 					}
 					if (sub_count == xfer->num_sub_tasks) {
@@ -6266,7 +6268,9 @@ md_xfer_poller(void *cb_arg)
 						destroy_parent_xfer_task(xfer);
 					}
 				} else {
-					count += xfer_migration(xfer);
+					migration_count = xfer_migration(xfer);
+					count += migration_count;
+					g_migration_counter += migration_count;
 				}
 				break;
 			case XFER_S3_BACKUP:
@@ -6285,7 +6289,7 @@ md_xfer_poller(void *cb_arg)
 
 	uint64_t current_time = spdk_get_ticks();
 
-	if (g_migration_counter > 0 && (current_time - g_migration_timer > spdk_get_ticks_hz())) {
+	if (g_migration_counter > 0 && (current_time - g_migration_timer >= spdk_get_ticks_hz())) {
 		SPDK_NOTICELOG("Number IO per seconds %" PRIu32 "\n", g_migration_counter);
 		g_migration_timer = current_time;
 		g_migration_counter = 0;
