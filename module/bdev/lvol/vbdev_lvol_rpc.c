@@ -3633,8 +3633,11 @@ rpc_bdev_lvol_s3_backup(struct spdk_jsonrpc_request *request,
 	rc = spdk_lvol_s3_backup(snapshot_chain[0], req.cluster_batch, snapshot_chain,
 				 req.snapshot_names.num, req.s3_id, req.s3_bdev);
 	if (rc < 0) {
-		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
-						 spdk_strerror(-rc));
+		/* The real errno as the JSON-RPC error code (not always
+		 * INVALID_PARAMS) so a caller can distinguish -EBUSY -- the
+		 * target tdev already has another transfer in flight, worth
+		 * retrying -- from every other, non-retryable failure. */
+		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
 		goto cleanup;
 	}
 	spdk_jsonrpc_send_bool_response(request, true);
@@ -3706,8 +3709,7 @@ rpc_bdev_lvol_s3_merge(struct spdk_jsonrpc_request *request,
 
 	rc = spdk_lvol_s3_merge(lvs, req.s3_id, req.old_s3_id, req.cluster_batch, req.s3_bdev);
 	if (rc < 0) {
-		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
-						 spdk_strerror(-rc));
+		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
 		goto cleanup;
 	}
 	spdk_jsonrpc_send_bool_response(request, true);
@@ -3866,8 +3868,7 @@ rpc_bdev_lvol_s3_recovery(struct spdk_jsonrpc_request *request,
 	rc = spdk_lvol_s3_recovery(lvol, req.cluster_batch, s3_ids_chain, req.s3_ids.num,
 				   req.s3_bdev);
 	if (rc < 0) {
-		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
-						 spdk_strerror(-rc));
+		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
 		goto cleanup;
 	}
 	spdk_jsonrpc_send_bool_response(request, true);
