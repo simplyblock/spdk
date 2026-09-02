@@ -253,8 +253,14 @@ struct spdk_lvs_xfer {
 	uint64_t page_size;
 	uint64_t page_per_cluster;
 
-	//related to s3 backup 
+	//related to s3 backup
 	enum xfer_state   state;
+
+	//: The transfer device (S3 bdev) this task is bound to. Used to reject a
+	//: second backup/recovery/merge task against a lvstore's tdev while one is
+	//: already in flight -- concurrent transfers sharing a tdev corrupt the
+	//: shared channel/descriptor state.
+	struct spdk_transfer_dev *tdev;
 
 	struct spdk_lvol  **chain;
 	uint32_t *chain_s3_ids;

@@ -6703,6 +6703,8 @@ spdk_lvol_create_backup_task(struct spdk_lvs_xfer *task, struct spdk_transfer_de
 	struct spdk_lvs_poll_group *lpg;
 	int s_elements_payload = 0;
 
+	task->tdev = tdev;
+
 	s_elements_payload = spdk_bs_get_cluster_size(tdev->lvs->blobstore);
 
 	if (task->type == XFER_MIGRATE_SNAPSHOT) {
@@ -7069,18 +7071,23 @@ spdk_lvol_s3_backup(struct spdk_lvol *lvol, uint32_t cluster_batch,
 	struct spdk_lvs_xfer *xfer, *task;
 	int rc;
 
-	TAILQ_FOREACH(xfer, &g_lvs_xfer_tasks, entry) {
-		if (xfer->s3_id == s3_id) {
-			SPDK_NOTICELOG("The same transfer task already exists.\n");
-			return -EEXIST;
-		}
-	}
-
 	tdev = spdk_find_s3_bdev(lvol->lvol_store, s3_bdev);
 	if (!tdev) {
 		SPDK_ERRLOG("No S3 transfer device named %s on this lvolstore.\n",
 			    s3_bdev ? s3_bdev : "(null)");
 		return -ENODEV;
+	}
+
+	TAILQ_FOREACH(xfer, &g_lvs_xfer_tasks, entry) {
+		if (xfer->s3_id == s3_id) {
+			SPDK_NOTICELOG("The same transfer task already exists.\n");
+			return -EEXIST;
+		}
+		if (xfer->tdev == tdev) {
+			SPDK_NOTICELOG("S3 transfer device %s is busy with another transfer.\n",
+					s3_bdev ? s3_bdev : "(null)");
+			return -EBUSY;
+		}
 	}
 
 	task = calloc(1, sizeof(*task));
@@ -7140,18 +7147,23 @@ spdk_lvol_s3_merge(struct spdk_lvol_store *lvs, uint32_t s3_id, uint32_t old_s3_
 	struct spdk_lvs_xfer *xfer, *task;
 	int rc;
 
-	TAILQ_FOREACH(xfer, &g_lvs_xfer_tasks, entry) {
-		if (xfer->s3_id == s3_id && xfer->old_s3_id == old_s3_id) {
-			SPDK_NOTICELOG("The same transfer task already exists.\n");
-			return -EEXIST;
-		}
-	}
-
 	tdev = spdk_find_s3_bdev(lvs, s3_bdev);
 	if (!tdev) {
 		SPDK_ERRLOG("No S3 transfer device named %s on this lvolstore.\n",
 			    s3_bdev ? s3_bdev : "(null)");
 		return -ENODEV;
+	}
+
+	TAILQ_FOREACH(xfer, &g_lvs_xfer_tasks, entry) {
+		if (xfer->s3_id == s3_id && xfer->old_s3_id == old_s3_id) {
+			SPDK_NOTICELOG("The same transfer task already exists.\n");
+			return -EEXIST;
+		}
+		if (xfer->tdev == tdev) {
+			SPDK_NOTICELOG("S3 transfer device %s is busy with another transfer.\n",
+					s3_bdev ? s3_bdev : "(null)");
+			return -EBUSY;
+		}
 	}
 
 	task = calloc(1, sizeof(*task));
@@ -7191,18 +7203,23 @@ spdk_lvol_s3_recovery(struct spdk_lvol *lvol, uint32_t cluster_batch,
 	struct spdk_lvs_xfer *xfer, *task;
 	int rc;
 
-	TAILQ_FOREACH(xfer, &g_lvs_xfer_tasks, entry) {
-		if (xfer->lvol == lvol) {
-			SPDK_NOTICELOG("The same transfer task already exists.\n");
-			return -EEXIST;
-		}
-	}
-
 	tdev = spdk_find_s3_bdev(lvol->lvol_store, s3_bdev);
 	if (!tdev) {
 		SPDK_ERRLOG("No S3 transfer device named %s on this lvolstore.\n",
 			    s3_bdev ? s3_bdev : "(null)");
 		return -ENODEV;
+	}
+
+	TAILQ_FOREACH(xfer, &g_lvs_xfer_tasks, entry) {
+		if (xfer->lvol == lvol) {
+			SPDK_NOTICELOG("The same transfer task already exists.\n");
+			return -EEXIST;
+		}
+		if (xfer->tdev == tdev) {
+			SPDK_NOTICELOG("S3 transfer device %s is busy with another transfer.\n",
+					s3_bdev ? s3_bdev : "(null)");
+			return -EBUSY;
+		}
 	}
 
 	task = calloc(1, sizeof(*task));

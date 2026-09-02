@@ -3640,6 +3640,133 @@ lvol_set_external_parent(void)
 	g_lvol_store = NULL;
 }
 
+/* --------------------------------------------------------------------------
+ * S3 transfer-device busy guard: bdev_lvol_s3_backup/_recovery/_merge must
+ * reject a second transfer against a lvstore's S3 tdev while one is already
+ * in flight, rather than let two transfers share the tdev's channel state
+ * concurrently (the ext4 chain-restore corruption root cause).
+ *
+ * These fixtures are hand-built (not via spdk_lvs_init/spdk_lvol_create):
+ * the guard under test only reads lvol->lvol_store->transfer_devs and
+ * g_lvs_xfer_tasks, and going further into a real transfer -- which these
+ * functions would do once the guard passes -- immediately divides by
+ * spdk_bs_get_page_size()'s stubbed return of 0 (see DEFINE_STUB above).
+ * That is a pre-existing gap in this harness, not something these tests
+ * attempt to exercise; they only assert the guard's own return value.
+ * -------------------------------------------------------------------- */
+
+static struct spdk_lvol_store *
+ut_s3_alloc_lvs(void)
+{
+	struct spdk_lvol_store *lvs = calloc(1, sizeof(*lvs));
+
+	SPDK_CU_ASSERT_FATAL(lvs != NULL);
+	TAILQ_INIT(&lvs->transfer_devs);
+	return lvs;
+}
+
+static struct spdk_transfer_dev *
+ut_s3_alloc_tdev(struct spdk_lvol_store *lvs, const char *name)
+{
+	struct spdk_transfer_dev *tdev = calloc(1, sizeof(*tdev));
+
+	SPDK_CU_ASSERT_FATAL(tdev != NULL);
+	tdev->is_s3 = true;
+	tdev->lvs = lvs;
+	snprintf(tdev->bdev_name, sizeof(tdev->bdev_name), "%s", name);
+	TAILQ_INSERT_TAIL(&lvs->transfer_devs, tdev, entry);
+	return tdev;
+}
+
+static struct spdk_lvs_xfer *
+ut_s3_mark_busy(struct spdk_transfer_dev *tdev, struct spdk_lvol *lvol, uint32_t s3_id)
+{
+	struct spdk_lvs_xfer *xfer = calloc(1, sizeof(*xfer));
+
+	SPDK_CU_ASSERT_FATAL(xfer != NULL);
+	xfer->tdev = tdev;
+	xfer->lvol = lvol;
+	xfer->s3_id = s3_id;
+	TAILQ_INSERT_TAIL(&g_lvs_xfer_tasks, xfer, entry);
+	return xfer;
+}
+
+static void
+ut_s3_unmark_busy(struct spdk_lvs_xfer *xfer)
+{
+	TAILQ_REMOVE(&g_lvs_xfer_tasks, xfer, entry);
+	free(xfer);
+}
+
+static void
+s3_backup_rejects_busy_tdev(void)
+{
+	struct spdk_lvol_store *lvs = ut_s3_alloc_lvs();
+	struct spdk_transfer_dev *tdev = ut_s3_alloc_tdev(lvs, "s3_dev");
+	struct spdk_lvol lvol = { .lvol_store = lvs };
+	struct spdk_lvol *chain[1] = { &lvol };
+	struct spdk_lvs_xfer *busy;
+	int rc;
+
+	/* A different s3_id than the in-flight one, so the pre-existing
+	 * exact-s3_id guard can't be what rejects this -- only the new tdev
+	 * check can. */
+	busy = ut_s3_mark_busy(tdev, &lvol, 999);
+
+	rc = spdk_lvol_s3_backup(&lvol, 16, chain, 1, 1, "s3_dev");
+	CU_ASSERT(rc == -EBUSY);
+
+	ut_s3_unmark_busy(busy);
+	free(tdev);
+	free(lvs);
+}
+
+static void
+s3_recovery_rejects_busy_tdev(void)
+{
+	struct spdk_lvol_store *lvs = ut_s3_alloc_lvs();
+	struct spdk_transfer_dev *tdev = ut_s3_alloc_tdev(lvs, "s3_dev");
+	struct spdk_lvol lvol = { .lvol_store = lvs };
+	struct spdk_lvol other_lvol = { .lvol_store = lvs };
+	struct spdk_lvs_xfer *busy;
+	uint32_t s3_ids[1] = { 1 };
+	int rc;
+
+	/* A different lvol than the in-flight one, so the pre-existing
+	 * same-lvol guard can't be what rejects this -- only the new tdev
+	 * check can. */
+	busy = ut_s3_mark_busy(tdev, &other_lvol, 999);
+
+	rc = spdk_lvol_s3_recovery(&lvol, 16, s3_ids, 1, "s3_dev");
+	CU_ASSERT(rc == -EBUSY);
+
+	ut_s3_unmark_busy(busy);
+	free(tdev);
+	free(lvs);
+}
+
+static void
+s3_merge_rejects_busy_tdev(void)
+{
+	struct spdk_lvol_store *lvs = ut_s3_alloc_lvs();
+	struct spdk_transfer_dev *tdev = ut_s3_alloc_tdev(lvs, "s3_dev");
+	struct spdk_lvs_xfer *busy;
+	int rc;
+
+	/* A different (s3_id, old_s3_id) pair than the in-flight one, so the
+	 * pre-existing exact-pair guard can't be what rejects this -- only
+	 * the new tdev check can. */
+	busy = ut_s3_mark_busy(tdev, NULL, 999);
+	busy->old_s3_id = 998;
+
+	rc = spdk_lvol_s3_merge(lvs, 1, 2, 16, "s3_dev");
+	CU_ASSERT(rc == -EBUSY);
+
+	ut_s3_unmark_busy(busy);
+	free(tdev);
+	free(lvs);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -3687,6 +3814,9 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, lvol_shallow_copy);
 	CU_ADD_TEST(suite, lvol_set_parent);
 	CU_ADD_TEST(suite, lvol_set_external_parent);
+	CU_ADD_TEST(suite, s3_backup_rejects_busy_tdev);
+	CU_ADD_TEST(suite, s3_recovery_rejects_busy_tdev);
+	CU_ADD_TEST(suite, s3_merge_rejects_busy_tdev);
 
 	allocate_threads(1);
 	set_thread(0);
