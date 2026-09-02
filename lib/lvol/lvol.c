@@ -4350,7 +4350,7 @@ fragment_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 
 	/* if this was the last fragment, do final work and recycle req */
 	if (req->fragments_outstanding == 0) {
-		SPDK_NOTICELOG("3- Remote write I/O src: %" PRIu64 ", dst: %" PRIu64 " len: %" PRIu64 " frag: %d t %p\n", req->offset, req->dst_offset, req->len, req->fragments_outstanding, spdk_get_thread());
+		SPDK_NOTICELOG("3- Remote write I/O src: %" PRIu64 ", dst: %" PRIu64 " len: %" PRIu64 " frag: %d status %d\n", req->offset, req->dst_offset, req->len, req->fragments_outstanding, req->aggregated_status);
 		/* final aggregated status */
 		int st = req->aggregated_status;
 		if (st != 0) {
@@ -4497,6 +4497,8 @@ fragment_read_cb(void *cb_arg, int bserrno)
 
 	if (req->fragments_outstanding == 0) {
 		if (req->aggregated_status != 0) {
+			SPDK_ERRLOG("Local read I/O failed at offset: %" PRIu64 " len: %" PRIu64 "\n",
+								req->offset, req->len);
 			set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
 			return;
 		}
@@ -4559,7 +4561,19 @@ submit_rw_reqs_local(struct spdk_lvs_xfer_req *req)
 			spdk_blob_io_write(xfer->lvol->blob, md_ch, req->payload, req->offset,
 								req->len, local_op_comp, req);
 			break;
+		case REQ_ACTION_WRITE:
+			if (req->xfer->type == XFER_REPLICATE_SNAPSHOT) {
+				rc = spdk_bdev_write_blocks(rmt->desc, rmt->channel,
+					req->payload, req->dst_offset, req->len, complete_op_cb, req);
+			} else {
+				SPDK_ERRLOG("Local I/O failed at offset: %" PRIu64 " len: %" PRIu64 " due to invalid action\n",
+				req->offset, req->len);
+				rc = -EINVAL;
+			}
+			break;
 		default:
+			SPDK_ERRLOG("Local I/O failed at offset: %" PRIu64 " len: %" PRIu64 " due to invalid action\n",
+				req->offset, req->len);
 			rc = -EINVAL;
 			break;
 	}
@@ -4617,7 +4631,7 @@ helper_xfer_poller(void *arg)
 						rc = spdk_bdev_read_blocks(rmt_lvol->desc, rmt_lvol->channel,
 											req->payload, req->dst_offset, req->len, complete_op_cb, req);
 						break;
-					case REQ_ACTION_WRITE:					
+					case REQ_ACTION_WRITE:
 						rc = spdk_bdev_write_blocks(rmt_lvol->desc, rmt_lvol->channel,
 											req->payload, req->dst_offset, req->len, complete_op_cb, req);
 						break;
