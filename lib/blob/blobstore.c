@@ -10314,11 +10314,6 @@ spdk_bs_update_snapshot_clone(struct spdk_blob_store *bs, struct spdk_blob *orig
 	struct spdk_blob *parentblob = NULL;
 	if (newblob->parent_id != SPDK_BLOBID_INVALID) {
 		parentblob = blob_lookup(newblob->bs, newblob->parent_id);
-		if (parentblob) {
-			parentblob->open_ref--;
-			SPDK_NOTICELOG("Check ref on register snap in secondary parentblob 0x%" PRIx64 " "
-						"0x%" PRIx32 " \n", parentblob->id, parentblob->open_ref);
-		}
 	}
 
 	if (newblob->parent_id != origblob->parent_id && origblob->parent_id != SPDK_BLOBID_INVALID) {
@@ -10344,6 +10339,8 @@ spdk_bs_update_snapshot_clone(struct spdk_blob_store *bs, struct spdk_blob *orig
 			if (snapshot_entry && parentblob->open_ref != snapshot_entry->clone_count + 1 ) {
 				parentblob->open_ref = snapshot_entry->clone_count + 1;
 			}
+			SPDK_NOTICELOG("Check ref on register snap in secondary parentblob 0x%" PRIx64 " "
+					"0x%" PRIx32 " \n", parentblob->id, parentblob->open_ref);
 		}
 		return;
 	}
@@ -10352,6 +10349,15 @@ spdk_bs_update_snapshot_clone(struct spdk_blob_store *bs, struct spdk_blob *orig
 	origblob->parent_id = newblob->id;
 	bs_blob_list_add(newblob);
 	bs_blob_list_add(origblob);
+	if (parentblob) {
+		parentblob->open_ref--;
+		snapshot_entry = bs_get_snapshot_entry(bs, parentblob->id);
+		if (snapshot_entry && parentblob->open_ref != snapshot_entry->clone_count + 1 ) {
+			parentblob->open_ref = snapshot_entry->clone_count + 1;
+		}
+		SPDK_NOTICELOG("Check ref on register snap in secondary parentblob 0x%" PRIx64 " "
+					"0x%" PRIx32 " \n", parentblob->id, parentblob->open_ref);
+	}
 	spdk_blob_print_clones(bs, newblob->id, origblob->id);
 	SPDK_NOTICELOG("Check ref on register snap in secondary "
                "origblob 0x%" PRIx64 " 0x%" PRIx32 " "
@@ -11375,7 +11381,6 @@ delete_blob_manually(struct spdk_blob_store *bs, struct spdk_blob *blob, bool si
 	struct spdk_blob_list *clone_entry = NULL, *clone_entry_tmp = NULL;
 	struct spdk_blob *tmp_blob = NULL;
 	uint32_t page_num;
-	uint32_t i;
 
 	if (!single) {
 		tmp_blob = blob_lookup(blob->bs, blob->id);
@@ -11386,6 +11391,8 @@ delete_blob_manually(struct spdk_blob_store *bs, struct spdk_blob *blob, bool si
 			*/
 			spdk_bit_array_clear(blob->bs->open_blobids, blob->id);
 			RB_REMOVE(spdk_blob_tree, &blob->bs->open_blobs, tmp_blob);
+			tmp_blob->back_bs_dev = NULL;
+			blob_free(tmp_blob);
 		}
 	}
 
@@ -11409,37 +11416,43 @@ delete_blob_manually(struct spdk_blob_store *bs, struct spdk_blob *blob, bool si
 	spdk_bit_array_clear(bs->map_blobids, blob->map_id);
 	bs_release_md_page(bs, page_num);
 
-
-	if (single) {
-		for (i = 1; i < blob->active.num_pages; i++) {
-			if (blob->active.pages[i] != 0 && spdk_bit_array_get(bs->used_md_pages, blob->active.pages[i])) {
-				bs_release_md_page(bs, blob->active.pages[i]);
-			}
-		}
-
-		/* Release all clusters that were truncated */
-		for (i = 0; i < blob->active.num_clusters; i++) {
-			uint32_t cluster_num = bs_lba_to_cluster(bs, blob->active.clusters[i]);
-
-			/* Nothing to release if it was not allocated */
-			if (blob->active.clusters[i] != 0 && spdk_bit_pool_is_allocated(bs->used_clusters, cluster_num)) {
-				bs_release_cluster(bs, cluster_num);
-			}
-		}
-
-		/* Release all extent_pages that were truncated */
-		for (i = 0; i < blob->active.num_extent_pages; i++) {
-			/* Nothing to release if it was not allocated */
-			if (blob->active.extent_pages[i] != 0 && spdk_bit_array_get(bs->used_md_pages, blob->active.extent_pages[i])) {
-				bs_release_md_page(bs, blob->active.extent_pages[i]);	
-			}
-		}
-	}
-
 	spdk_spin_unlock(&bs->used_lock);
 
 	blob->back_bs_dev = NULL;
 	blob_free(blob);
+}
+
+static void
+force_delete_blob_manually(struct spdk_blob *blob) {
+	struct spdk_blob *tmp_blob = NULL, *parentblob = NULL;
+	struct spdk_blob_store *bs = blob->bs;
+
+	tmp_blob = blob_lookup(blob->bs, blob->id);
+	if (tmp_blob) {
+		/*
+		* Remove the blob from the blob_store list now, to ensure it does not
+		*  get returned after this point by blob_lookup().
+		*/
+		spdk_bit_array_clear(blob->bs->open_blobids, blob->id);
+		RB_REMOVE(spdk_blob_tree, &blob->bs->open_blobs, tmp_blob);
+		if (tmp_blob->parent_id != SPDK_BLOBID_INVALID && tmp_blob->back_bs_dev != NULL) {
+			parentblob = blob_lookup(blob->bs, tmp_blob->parent_id);
+			if (parentblob) {
+				if (parentblob->open_ref == 1) {
+					/* Free blob_bs_dev */
+					free(tmp_blob->back_bs_dev);
+					tmp_blob->back_bs_dev = NULL;
+				}
+			} else {
+				free(tmp_blob->back_bs_dev);
+				tmp_blob->back_bs_dev = NULL;
+			}
+		}
+		blob_free(tmp_blob);
+	}
+
+	bs_blob_list_remove(blob);
+	delete_blob_manually(bs, blob, true);
 }
 
 int
@@ -11462,19 +11475,9 @@ spdk_bs_delete_blob_non_leader(struct spdk_blob_store *bs, struct spdk_blob *blo
 	/* Check if blob can be removed and if it is a snapshot with clone on top of it */
 	int bserrno = bs_is_blob_deletable(blob, &update_clone);
 	if (bserrno) {
-		SPDK_ERRLOG("Cannot remove blob in state nonleader.\n");
-		blob->back_bs_dev = NULL;
-		blob_free(blob);
-		// delete_blob_manually(bs, blob, true);
-		return -1;
-	}
-
-	if (blob->locked_operation_in_progress) {
-		SPDK_DEBUGLOG(blob, "Cannot remove blob - another operation in progress\n");
-		blob->back_bs_dev = NULL;
-		blob_free(blob);
-		// delete_blob_manually(bs, blob, true);
-		return -EBUSY;
+		SPDK_ERRLOG("Cannot remove blob in state nonleader. force remove it.\n");
+		force_delete_blob_manually(blob);
+		return 0;
 	}
 
 	rc = blob_get_xattr_value(blob, SNAPSHOT_PENDING_REMOVAL, &value, &len, true);
@@ -11502,7 +11505,9 @@ spdk_bs_delete_blob_non_leader(struct spdk_blob_store *bs, struct spdk_blob *blo
 		}
 
 		if (!clone) {
-			SPDK_ERRLOG("The clone for snapshot 0x%" PRIx64 " is missing\n", blob->id);
+			SPDK_ERRLOG("The clone for snapshot 0x%" PRIx64 " is missing. force remove it.\n", blob->id);
+			force_delete_blob_manually(blob);
+			return 0;
 		}
 
 		/* Get snapshot entry for parent snapshot and clone entry within that snapshot for
