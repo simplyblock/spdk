@@ -1803,6 +1803,29 @@ spdk_create_snapshot_freez_cpl(void *cb_arg, int lvolerrno) {
 	req->poller = spdk_poller_register(spdk_lvol_create_snapshot_poller, req, 50000); // Delay of 50ms
 }
 
+static void
+origlvol_update_snapshot_create_cpl(void *cb_arg, int lvolerrno)
+{
+	struct spdk_lvol_with_handle_req *req = cb_arg;
+	struct spdk_lvol *lvol = req->lvol;
+	struct spdk_lvol *origlvol = req->origlvol;
+	struct spdk_lvol_store *lvs = lvol->lvol_store;
+
+	if (lvolerrno < 0) {
+		SPDK_ERRLOG("Could not update origlvol for create snapshot uuid %s name %s .\n", origlvol->unique_id, origlvol->name);
+		spdk_lvol_set_leader_failed_on_update(origlvol);
+		TAILQ_REMOVE(&lvs->pending_lvols, req->lvol, link);
+		lvol_free(lvol);
+		req->cb_fn(req->cb_arg, NULL, ERR_UPDATE_FAILED);
+		free(req);
+		return;
+	}
+
+	SPDK_NOTICELOG("update origlvol for create snapshot uuid %s name %s done.\n", origlvol->unique_id, origlvol->name);
+	spdk_lvol_set_leader(lvol);
+	spdk_snapshot_freeze_blob(req->origlvol->blob, spdk_create_snapshot_freez_cpl, req);
+}
+
 void
 spdk_lvol_create_snapshot(struct spdk_lvol *origlvol, const char *snapshot_name,
 			  spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg)
@@ -1811,6 +1834,7 @@ spdk_lvol_create_snapshot(struct spdk_lvol *origlvol, const char *snapshot_name,
 	struct spdk_lvol *newlvol;
 	struct spdk_blob *origblob;
 	struct spdk_lvol_with_handle_req *req;
+	bool update = false;
 	int rc;
 
 	if (origlvol == NULL) {
@@ -1827,13 +1851,8 @@ spdk_lvol_create_snapshot(struct spdk_lvol *origlvol, const char *snapshot_name,
 		return;
 	}
 
-	if (!lvs->leader || !origlvol->leader) {
-		SPDK_ERRLOG("Cannot create snapshot; the lvs/lvol not leader.\n");
-		/* ERR_LEADERSHIP_CHANGED is already negative (-35). Negating it
-		 * here delivered +35, which sailed past the `lvolerrno < 0`
-		 * failure guard in _vbdev_lvol_create_cb and dereferenced the
-		 * NULL lvol (SIGSEGV, run mass_create_delete 2026-07-21, node
-		 * c42f1686). Every other call site passes the macro unnegated. */
+	if (!lvs->leader) {
+		SPDK_ERRLOG("Cannot create snapshot; the lvs not leader.\n");
 		cb_fn(cb_arg, NULL, ERR_LEADERSHIP_CHANGED);
 		return;
 	}
@@ -1863,6 +1882,30 @@ spdk_lvol_create_snapshot(struct spdk_lvol *origlvol, const char *snapshot_name,
 	req->origlvol = origlvol;
 	req->cb_fn = cb_fn;
 	req->cb_arg = cb_arg;
+
+	if (!origlvol->leader) {
+		pthread_mutex_lock(&g_lvol_stores_mutex);
+
+		if (!origlvol->update_in_progress) {
+			origlvol->update_in_progress = true;
+			origlvol->failed_on_update = false;
+			blob_freeze_on_failover(origlvol->blob);
+			update = true;
+		}
+
+		pthread_mutex_unlock(&g_lvol_stores_mutex);
+
+		if (update) {
+			spdk_blob_update_on_failover(origlvol->blob, origlvol_update_snapshot_create_cpl, req);
+			return;
+		}
+
+		SPDK_ERRLOG("Cannot create snapshot; the lvol is not leader, update in progress. try again later\n");
+		lvol_free(req->lvol);
+		free(req);
+		cb_fn(cb_arg, NULL, -EAGAIN);
+		return;
+	}
 
 	spdk_snapshot_freeze_blob(origblob, spdk_create_snapshot_freez_cpl, req);
 }
@@ -2408,8 +2451,8 @@ clone_lvol_update_delete_async_cpl(void *cb_arg, int lvolerrno)
 	struct spdk_lvol *lvol = req->lvol;
 
 	if (lvolerrno < 0) {
-		SPDK_ERRLOG("Could not update clone lvol for async delete uuid %s name %s .\n", clone_lvol->unique_id, clone_lvol->name);
-		clone_lvol->failed_on_update = true;
+		SPDK_ERRLOG("Could not update clone lvol for async delete uuid %s name %s .\n", clone_lvol->unique_id, clone_lvol->name);		
+		spdk_lvol_set_leader_failed_on_update(clone_lvol);
 		req->cb_fn(req->cb_arg, ERR_UPDATE_FAILED);
 		free(req);
 		return;
@@ -2433,7 +2476,7 @@ origlvol_update_delete_async_cpl(void *cb_arg, int lvolerrno)
 
 	if (lvolerrno < 0) {
 		SPDK_ERRLOG("Could not update origlvol for async delete uuid %s name %s .\n", lvol->unique_id, lvol->name);
-		lvol->failed_on_update = true;
+		spdk_lvol_set_leader_failed_on_update(lvol);
 		req->cb_fn(req->cb_arg, ERR_UPDATE_FAILED);
 		free(req);
 		return;
