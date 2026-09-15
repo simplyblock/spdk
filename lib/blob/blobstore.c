@@ -27,6 +27,9 @@
 #include "blob_md_journal.h"
 
 #define BLOB_CRC32C_INITIAL    0xffffffffUL
+#define BLOB_CLEAR_EXTENTS_BATCH_SIZE 500
+#define BS_UPDATE_EXTENT_BATCH_SIZE 2048
+#define BS_UPDATE_SET_MDS_TIME_MS	500
 
 static int bs_register_md_thread(struct spdk_blob_store *bs);
 static int bs_unregister_md_thread(struct spdk_blob_store *bs);
@@ -2304,6 +2307,8 @@ struct spdk_blob_persist_ctx {
 
 	struct spdk_bit_page	*bit_page;
 	uint64_t 			idx_blobids;
+	uint64_t 			idx_extents;
+	int 				rc;
 	spdk_bs_sequence_t		*bit_seq_persist;
 	spdk_bs_sequence_cpl	bit_cb_fn_persist;
 
@@ -2482,29 +2487,116 @@ blob_persist_clear_extents_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrn
 }
 
 static void
-blob_persist_clear_extents(spdk_bs_sequence_t *seq, struct spdk_blob_persist_ctx *ctx)
+blob_persist_clear_extents_partial(spdk_bs_sequence_t *seq, struct spdk_blob_persist_ctx *ctx);
+
+static void
+blob_persist_clear_extents_partial_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
-	struct spdk_blob		*blob = ctx->blob;
-	struct spdk_blob_store		*bs = blob->bs;
-	size_t				i;
-	uint64_t                        lba;
-	uint64_t                        lba_count;
-	spdk_bs_batch_t                 *batch;
+	struct spdk_blob_persist_ctx *ctx = cb_arg;
+	struct spdk_blob *blob = ctx->blob;
 
-	batch = bs_sequence_to_batch(seq, 0, blob_persist_clear_extents_cpl, ctx);
-	lba_count = bs_byte_to_lba(bs, SPDK_BS_PAGE_SIZE);
+	if (bserrno != 0) {
+		SPDK_ERRLOG("Failed to clear extent pages, rc=%d\n", bserrno);
 
-	/* Clear all extent_pages that were truncated */
-	for (i = blob->active.num_extent_pages; i < blob->active.extent_pages_array_size; i++) {
-		/* Nothing to clear if it was not allocated */
-		if (blob->active.extent_pages[i] != 0) {
-			lba = bs_md_page_to_lba(bs, blob->active.extent_pages[i]);
-			bs->w_io++;
-			bs_batch_write_zeroes_dev(batch, lba, lba_count);
+		if (ctx->rc == 0) {
+			ctx->rc = bserrno;
 		}
+
+		/*
+		 * Do not submit additional zero operations after an error.
+		 */
+		blob_persist_clear_extents_cpl(seq, ctx, ctx->rc);
+		return;
 	}
 
+	/*
+	 * idx_extents always points to the next extent-array entry
+	 * that has not yet been inspected.
+	 */
+	if (ctx->idx_extents >= blob->active.extent_pages_array_size) {
+
+		blob_persist_clear_extents_cpl(seq, ctx, ctx->rc);
+		return;
+	}
+
+	/*
+	 * Submit next group of at most 500 zero-write requests.
+	 */
+	blob_persist_clear_extents_partial(seq, ctx);
+}
+
+
+static void
+blob_persist_clear_extents_partial(spdk_bs_sequence_t *seq,
+				   struct spdk_blob_persist_ctx *ctx)
+{
+	struct spdk_blob *blob = ctx->blob;
+	struct spdk_blob_store *bs = blob->bs;
+	spdk_bs_batch_t *batch;
+	uint64_t lba;
+	uint64_t lba_count;
+	uint32_t submitted = 0;
+	uint32_t i;
+
+	batch = bs_sequence_to_batch(seq, 0, blob_persist_clear_extents_partial_cpl, ctx);
+
+	if (batch == NULL) {
+		if (ctx->rc == 0) {
+			ctx->rc = -ENOMEM;
+		}
+
+		blob_persist_clear_extents_cpl(seq, ctx, ctx->rc);
+		return;
+	}
+
+	lba_count = bs_byte_to_lba(bs, SPDK_BS_PAGE_SIZE);
+
+	while (ctx->idx_extents < blob->active.extent_pages_array_size && submitted < BLOB_CLEAR_EXTENTS_BATCH_SIZE) {
+
+		i = ctx->idx_extents;
+		ctx->idx_extents++;
+
+		if (blob->active.extent_pages[i] == 0) {
+			continue;
+		}
+
+		lba = bs_md_page_to_lba(bs, blob->active.extent_pages[i]);
+		bs->w_io++;
+		bs_batch_write_zeroes_dev(batch, lba, lba_count);
+		submitted++;
+	}
+
+	// SPDK_DEBUGLOG(blob,
+	// 	      "Clear extents batch: submitted=%u "
+	// 	      "next_idx=%zu total=%zu\n",
+	// 	      submitted,
+	// 	      ctx->idx_extents,
+	// 	      blob->active.extent_pages_array_size);
+
 	bs_batch_close(batch);
+}
+
+static void
+blob_persist_clear_extents(spdk_bs_sequence_t *seq, struct spdk_blob_persist_ctx *ctx)
+{
+	struct spdk_blob *blob = ctx->blob;
+
+	/*
+	 * Everything before num_extent_pages was retained.
+	 * Start clearing truncated extent-page entries from here.
+	 */
+	ctx->idx_extents = blob->active.num_extent_pages;
+
+	if (ctx->idx_extents >= blob->active.extent_pages_array_size) {
+
+		/*
+		 * Nothing to clear.
+		 */
+		blob_persist_clear_extents_cpl(seq, ctx, 0);
+		return;
+	}
+
+	blob_persist_clear_extents_partial(seq, ctx);
 }
 
 static void
@@ -14083,6 +14175,13 @@ struct spdk_bs_update_failover_ctx {
 	struct spdk_blob		*blob;
 };
 
+enum bs_update_set_mds_stage {
+	BS_UPDATE_SET_MD_PAGES = 0,
+	BS_UPDATE_SET_BLOBIDS,
+	BS_UPDATE_SET_CLUSTERS,
+	BS_UPDATE_SET_DONE,
+};
+
 struct spdk_bs_update_ctx {
 	struct spdk_blob_store		*bs;
 	struct spdk_bs_super_block	*super;
@@ -14099,13 +14198,24 @@ struct spdk_bs_update_ctx {
 	struct spdk_bit_array		*used_clusters;
 
 	struct spdk_bit_array		*used_blobids;
-	uint64_t			new_blobid;
+	uint64_t					new_blobid;
+	enum bs_update_set_mds_stage set_mds_stage;
+
+	uint32_t set_mds_idx;
+	uint32_t set_blobids_idx;
+	uint32_t set_clusters_idx;
+
+	uint64_t extent_page_idx;      /* Next extent page to read */
+	uint32_t extent_batch_count;   /* Number of pages in current batch */
+
+	struct spdk_poller *poller;
 
 	struct spdk_bit_array		*used_md_pages;
 	struct spdk_bit_array		*synnced_used_blobid_pages;
 	bool				failover;
 
 	spdk_bs_sequence_t		*seq;
+	int rc;
 };
 
 static void
@@ -14707,6 +14817,141 @@ bs_update_write_used_md(struct spdk_bs_update_ctx *ctx)
 	bs_write_used_md_on_failover(ctx->seq, ctx, bs_update_write_used_pages_cpl);
 }
 
+static inline bool
+bs_update_set_mds_timeout(uint64_t start_ticks, uint64_t timeout_ticks)
+{
+	return spdk_get_ticks() - start_ticks >= timeout_ticks;
+}
+
+static int
+bs_update_blob_set_mds(void *cb_args) {
+	struct spdk_bs_update_ctx *ctx = cb_args;
+	struct spdk_blob_store *bs = ctx->bs;
+	uint64_t start_ticks;
+	uint64_t timeout_ticks;
+	uint32_t idx;
+
+	start_ticks = spdk_get_ticks();
+
+	timeout_ticks = (spdk_get_ticks_hz() * BS_UPDATE_SET_MDS_TIME_MS) / 1000;
+
+	spdk_spin_lock(&bs->used_lock);
+
+	/*
+	 * Stage 1:
+	 * Merge used metadata pages.
+	 */
+	if (ctx->set_mds_stage == BS_UPDATE_SET_MD_PAGES) {
+
+		idx = spdk_bit_array_find_first_set(ctx->used_md_pages, ctx->set_mds_idx);
+
+		while (idx != UINT32_MAX) {
+
+			spdk_bit_array_set(bs->used_md_pages, idx);
+			/*
+			 * Resume from the next bit on the next iteration/poll.
+			 */
+			if (idx == UINT32_MAX - 1) {
+				ctx->set_mds_idx = UINT32_MAX;
+				break;
+			}
+
+			ctx->set_mds_idx = idx + 1;
+
+			if (bs_update_set_mds_timeout(start_ticks, timeout_ticks)) {
+				spdk_spin_unlock(&bs->used_lock);
+				SPDK_NOTICELOG("out of time BS_UPDATE_SET_MD_PAGES\n");
+				return SPDK_POLLER_BUSY;
+			}
+
+			idx = spdk_bit_array_find_first_set(ctx->used_md_pages, ctx->set_mds_idx);
+		}
+
+		ctx->set_mds_stage = BS_UPDATE_SET_BLOBIDS;
+		ctx->set_blobids_idx = 0;
+	}
+
+	/*
+	 * Stage 2:
+	 * Merge used blob IDs.
+	 */
+	if (ctx->set_mds_stage == BS_UPDATE_SET_BLOBIDS) {
+
+		idx = spdk_bit_array_find_first_set(ctx->used_blobids, ctx->set_blobids_idx);
+
+		while (idx != UINT32_MAX) {
+
+			spdk_bit_array_set(bs->used_blobids, idx);
+
+			if (idx == UINT32_MAX - 1) {
+				ctx->set_blobids_idx = UINT32_MAX;
+				break;
+			}
+
+			ctx->set_blobids_idx = idx + 1;
+
+			if (bs_update_set_mds_timeout(start_ticks, timeout_ticks)) {
+				spdk_spin_unlock(&bs->used_lock);
+				SPDK_NOTICELOG("out of time BS_UPDATE_SET_BLOBIDS\n");
+				return SPDK_POLLER_BUSY;
+			}
+
+			idx = spdk_bit_array_find_first_set(ctx->used_blobids, ctx->set_blobids_idx);
+		}
+
+		ctx->set_mds_stage = BS_UPDATE_SET_CLUSTERS;
+		ctx->set_clusters_idx = 0;
+	}
+
+	/*
+	 * Stage 3:
+	 * Merge allocated clusters.
+	 */
+	if (ctx->set_mds_stage == BS_UPDATE_SET_CLUSTERS) {
+
+		idx = spdk_bit_array_find_first_set(ctx->used_clusters, ctx->set_clusters_idx);
+
+		while (idx != UINT32_MAX) {
+
+			spdk_bit_pool_set_bit_no_update(bs->used_clusters, idx);
+			if (idx == UINT32_MAX - 1) {
+				ctx->set_clusters_idx = UINT32_MAX;
+				break;
+			}
+
+			ctx->set_clusters_idx = idx + 1;
+
+			if (bs_update_set_mds_timeout(start_ticks, timeout_ticks)) {
+				spdk_spin_unlock(&bs->used_lock);
+				SPDK_NOTICELOG("out of time BS_UPDATE_SET_CLUSTERS\n");
+				return SPDK_POLLER_BUSY;
+			}
+
+			idx = spdk_bit_array_find_first_set(ctx->used_clusters, ctx->set_clusters_idx);
+		}
+
+		spdk_bit_pool_update_lowest_free_bit(bs->used_clusters);
+		ctx->set_mds_stage = BS_UPDATE_SET_DONE;
+	}
+
+	spdk_spin_unlock(&bs->used_lock);
+
+	/*
+	 * Everything has been merged.
+	 */
+	if (ctx->set_mds_stage == BS_UPDATE_SET_DONE) {
+		SPDK_NOTICELOG("Finished setting blobstore used metadata, blob IDs and clusters\n");
+		spdk_poller_unregister(&ctx->poller);
+		spdk_bit_array_free(&ctx->used_clusters);
+		spdk_bit_array_free(&ctx->used_md_pages);
+		spdk_bit_array_free(&ctx->used_blobids);
+		bs_update_live_done(ctx, 0);
+		return -1;
+	}
+
+	return SPDK_POLLER_BUSY;
+}
+
 static void
 bs_update_replay_md_chain_cpl(struct spdk_bs_update_ctx *ctx)
 {
@@ -14716,46 +14961,13 @@ bs_update_replay_md_chain_cpl(struct spdk_bs_update_ctx *ctx)
 	ctx->in_page_chain = false;
 	if (!ctx->failover && ctx->new_blobid) {
 		SPDK_NOTICELOG("Update the blobstore for new blob done.\n");
-		//set md pages
-		uint64_t idx = 0;		
-		spdk_spin_lock(&ctx->bs->used_lock);
-
-		do {
-			idx++;
-			idx = spdk_bit_array_find_first_set(ctx->used_md_pages, idx);
-			if (idx != UINT32_MAX && spdk_bit_array_get(ctx->used_md_pages, idx) == true) {
-				spdk_bit_array_set(ctx->bs->used_md_pages, idx);
-			}
-		} while (idx != UINT32_MAX);
-
-		//set blobids
-		idx = 0;
-		do {
-			idx++;
-			idx = spdk_bit_array_find_first_set(ctx->used_blobids, idx);
-			if (idx != UINT32_MAX && spdk_bit_array_get(ctx->used_blobids, idx) == true) {
-				spdk_bit_array_set(ctx->bs->used_blobids, idx);
-			}
-		} while (idx != UINT32_MAX);
-
-		// set cluster
-		idx = 0;
-		do {
-			idx++;
-			idx = spdk_bit_array_find_first_set(ctx->used_clusters, idx);
-			if (idx != UINT32_MAX && spdk_bit_array_get(ctx->used_clusters, idx) == true) {
-				spdk_bit_pool_allocate_specific_bit(ctx->bs->used_clusters, idx);
-			}
-		} while (idx != UINT32_MAX);
-				
-		spdk_spin_unlock(&ctx->bs->used_lock);
-
-		spdk_bit_array_free(&ctx->used_clusters);		
-		spdk_bit_array_free(&ctx->used_md_pages);			
-		spdk_bit_array_free(&ctx->used_blobids);
-		bs_update_live_done(ctx, 0);
+		ctx->set_mds_stage = BS_UPDATE_SET_MD_PAGES;
+		ctx->set_mds_idx = 0;
+		ctx->set_blobids_idx = 0;
+		ctx->set_clusters_idx = 0;
+		ctx->poller = spdk_poller_register(bs_update_blob_set_mds, ctx, 1000); /* 1 ms */
 		return;
-	} 
+	}
 
 	do {
 		ctx->page_index++;
@@ -14809,43 +15021,91 @@ bs_update_replay_md_chain_cpl(struct spdk_bs_update_ctx *ctx)
 }
 
 static void
+bs_update_replay_extent_pages(struct spdk_bs_update_ctx *ctx);
+
+static void
+bs_update_replay_extent_reset(struct spdk_bs_update_ctx *ctx)
+{
+	if (ctx->extent_pages != NULL) {
+		spdk_free(ctx->extent_pages);
+		ctx->extent_pages = NULL;
+	}
+
+	free(ctx->extent_page_num);
+	ctx->extent_page_num = NULL;
+
+	ctx->extent_page_idx = 0;
+	ctx->extent_batch_count = 0;
+	ctx->num_extent_pages = 0;
+}
+
+static void
 bs_update_replay_extent_page_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
 	struct spdk_bs_update_ctx *ctx = cb_arg;
-	uint32_t page_num;
+	uint64_t batch_start;
 	uint64_t i;
+	uint32_t page_num;
 
 	if (bserrno != 0) {
-		SPDK_ERRLOG("Read extent md page failed 2.\n");
+		SPDK_ERRLOG("Read extent md page failed, rc=%d\n", bserrno);
+		bs_update_replay_extent_reset(ctx);
 		bs_update_live_done(ctx, -ENOTCONN);
 		return;
 	}
 
-	for (i = 0; i < ctx->num_extent_pages; i++) {
-		/* Extent pages are only read when present within in chain md.
-		 * Integrity of md is not right if that page was not a valid extent page. */
-		if (bs_load_cur_extent_page_valid(&ctx->extent_pages[i]) != true) {
-			uint64_t lba = bs_md_page_to_lba(ctx->bs, ctx->extent_page_num[i]);
-			SPDK_ERRLOG("Extent page %" PRIu64 " is not valid.\n", lba);
+	if (ctx->rc != 0) {
+		SPDK_ERRLOG("Extent page replay failed, rc=%d\n", ctx->rc);
+		bs_update_replay_extent_reset(ctx);
+		bs_update_live_done(ctx, ctx->rc);
+		return;
+	}
+
+	/*
+	 * extent_page_idx already points to the first page AFTER
+	 * the currently completed batch.
+	 */
+	batch_start = ctx->extent_page_idx - ctx->extent_batch_count;
+
+	/*
+	 * Parse only the pages belonging to this batch.
+	 */
+	for (i = 0; i < ctx->extent_batch_count; i++) {
+		uint64_t global_idx = batch_start + i;
+		/*
+		 * Extent pages are only read when present within
+		 * the chain md. Integrity of md is not right if
+		 * that page was not a valid extent page.
+		 */
+		if (!bs_load_cur_extent_page_valid(&ctx->extent_pages[i])) {
+			uint64_t lba = bs_md_page_to_lba(ctx->bs, ctx->extent_page_num[global_idx]);
+			SPDK_ERRLOG("Extent page %" PRIu64" is not valid.\n", lba);
+			bs_update_replay_extent_reset(ctx);
 			bs_update_live_done(ctx, -EILSEQ);
 			return;
 		}
 
-		page_num = ctx->extent_page_num[i];
+		page_num = ctx->extent_page_num[global_idx];
+
 		spdk_bit_array_set(ctx->used_md_pages, page_num);
+
 		if (bs_update_replay_md_parse_page(ctx, &ctx->extent_pages[i])) {
 			SPDK_ERRLOG("Extent page parsing encountered an error.\n");
+			bs_update_replay_extent_reset(ctx);
 			bs_update_live_done(ctx, -EILSEQ);
 			return;
 		}
 	}
 
-	spdk_free(ctx->extent_pages);
-	free(ctx->extent_page_num);
-	ctx->extent_pages = NULL;
-	ctx->extent_page_num = NULL;
-	ctx->num_extent_pages = 0;
+	/*
+	 * More extent pages remain.
+	 */
+	if (ctx->extent_page_idx < ctx->num_extent_pages) {
+		bs_update_replay_extent_pages(ctx);
+		return;
+	}
 
+	bs_update_replay_extent_reset(ctx);
 	bs_update_replay_md_chain_cpl(ctx);
 }
 
@@ -14853,28 +15113,67 @@ static void
 bs_update_replay_extent_pages(struct spdk_bs_update_ctx *ctx)
 {
 	spdk_bs_batch_t *batch;
+	uint64_t remaining;
+	uint64_t batch_start;
+	uint64_t i;
 	uint32_t page;
 	uint64_t lba;
-	uint64_t i;
+	uint64_t lba_count;
 
-	ctx->extent_pages = spdk_zmalloc(SPDK_BS_PAGE_SIZE * ctx->num_extent_pages, 0,
-					 NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
-	if (!ctx->extent_pages) {
-		SPDK_ERRLOG("Could not allocate buffer for reading the extent pages.\n");
-		bs_update_live_done(ctx, -ENOMEM);
+	/*
+	 * All pages already processed.
+	 */
+	if (ctx->extent_page_idx >= ctx->num_extent_pages) {
+
+		bs_update_replay_extent_reset(ctx);
+		bs_update_replay_md_chain_cpl(ctx);
 		return;
+	}
+
+	batch_start = ctx->extent_page_idx;
+	remaining = ctx->num_extent_pages - ctx->extent_page_idx;
+
+	ctx->extent_batch_count = spdk_min(remaining, (uint64_t)BS_UPDATE_EXTENT_BATCH_SIZE);
+
+	if (ctx->extent_pages == NULL) {
+		ctx->extent_pages = spdk_zmalloc(SPDK_BS_PAGE_SIZE * ctx->extent_batch_count, 0, NULL,
+						 SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+
+		if (ctx->extent_pages == NULL) {
+			SPDK_ERRLOG("Could not allocate buffer for reading extent pages.\n");
+			bs_update_replay_extent_reset(ctx);
+			bs_update_live_done(ctx, -ENOMEM);
+			return;
+		}
 	}
 
 	batch = bs_sequence_to_batch(ctx->seq, 0, bs_update_replay_extent_page_cpl, ctx);
 
-	for (i = 0; i < ctx->num_extent_pages; i++) {
-		page = ctx->extent_page_num[i];
-		assert(page < ctx->super->md_len);
+	lba_count = bs_byte_to_lba(ctx->bs, SPDK_BS_PAGE_SIZE);
+
+	for (i = 0; i < ctx->extent_batch_count; i++) {
+		uint64_t global_idx = batch_start + i;
+		page = ctx->extent_page_num[global_idx];
+		if (page >= ctx->super->md_len) {
+			SPDK_ERRLOG("Invalid extent page %" PRIu32", md_len=%" PRIu32", global_idx=%" PRIu64
+				", num_extent_pages=%" PRIu64 "\n", page, ctx->super->md_len, global_idx, ctx->num_extent_pages);
+			ctx->rc = -EILSEQ;
+			bs_batch_close(batch);
+			return;
+		}
 		lba = bs_md_page_to_lba(ctx->bs, page);
 		ctx->bs->r_io++;
-		bs_batch_read_dev(batch, &ctx->extent_pages[i], lba,
-				  bs_byte_to_lba(ctx->bs, SPDK_BS_PAGE_SIZE));
+		bs_batch_read_dev(batch, &ctx->extent_pages[i], lba, lba_count);
 	}
+
+	/*
+	 * Save resume position BEFORE closing the batch.
+	 *
+	 * When the completion callback runs,
+	 * extent_page_idx points to the next page that
+	 * has not yet been submitted.
+	 */
+	ctx->extent_page_idx += ctx->extent_batch_count;
 
 	bs_batch_close(batch);
 }
@@ -14914,6 +15213,10 @@ bs_update_replay_md_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 				return;
 			}
 			if (ctx->num_extent_pages != 0) {
+				ctx->extent_page_idx = 0;
+				ctx->extent_batch_count = 0;
+				ctx->extent_pages = NULL;
+				ctx->rc = 0;
 				bs_update_replay_extent_pages(ctx);
 				return;
 			}
