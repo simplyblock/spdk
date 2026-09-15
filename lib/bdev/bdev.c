@@ -9779,6 +9779,7 @@ bdev_write_zero_buffer(void *ctx)
 		return;
 	} else {
 		if (spdk_unlikely(rc == -ENOMEM)) {
+			bdev_io->internal.waitq_entry.dep_unblock = true;
 			bdev_queue_io_wait_with_cb(bdev_io, bdev_write_zero_buffer);
 			return;
 		}
