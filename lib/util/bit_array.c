@@ -484,6 +484,21 @@ spdk_bit_pool_allocate_bit(struct spdk_bit_pool *pool)
 		return UINT32_MAX;
 	}
 
+	/*
+	 * spdk_bit_pool_set_bit_no_update() sets bits without moving the cursor,
+	 * so the cursor can lag behind onto a bit that is now allocated -- it can
+	 * only ever be too LOW, never too high. Handing that bit out would give
+	 * the same cluster to two owners, so re-scan instead of trusting it. A
+	 * no-op on the hot path, where the cursor is already clear.
+	 */
+	if (spdk_bit_array_get(pool->array, bit_index)) {
+		bit_index = spdk_bit_array_find_first_clear(pool->array, bit_index);
+		if (bit_index == UINT32_MAX) {
+			pool->lowest_free_bit = UINT32_MAX;
+			return UINT32_MAX;
+		}
+	}
+
 	spdk_bit_array_set(pool->array, bit_index);
 	pool->lowest_free_bit = spdk_bit_array_find_first_clear(pool->array, bit_index);
 	pool->free_count--;
