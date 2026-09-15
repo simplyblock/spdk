@@ -317,6 +317,65 @@ test_mask_clear(void)
 	spdk_bit_array_free(&ba);
 }
 
+/*
+ * spdk_bit_pool_set_bit_no_update() leaves lowest_free_bit behind on purpose,
+ * so a caller that yields mid-batch can expose a pool whose cursor points at a
+ * bit that is now allocated. Handing that bit out gives the same cluster to two
+ * owners -- silent data corruption. The cursor can only ever lag too LOW, never
+ * too high, so allocate_bit must re-scan rather than trust it.
+ */
+static void
+test_bit_pool_stale_lowest_free_bit(void)
+{
+	struct spdk_bit_pool *pool;
+	uint32_t first, second;
+
+	pool = spdk_bit_pool_create(64);
+	SPDK_CU_ASSERT_FATAL(pool != NULL);
+
+	/* The cursor sits on bit 0; claim it without moving the cursor. */
+	CU_ASSERT(spdk_bit_pool_set_bit_no_update(pool, 0) == true);
+	CU_ASSERT(spdk_bit_pool_is_allocated(pool, 0) == true);
+
+	/* An allocation racing the un-repaid cursor must not re-hand out bit 0. */
+	first = spdk_bit_pool_allocate_bit(pool);
+	CU_ASSERT(first != 0);
+	CU_ASSERT(first == 1);
+
+	/* ...and the bit it did hand out must not be handed out again. */
+	second = spdk_bit_pool_allocate_bit(pool);
+	CU_ASSERT(second != first);
+	CU_ASSERT(second == 2);
+
+	/* Explicit repair is idempotent once the cursor is already correct. */
+	spdk_bit_pool_update_lowest_free_bit(pool);
+	CU_ASSERT(spdk_bit_pool_allocate_bit(pool) == 3);
+
+	spdk_bit_pool_free(&pool);
+}
+
+/*
+ * A full pool whose cursor is stale must report exhaustion, not wrap onto an
+ * allocated bit.
+ */
+static void
+test_bit_pool_stale_cursor_when_full(void)
+{
+	struct spdk_bit_pool *pool;
+	uint32_t i;
+
+	pool = spdk_bit_pool_create(8);
+	SPDK_CU_ASSERT_FATAL(pool != NULL);
+
+	for (i = 0; i < 8; i++) {
+		CU_ASSERT(spdk_bit_pool_set_bit_no_update(pool, i) == true);
+	}
+
+	CU_ASSERT(spdk_bit_pool_allocate_bit(pool) == UINT32_MAX);
+
+	spdk_bit_pool_free(&pool);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -335,6 +394,8 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_count);
 	CU_ADD_TEST(suite, test_mask_store_load);
 	CU_ADD_TEST(suite, test_mask_clear);
+	CU_ADD_TEST(suite, test_bit_pool_stale_lowest_free_bit);
+	CU_ADD_TEST(suite, test_bit_pool_stale_cursor_when_full);
 
 
 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
