@@ -14580,6 +14580,18 @@ bs_update_blob_set_mds(void *cb_args) {
 			ctx->set_clusters_idx = idx + 1;
 
 			if (bs_update_set_mds_timeout(start_ticks, timeout_ticks)) {
+				/*
+				 * The bits above were set with set_bit_no_update(), which
+				 * deliberately leaves lowest_free_bit behind. Repay that
+				 * before dropping used_lock: spdk_bit_pool_allocate_bit()
+				 * trusts the cursor without checking the bit is clear, so a
+				 * concurrent bs_claim_cluster() in the gap before this poller
+				 * resumes would hand out a cluster a replayed blob already
+				 * owns. Cheap -- a no-op unless the cursor now points at a
+				 * bit we just set, and paid once per slice rather than once
+				 * per bit, so the point of the batching is preserved.
+				 */
+				spdk_bit_pool_update_lowest_free_bit(bs->used_clusters);
 				spdk_spin_unlock(&bs->used_lock);
 				SPDK_NOTICELOG("out of time BS_UPDATE_SET_CLUSTERS\n");
 				return SPDK_POLLER_BUSY;
