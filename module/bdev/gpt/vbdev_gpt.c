@@ -164,6 +164,7 @@ vbdev_gpt_queue_io(struct gpt_io *io)
 	io->bdev_io_wait.bdev = io->bdev_io->bdev;
 	io->bdev_io_wait.cb_fn = vbdev_gpt_resubmit_request;
 	io->bdev_io_wait.cb_arg = io;
+	io->bdev_io_wait.dep_unblock = true;
 
 	rc = spdk_bdev_queue_io_wait(io->bdev_io->bdev,
 				     ch->part_ch.base_ch, &io->bdev_io_wait);
