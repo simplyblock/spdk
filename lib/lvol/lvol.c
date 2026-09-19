@@ -4607,7 +4607,8 @@ pipelined_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	struct spdk_lvs_xfer_req *req = frag->req;
 
 	if (!success) {
-		SPDK_ERRLOG("Pipelined hub write failed at req offset %" PRIu64 " frag %u\n",
+		SPDK_ERRLOG("Pipelined hub write failed at req offset %" PRIu64 " frag %u
+",
 			    req->offset, frag->idx);
 		req->aggregated_status = -EIO;
 	}
@@ -4631,7 +4632,8 @@ pipelined_read_cb(void *cb_arg, int bserrno)
 	req->reads_outstanding--;
 
 	if (bserrno != 0) {
-		SPDK_ERRLOG("Pipelined read fragment failed at req offset %" PRIu64 " frag %u\n",
+		SPDK_ERRLOG("Pipelined read fragment failed at req offset %" PRIu64 " frag %u
+",
 			    req->offset, frag->idx);
 		req->aggregated_status = -EIO;
 	} else if (req->aggregated_status == 0) {
@@ -4645,7 +4647,8 @@ pipelined_read_cb(void *cb_arg, int bserrno)
 					    req->dst_offset + off_pages, len_pages,
 					    pipelined_write_cb, frag);
 		if (rc != 0) {
-			SPDK_ERRLOG("Pipelined hub write submit failed rc=%d frag %u\n",
+			SPDK_ERRLOG("Pipelined hub write submit failed rc=%d frag %u
+",
 				    rc, frag->idx);
 			req->writes_outstanding--;
 			req->aggregated_status = -EIO;
@@ -7048,7 +7051,8 @@ spdk_lvol_create_backup_task(struct spdk_lvs_xfer *task, struct spdk_transfer_de
 		task->frag_pool = calloc((size_t)task->cluster_batch * nfrags,
 					 sizeof(struct spdk_lvs_xfer_frag));
 		if (!task->frag_pool) {
-			SPDK_ERRLOG("Unable to allocate frag contexts on transfer task\n");
+			SPDK_ERRLOG("Unable to allocate frag contexts on transfer task
+");
 			goto error;
 		}
 		for (int i = 0; i < task->cluster_batch; i++) {
@@ -7216,7 +7220,8 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
 	task->special_io = special_io;
 	if (special_io && allow_partial) {
 		SPDK_NOTICELOG("Transfer lvol %s: special IO works on whole blob "
-			       "clusters only -- ignoring allow_partial\n", lvol->name);
+			       "clusters only -- ignoring allow_partial
+", lvol->name);
 		allow_partial = false;
 	}
 
