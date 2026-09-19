@@ -7813,7 +7813,7 @@ spdk_bs_get_super(struct spdk_blob_store *bs,
 void
 spdk_bs_set_leader(struct spdk_blob_store *bs, bool state)
 {
-	bs->is_leader = state;	
+	bs->is_leader = state;
 }
 
 void
