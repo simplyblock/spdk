@@ -503,28 +503,6 @@ const char *node_role_to_string(node_role_t role);
 void spdk_bs_set_read_only(struct spdk_blob_store *bs, bool state);
 void prepare_s3_clusters(struct spdk_blob* blob, uint64_t *clusters, uint32_t num_clusters, int *count);
 
-/* Metadata-journal introspection and test control (blob_md_journal.h).
- * The stats are a snapshot of the ring as this process sees it. Pausing the
- * drain is a test hook: it lets a workload build up a backlog of
- * acknowledged-but-not-home pages, which is otherwise almost impossible to
- * observe because the drain keeps up with any md rate the blobstore can
- * produce. */
-struct spdk_bs_md_journal_stats {
-	bool		enabled;	/* journal present and intercepting */
-	bool		drain_paused;
-	bool		drain_demoted;	/* drain stopped: not the leader */
-	uint32_t	num_slots;
-	uint32_t	used_slots;
-	uint32_t	mem_head;
-	uint32_t	mem_tail;
-	uint32_t	disk_head;
-	uint32_t	disk_tail;
-};
-
-int spdk_bs_get_md_journal_stats(struct spdk_blob_store *bs,
-				 struct spdk_bs_md_journal_stats *stats);
-int spdk_bs_set_md_journal_drain_paused(struct spdk_blob_store *bs, bool paused);
-
 /* In-memory dirty tracking for partial snapshot replication (lib/blob/blob_dirty.c).
  * A blob's dirty GENERATION records, at 8 KiB granularity, which blocks were
  * written since the blob's epoch began (creation or the last snapshot

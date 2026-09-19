@@ -7986,37 +7986,7 @@ spdk_bs_get_super(struct spdk_blob_store *bs,
 void
 spdk_bs_set_leader(struct spdk_blob_store *bs, bool state)
 {
-	bs->is_leader = state;
-	if (bs->md_journal != NULL) {
-		/* only the leader may drain the shared ring - see
-		 * bs_md_journal_set_leader() */
-		bs_md_journal_set_leader(bs->md_journal, state);
-	}
-}
-
-int
-spdk_bs_get_md_journal_stats(struct spdk_blob_store *bs,
-			     struct spdk_bs_md_journal_stats *stats)
-{
-	memset(stats, 0, sizeof(*stats));
-	if (bs->md_journal == NULL) {
-		return -ENODEV;
-	}
-	bs_md_journal_get_stats(bs->md_journal, &stats->enabled, &stats->num_slots,
-				&stats->used_slots, &stats->mem_head, &stats->mem_tail,
-				&stats->disk_head, &stats->disk_tail,
-				&stats->drain_paused, &stats->drain_demoted);
-	return 0;
-}
-
-int
-spdk_bs_set_md_journal_drain_paused(struct spdk_blob_store *bs, bool paused)
-{
-	if (bs->md_journal == NULL) {
-		return -ENODEV;
-	}
-	bs_md_journal_set_drain_paused(bs->md_journal, paused);
-	return 0;
+	bs->is_leader = state;	
 }
 
 void
@@ -15403,43 +15373,6 @@ bs_update_super_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	bs_update_read_only_used_blobid_pages(ctx);
 }
 
-static void bs_update_live_read_super(struct spdk_bs_update_ctx *ctx);
-
-/* The ring lives on the shared device, the buffer/dictionary that overlays md
- * reads from it does not: it is rebuilt by recovery when the lvstore is
- * LOADED. A peer that loaded the lvstore while another node was the leader
- * therefore holds a snapshot of the ring as of its own load, and the product
- * promotes exactly such a peer (bdev_lvol_update_lvstore + set_leader) rather
- * than loading the lvstore anew. Re-read the ring before re-reading md, so a
- * takeover sees every acknowledged page the dead leader left undrained and
- * appends behind them instead of over them. */
-static void
-bs_update_live_journal_rescan_cpl(void *cb_arg, int bserrno)
-{
-	struct spdk_bs_update_ctx *ctx = cb_arg;
-
-	if (bserrno != 0) {
-		SPDK_ERRLOG("md journal rescan before md reload failed: %d\n", bserrno);
-		ctx->bs->r_io--;
-		bs_update_live_done(ctx, bserrno);
-		return;
-	}
-	ctx->bs->r_io--;
-	bs_update_live_read_super(ctx);
-}
-
-static void
-bs_update_live_read_super(struct spdk_bs_update_ctx *ctx)
-{
-	struct spdk_blob_store *bs = ctx->bs;
-
-	/* Read the super block */
-	bs->r_io++;
-	bs_sequence_read_dev(ctx->seq, ctx->super, bs_page_to_lba(bs, 0),
-			     bs_byte_to_lba(bs, sizeof(*ctx->super)),
-			     bs_update_super_cpl, ctx);
-}
-
 void
 spdk_bs_update_live(struct spdk_blob_store *bs, bool failover, uint64_t id,
 		  spdk_bs_op_complete cb_fn, void *cb_arg)
@@ -15481,15 +15414,11 @@ spdk_bs_update_live(struct spdk_blob_store *bs, bool failover, uint64_t id,
 		return;
 	}
 
-	if (bs->md_journal != NULL && id == 0) {
-		/* whole-store reload (promotion / failover), not the per-blob
-		 * variant of bdev_lvol_register: re-read the ring first */
-		bs->r_io++;
-		bs_md_journal_rescan(bs->md_journal, bs_update_live_journal_rescan_cpl, ctx);
-		return;
-	}
-
-	bs_update_live_read_super(ctx);
+	/* Read the super block */
+	bs->r_io++;
+	bs_sequence_read_dev(ctx->seq, ctx->super, bs_page_to_lba(bs, 0),
+			     bs_byte_to_lba(bs, sizeof(*ctx->super)),
+			     bs_update_super_cpl, ctx);
 }
 
 static void
