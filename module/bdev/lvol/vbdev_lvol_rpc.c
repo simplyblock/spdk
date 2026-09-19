@@ -3752,7 +3752,7 @@ rpc_bdev_lvol_transfer_final_step(struct spdk_jsonrpc_request *request,
 	SPDK_NOTICELOG("Transfering lvol %s in mode %s for final step.\n", req.lvol_name, req.operation);
 
 	rc = spdk_lvol_transfer(lvol, 0, req.cluster_batch, type, tdev, req.snapshot_name, req.lvol_id,
-		 											rpc_bdev_lvol_transfer_final_step_cb, request);
+													rpc_bdev_lvol_transfer_final_step_cb, request);
 	if (rc < 0) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 spdk_strerror(-rc));
