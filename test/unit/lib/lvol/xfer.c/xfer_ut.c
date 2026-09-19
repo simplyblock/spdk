@@ -18,11 +18,12 @@
  * blobstore freeze probe. blob_dirty.c is self-contained -- link the real
  * code; the freeze probe is stubbed (no in-flight IO in these tests). */
 #include "blob/blob_dirty.c"
-void
-blob_check_io_inflaight(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+int blob_check_io_inflaight(struct spdk_blob *blob);
+int
+blob_check_io_inflaight(struct spdk_blob *blob)
 {
 	(void)blob;
-	cb_fn(cb_arg, 0);          /* no in-flight IO in these tests */
+	return 0;
 }
 
 static struct spdk_lvol g_xfer_lvol;
