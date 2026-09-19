@@ -510,6 +510,7 @@ uint32_t spdk_blob_dirty_max_ranges(const struct blob_dirty_gen *gen);
  * cluster), otherwise the number of coalesced ranges written to out. */
 int spdk_blob_dirty_cluster_ranges(struct blob_dirty_gen *gen, uint64_t cluster_idx,
 				   struct blob_dirty_range *out, uint32_t max_out);
+>>>>>>> 19dbcbce0 (blob/lvol: in-memory dirty bitmap for partial snapshot replication)
 bool spdk_blob_get_offset_allocate(struct spdk_blob *blob, uint64_t offset);
 bool spdk_blob_check_offset_valid(struct spdk_blob *blob, uint64_t offset, uint64_t length);
 int spdk_read_cluster_data_xfer(struct spdk_blob *blob, void *buf, uint64_t offset, 
