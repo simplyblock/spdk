@@ -96,6 +96,7 @@ enum spdk_blob_load_status {
 	SPDK_BLOB_UPDATE_NORMAL,
 	SPDK_BLOB_UPDATE_LIVE,
 	SPDK_BLOB_UPDATE_FAILOVER,
+	SPDK_BLOB_LOAD_EXAMINE,
 };
 
 TAILQ_HEAD(spdk_xattr_tailq, spdk_xattr);
@@ -119,6 +120,12 @@ struct spdk_blob {
 	uint8_t		geometry;
 	bool  migration_flag;
 	spdk_blob_id	parent_id;
+
+	/* In-memory dirty tracking for partial replication (blob_dirty.c).
+	 * NULL means "not tracked" (e.g. blob loaded from disk): the transfer
+	 * then falls back to full clusters. Moves to the snapshot at rotation
+	 * (bs_snapshot_swap_cluster_maps), freed in blob_free(). */
+	struct blob_dirty_gen *dirty_gen;
 
 	enum spdk_blob_state		state;
 
@@ -162,6 +169,7 @@ struct spdk_blob {
 	/* Number of data clusters retrieved from extent table,
 	 * that many have to be read from extent pages. */
 	uint64_t	remaining_clusters_in_et;
+	bool 		examine_flag;
 };
 
 struct spdk_blob_store {
@@ -185,6 +193,9 @@ struct spdk_blob_store {
 	int priority_class; // max priority_class of all constituent blobs to speed up metadata I/Os
 
 	struct spdk_bs_dev		*dev;
+	/* torn-write-protection journal owning the top of the base dev;
+	 * bs->dev is its proxy when set (see blob_md_journal.h) */
+	struct spdk_bs_md_journal	*md_journal;
 
 	struct spdk_bit_array		*used_md_pages;		/* Protected by used_lock */
 	struct spdk_bit_pool		*used_clusters;		/* Protected by used_lock */
@@ -476,7 +487,13 @@ struct spdk_bs_super_block {
 	uint64_t	size; /* size of blobstore in bytes */
 	uint32_t	io_unit_size; /* Size of io unit in bytes */
 
-	uint8_t		reserved[4000];
+	/* Torn-write-protection md journal (blob_md_journal.h): 1 iff the
+	 * store was formatted with the reserved ring region at the top of
+	 * the device. Legacy stores have 0 here and load unchanged. The
+	 * flag never changes over the lifetime of a store. */
+	uint32_t	md_journal;
+
+	uint8_t		reserved[3996];
 	uint32_t	crc;
 };
 SPDK_STATIC_ASSERT(sizeof(struct spdk_bs_super_block) == 0x1000, "Invalid super block size");

@@ -109,6 +109,25 @@ def bdev_lvol_set_leader_all(client, uuid=None, lvs_name=None, lvs_leadership=Fa
         params['lvs_name'] = lvs_name
     return client.call('bdev_lvol_set_leader_all', params)
 
+def bdev_lvs_snapshot_tree(client, uuid=None, lvs_name=None):
+    """Change state of the leadership
+
+    Args:
+        uuid: UUID of the lvolstore
+        lvs_name: lvolstore name
+        lvs_leadership: Leadership state for lvolstore (default: False)
+        bs_leadership: Leadership state for blobstore (default: False)
+    """ 
+    params = {}
+        
+    if (uuid and lvs_name):
+        raise ValueError("Exactly one of uuid or lvs_name may be specified")
+    if uuid:
+        params['uuid'] = uuid
+    if lvs_name:
+        params['lvs_name'] = lvs_name
+    return client.call('bdev_lvs_snapshot_tree', params)
+
 def bdev_lvol_block_data_port(client, uuid=None, lvs_name=None):
     """Block data port of the lvolstore
 

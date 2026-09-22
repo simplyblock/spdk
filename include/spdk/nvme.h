@@ -1349,6 +1349,22 @@ void spdk_nvme_ctrlr_fail(struct spdk_nvme_ctrlr *ctrlr);
 bool spdk_nvme_ctrlr_is_failed(struct spdk_nvme_ctrlr *ctrlr);
 
 /**
+ * Determine if a controller has already completed a disconnect.
+ *
+ * A controller whose disconnect has run to completion is parked in the
+ * disconnected state indefinitely: no further state transition occurs and
+ * spdk_nvme_ctrlr_process_admin_completions() stops reporting an error for it.
+ * Callers that arm a callback on the completion *edge* of
+ * spdk_nvme_ctrlr_disconnect() must use this to detect that the edge has
+ * already passed, otherwise they wait for a notification that will never come.
+ *
+ * \param ctrlr Opaque handle to an NVMe controller.
+ *
+ * \return True if the controller is disconnected and not mid-disconnect.
+ */
+bool spdk_nvme_ctrlr_is_disconnected(struct spdk_nvme_ctrlr *ctrlr);
+
+/**
  * Get the identify controller data as defined by the NVMe specification.
  *
  * This function is thread safe and can be called at any point while the controller

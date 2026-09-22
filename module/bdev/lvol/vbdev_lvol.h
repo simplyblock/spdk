@@ -52,6 +52,29 @@ int vbdev_lvs_dump(struct spdk_lvol_store *lvs, const char *file,
 
 void vbdev_lvol_create_snapshot(struct spdk_lvol *lvol, const char *snapshot_name,
 				spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
+
+/* --- consistency-group snapshots ------------------------------------------
+ * One crash-consistent snapshot per member volume, all members of one LVS.
+ * IO is group-frozen on EVERY member blob before the first snapshot and
+ * unfrozen after the last, so the set of snapshots represents one point in
+ * time across the whole group. On any mid-sequence failure the machine
+ * FIRST unfreezes every member (host IO must never stay parked because a
+ * snapshot failed) and THEN deletes the snapshots already taken.
+ */
+struct vbdev_lvol_group_snap_entry {
+	struct spdk_lvol	*lvol;		/* in: member volume */
+	char			*snapshot_name;	/* in: name for its snapshot */
+	struct spdk_lvol	*snap;		/* out: created snapshot (NULL on failure) */
+};
+
+typedef void (*vbdev_lvol_group_snapshot_complete)(void *cb_arg,
+		struct vbdev_lvol_group_snap_entry *entries, uint32_t count,
+		int lvolerrno);
+
+void vbdev_lvol_create_snapshot_group(struct vbdev_lvol_group_snap_entry *entries,
+				      uint32_t count,
+				      vbdev_lvol_group_snapshot_complete cb_fn,
+				      void *cb_arg);
 void
 vbdev_lvol_update_snapshot_clone(struct spdk_lvol *lvol, struct spdk_lvol *origlvol,
 			   bool clone, spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);

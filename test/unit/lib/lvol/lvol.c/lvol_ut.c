@@ -14,6 +14,26 @@
 #include "common/lib/ut_multithread.c"
 #include "lvol/lvol.c"
 
+/* lvol.c calls into the dirty-bitmap module and the fork's blobstore freeze
+ * probe. blob_dirty.c is self-contained, so link the real code (the transfer
+ * tests need the real coalescing); spdk_blob_get_dirty_gen lives in
+ * blobstore.c, which is not part of this binary, and the freeze probe is a
+ * no-op here (no in-flight IO in unit tests). */
+#include "blob/blob_dirty.c"
+struct blob_dirty_gen *
+spdk_blob_get_dirty_gen(struct spdk_blob *blob)
+{
+	(void)blob;
+	return NULL;               /* no tracked generation in these tests */
+}
+void
+blob_check_io_inflaight(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	(void)blob;
+	cb_fn(cb_arg, 0);          /* no in-flight IO in these tests */
+}
+
+
 #define DEV_BUFFER_SIZE (64 * 1024 * 1024)
 #define DEV_BUFFER_BLOCKLEN (4096)
 #define DEV_BUFFER_BLOCKCNT (DEV_BUFFER_SIZE / DEV_BUFFER_BLOCKLEN)
@@ -46,6 +66,7 @@ DEFINE_STUB(spdk_blob_get_md_ro, bool, (struct spdk_blob *blob), false);
 DEFINE_STUB_V(spdk_blob_set_md_ro, (struct spdk_blob *blob, bool md_ro));
 DEFINE_STUB_V(spdk_blob_set_clean, (struct spdk_blob *blob));
 DEFINE_STUB_V(spdk_snapshot_freeze_blob, (struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg));
+DEFINE_STUB_V(spdk_blob_update_on_failover, (struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg));
 DEFINE_STUB(spdk_bs_delete_blob_non_leader, int ,(struct spdk_blob_store *bs, struct spdk_blob *blob), 0);
 DEFINE_STUB_V(spdk_bdev_free_io, (struct spdk_bdev_io *g_bdev_io));
 DEFINE_STUB_V(spdk_blob_io_read, (struct spdk_blob *blob, struct spdk_io_channel *channel,
@@ -54,7 +75,11 @@ DEFINE_STUB_V(spdk_blob_io_read, (struct spdk_blob *blob, struct spdk_io_channel
 DEFINE_STUB_V(spdk_blob_io_write, (struct spdk_blob *blob, struct spdk_io_channel *channel,
 		   void *payload, uint64_t offset, uint64_t length,
 		   spdk_blob_op_complete cb_fn, void *cb_arg));
-DEFINE_STUB_V(prepare_s3_clusters, (struct spdk_blob* blob, uint64_t *clusters, uint32_t num_clusters));
+DEFINE_STUB_V(prepare_s3_clusters, (struct spdk_blob* blob, uint64_t *clusters, uint32_t num_clusters, int *count));
+
+DEFINE_STUB(spdk_bs_for_each_loaded_blob, int,(struct spdk_blob_store *bs,
+			     spdk_bs_loaded_blob_fn fn, void *cb_arg), 0);
+
 DEFINE_STUB(spdk_bdev_write_blocks, int,
 	    (struct spdk_bdev_desc *desc, struct spdk_io_channel *ch, void *buf, uint64_t offset_blocks,
 	     uint64_t num_blocks, spdk_bdev_io_completion_cb cb, void *cb_arg), 0);
@@ -148,6 +173,16 @@ spdk_bdev_get_io_channel(struct spdk_bdev_desc *desc)
 		return (struct spdk_io_channel *)0x1;
 	}
 	return NULL;
+}
+
+int
+spdk_bdev_abort(struct spdk_bdev_desc *desc,
+		struct spdk_io_channel *ch,
+		void *bio_cb_arg,
+		spdk_bdev_io_completion_cb cb,
+		void *cb_arg)
+{
+	return 0;
 }
 
 void

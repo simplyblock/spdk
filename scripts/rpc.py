@@ -2134,6 +2134,17 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('-s', '--lvs-name', help='lvol store name')
     p.set_defaults(func=bdev_lvol_set_leader_all)
     
+    def bdev_lvs_snapshot_tree(args):
+        print_dict(rpc.lvol.bdev_lvs_snapshot_tree(args.client,
+                                                   uuid=args.uuid,
+                                                   lvs_name=args.lvs_name))
+
+    p = subparsers.add_parser('bdev_lvs_snapshot_tree',
+                              help='Change leadership state for lvstore and lvols')
+    p.add_argument('-u', '--uuid', help='lvol store UUID')
+    p.add_argument('-s', '--lvs-name', help='lvol store name')
+    p.set_defaults(func=bdev_lvs_snapshot_tree)
+    
     def bdev_lvol_block_data_port(args):
         print_dict(rpc.lvol.bdev_lvol_block_data_port(args.client,
                                                    uuid=args.uuid,

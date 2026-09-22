@@ -2051,7 +2051,7 @@ spdk_nvmf_check_port_timeout(uint64_t ack_timeout)
 
 			port = g_nvmf_blocked_ports[i].port;
 			current_ticks = spdk_get_ticks();
-			ack_timeout_ticks = ack_timeout * 3 * spdk_get_ticks_hz() / 1000;
+			ack_timeout_ticks = ack_timeout * 4 * spdk_get_ticks_hz() / 1000;
 
 			if (g_nvmf_blocked_ports[i].timeout && (current_ticks - g_nvmf_blocked_ports[i].timeout > ack_timeout_ticks)) {
 				if (__atomic_compare_exchange_n(&g_nvmf_blocked_ports[i].is_reject, &expected, true, false,

@@ -119,6 +119,7 @@ enum xfer_req_status {
 	XFER_REQ_STATUS_READY,
 	XFER_REQ_STATUS_DONE,
 	XFER_REQ_STATUS_FAILED,
+	XFER_REQ_STATUS_IN_FLIGHT,
 };
 
 typedef enum {
@@ -140,6 +141,8 @@ struct spdk_io_channel;
 struct spdk_blob;
 struct spdk_xattr_names;
 
+
+typedef void (*spdk_bs_loaded_blob_fn)(void *ctx, struct spdk_blob *blob, int bserrno);
 /**
  * Blobstore operation completion callback.
  *
@@ -465,6 +468,24 @@ void spdk_blob_failover_unfreaze(struct spdk_blob *blob,
 				spdk_blob_op_complete cb_fn, void *cb_arg);
 
 void spdk_snapshot_freeze_blob(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
+
+/**
+ * Group-freeze IO on a blob: pure refcounted freeze with NO
+ * locked_operation_in_progress gate, so a subsequent per-blob snapshot
+ * (which takes its own freeze via spdk_snapshot_freeze_blob) still works.
+ * Used by consistency-group snapshots to park IO on EVERY member blob
+ * before the first snapshot of the group is taken and until after the
+ * last one; the per-snapshot freeze/unfreeze inside the window only moves
+ * the refcount between 1 and 2, so IO stays parked for the whole group.
+ * Must be called from the blobstore md thread.
+ */
+void spdk_blob_group_freeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
+
+/**
+ * Counterpart of spdk_blob_group_freeze_io: refcounted unfreeze; queued IO
+ * resumes when the count reaches zero.
+ */
+void spdk_blob_group_unfreeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
 int spdk_blob_get_freeze_cnt(struct spdk_blob *blob);
 
 void spdk_blob_unfreeze_cleanup(struct spdk_blob *blob,
@@ -480,7 +501,60 @@ void spdk_bs_set_role(struct spdk_blob_store *bs, node_role_t role);
 node_role_t node_role_from_string(const char *str);
 const char *node_role_to_string(node_role_t role);
 void spdk_bs_set_read_only(struct spdk_blob_store *bs, bool state);
-void prepare_s3_clusters(struct spdk_blob* blob, uint64_t *clusters, uint32_t num_clusters);
+void prepare_s3_clusters(struct spdk_blob* blob, uint64_t *clusters, uint32_t num_clusters, int *count);
+
+/* Metadata-journal introspection and test control (blob_md_journal.h).
+ * The stats are a snapshot of the ring as this process sees it. Pausing the
+ * drain is a test hook: it lets a workload build up a backlog of
+ * acknowledged-but-not-home pages, which is otherwise almost impossible to
+ * observe because the drain keeps up with any md rate the blobstore can
+ * produce. */
+struct spdk_bs_md_journal_stats {
+	bool		enabled;	/* journal present and intercepting */
+	bool		drain_paused;
+	bool		drain_demoted;	/* drain stopped: not the leader */
+	uint32_t	num_slots;
+	uint32_t	used_slots;
+	uint32_t	mem_head;
+	uint32_t	mem_tail;
+	uint32_t	disk_head;
+	uint32_t	disk_tail;
+};
+
+int spdk_bs_get_md_journal_stats(struct spdk_blob_store *bs,
+				 struct spdk_bs_md_journal_stats *stats);
+int spdk_bs_set_md_journal_drain_paused(struct spdk_blob_store *bs, bool paused);
+
+/* In-memory dirty tracking for partial snapshot replication (lib/blob/blob_dirty.c).
+ * A blob's dirty GENERATION records, at 8 KiB granularity, which blocks were
+ * written since the blob's epoch began (creation or the last snapshot
+ * rotation). Purely in memory: after a restart no generation exists and the
+ * transfer falls back to full clusters. */
+/* dirty-tracking granularity: one bit per this many bytes */
+#define SPDK_BLOB_DIRTY_BLOCK_SZ	(8 * 1024)
+
+struct blob_dirty_gen;
+
+struct blob_dirty_range {
+	uint32_t off;	/* in 8 KiB blocks, relative to the cluster start */
+	uint32_t len;	/* in 8 KiB blocks */
+};
+
+struct blob_dirty_gen *spdk_blob_get_dirty_gen(struct spdk_blob *blob);
+/* Pin a generation for the lifetime of a transfer task. The snapshot family
+ * cap frees generations older than the two newest snapshots, so a task that
+ * keeps a raw pointer across ticks MUST hold a reference. */
+void spdk_blob_dirty_gen_ref(struct blob_dirty_gen *gen);
+void spdk_blob_dirty_gen_unref(struct blob_dirty_gen *gen);
+bool spdk_blob_dirty_gen_complete(const struct blob_dirty_gen *gen);
+uint64_t spdk_blob_dirty_gen_id(const struct blob_dirty_gen *gen);
+uint64_t spdk_blob_dirty_gen_tracked(const struct blob_dirty_gen *gen);
+uint64_t spdk_blob_dirty_gen_bytes(const struct blob_dirty_gen *gen);
+uint32_t spdk_blob_dirty_max_ranges(const struct blob_dirty_gen *gen);
+/* Ranges to transfer for one cluster: -1 = no bitmap (send the whole
+ * cluster), otherwise the number of coalesced ranges written to out. */
+int spdk_blob_dirty_cluster_ranges(struct blob_dirty_gen *gen, uint64_t cluster_idx,
+				   struct blob_dirty_range *out, uint32_t max_out);
 bool spdk_blob_get_offset_allocate(struct spdk_blob *blob, uint64_t offset);
 bool spdk_blob_check_offset_valid(struct spdk_blob *blob, uint64_t offset, uint64_t length);
 int spdk_read_cluster_data_xfer(struct spdk_blob *blob, void *buf, uint64_t offset, 
@@ -595,6 +669,8 @@ void spdk_bs_get_super(struct spdk_blob_store *bs,
  * \return cluster size.
  */
 uint64_t spdk_bs_get_cluster_size(struct spdk_blob_store *bs);
+
+void spdk_bs_get_snapshot_tree(struct spdk_blob_store *bs);
 
 /**
  * Get the page size in bytes. This is the write and read granularity of blobs.
@@ -1115,6 +1191,10 @@ void spdk_bs_open_blob(struct spdk_blob_store *bs, spdk_blob_id blobid,
 void spdk_bs_open_blob_on_failover(struct spdk_blob_store *bs, spdk_blob_id blobid,
 		  spdk_blob_op_with_handle_complete cb_fn, void *cb_arg);
 
+void
+spdk_bs_open_blob_on_examine(struct spdk_blob_store *bs, spdk_blob_id blobid,
+		  spdk_blob_op_with_handle_complete cb_fn, void *cb_arg);
+
 /**
  * Open a blob from the given blobstore with additional options.
  *
@@ -1133,6 +1213,7 @@ void spdk_bs_create_hubblob(struct spdk_blob_store *bs, const struct spdk_blob_o
 void spdk_bs_open_blob_without_reference(struct spdk_blob_store *bs, spdk_blob_id blobid,
 		  struct spdk_blob_open_opts *opts, spdk_blob_op_with_handle_complete cb_fn, void *cb_arg);
 
+int spdk_bs_for_each_loaded_blob(struct spdk_blob_store *bs, spdk_bs_loaded_blob_fn fn, void *cb_arg);
 /**
  * Resize a blob to 'sz' clusters. These changes are not persisted to disk until
  * spdk_bs_md_sync_blob() is called.

@@ -103,6 +103,8 @@ bool spdk_bit_pool_is_allocated(const struct spdk_bit_pool *pool, uint32_t bit_i
  */
 uint32_t spdk_bit_pool_allocate_bit(struct spdk_bit_pool *pool);
 uint32_t spdk_bit_pool_allocate_specific_bit(struct spdk_bit_pool *pool, uint32_t bit_index);
+void spdk_bit_pool_update_lowest_free_bit(struct spdk_bit_pool *pool);
+bool spdk_bit_pool_set_bit_no_update(struct spdk_bit_pool *pool, uint32_t bit_index);
 
 /**
  * Free a bit back to the bit pool.

@@ -11,6 +11,8 @@
 	spdk_bs_set_super;
 	spdk_bs_get_super;
 	spdk_bs_get_cluster_size;
+	spdk_bs_get_md_journal_stats;
+	spdk_bs_set_md_journal_drain_paused;
 	spdk_bs_get_page_size;
 	spdk_bs_get_io_unit_size;
 	spdk_bs_free_cluster_count;
@@ -27,6 +29,8 @@
 	spdk_bs_create_blob_ext;
 	spdk_bs_create_blob;
 	spdk_bs_create_snapshot;
+	spdk_blob_group_freeze_io;
+	spdk_blob_group_unfreeze_io;
 	spdk_bs_create_clone;
 	spdk_blob_get_clones;
 	spdk_blob_get_parent_snapshot;
