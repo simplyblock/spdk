@@ -1155,10 +1155,12 @@ rpc_bdev_lvol_snapshot_group_cb(void *cb_arg, struct vbdev_lvol_group_snap_entry
 	if (lvolerrno != 0) {
 		spdk_jsonrpc_send_error_response(ctx->request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 spdk_strerror(-lvolerrno));
+		SPDK_NOTICELOG("Snapshotting blob failed\n");
 		free_rpc_bdev_lvol_snapshot_group(ctx);
 		return;
 	}
 
+	SPDK_NOTICELOG("Snapshotting blob completed successfully\n");
 	w = spdk_jsonrpc_begin_result(ctx->request);
 	spdk_json_write_array_begin(w);
 	for (i = 0; i < count; i++) {
@@ -1183,6 +1185,7 @@ rpc_bdev_lvol_snapshot_group(struct spdk_jsonrpc_request *request,
 	struct spdk_lvol *lvol;
 	size_t i;
 
+	SPDK_NOTICELOG("Snapshotting blob\n");
 	ctx = calloc(1, sizeof(*ctx));
 	if (ctx == NULL) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,

@@ -407,7 +407,7 @@ blob_free(struct spdk_blob *blob)
 	xattrs_free(&blob->xattrs);
 	xattrs_free(&blob->xattrs_internal);
 
-	blob_dirty_gen_free(blob->dirty_gen);
+	// blob_dirty_gen_free(blob->dirty_gen);
 
 	if (blob->back_bs_dev) {
 		blob_unref_back_bs_dev(blob);
@@ -3043,9 +3043,9 @@ blob_resize_secondary(struct spdk_blob *blob, uint64_t sz)
 	}
 
 	/* Same rule as blob_resize(): a shrink is not expressible as a delta. */
-	if (sz < blob->active.num_clusters) {
-		blob_dirty_gen_invalidate(blob->dirty_gen);
-	}
+	// if (sz < blob->active.num_clusters) {
+	// 	blob_dirty_gen_invalidate(blob->dirty_gen);
+	// }
 
 	blob->active.num_clusters = sz;
 	blob->active.num_extent_pages = new_num_ep;
@@ -3175,9 +3175,9 @@ blob_resize(struct spdk_blob *blob, uint64_t sz)
 	 * marked. Growing is safe (the added clusters are unallocated, and the
 	 * transfer only ever visits allocated ones), so only shrinking gives
 	 * up the generation. */
-	if (sz < blob->active.num_clusters) {
-		blob_dirty_gen_invalidate(blob->dirty_gen);
-	}
+	// if (sz < blob->active.num_clusters) {
+	// 	blob_dirty_gen_invalidate(blob->dirty_gen);
+	// }
 
 	blob->active.num_clusters = sz;
 	blob->active.num_extent_pages = new_num_ep;
@@ -3973,17 +3973,18 @@ spdk_free_cluster_unmap_complete(void *cb_arg, int bserrno)
 static inline void
 blob_dirty_mark_io_units(struct spdk_blob *blob, uint64_t offset, uint64_t length)
 {
-	if (spdk_likely(blob->dirty_gen == NULL)) {
-		return;
-	}
-	blob_dirty_mark(blob->dirty_gen, offset * blob->bs->io_unit_size,
-			length * blob->bs->io_unit_size);
+	// if (spdk_likely(blob->dirty_gen == NULL)) {
+	// 	return;
+	// }
+	// blob_dirty_mark(blob->dirty_gen, offset * blob->bs->io_unit_size,
+	// 		length * blob->bs->io_unit_size);
 }
 
 struct blob_dirty_gen *
 spdk_blob_get_dirty_gen(struct spdk_blob *blob)
 {
-	return blob ? blob->dirty_gen : NULL;
+	// return blob ? blob->dirty_gen : NULL;
+	return NULL;
 }
 
 static void
@@ -4057,7 +4058,7 @@ blob_request_submit_op_single(struct spdk_io_channel *_ch, struct spdk_blob *blo
 			 * branch (a COW-triggering write re-executes here after
 			 * the cluster copy), so this is the single tracking
 			 * point for the dirty bitmap. */
-			blob_dirty_mark_io_units(blob, offset, length);
+			// blob_dirty_mark_io_units(blob, offset, length);
 
 			uint8_t special_io = (blob->migration_flag & (op_type == SPDK_BLOB_WRITE)) ? 1 : 0;
 			batch = bs_batch_open_s(_ch, &cpl, special_io, blob);
@@ -4143,7 +4144,7 @@ blob_request_submit_op_single(struct spdk_io_channel *_ch, struct spdk_blob *blo
 			 * transfer built on this generation could no longer
 			 * express "this cluster is gone", so the generation is
 			 * no longer a valid delta basis. */
-			blob_dirty_gen_invalidate(blob->dirty_gen);
+			// blob_dirty_gen_invalidate(blob->dirty_gen);
 		}
 
 		batch = bs_batch_open(_ch, &cpl, blob);
@@ -4154,12 +4155,12 @@ blob_request_submit_op_single(struct spdk_io_channel *_ch, struct spdk_blob *blo
 		}
 
 		if (is_allocated) {
-			if (ctx == NULL) {
-				/* Range unmap inside an allocated cluster: the
-				 * blocks now read as zeroes, which the delta
-				 * must carry like any other modification. */
-				blob_dirty_mark_io_units(blob, offset, length);
-			}
+			// if (ctx == NULL) {
+			// 	/* Range unmap inside an allocated cluster: the
+			// 	 * blocks now read as zeroes, which the delta
+			// 	 * must carry like any other modification. */
+			// 	blob_dirty_mark_io_units(blob, offset, length);
+			// }
 			bs_batch_unmap_dev(batch, lba, lba_count);
 		}
 
@@ -4424,7 +4425,7 @@ blob_request_submit_rw_iov(struct spdk_blob *blob, struct spdk_io_channel *_chan
 
 				seq->ext_io_opts = ext_io_opts;
 
-				blob_dirty_mark_io_units(blob, offset, length);
+				// blob_dirty_mark_io_units(blob, offset, length);
 				bs_sequence_writev_dev(seq, iov, iovcnt, lba, lba_count, rw_iov_done, NULL);
 			} else {
 				/* Queue this operation and allocate the cluster */
@@ -8201,7 +8202,7 @@ bs_create_blob(struct spdk_blob_store *bs,
 	 * every write from birth (complete). Blobs LOADED from disk get none:
 	 * their history is unknown and their transfers stay full until the
 	 * next snapshot rotation hands them a fresh generation. */
-	blob->dirty_gen = blob_dirty_gen_create(bs->cluster_sz);
+	// blob->dirty_gen = blob_dirty_gen_create(bs->cluster_sz);
 	if (blob->use_extent_table) {
 		blob->invalid_flags |= SPDK_BLOB_EXTENT_TABLE;
 	}
@@ -8499,11 +8500,11 @@ bs_snapshot_swap_cluster_maps(struct spdk_blob *blob1, struct spdk_blob *blob2)
 	 * the empty, complete generation the snapshot blob received at
 	 * creation -- which IS the rotation. The error-path unwind calls swap
 	 * everything straight back. */
-	{
-		struct blob_dirty_gen *dirty_temp = blob1->dirty_gen;
-		blob1->dirty_gen = blob2->dirty_gen;
-		blob2->dirty_gen = dirty_temp;
-	}
+	// {
+	// 	struct blob_dirty_gen *dirty_temp = blob1->dirty_gen;
+	// 	blob1->dirty_gen = blob2->dirty_gen;
+	// 	blob2->dirty_gen = dirty_temp;
+	// }
 }
 
 /* Copies an internal xattr */
@@ -8557,20 +8558,20 @@ bs_snapshot_origblob_sync_cpl(void *cb_arg, int bserrno)
 	 * Walk the new snapshot's ancestor chain and drop bitmaps older than
 	 * its immediate predecessor. Ancestors that are not open lost their
 	 * generation with blob_free already. */
-	{
-		struct spdk_blob *anc = newblob;
-		int depth = 0;
+	// {
+	// 	struct spdk_blob *anc = newblob;
+	// 	int depth = 0;
 
-		while (anc != NULL && anc->parent_id != 0 &&
-		       anc->parent_id != SPDK_BLOBID_INVALID && depth < 64) {
-			anc = blob_lookup(newblob->bs, anc->parent_id);
-			depth++;
-			if (anc != NULL && depth >= 2 && anc->dirty_gen != NULL) {
-				blob_dirty_gen_free(anc->dirty_gen);
-				anc->dirty_gen = NULL;
-			}
-		}
-	}
+	// 	while (anc != NULL && anc->parent_id != 0 &&
+	// 	       anc->parent_id != SPDK_BLOBID_INVALID && depth < 64) {
+	// 		anc = blob_lookup(newblob->bs, anc->parent_id);
+	// 		depth++;
+	// 		if (anc != NULL && depth >= 2 && anc->dirty_gen != NULL) {
+	// 			blob_dirty_gen_free(anc->dirty_gen);
+	// 			anc->dirty_gen = NULL;
+	// 		}
+	// 	}
+	// }
 
 	bs_blob_list_add(ctx->original.blob);
 
@@ -12373,10 +12374,10 @@ bs_open_blob_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	 * lvol actually takes (bs_create_blob's in-memory object is not the one
 	 * the lvol layer opens), and it is restart-safe by construction: a blob
 	 * reopened WITH data keeps dirty_gen == NULL and transfers stay full. */
-	if (blob->dirty_gen == NULL && !blob->data_ro &&
-	    blob->active.num_allocated_clusters == 0) {
-		blob->dirty_gen = blob_dirty_gen_create(blob->bs->cluster_sz);
-	}
+	// if (blob->dirty_gen == NULL && !blob->data_ro &&
+	//     blob->active.num_allocated_clusters == 0) {
+	// 	blob->dirty_gen = blob_dirty_gen_create(blob->bs->cluster_sz);
+	// }
 
 	bs_sequence_finish(seq, bserrno);
 }

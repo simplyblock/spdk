@@ -4702,13 +4702,13 @@ submit_read_fragments(struct spdk_lvs_xfer_req *req)
 	if (frag_pages == 0) {
 		frag_pages = 1;
 	}
-	/* Special (geometry) IO must not be split below the blob cluster on the
-	 * READ side either: one whole-request read, mirroring the single
-	 * whole-cluster write. Partial transfer is already refused for it, so
-	 * req->len is the full cluster here. */
-	if (xfer->special_io) {
-		frag_pages = req->len;
-	}
+	// /* Special (geometry) IO must not be split below the blob cluster on the
+	//  * READ side either: one whole-request read, mirroring the single
+	//  * whole-cluster write. Partial transfer is already refused for it, so
+	//  * req->len is the full cluster here. */
+	// if (xfer->special_io) {
+	// 	frag_pages = req->len;
+	// }
 
 	/* Fill the payload with PARALLEL 64 KiB reads instead of one monolithic
 	 * cluster-sized read: a single 2 MiB spdk_blob_io_read serialized the whole
@@ -5201,9 +5201,9 @@ destroy_xfer_task_tmo(void *arg) {
 		free(xfer->old_clusters);
 	if (xfer->ranges)
 		free(xfer->ranges);
-	/* release the pinned dirty generation (no-op when NULL) */
-	spdk_blob_dirty_gen_unref(xfer->dirty_gen);
-	xfer->dirty_gen = NULL;
+	// /* release the pinned dirty generation (no-op when NULL) */
+	// spdk_blob_dirty_gen_unref(xfer->dirty_gen);
+	// xfer->dirty_gen = NULL;
 	free(xfer);
 	return -1;
 }
@@ -7259,33 +7259,33 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
 	 * content) AND this snapshot's dirty generation tracked every write
 	 * since its epoch began. Anything else -- restarted node, invalidated
 	 * generation, untracked blob -- falls back to full clusters. */
-	if (allow_partial && type == XFER_REPLICATE_SNAPSHOT) {
-		struct blob_dirty_gen *gen = spdk_blob_get_dirty_gen(lvol->blob);
+	// if (allow_partial && type == XFER_REPLICATE_SNAPSHOT) {
+	// 	struct blob_dirty_gen *gen = spdk_blob_get_dirty_gen(lvol->blob);
 
-		if (gen != NULL && spdk_blob_dirty_gen_complete(gen)) {
-			task->ranges = calloc(spdk_blob_dirty_max_ranges(gen),
-					      sizeof(struct blob_dirty_range));
-			if (task->ranges != NULL) {
-				task->dirty_gen = gen;
-				/* Pin it: the family cap in the blob layer frees
-				 * generations older than the two newest
-				 * snapshots, and this task walks the bitmaps
-				 * across many poller ticks. */
-				spdk_blob_dirty_gen_ref(gen);
-				task->allow_partial = true;
-				SPDK_NOTICELOG("Transfer lvol %s: dirty-bitmap partial transfer "
-					       "(gen %" PRIu64 ", %" PRIu64 " tracked clusters, "
-					       "%" PRIu64 " dirty bytes)\n",
-					       lvol->name, spdk_blob_dirty_gen_id(gen),
-					       spdk_blob_dirty_gen_tracked(gen),
-					       spdk_blob_dirty_gen_bytes(gen));
-			}
-		} else {
-			SPDK_NOTICELOG("Transfer lvol %s: partial requested but no complete "
-				       "dirty generation -- falling back to full clusters\n",
-				       lvol->name);
-		}
-	}
+	// 	if (gen != NULL && spdk_blob_dirty_gen_complete(gen)) {
+	// 		task->ranges = calloc(spdk_blob_dirty_max_ranges(gen),
+	// 				      sizeof(struct blob_dirty_range));
+	// 		if (task->ranges != NULL) {
+	// 			// task->dirty_gen = gen;
+	// 			// /* Pin it: the family cap in the blob layer frees
+	// 			//  * generations older than the two newest
+	// 			//  * snapshots, and this task walks the bitmaps
+	// 			//  * across many poller ticks. */
+	// 			// spdk_blob_dirty_gen_ref(gen);
+	// 			// task->allow_partial = true;
+	// 			SPDK_NOTICELOG("Transfer lvol %s: dirty-bitmap partial transfer "
+	// 				       "(gen %" PRIu64 ", %" PRIu64 " tracked clusters, "
+	// 				       "%" PRIu64 " dirty bytes)\n",
+	// 				       lvol->name, spdk_blob_dirty_gen_id(gen),
+	// 				       spdk_blob_dirty_gen_tracked(gen),
+	// 				       spdk_blob_dirty_gen_bytes(gen));
+	// 		}
+	// 	} else {
+	// 		SPDK_NOTICELOG("Transfer lvol %s: partial requested but no complete "
+	// 			       "dirty generation -- falling back to full clusters\n",
+	// 			       lvol->name);
+	// 	}
+	// }
 
 	// rememeber
 	// if (type == XFER_MIGRATE_SNAPSHOT) {

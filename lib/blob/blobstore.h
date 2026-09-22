@@ -125,7 +125,7 @@ struct spdk_blob {
 	 * NULL means "not tracked" (e.g. blob loaded from disk): the transfer
 	 * then falls back to full clusters. Moves to the snapshot at rotation
 	 * (bs_snapshot_swap_cluster_maps), freed in blob_free(). */
-	struct blob_dirty_gen *dirty_gen;
+	// struct blob_dirty_gen *dirty_gen;
 
 	enum spdk_blob_state		state;
 
