@@ -108,6 +108,7 @@ vbdev_split_queue_io(struct vbdev_split_bdev_io *split_io)
 	split_io->bdev_io_wait.bdev = split_io->bdev_io->bdev;
 	split_io->bdev_io_wait.cb_fn = vbdev_split_resubmit_io;
 	split_io->bdev_io_wait.cb_arg = split_io;
+	split_io->bdev_io_wait.dep_unblock = true;
 
 	rc = spdk_bdev_queue_io_wait(split_io->bdev_io->bdev,
 				     ch->part_ch.base_ch, &split_io->bdev_io_wait);
