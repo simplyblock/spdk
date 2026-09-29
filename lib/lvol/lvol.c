@@ -4779,6 +4779,8 @@ submit_rw_reqs_local(struct spdk_lvs_xfer_req *req)
 	return rc;
 }
 
+#define XFER_HELPER_MAX_BURST   32
+
 static int
 helper_xfer_poller(void *arg)
 {
@@ -4786,6 +4788,7 @@ helper_xfer_poller(void *arg)
 	struct remote_lvol_info *rmt_lvol;
 	struct spdk_lvs_xfer_req *req;
 	int rc, count = 0;
+	uint32_t burst = 0;
 	bool priority_active =
 		__atomic_load_n(&g_priority_xfer_cnt, __ATOMIC_SEQ_CST) > 0;
 	/* Two passes: freeze-critical transfers first, and while any is active
@@ -4795,10 +4798,15 @@ helper_xfer_poller(void *arg)
 	if (pass == 1 && priority_active) {
 		break;
 	}
+
+	uint32_t max_outstanding = spdk_divide_round_up(/*cluster_batch*/256, spdk_max(g_lvs_num_pgs, 1));
+	uint32_t max_burst = spdk_min(max_outstanding, XFER_HELPER_MAX_BURST);
+
 	TAILQ_FOREACH(rmt_lvol, &lpg->rmt_lvols, entry) {
 		if ((pass == 0) != rmt_lvol->priority) {
 			continue;
 		}
+		burst = 0;
 		/* Drain the ring, do not take ONE request per 200us tick: with the
 		 * dispatcher now filling the whole window per tick, a single-dequeue
 		 * here would re-serialize everything it batched. The ring is bounded
@@ -4875,6 +4883,21 @@ helper_xfer_poller(void *arg)
 				set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
 				break;
 		}
+
+		if (rmt_lvol->type == XFER_MIGRATE_SNAPSHOT) {
+			burst++;
+
+			if (rmt_lvol->outstanding_io > max_outstanding) {
+				break;
+			}
+
+			if (burst == max_burst) {
+				break;
+			}
+
+		}
+
+
 		}
 	}
 	}
