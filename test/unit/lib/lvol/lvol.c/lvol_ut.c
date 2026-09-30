@@ -20,6 +20,7 @@
  * blobstore.c, which is not part of this binary, and the freeze probe is a
  * no-op here (no in-flight IO in unit tests). */
 #include "blob/blob_dirty.c"
+// #include "blob/blob_md_journal.c"
 struct blob_dirty_gen *
 spdk_blob_get_dirty_gen(struct spdk_blob *blob)
 {

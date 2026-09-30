@@ -23,6 +23,7 @@
 #include "spdk/log.h"
 
 #include "blobstore.h"
+#include "blob_md_journal.h"
 #include "blob_dirty.h"
 
 #define BLOB_CRC32C_INITIAL    0xffffffffUL
@@ -2107,7 +2108,7 @@ blob_load_read_extents_partial(spdk_bs_sequence_t *seq, struct spdk_blob_load_ct
 	spdk_bs_batch_t			*batch;
 	uint64_t				i;
 	uint64_t				lba;
-
+	bool found = false;
 	ctx->next_idx_page = 0;
 	batch = bs_sequence_to_batch(seq, 0, blob_load_cpl_extents_cpl, ctx);
 
@@ -2116,8 +2117,19 @@ blob_load_read_extents_partial(spdk_bs_sequence_t *seq, struct spdk_blob_load_ct
 			/* Extent page was allocated, read and parse it. */
 			lba = bs_md_page_to_lba(blob->bs, blob->active.extent_pages[i]);
 			blob->bs->r_io++;
-			bs_batch_read_dev(batch, &ctx->pages[ctx->next_idx_page], lba,
+			if (blob->examine_flag && blob->bs->md_journal) {
+			//search for lba if there is present or not
+				if (bs_md_journal_read_on_examine(blob->bs->md_journal, lba, &ctx->pages[ctx->next_idx_page])) {
+					found = true;
+				}
+			}
+
+			if (!found) {
+				bs_batch_read_dev(batch, &ctx->pages[ctx->next_idx_page], lba,
 				  bs_byte_to_lba(blob->bs, SPDK_BS_PAGE_SIZE));
+			}
+			
+			found = false;
 			ctx->next_idx_page++;
 			if (ctx->next_idx_page >= ctx->num_pages) {
 				break;
@@ -2207,6 +2219,15 @@ blob_load_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		ctx->num_pages++;
 		ctx->pages = tmp_pages;
 		blob->bs->r_io++;
+
+		if (blob->examine_flag && blob->bs->md_journal) {
+		//search for lba if there is present or not
+			if(bs_md_journal_read_on_examine(blob->bs->md_journal, next_lba, &ctx->pages[ctx->num_pages - 1])) {
+				blob_load_cpl(seq, ctx, 0);
+				return;
+			}
+		}
+
 		bs_sequence_read_dev(seq, &ctx->pages[ctx->num_pages - 1],
 				     next_lba,
 				     bs_byte_to_lba(blob->bs, sizeof(*page)),
@@ -2292,6 +2313,15 @@ blob_load(spdk_bs_sequence_t *seq, struct spdk_blob *blob,
 
 	blob->state = SPDK_BLOB_STATE_LOADING;
 	bs->r_io++;
+
+	if (blob->examine_flag && bs->md_journal) {
+		//search for lba if there is present or not
+		if(bs_md_journal_read_on_examine(bs->md_journal, lba, &ctx->pages[0])) {
+			blob_load_cpl(seq, ctx, 0);
+			return;
+		}
+	}
+
 	bs_sequence_read_dev(seq, &ctx->pages[0], lba,
 			     bs_byte_to_lba(bs, SPDK_BS_PAGE_SIZE),
 			     blob_load_cpl, ctx);
@@ -2532,20 +2562,34 @@ blob_persist_clear_extents_partial(spdk_bs_sequence_t *seq,
 	struct spdk_blob *blob = ctx->blob;
 	struct spdk_blob_store *bs = blob->bs;
 	spdk_bs_batch_t *batch;
+	struct md_journal_batch *jr_batch;
 	uint64_t lba;
 	uint64_t lba_count;
 	uint32_t submitted = 0;
 	uint32_t i;
 
-	batch = bs_sequence_to_batch(seq, 0, blob_persist_clear_extents_partial_cpl, ctx);
 
-	if (batch == NULL) {
-		if (ctx->rc == 0) {
-			ctx->rc = -ENOMEM;
+	if (bs->md_journal) {
+		jr_batch = bs_md_journal_sequence_to_batch(bs->md_journal, seq, BLOB_CLEAR_EXTENTS_BATCH_SIZE,
+					blob_persist_clear_extents_partial_cpl, ctx);
+		if (jr_batch == NULL) {
+			if (ctx->rc == 0) {
+				ctx->rc = -ENOMEM;
+			}
+
+			blob_persist_clear_extents_cpl(seq, ctx, ctx->rc);
+			return;
 		}
+	} else {
+		batch = bs_sequence_to_batch(seq, 0, blob_persist_clear_extents_partial_cpl, ctx);
+		if (batch == NULL) {
+			if (ctx->rc == 0) {
+				ctx->rc = -ENOMEM;
+			}
 
-		blob_persist_clear_extents_cpl(seq, ctx, ctx->rc);
-		return;
+			blob_persist_clear_extents_cpl(seq, ctx, ctx->rc);
+			return;
+		}
 	}
 
 	lba_count = bs_byte_to_lba(bs, SPDK_BS_PAGE_SIZE);
@@ -2561,18 +2605,20 @@ blob_persist_clear_extents_partial(spdk_bs_sequence_t *seq,
 
 		lba = bs_md_page_to_lba(bs, blob->active.extent_pages[i]);
 		bs->w_io++;
-		bs_batch_write_zeroes_dev(batch, lba, lba_count);
+		if (bs->md_journal) {
+			bs_md_journal_batch_write(jr_batch, NULL, lba, lba_count, MD_JOURNAL_WRITE_ZEROS);
+		} else {
+			bs_batch_write_zeroes_dev(batch, lba, lba_count);
+		}
 		submitted++;
 	}
 
-	// SPDK_DEBUGLOG(blob,
-	// 	      "Clear extents batch: submitted=%u "
-	// 	      "next_idx=%zu total=%zu\n",
-	// 	      submitted,
-	// 	      ctx->idx_extents,
-	// 	      blob->active.extent_pages_array_size);
+	if (bs->md_journal) {
+		bs_md_journal_batch_close(jr_batch);
+	} else {
+		bs_batch_close(batch);
+	}
 
-	bs_batch_close(batch);
 }
 
 static void
@@ -2781,6 +2827,7 @@ blob_persist_zero_pages(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	uint64_t			lba;
 	uint64_t			lba_count;
 	spdk_bs_batch_t			*batch;
+	struct md_journal_batch *jr_batch;
 	size_t				i;
 
 	if (bserrno != 0) {
@@ -2788,7 +2835,16 @@ blob_persist_zero_pages(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		return;
 	}
 
-	batch = bs_sequence_to_batch(seq, 0, blob_persist_zero_pages_cpl, ctx);
+	if (bs->md_journal) {
+		jr_batch = bs_md_journal_sequence_to_batch(bs->md_journal, seq, blob->clean.num_pages + 1,
+				blob_persist_zero_pages_cpl, ctx);
+		if (jr_batch == NULL) {
+			blob_persist_zero_pages_cpl(seq, ctx, -ENOMEM);
+			return;
+		}
+	} else {
+		batch = bs_sequence_to_batch(seq, 0, blob_persist_zero_pages_cpl, ctx);
+	}
 
 	lba_count = bs_byte_to_lba(bs, SPDK_BS_PAGE_SIZE);
 
@@ -2800,7 +2856,11 @@ blob_persist_zero_pages(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		page_num = bs_blobid_to_page(blob->id);
 		lba = bs_md_page_to_lba(bs, page_num);
 		bs->w_io++;
-		bs_batch_write_zeroes_dev(batch, lba, lba_count);
+		if (bs->md_journal) {
+			bs_md_journal_batch_write(jr_batch, NULL, lba, lba_count, MD_JOURNAL_WRITE_ZEROS);
+		} else {
+			bs_batch_write_zeroes_dev(batch, lba, lba_count);
+		}
 	}
 
 	/* This loop starts at 1 because the first page is special and handled
@@ -2810,10 +2870,18 @@ blob_persist_zero_pages(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	for (i = 1; i < blob->clean.num_pages; i++) {
 		lba = bs_md_page_to_lba(bs, blob->clean.pages[i]);
 		bs->w_io++;
-		bs_batch_write_zeroes_dev(batch, lba, lba_count);
+		if (bs->md_journal) {
+			bs_md_journal_batch_write(jr_batch, NULL, lba, lba_count, MD_JOURNAL_WRITE_ZEROS);
+		} else {
+			bs_batch_write_zeroes_dev(batch, lba, lba_count);
+		}
 	}
 
-	bs_batch_close(batch);
+	if (bs->md_journal) {
+		bs_md_journal_batch_close(jr_batch);
+	} else {
+		bs_batch_close(batch);
+	}
 }
 
 static void
@@ -2933,6 +3001,13 @@ blob_persist_write_page_root(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	ctx->bit_cb_fn_persist = blob_persist_zero_pages;
 	ctx->idx_blobids = bs_blobid_to_page(blob->id);
 	bs->w_io++;
+
+	if (bs->md_journal) {
+		bs_md_journal_write(bs->md_journal, seq, page, lba, lba_count,
+			      persist_bs_write_used_blobids, ctx, MD_JOURNAL_WRITE);
+		return;
+	}
+
 	bs_sequence_write_dev(seq, page, lba, lba_count,
 			      persist_bs_write_used_blobids, ctx);
 }
@@ -2946,6 +3021,7 @@ blob_persist_write_page_chain(spdk_bs_sequence_t *seq, struct spdk_blob_persist_
 	uint32_t			lba_count;
 	struct spdk_blob_md_page	*page;
 	spdk_bs_batch_t			*batch;
+	struct md_journal_batch *jr_batch;
 	size_t				i;
 
 	/* Clusters don't move around in blobs. The list shrinks or grows
@@ -2953,6 +3029,26 @@ blob_persist_write_page_chain(spdk_bs_sequence_t *seq, struct spdk_blob_persist_
 	 */
 
 	lba_count = bs_byte_to_lba(bs, sizeof(*page));
+
+	if (bs->md_journal) {
+		jr_batch = bs_md_journal_sequence_to_batch(bs->md_journal, seq, blob->active.num_pages - 1, blob_persist_write_page_root, ctx);
+		if (jr_batch == NULL) {
+			blob_persist_write_page_root(seq, ctx, -ENOMEM);
+			return;
+		}
+
+		for (i = 1; i < blob->active.num_pages; i++) {
+			page = &ctx->pages[i];
+			assert(page->sequence_num == i);
+
+			lba = bs_md_page_to_lba(bs, blob->active.pages[i]);
+			bs->w_io++;
+			bs_md_journal_batch_write(jr_batch, page, lba, lba_count, MD_JOURNAL_WRITE);
+		}
+
+		bs_md_journal_batch_close(jr_batch);
+		return;
+	}
 
 	batch = bs_sequence_to_batch(seq, 0, blob_persist_write_page_root, ctx);
 
@@ -3303,6 +3399,13 @@ blob_persist_write_extent_pages(spdk_bs_sequence_t *seq, void *cb_arg, int bserr
 			SPDK_ERRLOG("Invaild extent page in insert new page2 %" PRIu64 ".\n", blob->id);
 		}
 		blob->bs->w_io++;
+		if (blob->bs->md_journal) {
+			bs_md_journal_write(blob->bs->md_journal, seq, ctx->extent_page, bs_md_page_to_lba(blob->bs, extent_page_id),
+				      bs_byte_to_lba(blob->bs, SPDK_BS_PAGE_SIZE),
+				      blob_persist_write_extent_pages, ctx, MD_JOURNAL_WRITE);
+			return;
+		}
+
 		bs_sequence_write_dev(seq, ctx->extent_page, bs_md_page_to_lba(blob->bs, extent_page_id),
 				      bs_byte_to_lba(blob->bs, SPDK_BS_PAGE_SIZE),
 				      blob_persist_write_extent_pages, ctx);
@@ -4751,6 +4854,12 @@ bs_free(struct spdk_blob_store *bs)
 	bs_blob_list_free(bs);
 	bs->stop = true;
 	spdk_poller_unregister(&bs->poller);
+
+	//TODO we need to wait here to destroy md journal completed
+	if (bs->md_journal) {
+		bs_md_journal_destroy(bs->md_journal);
+	}
+
 	bs_unregister_md_thread(bs);
 	spdk_io_device_unregister(bs, bs_dev_destroy);
 }
@@ -5100,6 +5209,14 @@ bs_write_super(spdk_bs_sequence_t *seq, struct spdk_blob_store *bs,
 	memcpy(&super->bstype, &bs->bstype, sizeof(bs->bstype));
 	super->crc = blob_md_page_calc_crc(super);
 	bs->w_io++;
+
+	if (bs->md_journal) {
+		bs_md_journal_write(bs->md_journal, seq, super, bs_page_to_lba(bs, 0),
+			      bs_byte_to_lba(bs, sizeof(*super)),
+			      cb_fn, cb_arg, MD_JOURNAL_WRITE);
+		return;
+	}
+
 	bs_sequence_write_dev(seq, super, bs_page_to_lba(bs, 0),
 			      bs_byte_to_lba(bs, sizeof(*super)),
 			      cb_fn, cb_arg);
@@ -5476,6 +5593,9 @@ bs_load_iter_on_examine_cpl(void *cb_arg, int bserrno)
 
 finish:
 	SPDK_NOTICELOG("Parallel examine blob loading done, rc=%d\n", master->rc);
+
+	bs_md_journal_examine_complete(master->bs->md_journal);
+	bs_md_journal_start(master->bs->md_journal);
 
 	free(master->master_worker);
 	master->master_worker = NULL;
@@ -6155,6 +6275,65 @@ bs_load_blob_iter_on_examine(struct spdk_bs_load_ctx *ctx)
 }
 
 static void
+bs_load_journal_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct spdk_bs_load_ctx *ctx = cb_arg;
+	uint32_t set_count;
+	uint32_t count;
+	uint64_t num_md_clusters;
+	uint64_t i;
+
+	if (bserrno != 0) {
+		bs_load_ctx_fail(ctx, bserrno);
+		return;
+	}
+
+	num_md_clusters = spdk_divide_round_up(ctx->super->md_start + ctx->super->md_len, ctx->bs->pages_per_cluster);
+	for (i = 0; i < num_md_clusters; i++) {
+		spdk_bit_array_set(ctx->used_clusters, i);
+	}
+	ctx->bs->num_free_clusters -= num_md_clusters;
+	spdk_bit_array_free(&ctx->bs->used_blobids);
+	ctx->bs->used_blobids = ctx->used_blobid_pages;
+	ctx->used_blobid_pages = NULL;
+	ctx->mask = NULL;
+	spdk_free(ctx->super);
+	ctx->super = NULL;
+	ctx->bs->used_clusters = spdk_bit_pool_create_from_array(ctx->used_clusters);
+
+	set_count = spdk_bit_array_count_set(ctx->bs->used_blobids);
+	count = spdk_min(set_count, 3000U);
+
+	struct spdk_bs_load_ctx *ctxs;
+	ctxs = calloc(count, sizeof(*ctxs));
+	if (ctxs == NULL) {
+		bs_load_ctx_fail(ctx, -ENOMEM);
+		return;
+	}
+	SPDK_NOTICELOG("Allocated %u load contexts, size=%zu bytes each, total=%zu bytes\n",
+		       count, sizeof(*ctxs), (size_t)count * sizeof(*ctxs));
+
+	ctx->cur_page = 0;
+	ctx->active_workers = 0;
+	ctx->master_worker = ctxs;
+
+	for (i = 0; i < count; i++) {
+		struct spdk_bs_load_ctx *worker = &ctxs[i];
+
+		worker->bs = ctx->bs;
+		worker->seq = ctx->seq;
+		worker->master_worker = ctx;
+
+		if (!bs_load_examine_assign_next(worker)) {
+			break;
+		}
+
+		ctx->active_workers++;
+		bs_load_blob_iter_on_examine(worker);
+	}
+}
+
+static void
 bs_recover(struct spdk_bs_load_ctx *ctx)
 {
 	uint32_t set_count;
@@ -6190,6 +6369,18 @@ bs_recover(struct spdk_bs_load_ctx *ctx)
 	}
 
 	ctx->bs->num_free_clusters = ctx->bs->total_clusters;
+
+	if (ctx->super->used_md_journal) {
+		/* metadata layout is known now — arm write/read interception
+		 * for the whole md region (super, masks, md pages) */
+		ctx->bs->md_journal = bs_md_journal_create(ctx->bs, ctx->super->md_journal_mask_start, ctx->super->md_journal_mask_len);
+		if (ctx->bs->md_journal == NULL) {
+			bs_load_ctx_fail(ctx, -ENOMEM);
+			return;
+		}
+		bs_md_journal_recovery_on_failover(ctx->bs->md_journal, ctx->seq, bs_load_journal_cpl, ctx, true);
+		return;
+	}
 
 	/* Claim all of the clusters used by the metadata */
 	num_md_clusters = spdk_divide_round_up(ctx->super->md_start + ctx->super->md_len, ctx->bs->pages_per_cluster);
@@ -6362,6 +6553,9 @@ bs_load_super_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 
 	ctx->bs->used_cluster_mask_start = ctx->super->used_cluster_mask_start;
 	ctx->bs->used_cluster_mask_len = ctx->super->used_cluster_mask_len;
+
+	ctx->bs->md_journal_mask_start = ctx->super->md_journal_mask_start;
+	ctx->bs->md_journal_mask_len = ctx->super->md_journal_mask_len;
 
 	SPDK_INFOLOG(blob, "Loading blobstore super block from base dev done\n");
 	if (ctx->super->used_blobid_mask_len == 0 || ctx->super->clean == 0 || ctx->force_recover) {
@@ -7203,6 +7397,12 @@ static void
 bs_init_persist_super_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
 	struct spdk_bs_load_ctx *ctx = cb_arg;
+	if (bserrno == 0 && ctx->bs->md_journal != NULL) {
+		/* the super block (with the md_journal flag) is home-durable
+		 * now — arm md write/read interception for everything that
+		 * follows */
+		bs_md_journal_start(ctx->bs->md_journal);
+	}
 
 	ctx->bs->used_clusters = spdk_bit_pool_create_from_array(ctx->used_clusters);
 	spdk_free(ctx->super);
@@ -7329,6 +7529,8 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	ctx->super->length = sizeof(*ctx->super);
 	ctx->super->super_blob = bs->super_blob;
 	ctx->super->clean = 0;
+	ctx->super->md_journal_element_size = BS_MD_JOURNAL_ENTRY_SIZE;
+	ctx->super->md_journal_elements = BS_MD_JOURNAL_NUM_ELEMS;
 	ctx->super->cluster_size = bs->cluster_sz;
 	ctx->super->io_unit_size = bs->io_unit_size;
 	memcpy(&ctx->super->bstype, &bs->bstype, sizeof(bs->bstype));
@@ -7366,6 +7568,38 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	max_used_cluster_mask_len = spdk_max(max_used_cluster_mask_len,
 					     ctx->super->used_cluster_mask_len);
 	num_md_pages += max_used_cluster_mask_len;
+
+	/* The md journal will use 64MB storage size, rounded
+	 * up to the nearest page, plus a header.
+	 */
+	/* Torn-write protection: if the user requested a metadata journal, create it now. */
+	if (/*opts.md_journal*/1) {
+		ctx->super->used_md_journal = 1;
+		ctx->super->md_journal_mask_start = num_md_pages;
+		ctx->super->md_journal_mask_len = spdk_divide_round_up(ctx->super->md_journal_element_size * ctx->super->md_journal_elements,
+						SPDK_BS_PAGE_SIZE);
+		num_md_pages += ctx->super->md_journal_mask_len;
+
+		bs->md_journal = bs_md_journal_create(bs, ctx->super->md_journal_mask_start, ctx->super->md_journal_mask_len);
+		if (bs->md_journal == NULL) {
+			dev->destroy(dev);
+			bs_free(bs);
+			cb_fn(cb_arg, NULL, -ENOMEM);
+			return;
+		}
+
+		rc = bs_md_journal_start(bs->md_journal); 
+		if (rc) {
+			dev->destroy(dev);
+			bs_free(bs);
+			cb_fn(cb_arg, NULL, -ENOMEM);
+			return;
+		}
+	} else {
+		ctx->super->used_md_journal = 0;
+		ctx->super->md_journal_mask_start = 0;
+		ctx->super->md_journal_mask_len = 0;
+	}
 
 	/* The used_blobids mask requires 1 bit per metadata page, rounded
 	 * up to the nearest page, plus a header.
@@ -8916,27 +9150,6 @@ spdk_blob_get_freeze_cnt(struct spdk_blob *blob)
 	/* get Freeze count on blob */
 	return blob->frozen_refcnt;
 }
-
-void
-spdk_blob_group_freeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
-{
-	/* Consistency-group freeze: refcount only. Deliberately NOT taking
-	 * locked_operation_in_progress -- the group holds its freeze across the
-	 * per-member snapshot creations, and each of those takes its own
-	 * spdk_snapshot_freeze_blob, which refuses when that flag is set. The
-	 * group window therefore relies purely on frozen_refcnt staying >= 1
-	 * from before the first member snapshot until after the last. */
-	blob_verify_md_op(blob);
-	blob_freeze_io(blob, cb_fn, cb_arg);
-}
-
-void
-spdk_blob_group_unfreeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
-{
-	blob_verify_md_op(blob);
-	blob_unfreeze_io(blob, cb_fn, cb_arg);
-}
-
 /* END spdk_bs_create_snapshot */
 
 /* START spdk_bs_create_clone */
@@ -12818,7 +13031,6 @@ blob_free_cluster_clear_ep_cb(void *arg, int bserrno)
 	struct spdk_blob_store		*bs = blob->bs;
 	spdk_bs_sequence_t			*seq;
 	struct spdk_bs_cpl			cpl;
-	spdk_bs_batch_t                 *batch;
 
 	cpl.type = SPDK_BS_CPL_TYPE_BLOB_BASIC;
 	cpl.u.blob_basic.cb_fn = blob_free_cluster_clear_ep_cpl;
@@ -12830,13 +13042,15 @@ blob_free_cluster_clear_ep_cb(void *arg, int bserrno)
 		return;
 	}
 
-	batch = bs_sequence_to_batch(seq, 0, blob_write_zero_extent_page_cpl, ctx);
 	uint64_t lba_count = bs_byte_to_lba(bs, SPDK_BS_PAGE_SIZE);
 	uint64_t lba = bs_md_page_to_lba(blob->bs,  ctx->extent_page);
 	bs->w_io++;
-	bs_batch_write_zeroes_dev(batch, lba, lba_count);
 
-	bs_batch_close(batch);
+	if (bs->md_journal) {
+		bs_md_journal_write(bs->md_journal, seq, NULL, lba, lba_count, blob_write_zero_extent_page_cpl, ctx, MD_JOURNAL_WRITE_ZEROS);
+		return;
+	}
+	bs_sequence_write_zeroes_dev(seq, lba, lba_count, blob_write_zero_extent_page_cpl, ctx);
 }
 
 static void
@@ -12858,6 +13072,13 @@ blob_write_extent_page_ready(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	}
 
 	ctx->bs->w_io++;
+	if (ctx->bs->md_journal) {
+		bs_md_journal_write(ctx->bs->md_journal, seq, ctx->page, bs_md_page_to_lba(ctx->bs, ctx->extent),
+		      bs_byte_to_lba(ctx->bs, SPDK_BS_PAGE_SIZE),
+		      blob_persist_extent_page_cpl, ctx, MD_JOURNAL_WRITE);
+		return;
+	}
+
 	bs_sequence_write_dev(seq, ctx->page, bs_md_page_to_lba(ctx->bs, ctx->extent),
 		      bs_byte_to_lba(ctx->bs, SPDK_BS_PAGE_SIZE),
 		      blob_persist_extent_page_cpl, ctx);
@@ -15067,6 +15288,18 @@ bs_update_replay_blobid(struct spdk_bs_update_ctx *ctx)
 }
 
 static void
+bs_update_journal_recovery_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct spdk_bs_update_ctx *ctx = cb_arg;
+
+	if (bserrno != 0) {
+		bs_update_live_done(ctx, bserrno);
+		return;
+	}
+	bs_update_replay_md(ctx);
+}
+
+static void
 bs_recover_on_update(struct spdk_bs_update_ctx *ctx)
 {
 	int		rc;
@@ -15100,6 +15333,15 @@ bs_recover_on_update(struct spdk_bs_update_ctx *ctx)
 		return;
 	}
 	ctx->bs->num_free_clusters = ctx->bs->total_clusters;
+
+	if (ctx->failover) {
+		// journal recovery on failover
+		if (ctx->bs->md_journal) {
+			bs_md_journal_recovery_on_failover(ctx->bs->md_journal, ctx->seq, bs_update_journal_recovery_cpl, ctx, false);
+			return;
+		}
+	}
+
 	bs_update_replay_md(ctx);
 }
 
