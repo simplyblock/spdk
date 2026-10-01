@@ -256,6 +256,7 @@ struct spdk_lvs_xfer {
 	uint32_t outstanding_io;
 	uint64_t current_offset;
 	uint64_t timeout;
+	uint64_t terminate_timeout;     /* the task will be terminated after this time*/
 	struct spdk_poller 	*tmo_poller;
 	// char bdev_name[SPDK_LVOL_NAME_MAX];
 	char snapshot_name[SPDK_LVOL_NAME_MAX];
