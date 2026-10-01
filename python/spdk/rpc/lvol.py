@@ -204,7 +204,7 @@ def bdev_lvol_create(client, lvol_name, size_in_mib, thin_provision=False, uuid=
     params['lvol_priority_class'] = lvol_priority_class
     return client.call('bdev_lvol_create', params)
 
-def bdev_lvol_s3_backup(client, s3_id=0, snapshot_names=None, cluster_batch=16):
+def bdev_lvol_s3_backup(client, s3_id=0, snapshot_names=None, s3_bdev=None, cluster_batch=16):
     """
     Trigger an S3 backup operation for one or more lvol snapshots.
 
@@ -213,8 +213,14 @@ def bdev_lvol_s3_backup(client, s3_id=0, snapshot_names=None, cluster_batch=16):
     in batches of clusters.
 
     Args:
-        s3_id (int): Identifier of the S3 target used for the backup (required).
-        snapshot_names (list[str]): List of snapshot lvol names to back up (required).
+        s3_id (int): Identifier this backup's objects are keyed by (required).
+            Must be below 2**30 -- the data plane packs it into 30 bits of the
+            I/O offset and masks rather than validates, so a larger value
+            silently aliases onto another backup's keys.
+        snapshot_names (list[str]): Snapshot lvol names, NEWEST FIRST (required).
+            Their cluster maps are unioned first-writer-wins, so the newest
+            snapshot's allocation must be seen first.
+        s3_bdev (str): Name of the S3 device to write through (required).
         cluster_batch (int): Number of cluster transfer requests processed
             concurrently in the internal transfer queue (default: 16).
 
@@ -222,17 +228,20 @@ def bdev_lvol_s3_backup(client, s3_id=0, snapshot_names=None, cluster_batch=16):
         RPC response object from the SPDK target.
 
     Raises:
-        ValueError: If snapshot_names is not provided or s3_id is invalid.
+        ValueError: If snapshot_names or s3_bdev is not provided, or s3_id is invalid.
     """
     if not snapshot_names:
         raise ValueError("snapshots names must be specified")
     if s3_id <= 0:
         raise ValueError("s3_id must be specified")
+    if not s3_bdev:
+        raise ValueError("s3_bdev must be specified")
 
-    params = {'s3_id': s3_id, 'snapshot_names': snapshot_names, 'cluster_batch': cluster_batch}
+    params = {'s3_id': s3_id, 'snapshot_names': snapshot_names, 's3_bdev': s3_bdev,
+              'cluster_batch': cluster_batch}
     return client.call('bdev_lvol_s3_backup', params)
 
-def bdev_lvol_s3_merge(client, uuid=None, lvs_name=None, s3_id=0, old_s3_id=0, cluster_batch=16):
+def bdev_lvol_s3_merge(client, uuid=None, lvs_name=None, s3_id=0, old_s3_id=0, s3_bdev=None, cluster_batch=16):
     """
     Trigger an S3 merge operation between two S3 backups.
 
@@ -245,6 +254,7 @@ def bdev_lvol_s3_merge(client, uuid=None, lvs_name=None, s3_id=0, old_s3_id=0, c
         client: RPC client instance.
         s3_id (int): Identifier of the destination S3 backup (required).
         old_s3_id (int): Identifier of the source S3 backup to merge from (required).
+        s3_bdev (str): Name of the S3 device holding both backups (required).
         cluster_batch (int): Number of cluster transfer requests processed
             concurrently in the internal transfer queue (default: 16).
 
@@ -258,8 +268,11 @@ def bdev_lvol_s3_merge(client, uuid=None, lvs_name=None, s3_id=0, old_s3_id=0, c
         raise ValueError("Either uuid or lvs_name must be specified, but not both")
     if s3_id <= 0 or old_s3_id <= 0:
         raise ValueError("s3_id must be specified")
+    if not s3_bdev:
+        raise ValueError("s3_bdev must be specified")
 
-    params = {'s3_id': s3_id, 'old_s3_id': old_s3_id, 'cluster_batch': cluster_batch}
+    params = {'s3_id': s3_id, 'old_s3_id': old_s3_id, 's3_bdev': s3_bdev,
+              'cluster_batch': cluster_batch}
 
     if uuid is not None:
         params['uuid'] = uuid
@@ -268,7 +281,7 @@ def bdev_lvol_s3_merge(client, uuid=None, lvs_name=None, s3_id=0, old_s3_id=0, c
 
     return client.call('bdev_lvol_s3_merge', params)
 
-def bdev_lvol_s3_recovery(client, lvol_name=None, s3_ids=0, cluster_batch=16):
+def bdev_lvol_s3_recovery(client, lvol_name=None, s3_ids=0, s3_bdev=None, cluster_batch=16):
     """
     Recover an lvol from one or more S3 backups.
 
@@ -280,8 +293,14 @@ def bdev_lvol_s3_recovery(client, lvol_name=None, s3_ids=0, cluster_batch=16):
     Args:
         client: RPC client instance.
         lvol_name (str): Name of the logical volume to be recovered (required).
-        s3_ids (list[int]): Ordered list of S3 backup identifiers used
-            for recovery (required).
+        s3_ids (list[int]): S3 backup identifiers forming the chain, NEWEST
+            FIRST (required). Each cluster is claimed by the first identifier
+            that offers it, so the newest backup's data wins and older ones fill
+            the gaps. Passing these oldest-first restores stale data with no
+            error.
+        s3_bdev (str): Name of the S3 device to read from (required). An
+            lvolstore may carry more than one -- its own bucket plus one
+            attached for a restore from another cluster's bucket.
         cluster_batch (int): Number of cluster transfer requests processed
             concurrently in the internal transfer queue (default: 16).
 
@@ -289,14 +308,17 @@ def bdev_lvol_s3_recovery(client, lvol_name=None, s3_ids=0, cluster_batch=16):
         RPC response object from the SPDK target.
 
     Raises:
-        ValueError: If lvol_name or s3_ids is not provided or invalid.
+        ValueError: If lvol_name, s3_ids or s3_bdev is not provided or invalid.
     """
     if not lvol_name:
         raise ValueError("lvol_name must be specified")
     if not s3_ids:
         raise ValueError("s3_ids must be specified")
+    if not s3_bdev:
+        raise ValueError("s3_bdev must be specified")
 
-    params = {'lvol_name': lvol_name, 's3_ids': s3_ids, 'cluster_batch': cluster_batch}
+    params = {'lvol_name': lvol_name, 's3_ids': s3_ids, 's3_bdev': s3_bdev,
+              'cluster_batch': cluster_batch}
     return client.call('bdev_lvol_s3_recovery', params)
 
 def bdev_lvol_s3_bdev(client, bdev=None, uuid=None, lvs_name=None):
