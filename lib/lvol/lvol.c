@@ -5261,17 +5261,15 @@ xfer_status_check(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req **preq, u
 		return -1;
 	}
 
-	if (xfer->lvol && xfer->lvol->transfer_status == XFER_FAILED) {
+	if (xfer->lvol && xfer->lvol->transfer_status == XFER_FAILED && xfer->state != XFER_STATE_FAILED) {
 		xfer->state = XFER_STATE_FAILED;
 		return -1;
 	}
 
 	if (xfer->final_step) {
-		if (current_time > xfer->terminate_timeout) {
+		if (current_time > xfer->terminate_timeout && xfer->state != XFER_STATE_FAILED) {
 			SPDK_ERRLOG("Task transfer terminate timeout for %s with type %s\n", xfer->lvol ? xfer->lvol->name : "NULL", xfer_type_to_string(xfer->type));
 			xfer->state = XFER_STATE_FAILED;
-			xfer->lvol->transfer_status = XFER_FAILED;
-			return -1;
 		}
 	}
 
