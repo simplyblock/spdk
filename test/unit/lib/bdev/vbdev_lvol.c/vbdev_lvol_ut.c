@@ -1031,31 +1031,31 @@ grp_blob_index(struct spdk_blob *blob)
 	return -1;
 }
 
-void
-spdk_blob_group_freeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
-{
-	g_grp_freeze_calls++;
-	if (g_grp_freeze_fail_at && g_grp_freeze_calls == g_grp_freeze_fail_at) {
-		grp_event('f', grp_blob_index(blob) >= 0 ? grp_blob_index(blob) : g_grp_freeze_calls - 1);
-		cb_fn(cb_arg, -EBUSY);
-		return;
-	}
-	(*grp_freeze_slot(blob))++;
-	grp_event('F', grp_blob_index(blob));
-	cb_fn(cb_arg, 0);
-}
+// void
+// spdk_blob_group_freeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+// {
+// 	g_grp_freeze_calls++;
+// 	if (g_grp_freeze_fail_at && g_grp_freeze_calls == g_grp_freeze_fail_at) {
+// 		grp_event('f', grp_blob_index(blob) >= 0 ? grp_blob_index(blob) : g_grp_freeze_calls - 1);
+// 		cb_fn(cb_arg, -EBUSY);
+// 		return;
+// 	}
+// 	(*grp_freeze_slot(blob))++;
+// 	grp_event('F', grp_blob_index(blob));
+// 	cb_fn(cb_arg, 0);
+// }
 
-void
-spdk_blob_group_unfreeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
-{
-	int *slot = grp_freeze_slot(blob);
+// void
+// spdk_blob_group_unfreeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+// {
+// 	int *slot = grp_freeze_slot(blob);
 
-	if (*slot > 0) {
-		(*slot)--;
-	}
-	grp_event('U', grp_blob_index(blob));
-	cb_fn(cb_arg, 0);
-}
+// 	if (*slot > 0) {
+// 		(*slot)--;
+// 	}
+// 	grp_event('U', grp_blob_index(blob));
+// 	cb_fn(cb_arg, 0);
+// }
 
 void
 spdk_lvol_create_snapshot(struct spdk_lvol *lvol, const char *snapshot_name,

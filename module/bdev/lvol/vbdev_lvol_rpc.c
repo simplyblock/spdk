@@ -3425,6 +3425,7 @@ struct rpc_bdev_lvol_s3_backup {
 	// uint64_t offset;
 	uint32_t cluster_batch;
 	uint32_t s3_id;	
+	char *s3_bdev;
 	struct rpc_bdev_lvol_s3_backup_snapshots snapshot_names;
 };
 
@@ -3441,6 +3442,7 @@ decode_snapshot_names(const struct spdk_json_val *val, void *out)
 
 static void 
 free_rpc_bdev_lvol_s3_backup(struct rpc_bdev_lvol_s3_backup *req) {
+	free(req->s3_bdev);
 	for (size_t i = 0; i < req->snapshot_names.num; i++) {
 		free(req->snapshot_names.names[i]);
 	}
@@ -3450,6 +3452,10 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_s3_backup_decoders[] 
 	// {"offset", offsetof(struct rpc_bdev_lvol_s3_backup, offset), spdk_json_decode_uint64},
 	{"cluster_batch", offsetof(struct rpc_bdev_lvol_s3_backup, cluster_batch), spdk_json_decode_uint32, true},
 	{"s3_id", offsetof(struct rpc_bdev_lvol_s3_backup, s3_id), spdk_json_decode_uint32},
+	/* Required: an lvolstore may carry several S3 devices, and defaulting to
+	 * "the first" is ambiguous exactly during a restore from a foreign bucket.
+	 * A missing parameter is rejected by the decoder rather than guessed. */
+	{"s3_bdev", offsetof(struct rpc_bdev_lvol_s3_backup, s3_bdev), spdk_json_decode_string},
 	{"snapshot_names", offsetof(struct rpc_bdev_lvol_s3_backup, snapshot_names), decode_snapshot_names},
 };
 
@@ -3472,8 +3478,10 @@ rpc_bdev_lvol_s3_backup(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 	
-	if (req.s3_id == 0) {
-		SPDK_ERRLOG("s3_id must be specified");
+	/* The offset packing masks s3_id to S3_ID_BITS and does not validate, so a
+	 * larger value silently aliases onto another backup's object keys. */
+	if (req.s3_id == 0 || req.s3_id >= (1u << S3_ID_BITS)) {
+		SPDK_ERRLOG("s3_id must be non-zero and below %u\n", 1u << S3_ID_BITS);
 		spdk_jsonrpc_send_error_response(request, -EINVAL, spdk_strerror(EINVAL));
 		goto cleanup;
 	} else if (req.s3_id & ~(S3_ID_MASK)) {
@@ -3512,10 +3520,14 @@ rpc_bdev_lvol_s3_backup(struct spdk_jsonrpc_request *request,
 
 	SPDK_NOTICELOG("Backing up lvol %s to S3 id %u.\n", snapshot_chain[0]->name,  req.s3_id);
 
-	rc = spdk_lvol_s3_backup(snapshot_chain[0], req.cluster_batch, snapshot_chain, req.snapshot_names.num, req.s3_id);
+	rc = spdk_lvol_s3_backup(snapshot_chain[0], req.cluster_batch, snapshot_chain,
+				 req.snapshot_names.num, req.s3_id, req.s3_bdev);
 	if (rc < 0) {
-		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
-						 spdk_strerror(-rc));
+		/* The real errno as the JSON-RPC error code (not always
+		 * INVALID_PARAMS) so a caller can distinguish -EBUSY -- the
+		 * target tdev already has another transfer in flight, worth
+		 * retrying -- from every other, non-retryable failure. */
+		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
 		goto cleanup;
 	}
 	spdk_jsonrpc_send_bool_response(request, true);
@@ -3529,6 +3541,7 @@ SPDK_RPC_REGISTER("bdev_lvol_s3_backup", rpc_bdev_lvol_s3_backup, SPDK_RPC_RUNTI
 struct rpc_bdev_lvol_s3_merge {
 	char *uuid;
 	char *lvs_name;
+	char *s3_bdev;
 	uint32_t old_s3_id;
 	uint32_t s3_id;
 	uint32_t cluster_batch;
@@ -3536,6 +3549,7 @@ struct rpc_bdev_lvol_s3_merge {
 
 static void 
 free_rpc_bdev_lvol_s3_merge(struct rpc_bdev_lvol_s3_merge *req) {
+	free(req->s3_bdev);
 	free(req->uuid);
 	free(req->lvs_name);
 }
@@ -3546,6 +3560,7 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_s3_merge_decoders[] =
 	{"old_s3_id", offsetof(struct rpc_bdev_lvol_s3_merge, old_s3_id), spdk_json_decode_uint32},
 	{"cluster_batch", offsetof(struct rpc_bdev_lvol_s3_merge, cluster_batch), spdk_json_decode_uint32},
 	{"s3_id", offsetof(struct rpc_bdev_lvol_s3_merge, s3_id), spdk_json_decode_uint32},
+	{"s3_bdev", offsetof(struct rpc_bdev_lvol_s3_merge, s3_bdev), spdk_json_decode_string},
 };
 
 static void 
@@ -3565,8 +3580,10 @@ rpc_bdev_lvol_s3_merge(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
-	if (req.old_s3_id == 0 || req.s3_id == 0) {
-		SPDK_ERRLOG("old_s3_id and s3_id must be specified");
+	if (req.old_s3_id == 0 || req.s3_id == 0
+	    || req.old_s3_id >= (1u << S3_ID_BITS) || req.s3_id >= (1u << S3_ID_BITS)) {
+		SPDK_ERRLOG("old_s3_id and s3_id must be non-zero and below %u\n",
+			    1u << S3_ID_BITS);
 		spdk_jsonrpc_send_error_response(request, -EINVAL, spdk_strerror(EINVAL));
 		goto cleanup;
 	}
@@ -3580,10 +3597,9 @@ rpc_bdev_lvol_s3_merge(struct spdk_jsonrpc_request *request,
 	// SPDK_NOTICELOG("Backing up lvol %s to S3 id %u.\n", req.lvol_name,  req.s3_id);
 	SPDK_NOTICELOG("Backing up s3 id %u to S3 id %u.\n", req.old_s3_id,  req.s3_id);
 
-	rc = spdk_lvol_s3_merge(lvs, req.s3_id, req.old_s3_id, req.cluster_batch);
+	rc = spdk_lvol_s3_merge(lvs, req.s3_id, req.old_s3_id, req.cluster_batch, req.s3_bdev);
 	if (rc < 0) {
-		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
-						 spdk_strerror(-rc));
+		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
 		goto cleanup;
 	}
 	spdk_jsonrpc_send_bool_response(request, true);
@@ -3648,6 +3664,7 @@ struct rpc_bdev_lvol_recovery_s3_ids {
 
 struct rpc_bdev_lvol_s3_recovery {
 	char *lvol_name;
+	char *s3_bdev;
 	uint32_t cluster_batch;
 	struct rpc_bdev_lvol_recovery_s3_ids s3_ids;  /* JSON array */
 };
@@ -3665,12 +3682,14 @@ decode_s3_ids(const struct spdk_json_val *val, void *out)
 
 static void 
 free_rpc_bdev_lvol_s3_recovery(struct rpc_bdev_lvol_s3_recovery *req) {
+	free(req->s3_bdev);
 	free(req->lvol_name);	
 }
 
 static const struct spdk_json_object_decoder rpc_bdev_lvol_s3_recovery_decoders[] = {
 	{"lvol_name", offsetof(struct rpc_bdev_lvol_s3_recovery, lvol_name), spdk_json_decode_string},
 	{"cluster_batch", offsetof(struct rpc_bdev_lvol_s3_recovery, cluster_batch), spdk_json_decode_uint32},
+	{"s3_bdev", offsetof(struct rpc_bdev_lvol_s3_recovery, s3_bdev), spdk_json_decode_string},
 	{"s3_ids", offsetof(struct rpc_bdev_lvol_s3_recovery, s3_ids), decode_s3_ids},
 };
 
@@ -3736,10 +3755,10 @@ rpc_bdev_lvol_s3_recovery(struct spdk_jsonrpc_request *request,
 
 	SPDK_NOTICELOG("Recovering lvol %s from S3.\n", req.lvol_name);
 
-	rc = spdk_lvol_s3_recovery(lvol, req.cluster_batch, s3_ids_chain, req.s3_ids.num);
+	rc = spdk_lvol_s3_recovery(lvol, req.cluster_batch, s3_ids_chain, req.s3_ids.num,
+				   req.s3_bdev);
 	if (rc < 0) {
-		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
-						 spdk_strerror(-rc));
+		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
 		goto cleanup;
 	}
 	spdk_jsonrpc_send_bool_response(request, true);
@@ -3818,7 +3837,6 @@ struct rpc_bdev_lvol_transfer_final_step {
 	char *gateway;
 	char *snapshot_name;
 	char *operation;
-	bool special_io;
 };
 
 static void 
@@ -3835,7 +3853,6 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_transfer_final_step_d
 	{"cluster_batch", offsetof(struct rpc_bdev_lvol_transfer_final_step, cluster_batch), spdk_json_decode_uint32, true},
 	{"gateway", offsetof(struct rpc_bdev_lvol_transfer_final_step, gateway), spdk_json_decode_string},
 	{"snapshot_name", offsetof(struct rpc_bdev_lvol_transfer_final_step, snapshot_name), spdk_json_decode_string},
-	{"special_io", offsetof(struct rpc_bdev_lvol_transfer_final_step, special_io), spdk_json_decode_bool, true},
 	{"operation", offsetof(struct rpc_bdev_lvol_transfer_final_step, operation), spdk_json_decode_string},
 };
 
@@ -3934,9 +3951,8 @@ rpc_bdev_lvol_transfer_final_step(struct spdk_jsonrpc_request *request,
 	}
 	SPDK_NOTICELOG("Transfering lvol %s in mode %s for final step.\n", req.lvol_name, req.operation);
 
-	rc = spdk_lvol_transfer(lvol, 0, req.cluster_batch, type, tdev, req.snapshot_name, req.lvol_id, false,
-							req.special_io,
-		 					rpc_bdev_lvol_transfer_final_step_cb, request);
+	rc = spdk_lvol_transfer(lvol, 0, req.cluster_batch, type, tdev, req.snapshot_name, req.lvol_id,
+		 											rpc_bdev_lvol_transfer_final_step_cb, request);
 	if (rc < 0) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 spdk_strerror(-rc));
@@ -4135,8 +4151,6 @@ struct rpc_bdev_lvol_transfer {
 	uint32_t cluster_batch;
 	char *gateway;
 	char *operation;
-	bool allow_partial;
-	bool special_io;
 };
 
 static void 
@@ -4153,8 +4167,6 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_transfer_decoders[] =
 	{"gateway", offsetof(struct rpc_bdev_lvol_transfer, gateway), spdk_json_decode_string},	
 	{"operation", offsetof(struct rpc_bdev_lvol_transfer, operation), spdk_json_decode_string},
 	{"lvol_id", offsetof(struct rpc_bdev_lvol_transfer, lvol_id), spdk_json_decode_uint32, true},
-	{"allow_partial", offsetof(struct rpc_bdev_lvol_transfer, allow_partial), spdk_json_decode_bool, true},
-	{"special_io", offsetof(struct rpc_bdev_lvol_transfer, special_io), spdk_json_decode_bool, true},
 };
 
 static void 
@@ -4221,8 +4233,7 @@ rpc_bdev_lvol_transfer(struct spdk_jsonrpc_request *request,
 	}
 	SPDK_NOTICELOG("Transfering lvol %s in %s mode.\n", req.lvol_name, req.operation);
 
-	rc = spdk_lvol_transfer(lvol, req.offset, req.cluster_batch, type, tdev, NULL, req.lvol_id,
-				req.allow_partial, req.special_io, NULL, NULL);
+	rc = spdk_lvol_transfer(lvol, req.offset, req.cluster_batch, type, tdev, NULL, req.lvol_id, NULL, NULL);
 	if (rc < 0) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 spdk_strerror(-rc));
@@ -4295,9 +4306,6 @@ rpc_bdev_lvol_transfer_stat(struct spdk_jsonrpc_request *request,
 		spdk_json_write_named_string(w, "transfer_state", "No process");
 	}
 	spdk_json_write_named_uint64(w, "offset", lvol->last_offset);
-	spdk_json_write_named_uint64(w, "partial_reqs", lvol->xfer_partial_reqs);
-	spdk_json_write_named_uint64(w, "full_clusters", lvol->xfer_full_clusters);
-	spdk_json_write_named_uint64(w, "pages_sent", lvol->xfer_pages_sent);
 	spdk_json_write_object_end(w);
 	// spdk_json_write_array_end(w);
 	spdk_jsonrpc_end_result(request, w);
@@ -4307,73 +4315,6 @@ cleanup:
 }
 
 SPDK_RPC_REGISTER("bdev_lvol_transfer_stat", rpc_bdev_lvol_transfer_stat, SPDK_RPC_RUNTIME)
-
-struct rpc_bdev_lvol_dirty_bitmap_info {
-	char *lvol_name;
-};
-
-static void
-free_rpc_bdev_lvol_dirty_bitmap_info(struct rpc_bdev_lvol_dirty_bitmap_info *req)
-{
-	free(req->lvol_name);
-}
-
-static const struct spdk_json_object_decoder rpc_bdev_lvol_dirty_bitmap_info_decoders[] = {
-	{"lvol_name", offsetof(struct rpc_bdev_lvol_dirty_bitmap_info, lvol_name), spdk_json_decode_string},
-};
-
-/* Inspect the in-memory dirty generation of an lvol/snapshot: whether writes
- * are being tracked, whether the generation is COMPLETE (a valid basis for a
- * partial transfer), and how much data it marks dirty. */
-static void
-rpc_bdev_lvol_dirty_bitmap_info(struct spdk_jsonrpc_request *request,
-				const struct spdk_json_val *params)
-{
-	struct rpc_bdev_lvol_dirty_bitmap_info req = {};
-	struct spdk_bdev *bdev;
-	struct spdk_lvol *lvol;
-	struct blob_dirty_gen *gen;
-	struct spdk_json_write_ctx *w;
-
-	if (spdk_json_decode_object(params, rpc_bdev_lvol_dirty_bitmap_info_decoders,
-				    SPDK_COUNTOF(rpc_bdev_lvol_dirty_bitmap_info_decoders),
-				    &req)) {
-		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
-						 "spdk_json_decode_object failed");
-		goto cleanup;
-	}
-
-	bdev = spdk_bdev_get_by_name(req.lvol_name);
-	if (bdev == NULL) {
-		SPDK_INFOLOG(lvol_rpc, "bdev '%s' does not exist\n", req.lvol_name);
-		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
-		goto cleanup;
-	}
-
-	lvol = vbdev_lvol_get_from_bdev(bdev);
-	if (lvol == NULL) {
-		SPDK_ERRLOG("lvol does not exist\n");
-		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
-		goto cleanup;
-	}
-
-	gen = spdk_blob_get_dirty_gen(lvol->blob);
-
-	w = spdk_jsonrpc_begin_result(request);
-	spdk_json_write_object_begin(w);
-	spdk_json_write_named_bool(w, "tracking", gen != NULL);
-	spdk_json_write_named_bool(w, "complete", spdk_blob_dirty_gen_complete(gen));
-	spdk_json_write_named_uint64(w, "gen_id", spdk_blob_dirty_gen_id(gen));
-	spdk_json_write_named_uint64(w, "clusters_tracked", spdk_blob_dirty_gen_tracked(gen));
-	spdk_json_write_named_uint64(w, "dirty_bytes", spdk_blob_dirty_gen_bytes(gen));
-	spdk_json_write_object_end(w);
-	spdk_jsonrpc_end_result(request, w);
-
-cleanup:
-	free_rpc_bdev_lvol_dirty_bitmap_info(&req);
-}
-
-SPDK_RPC_REGISTER("bdev_lvol_dirty_bitmap_info", rpc_bdev_lvol_dirty_bitmap_info, SPDK_RPC_RUNTIME)
 
 struct rpc_bdev_lvol_set_migration_flag {
 	char *lvol_name;

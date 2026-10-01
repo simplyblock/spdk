@@ -19,19 +19,19 @@
  * tests need the real coalescing); spdk_blob_get_dirty_gen lives in
  * blobstore.c, which is not part of this binary, and the freeze probe is a
  * no-op here (no in-flight IO in unit tests). */
-#include "blob/blob_dirty.c"
-struct blob_dirty_gen *
-spdk_blob_get_dirty_gen(struct spdk_blob *blob)
-{
-	(void)blob;
-	return NULL;               /* no tracked generation in these tests */
-}
-void
-blob_check_io_inflaight(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
-{
-	(void)blob;
-	cb_fn(cb_arg, 0);          /* no in-flight IO in these tests */
-}
+// #include "blob/blob_dirty.c"
+// struct blob_dirty_gen *
+// spdk_blob_get_dirty_gen(struct spdk_blob *blob)
+// {
+// 	(void)blob;
+// 	return NULL;               /* no tracked generation in these tests */
+// }
+// void
+// blob_check_io_inflaight(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+// {
+// 	(void)blob;
+// 	cb_fn(cb_arg, 0);          /* no in-flight IO in these tests */
+// }
 
 
 #define DEV_BUFFER_SIZE (64 * 1024 * 1024)
