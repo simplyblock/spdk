@@ -9,7 +9,7 @@ include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 SO_VER := 12
 SO_MINOR := 0
 
-C_SRCS = blobstore.c request.c zeroes.c blob_bs_dev.c
+C_SRCS = blobstore.c request.c zeroes.c blob_bs_dev.c blob_dirty.c
 LIBNAME = blob
 
 SPDK_MAP_FILE = $(abspath $(CURDIR)/spdk_blob.map)

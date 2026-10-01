@@ -23,6 +23,7 @@
 #include "spdk/log.h"
 
 #include "blobstore.h"
+#include "blob_dirty.h"
 
 #define BLOB_CRC32C_INITIAL    0xffffffffUL
 #define BLOB_CLEAR_EXTENTS_BATCH_SIZE 500
@@ -405,6 +406,8 @@ blob_free(struct spdk_blob *blob)
 
 	xattrs_free(&blob->xattrs);
 	xattrs_free(&blob->xattrs_internal);
+
+	// blob_dirty_gen_free(blob->dirty_gen);
 
 	if (blob->back_bs_dev) {
 		blob_unref_back_bs_dev(blob);
@@ -2651,7 +2654,7 @@ blob_persist_clear_clusters(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	size_t				i;
 	uint64_t			lba;
 	uint64_t			lba_count;
-	// uint64_t	index = 0;
+	uint64_t	index = 0;
 
 	/* Clusters don't move around in blobs. The list shrinks or grows
 	 * at the end, but no changes ever occur in the middle of the list.
@@ -2694,16 +2697,16 @@ blob_persist_clear_clusters(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 
 		/* If a run of LBAs previously existing, clear them now */
 		if (lba_count > 0) {
-			// if (special_io) {
-			// 	SPDK_NOTICELOG("spatial unmap blob %" PRIu64 ": lba=%" PRIu64 ", real_offset=%" PRIu64 ", CNT=%" PRIu64 ", index=%" PRIu64 "\n", blob->id, lba, (index * blob->bs->pages_per_cluster), lba_count, index);
-			// }
+			if (special_io) {
+				SPDK_NOTICELOG("spatial unmap blob %" PRIu64 ": lba=%" PRIu64 ", real_offset=%" PRIu64 ", CNT=%" PRIu64 ", index=%" PRIu64 "\n", blob->id, lba, (index * blob->bs->pages_per_cluster), lba_count, index);
+			}
 			bs_batch_clear_dev(ctx->blob, batch, lba, lba_count);
-			// index = 0;
+			index = 0;
 		}
 
 		/* Start building the next batch */
 		lba = next_lba;
-		// index = i;
+		index = i;
 		if (next_lba > 0) {
 			lba_count = next_lba_count;
 		} else {
@@ -2713,9 +2716,9 @@ blob_persist_clear_clusters(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 
 	/* If we ended with a contiguous set of LBAs, clear them now */
 	if (lba_count > 0) {
-		// if (special_io) {
-		// 		SPDK_NOTICELOG("spatial unmap blob %" PRIu64 ": lba=%" PRIu64 ", real_offset=%" PRIu64 ", CNT=%" PRIu64 ",index=%" PRIu64 "\n", blob->id, lba, (index * blob->bs->pages_per_cluster), lba_count, index);
-		// }
+		if (special_io) {
+				SPDK_NOTICELOG("spatial unmap blob %" PRIu64 ": lba=%" PRIu64 ", real_offset=%" PRIu64 ", CNT=%" PRIu64 ",index=%" PRIu64 "\n", blob->id, lba, (index * blob->bs->pages_per_cluster), lba_count, index);
+		}
 		bs_batch_clear_dev(ctx->blob, batch, lba, lba_count);
 	}
 
@@ -3039,6 +3042,11 @@ blob_resize_secondary(struct spdk_blob *blob, uint64_t sz)
 		}
 	}
 
+	/* Same rule as blob_resize(): a shrink is not expressible as a delta. */
+	// if (sz < blob->active.num_clusters) {
+	// 	blob_dirty_gen_invalidate(blob->dirty_gen);
+	// }
+
 	blob->active.num_clusters = sz;
 	blob->active.num_extent_pages = new_num_ep;
 	
@@ -3158,6 +3166,18 @@ blob_resize(struct spdk_blob *blob, uint64_t sz)
 			blob->active.num_allocated_clusters--;
 		}
 	}
+
+	/* A SHRINK drops clusters out of the blob's map exactly like a
+	 * cluster-freeing unmap does, and a dirty generation cannot express
+	 * "this cluster is gone": a delta built on it would leave the stale
+	 * pre-shrink content on the destination, and a later re-grow would
+	 * reallocate the cluster from the parent with only the new writes
+	 * marked. Growing is safe (the added clusters are unallocated, and the
+	 * transfer only ever visits allocated ones), so only shrinking gives
+	 * up the generation. */
+	// if (sz < blob->active.num_clusters) {
+	// 	blob_dirty_gen_invalidate(blob->dirty_gen);
+	// }
 
 	blob->active.num_clusters = sz;
 	blob->active.num_extent_pages = new_num_ep;
@@ -3950,6 +3970,23 @@ spdk_free_cluster_unmap_complete(void *cb_arg, int bserrno)
 				       ctx->extent_page, ctx->md_page, blob_free_cluster_cpl, ctx);
 }
 
+static inline void
+blob_dirty_mark_io_units(struct spdk_blob *blob, uint64_t offset, uint64_t length)
+{
+	// if (spdk_likely(blob->dirty_gen == NULL)) {
+	// 	return;
+	// }
+	// blob_dirty_mark(blob->dirty_gen, offset * blob->bs->io_unit_size,
+	// 		length * blob->bs->io_unit_size);
+}
+
+struct blob_dirty_gen *
+spdk_blob_get_dirty_gen(struct spdk_blob *blob)
+{
+	// return blob ? blob->dirty_gen : NULL;
+	return NULL;
+}
+
 static void
 blob_request_submit_op_single(struct spdk_io_channel *_ch, struct spdk_blob *blob,
 			      void *payload, uint64_t offset, uint64_t length,
@@ -4016,6 +4053,12 @@ blob_request_submit_op_single(struct spdk_io_channel *_ch, struct spdk_blob *blo
 				cb_fn(cb_arg, 0);
 				return;
 			}
+
+			/* Every host mutation funnels through this allocated
+			 * branch (a COW-triggering write re-executes here after
+			 * the cluster copy), so this is the single tracking
+			 * point for the dirty bitmap. */
+			// blob_dirty_mark_io_units(blob, offset, length);
 
 			uint8_t special_io = (blob->migration_flag & (op_type == SPDK_BLOB_WRITE)) ? 1 : 0;
 			batch = bs_batch_open_s(_ch, &cpl, special_io, blob);
@@ -4096,6 +4139,12 @@ blob_request_submit_op_single(struct spdk_io_channel *_ch, struct spdk_blob *blo
 
 			cpl.u.blob_basic.cb_fn = spdk_free_cluster_unmap_complete;
 			cpl.u.blob_basic.cb_arg = ctx;
+
+			/* The cluster leaves the blob's map entirely; a partial
+			 * transfer built on this generation could no longer
+			 * express "this cluster is gone", so the generation is
+			 * no longer a valid delta basis. */
+			// blob_dirty_gen_invalidate(blob->dirty_gen);
 		}
 
 		batch = bs_batch_open(_ch, &cpl, blob);
@@ -4106,6 +4155,12 @@ blob_request_submit_op_single(struct spdk_io_channel *_ch, struct spdk_blob *blo
 		}
 
 		if (is_allocated) {
+			// if (ctx == NULL) {
+			// 	/* Range unmap inside an allocated cluster: the
+			// 	 * blocks now read as zeroes, which the delta
+			// 	 * must carry like any other modification. */
+			// 	blob_dirty_mark_io_units(blob, offset, length);
+			// }
 			bs_batch_unmap_dev(batch, lba, lba_count);
 		}
 
@@ -4370,6 +4425,7 @@ blob_request_submit_rw_iov(struct spdk_blob *blob, struct spdk_io_channel *_chan
 
 				seq->ext_io_opts = ext_io_opts;
 
+				// blob_dirty_mark_io_units(blob, offset, length);
 				bs_sequence_writev_dev(seq, iov, iovcnt, lba, lba_count, rw_iov_done, NULL);
 			} else {
 				/* Queue this operation and allocate the cluster */
@@ -7194,7 +7250,12 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 		cb_fn(cb_arg, NULL, -EINVAL);
 		return;
 	}
-	bs_opts_print(o);
+	/* `o` is optional -- NULL means "use the defaults", which the block
+	 * below relies on. Printing it unconditionally dereferenced NULL and
+	 * crashed every caller that passed no opts. */
+	if (o != NULL) {
+		bs_opts_print(o);
+	}
 	spdk_bs_opts_init(&opts, sizeof(opts));
 	if (o) {
 		if (bs_opts_copy(o, &opts)) {
@@ -7753,7 +7814,7 @@ spdk_bs_get_super(struct spdk_blob_store *bs,
 void
 spdk_bs_set_leader(struct spdk_blob_store *bs, bool state)
 {
-	bs->is_leader = state;	
+	bs->is_leader = state;
 }
 
 void
@@ -8136,6 +8197,12 @@ bs_create_blob(struct spdk_blob_store *bs,
 	blob->map_id = map_id;
 	blob->geometry = opts_local.geometry;
 	blob->use_extent_table = opts_local.use_extent_table;
+
+	/* A brand-new blob owns nothing yet, so a fresh dirty generation tracks
+	 * every write from birth (complete). Blobs LOADED from disk get none:
+	 * their history is unknown and their transfers stay full until the
+	 * next snapshot rotation hands them a fresh generation. */
+	// blob->dirty_gen = blob_dirty_gen_create(bs->cluster_sz);
 	if (blob->use_extent_table) {
 		blob->invalid_flags |= SPDK_BLOB_EXTENT_TABLE;
 	}
@@ -8426,6 +8493,18 @@ bs_snapshot_swap_cluster_maps(struct spdk_blob *blob1, struct spdk_blob *blob2)
 	extent_page_temp = blob1->active.extent_pages;
 	blob1->active.extent_pages = blob2->active.extent_pages;
 	blob2->active.extent_pages = extent_page_temp;
+
+	/* The dirty generation describes exactly the clusters in the map it
+	 * tracked, so it travels with the map. On the forward swap the new
+	 * snapshot takes the clone's populated generation and the clone takes
+	 * the empty, complete generation the snapshot blob received at
+	 * creation -- which IS the rotation. The error-path unwind calls swap
+	 * everything straight back. */
+	// {
+	// 	struct blob_dirty_gen *dirty_temp = blob1->dirty_gen;
+	// 	blob1->dirty_gen = blob2->dirty_gen;
+	// 	blob2->dirty_gen = dirty_temp;
+	// }
 }
 
 /* Copies an internal xattr */
@@ -8474,6 +8553,25 @@ bs_snapshot_origblob_sync_cpl(void *cb_arg, int bserrno)
 		bs_clone_snapshot_origblob_cleanup(ctx, bserrno);
 		return;
 	}
+
+	/* Dirty-generation family cap: live (clone) + the two newest snapshots.
+	 * Walk the new snapshot's ancestor chain and drop bitmaps older than
+	 * its immediate predecessor. Ancestors that are not open lost their
+	 * generation with blob_free already. */
+	// {
+	// 	struct spdk_blob *anc = newblob;
+	// 	int depth = 0;
+
+	// 	while (anc != NULL && anc->parent_id != 0 &&
+	// 	       anc->parent_id != SPDK_BLOBID_INVALID && depth < 64) {
+	// 		anc = blob_lookup(newblob->bs, anc->parent_id);
+	// 		depth++;
+	// 		if (anc != NULL && depth >= 2 && anc->dirty_gen != NULL) {
+	// 			blob_dirty_gen_free(anc->dirty_gen);
+	// 			anc->dirty_gen = NULL;
+	// 		}
+	// 	}
+	// }
 
 	bs_blob_list_add(ctx->original.blob);
 
@@ -8570,7 +8668,18 @@ bs_snapshot_freeze_cpl(void *cb_arg, int rc)
 		return;
 	}
 
-	ctx->frozen = true;
+	/* This path does NOT take the freeze itself -- bs_snapshot_newblob_open_cpl
+	 * calls us directly rather than through blob_freeze_io, because the caller
+	 * is required to already hold one (spdk_lvol_create_snapshot takes it via
+	 * spdk_snapshot_freeze_blob, and a consistency group holds one across all
+	 * its members). The cleanup path unfreezes whatever `frozen` claims, so
+	 * claiming a freeze we never had made blob_unfreeze_io decrement a zero
+	 * refcount. frozen_refcnt is a uint32_t and the assert guarding it is
+	 * compiled out by -DNDEBUG, so it wrapped to ~0u and the blob looked
+	 * frozen for ever: every subsequent write was queued and never executed
+	 * or completed -- silent data loss, and a dirty generation that reported
+	 * no writes at all. Only release a freeze that actually exists. */
+	ctx->frozen = (origblob->frozen_refcnt > 0);
 
 	if (blob_is_esnap_clone(origblob)) {
 		/* Clean up any channels associated with the original blob id because future IO will
@@ -8806,6 +8915,26 @@ spdk_blob_get_freeze_cnt(struct spdk_blob *blob)
 {
 	/* get Freeze count on blob */
 	return blob->frozen_refcnt;
+}
+
+void
+spdk_blob_group_freeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	/* Consistency-group freeze: refcount only. Deliberately NOT taking
+	 * locked_operation_in_progress -- the group holds its freeze across the
+	 * per-member snapshot creations, and each of those takes its own
+	 * spdk_snapshot_freeze_blob, which refuses when that flag is set. The
+	 * group window therefore relies purely on frozen_refcnt staying >= 1
+	 * from before the first member snapshot until after the last. */
+	blob_verify_md_op(blob);
+	blob_freeze_io(blob, cb_fn, cb_arg);
+}
+
+void
+spdk_blob_group_unfreeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	blob_verify_md_op(blob);
+	blob_unfreeze_io(blob, cb_fn, cb_arg);
 }
 
 /* END spdk_bs_create_snapshot */
@@ -11853,7 +11982,7 @@ blob_clear_clusters_async(spdk_bs_sequence_t *seq, struct spdk_blob	*blob)
 	size_t				i;
 	uint64_t			lba;
 	uint64_t			lba_count;
-	// uint64_t	index = 0;
+	uint64_t	index = 0;
 
 	uint8_t special_io = blob->migration_flag ? 1 : 0;
 	batch = bs_sequence_to_batch_s(seq, blob->geometry, special_io, blob_clear_clusters_async_cpl, blob);
@@ -11889,16 +12018,16 @@ blob_clear_clusters_async(spdk_bs_sequence_t *seq, struct spdk_blob	*blob)
 
 		/* If a run of LBAs previously existing, clear them now */
 		if (lba_count > 0) {
-			// if (special_io) {
-			// 	SPDK_NOTICELOG("spatial unmap blob %" PRIu64 ": lba=%" PRIu64 ", real_offset=%" PRIu64 ", CNT=%" PRIu64 ", index=%" PRIu64 "\n", blob->id, lba, (index * blob->bs->pages_per_cluster), lba_count, index);
-			// }
+			if (special_io) {
+				SPDK_NOTICELOG("spatial unmap blob %" PRIu64 ": lba=%" PRIu64 ", real_offset=%" PRIu64 ", CNT=%" PRIu64 ", index=%" PRIu64 "\n", blob->id, lba, (index * blob->bs->pages_per_cluster), lba_count, index);
+			}
 			bs_batch_clear_dev(blob, batch, lba, lba_count);
-			// index = 0;
+			index = 0;
 		}
 
 		/* Start building the next batch */
 		lba = next_lba;
-		// index = i;
+		index = i;
 		if (next_lba > 0) {
 			lba_count = next_lba_count;
 		} else {
@@ -11908,9 +12037,9 @@ blob_clear_clusters_async(spdk_bs_sequence_t *seq, struct spdk_blob	*blob)
 
 	/* If we ended with a contiguous set of LBAs, clear them now */
 	if (lba_count > 0) {
-		// if (special_io) {
-		// 		SPDK_NOTICELOG("spatial unmap blob %" PRIu64 ": lba=%" PRIu64 ", real_offset=%" PRIu64 ", CNT=%" PRIu64 ",index=%" PRIu64 "\n", blob->id, lba, (index * blob->bs->pages_per_cluster), lba_count, index);
-		// }
+		if (special_io) {
+				SPDK_NOTICELOG("spatial unmap blob %" PRIu64 ": lba=%" PRIu64 ", real_offset=%" PRIu64 ", CNT=%" PRIu64 ",index=%" PRIu64 "\n", blob->id, lba, (index * blob->bs->pages_per_cluster), lba_count, index);
+		}
 		bs_batch_clear_dev(blob, batch, lba, lba_count);
 	}
 
@@ -12238,6 +12367,17 @@ bs_open_blob_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 
 	spdk_bit_array_set(blob->bs->open_blobids, blob->id);
 	RB_INSERT(spdk_blob_tree, &blob->bs->open_blobs, blob);
+
+	/* Dirty tracking epoch: a writable blob that owns NO clusters yet can
+	 * start a COMPLETE generation at open -- every cluster it will ever own
+	 * gets its first write tracked from here on. This is the path a fresh
+	 * lvol actually takes (bs_create_blob's in-memory object is not the one
+	 * the lvol layer opens), and it is restart-safe by construction: a blob
+	 * reopened WITH data keeps dirty_gen == NULL and transfers stay full. */
+	// if (blob->dirty_gen == NULL && !blob->data_ro &&
+	//     blob->active.num_allocated_clusters == 0) {
+	// 	blob->dirty_gen = blob_dirty_gen_create(blob->bs->cluster_sz);
+	// }
 
 	bs_sequence_finish(seq, bserrno);
 }
@@ -15536,14 +15676,14 @@ spdk_read_cluster_data_xfer(struct spdk_blob *blob, void *buf, uint64_t offset, 
 	bs->r_io++;
 	if (type == XFER_MIGRATE_SNAPSHOT) {
 		blob_calculate_lba_and_lba_count(blob, offset, length, &lba, &lba_count);
-		// uint64_t	index = 0;
-		// if (blob->bs->pages_per_cluster_shift != 0) {
-		// 	index = bs_io_unit_to_page(blob->bs, offset) >> blob->bs->pages_per_cluster_shift;
-		// } else {
-		// 	index = bs_io_unit_to_page(blob->bs, offset) / blob->bs->pages_per_cluster;
-		// }
+		uint64_t	index = 0;
+		if (blob->bs->pages_per_cluster_shift != 0) {
+			index = bs_io_unit_to_page(blob->bs, offset) >> blob->bs->pages_per_cluster_shift;
+		} else {
+			index = bs_io_unit_to_page(blob->bs, offset) / blob->bs->pages_per_cluster;
+		}
 
-		// SPDK_NOTICELOG("blob %" PRIu64 " spatial read: lba=%" PRIu64 ", real_offset=%" PRIu64 ", index=%" PRIu64 "\n", blob->id, lba, offset, index);
+		SPDK_NOTICELOG("blob %" PRIu64 " spatial read: lba=%" PRIu64 ", real_offset=%" PRIu64 ", index=%" PRIu64 "\n", blob->id, lba, offset, index);
 		bs_batch_read_dev(batch, buf, lba, 8 * bs_byte_to_lba(bs, SPDK_BS_PAGE_SIZE));
 	} else {
 		// byte to lba = block cnt -> block_cnt in 4k * page per cluster = bs_io_unit_to_back_dev_lba(blob, lba_len)

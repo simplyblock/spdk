@@ -437,9 +437,9 @@ raid_bdev_readv_blocks_ext(struct raid_base_bdev_info *base_info, struct spdk_io
 	 										((uint64_t)used_bits->geometry << GEOMETRY_BITS_POS) |
 											((uint64_t)used_bits->special_io << SPECIAL_IO_BITS_POS) | (base_info->data_offset + offset_blocks);
 
-	// if (used_bits->special_io) {
-	// 	SPDK_NOTICELOG("raid: lba=%lu,(H) %"PRIx64" trace id=%"PRIu64" 1,\n", priority_lba, priority_lba, used_bits->trace_id);
-	// }
+	if (used_bits->special_io) {
+		SPDK_NOTICELOG("raid: lba=%lu,(H) %"PRIx64" trace id=%"PRIu64" 1,\n", priority_lba, priority_lba, used_bits->trace_id);
+	}
 
 	return spdk_bdev_readv_blocks_ext(base_info->desc, ch, iov, iovcnt,
 					  priority_lba, num_blocks, cb, cb_arg, opts);
@@ -470,9 +470,9 @@ raid_bdev_writev_blocks_ext(struct raid_base_bdev_info *base_info, struct spdk_i
 											((uint64_t)used_bits->geometry << GEOMETRY_BITS_POS) |
 											((uint64_t)used_bits->special_io << SPECIAL_IO_BITS_POS) | remapped_offset_blocks;
 
-	// if (used_bits->special_io) {
-	// 	SPDK_NOTICELOG("raid: lba=%lu,(H) %"PRIx64" trace id=%"PRIu64" 2,\n", priority_lba, priority_lba, used_bits->trace_id);
-	// }
+	if (used_bits->special_io) {
+		SPDK_NOTICELOG("raid: lba=%lu,(H) %"PRIx64" trace id=%"PRIu64" 2,\n", priority_lba, priority_lba, used_bits->trace_id);
+	}
 
 	return spdk_bdev_writev_blocks_ext(base_info->desc, ch, iov, iovcnt,
 					   priority_lba, num_blocks, cb, cb_arg, opts);
@@ -491,9 +491,9 @@ raid_bdev_unmap_blocks(struct raid_base_bdev_info *base_info, struct spdk_io_cha
 	 										((uint64_t)used_bits->geometry << GEOMETRY_BITS_POS) |
 											((uint64_t)used_bits->special_io << SPECIAL_IO_BITS_POS) | (base_info->data_offset + offset_blocks);
 	
-	// if (used_bits->special_io) {
-	// 	SPDK_NOTICELOG("raid: lba=%lu,(H) %"PRIx64" trace id=%"PRIu64" 3,\n", priority_lba, priority_lba, used_bits->trace_id);
-	// }
+	if (used_bits->special_io) {
+		SPDK_NOTICELOG("raid: lba=%lu,(H) %"PRIx64" trace id=%"PRIu64" 3,\n", priority_lba, priority_lba, used_bits->trace_id);
+	}
 
 	return spdk_bdev_unmap_blocks(base_info->desc, ch, priority_lba,
 				      num_blocks, cb, cb_arg);

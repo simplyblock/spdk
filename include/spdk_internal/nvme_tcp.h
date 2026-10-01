@@ -399,6 +399,40 @@ end:
 	return iovcnt - sgl.iovcnt;
 }
 
+// static int
+// nvme_tcp_read_data(struct spdk_sock *sock, int bytes,
+// 		   void *buf)
+// {
+// 	int ret;
+
+// 	ret = spdk_sock_recv(sock, buf, bytes);
+
+// 	if (ret > 0) {
+// 		return ret;
+// 	}
+
+// 	if (ret <= 0) {
+// 		if (errno == EAGAIN || errno == EWOULDBLOCK) {
+// 			return 0;
+// 		}
+
+// 		/* For connect reset issue, do not output error log */
+// 		// if (errno != ECONNRESET) {
+// 			SPDK_ERRLOG("spdk_sock_recv() failed, errno %d: %s\n",
+// 				    errno, spdk_strerror(errno));
+// 		// }
+// 	}
+
+// 	// if (ret == 0) {
+// 	// 	SPDK_ERRLOG("receive zero byte from spdk_sock_recv() failed, errno %d: %s\n",
+// 	// 			    errno, spdk_strerror(errno));
+// 	// }
+
+// 	/* connection closed */
+// 	return NVME_TCP_CONNECTION_FATAL;
+// }
+
+
 static int
 nvme_tcp_read_data(struct spdk_sock *sock, int bytes,
 		   void *buf)
@@ -411,22 +445,24 @@ nvme_tcp_read_data(struct spdk_sock *sock, int bytes,
 		return ret;
 	}
 
-	if (ret <= 0) {
-		if (errno == EAGAIN || errno == EWOULDBLOCK) {
-			return 0;
-		}
-
-		/* For connect reset issue, do not output error log */
-		// if (errno != ECONNRESET) {
-			SPDK_ERRLOG("spdk_sock_recv() failed, errno %d: %s\n",
-				    errno, spdk_strerror(errno));
-		// }
+	/* ret == 0 means orderly shutdown by the peer.
+	 * errno is undefined/stale in this case.
+	 */
+	if (ret == 0) {
+		/* connection closed */
+		return NVME_TCP_CONNECTION_FATAL;
 	}
 
-	// if (ret == 0) {
-	// 	SPDK_ERRLOG("receive zero byte from spdk_sock_recv() failed, errno %d: %s\n",
-	// 			    errno, spdk_strerror(errno));
-	// }
+	/* ret < 0: errno is meaningful. */
+	if (errno == EAGAIN || errno == EWOULDBLOCK) {
+		return 0;
+	}
+
+	/* For connection reset, optionally suppress the error log. */
+	if (errno != ECONNRESET) {
+		SPDK_ERRLOG("spdk_sock_recv() failed, errno %d: %s\n",
+			    errno, spdk_strerror(errno));
+	}
 
 	/* connection closed */
 	return NVME_TCP_CONNECTION_FATAL;

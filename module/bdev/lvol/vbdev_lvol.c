@@ -2565,6 +2565,237 @@ vbdev_lvol_create_snapshot(struct spdk_lvol *lvol, const char *snapshot_name,
 }
 
 
+/* --- consistency-group snapshots ------------------------------------------
+ *
+ * Sequence: group-freeze member 0..n-1  ->  snapshot member 0..n-1
+ *           ->  group-unfreeze member 0..n-1  ->  complete.
+ *
+ * The group freeze is a pure refcount (spdk_blob_group_freeze_io): each
+ * per-member vbdev_lvol_create_snapshot still takes its own
+ * spdk_snapshot_freeze_blob internally, which only moves the refcount
+ * between 1 and 2 inside the group window, so host IO on every member is
+ * parked from before the first snapshot until after the last -- that is
+ * what makes the set crash-consistent as a GROUP.
+ *
+ * Failure rules (per the feature spec): a freeze failure unwinds the
+ * freezes taken so far and fails without having created anything. A
+ * snapshot failure FIRST unfreezes every frozen member -- host IO must
+ * never stay parked because a snapshot failed -- and THEN garbage-collects
+ * the snapshots already taken, newest first.
+ */
+enum group_snap_phase {
+	GRP_SNAP_CREATE = 0,
+	GRP_SNAP_INPROCESS,
+	GRP_SNAP_GC,
+	GRP_SNAP_GC_INPROCESS
+};
+
+struct spdk_lvol_group_snap_entry;
+
+struct vbdev_lvol_group_snap_ctx {
+	struct spdk_lvol_group_snap_entry *entry;
+	struct vbdev_lvol_group_snap_entry	*entries;
+	uint32_t		count;
+	uint32_t		completed;	/* async completions plus submission reference */
+	uint32_t		idx;
+	enum group_snap_phase			phase;
+	int				rc;		/* first error, sticky */
+	vbdev_lvol_group_snapshot_complete	cb_fn;
+	void			*cb_arg;
+};
+
+struct spdk_lvol_group_snap_entry {
+	struct vbdev_lvol_group_snap_ctx	*ctx;
+	uint32_t	idx;
+};
+
+static void group_snap_advance(struct vbdev_lvol_group_snap_ctx *ctx);
+
+static void
+group_snap_complete(struct vbdev_lvol_group_snap_ctx *ctx)
+{
+	ctx->cb_fn(ctx->cb_arg, ctx->entries, ctx->count, ctx->rc);
+	free(ctx->entry);
+	free(ctx);
+}
+
+static void
+group_snap_create_cb(void *cb_arg, struct spdk_lvol *snap, int lvolerrno)
+{
+	struct spdk_lvol_group_snap_entry *entries = cb_arg;
+	struct vbdev_lvol_group_snap_ctx *ctx = entries->ctx;
+	ctx->completed++;
+	if (lvolerrno != 0 || snap == NULL) {
+		SPDK_ERRLOG("group snapshot: snapshot %s of member %s failed: %d\n",
+				ctx->entries[entries->idx].snapshot_name,
+				ctx->entries[entries->idx].lvol->name, lvolerrno);
+
+		if (ctx->rc == 0) {
+			ctx->rc = lvolerrno != 0 ? lvolerrno : -EIO;
+
+		}
+		group_snap_advance(ctx);
+		return;
+	}
+	ctx->entries[entries->idx].snap = snap;	
+	group_snap_advance(ctx);
+}
+
+static void
+group_snap_gc_cb(void *cb_arg, int lvolerrno)
+{
+	struct spdk_lvol_group_snap_entry *entries = cb_arg;
+	struct vbdev_lvol_group_snap_ctx *ctx = entries->ctx;
+	ctx->completed++;
+	if (lvolerrno != 0) {
+		SPDK_ERRLOG("group snapshot: GC of partial snapshot %u failed: %d "
+					"(snapshot left behind)\n", entries->idx, lvolerrno);
+	} else {
+		ctx->entries[entries->idx].snap = NULL;
+	}
+	group_snap_advance(ctx);
+}
+
+static void
+group_snap_advance(struct vbdev_lvol_group_snap_ctx *ctx)
+{
+	uint32_t i = 0;
+	switch (ctx->phase) {
+
+	case GRP_SNAP_CREATE:
+		ctx->entry = calloc(ctx->count, sizeof(*ctx->entry));
+		if (ctx->entry == NULL) {
+			SPDK_NOTICELOG("Snapshotting blob failed\n");
+			ctx->rc = -ENOMEM;
+			group_snap_complete(ctx);
+			return;
+		}
+
+		ctx->phase = GRP_SNAP_INPROCESS;
+
+		for (i = 0; i < ctx->count; i++) {
+			ctx->entry[i].ctx = ctx;
+			ctx->entry[i].idx = i;
+			vbdev_lvol_create_snapshot(ctx->entries[i].lvol,
+						   ctx->entries[i].snapshot_name,
+						   group_snap_create_cb, &ctx->entry[i]);
+		}
+		/*
+		* Account for the submission loop with one extra completion. A snapshot
+		* callback may run inline and call group_snap_advance(), but it must not
+		* complete/free ctx while this loop is still submitting requests.
+		*
+		* Each snapshot callback increments completed once. After all requests
+		* have been submitted, increment completed once more for the submission
+		* loop itself. Therefore this phase completes only when
+		* completed == count + 1.
+		*/
+		ctx->completed++;
+		group_snap_advance(ctx);
+		return;
+	case GRP_SNAP_INPROCESS:
+		if (ctx->completed != ctx->count + 1) {
+			SPDK_NOTICELOG("GRP_SNAP_INPROCESS: completed=%d, count=%d\n", ctx->completed, ctx->count);
+			return;
+		}
+
+		if (ctx->rc != 0) {
+			SPDK_ERRLOG("group snapshot creation failed: rc=%d\n", ctx->rc);
+			ctx->phase = GRP_SNAP_GC;
+			group_snap_advance(ctx);
+			return;
+		}
+
+		group_snap_complete(ctx);
+		return;
+	case GRP_SNAP_GC:
+		ctx->completed = 0;
+		ctx->idx = 0;
+		ctx->phase = GRP_SNAP_GC_INPROCESS;
+		for (i = 0; i < ctx->count; i++) {
+			if (ctx->entries[i].snap != NULL) {
+				ctx->idx++;
+				vbdev_lvol_destroy(ctx->entries[i].snap,
+						   group_snap_gc_cb, &ctx->entry[i], true);
+			}
+		}
+
+		/*
+		* Account for the GC submission loop with one extra completion. A destroy
+		* callback may run inline and call group_snap_advance(), but it must not
+		* complete/free ctx while this loop is still submitting requests.
+		*
+		* idx is the number of destroy requests submitted. Each destroy callback
+		* increments completed once, and the increment below accounts for the
+		* submission loop itself. Therefore GC completes only when
+		* completed == idx + 1.
+		*/
+		ctx->completed++;
+		group_snap_advance(ctx);
+		return;
+	case GRP_SNAP_GC_INPROCESS:
+		if (ctx->completed != ctx->idx + 1) {
+			SPDK_ERRLOG("GRP_SNAP_GC_INPROCESS: idx=%d, completed=%d\n", ctx->idx, ctx->completed);
+			return;
+		}
+		group_snap_complete(ctx);
+		return;
+	default:
+		assert(false);
+	}
+}
+
+void
+vbdev_lvol_create_snapshot_group(struct vbdev_lvol_group_snap_entry *entries,
+				 uint32_t count,
+				 vbdev_lvol_group_snapshot_complete cb_fn, void *cb_arg)
+{
+	struct vbdev_lvol_group_snap_ctx *ctx;
+	struct spdk_lvol_store *lvs = NULL;
+	uint32_t i;
+
+	if (count == 0 || entries == NULL) {
+		cb_fn(cb_arg, entries, count, -EINVAL);
+		return;
+	}
+
+	/* All members must share one LVS */
+	for (i = 0; i < count; i++) {
+		if (entries[i].lvol == NULL || entries[i].lvol->lvol_store == NULL) {
+			SPDK_ERRLOG("group snapshot: member %u missing or not in lvs %s\n",
+				    i, lvs ? lvs->name : "?");
+			cb_fn(cb_arg, entries, count, -EINVAL);
+			return;
+		}
+
+		if (lvs == NULL) {
+			lvs = entries[i].lvol->lvol_store;
+		} else if (entries[i].lvol->lvol_store != lvs) {
+			SPDK_ERRLOG("group snapshot: member %u not in same lvs %s\n",
+				    i, lvs->name);
+			cb_fn(cb_arg, entries, count, -EINVAL);
+			return;
+		}
+
+		entries[i].snap = NULL;
+	}
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL) {
+		SPDK_NOTICELOG("Snapshotting blob failed\n");
+		cb_fn(cb_arg, entries, count, -ENOMEM);
+		return;
+	}
+	ctx->entry = NULL;
+	ctx->entries = entries;
+	ctx->count = count;
+	ctx->cb_fn = cb_fn;
+	ctx->cb_arg = cb_arg;
+	ctx->phase = GRP_SNAP_CREATE;
+	group_snap_advance(ctx);
+}
+
+
 static void
 vbdev_lvol_update_snapshot_clone_cb(void *cb_arg, struct spdk_lvol *lvol, int lvolerrno)
 {
