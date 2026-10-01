@@ -17,7 +17,7 @@
 
 /* Default blob channel opts for lvol */
 #define SPDK_LVOL_BLOB_OPTS_CHANNEL_OPS 12000
-
+#define SPDK_LVOL_TRANSFER_TERMINATE_TIMEOUT 12 // 12 seconds timeout for final step of transfer
 #define LVOL_NAME "name"
 
 /* How long a finished merge's result stays queryable via bdev_lvol_s3_merge_stat
@@ -5432,6 +5432,15 @@ xfer_status_check(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req **preq, u
 		return -1;
 	}
 
+	if (xfer->final_step) {
+		if (current_time > xfer->terminate_timeout) {
+			SPDK_ERRLOG("Task transfer terminate timeout for %s with type %s\n", xfer->lvol ? xfer->lvol->name : "NULL", xfer_type_to_string(xfer->type));
+			xfer->state = XFER_STATE_FAILED;
+			xfer->lvol->transfer_status = XFER_FAILED;
+			return -1;
+		}
+	}
+
 	if (spdk_ring_dequeue(xfer->free_ring, (void **)preq, 1) == 0) {
 		if (current_time - xfer->timeout > timeout_ticks) {// in timeout consider outstanding io
 			if (xfer->outstanding_io == 0) {
@@ -5694,6 +5703,9 @@ xfer_migration(struct spdk_lvs_xfer *xfer) {
 			prepare_s3_clusters(lvol->blob, xfer->clusters, xfer->num_clusters, &count);
 			SPDK_NOTICELOG("Number clusters %u to migrate and total clusters %" PRIu32 " for lvol %s\n", count, xfer->num_clusters, lvol->name);
 			xfer->state = XFER_STATE_TRANSFER_CLUSTERS;
+			if (xfer->final_step) {
+				xfer->terminate_timeout = spdk_get_ticks() + (spdk_get_ticks_hz() * SPDK_LVOL_TRANSFER_TERMINATE_TIMEOUT);
+			}
 			xfer_fill_queue(xfer, xfer->cluster_batch);
 			break;
 
