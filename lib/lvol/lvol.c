@@ -1844,7 +1844,7 @@ origlvol_update_snapshot_create_cpl(void *cb_arg, int lvolerrno)
 	}
 
 	SPDK_NOTICELOG("update origlvol for create snapshot uuid %s name %s done.\n", origlvol->unique_id, origlvol->name);
-	spdk_lvol_set_leader(lvol);
+	spdk_lvol_set_leader(origlvol);
 	spdk_snapshot_freeze_blob(req->origlvol->blob, spdk_create_snapshot_freez_cpl, req);
 }
 
