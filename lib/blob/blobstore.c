@@ -14410,6 +14410,7 @@ bs_write_used_clusters_on_failover(spdk_bs_sequence_t *seq, void *arg, spdk_bs_s
 	ctx->mask = spdk_zmalloc(mask_size, 0x1000, NULL,
 				 SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
 	if (!ctx->mask) {
+		SPDK_ERRLOG("Update used clusters failed on memory allocation.\n");
 		bs_update_live_done(ctx, -ENOMEM);
 		return;
 	}
@@ -14453,6 +14454,7 @@ bs_write_used_blobids_on_failover(spdk_bs_sequence_t *seq, void *arg, spdk_bs_se
 	ctx->mask = spdk_zmalloc(mask_size, 0x1000, NULL, SPDK_ENV_SOCKET_ID_ANY,
 				 SPDK_MALLOC_DMA);
 	if (!ctx->mask) {
+		SPDK_ERRLOG("Update used blobids failed on memory allocation.\n");
 		bs_update_live_done(ctx, -ENOMEM);
 		return;
 	}
@@ -14549,6 +14551,7 @@ bs_write_used_md_on_failover(spdk_bs_sequence_t *seq, void *arg, spdk_bs_sequenc
 	ctx->mask = spdk_zmalloc(mask_size, 0x1000, NULL,
 				 SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
 	if (!ctx->mask) {
+		SPDK_ERRLOG("Update used md pages failed on memory allocation.\n");
 		bs_update_live_done(ctx, -ENOMEM);
 		return;
 	}
@@ -14569,7 +14572,11 @@ bs_update_write_used_clusters_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bse
 {
 	struct spdk_bs_update_ctx	*ctx = cb_arg;
 
+	spdk_free(ctx->mask);
+	ctx->mask = NULL;
+
 	if (bserrno != 0) {
+		SPDK_ERRLOG("Update used clusters failed.\n");
 		bs_update_live_done(ctx, bserrno);
 		return;
 	}
@@ -14586,6 +14593,7 @@ bs_update_write_used_blobids_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bser
 	ctx->mask = NULL;
 
 	if (bserrno != 0) {
+		SPDK_ERRLOG("Update used blobids failed.\n");
 		bs_update_live_done(ctx, bserrno);
 		return;
 	}
@@ -14601,7 +14609,8 @@ bs_update_write_used_pages_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrn
 	spdk_free(ctx->mask);
 	ctx->mask = NULL;
 
-	if (bserrno != 0) {		
+	if (bserrno != 0) {
+		SPDK_ERRLOG("Update used md pages failed.\n");	
 		bs_update_live_done(ctx, bserrno);
 		return;
 	}

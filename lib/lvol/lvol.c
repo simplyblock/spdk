@@ -2949,18 +2949,18 @@ lvs_update_on_failover_cpl(void *cb_arg, int lvolerrno)
 	if (lvolerrno == 0) {
 		spdk_lvs_set_leader(lvs, true);
 		lvs->timeout_trigger = 0;
-		SPDK_NOTICELOG("Update lvolstore done.\n");	
+		SPDK_NOTICELOG("Update lvolstore done.\n");
 		free(req);
 		TAILQ_FOREACH_SAFE(lvol, &lvs->pending_update_lvols, entry_to_update, tmp) {
 			TAILQ_REMOVE(&lvs->pending_update_lvols, lvol, entry_to_update);
-			assert(lvol->update_in_progress == true);		
+			assert(lvol->update_in_progress == true);
 			// still in md thread so we can call the load function
 			lvol_update_on_failover(lvs, lvol, false);
 		}
 		return;
 	}
 
-	SPDK_ERRLOG("Cannot update lvolstore on failover ...\n");
+	SPDK_ERRLOG("Cannot update lvolstore on failover ...rc = %d \n", lvolerrno);
 	if (lvolerrno == -ENOTCONN || (lvolerrno != 0 && lvs->timeout_trigger == 1)) {
     	SPDK_ERRLOG("Failed to update lvolstore during failover due to distrib-level functionality.\n");
     	SPDK_ERRLOG("Forcing application shutdown via abort.\n");

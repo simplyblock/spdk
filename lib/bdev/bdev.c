@@ -4133,6 +4133,7 @@ uint64_t
 spdk_bdev_io_set_send_msg_tsc(struct spdk_bdev_io *bdev_io)
 {
 	bdev_io->internal.send_msg_tsc = spdk_get_ticks();
+	return 0;
 }
 
 
