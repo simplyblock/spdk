@@ -2,7 +2,6 @@
 #include "request.h"
 #include "blobstore.h"
 #include "spdk/crc32.h"
-#include "spdk/blob.h"
 #include "spdk/queue.h"
 #include "spdk/log.h"
 
@@ -534,12 +533,6 @@ md_journal_submit_batch(struct md_journal_batch *batch)
 	 * blobstore IO batch.
 	 */
 	io_batch = bs_sequence_to_batch(batch->seq, 0, md_journal_batch_write_cpl, batch);
-	if (io_batch == NULL) {
-		batch->cb_fn(batch->seq, batch->cb_arg, -ENOMEM);
-		free(batch->entry);
-		free(batch);
-		return;
-	}
 
 	/*
 	 * Reserve/fill one journal element for every metadata page.
@@ -597,7 +590,7 @@ md_journal_process_waiting(struct spdk_bs_md_journal *jr)
 			return work;
 		}
 
-		if (jr->stopping) {
+		if (jr->stopping || jr->bs->is_leader == false || jr->failed) {
 			TAILQ_REMOVE(&jr->wait_queue, waiting_req, link);
 			if (waiting_req->type == MD_JOURNAL_WAIT_SINGLE) {
 				md_journal_terminate_waiting_single(waiting_req);
@@ -643,6 +636,19 @@ md_journal_process_waiting(struct spdk_bs_md_journal *jr)
 	return work;
 }
 
+static void
+md_journal_complete_home_waiters(struct spdk_bs_md_journal *jr, int rc)
+{
+	struct md_journal_home_waiter *waiter, *tmp;
+
+	TAILQ_FOREACH_SAFE(waiter, &jr->home_wait_queue, link, tmp) {
+		TAILQ_REMOVE(&jr->home_wait_queue, waiter, link);
+
+		waiter->cb_fn(waiter->seq, waiter->cb_arg, rc);
+		free(waiter);
+	}
+}
+
 void
 bs_md_journal_write(struct spdk_bs_md_journal *jr, spdk_bs_sequence_t *seq, void *payload,
 		    uint64_t lba, uint32_t lba_count,
@@ -651,7 +657,7 @@ bs_md_journal_write(struct spdk_bs_md_journal *jr, spdk_bs_sequence_t *seq, void
 	struct md_journal_wait_req *req;
 	struct md_journal_elem *elem;
 
-	if (jr == NULL || cb_fn == NULL || seq == NULL) {
+	if (jr == NULL || cb_fn == NULL || seq == NULL || jr->bs->is_leader == false) {
 		if (cb_fn != NULL) {
 			cb_fn(seq, cb_arg, -EINVAL);
 		}
@@ -682,7 +688,8 @@ bs_md_journal_write(struct spdk_bs_md_journal *jr, spdk_bs_sequence_t *seq, void
 	/*
 	 * Do not allow a new write to bypass older queued writes.
 	 */
-	if (TAILQ_EMPTY(&jr->wait_queue) && !jr->seq_resetting) {
+	if (TAILQ_EMPTY(&jr->wait_queue) && !jr->seq_resetting &&
+	    !(jr->recovering && !jr->examine)) {
 		elem = md_journal_get_free_elem(jr);
 		if (elem != NULL) {
 			md_journal_fill_elem(jr, elem, payload, lba, lba_count, type);
@@ -729,7 +736,7 @@ bs_md_journal_sequence_to_batch(struct spdk_bs_md_journal *jr, spdk_bs_sequence_
 	struct md_journal_batch *batch;
 	struct md_journal_op *entry;
 
-	if (jr == NULL || seq == NULL || cb_fn == NULL || capacity == 0) {
+	if (jr == NULL || seq == NULL || cb_fn == NULL || capacity == 0 || jr->bs->is_leader == false) {
 		return NULL;
 	}
 
@@ -853,8 +860,8 @@ bs_md_journal_batch_close(struct md_journal_batch *batch)
 	/*
 	 * Do not allow this batch to bypass an older waiting request.
 	 */
-	if (!TAILQ_EMPTY(&jr->wait_queue) || jr->free_count < batch->count || jr->seq_resetting) {
-
+	if (!TAILQ_EMPTY(&jr->wait_queue) || jr->free_count < batch->count || jr->seq_resetting ||
+				 (jr->recovering && !jr->examine)) {
 		req = calloc(1, sizeof(*req));
 		if (req == NULL) {
 			batch->cb_fn(batch->seq, batch->cb_arg, -ENOMEM);
@@ -878,6 +885,35 @@ bs_md_journal_batch_close(struct md_journal_batch *batch)
 	}
 
 	md_journal_submit_batch(batch);
+}
+
+static void
+md_journal_process_home_waiters(struct spdk_bs_md_journal *jr)
+{
+	struct md_journal_home_waiter *waiter, *tmp;
+
+	TAILQ_FOREACH_SAFE(waiter, &jr->home_wait_queue, link, tmp) {
+
+		if (waiter->target_seq > jr->home_durable_seq) {
+			if (jr->failed) {
+				TAILQ_REMOVE(&jr->home_wait_queue, waiter, link);
+				waiter->cb_fn(waiter->seq, waiter->cb_arg, jr->failure_rc);
+				free(waiter);
+			} else if (jr->bs->is_leader == false) {
+				TAILQ_REMOVE(&jr->home_wait_queue, waiter, link);
+				waiter->cb_fn(waiter->seq, waiter->cb_arg, -EIO);
+				free(waiter);
+			}
+
+			continue;
+		}
+
+		TAILQ_REMOVE(&jr->home_wait_queue, waiter, link);
+
+		waiter->cb_fn(waiter->seq, waiter->cb_arg, 0);
+
+		free(waiter);
+	}
 }
 
 static void
@@ -919,6 +955,13 @@ md_journal_fail(struct spdk_bs_md_journal *jr, int bserrno, const char *reason)
 
 		free(req);
 	}
+
+	md_journal_process_home_waiters(jr);
+}
+
+uint64_t
+bs_md_journal_next_seq_num(struct spdk_bs_md_journal *jr) {
+	return jr->next_seq;
 }
 
 static void
@@ -943,24 +986,21 @@ spdk_md_journal_batch_drain_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserr
 		* elements. Persistent journal state will be reconstructed by
 		* the next update/recovery.
 		*/
-
-		// for (i = drain_batch->elem_count; i > 0; i--) {
-		// 	elem = drain_batch->items[i - 1];
-		// 	assert(elem != NULL);
-		// 	assert(elem->state == MD_JOURNAL_ELEM_HOME_INFLIGHT);
-		// 	elem->state = MD_JOURNAL_ELEM_HOME_PENDING;
-		// 	TAILQ_INSERT_HEAD(&jr->home_queue, elem, link);
-		// }
-
 		memset(drain_batch->items, 0, sizeof(drain_batch->items));
 		drain_batch->elem_count = 0;
 		drain_batch->rc = 0;
 
 		md_journal_fail(jr, bserrno, "HOME");
-
-		// bs_sequence_finish(seq, bserrno);
 		return;
 	}
+
+	if (TAILQ_EMPTY(&jr->home_queue)) {
+		jr->home_durable_seq = jr->next_home_seq - 1;
+	} else {
+		jr->home_durable_seq = drain_batch->items[drain_batch->elem_count - 1]->seq;
+	}
+
+	md_journal_process_home_waiters(jr);
 
 	/*
 	 * All HOME writes in this blobstore batch are durable now.
@@ -972,9 +1012,10 @@ spdk_md_journal_batch_drain_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserr
 		elem = drain_batch->items[i];
 
 		elem->state = MD_JOURNAL_ELEM_ZERO_PENDING;
-
+		elem->drain_gen = jr->next_drain_gen;
 		TAILQ_INSERT_TAIL(&jr->zero_queue, elem, link);
 	}
+	jr->next_drain_gen++;
 
 	drain_batch = jr->drain_batch;
 	memset(drain_batch->items, 0, sizeof(drain_batch->items));
@@ -999,10 +1040,6 @@ spdk_md_journal_write_batch_drain(struct spdk_bs_md_journal *jr)
 	drain_batch = jr->drain_batch;
 
 	batch = bs_sequence_to_batch(jr->home_seq, 0, spdk_md_journal_batch_drain_cpl, jr);
-	if (batch == NULL) {
-		SPDK_ERRLOG("Failed to allocate MD journal HOME batch\n");
-		return -ENOMEM;
-	}
 
 	for (i = 0; i < drain_batch->elem_count; i++) {
 		elem = drain_batch->items[i];
@@ -1055,11 +1092,15 @@ md_journal_start_drain_batch(struct spdk_bs_md_journal *jr, bool force)
 {
 	struct md_journal_drain_batch *batch;
 	struct md_journal_elem *elem;
-	uint32_t i;
 
     if (jr->active_drain_batch || TAILQ_EMPTY(&jr->home_queue)) {
         return;
     }
+
+	if (jr->bs->is_leader == false) {
+		md_journal_process_home_waiters(jr);
+		return;
+	}
 	
 	batch = jr->drain_batch;
 
@@ -1108,27 +1149,11 @@ md_journal_start_drain_batch(struct spdk_bs_md_journal *jr, bool force)
 	 * We will implement the actual home IO and completion in
 	 * the next part.
 	 */
-	int rc = spdk_md_journal_write_batch_drain(jr);
-	if (rc != 0) {
-		/* restore elements to HOME queue */
-		/* active_drain_batch = false */
-
-		for (i = batch->elem_count; i > 0; i--) {
-			elem = batch->items[i - 1];
-			elem->state = MD_JOURNAL_ELEM_HOME_PENDING;
-			TAILQ_INSERT_HEAD(&jr->home_queue, elem, link);
-		}
-
-		memset(batch->items, 0, sizeof(batch->items));
-		batch->elem_count = 0;
-		batch->rc = 0;
-		jr->active_drain_batch = false;
-		return;
-	}
+	spdk_md_journal_write_batch_drain(jr);
 
 	if (jr->force_home_drain) {
 		jr->force_home_drain = false;
-	} 
+	}
 
 }
 
@@ -1143,7 +1168,7 @@ spdk_md_journal_zeroes_finished(void *cb_arg, int bserrno) {
 }
 
 static void
-spdk_md_journal_submit_zeroes_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+spdk_md_journal_submit_zeroes_v2_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
 	struct md_journal_drain_batch *zero_batch = cb_arg;
 	struct spdk_bs_md_journal *jr = zero_batch->journal;
@@ -1191,6 +1216,59 @@ spdk_md_journal_submit_zeroes_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bse
 	zero_batch->elem_count = 0;
 }
 
+static void
+spdk_md_journal_submit_zeroes_v1_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct md_journal_drain_batch *zero_batch = cb_arg;
+	struct spdk_bs_md_journal *jr = zero_batch->journal;
+	struct spdk_blob_store *bs = jr->bs;
+	struct md_journal_elem *elem;
+	spdk_bs_batch_t *batch;
+	uint64_t journal_lba, lba_count;
+
+	if (bserrno < 0) {
+		spdk_md_journal_submit_zeroes_v2_cpl(seq, cb_arg, bserrno);
+		return;
+	}
+
+	if (jr->bs->is_leader == false) {
+		spdk_md_journal_submit_zeroes_v2_cpl(seq, cb_arg, -EINVAL);
+		/*
+		* Leadership was lost between ZERO phase 1 and phase 2.
+		*
+		* This is not a journal IO failure.  Stop runtime ZERO processing.
+		* The remaining persistent journal entries will be handled by the
+		* next leader during recovery.
+		*/
+		SPDK_NOTICELOG("MD journal ZERO stopped after leadership loss\n");
+
+		jr->active_zero_batch = false;
+
+		memset(zero_batch->items, 0, sizeof(zero_batch->items));
+		zero_batch->elem_count = 0;
+		zero_batch->rc = 0;
+		return;
+	}
+
+	batch = bs_sequence_to_batch(jr->zero_seq, 0, spdk_md_journal_submit_zeroes_v2_cpl, zero_batch);
+	
+	for (uint32_t i = 0; i < zero_batch->elem_count; i++) {
+		elem = zero_batch->items[i];
+		if (elem == NULL) {
+			break;
+		}
+
+		if (elem->skip_home) {
+			continue;
+		}
+		elem->state = MD_JOURNAL_ELEM_ZERO_INFLIGHT;
+		journal_lba = bs_page_to_lba(jr->bs, jr->md_journal_mask_start + ((uint64_t)elem->slot * jr->blocks_per_entry));
+		lba_count = bs_byte_to_lba(jr->bs, BS_MD_JOURNAL_ENTRY_SIZE);
+		bs->w_io++;
+		bs_batch_write_zeroes_dev(batch, journal_lba, lba_count);
+	}
+	bs_batch_close(batch);
+}
 
 static int
 spdk_md_journal_submit_zeroes(struct spdk_bs_md_journal *jr)
@@ -1201,7 +1279,7 @@ spdk_md_journal_submit_zeroes(struct spdk_bs_md_journal *jr)
 	spdk_bs_batch_t *batch;
 	uint64_t journal_lba, lba_count;
 
-	if (jr->zero_batch == NULL) {
+	if (jr->zero_batch == NULL || jr->bs->is_leader == false) {
 		return -EINVAL;
 	}
 
@@ -1221,27 +1299,23 @@ spdk_md_journal_submit_zeroes(struct spdk_bs_md_journal *jr)
 		return 0;
 	}
 
-	batch = bs_sequence_to_batch(jr->zero_seq, 0, spdk_md_journal_submit_zeroes_cpl, zero_batch);
-	if (batch == NULL) {
-		SPDK_ERRLOG("Failed to allocate MD journal ZERO batch\n");
-		return -ENOMEM;
-	}
-	
+	batch = bs_sequence_to_batch(jr->zero_seq, 0, spdk_md_journal_submit_zeroes_v1_cpl, zero_batch);
+	uint32_t gen = TAILQ_FIRST(&jr->zero_queue)->drain_gen;
 	while (zero_batch->elem_count < BS_MD_JOURNAL_DRAIN_BATCH_SIZE) {
 		elem = TAILQ_FIRST(&jr->zero_queue);
-		if (elem == NULL) {
+		if (elem == NULL || elem->drain_gen != gen) {
 			break;
 		}
 
 		TAILQ_REMOVE(&jr->zero_queue, elem, link);
 
-		elem->state = MD_JOURNAL_ELEM_ZERO_INFLIGHT;
-		journal_lba = bs_page_to_lba(jr->bs, jr->md_journal_mask_start + ((uint64_t)elem->slot * jr->blocks_per_entry));
-		lba_count = bs_byte_to_lba(jr->bs, BS_MD_JOURNAL_ENTRY_SIZE);
-
-		bs->w_io++;
-		
-		bs_batch_write_zeroes_dev(batch, journal_lba, lba_count);
+		if (elem->skip_home) {
+			elem->state = MD_JOURNAL_ELEM_ZERO_INFLIGHT;
+			journal_lba = bs_page_to_lba(jr->bs, jr->md_journal_mask_start + ((uint64_t)elem->slot * jr->blocks_per_entry));
+			lba_count = bs_byte_to_lba(jr->bs, BS_MD_JOURNAL_ENTRY_SIZE);
+			bs->w_io++;
+			bs_batch_write_zeroes_dev(batch, journal_lba, lba_count);
+		}
 
 		zero_batch->items[zero_batch->elem_count++] = elem;
 	}
@@ -1258,7 +1332,7 @@ md_journal_discard_runtime_state(struct spdk_bs_md_journal *jr)
 	struct md_journal_elem *elem;
 
 	assert(jr != NULL);
-	assert(jr->failed);
+	assert(jr->failed || (jr->stopping && !jr->bs->is_leader));
 
 	/*
 	 * The journal instance is dead, but we must not destroy/reset
@@ -1347,6 +1421,7 @@ md_journal_reset_seq(struct spdk_bs_md_journal *jr)
 
 	jr->next_seq = 1;
 	jr->next_home_seq = 1;
+	jr->home_durable_seq = 0;
 
 	SPDK_NOTICELOG("MD journal sequence reset to 1\n");
 
@@ -1358,6 +1433,8 @@ md_journal_drain_poller(void *arg)
 {
 	struct spdk_bs_md_journal *jr = arg;
 	bool work = false;
+	spdk_blob_op_complete destroy_cb_fn;
+	struct spdk_blob_store *bs;
 
 	if (jr->stopping) {
 		/*
@@ -1374,7 +1451,7 @@ md_journal_drain_poller(void *arg)
 			return SPDK_POLLER_BUSY;
 		}
 
-		if (jr->failed) {
+		if (jr->failed || !jr->bs->is_leader) {
 			/*
 			* Journal instance is dead.
 			*
@@ -1385,8 +1462,12 @@ md_journal_drain_poller(void *arg)
 				return SPDK_POLLER_BUSY;
 			}
 
+			md_journal_complete_home_waiters(jr, -ESHUTDOWN);
 			spdk_poller_unregister(&jr->drain_poller);
+			destroy_cb_fn = jr->destroy_cb_fn;
+			bs = jr->bs;
 			md_journal_free(jr);
+			destroy_cb_fn(bs, 0);
 			return -1;
 		}
 
@@ -1406,12 +1487,17 @@ md_journal_drain_poller(void *arg)
 			md_journal_start_drain_batch(jr, true);
 		}
 
+		md_journal_complete_home_waiters(jr, -ESHUTDOWN);
+
 		if (!md_journal_can_destroy(jr)) {
 			return SPDK_POLLER_BUSY;
 		}
 
 		spdk_poller_unregister(&jr->drain_poller);
+		destroy_cb_fn = jr->destroy_cb_fn;
+		bs = jr->bs;
 		md_journal_free(jr);
+		destroy_cb_fn(bs, 0);
 		return -1;
 	}
 
@@ -1615,6 +1701,8 @@ spdk_md_journal_update_zero_finished(spdk_bs_sequence_t *seq, void *cb_arg, int 
 	struct spdk_bs_md_journal *jr = cb_arg;
 	int rc;
 
+	jr->recovering = false;
+
 	if (bserrno != 0) {
 		SPDK_ERRLOG("MD journal failover ZERO failed: rc=%d\n", bserrno);
 		jr->update_cb_fn(seq, jr->update_cb_arg, bserrno);
@@ -1633,10 +1721,43 @@ spdk_md_journal_update_zero_finished(spdk_bs_sequence_t *seq, void *cb_arg, int 
 	}
 
 	SPDK_NOTICELOG("MD journal failover recovery completed: \n");
-	jr->recovering = false;
 	jr->update_cb_fn(seq, jr->update_cb_arg, bserrno);
 }
 
+/* Second ZERO phase of the recovery: the newest slot per LBA. */
+static void
+spdk_md_journal_update_zero_latest(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct spdk_bs_md_journal *jr = cb_arg;
+	struct md_journal_elem *elem;
+	spdk_bs_batch_t *batch;
+	uint64_t journal_lba;
+	uint64_t lba_count;
+	uint32_t i;
+
+	if (bserrno != 0) {
+		spdk_md_journal_update_zero_finished(seq, jr, bserrno);
+		return;
+	}
+
+	batch = bs_sequence_to_batch(seq, 0, spdk_md_journal_update_zero_finished, jr);
+
+	lba_count = bs_byte_to_lba(jr->bs, BS_MD_JOURNAL_ENTRY_SIZE);
+
+	for (i = 0; i < jr->zero_batch->elem_count; i++) {
+		elem = jr->zero_batch->items[i];
+		if (md_journal_hash_get(jr, elem->hdr->target_lba) != elem) {
+			continue;	/* superseded: already zeroed in the first phase */
+		}
+		journal_lba = bs_page_to_lba(jr->bs, jr->md_journal_mask_start + ((uint64_t)elem->slot * jr->blocks_per_entry));
+
+		jr->bs->w_io++;
+
+		bs_batch_write_zeroes_dev(batch, journal_lba, lba_count);
+	}
+
+	bs_batch_close(batch);
+}
 
 static void
 spdk_md_journal_update_home_finished(spdk_bs_sequence_t *seq,
@@ -1666,12 +1787,15 @@ spdk_md_journal_update_home_finished(spdk_bs_sequence_t *seq,
 	 * Clear the complete persistent journal area.  We deliberately
 	 * zero every slot, including invalid/torn entries.
 	 */
-	batch = bs_sequence_to_batch(seq, 0, spdk_md_journal_update_zero_finished, jr);
+	batch = bs_sequence_to_batch(seq, 0, spdk_md_journal_update_zero_latest, jr);
 
 	lba_count = bs_byte_to_lba(jr->bs, BS_MD_JOURNAL_ENTRY_SIZE);
 
 	for (i = 0; i < jr->zero_batch->elem_count; i++) {
 		elem = jr->zero_batch->items[i];
+		if (md_journal_hash_get(jr, elem->hdr->target_lba) == elem) {
+			continue; /* write zero the old LBA first */
+		}
 		journal_lba = bs_page_to_lba(jr->bs, jr->md_journal_mask_start + ((uint64_t)elem->slot * jr->blocks_per_entry));
 
 		jr->bs->w_io++;
@@ -1743,6 +1867,8 @@ spdk_md_journal_update_read_finished(spdk_bs_sequence_t *seq, void *cb_arg, int 
 		valid_count++;
 		int rc = md_journal_hash_insert(jr, elem);
 		if (rc != 0) {
+			SPDK_ERRLOG("MD journal failover hash insert failed: slot=%u seq=%" PRIu64 "\n", i, elem->hdr->seq);
+			bserrno = rc;
 			goto error;
 		}
 	}
@@ -1764,10 +1890,6 @@ spdk_md_journal_update_read_finished(spdk_bs_sequence_t *seq, void *cb_arg, int 
 	}
 
 	batch = bs_sequence_to_batch(seq, 0, spdk_md_journal_update_home_finished, jr);
-	if (batch == NULL) {
-		bserrno = -ENOMEM;
-		goto error;
-	}
 
 	for (i = 0; i < jr->hash_size; i++) {
 		elem = jr->hash_table[i].elem;
@@ -1826,10 +1948,6 @@ bs_md_journal_recovery_on_failover(struct spdk_bs_md_journal *jr, spdk_bs_sequen
 	jr->examine = examine_flag;
 
 	batch = bs_sequence_to_batch(seq, 0, spdk_md_journal_update_read_finished, jr);
-	if (batch == NULL) {
-		jr->recovering = false;
-		return -ENOMEM;
-	}
 
 	lba_count = bs_byte_to_lba(jr->bs, BS_MD_JOURNAL_ENTRY_SIZE);
 
@@ -1846,6 +1964,54 @@ bs_md_journal_recovery_on_failover(struct spdk_bs_md_journal *jr, spdk_bs_sequen
 	}
 
 	bs_batch_close(batch);
+
+	return 0;
+}
+
+int
+md_journal_confirm_home_drain(struct spdk_bs_md_journal *jr, uint64_t target_seq,
+			      spdk_bs_sequence_t *seq, spdk_bs_sequence_cpl cb_fn, void *cb_arg)
+{
+	struct md_journal_home_waiter *waiter;
+
+	if (jr == NULL || cb_fn == NULL) {
+		return -EINVAL;
+	}
+
+	if (jr->failed) {
+		return jr->failure_rc != 0 ? jr->failure_rc : -EIO;
+	}
+
+	if (jr->stopping) {
+		return -ESHUTDOWN;
+	}
+
+	/*
+	 * Already HOME durable.
+	 *
+	 * I would still avoid calling cb_fn synchronously from here.
+	 * More on this below.
+	 */
+	if (target_seq <= jr->home_durable_seq) {
+		return 1;
+	}
+
+	waiter = calloc(1, sizeof(*waiter));
+	if (waiter == NULL) {
+		return -ENOMEM;
+	}
+
+	waiter->target_seq = target_seq;
+	waiter->cb_fn = cb_fn;
+	waiter->seq = seq;
+	waiter->cb_arg = cb_arg;
+
+	TAILQ_INSERT_TAIL(&jr->home_wait_queue, waiter, link);
+
+	/*
+	 * We explicitly need HOME progress now.
+	 */
+	jr->force_home_drain = true;
 
 	return 0;
 }
@@ -1874,15 +2040,23 @@ bs_md_journal_reset(struct spdk_bs_md_journal *jr)
 		return -EBUSY;
 	}
 
+
+
 	/*
-	 * There must not be requests waiting for journal slots.
-	 * The caller must stop admission before performing the
-	 * update/failover scan and reset.
+	 * Requests in wait_queue have no element and no seq yet; they were
+	 * queued while the recovery ran and are admitted by the poller with
+	 * the new generation.
 	 */
-	if (!TAILQ_EMPTY(&jr->wait_queue)) {
-		SPDK_ERRLOG("Cannot reset MD journal: wait queue is not empty\n");
-		return -EBUSY;
-	}
+	md_journal_complete_home_waiters(jr, 0);
+	// /*
+	//  * There must not be requests waiting for journal slots.
+	//  * The caller must stop admission before performing the
+	//  * update/failover scan and reset.
+	//  */
+	// if (!TAILQ_EMPTY(&jr->wait_queue)) {
+	// 	SPDK_ERRLOG("Cannot reset MD journal: wait queue is not empty\n");
+	// 	return -EBUSY;
+	// }
 
 	/*
 	 * At this point recovery/update must already have processed
@@ -1931,7 +2105,7 @@ bs_md_journal_reset(struct spdk_bs_md_journal *jr)
 	 */
 	jr->next_seq = 1;
 	jr->next_home_seq = 1;
-
+	jr->home_durable_seq = 0;
 	jr->journal_inflight = 0;
 
 	jr->active_drain_batch = false;
@@ -1988,6 +2162,8 @@ bs_md_journal_create(struct spdk_blob_store *bs, uint64_t md_journal_mask_start,
 
 	TAILQ_INIT(&jr->wait_queue);
 
+	TAILQ_INIT(&jr->home_wait_queue);
+
 	jr->force_home_drain = false;
 
 	struct spdk_bs_cpl home_cpl;
@@ -2019,7 +2195,8 @@ bs_md_journal_create(struct spdk_blob_store *bs, uint64_t md_journal_mask_start,
 	 */
 	jr->next_seq = 1;
 	jr->next_home_seq = 1;
-
+	jr->home_durable_seq = 0;
+	jr->next_drain_gen = 0;
 	jr->free_count = 0;
 	jr->journal_inflight = 0;
 
@@ -2066,12 +2243,81 @@ bs_md_journal_create(struct spdk_blob_store *bs, uint64_t md_journal_mask_start,
 	return jr;
 }
 
+static void
+spdk_md_journal_leader_zero_finished(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	// struct spdk_bs_md_journal *jr = cb_arg;
+
+	if (bserrno != 0) {
+		SPDK_ERRLOG("MD journal promotion recovery failed: rc=%d - dropping leadership\n",
+			    bserrno);
+		bs_sequence_finish(seq, bserrno);
+		return;
+	}
+
+	SPDK_NOTICELOG("MD journal ZERO completed: \n");
+	bs_sequence_finish(seq, bserrno);
+}
+
+static void
+md_journal_demote_msg(void *arg)
+{
+	struct spdk_blob_store *bs = arg;
+	struct spdk_bs_md_journal *jr = bs->md_journal;
+
+	if (jr == NULL || bs->is_leader) {
+		/* destroyed meanwhile, or promoted again */
+		return;
+	}
+
+	md_journal_complete_home_waiters(jr, -EIO);
+	bs_md_journal_reset(jr);
+}
+
 void
-bs_md_journal_destroy(struct spdk_bs_md_journal *jr)
+bs_md_journal_leadership_change(struct spdk_bs_md_journal *jr, spdk_bs_sequence_t *seq, bool state, bool lvs_state) {
+	int rc;
+
+	if (jr == NULL) {
+		if (seq) {
+			bs_sequence_finish(seq, -EINVAL);
+		}
+		return;
+	}
+
+	if (!state) {
+		spdk_thread_send_msg(jr->bs->md_thread, md_journal_demote_msg, jr->bs);
+		return;
+	}
+
+	if (!lvs_state && state) {
+		rc = bs_md_journal_recovery_on_failover(jr, seq, spdk_md_journal_leader_zero_finished, jr, false);
+		if (rc != 0) {
+			SPDK_ERRLOG("MD journal failover recovery failed: rc=%d\n", rc);
+			bs_sequence_finish(seq, rc);
+			return;
+		}
+	}
+}
+
+void
+bs_md_journal_destroy(struct spdk_bs_md_journal *jr, spdk_blob_op_complete cb_fn)
 {
 	if (jr == NULL) {
 		return;
 	}
 
+	if (jr->drain_poller == NULL) {	/* never started, nothing in flight */
+		struct spdk_blob_store *bs = jr->bs;
+		/* process_waiting only terminates requests when stopping */
+		jr->stopping = true;
+		md_journal_process_waiting(jr);
+		md_journal_complete_home_waiters(jr, -ESHUTDOWN);
+		md_journal_free(jr);
+		cb_fn(bs, 0);
+		return;
+	}
+
 	jr->stopping = true;
+	jr->destroy_cb_fn = cb_fn;
 }

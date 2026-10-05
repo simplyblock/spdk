@@ -479,7 +479,7 @@ void blob_freeze_on_failover(struct spdk_blob *blob);
 void spdk_blob_update_failed_cleanup(struct spdk_blob *blob,
 				 spdk_blob_op_complete cb_fn, void *cb_arg);
 
-void spdk_bs_set_leader(struct spdk_blob_store *bs, bool state);
+void spdk_bs_set_leader(struct spdk_blob_store *bs, bool state, bool lvs_state);
 void spdk_bs_set_role(struct spdk_blob_store *bs, node_role_t role);
 node_role_t node_role_from_string(const char *str);
 const char *node_role_to_string(node_role_t role);
@@ -1212,7 +1212,7 @@ int spdk_blob_set_read_only(struct spdk_blob *blob);
  * \param cb_fn Called when the operation is complete.
  * \param cb_arg Argument passed to function cb_fn.
  */
-void spdk_blob_sync_md(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
+void spdk_blob_sync_md(struct spdk_blob *blob, bool md_drain, spdk_blob_op_complete cb_fn, void *cb_arg);
 
 /**
  * Close a blob. This will automatically sync.

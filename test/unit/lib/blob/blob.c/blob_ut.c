@@ -1053,7 +1053,7 @@ blob_clone(void)
 
 	/* Mark blob as read only */
 	spdk_blob_set_read_only(blob);
-	spdk_blob_sync_md(blob, blob_op_complete, NULL);
+	spdk_blob_sync_md(blob, false, blob_op_complete, NULL);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 
@@ -1243,7 +1243,7 @@ blob_resize_test(void)
 	CU_ASSERT((free_clusters - 5) == spdk_bs_free_cluster_count(bs));
 	CU_ASSERT(spdk_blob_get_num_allocated_clusters(blob) == 3);
 
-	spdk_blob_sync_md(blob, blob_op_complete, NULL);
+	spdk_blob_sync_md(blob, false, blob_op_complete, NULL);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 	/* Now there are only 3 clusters in use */
@@ -1335,7 +1335,7 @@ blob_resize_thin_test(void)
 	CU_ASSERT(spdk_blob_get_num_allocated_clusters(blob) == 1);
 
 	/* Sync blob: 4 clusters were truncated but only 3 of them was allocated */
-	spdk_blob_sync_md(blob, blob_op_complete, NULL);
+	spdk_blob_sync_md(blob, false, blob_op_complete, NULL);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 	CU_ASSERT((free_clusters - 1) == spdk_bs_free_cluster_count(bs));
@@ -1375,7 +1375,7 @@ blob_read_only(void)
 	CU_ASSERT(blob->data_ro == false);
 	CU_ASSERT(blob->md_ro == false);
 
-	spdk_blob_sync_md(blob, bs_op_complete, NULL);
+	spdk_blob_sync_md(blob, false, bs_op_complete, NULL);
 	poll_threads();
 
 	CU_ASSERT(blob->data_ro == true);
@@ -2140,7 +2140,7 @@ blob_unmap(void)
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 
-	spdk_blob_sync_md(blob, blob_op_complete, NULL);
+	spdk_blob_sync_md(blob, false, blob_op_complete, NULL);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 	CU_ASSERT(spdk_blob_get_num_allocated_clusters(blob) == 0);
@@ -2334,7 +2334,7 @@ blob_parse_md(void)
 	free(xattr);
 	SPDK_CU_ASSERT_FATAL(rc == 0);
 
-	spdk_blob_sync_md(blob, blob_op_complete, NULL);
+	spdk_blob_sync_md(blob, false, blob_op_complete, NULL);
 	poll_threads();
 
 	/* Delete the blob and verify that number of pages returned to before its creation. */
@@ -2460,7 +2460,7 @@ bs_load(void)
 	blob = g_blob;
 
 	/* Verify that blobstore is marked dirty after first metadata sync */
-	spdk_blob_sync_md(blob, blob_op_complete, NULL);
+	spdk_blob_sync_md(blob, false, blob_op_complete, NULL);
 	CU_ASSERT(super_block->clean == 1);
 
 	/* Get the xattrs */
@@ -2623,7 +2623,7 @@ bs_load_pending_removal(void)
 	/* Remove parent_id from blob by removing BLOB_SNAPSHOT xattr */
 	blob_remove_xattr(blob, BLOB_SNAPSHOT, true);
 
-	spdk_blob_sync_md(blob, blob_op_complete, NULL);
+	spdk_blob_sync_md(blob, false, blob_op_complete, NULL);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 
@@ -3672,7 +3672,7 @@ blob_serialize_test(void)
 	}
 
 	for (i = 0; i < 2; i++) {
-		spdk_blob_sync_md(blob[i], blob_op_complete, NULL);
+		spdk_blob_sync_md(blob[i], false, blob_op_complete, NULL);
 		poll_threads();
 		CU_ASSERT(g_bserrno == 0);
 	}
@@ -4091,15 +4091,15 @@ blob_flags(void)
 	blob_md_ro->state = SPDK_BLOB_STATE_DIRTY;
 
 	g_bserrno = -1;
-	spdk_blob_sync_md(blob_invalid, blob_op_complete, NULL);
+	spdk_blob_sync_md(blob_invalid, false, blob_op_complete, NULL);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 	g_bserrno = -1;
-	spdk_blob_sync_md(blob_data_ro, blob_op_complete, NULL);
+	spdk_blob_sync_md(blob_data_ro, false, blob_op_complete, NULL);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 	g_bserrno = -1;
-	spdk_blob_sync_md(blob_md_ro, blob_op_complete, NULL);
+	spdk_blob_sync_md(blob_md_ro, false, blob_op_complete, NULL);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 
@@ -4154,7 +4154,7 @@ blob_flags(void)
 	CU_ASSERT(blob_md_ro->md_ro == true);
 
 	g_bserrno = -1;
-	spdk_blob_sync_md(blob_md_ro, blob_op_complete, NULL);
+	spdk_blob_sync_md(blob_md_ro, false, blob_op_complete, NULL);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 
@@ -4379,7 +4379,7 @@ blob_thin_prov_alloc(void)
 	CU_ASSERT(spdk_blob_get_num_clusters(blob) == 262144);
 	CU_ASSERT(spdk_blob_get_num_allocated_clusters(blob) == 0);
 
-	spdk_blob_sync_md(blob, blob_op_complete, NULL);
+	spdk_blob_sync_md(blob, false, blob_op_complete, NULL);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 	/* Sync must not change anything */
@@ -4401,7 +4401,7 @@ blob_thin_prov_alloc(void)
 	CU_ASSERT(spdk_blob_get_num_clusters(blob) == 3);
 	CU_ASSERT(spdk_blob_get_num_allocated_clusters(blob) == 0);
 
-	spdk_blob_sync_md(blob, blob_op_complete, NULL);
+	spdk_blob_sync_md(blob, false, blob_op_complete, NULL);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 	/* Sync must not change anything */
@@ -4540,7 +4540,7 @@ blob_thin_prov_rw(void)
 	CU_ASSERT(blob->active.num_clusters == 5);
 	CU_ASSERT(spdk_blob_get_num_allocated_clusters(blob) == 0);
 
-	spdk_blob_sync_md(blob, blob_op_complete, NULL);
+	spdk_blob_sync_md(blob, false, blob_op_complete, NULL);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 	/* Sync must not change anything */
@@ -4660,7 +4660,7 @@ blob_thin_prov_write_count_io(void)
 	CU_ASSERT(g_bserrno == 0);
 
 	g_bserrno = -1;
-	spdk_blob_sync_md(blob, blob_op_complete, NULL);
+	spdk_blob_sync_md(blob, false, blob_op_complete, NULL);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 	CU_ASSERT(free_clusters == spdk_bs_free_cluster_count(bs));
@@ -4700,7 +4700,7 @@ blob_thin_prov_write_count_io(void)
 		read_bytes = g_dev_read_bytes;
 
 		g_bserrno = -1;
-		spdk_blob_sync_md(blob, blob_op_complete, NULL);
+		spdk_blob_sync_md(blob, false, blob_op_complete, NULL);
 		poll_threads();
 		CU_ASSERT(g_bserrno == 0);
 		CU_ASSERT(free_clusters - (2 * i + 1) == spdk_bs_free_cluster_count(bs));
@@ -4810,7 +4810,7 @@ blob_thin_prov_unmap_cluster(void)
 	CU_ASSERT(g_bserrno == 0);
 
 	g_bserrno = -1;
-	spdk_blob_sync_md(blob, blob_op_complete, NULL);
+	spdk_blob_sync_md(blob, false, blob_op_complete, NULL);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 	CU_ASSERT(free_clusters == spdk_bs_free_cluster_count(bs));
@@ -4938,7 +4938,7 @@ blob_thin_prov_unmap_cluster(void)
 	spdk_blob_resize(blob, 1, blob_op_complete, NULL);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
-	spdk_blob_sync_md(blob, blob_op_complete, NULL);
+	spdk_blob_sync_md(blob, false, blob_op_complete, NULL);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 	CU_ASSERT(free_clusters == spdk_bs_free_cluster_count(bs));
@@ -5136,7 +5136,7 @@ blob_thin_prov_rw_iov(void)
 	CU_ASSERT(free_clusters == spdk_bs_free_cluster_count(bs));
 	CU_ASSERT(blob->active.num_clusters == 5);
 
-	spdk_blob_sync_md(blob, blob_op_complete, NULL);
+	spdk_blob_sync_md(blob, false, blob_op_complete, NULL);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 	/* Sync must not change anything */
@@ -5971,7 +5971,7 @@ blob_relations(void)
 
 	/* Mark blob as read only */
 	spdk_blob_set_read_only(blob);
-	spdk_blob_sync_md(blob, blob_op_complete, NULL);
+	spdk_blob_sync_md(blob, false, blob_op_complete, NULL);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 
@@ -6386,7 +6386,7 @@ blob_relations2(void)
 
 	/* Mark blob as read only */
 	spdk_blob_set_read_only(blob);
-	spdk_blob_sync_md(blob, blob_op_complete, NULL);
+	spdk_blob_sync_md(blob, false, blob_op_complete, NULL);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 
@@ -6655,7 +6655,7 @@ blobstore_clean_power_failure(void)
 
 		g_bserrno = -1;
 		dev_set_power_failure_thresholds(thresholds);
-		spdk_blob_sync_md(blob, blob_op_complete, NULL);
+		spdk_blob_sync_md(blob, false, blob_op_complete, NULL);
 		poll_threads();
 		dev_reset_power_failure_event();
 
@@ -7864,7 +7864,7 @@ blob_simultaneous_operations(void)
 	poll_threads();
 	CU_ASSERT(blob->locked_operation_in_progress == false);
 	/* Blob resized successfully */
-	spdk_blob_sync_md(blob, blob_op_complete, NULL);
+	spdk_blob_sync_md(blob, false, blob_op_complete, NULL);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 
@@ -7876,10 +7876,10 @@ blob_simultaneous_operations(void)
 
 	rc = spdk_blob_set_xattr(blob, "sync", "first", strlen("first") + 1);
 	CU_ASSERT(rc == 0);
-	spdk_blob_sync_md(blob, first_sync_complete, blob);
+	spdk_blob_sync_md(blob, false, first_sync_complete, blob);
 	CU_ASSERT(g_bserrno == -1);
 
-	spdk_blob_sync_md(blob, second_sync_complete, blob);
+	spdk_blob_sync_md(blob, false, second_sync_complete, blob);
 	CU_ASSERT(g_bserrno == -1);
 
 	poll_threads();
@@ -7930,7 +7930,7 @@ blob_persist_test(void)
 
 	rc = spdk_blob_set_xattr(blob, "large_xattr", xattr, xattr_length);
 	SPDK_CU_ASSERT_FATAL(rc == 0);
-	spdk_blob_sync_md(blob, blob_op_complete, NULL);
+	spdk_blob_sync_md(blob, false, blob_op_complete, NULL);
 	poll_threads();
 	SPDK_CU_ASSERT_FATAL(g_bserrno == 0);
 
@@ -7948,7 +7948,7 @@ blob_persist_test(void)
 		rc = spdk_blob_set_xattr(blob, "large_xattr", xattr, xattr_length);
 		SPDK_CU_ASSERT_FATAL(rc == 0);
 		g_bserrno = -1;
-		spdk_blob_sync_md(blob, blob_op_complete, NULL);
+		spdk_blob_sync_md(blob, false, blob_op_complete, NULL);
 		poll_thread_times(0, poller_iterations);
 		if (g_bserrno == 0) {
 			/* Poller iteration count was high enough for first sync to complete.
@@ -7960,7 +7960,7 @@ blob_persist_test(void)
 		}
 		rc = spdk_blob_remove_xattr(blob, "large_xattr");
 		SPDK_CU_ASSERT_FATAL(rc == 0);
-		spdk_blob_sync_md(blob, blob_op_complete, NULL);
+		spdk_blob_sync_md(blob, false, blob_op_complete, NULL);
 		poll_threads();
 		SPDK_CU_ASSERT_FATAL(g_bserrno == 0);
 		SPDK_CU_ASSERT_FATAL(blob->active.num_pages + blob->active.num_extent_pages == page_count_clear);
@@ -9615,7 +9615,7 @@ blob_shallow_copy(void)
 
 	/* Set blob read only */
 	spdk_blob_set_read_only(blob);
-	spdk_blob_sync_md(blob, blob_op_complete, NULL);
+	spdk_blob_sync_md(blob, false, blob_op_complete, NULL);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 
@@ -10232,7 +10232,7 @@ blob_dirty_gen_reload_refuses_partial(void)
 	blobid = spdk_blob_get_id(blob);
 	dirty_write_blk(blob, ch, 2, 0, 0xD1);
 	CU_ASSERT(spdk_blob_dirty_gen_tracked(dirty_gen(blob)) == 1);
-	spdk_blob_sync_md(blob, blob_op_complete, NULL);
+	spdk_blob_sync_md(blob, false, blob_op_complete, NULL);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 

@@ -290,7 +290,7 @@ resize_cb(void *cb_arg, int bserrno)
 	 * Always a good idea to sync after MD changes or the changes
 	 * may be lost if things aren't closed cleanly.
 	 */
-	spdk_blob_sync_md(cli_context->blob, sync_cb, cli_context);
+	spdk_blob_sync_md(cli_context->blob, false, sync_cb, cli_context);
 }
 
 /*
@@ -547,7 +547,7 @@ set_xattr_cb(void *cb_arg, struct spdk_blob *blob, int bserrno)
 		printf("Xattr has been removed.\n");
 	}
 
-	spdk_blob_sync_md(cli_context->blob, sync_cb, cli_context);
+	spdk_blob_sync_md(cli_context->blob, false, sync_cb, cli_context);
 }
 
 static void __read_dump_cb(void *arg1);

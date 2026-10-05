@@ -541,7 +541,7 @@ spdk_blob_resize(struct spdk_blob *blob, uint64_t sz, spdk_blob_op_complete cb_f
 DEFINE_STUB(spdk_blob_set_read_only, int, (struct spdk_blob *blob), 0);
 
 void
-spdk_blob_sync_md(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+spdk_blob_sync_md(struct spdk_blob *blob, bool md_drain, spdk_blob_op_complete cb_fn, void *cb_arg)
 {
 	cb_fn(cb_arg, 0);
 }

@@ -265,7 +265,7 @@ resize_complete(void *cb_arg, int bserrno)
 	 * good idea to sync after making metadata changes unless
 	 * it has an unacceptable impact on application performance.
 	 */
-	spdk_blob_sync_md(hello_context->blob, sync_complete, hello_context);
+	spdk_blob_sync_md(hello_context->blob, false, sync_complete, hello_context);
 }
 
 /*

@@ -753,7 +753,7 @@ super_blob_init_cb(void *cb_arg, int lvolerrno)
 
 	spdk_blob_set_xattr(blob, "uuid", uuid, sizeof(uuid));
 	spdk_blob_set_xattr(blob, "name", lvs->name, strnlen(lvs->name, SPDK_LVS_NAME_MAX) + 1);
-	spdk_blob_sync_md(blob, super_blob_set_cb, req);
+	spdk_blob_sync_md(blob, false, super_blob_set_cb, req);
 }
 
 static void
@@ -1031,7 +1031,7 @@ lvs_rename_open_cb(void *cb_arg, struct spdk_blob *blob, int lvolerrno)
 
 	req->lvol_store->super_blob = blob;
 
-	spdk_blob_sync_md(blob, lvs_rename_sync_cb, req);
+	spdk_blob_sync_md(blob, true, lvs_rename_sync_cb, req);
 }
 
 void
@@ -2106,7 +2106,7 @@ lvol_blob_resize_cb(void *cb_arg, int bserrno)
 		return;
 	}
 
-	spdk_blob_sync_md(lvol->blob, lvol_resize_done, req);
+	spdk_blob_sync_md(lvol->blob, true, lvol_resize_done, req);
 }
 
 void
@@ -2299,7 +2299,7 @@ spdk_lvol_set_read_only(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, voi
 	req->cb_arg = cb_arg;
 
 	spdk_blob_set_read_only(lvol->blob);
-	spdk_blob_sync_md(lvol->blob, lvol_set_read_only_cb, req);
+	spdk_blob_sync_md(lvol->blob, true, lvol_set_read_only_cb, req);
 }
 
 static void
@@ -2365,7 +2365,7 @@ spdk_lvol_rename(struct spdk_lvol *lvol, const char *new_name,
 	}
 
 	if (lvol->lvol_store->leader) {
-		spdk_blob_sync_md(blob, lvol_rename_cb, req);
+		spdk_blob_sync_md(blob, true, lvol_rename_cb, req);
 		return;
 	} else {
 		spdk_blob_set_clean(blob);
@@ -2960,7 +2960,7 @@ lvs_update_on_failover_cpl(void *cb_arg, int lvolerrno)
 		return;
 	}
 
-	SPDK_ERRLOG("Cannot update lvolstore on failover ...\n");
+	SPDK_ERRLOG("Cannot update lvolstore on failover ...rc = %d\n", lvolerrno);
 	if (lvolerrno == -ENOTCONN || (lvolerrno != 0 && lvs->timeout_trigger == 1)) {
     	SPDK_ERRLOG("Failed to update lvolstore during failover due to distrib-level functionality.\n");
     	SPDK_ERRLOG("Forcing application shutdown via abort.\n");
@@ -3491,7 +3491,7 @@ spdk_lvs_nonleader_timeout(struct spdk_lvol_store *lvs)
 			state = true;
 		} else {
 			lvs->timeout_trigger = 0;
-			spdk_bs_set_leader(lvs->blobstore, true);
+			spdk_bs_set_leader(lvs->blobstore, true, true);
 		}
 	}
 
@@ -3662,9 +3662,9 @@ spdk_lvs_unfreeze_on_conflict(struct spdk_lvol_store *lvs)
 	lvs->failed_on_update = false;
 	lvs->leadership_timeout = spdk_get_ticks();
 	lvs->timeout_trigger = 1;
-	lvs->leader = false;
 
-	spdk_bs_set_leader(lvs->blobstore, false);
+	spdk_bs_set_leader(lvs->blobstore, false, lvs->leader);
+	lvs->leader = false;
 
 	TAILQ_FOREACH(lvol, &lvs->lvols, link) {
 		lvol->leader = false;
@@ -3758,9 +3758,8 @@ spdk_lvs_change_leader_state(uint64_t groupid)
 				lvs->failed_on_update = false;
 				lvs->leadership_timeout = spdk_get_ticks();
 				lvs->timeout_trigger = 1;
+				spdk_bs_set_leader(lvs->blobstore, false, lvs->leader);
 				lvs->leader = false;
-
-				spdk_bs_set_leader(lvs->blobstore, false);
 
 				TAILQ_FOREACH(lvol, &lvs->lvols, link) {
 					lvol->leader = false;
@@ -3827,9 +3826,8 @@ spdk_lvs_queued_failed_IO(struct spdk_lvol_store *lvs)
 		lvs->failed_on_update = false;
 		lvs->leadership_timeout = spdk_get_ticks();
 		lvs->timeout_trigger = 1;
+		spdk_bs_set_leader(lvs->blobstore, false, lvs->leader);
 		lvs->leader = false;
-
-		spdk_bs_set_leader(lvs->blobstore, false);
 
 		TAILQ_FOREACH(lvol, &lvs->lvols, link) {
 			lvol->leader = false;
@@ -7798,7 +7796,7 @@ spdk_lvs_check_active_process(struct spdk_lvol_store *lvs, struct spdk_lvol *lvo
 		lvs->failed_on_update = false;
 		lvs->trigger_leader_sent = false;
 		lvs->retry_on_update++;
-		spdk_bs_set_leader(lvs->blobstore, true);
+		spdk_bs_set_leader(lvs->blobstore, true, true);
 		SPDK_NOTICELOG("Lvolstore %s failover set poller - trigger refresh: %" PRIu64 " t %d \n", node_role_to_string(lvs->node_role), lvol->blob_id, type);
 		req->poller = spdk_poller_register(spdk_lvs_update_on_failover_poller, req, 500000); // Delay of 500ms
 	}
@@ -7864,10 +7862,10 @@ spdk_set_leader_all(struct spdk_lvol_store *t_lvs, bool lvs_leader, bool bs_nonl
 	pthread_mutex_lock(&g_lvol_stores_mutex);
 
 	TAILQ_FOREACH(lvs, &g_lvol_stores, link) {
-		if (t_lvs == lvs) {			
+		if (t_lvs == lvs) {
 			lvs->update_in_progress = false;
 
-			spdk_bs_set_leader(lvs->blobstore, !bs_nonleadership);
+			spdk_bs_set_leader(lvs->blobstore, !bs_nonleadership, lvs->leader);
 
 			TAILQ_FOREACH(lvol, &lvs->lvols, link) {
 				lvol->leader = lvs_leader;

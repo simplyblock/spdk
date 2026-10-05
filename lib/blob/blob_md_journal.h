@@ -113,11 +113,8 @@ typedef void (*bs_md_journal_batch_cb)(spdk_bs_sequence_t *seq, void *cb_arg, in
 
 struct md_journal_elem {
 
-	struct spdk_bs_md_journal *journal;
-
 	uint32_t slot;
-	enum md_journal_elem_state state;
-
+	uint32_t drain_gen;
 	/*
 	 * Logical ordering number.
 	 *
@@ -126,7 +123,8 @@ struct md_journal_elem {
 	 */
 	uint64_t seq;
 	spdk_bs_sequence_t *bs_seq;
-
+	enum md_journal_elem_state state;
+	struct spdk_bs_md_journal *journal;
 	struct spdk_bs_io_opts io_opts;
 
 	/*
@@ -228,10 +226,20 @@ struct md_journal_drain_batch {
 
 TAILQ_HEAD(md_journal_elem_queue, md_journal_elem);
 
+struct md_journal_home_waiter {
+	uint64_t target_seq;
+
+	spdk_bs_sequence_cpl cb_fn;
+	spdk_bs_sequence_t *seq;
+	void *cb_arg;
+
+	TAILQ_ENTRY(md_journal_home_waiter) link;
+};
+
+TAILQ_HEAD(md_journal_home_wait_queue, md_journal_home_waiter);
+
 struct spdk_bs_md_journal {
-	struct spdk_bs_dev *dev;
 	struct spdk_blob_store *bs;
-	struct spdk_io_channel *md_channel;
 	spdk_bs_sequence_t *home_seq;
 	spdk_bs_sequence_t *zero_seq;
 	/*
@@ -241,7 +249,7 @@ struct spdk_bs_md_journal {
 	uint64_t journal_mask_len;
 	uint32_t blocks_per_page;
 	uint32_t blocks_per_entry;
-
+	uint32_t next_drain_gen;
 	/*
 	 * Sequence assigned to the next admitted metadata write.
 	 */
@@ -284,6 +292,10 @@ struct spdk_bs_md_journal {
 
 	struct md_journal_wait_queue wait_queue;
 
+	uint64_t home_durable_seq;
+
+	struct md_journal_home_wait_queue home_wait_queue;
+
 	/*
 	* Set when the head of wait_queue cannot be admitted because
 	* there are not enough FREE journal elements.
@@ -308,6 +320,8 @@ struct spdk_bs_md_journal {
 	spdk_bs_sequence_cpl update_cb_fn;
 	void *update_cb_arg;
 
+	spdk_blob_op_complete destroy_cb_fn;
+
 	bool recovering;
 	bool examine;
 	bool stopping;
@@ -330,7 +344,7 @@ int bs_md_journal_reset(struct spdk_bs_md_journal *jr);
 
 int bs_md_journal_start(struct spdk_bs_md_journal *jr);
 
-void bs_md_journal_destroy(struct spdk_bs_md_journal *jr);
+void bs_md_journal_destroy(struct spdk_bs_md_journal *jr, spdk_blob_op_complete cb_fn);
 
 void bs_md_journal_batch_close(struct md_journal_batch *batch);
 
@@ -352,6 +366,11 @@ int
 bs_md_journal_recovery_on_failover(struct spdk_bs_md_journal *jr, spdk_bs_sequence_t *seq, spdk_bs_sequence_cpl cb_fn, void *cb_arg, bool examine_flag);
 
 bool bs_md_journal_read_on_examine(struct spdk_bs_md_journal *jr, uint64_t target_lba, void *payload);
+void bs_md_journal_leadership_change(struct spdk_bs_md_journal *jr, spdk_bs_sequence_t *seq, bool state, bool lvs_state);
 
+int md_journal_confirm_home_drain(struct spdk_bs_md_journal *jr, uint64_t target_seq, spdk_bs_sequence_t *seq,
+			      spdk_bs_sequence_cpl cb_fn, void *cb_arg);
+
+uint64_t bs_md_journal_next_seq_num(struct spdk_bs_md_journal *jr);
 
 #endif /* SPDK_BLOB_MD_JOURNAL_H */

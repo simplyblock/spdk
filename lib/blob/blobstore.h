@@ -479,12 +479,6 @@ struct spdk_bs_super_block {
 	uint32_t	used_cluster_mask_start; /* Offset from beginning of disk, in pages */
 	uint32_t	used_cluster_mask_len; /* Count, in pages */
 
-	uint8_t		used_md_journal;
-	uint16_t	md_journal_elements;
-	uint16_t	md_journal_element_size; /* In bytes */
-	uint32_t	md_journal_mask_start; /* Offset from beginning of disk, in pages */
-	uint32_t	md_journal_mask_len; /* Count, in pages */
-
 	uint32_t	md_start; /* Offset from beginning of disk, in pages */
 	uint32_t	md_len; /* Count, in pages */
 
@@ -495,6 +489,12 @@ struct spdk_bs_super_block {
 
 	uint64_t	size; /* size of blobstore in bytes */
 	uint32_t	io_unit_size; /* Size of io unit in bytes */
+
+	uint16_t	md_journal_elements;
+	uint16_t	md_journal_element_size; /* In bytes */
+	uint32_t	md_journal_mask_start; /* Offset from beginning of disk, in pages */
+	uint32_t	md_journal_mask_len; /* Count, in pages */
+	uint8_t		used_md_journal;
 
 	uint8_t		reserved[3987];
 	uint32_t	crc;

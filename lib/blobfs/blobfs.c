@@ -1497,7 +1497,7 @@ spdk_fs_delete_file_async(struct spdk_filesystem *fs, const char *name,
 		/* If the ref > 0, we mark the file as deleted and delete it when we close it. */
 		f->is_deleted = true;
 		spdk_blob_set_xattr(f->blob, "is_deleted", &f->is_deleted, sizeof(bool));
-		spdk_blob_sync_md(f->blob, blob_delete_cb, req);
+		spdk_blob_sync_md(f->blob, false, blob_delete_cb, req);
 		return;
 	}
 
@@ -1627,7 +1627,7 @@ fs_truncate_resize_cb(void *ctx, int bserrno)
 		file->append_pos = file->length;
 	}
 
-	spdk_blob_sync_md(file->blob, fs_truncate_complete_cb, req);
+	spdk_blob_sync_md(file->blob, false, fs_truncate_complete_cb, req);
 }
 
 static uint64_t
@@ -2215,7 +2215,7 @@ __check_sync_reqs(struct spdk_file *file)
 		pthread_spin_unlock(&file->lock);
 		spdk_trace_record(TRACE_BLOBFS_XATTR_START, 0, file->length_flushed,
 				  0, file->name);
-		spdk_blob_sync_md(file->blob, __file_cache_finish_sync, sync_req);
+		spdk_blob_sync_md(file->blob, false, __file_cache_finish_sync, sync_req);
 	} else {
 		pthread_spin_unlock(&file->lock);
 	}
@@ -2345,7 +2345,7 @@ __file_extend_resize_cb(void *_args, int bserrno)
 		return;
 	}
 
-	spdk_blob_sync_md(file->blob, __file_extend_done, args);
+	spdk_blob_sync_md(file->blob, false, __file_extend_done, args);
 }
 
 static void
