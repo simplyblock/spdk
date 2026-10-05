@@ -14077,6 +14077,8 @@ bs_update_live_done(struct spdk_bs_update_ctx *ctx, int bserrno)
 		spdk_free(ctx->extent_pages);
 	}
 
+	spdk_free(ctx->page);   /* NULL-safe */
+	spdk_free(ctx->mask);
 	free(ctx);
 }
 
@@ -14429,6 +14431,9 @@ bs_update_write_used_clusters_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bse
 {
 	struct spdk_bs_update_ctx	*ctx = cb_arg;
 
+	spdk_free(ctx->mask);
+	ctx->mask = NULL;
+
 	if (bserrno != 0) {
 		bs_update_live_done(ctx, bserrno);
 		return;
@@ -14666,6 +14671,7 @@ bs_update_replay_md_chain_cpl(struct spdk_bs_update_ctx *ctx)
 		struct spdk_bit_array		*used_blobids_tmp;
 
 		spdk_free(ctx->page);
+		ctx->page = NULL;
 
 		spdk_spin_lock(&ctx->bs->used_lock);
 		used_md_pages_tmp = ctx->bs->used_md_pages;
@@ -14983,6 +14989,8 @@ bs_update_only_used_blobid_pages_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int 
 
 	if (bserrno != 0) {
 		// read failed
+		spdk_free(ctx->mask);
+		ctx->mask = NULL;
 		bs_update_live_done(ctx, -ENOTCONN);
 		return;
 	}
@@ -14999,6 +15007,7 @@ bs_update_only_used_blobid_pages_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int 
 			    ctx->mask->length, ctx->super->md_len);
 		assert(false);
 		spdk_free(ctx->mask);
+		ctx->mask = NULL;
 		bs_update_live_done(ctx, -ENOTCONN);
 		return;
 	}
@@ -15006,12 +15015,14 @@ bs_update_only_used_blobid_pages_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int 
 	rc = spdk_bit_array_resize(&ctx->synnced_used_blobid_pages, ctx->mask->length);
 	if (rc < 0) {
 		spdk_free(ctx->mask);
+		ctx->mask = NULL;
 		bs_update_live_done(ctx, rc);
 		return;
 	}
 
 	spdk_bit_array_load_mask(ctx->synnced_used_blobid_pages, ctx->mask->mask);
 	spdk_free(ctx->mask);
+	ctx->mask = NULL;
 	bs_recover_on_update(ctx);
 }
 
