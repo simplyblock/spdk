@@ -7227,7 +7227,6 @@ spdk_lvol_transfer_delay(void *ctx) {
 int
 spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_batch, enum xfer_type type,
 				struct spdk_transfer_dev *tdev, const char *snapshot_name, uint32_t lvol_id,
-				bool allow_partial, bool special_io,
 				spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg) {
 	struct spdk_lvs_xfer *xfer, *task;	
 	struct spdk_lvol_store *lvs = lvol->lvol_store;	
@@ -7284,12 +7283,6 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
 	 * spends queued behind background snapshot transfers is added client
 	 * stall. Migration transfers are freeze-flows too. */
 	task->priority = task->final_step || type == XFER_MIGRATE_SNAPSHOT;
-	task->special_io = special_io;
-	if (special_io && allow_partial) {
-		SPDK_NOTICELOG("Transfer lvol %s: special IO works on whole blob "
-			       "clusters only -- ignoring allow_partial\n", lvol->name);
-		allow_partial = false;
-	}
 
 	task->num_clusters = spdk_blob_get_num_clusters(lvol->blob);
 	task->clusters = calloc(task->num_clusters, sizeof(uint64_t));
