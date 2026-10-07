@@ -27,6 +27,7 @@ struct spdk_lvs_req {
 	struct spdk_poller *poller;
 	int				lvserrno;
 	bool			destroy;
+	bool            lvs_state;
 };
 
 struct spdk_lvol_update_on_failover_req {
@@ -310,20 +311,6 @@ struct spdk_lvs_xfer {
 	uint32_t idx;
 	bool persist_swap;
 	uint32_t timeout_cnt;
-
-	/* dirty-bitmap partial transfer (see lib/blob/blob_dirty.c). allow_partial
-	 * comes from the RPC; dirty_gen is the snapshot's COMPLETE generation or
-	 * NULL; ranges is a per-cluster scratch array of coalesced transfer
-	 * ranges, walked via range_pos while range_cluster names the cluster
-	 * they belong to. */
-	bool allow_partial;
-	/* backing storage for every request's frag_ctx slice */
-	struct spdk_lvs_xfer_frag *frag_pool;
-	struct blob_dirty_gen *dirty_gen;
-	struct blob_dirty_range *ranges;
-	uint32_t num_ranges;
-	uint32_t range_pos;
-	uint64_t range_cluster;
 };
 
 struct spdk_lvol_store {

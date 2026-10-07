@@ -3491,7 +3491,8 @@ spdk_lvs_nonleader_timeout(struct spdk_lvol_store *lvs)
 			state = true;
 		} else {
 			lvs->timeout_trigger = 0;
-			spdk_bs_set_leader(lvs->blobstore, true, true);
+			// no need to do anything bcs it will trigger the failover when we receive new IO and from last changing leadership is 10 seconds passed
+			spdk_bs_set_leader(lvs->blobstore, true);
 		}
 	}
 
@@ -3626,6 +3627,12 @@ spdk_lvs_remove_rules_poller(void *cb_arg)
 }
 
 static void
+spdk_lvs_md_journal_signal_cpl(void *cb_arg, int lvolerrno)
+{
+	//nothing
+}
+
+static void
 spdk_lvs_unfreeze_on_conflict(struct spdk_lvol_store *lvs)
 {
 	struct spdk_lvol *lvol;
@@ -3663,7 +3670,8 @@ spdk_lvs_unfreeze_on_conflict(struct spdk_lvol_store *lvs)
 	lvs->leadership_timeout = spdk_get_ticks();
 	lvs->timeout_trigger = 1;
 
-	spdk_bs_set_leader(lvs->blobstore, false, lvs->leader);
+	spdk_bs_set_leader(lvs->blobstore, false);
+	spdk_bs_activate_md_journal(lvs->blobstore, lvs->leader, false, spdk_lvs_md_journal_signal_cpl, NULL);
 	lvs->leader = false;
 
 	TAILQ_FOREACH(lvol, &lvs->lvols, link) {
@@ -3758,7 +3766,8 @@ spdk_lvs_change_leader_state(uint64_t groupid)
 				lvs->failed_on_update = false;
 				lvs->leadership_timeout = spdk_get_ticks();
 				lvs->timeout_trigger = 1;
-				spdk_bs_set_leader(lvs->blobstore, false, lvs->leader);
+				spdk_bs_set_leader(lvs->blobstore, false);
+				spdk_bs_activate_md_journal(lvs->blobstore, lvs->leader, false, spdk_lvs_md_journal_signal_cpl, NULL);
 				lvs->leader = false;
 
 				TAILQ_FOREACH(lvol, &lvs->lvols, link) {
@@ -3826,7 +3835,9 @@ spdk_lvs_queued_failed_IO(struct spdk_lvol_store *lvs)
 		lvs->failed_on_update = false;
 		lvs->leadership_timeout = spdk_get_ticks();
 		lvs->timeout_trigger = 1;
-		spdk_bs_set_leader(lvs->blobstore, false, lvs->leader);
+		// we should send the signal to the md journal but no need to wait bcs we have 10 seconds until next failover at minmum
+		spdk_bs_set_leader(lvs->blobstore, false);
+		spdk_bs_activate_md_journal(lvs->blobstore, lvs->leader, false, spdk_lvs_md_journal_signal_cpl, NULL);
 		lvs->leader = false;
 
 		TAILQ_FOREACH(lvol, &lvs->lvols, link) {
@@ -5208,7 +5219,6 @@ destroy_xfer_task_tmo(void *arg) {
 	spdk_poller_unregister(&xfer->tmo_poller);
 	xfer->tmo_poller = NULL;
 	spdk_dma_free(xfer->pdus);
-	free(xfer->frag_pool);
 	free(xfer->reqs);
 	spdk_ring_free(xfer->free_ring);
 	spdk_ring_free(xfer->ready_ring);
@@ -5220,11 +5230,6 @@ destroy_xfer_task_tmo(void *arg) {
 		free(xfer->chain_s3_ids);
 	if (xfer->old_clusters)
 		free(xfer->old_clusters);
-	if (xfer->ranges)
-		free(xfer->ranges);
-	// /* release the pinned dirty generation (no-op when NULL) */
-	// spdk_blob_dirty_gen_unref(xfer->dirty_gen);
-	// xfer->dirty_gen = NULL;
 	free(xfer);
 	return -1;
 }
@@ -5485,30 +5490,6 @@ xfer_status_check(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req **preq, u
 	return 0;
 }
 
-static void
-xfer_enqueue_range_req(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req *req,
-		       uint64_t cluster_idx, const struct blob_dirty_range *r)
-{
-	uint64_t pages_per_block = SPDK_BLOB_DIRTY_BLOCK_SZ / xfer->page_size;
-
-	req->offset = cluster_idx * xfer->page_per_cluster + (uint64_t)r->off * pages_per_block;
-	req->len = (uint64_t)r->len * pages_per_block;
-	req->dst_offset = req->offset;
-	if (xfer->lvol->redirect_map_id != 0) {
-		req->dst_offset = ((uint64_t)(xfer->lvol->redirect_map_id) << 48) | req->offset;
-	}
-	req->action = REQ_ACTION_COPY_BACKUP;
-	req->status = XFER_REQ_STATUS_READY;
-	if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
-		SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
-		assert(false);
-	}
-	xfer->lvol->xfer_partial_reqs++;
-	xfer->lvol->xfer_pages_sent += req->len;
-	xfer->outstanding_io++;
-	xfer->idx++;
-}
-
 static int
 xfer_replication(struct spdk_lvs_xfer *xfer) {
 	struct spdk_lvs_xfer_req *req;
@@ -5566,37 +5547,11 @@ xfer_replication(struct spdk_lvs_xfer *xfer) {
 
 				// prepare req
 				memset(req->payload, 0, xfer->page_size * xfer->page_per_cluster);
-				if (xfer->allow_partial && xfer->range_pos < xfer->num_ranges) {
-					/* remaining coalesced ranges of the current cluster */
-					is_allocate = true;
-					xfer_enqueue_range_req(xfer, req, xfer->range_cluster,
-							       &xfer->ranges[xfer->range_pos++]);
-					count++;
-					continue;
-				}
+
 				if (xfer->hold_idx < xfer->num_clusters) {
 					for (uint32_t i = xfer->hold_idx; i < xfer->num_clusters; i++) {
 						if (xfer->clusters[i] == 0) {
 							continue;
-						}
-
-						if (xfer->allow_partial) {
-							int nr = spdk_blob_dirty_cluster_ranges(
-									xfer->dirty_gen, i, xfer->ranges,
-									spdk_blob_dirty_max_ranges(xfer->dirty_gen));
-							if (nr > 0) {
-								/* bitmap-driven: only the dirty ranges travel */
-								xfer->num_ranges = (uint32_t)nr;
-								xfer->range_pos = 1;
-								xfer->range_cluster = i;
-								is_allocate = true;
-								xfer_enqueue_range_req(xfer, req, i, &xfer->ranges[0]);
-								xfer->hold_idx = i + 1;
-								count++;
-								break;
-							}
-							/* nr <= 0: no bitmap for this cluster (defensive)
-							 * -- transfer it whole below */
 						}
 
 						is_allocate = true;
@@ -7109,24 +7064,6 @@ spdk_lvol_create_backup_task(struct spdk_lvs_xfer *task, struct spdk_transfer_de
 		goto error;
 	}
 
-	/* one frag-context slot per possible 64 KiB fragment, per request --
-	 * the read->write pipeline addresses fragments individually */
-	{
-		int nfrags = (s_elements_payload + XFER_FRAG_BYTES - 1) / XFER_FRAG_BYTES;
-		if (nfrags < 1) {
-			nfrags = 1;
-		}
-		task->frag_pool = calloc((size_t)task->cluster_batch * nfrags,
-					 sizeof(struct spdk_lvs_xfer_frag));
-		if (!task->frag_pool) {
-			SPDK_ERRLOG("Unable to allocate frag contexts on transfer task\n");
-			goto error;
-		}
-		for (int i = 0; i < task->cluster_batch; i++) {
-			task->reqs[i].frag_ctx = task->frag_pool + (size_t)i * nfrags;
-		}
-	}
-
 	for (int i = 0; i < task->cluster_batch; i++) {
         task->reqs[i].payload =  task->pdus + (i * s_elements_payload);
         task->reqs[i].len = s_elements_payload / task->page_size; // in page unit
@@ -7177,7 +7114,6 @@ spdk_lvol_create_backup_task(struct spdk_lvs_xfer *task, struct spdk_transfer_de
 
 error:
 	spdk_dma_free(task->pdus);
-	free(task->frag_pool);
 	free(task->reqs);
 	spdk_ring_free(task->free_ring);
 	spdk_ring_free(task->ready_ring);
@@ -7295,39 +7231,6 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
 	lvol->xfer_partial_reqs = 0;
 	lvol->xfer_full_clusters = 0;
 	lvol->xfer_pages_sent = 0;
-
-	/* Bitmap-driven partial transfer: only when the caller allows it (the
-	 * control plane guarantees the landing volume carries the predecessor's
-	 * content) AND this snapshot's dirty generation tracked every write
-	 * since its epoch began. Anything else -- restarted node, invalidated
-	 * generation, untracked blob -- falls back to full clusters. */
-	// if (allow_partial && type == XFER_REPLICATE_SNAPSHOT) {
-	// 	struct blob_dirty_gen *gen = spdk_blob_get_dirty_gen(lvol->blob);
-
-	// 	if (gen != NULL && spdk_blob_dirty_gen_complete(gen)) {
-	// 		task->ranges = calloc(spdk_blob_dirty_max_ranges(gen),
-	// 				      sizeof(struct blob_dirty_range));
-	// 		if (task->ranges != NULL) {
-	// 			// task->dirty_gen = gen;
-	// 			// /* Pin it: the family cap in the blob layer frees
-	// 			//  * generations older than the two newest
-	// 			//  * snapshots, and this task walks the bitmaps
-	// 			//  * across many poller ticks. */
-	// 			// spdk_blob_dirty_gen_ref(gen);
-	// 			// task->allow_partial = true;
-	// 			SPDK_NOTICELOG("Transfer lvol %s: dirty-bitmap partial transfer "
-	// 				       "(gen %" PRIu64 ", %" PRIu64 " tracked clusters, "
-	// 				       "%" PRIu64 " dirty bytes)\n",
-	// 				       lvol->name, spdk_blob_dirty_gen_id(gen),
-	// 				       spdk_blob_dirty_gen_tracked(gen),
-	// 				       spdk_blob_dirty_gen_bytes(gen));
-	// 		}
-	// 	} else {
-	// 		SPDK_NOTICELOG("Transfer lvol %s: partial requested but no complete "
-	// 			       "dirty generation -- falling back to full clusters\n",
-	// 			       lvol->name);
-	// 	}
-	// }
 
 	// rememeber
 	// if (type == XFER_MIGRATE_SNAPSHOT) {
@@ -7789,7 +7692,9 @@ spdk_lvs_check_active_process(struct spdk_lvol_store *lvs, struct spdk_lvol *lvo
 		lvs->failed_on_update = false;
 		lvs->trigger_leader_sent = false;
 		lvs->retry_on_update++;
-		spdk_bs_set_leader(lvs->blobstore, true, true);
+		//no need to do anything about the md journal bcs here we trigger the failover and the update/recovery
+		// and from last update at least spend more than 10 second
+		spdk_bs_set_leader(lvs->blobstore, true);
 		SPDK_NOTICELOG("Lvolstore %s failover set poller - trigger refresh: %" PRIu64 " t %d \n", node_role_to_string(lvs->node_role), lvol->blob_id, type);
 		req->poller = spdk_poller_register(spdk_lvs_update_on_failover_poller, req, 500000); // Delay of 500ms
 	}
@@ -7842,40 +7747,41 @@ spdk_lvol_set_leader_failed_on_update(struct spdk_lvol *lvol)
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
 }
 
-void
-spdk_set_leader_all(struct spdk_lvol_store *t_lvs, bool lvs_leader, bool bs_nonleadership)
+static void
+spdk_lvol_set_leader_cpl(void *cb_arg, int lvolerrno)
 {
-	struct spdk_lvol_store *lvs;
+	struct spdk_lvs_req *req = cb_arg;
+	struct spdk_lvol_store *lvs = req->lvol_store;
 	struct spdk_lvol_store *tmp_lvs = NULL;
-	struct spdk_lvol *lvol;	
-	SPDK_NOTICELOG("Lvs %s leader state changed via RPC to %s and bs_nonleader to %s.\n", node_role_to_string(t_lvs->node_role),
-                lvs_leader ? "true" : "false",
-                bs_nonleadership ? "true" : "false");
+	bool lvs_leader = req->lvs_state;
+	struct spdk_lvol *lvol;
+
+
+	if (lvolerrno < 0 ) {
+		req->cb_fn(req->cb_arg, lvolerrno);
+		free(req);
+		return;
+	}
 
 	pthread_mutex_lock(&g_lvol_stores_mutex);
 
-	TAILQ_FOREACH(lvs, &g_lvol_stores, link) {
-		if (t_lvs == lvs) {
-			lvs->update_in_progress = false;
+	lvs->update_in_progress = false;
 
-			spdk_bs_set_leader(lvs->blobstore, !bs_nonleadership, lvs->leader);
+	TAILQ_FOREACH(lvol, &lvs->lvols, link) {
+		lvol->leader = lvs_leader;
+		lvol->update_in_progress = false;
+	}
 
-			TAILQ_FOREACH(lvol, &lvs->lvols, link) {
-				lvol->leader = lvs_leader;
-				lvol->update_in_progress = false;
-			}
-
-			if (!lvs_leader && lvs->node_role != NODE_PRIMARY ) {
-				tmp_lvs = lvs;
-				if (lvs->hub_dev.state == HUBLVOL_CONNECTED) {
-					SPDK_NOTICELOG("enable redirect IO mode.\n");
-					lvs->skip_redirecting = false;
-					lvs->hub_dev.drain_in_action = false;
-				}
-			}
-			lvs->leader = lvs_leader;
+	if (!lvs_leader && lvs->node_role != NODE_PRIMARY ) {
+		tmp_lvs = lvs;
+		if (lvs->hub_dev.state == HUBLVOL_CONNECTED) {
+			SPDK_NOTICELOG("enable redirect IO mode.\n");
+			lvs->skip_redirecting = false;
+			lvs->hub_dev.drain_in_action = false;
 		}
 	}
+	lvs->leader = lvs_leader;
+
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
 
 	if (tmp_lvs) {
@@ -7886,6 +7792,36 @@ spdk_set_leader_all(struct spdk_lvol_store *t_lvs, bool lvs_leader, bool bs_nonl
 			}
 		}
 	}
+
+	req->cb_fn(req->cb_arg, lvolerrno);
+	free(req);
+}
+
+void
+spdk_set_leader_all(struct spdk_lvol_store *lvs, bool lvs_leader, bool bs_nonleadership,
+			spdk_lvs_op_complete cb_fn, void *cb_arg)
+{
+
+	struct spdk_lvs_req *req;
+
+	SPDK_NOTICELOG("Lvs %s leader state changed via RPC to %s and bs_nonleader to %s.\n", node_role_to_string(lvs->node_role),
+                lvs_leader ? "true" : "false",
+                bs_nonleadership ? "true" : "false");
+
+	spdk_bs_set_leader(lvs->blobstore, !bs_nonleadership);
+
+	req = calloc(1, sizeof(*req));
+	if (req == NULL) {
+		SPDK_ERRLOG("Cannot alloc memory for request structure\n");
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+	req->lvol_store = lvs;
+	req->lvs_state = lvs_leader;
+
+	spdk_bs_activate_md_journal(lvs->blobstore, lvs->leader, lvs_leader, spdk_lvol_set_leader_cpl, req);
 }
 
 void

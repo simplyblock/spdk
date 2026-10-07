@@ -2918,6 +2918,15 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_leadership_decoders[]
 };
 
 static void
+rpc_bdev_lvol_leadership_cb(void *cb_arg, int lvolerrno)
+{
+	struct spdk_jsonrpc_request *request = cb_arg;
+	bool rc = lvolerrno == 0 ? true : false;
+
+	spdk_jsonrpc_send_bool_response(request, rc);
+}
+
+static void
 rpc_bdev_lvol_set_leader_all(struct spdk_jsonrpc_request *request,
 			   const struct spdk_json_val *params)
 {
@@ -2940,8 +2949,8 @@ rpc_bdev_lvol_set_leader_all(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
-	spdk_set_leader_all(lvs, req.lvs_leadership, req.bs_nonleadership);
-	spdk_jsonrpc_send_bool_response(request, true);
+	spdk_set_leader_all(lvs, req.lvs_leadership, req.bs_nonleadership, rpc_bdev_lvol_leadership_cb, request);
+	// spdk_jsonrpc_send_bool_response(request, true);
 cleanup:
 	free(req.uuid);
 	free(req.lvs_name);
@@ -4324,73 +4333,6 @@ cleanup:
 }
 
 SPDK_RPC_REGISTER("bdev_lvol_transfer_stat", rpc_bdev_lvol_transfer_stat, SPDK_RPC_RUNTIME)
-
-struct rpc_bdev_lvol_dirty_bitmap_info {
-	char *lvol_name;
-};
-
-static void
-free_rpc_bdev_lvol_dirty_bitmap_info(struct rpc_bdev_lvol_dirty_bitmap_info *req)
-{
-	free(req->lvol_name);
-}
-
-static const struct spdk_json_object_decoder rpc_bdev_lvol_dirty_bitmap_info_decoders[] = {
-	{"lvol_name", offsetof(struct rpc_bdev_lvol_dirty_bitmap_info, lvol_name), spdk_json_decode_string},
-};
-
-/* Inspect the in-memory dirty generation of an lvol/snapshot: whether writes
- * are being tracked, whether the generation is COMPLETE (a valid basis for a
- * partial transfer), and how much data it marks dirty. */
-static void
-rpc_bdev_lvol_dirty_bitmap_info(struct spdk_jsonrpc_request *request,
-				const struct spdk_json_val *params)
-{
-	struct rpc_bdev_lvol_dirty_bitmap_info req = {};
-	struct spdk_bdev *bdev;
-	struct spdk_lvol *lvol;
-	struct blob_dirty_gen *gen;
-	struct spdk_json_write_ctx *w;
-
-	if (spdk_json_decode_object(params, rpc_bdev_lvol_dirty_bitmap_info_decoders,
-				    SPDK_COUNTOF(rpc_bdev_lvol_dirty_bitmap_info_decoders),
-				    &req)) {
-		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
-						 "spdk_json_decode_object failed");
-		goto cleanup;
-	}
-
-	bdev = spdk_bdev_get_by_name(req.lvol_name);
-	if (bdev == NULL) {
-		SPDK_INFOLOG(lvol_rpc, "bdev '%s' does not exist\n", req.lvol_name);
-		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
-		goto cleanup;
-	}
-
-	lvol = vbdev_lvol_get_from_bdev(bdev);
-	if (lvol == NULL) {
-		SPDK_ERRLOG("lvol does not exist\n");
-		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
-		goto cleanup;
-	}
-
-	gen = spdk_blob_get_dirty_gen(lvol->blob);
-
-	w = spdk_jsonrpc_begin_result(request);
-	spdk_json_write_object_begin(w);
-	spdk_json_write_named_bool(w, "tracking", gen != NULL);
-	spdk_json_write_named_bool(w, "complete", spdk_blob_dirty_gen_complete(gen));
-	spdk_json_write_named_uint64(w, "gen_id", spdk_blob_dirty_gen_id(gen));
-	spdk_json_write_named_uint64(w, "clusters_tracked", spdk_blob_dirty_gen_tracked(gen));
-	spdk_json_write_named_uint64(w, "dirty_bytes", spdk_blob_dirty_gen_bytes(gen));
-	spdk_json_write_object_end(w);
-	spdk_jsonrpc_end_result(request, w);
-
-cleanup:
-	free_rpc_bdev_lvol_dirty_bitmap_info(&req);
-}
-
-SPDK_RPC_REGISTER("bdev_lvol_dirty_bitmap_info", rpc_bdev_lvol_dirty_bitmap_info, SPDK_RPC_RUNTIME)
 
 struct rpc_bdev_lvol_set_migration_flag {
 	char *lvol_name;

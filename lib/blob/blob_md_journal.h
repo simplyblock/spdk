@@ -52,6 +52,13 @@ enum md_journal_op_type {
 	MD_JOURNAL_WRITE_ZEROS,
 };
 
+
+enum bs_md_journal_state {
+        BS_MD_JOURNAL_RUNNING,
+        BS_MD_JOURNAL_RESETTING,
+        BS_MD_JOURNAL_RECOVERING,
+};
+
 /*
  * Persistent 4 KiB header.
  *
@@ -325,6 +332,7 @@ struct spdk_bs_md_journal {
 	bool recovering;
 	bool examine;
 	bool stopping;
+	bool paused;
 	/*
 	 * Fatal HOME/ZERO IO failure.
 	 *
@@ -366,7 +374,8 @@ int
 bs_md_journal_recovery_on_failover(struct spdk_bs_md_journal *jr, spdk_bs_sequence_t *seq, spdk_bs_sequence_cpl cb_fn, void *cb_arg, bool examine_flag);
 
 bool bs_md_journal_read_on_examine(struct spdk_bs_md_journal *jr, uint64_t target_lba, void *payload);
-void bs_md_journal_leadership_change(struct spdk_bs_md_journal *jr, spdk_bs_sequence_t *seq, bool state, bool lvs_state);
+void bs_md_journal_leadership_change(struct spdk_bs_md_journal *jr, spdk_bs_sequence_t *seq, bool state,
+			    bool lvs_state, spdk_bs_sequence_cpl cb_fn, void *cb_arg);
 
 int md_journal_confirm_home_drain(struct spdk_bs_md_journal *jr, uint64_t target_seq, spdk_bs_sequence_t *seq,
 			      spdk_bs_sequence_cpl cb_fn, void *cb_arg);
