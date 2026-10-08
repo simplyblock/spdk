@@ -72,6 +72,20 @@ static void blob_esnap_destroy_bs_channel(struct spdk_bs_channel *ch);
 static void blob_set_back_bs_dev_frozen(void *_ctx, int bserrno);
 RB_GENERATE_STATIC(blob_esnap_channel_tree, blob_esnap_channel, node, blob_esnap_channel_compare)
 
+static int
+bs_cluster_alloc_compare(struct spdk_bs_cluster_alloc *a1, struct spdk_bs_cluster_alloc *a2)
+{
+	if (a1->blob_id != a2->blob_id) {
+		return a1->blob_id < a2->blob_id ? -1 : 1;
+	}
+	if (a1->cluster_num != a2->cluster_num) {
+		return a1->cluster_num < a2->cluster_num ? -1 : 1;
+	}
+	return 0;
+}
+
+RB_GENERATE_STATIC(bs_cluster_alloc_tree, spdk_bs_cluster_alloc, node, bs_cluster_alloc_compare)
+
 static inline bool
 blob_is_esnap_clone(const struct spdk_blob *blob)
 {
@@ -366,6 +380,7 @@ blob_alloc(struct spdk_blob_store *bs, spdk_blob_id id)
 	TAILQ_INIT(&blob->xattrs_internal);
 	TAILQ_INIT(&blob->pending_persists);
 	TAILQ_INIT(&blob->persists_to_complete);
+	RB_INIT(&blob->ep_inserts);
 
 	return blob;
 }
@@ -396,6 +411,7 @@ blob_free(struct spdk_blob *blob)
 	assert(blob != NULL);
 	assert(TAILQ_EMPTY(&blob->pending_persists));
 	assert(TAILQ_EMPTY(&blob->persists_to_complete));
+	assert(RB_EMPTY(&blob->ep_inserts));
 
 	free(blob->active.extent_pages);
 	free(blob->clean.extent_pages);
@@ -3603,6 +3619,9 @@ struct spdk_blob_copy_cluster_ctx {
 	uint32_t new_extent_page;
 	spdk_bs_sequence_t *seq;
 	struct spdk_blob_md_page *new_cluster_page;
+	struct spdk_bs_cluster_alloc *alloc;
+	bool data_written;	/* CoW data was written to new_cluster */
+	int insert_rc;		/* insert error kept while the cluster is cleared */
 };
 
 struct spdk_blob_free_cluster_ctx {
@@ -3614,16 +3633,72 @@ struct spdk_blob_free_cluster_ctx {
 	spdk_bs_sequence_t *seq;
 };
 
+static struct spdk_bs_cluster_alloc *
+bs_cluster_alloc_find(struct spdk_bs_channel *ch, spdk_blob_id blob_id, uint32_t cluster_num)
+{
+	struct spdk_bs_cluster_alloc find = {};
+
+	find.blob_id = blob_id;
+	find.cluster_num = cluster_num;
+	return RB_FIND(bs_cluster_alloc_tree, &ch->busy_cluster_allocs, &find);
+}
+
+static struct spdk_bs_cluster_alloc *
+bs_cluster_alloc_get(struct spdk_bs_channel *ch, spdk_blob_id blob_id, uint32_t cluster_num)
+{
+	struct spdk_bs_cluster_alloc *alloc;
+
+	alloc = TAILQ_FIRST(&ch->free_cluster_allocs);
+	assert(alloc != NULL);
+	TAILQ_REMOVE(&ch->free_cluster_allocs, alloc, link);
+
+	alloc->blob_id = blob_id;
+	alloc->cluster_num = cluster_num;
+	memset(alloc->page, 0, SPDK_BS_PAGE_SIZE);
+	assert(TAILQ_EMPTY(&alloc->waiting));
+	RB_INSERT(bs_cluster_alloc_tree, &ch->busy_cluster_allocs, alloc);
+
+	return alloc;
+}
+
+static void
+bs_cluster_alloc_put(struct spdk_bs_channel *ch, struct spdk_bs_cluster_alloc *alloc)
+{
+	assert(TAILQ_EMPTY(&alloc->waiting));
+	RB_REMOVE(bs_cluster_alloc_tree, &ch->busy_cluster_allocs, alloc);
+	TAILQ_INSERT_HEAD(&ch->free_cluster_allocs, alloc, link);
+}
+
+/* Restart ops that waited for a free slot, as long as there are free slots. */
+static void
+bs_cluster_alloc_resume(struct spdk_bs_channel *ch)
+{
+	spdk_bs_user_op_t *op;
+
+	while (!TAILQ_EMPTY(&ch->need_cluster_alloc) &&
+	       !TAILQ_EMPTY(&ch->free_cluster_allocs)) {
+		op = TAILQ_FIRST(&ch->need_cluster_alloc);
+		TAILQ_REMOVE(&ch->need_cluster_alloc, op, link);
+		bs_user_op_execute(op);
+	}
+}
+
 static void
 blob_allocate_and_copy_cluster_cpl(void *cb_arg, int bserrno)
 {
 	struct spdk_blob_copy_cluster_ctx *ctx = cb_arg;
 	struct spdk_bs_request_set *set = (struct spdk_bs_request_set *)ctx->seq;
+	struct spdk_bs_channel *ch = set->channel;
 	TAILQ_HEAD(, spdk_bs_request_set) requests;
 	spdk_bs_user_op_t *op;
 
 	TAILQ_INIT(&requests);
-	TAILQ_SWAP(&set->channel->need_cluster_alloc, &requests, spdk_bs_request_set, link);
+	TAILQ_SWAP(&ctx->alloc->waiting, &requests, spdk_bs_request_set, link);
+
+	/* Free the slot before running the ops again, so they see this
+	 * cluster as done (or start a new allocation if it failed). */
+	bs_cluster_alloc_put(ch, ctx->alloc);
+	ctx->alloc = NULL;
 
 	while (!TAILQ_EMPTY(&requests)) {
 		op = TAILQ_FIRST(&requests);
@@ -3635,6 +3710,8 @@ blob_allocate_and_copy_cluster_cpl(void *cb_arg, int bserrno)
 			bs_user_op_abort(op, bserrno);
 		}
 	}
+
+	bs_cluster_alloc_resume(ch);
 
 	spdk_free(ctx->buf);
 	free(ctx);
@@ -3672,7 +3749,8 @@ blob_insert_cluster_clear_cpl(void *cb_arg, int bserrno)
 	}
 
 	blob_insert_cluster_revert(ctx);
-	bs_sequence_finish(ctx->seq, bserrno);
+	/* Keep the insert error if there was one; -EEXIST continues without error. */
+	bs_sequence_finish(ctx->seq, ctx->insert_rc != 0 ? ctx->insert_rc : bserrno);
 }
 
 static void
@@ -3721,6 +3799,14 @@ blob_insert_cluster_cpl(void *cb_arg, int bserrno)
 		if (bserrno == -EAGAIN) {
 			bserrno = 0;
 		}
+		if (ctx->data_written) {
+			/* CoW data is already on the cluster. Clear it before it is
+			 * freed: a new cluster must read as zeroes, CoW skips zero
+			 * ranges and thin first writes rely on it. */
+			ctx->insert_rc = bserrno;
+			blob_insert_cluster_clear(ctx);
+			return;
+		}
 		blob_insert_cluster_revert(ctx);
 	}
 
@@ -3740,15 +3826,82 @@ blob_write_copy_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	}
 
 	cluster_number = bs_page_to_cluster(ctx->blob->bs, ctx->page);
+	ctx->data_written = true;
 
 	blob_insert_cluster_on_md_thread(ctx->blob, cluster_number, ctx->new_cluster,
 					 ctx->new_extent_page, ctx->new_cluster_page, true, blob_insert_cluster_cpl, ctx);
+}
+
+/*
+ * CoW writes only the parts of the copied cluster that hold data. Zero parts
+ * are skipped: a newly claimed cluster already reads as zeroes, because freed
+ * clusters are cleared (unmap by default). A thin blob's first write into a
+ * new cluster relies on the same thing.
+ */
+#define BLOB_COW_SCAN_UNIT	SPDK_BS_PAGE_SIZE	/* zero check granularity */
+#define BLOB_COW_MAX_WRITES	128		/* more ranges than this: write the whole cluster */
+
+struct blob_cow_range {
+	uint64_t	start;	/* byte offset in the cluster */
+	uint64_t	end;	/* byte offset after the range */
+};
+
+static bool
+blob_cow_unit_is_zero(const void *buf, size_t len)
+{
+	const uint64_t *w = buf;
+	uint64_t acc = 0;
+	size_t i;
+
+	/* No early exit, so the compiler can vectorize the loop. */
+	for (i = 0; i < len / sizeof(uint64_t); i++) {
+		acc |= w[i];
+	}
+	return acc == 0;
+}
+
+/*
+ * Find the ranges of the cluster buffer that hold data. A range is a run of
+ * neighbouring blocks with data; any zero block ends it, and the next data
+ * block starts a new range. Returns the number of ranges, or -1 when there are
+ * more than BLOB_COW_MAX_WRITES (then the caller writes the whole cluster in
+ * one IO).
+ */
+static int
+blob_cow_find_ranges(const uint8_t *buf, uint64_t cluster_sz, struct blob_cow_range *ranges)
+{
+	uint64_t off;
+	int nranges = 0;
+
+	for (off = 0; off < cluster_sz; off += BLOB_COW_SCAN_UNIT) {
+		if (blob_cow_unit_is_zero(buf + off, BLOB_COW_SCAN_UNIT)) {
+			continue;
+		}
+		if (nranges > 0 && ranges[nranges - 1].end == off) {
+			/* Right after the previous range: extend it. */
+			ranges[nranges - 1].end = off + BLOB_COW_SCAN_UNIT;
+			continue;
+		}
+		if (nranges == BLOB_COW_MAX_WRITES) {
+			return -1;
+		}
+		ranges[nranges].start = off;
+		ranges[nranges].end = off + BLOB_COW_SCAN_UNIT;
+		nranges++;
+	}
+
+	return nranges;
 }
 
 static void
 blob_write_copy(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
 	struct spdk_blob_copy_cluster_ctx *ctx = cb_arg;
+	struct spdk_blob_store *bs = ctx->blob->bs;
+	struct blob_cow_range ranges[BLOB_COW_MAX_WRITES];
+	spdk_bs_batch_t *batch;
+	uint64_t cluster_lba;
+	int nranges, i;
 
 	if (bserrno != 0) {
 		/* The read failed, so jump to the final completion handler */
@@ -3756,11 +3909,28 @@ blob_write_copy(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		return;
 	}
 
-	/* Write whole cluster */
-	bs_sequence_write_dev(seq, ctx->buf,
-			      bs_cluster_to_lba(ctx->blob->bs, ctx->new_cluster),
-			      bs_cluster_to_lba(ctx->blob->bs, 1),
-			      blob_write_copy_cpl, ctx);
+	cluster_lba = bs_cluster_to_lba(bs, ctx->new_cluster);
+
+	nranges = blob_cow_find_ranges(ctx->buf, bs->cluster_sz, ranges);
+	if (nranges < 0) {
+		/* Data is spread over the cluster: write whole cluster */
+		bs_sequence_write_dev(seq, ctx->buf, cluster_lba, bs_cluster_to_lba(bs, 1),
+				      blob_write_copy_cpl, ctx);
+		return;
+	}
+
+	SPDK_DEBUGLOG(blob, "CoW blob 0x%" PRIx64 " cluster %" PRIu64 ": %d write(s)\n",
+		      ctx->blob->id, ctx->new_cluster, nranges);
+
+	/* Write only the ranges with data. With no ranges the batch completes
+	 * at close and the cluster is inserted without any data write. */
+	batch = bs_sequence_to_batch(seq, 0, blob_write_copy_cpl, ctx);
+	for (i = 0; i < nranges; i++) {
+		bs_batch_write_dev(batch, ctx->buf + ranges[i].start,
+				   cluster_lba + bs_byte_to_lba(bs, ranges[i].start),
+				   bs_byte_to_lba(bs, ranges[i].end - ranges[i].start));
+	}
+	bs_batch_close(batch);
 }
 
 static bool
@@ -3801,15 +3971,9 @@ bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 	uint64_t copy_src_lba;
 	int rc;
 
-	ch = spdk_io_channel_get_ctx(_ch);
+	struct spdk_bs_cluster_alloc *alloc;
 
-	if (!TAILQ_EMPTY(&ch->need_cluster_alloc)) {
-		/* There are already operations pending. Queue this user op
-		 * and return because it will be re-executed when the outstanding
-		 * cluster allocation completes. */
-		TAILQ_INSERT_TAIL(&ch->need_cluster_alloc, op, link);
-		return;
-	}
+	ch = spdk_io_channel_get_ctx(_ch);
 
 	/* Round the io_unit offset down to the first page in the cluster */
 	cluster_start_page = bs_io_unit_to_cluster_start(blob, io_unit);
@@ -3817,6 +3981,21 @@ bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 	/* Calculate which index in the metadata cluster array the corresponding
 	 * cluster is supposed to be at. */
 	cluster_number = bs_io_unit_to_cluster_number(blob, io_unit);
+
+	alloc = bs_cluster_alloc_find(ch, blob->id, cluster_number);
+	if (alloc != NULL) {
+		/* This cluster is already being allocated. Queue this user op;
+		 * it will be re-executed when that allocation completes. */
+		TAILQ_INSERT_TAIL(&alloc->waiting, op, link);
+		return;
+	}
+
+	if (TAILQ_EMPTY(&ch->free_cluster_allocs)) {
+		/* All allocation slots are busy. Queue this user op; it will be
+		 * re-executed when a slot is free. */
+		TAILQ_INSERT_TAIL(&ch->need_cluster_alloc, op, link);
+		return;
+	}
 
 	ctx = calloc(1, sizeof(*ctx));
 	if (!ctx) {
@@ -3829,8 +4008,6 @@ bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 
 	ctx->blob = blob;
 	ctx->page = cluster_start_page;
-	ctx->new_cluster_page = ch->new_cluster_page;
-	memset(ctx->new_cluster_page, 0, SPDK_BS_PAGE_SIZE);
 
 	/* Check if the cluster that we intend to do CoW for is valid for
 	 * the backing dev. For zeroes backing dev, it'll be always valid.
@@ -3885,8 +4062,12 @@ bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 		return;
 	}
 
-	/* Queue the user op to block other incoming operations */
-	TAILQ_INSERT_TAIL(&ch->need_cluster_alloc, op, link);
+	/* Take a slot for this (blob, cluster). Nothing above is async, so the
+	 * free slot found at the top is still there. Queue the user op on the
+	 * slot to block other ops for the same cluster. */
+	ctx->alloc = bs_cluster_alloc_get(ch, blob->id, cluster_number);
+	ctx->new_cluster_page = ctx->alloc->page;
+	TAILQ_INSERT_TAIL(&ctx->alloc->waiting, op, link);
 
 	if (blob->parent_id != SPDK_BLOBID_INVALID && !is_zeroes) {
 		if (can_copy) {
@@ -4628,13 +4809,25 @@ bs_channel_create(void *io_device, void *ctx_buf)
 		return -1;
 	}
 
-	channel->new_cluster_page = spdk_zmalloc(SPDK_BS_PAGE_SIZE, 0, NULL, SPDK_ENV_SOCKET_ID_ANY,
-				    SPDK_MALLOC_DMA);
-	if (!channel->new_cluster_page) {
-		SPDK_ERRLOG("Failed to allocate new cluster page\n");
+	channel->cluster_allocs = calloc(SPDK_BS_CHANNEL_CLUSTER_ALLOCS,
+					 sizeof(*channel->cluster_allocs));
+	channel->cluster_alloc_pages = spdk_zmalloc(SPDK_BS_CHANNEL_CLUSTER_ALLOCS * SPDK_BS_PAGE_SIZE,
+				       0, NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+	if (!channel->cluster_allocs || !channel->cluster_alloc_pages) {
+		SPDK_ERRLOG("Failed to allocate cluster allocation slots\n");
+		free(channel->cluster_allocs);
+		spdk_free(channel->cluster_alloc_pages);
 		free(channel->req_mem);
 		channel->dev->destroy_channel(channel->dev, channel->dev_channel);
 		return -1;
+	}
+
+	TAILQ_INIT(&channel->free_cluster_allocs);
+	RB_INIT(&channel->busy_cluster_allocs);
+	for (i = 0; i < SPDK_BS_CHANNEL_CLUSTER_ALLOCS; i++) {
+		channel->cluster_allocs[i].page = &channel->cluster_alloc_pages[i];
+		TAILQ_INIT(&channel->cluster_allocs[i].waiting);
+		TAILQ_INSERT_TAIL(&channel->free_cluster_allocs, &channel->cluster_allocs[i], link);
 	}
 
 	TAILQ_INIT(&channel->need_cluster_alloc);
@@ -4649,11 +4842,20 @@ bs_channel_destroy(void *io_device, void *ctx_buf)
 {
 	struct spdk_bs_channel *channel = ctx_buf;
 	spdk_bs_user_op_t *op;
+	uint32_t i;
 
 	while (!TAILQ_EMPTY(&channel->need_cluster_alloc)) {
 		op = TAILQ_FIRST(&channel->need_cluster_alloc);
 		TAILQ_REMOVE(&channel->need_cluster_alloc, op, link);
 		bs_user_op_abort(op, -EIO);
+	}
+
+	for (i = 0; i < SPDK_BS_CHANNEL_CLUSTER_ALLOCS; i++) {
+		while (!TAILQ_EMPTY(&channel->cluster_allocs[i].waiting)) {
+			op = TAILQ_FIRST(&channel->cluster_allocs[i].waiting);
+			TAILQ_REMOVE(&channel->cluster_allocs[i].waiting, op, link);
+			bs_user_op_abort(op, -EIO);
+		}
 	}
 
 	while (!TAILQ_EMPTY(&channel->queued_io)) {
@@ -4665,7 +4867,8 @@ bs_channel_destroy(void *io_device, void *ctx_buf)
 	blob_esnap_destroy_bs_channel(channel);
 
 	free(channel->req_mem);
-	spdk_free(channel->new_cluster_page);
+	free(channel->cluster_allocs);
+	spdk_free(channel->cluster_alloc_pages);
 
 	if (channel->set_redirect_ch && channel->redirect_ch) {
 		spdk_put_io_channel(channel->redirect_ch);
@@ -12909,7 +13112,33 @@ struct spdk_blob_cluster_op_ctx {
 	bool		copy;
 	spdk_blob_op_complete	cb_fn;
 	void			*cb_arg;
+	struct blob_ep_insert	*ep_insert;	/* extent page turn held or waited for */
+	TAILQ_ENTRY(spdk_blob_cluster_op_ctx) link;	/* in ep_insert->waiting */
 };
+
+/*
+ * A cluster insert in progress for one extent page of a blob. Inserts for
+ * the same extent page wait here; other extent pages run in parallel.
+ * Used only on the md thread.
+ */
+struct blob_ep_insert {
+	RB_ENTRY(blob_ep_insert)	node;
+	/* Extent page index, or UINT32_MAX when the blob has no extent table
+	 * (then every insert syncs the whole md, so the whole blob is one key). */
+	uint32_t			ep_index;
+	TAILQ_HEAD(, spdk_blob_cluster_op_ctx) waiting;
+};
+
+static int
+blob_ep_insert_compare(struct blob_ep_insert *e1, struct blob_ep_insert *e2)
+{
+	if (e1->ep_index != e2->ep_index) {
+		return e1->ep_index < e2->ep_index ? -1 : 1;
+	}
+	return 0;
+}
+
+RB_GENERATE_STATIC(blob_ep_insert_tree, blob_ep_insert, node, blob_ep_insert_compare)
 
 static void
 blob_op_cluster_msg_cpl(void *arg)
@@ -12929,6 +13158,44 @@ blob_op_cluster_msg_cb(void *arg, int bserrno)
 	spdk_thread_send_msg(ctx->thread, blob_op_cluster_msg_cpl, ctx);
 }
 
+static void blob_insert_cluster_run(void *arg);
+
+/*
+ * The cluster insert is done (ctx->rc is set). Start the next waiting insert
+ * for the same extent page, then send the result back to the IO thread.
+ * Runs on the md thread.
+ */
+static void
+blob_insert_cluster_msg_done(struct spdk_blob_cluster_op_ctx *ctx)
+{
+	struct spdk_blob *blob = ctx->blob;
+	struct blob_ep_insert *ep_insert = ctx->ep_insert;
+	struct spdk_blob_cluster_op_ctx *next;
+
+	assert(ep_insert != NULL);
+	next = TAILQ_FIRST(&ep_insert->waiting);
+	if (next != NULL) {
+		/* Hand the turn for this extent page to the next insert.
+		 * Start it from a new message, not on this stack. */
+		TAILQ_REMOVE(&ep_insert->waiting, next, link);
+		spdk_thread_send_msg(blob->bs->md_thread, blob_insert_cluster_run, next);
+	} else {
+		RB_REMOVE(blob_ep_insert_tree, &blob->ep_inserts, ep_insert);
+		free(ep_insert);
+	}
+
+	spdk_thread_send_msg(ctx->thread, blob_op_cluster_msg_cpl, ctx);
+}
+
+static void
+blob_insert_cluster_msg_cb(void *arg, int bserrno)
+{
+	struct spdk_blob_cluster_op_ctx *ctx = arg;
+
+	ctx->rc = bserrno;
+	blob_insert_cluster_msg_done(ctx);
+}
+
 static void
 blob_insert_new_ep_cb(void *arg, int bserrno)
 {
@@ -12938,7 +13205,7 @@ blob_insert_new_ep_cb(void *arg, int bserrno)
 	extent_page = bs_cluster_to_extent_page(ctx->blob, ctx->cluster_num);
 	*extent_page = ctx->extent_page;
 	ctx->blob->state = SPDK_BLOB_STATE_DIRTY;
-	blob_sync_md(ctx->blob, false, blob_op_cluster_msg_cb, ctx);
+	blob_sync_md(ctx->blob, false, blob_insert_cluster_msg_cb, ctx);
 }
 
 struct spdk_blob_write_extent_page_ctx {
@@ -13116,7 +13383,7 @@ blob_write_extent_page(struct spdk_blob *blob, uint32_t extent, uint64_t cluster
 }
 
 static void
-blob_insert_cluster_msg(void *arg)
+blob_insert_cluster_run(void *arg)
 {
 	struct spdk_blob_cluster_op_ctx *ctx = arg;
 	struct spdk_blob *blob = ctx->blob;
@@ -13126,25 +13393,25 @@ blob_insert_cluster_msg(void *arg)
 		SPDK_NOTICELOG("Frozen refcnt while IO proccess tryagain 1.\n");
 		if (ctx->copy) {
 			SPDK_NOTICELOG("Frozen refcnt while IO proccess 11.\n");
-			ctx->rc = -EEXIST;				
+			ctx->rc = -EEXIST;
 		} else {
 			SPDK_NOTICELOG("Frozen refcnt while IO proccess tryagain 12.\n");
 			ctx->rc = -EAGAIN;
 		}
-		spdk_thread_send_msg(ctx->thread, blob_op_cluster_msg_cpl, ctx);
+		blob_insert_cluster_msg_done(ctx);
 		return;
 	}
 
 	ctx->rc = blob_insert_cluster(blob, ctx->cluster_num, ctx->cluster);
 	if (ctx->rc != 0) {
-		spdk_thread_send_msg(ctx->thread, blob_op_cluster_msg_cpl, ctx);
+		blob_insert_cluster_msg_done(ctx);
 		return;
 	}
 
 	if (blob->use_extent_table == false) {
 		/* Extent table is not used, proceed with sync of md that will only use extents_rle. */
 		blob->state = SPDK_BLOB_STATE_DIRTY;
-		blob_sync_md(blob, false, blob_op_cluster_msg_cb, ctx);
+		blob_sync_md(blob, false, blob_insert_cluster_msg_cb, ctx);
 		return;
 	}
 
@@ -13166,7 +13433,7 @@ blob_insert_cluster_msg(void *arg)
 				ctx->rc = -EAGAIN;
 			}
 
-			spdk_thread_send_msg(ctx->thread, blob_op_cluster_msg_cpl, ctx);
+			blob_insert_cluster_msg_done(ctx);
 			return;
 		}
 
@@ -13187,8 +13454,49 @@ blob_insert_cluster_msg(void *arg)
 		/* Extent page already allocated.
 		 * Every cluster allocation, requires just an update of single extent page. */
 		blob_write_extent_page(blob, *extent_page, ctx->cluster_num, ctx->page,
-				       blob_op_cluster_msg_cb, ctx);
+				       blob_insert_cluster_msg_cb, ctx);
 	}
+}
+
+/*
+ * Entry on the md thread. Only one cluster insert per extent page of a blob
+ * runs at a time: two inserts into the same extent page would otherwise write
+ * that page together (older content may land last), or both claim a new
+ * extent page. Inserts into different extent pages run in parallel.
+ */
+static void
+blob_insert_cluster_msg(void *arg)
+{
+	struct spdk_blob_cluster_op_ctx *ctx = arg;
+	struct spdk_blob *blob = ctx->blob;
+	struct blob_ep_insert find = {};
+	struct blob_ep_insert *ep_insert;
+
+	if (blob->use_extent_table) {
+		find.ep_index = bs_cluster_to_extent_table_id(ctx->cluster_num);
+	} else {
+		find.ep_index = UINT32_MAX;
+	}
+
+	ep_insert = RB_FIND(blob_ep_insert_tree, &blob->ep_inserts, &find);
+	if (ep_insert != NULL) {
+		ctx->ep_insert = ep_insert;
+		TAILQ_INSERT_TAIL(&ep_insert->waiting, ctx, link);
+		return;
+	}
+
+	ep_insert = calloc(1, sizeof(*ep_insert));
+	if (ep_insert == NULL) {
+		ctx->rc = -ENOMEM;
+		spdk_thread_send_msg(ctx->thread, blob_op_cluster_msg_cpl, ctx);
+		return;
+	}
+	ep_insert->ep_index = find.ep_index;
+	TAILQ_INIT(&ep_insert->waiting);
+	RB_INSERT(blob_ep_insert_tree, &blob->ep_inserts, ep_insert);
+
+	ctx->ep_insert = ep_insert;
+	blob_insert_cluster_run(ctx);
 }
 
 static void

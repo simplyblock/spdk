@@ -160,6 +160,11 @@ struct spdk_blob {
 	TAILQ_HEAD(, spdk_blob_persist_ctx) pending_persists;
 	TAILQ_HEAD(, spdk_blob_persist_ctx) persists_to_complete;
 
+	/* Extent pages of this blob with a cluster insert in progress. Only one
+	 * insert per extent page runs at a time, so two inserts never write the
+	 * same extent page together. Used only on the md thread. */
+	RB_HEAD(blob_ep_insert_tree, blob_ep_insert) ep_inserts;
+
 	/* Number of data clusters retrieved from extent table,
 	 * that many have to be read from extent pages. */
 	uint64_t	remaining_clusters_in_et;
@@ -250,6 +255,26 @@ struct spdk_blob_store {
 	void				*esnap_unload_cb_arg;
 };
 
+/* Number of cluster allocations that can run at the same time on one channel. */
+#define SPDK_BS_CHANNEL_CLUSTER_ALLOCS	512
+
+/*
+ * One cluster allocation in flight on a channel. Only one allocation runs
+ * for the same (blob, cluster); other ops for that cluster wait on it.
+ */
+struct spdk_bs_cluster_alloc {
+	RB_ENTRY(spdk_bs_cluster_alloc)	node;	/* in busy_cluster_allocs */
+	TAILQ_ENTRY(spdk_bs_cluster_alloc) link;	/* in free_cluster_allocs */
+	spdk_blob_id			blob_id;
+	uint32_t			cluster_num;
+
+	/* Extent page buffer used while inserting the new cluster. */
+	struct spdk_blob_md_page	*page;
+
+	/* User ops for this cluster. The first one started the allocation. */
+	TAILQ_HEAD(, spdk_bs_request_set) waiting;
+};
+
 struct spdk_bs_channel {
 	struct spdk_bs_request_set	*req_mem;
 	TAILQ_HEAD(, spdk_bs_request_set) reqs;
@@ -263,9 +288,13 @@ struct spdk_bs_channel {
 	void *redirect_desc;
 	bool	set_redirect_ch;
 
-	/* This page is only used during insert of a new cluster. */
-	struct spdk_blob_md_page	*new_cluster_page;
+	/* Cluster allocation slots and their extent page buffers. */
+	struct spdk_bs_cluster_alloc	*cluster_allocs;
+	struct spdk_blob_md_page	*cluster_alloc_pages;
+	TAILQ_HEAD(, spdk_bs_cluster_alloc) free_cluster_allocs;
+	RB_HEAD(bs_cluster_alloc_tree, spdk_bs_cluster_alloc) busy_cluster_allocs;
 
+	/* User ops waiting for a free cluster allocation slot. */
 	TAILQ_HEAD(, spdk_bs_request_set) need_cluster_alloc;
 	TAILQ_HEAD(, spdk_bs_request_set) queued_io;
 
