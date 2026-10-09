@@ -111,6 +111,9 @@ struct spdk_blob_list {
 struct spdk_blob {
 	struct spdk_blob_store *bs;
 
+	/* Two-node arbitration: frozen once by spdk_bs_ha_hold_send_msg, released once. */
+	bool  ha_held;
+
 	int priority_class; // to save the lvol's priority class across cluster allocations
 	bool  failed_on_update;
 	uint32_t	open_ref;
@@ -225,6 +228,8 @@ struct spdk_blob_store {
 	 * Only when the distrib internal force state changes, it will be set to false.
 	 */
 	bool				is_leader;
+	/* Two-node arbitration: held IO is returned as a path error (-ENOTCONN), not EIO. */
+	bool				ha_fenced;
 	node_role_t 		node_role;
 	bool				read_only;
 	bool 				stop;

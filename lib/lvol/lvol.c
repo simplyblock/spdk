@@ -3620,7 +3620,13 @@ spdk_lvs_remove_rules_poller(void *cb_arg)
 	struct spdk_lvs_req *req = cb_arg;
 	struct spdk_lvol_store *lvs = req->lvol_store;
 	spdk_poller_unregister(&req->poller);
-	remove_reject_hublvol_port(lvs->hublvol_port);
+	if (lvs->ha_fenced) {
+		/* Two-node arbitration: a fenced LVS stays blocked until the control
+		 * plane unfences it and re-admits the node (invariant 6). */
+		SPDK_NOTICELOG("Rule removal skipped: lvs groupid %" PRIu64 " is fenced.\n", lvs->groupid);
+	} else {
+		remove_reject_hublvol_port(lvs->hublvol_port);
+	}
 	free(req);
 	return -1;
 }
@@ -3892,6 +3898,136 @@ spdk_lvs_set_signal_switch(struct spdk_lvol_store *lvs)
 		}
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
 }
+
+/* START two-node arbitration (sbcli docs/design/two-node-arbitration.md) */
+
+static struct spdk_lvol_store *
+lvs_ha_find_locked(uint64_t groupid)
+{
+	struct spdk_lvol_store *lvs;
+
+	TAILQ_FOREACH(lvs, &g_lvol_stores, link) {
+		if (lvs->groupid == groupid) {
+			return lvs;
+		}
+	}
+	return NULL;
+}
+
+int
+spdk_lvs_ha_hold(uint64_t groupid)
+{
+	struct spdk_lvol_store *lvs;
+	int rc = 0;
+
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+	lvs = lvs_ha_find_locked(groupid);
+	if (lvs == NULL) {
+		rc = -ENOENT;
+	} else if (lvs->leader && !lvs->ha_held && !lvs->ha_fenced) {
+		/* Only a leading LVS serves client writes; a follower has nothing to hold. */
+		lvs->ha_held = true;
+		rc = spdk_bs_ha_hold_send_msg(lvs->blobstore);
+		if (rc != 0) {
+			lvs->ha_held = false;
+		}
+		SPDK_NOTICELOG("HA hold on lvs groupid %" PRIu64 " rc=%d\n", groupid, rc);
+	}
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+	return rc;
+}
+
+static void
+lvs_ha_noop_cb(void *cb_arg, int rc)
+{
+}
+
+int
+spdk_lvs_ha_release(uint64_t groupid, spdk_lvs_ha_cb cb_fn, void *cb_arg)
+{
+	struct spdk_lvol_store *lvs;
+	int rc;
+
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+	lvs = lvs_ha_find_locked(groupid);
+	if (lvs == NULL) {
+		pthread_mutex_unlock(&g_lvol_stores_mutex);
+		return -ENOENT;
+	}
+	lvs->ha_held = false;
+	rc = spdk_bs_ha_release_send_msg(lvs->blobstore, cb_fn ? cb_fn : lvs_ha_noop_cb, cb_arg);
+	SPDK_NOTICELOG("HA release (grant) on lvs groupid %" PRIu64 " rc=%d\n", groupid, rc);
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+	return rc;
+}
+
+int
+spdk_lvs_ha_fence(uint64_t groupid, spdk_lvs_ha_cb cb_fn, void *cb_arg)
+{
+	struct spdk_lvol_store *lvs;
+	struct spdk_lvol *lvol;
+	int rc;
+
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+	lvs = lvs_ha_find_locked(groupid);
+	if (lvs == NULL) {
+		pthread_mutex_unlock(&g_lvol_stores_mutex);
+		return -ENOENT;
+	}
+	lvs->ha_fenced = true;
+	lvs->ha_held = false;
+	block_port(lvs->subsystem_port);
+	if (lvs->node_role != NODE_TERTIARY && lvs->hublvol_port != 0) {
+		block_port(lvs->hublvol_port);
+	}
+	lvs->update_in_progress = false;
+	lvs->leader = false;
+	spdk_bs_set_ha_fenced(lvs->blobstore, true);
+	spdk_bs_set_leader(lvs->blobstore, false);
+	TAILQ_FOREACH(lvol, &lvs->lvols, link) {
+		lvol->leader = false;
+		lvol->update_in_progress = false;
+	}
+	/* Release whatever was held: with ha_fenced set it completes as a path error. */
+	rc = spdk_bs_ha_release_send_msg(lvs->blobstore, cb_fn ? cb_fn : lvs_ha_noop_cb, cb_arg);
+	SPDK_NOTICELOG("HA fence on lvs groupid %" PRIu64 " (%s) rc=%d\n", groupid,
+		       node_role_to_string(lvs->node_role), rc);
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+	return rc;
+}
+
+int
+spdk_lvs_ha_unfence(uint64_t groupid)
+{
+	struct spdk_lvol_store *lvs;
+
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+	lvs = lvs_ha_find_locked(groupid);
+	if (lvs == NULL) {
+		pthread_mutex_unlock(&g_lvol_stores_mutex);
+		return -ENOENT;
+	}
+	lvs->ha_fenced = false;
+	spdk_bs_set_ha_fenced(lvs->blobstore, false);
+	SPDK_NOTICELOG("HA unfence on lvs groupid %" PRIu64 "\n", groupid);
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+	return 0;
+}
+
+bool
+spdk_lvs_ha_is_fenced(uint64_t groupid)
+{
+	struct spdk_lvol_store *lvs;
+	bool fenced;
+
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+	lvs = lvs_ha_find_locked(groupid);
+	fenced = lvs != NULL && lvs->ha_fenced;
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+	return fenced;
+}
+
+/* END two-node arbitration */
 
 int
 spdk_lvs_IO_redirect(void *cb_arg)
