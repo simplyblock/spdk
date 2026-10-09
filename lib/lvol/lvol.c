@@ -6744,6 +6744,38 @@ spdk_lvs_create_poll_group(void *ctx)
 	spdk_thread_send_msg(g_lvs_md_thread, spdk_lvs_create_poll_group_done, lpg);
 }
 
+/* NVMf poll groups counted by spdk_lvs_count_io_poll_groups. spdk_for_each_thread
+ * visits one thread at a time, so a plain counter is enough. */
+static uint32_t g_lvs_num_io_pgs_counting;
+
+static void
+spdk_lvs_count_io_poll_group(void *ctx)
+{
+	const char *name = spdk_thread_get_name(spdk_get_thread());
+
+	if (name != NULL && strncmp(name, "nvmf_tgt_poll_group_", 20) == 0) {
+		g_lvs_num_io_pgs_counting++;
+	}
+}
+
+static void
+spdk_lvs_count_io_poll_groups_done(void *ctx)
+{
+	SPDK_NOTICELOG("Found %u nvmf poll groups writing to lvols\n", g_lvs_num_io_pgs_counting);
+	/* Each of them can allocate clusters; the blobstore sizes the failover
+	 * unmap of free clusters by this number. */
+	spdk_bs_set_cluster_alloc_threads(g_lvs_num_io_pgs_counting);
+}
+
+/* Count the nvmf poll group threads. They exist already: they are created at
+ * nvmf subsystem init, before runtime RPCs. */
+static void
+spdk_lvs_count_io_poll_groups(void)
+{
+	g_lvs_num_io_pgs_counting = 0;
+	spdk_for_each_thread(spdk_lvs_count_io_poll_group, NULL, spdk_lvs_count_io_poll_groups_done);
+}
+
 static void
 spdk_lvs_create_poll_groups(struct spdk_lvol_store *lvs)
 {
@@ -6754,6 +6786,9 @@ spdk_lvs_create_poll_groups(struct spdk_lvol_store *lvs)
 	g_lvs_md_thread = spdk_get_thread();
 	assert(g_lvs_md_thread != NULL);
 	SPDK_NOTICELOG("Create new thread t %p md %p.\n", spdk_get_thread(), g_lvs_md_thread);
+
+	spdk_lvs_count_io_poll_groups();
+
 	SPDK_ENV_FOREACH_CORE(cpu) {
 		if (g_helper_set && !spdk_cpuset_get_cpu(g_helper_set, cpu)) {
 			continue;

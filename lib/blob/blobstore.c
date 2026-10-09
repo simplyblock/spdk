@@ -2605,8 +2605,8 @@ blob_persist_clear_extents_partial(spdk_bs_sequence_t *seq,
 {
 	struct spdk_blob *blob = ctx->blob;
 	struct spdk_blob_store *bs = blob->bs;
-	spdk_bs_batch_t *batch;
-	struct md_journal_batch *jr_batch;
+	spdk_bs_batch_t *batch = NULL;
+	struct md_journal_batch *jr_batch = NULL;
 	uint64_t lba;
 	uint64_t lba_count;
 	uint32_t submitted = 0;
@@ -2870,8 +2870,8 @@ blob_persist_zero_pages(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	struct spdk_blob_store		*bs = blob->bs;
 	uint64_t			lba;
 	uint64_t			lba_count;
-	spdk_bs_batch_t			*batch;
-	struct md_journal_batch *jr_batch;
+	spdk_bs_batch_t			*batch = NULL;
+	struct md_journal_batch *jr_batch = NULL;
 	size_t				i;
 
 	if (bserrno != 0) {
@@ -3064,8 +3064,8 @@ blob_persist_write_page_chain(spdk_bs_sequence_t *seq, struct spdk_blob_persist_
 	uint64_t			lba;
 	uint32_t			lba_count;
 	struct spdk_blob_md_page	*page;
-	spdk_bs_batch_t			*batch;
-	struct md_journal_batch *jr_batch;
+	spdk_bs_batch_t			*batch = NULL;
+	struct md_journal_batch *jr_batch = NULL;
 	size_t				i;
 
 	/* Clusters don't move around in blobs. The list shrinks or grows
@@ -8251,11 +8251,159 @@ spdk_bs_set_leader(struct spdk_blob_store *bs, bool state)
 	bs->is_leader = state;
 }
 
+/*
+ * Before this node starts allocating as leader (failover update, or failback:
+ * primary is up again, examined, and gets leadership by RPC), unmap the lowest
+ * free clusters. The old leader may have left data on clusters it allocated
+ * but never inserted, and CoW skips zero ranges / a thin first write leaves
+ * the rest of the cluster unwritten, so those clusters must read as zeroes.
+ * In-flight allocations always take the lowest free clusters, at most
+ * SPDK_BS_CHANNEL_CLUSTER_ALLOCS per writing thread.
+ */
+struct bs_clear_free_clusters_ctx {
+	struct spdk_blob_store	*bs;
+	uint32_t		*clusters;	/* claimed lowest free clusters, ascending */
+	uint32_t		num_clusters;
+	spdk_bs_sequence_cpl	cb_fn;
+	void			*cb_arg;
+};
+
+/* Threads that write to blobs (IO poll groups); 0 = not set. Set once by the
+ * lvol poll group RPC, before any blobstore is used. */
+static uint32_t g_bs_cluster_alloc_threads;
+
+void
+spdk_bs_set_cluster_alloc_threads(uint32_t num_threads)
+{
+	g_bs_cluster_alloc_threads = num_threads;
+}
+
+static uint32_t
+bs_num_clear_clusters(void)
+{
+	uint32_t num_threads = g_bs_cluster_alloc_threads;
+
+	if (num_threads == 0) {
+		/* Not set: the core count is an upper bound. */
+		num_threads = spdk_env_get_core_count();
+	}
+	return SPDK_BS_CHANNEL_CLUSTER_ALLOCS * num_threads;
+}
+
+static void
+bs_clear_free_clusters_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct bs_clear_free_clusters_ctx *ctx = cb_arg;
+	struct spdk_blob_store *bs = ctx->bs;
+	spdk_bs_sequence_cpl cb_fn = ctx->cb_fn;
+	void *fn_arg = ctx->cb_arg;
+	uint32_t i;
+
+	/* Release them also on error: after an IO error the IO that follows
+	 * fails or is queued the same way, so keeping them claimed gains nothing. */
+	spdk_spin_lock(&bs->used_lock);
+	for (i = 0; i < ctx->num_clusters; i++) {
+		bs_release_cluster(bs, ctx->clusters[i]);
+	}
+	spdk_spin_unlock(&bs->used_lock);
+
+	if (bserrno != 0) {
+		SPDK_ERRLOG("Unmap of %u lowest free clusters failed, rc=%d\n",
+			    ctx->num_clusters, bserrno);
+	} else {
+		SPDK_NOTICELOG("Unmapped %u lowest free clusters\n", ctx->num_clusters);
+	}
+
+	free(ctx->clusters);
+	free(ctx);
+	cb_fn(seq, fn_arg, 0);
+}
+
+/*
+ * Claim the lowest free clusters, unmap them on seq (one unmap per run of
+ * neighbouring clusters), release them, then cb_fn(seq, cb_arg, 0). Errors are
+ * logged and the caller goes on. Runs on the md thread.
+ */
+static void
+bs_clear_free_clusters(struct spdk_blob_store *bs, spdk_bs_sequence_t *seq,
+		       spdk_bs_sequence_cpl cb_fn, void *cb_arg)
+{
+	struct bs_clear_free_clusters_ctx *ctx;
+	spdk_bs_batch_t *batch;
+	uint32_t max, cluster, start, len, i;
+	/* Max clusters per unmap: 2048 LBAs per unmap. */
+	const uint32_t max_len = spdk_max(2048 / bs_cluster_to_lba(bs, 1), 1);
+
+	assert(spdk_get_thread() == bs->md_thread);
+
+	max = bs_num_clear_clusters();
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx != NULL) {
+		ctx->clusters = calloc(max, sizeof(*ctx->clusters));
+	}
+	if (ctx == NULL || ctx->clusters == NULL) {
+		SPDK_ERRLOG("Cannot allocate list of %u clusters to clear, skipping\n", max);
+		free(ctx);
+		cb_fn(seq, cb_arg, 0);
+		return;
+	}
+	ctx->bs = bs;
+	ctx->cb_fn = cb_fn;
+	ctx->cb_arg = cb_arg;
+
+	/* Claim them so nothing allocates one of them before it is unmapped. */
+	spdk_spin_lock(&bs->used_lock);
+	for (i = 0; i < max; i++) {
+		cluster = bs_claim_cluster(bs);
+		if (cluster == UINT32_MAX) {
+			break;
+		}
+		ctx->clusters[ctx->num_clusters++] = cluster;
+	}
+	spdk_spin_unlock(&bs->used_lock);
+
+	batch = bs_sequence_to_batch(seq, 0, bs_clear_free_clusters_cpl, ctx);
+	batch->u.batch.is_unmap = true;
+
+	/* Claimed lowest first, so ascending and mostly next to each other. */
+	if (ctx->num_clusters > 0) {
+		start = ctx->clusters[0];
+		len = 1;
+		for (i = 1; i < ctx->num_clusters; i++) {
+			if (ctx->clusters[i] == start + len && len < max_len) {
+				len++;
+				continue;
+			}
+			bs->w_io++;
+			bs_batch_unmap_dev(batch, bs_cluster_to_lba(bs, start), bs_cluster_to_lba(bs, len));
+			start = ctx->clusters[i];
+			len = 1;
+		}
+		bs->w_io++;
+		bs_batch_unmap_dev(batch, bs_cluster_to_lba(bs, start), bs_cluster_to_lba(bs, len));
+	}
+
+	bs_batch_close(batch);
+}
+
+static void
+bs_activate_leader_cleared(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	bs_sequence_finish(seq, bserrno);
+}
+
 static void
 spdk_bs_activate_md_journal_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
-	bs_sequence_finish(seq, bserrno);
-	return;
+	struct spdk_blob_store *bs = cb_arg;
+
+	if (bserrno != 0) {
+		bs_sequence_finish(seq, bserrno);
+		return;
+	}
+
+	/* Journal is replayed: now clear the lowest free clusters. */
+	bs_clear_free_clusters(bs, seq, bs_activate_leader_cleared, NULL);
 }
 
 void
@@ -8264,22 +8412,24 @@ spdk_bs_activate_md_journal(struct spdk_blob_store *bs, bool old_state, bool new
 	struct spdk_bs_cpl		cpl;
 	spdk_bs_sequence_t		*seq = NULL;
 
-	if (bs->md_journal == NULL) {
+	if (!new_state) {
+		if (bs->md_journal != NULL) {
+			bs_md_journal_leadership_change(bs->md_journal, NULL, old_state, new_state, NULL, NULL);
+		}
 		cb_fn(cb_arg, 0);
 		return;
 	}
 
-
-	if (!new_state) {
-		bs_md_journal_leadership_change(bs->md_journal, NULL, old_state, new_state, NULL, NULL);
+	if (old_state && bs->md_journal == NULL) {
+		/* Already leader (true -> true) and no journal: nothing to do. */
 		cb_fn(cb_arg, 0);
 		return;
 	}
 
 	/*
-	* Real promotion (lvs was not leader): replay the journal
-	* before new writes are admitted. Only the set-leader RPC
-	* passes lvs_state == false, so this runs on the md thread.
+	* Becoming leader: replay the journal (if any) and clear the lowest
+	* free clusters before new writes are admitted. Only the set-leader
+	* RPC gets here, so this runs on the md thread.
 	*/
 	assert(spdk_get_thread() == bs->md_thread);
 
@@ -8293,7 +8443,21 @@ spdk_bs_activate_md_journal(struct spdk_blob_store *bs, bool old_state, bool new
 		cb_fn(cb_arg, -ENOMEM);
 		return;
 	}
-	bs_md_journal_leadership_change(bs->md_journal, seq, old_state, new_state, spdk_bs_activate_md_journal_cpl, bs);
+
+	if (bs->md_journal != NULL) {
+		if (old_state) {
+			/* Already leader (true -> true): the clusters were cleared
+			 * when it became leader; only pass the change to the journal. */
+			bs_md_journal_leadership_change(bs->md_journal, seq, old_state, new_state,
+							bs_activate_leader_cleared, NULL);
+			return;
+		}
+		bs_md_journal_leadership_change(bs->md_journal, seq, old_state, new_state,
+						spdk_bs_activate_md_journal_cpl, bs);
+		return;
+	}
+
+	bs_clear_free_clusters(bs, seq, bs_activate_leader_cleared, NULL);
 }
 
 void
@@ -12340,39 +12504,83 @@ bs_delete_async_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	bs_sequence_finish(seq, bserrno);
 }
 
+/* Clusters of a blob deleted async, released only after its md is persisted.
+ * Allocated at the start of the delete, before anything changes. */
+struct bs_delete_async_release_ctx {
+	struct spdk_blob	*blob;
+	uint32_t		*clusters;
+	uint64_t		max_clusters;	/* size of clusters[] */
+	uint64_t		num_clusters;
+};
+
+static void
+bs_delete_async_release_ctx_free(struct bs_delete_async_release_ctx *ctx)
+{
+	free(ctx->clusters);
+	free(ctx);
+}
+
+static void
+bs_delete_async_persist_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct bs_delete_async_release_ctx *ctx = cb_arg;
+	struct spdk_blob *blob = ctx->blob;
+	struct spdk_blob_store *bs = blob->bs;
+	uint64_t i;
+
+	if (bserrno == 0) {
+		/* The md without these clusters is on disk: now they can be reused. */
+		spdk_spin_lock(&bs->used_lock);
+		for (i = 0; i < ctx->num_clusters; i++) {
+			bs_release_cluster(bs, ctx->clusters[i]);
+		}
+		spdk_spin_unlock(&bs->used_lock);
+	} else {
+		/* The md on disk may still list them: do not release. They stay
+		 * claimed until the next load rebuilds the cluster map. */
+		SPDK_ERRLOG("Persist of blob 0x%" PRIx64 " failed, not releasing its %" PRIu64 " clusters\n",
+			    blob->id, ctx->num_clusters);
+	}
+
+	bs_delete_async_release_ctx_free(ctx);
+	bs_delete_async_cpl(seq, blob, bserrno);
+}
+
 static void
 blob_clear_clusters_async_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
-	struct spdk_blob  *blob = cb_arg;
+	struct bs_delete_async_release_ctx *ctx = cb_arg;
+	struct spdk_blob		*blob = ctx->blob;
 	struct spdk_blob_store		*bs = blob->bs;
 	size_t				i;
 
 	if (bserrno != 0) {
+		bs_delete_async_release_ctx_free(ctx);
 		bs_delete_async_cpl(seq, blob, bserrno);
 		return;
 	}
 
 	if (!blob->bs->is_leader) {
 		SPDK_ERRLOG("Failed to async delete blob id %" PRIx64 ": due to leadership change\n", blob->id);
+		bs_delete_async_release_ctx_free(ctx);
 		bs_delete_async_cpl(seq, blob, ERR_LEADERSHIP_CHANGED);
 		return;
 	}
 
-	spdk_spin_lock(&bs->used_lock);
-	/* Release all clusters that were truncated */
+	/* Take the clusters out of the blob, but release them only after the md
+	 * without them is persisted (bs_delete_async_persist_cpl). Released
+	 * earlier, another blob could get one and persist it first, and after a
+	 * crash both blobs would own that cluster. */
 	for (i = 0; i < blob->active.cluster_array_size; i++) {
-		uint32_t cluster_num = bs_lba_to_cluster(bs, blob->active.clusters[i]);
-
-		/* Nothing to release if it was not allocated */
 		if (blob->active.clusters[i] != 0) {
-			bs_release_cluster(bs, cluster_num);
+			assert(ctx->num_clusters < ctx->max_clusters);
+			ctx->clusters[ctx->num_clusters++] = bs_lba_to_cluster(bs, blob->active.clusters[i]);
 			blob->active.clusters[i] = 0;
 			if (blob->active.num_allocated_clusters > 0) {
 				blob->active.num_allocated_clusters--;
 			}
 		}
 	}
-	spdk_spin_unlock(&bs->used_lock);
 
 	blob->state = SPDK_BLOB_STATE_DIRTY;
 	blob_resize(blob, 0);
@@ -12382,12 +12590,13 @@ blob_clear_clusters_async_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno
 	blob->md_ro = false;
 	blob_remove_xattr(blob, SNAPSHOT_PENDING_REMOVAL, true);
 	blob->md_ro = md_ro;
-	blob_persist(seq, blob, false, bs_delete_async_cpl, blob);
+	blob_persist(seq, blob, false, bs_delete_async_persist_cpl, ctx);
 }
 
 static void
-blob_clear_clusters_async(spdk_bs_sequence_t *seq, struct spdk_blob	*blob)
+blob_clear_clusters_async(spdk_bs_sequence_t *seq, struct bs_delete_async_release_ctx *ctx)
 {
+	struct spdk_blob		*blob = ctx->blob;
 	struct spdk_blob_store		*bs = blob->bs;
 	spdk_bs_batch_t			*batch;
 	size_t				i;
@@ -12396,7 +12605,7 @@ blob_clear_clusters_async(spdk_bs_sequence_t *seq, struct spdk_blob	*blob)
 	uint64_t	index = 0;
 
 	uint8_t special_io = blob->migration_flag ? 1 : 0;
-	batch = bs_sequence_to_batch_s(seq, blob->geometry, special_io, blob_clear_clusters_async_cpl, blob);
+	batch = bs_sequence_to_batch_s(seq, blob->geometry, special_io, blob_clear_clusters_async_cpl, ctx);
 
 	/* Clear all clusters that were truncated */
 	lba = 0;
@@ -12462,6 +12671,9 @@ bs_delete_blob_finish_async(void *cb_arg, struct spdk_blob *blob, int bserrno)
 {
 	spdk_bs_sequence_t *seq = cb_arg;
 	struct spdk_blob_list *snapshot_entry = NULL;
+	struct bs_delete_async_release_ctx *ctx;
+	uint64_t num = 0;
+	size_t i;
 
 	if (bserrno) {
 		bs_delete_async_cpl(seq, blob, bserrno);
@@ -12473,13 +12685,35 @@ bs_delete_blob_finish_async(void *cb_arg, struct spdk_blob *blob, int bserrno)
 		bs_delete_async_cpl(seq, blob, ERR_LEADERSHIP_CHANGED);
 		return;
 	}
+
+	/* Allocate the release list first, before anything changes: on failure
+	 * nothing is removed or unmapped yet. */
+	for (i = 0; i < blob->active.cluster_array_size; i++) {
+		if (blob->active.clusters[i] != 0) {
+			num++;
+		}
+	}
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx != NULL && num > 0) {
+		ctx->clusters = calloc(num, sizeof(*ctx->clusters));
+	}
+	if (ctx == NULL || (num > 0 && ctx->clusters == NULL)) {
+		SPDK_ERRLOG("Failed to async delete blob id %" PRIx64 ": cannot allocate release list\n",
+			    blob->id);
+		free(ctx);
+		bs_delete_async_cpl(seq, blob, -ENOMEM);
+		return;
+	}
+	ctx->blob = blob;
+	ctx->max_clusters = num;
+
 	/* Remove snapshot from the list */
 	snapshot_entry = bs_get_snapshot_entry(blob->bs, blob->id);
 	if (snapshot_entry != NULL) {
 		TAILQ_REMOVE(&blob->bs->snapshots, snapshot_entry, link);
 		free(snapshot_entry);
 	}
-	blob_clear_clusters_async(seq, blob);
+	blob_clear_clusters_async(seq, ctx);
 }
 
 void
@@ -15035,9 +15269,16 @@ bs_update_write_used_blobids_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bser
 }
 
 static void
-bs_update_write_used_md(struct spdk_bs_update_ctx *ctx)
+bs_update_write_used_blobids_md(struct spdk_bs_update_ctx *ctx)
 {
 	bs_write_used_blobids_on_failover(ctx->seq, ctx, bs_update_write_used_blobids_cpl);
+}
+
+static void
+bs_update_cleared_free_clusters(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	/* Free clusters are cleared: go on with writing the used blobids mask. */
+	bs_update_write_used_blobids_md(cb_arg);
 }
 
 static inline bool
@@ -15247,9 +15488,12 @@ bs_update_replay_md_chain_cpl(struct spdk_bs_update_ctx *ctx)
 		spdk_bit_array_free(&used_md_pages_tmp);
 		spdk_bit_array_free(&used_blobids_tmp);	
 		spdk_bit_pool_free(&used_clusters_tmp);
-		
+
 		if (ctx->failover) {
-			bs_update_write_used_md(ctx);
+			/* lvs is not leader yet, so no client IO allocates while the
+			 * lowest free clusters are claimed and unmapped. */
+			bs_clear_free_clusters(ctx->bs, ctx->seq,
+					       bs_update_cleared_free_clusters, ctx);
 		} else {
 			bs_update_live_done(ctx, 0);
 		}
@@ -16143,8 +16387,7 @@ spdk_read_cluster_data_xfer(struct spdk_blob *blob, void *buf, uint64_t offset, 
 		bs_batch_read_dev(batch, buf, lba, 8 * bs_byte_to_lba(bs, SPDK_BS_PAGE_SIZE));
 	} else {
 		// byte to lba = block cnt -> block_cnt in 4k * page per cluster = bs_io_unit_to_back_dev_lba(blob, lba_len)
-		bool is_allocated = blob_calculate_lba_and_lba_count(blob, offset, length, &lba, &lba_count);
-		assert(is_allocated);
+		blob_calculate_lba_and_lba_count(blob, offset, length, &lba, &lba_count);
 		bs_batch_read_dev(batch, buf, lba, lba_count);
 	}
 

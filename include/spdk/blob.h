@@ -482,6 +482,14 @@ void spdk_blob_update_failed_cleanup(struct spdk_blob *blob,
 void spdk_bs_set_leader(struct spdk_blob_store *bs, bool state);
 void spdk_bs_activate_md_journal(struct spdk_blob_store *bs, bool state, bool lvs_state, spdk_blob_op_complete cb_fn, void *cb_arg);
 void spdk_bs_set_role(struct spdk_blob_store *bs, node_role_t role);
+
+/**
+ * Set the number of threads that write to blobs (the IO poll groups). Each of
+ * them can run SPDK_BS_CHANNEL_CLUSTER_ALLOCS cluster allocations at once; on
+ * failover that many lowest free clusters are unmapped per thread. With 0 (not
+ * set) the app core count is used.
+ */
+void spdk_bs_set_cluster_alloc_threads(uint32_t num_threads);
 node_role_t node_role_from_string(const char *str);
 const char *node_role_to_string(node_role_t role);
 void spdk_bs_set_read_only(struct spdk_blob_store *bs, bool state);
