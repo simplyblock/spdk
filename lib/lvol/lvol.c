@@ -3623,8 +3623,7 @@ spdk_lvs_remove_rules_poller(void *cb_arg)
 	if (lvs->ha_fenced) {
 		/* Two-node arbitration: a fenced LVS stays blocked until the control
 		 * plane unfences it and re-admits the node (invariant 6). */
-		SPDK_NOTICELOG("Rule removal skipped: lvs groupid %" PRIu64 " is fenced.
-", lvs->groupid);
+		SPDK_NOTICELOG("Rule removal skipped: lvs groupid %" PRIu64 " is fenced.\n", lvs->groupid);
 	} else {
 		remove_reject_hublvol_port(lvs->hublvol_port);
 	}
@@ -3932,8 +3931,7 @@ spdk_lvs_ha_hold(uint64_t groupid)
 		if (rc != 0) {
 			lvs->ha_held = false;
 		}
-		SPDK_NOTICELOG("HA hold on lvs groupid %" PRIu64 " rc=%d
-", groupid, rc);
+		SPDK_NOTICELOG("HA hold on lvs groupid %" PRIu64 " rc=%d\n", groupid, rc);
 	}
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
 	return rc;
@@ -3958,8 +3956,7 @@ spdk_lvs_ha_release(uint64_t groupid, spdk_lvs_ha_cb cb_fn, void *cb_arg)
 	}
 	lvs->ha_held = false;
 	rc = spdk_bs_ha_release_send_msg(lvs->blobstore, cb_fn ? cb_fn : lvs_ha_noop_cb, cb_arg);
-	SPDK_NOTICELOG("HA release (grant) on lvs groupid %" PRIu64 " rc=%d
-", groupid, rc);
+	SPDK_NOTICELOG("HA release (grant) on lvs groupid %" PRIu64 " rc=%d\n", groupid, rc);
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
 	return rc;
 }
@@ -3993,8 +3990,7 @@ spdk_lvs_ha_fence(uint64_t groupid, spdk_lvs_ha_cb cb_fn, void *cb_arg)
 	}
 	/* Release whatever was held: with ha_fenced set it completes as a path error. */
 	rc = spdk_bs_ha_release_send_msg(lvs->blobstore, cb_fn ? cb_fn : lvs_ha_noop_cb, cb_arg);
-	SPDK_NOTICELOG("HA fence on lvs groupid %" PRIu64 " (%s) rc=%d
-", groupid,
+	SPDK_NOTICELOG("HA fence on lvs groupid %" PRIu64 " (%s) rc=%d\n", groupid,
 		       node_role_to_string(lvs->node_role), rc);
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
 	return rc;
@@ -4013,8 +4009,7 @@ spdk_lvs_ha_unfence(uint64_t groupid)
 	}
 	lvs->ha_fenced = false;
 	spdk_bs_set_ha_fenced(lvs->blobstore, false);
-	SPDK_NOTICELOG("HA unfence on lvs groupid %" PRIu64 "
-", groupid);
+	SPDK_NOTICELOG("HA unfence on lvs groupid %" PRIu64 "\n", groupid);
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
 	return 0;
 }

@@ -10919,8 +10919,7 @@ bs_ha_hold_msg(void *arg)
 		blob->frozen_refcnt++;
 		n++;
 	}
-	SPDK_NOTICELOG("HA hold: %d blobs hold new IO.
-", n);
+	SPDK_NOTICELOG("HA hold: %d blobs hold new IO.\n", n);
 }
 
 int
@@ -10942,8 +10941,7 @@ bs_ha_release_one_done(void *cb_arg, int bserrno)
 	struct spdk_bs_ha_release_ctx *ctx = cb_arg;
 
 	if (bserrno != 0) {
-		SPDK_ERRLOG("HA release: unfreeze failed, rc=%d
-", bserrno);
+		SPDK_ERRLOG("HA release: unfreeze failed, rc=%d\n", bserrno);
 	}
 	if (--ctx->remaining == 0) {
 		if (ctx->cb_fn) {
@@ -10970,8 +10968,7 @@ bs_ha_release_msg(void *arg)
 		n++;
 		blob_unfreeze_io(blob, bs_ha_release_one_done, ctx);
 	}
-	SPDK_NOTICELOG("HA release: %d blobs released, fenced=%d leader=%d.
-",
+	SPDK_NOTICELOG("HA release: %d blobs released, fenced=%d leader=%d.\n",
 		       n, (int)ctx->bs->ha_fenced, (int)ctx->bs->is_leader);
 	bs_ha_release_one_done(ctx, 0);
 }
