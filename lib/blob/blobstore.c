@@ -4203,6 +4203,13 @@ blob_request_submit_op(struct spdk_blob *blob, struct spdk_io_channel *_channel,
 		return;
 	}
 
+	if (blob->bs->ha_fenced && op_type != SPDK_BLOB_READ) {
+		/* Two-node arbitration: a fenced LVS takes no writes; the host retries
+		 * on the peer's path (path error, never EIO). */
+		cb_fn(cb_arg, -ENOTCONN);
+		return;
+	}
+
 	if (blob->failed_on_update) {
 		SPDK_NOTICELOG("FAILED IO on update filed condition.\n");
 		cb_fn(cb_arg, -EIO);
@@ -4341,6 +4348,13 @@ blob_request_submit_rw_iov(struct spdk_blob *blob, struct spdk_io_channel *_chan
 		cb_fn(cb_arg, -EIO);
 		return;
 	}
+
+	if (blob->bs->ha_fenced && !read) {
+		/* Two-node arbitration: see blob_request_submit_op. */
+		cb_fn(cb_arg, -ENOTCONN);
+		return;
+	}
+
 
 	if (blob->failed_on_update) {
 		SPDK_NOTICELOG("FAILED IO on update filed condition at LBA: %" PRIu64 " blob: %" PRIu64 " \n", blob->id, offset);

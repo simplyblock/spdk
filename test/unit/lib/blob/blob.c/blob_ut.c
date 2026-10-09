@@ -10656,6 +10656,223 @@ struct ut_config {
 	CU_InitializeFunc setup_cb;
 };
 
+/* START two-node arbitration (sbcli docs/design/two-node-arbitration.md) */
+
+static int g_ha_release_cb_cnt;
+static int g_ha_release_cb_rc;
+
+static void
+ha_release_done(void *cb_arg, int bserrno)
+{
+	g_ha_release_cb_cnt++;
+	g_ha_release_cb_rc = bserrno;
+}
+
+static struct spdk_io_channel *
+ha_setup_blob(struct spdk_blob *blob)
+{
+	struct spdk_io_channel *channel;
+
+	spdk_blob_resize(blob, 1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	channel = spdk_bs_alloc_io_channel(blob->bs);
+	SPDK_CU_ASSERT_FATAL(channel != NULL);
+	g_ha_release_cb_cnt = 0;
+	g_ha_release_cb_rc = -1;
+	return channel;
+}
+
+static void
+ha_teardown_blob(struct spdk_blob_store *bs, struct spdk_io_channel *channel)
+{
+	spdk_bs_set_ha_fenced(bs, false);
+	spdk_bs_free_io_channel(channel);
+	poll_threads();
+}
+
+/* No behaviour change when HA is never engaged. */
+static void
+blob_ha_not_engaged(void)
+{
+	struct spdk_blob *blob = g_blob;
+	struct spdk_io_channel *channel = ha_setup_blob(blob);
+	uint8_t payload[BLOCKLEN];
+	int rc = 99;
+
+	CU_ASSERT(blob->bs->ha_fenced == false);
+	CU_ASSERT(blob->ha_held == false);
+	CU_ASSERT(blob->frozen_refcnt == 0);
+	memset(payload, 0x5a, sizeof(payload));
+	spdk_blob_io_write(blob, channel, payload, 0, 1, blob_op_complete, &rc);
+	poll_threads();
+	CU_ASSERT(rc == 0);
+
+	/* A release without a hold is a no-op whose callback still runs once. */
+	CU_ASSERT(spdk_bs_ha_release_send_msg(blob->bs, ha_release_done, NULL) == 0);
+	poll_threads();
+	CU_ASSERT(g_ha_release_cb_cnt == 1);
+	CU_ASSERT(g_ha_release_cb_rc == 0);
+	CU_ASSERT(blob->frozen_refcnt == 0);
+	ha_teardown_blob(blob->bs, channel);
+}
+
+/* Hold freezes each writable blob exactly once; writes queue. */
+static void
+blob_ha_hold_queues_writes(void)
+{
+	struct spdk_blob *blob = g_blob;
+	struct spdk_io_channel *channel = ha_setup_blob(blob);
+	uint8_t payload[BLOCKLEN];
+	int rc = 99;
+
+	CU_ASSERT(spdk_bs_ha_hold_send_msg(blob->bs) == 0);
+	poll_threads();
+	CU_ASSERT(blob->ha_held == true);
+	CU_ASSERT(blob->frozen_refcnt == 1);
+
+	/* A second hold does not freeze again. */
+	CU_ASSERT(spdk_bs_ha_hold_send_msg(blob->bs) == 0);
+	poll_threads();
+	CU_ASSERT(blob->frozen_refcnt == 1);
+
+	memset(payload, 0x11, sizeof(payload));
+	spdk_blob_io_write(blob, channel, payload, 0, 1, blob_op_complete, &rc);
+	poll_threads();
+	CU_ASSERT(rc == 99); /* held: neither completed nor failed */
+
+	CU_ASSERT(spdk_bs_ha_release_send_msg(blob->bs, ha_release_done, NULL) == 0);
+	poll_threads();
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_ha_release_cb_cnt == 1);
+	CU_ASSERT(blob->ha_held == false);
+	CU_ASSERT(blob->frozen_refcnt == 0);
+	ha_teardown_blob(blob->bs, channel);
+}
+
+/* Release executes the held writes in order; the callback runs after they drained. */
+static void
+blob_ha_release_in_order(void)
+{
+	struct spdk_blob *blob = g_blob;
+	struct spdk_io_channel *channel = ha_setup_blob(blob);
+	uint8_t first[BLOCKLEN], second[BLOCKLEN], readback[BLOCKLEN];
+	int rc1 = 99, rc2 = 99, rcr = 99;
+
+	CU_ASSERT(spdk_bs_ha_hold_send_msg(blob->bs) == 0);
+	poll_threads();
+	memset(first, 0xa1, sizeof(first));
+	memset(second, 0xb2, sizeof(second));
+	spdk_blob_io_write(blob, channel, first, 0, 1, blob_op_complete, &rc1);
+	spdk_blob_io_write(blob, channel, second, 0, 1, blob_op_complete, &rc2);
+	poll_threads();
+	CU_ASSERT(rc1 == 99 && rc2 == 99);
+
+	CU_ASSERT(spdk_bs_ha_release_send_msg(blob->bs, ha_release_done, NULL) == 0);
+	poll_threads();
+	CU_ASSERT(rc1 == 0 && rc2 == 0);
+	CU_ASSERT(g_ha_release_cb_cnt == 1);
+
+	memset(readback, 0, sizeof(readback));
+	spdk_blob_io_read(blob, channel, readback, 0, 1, blob_op_complete, &rcr);
+	poll_threads();
+	CU_ASSERT(rcr == 0);
+	CU_ASSERT(memcmp(readback, second, sizeof(second)) == 0);
+	ha_teardown_blob(blob->bs, channel);
+}
+
+/* A read-only blob is not held. */
+static void
+blob_ha_hold_skips_read_only(void)
+{
+	struct spdk_blob *blob = g_blob;
+	struct spdk_io_channel *channel = ha_setup_blob(blob);
+
+	blob->data_ro = true;
+	CU_ASSERT(spdk_bs_ha_hold_send_msg(blob->bs) == 0);
+	poll_threads();
+	CU_ASSERT(blob->ha_held == false);
+	CU_ASSERT(blob->frozen_refcnt == 0);
+	blob->data_ro = false;
+	ha_teardown_blob(blob->bs, channel);
+}
+
+/* Fence: held writes complete with -ENOTCONN (a path error), never EIO. */
+static void
+blob_ha_fence_aborts_held_io(void)
+{
+	struct spdk_blob *blob = g_blob;
+	struct spdk_io_channel *channel = ha_setup_blob(blob);
+	uint8_t payload[BLOCKLEN];
+	int rc = 99;
+
+	CU_ASSERT(spdk_bs_ha_hold_send_msg(blob->bs) == 0);
+	poll_threads();
+	memset(payload, 0x33, sizeof(payload));
+	spdk_blob_io_write(blob, channel, payload, 0, 1, blob_op_complete, &rc);
+	poll_threads();
+	CU_ASSERT(rc == 99);
+
+	spdk_bs_set_ha_fenced(blob->bs, true);
+	CU_ASSERT(spdk_bs_ha_release_send_msg(blob->bs, ha_release_done, NULL) == 0);
+	poll_threads();
+	CU_ASSERT(rc == -ENOTCONN);
+	CU_ASSERT(rc != -EIO);
+	CU_ASSERT(g_ha_release_cb_cnt == 1);
+	CU_ASSERT(blob->frozen_refcnt == 0);
+	ha_teardown_blob(blob->bs, channel);
+}
+
+/* A fenced blobstore rejects new writes as a path error; reads stay possible;
+ * unfence restores writes. */
+static void
+blob_ha_fenced_rejects_writes(void)
+{
+	struct spdk_blob *blob = g_blob;
+	struct spdk_io_channel *channel = ha_setup_blob(blob);
+	uint8_t payload[BLOCKLEN];
+	struct iovec iov = { .iov_base = payload, .iov_len = BLOCKLEN };
+	int rc;
+
+	memset(payload, 0x44, sizeof(payload));
+	spdk_bs_set_ha_fenced(blob->bs, true);
+
+	rc = 99;
+	spdk_blob_io_write(blob, channel, payload, 0, 1, blob_op_complete, &rc);
+	poll_threads();
+	CU_ASSERT(rc == -ENOTCONN);
+
+	rc = 99;
+	spdk_blob_io_writev(blob, channel, &iov, 1, 0, 1, blob_op_complete, &rc);
+	poll_threads();
+	CU_ASSERT(rc == -ENOTCONN);
+
+	rc = 99;
+	spdk_blob_io_write_zeroes(blob, channel, 0, 1, blob_op_complete, &rc);
+	poll_threads();
+	CU_ASSERT(rc == -ENOTCONN);
+
+	rc = 99;
+	spdk_blob_io_unmap(blob, channel, 0, 1, blob_op_complete, &rc);
+	poll_threads();
+	CU_ASSERT(rc == -ENOTCONN);
+
+	rc = 99;
+	spdk_blob_io_read(blob, channel, payload, 0, 1, blob_op_complete, &rc);
+	poll_threads();
+	CU_ASSERT(rc == 0);
+
+	spdk_bs_set_ha_fenced(blob->bs, false);
+	rc = 99;
+	spdk_blob_io_write(blob, channel, payload, 0, 1, blob_op_complete, &rc);
+	poll_threads();
+	CU_ASSERT(rc == 0);
+	ha_teardown_blob(blob->bs, channel);
+}
+
+/* END two-node arbitration */
+
+
 int
 main(int argc, char **argv)
 {
@@ -10672,6 +10889,16 @@ main(int argc, char **argv)
 	};
 
 	CU_initialize_registry();
+
+	/* Two-node arbitration: run alone with -s blob_ha. */
+	suite = CU_add_suite_with_setup_and_teardown("blob_ha", ut_setup_config_nocopy_noextent, NULL,
+			suite_blob_setup, suite_blob_cleanup);
+	CU_ADD_TEST(suite, blob_ha_not_engaged);
+	CU_ADD_TEST(suite, blob_ha_hold_queues_writes);
+	CU_ADD_TEST(suite, blob_ha_release_in_order);
+	CU_ADD_TEST(suite, blob_ha_hold_skips_read_only);
+	CU_ADD_TEST(suite, blob_ha_fence_aborts_held_io);
+	CU_ADD_TEST(suite, blob_ha_fenced_rejects_writes);
 
 	for (i = 0; i < SPDK_COUNTOF(configs); ++i) {
 		config = &configs[i];

@@ -3788,6 +3788,234 @@ s3_merge_rejects_busy_tdev(void)
 	free(lvs);
 }
 
+/* START two-node arbitration (sbcli docs/design/two-node-arbitration.md) */
+
+/* Recording fakes for the blobstore and nvmf calls the lvs HA API makes. */
+static int g_ha_bs_hold_cnt;
+static int g_ha_bs_release_cnt;
+static int g_ha_bs_fenced_set = -1;
+static int g_ha_bs_leader_set = -1;
+static int g_ha_port_block_cnt;
+static int g_ha_port_unblock_cnt;
+static int g_ha_last_blocked_port;
+static int g_ha_cb_cnt;
+
+int
+spdk_bs_ha_hold_send_msg(struct spdk_blob_store *bs)
+{
+	g_ha_bs_hold_cnt++;
+	return 0;
+}
+
+int
+spdk_bs_ha_release_send_msg(struct spdk_blob_store *bs, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	g_ha_bs_release_cnt++;
+	if (cb_fn) {
+		cb_fn(cb_arg, 0);
+	}
+	return 0;
+}
+
+void
+spdk_bs_set_ha_fenced(struct spdk_blob_store *bs, bool fenced)
+{
+	g_ha_bs_fenced_set = fenced;
+}
+
+void
+spdk_bs_set_leader(struct spdk_blob_store *bs, bool state)
+{
+	g_ha_bs_leader_set = state;
+}
+
+bool
+spdk_nvmf_port_block(uint16_t port, bool is_reject)
+{
+	g_ha_port_block_cnt++;
+	g_ha_last_blocked_port = port;
+	return true;
+}
+
+bool
+spdk_nvmf_port_unblock(uint16_t port)
+{
+	g_ha_port_unblock_cnt++;
+	return true;
+}
+
+const char *
+node_role_to_string(node_role_t role)
+{
+	return role == NODE_PRIMARY ? "primary" : role == NODE_SECONDARY ? "secondary" : "tertiary";
+}
+
+static void
+ha_cb(void *cb_arg, int rc)
+{
+	g_ha_cb_cnt++;
+}
+
+static struct spdk_lvol_store *
+ha_alloc_lvs(uint64_t groupid, bool leader, node_role_t role)
+{
+	struct spdk_lvol_store *lvs = calloc(1, sizeof(*lvs));
+
+	SPDK_CU_ASSERT_FATAL(lvs != NULL);
+	TAILQ_INIT(&lvs->lvols);
+	snprintf(lvs->name, sizeof(lvs->name), "ha_lvs_%" PRIu64, groupid);
+	lvs->groupid = groupid;
+	lvs->leader = leader;
+	lvs->node_role = role;
+	lvs->subsystem_port = 4420;
+	lvs->hublvol_port = 4430;
+	lvs->blobstore = (struct spdk_blob_store *)0x1;
+	SPDK_CU_ASSERT_FATAL(add_lvs_to_list(lvs) == 0);
+	g_ha_bs_hold_cnt = g_ha_bs_release_cnt = g_ha_port_block_cnt = g_ha_port_unblock_cnt = 0;
+	g_ha_bs_fenced_set = g_ha_bs_leader_set = -1;
+	g_ha_last_blocked_port = 0;
+	g_ha_cb_cnt = 0;
+	return lvs;
+}
+
+static void
+ha_free_lvs(struct spdk_lvol_store *lvs)
+{
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+	TAILQ_REMOVE(&g_lvol_stores, lvs, link);
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+	free(lvs);
+}
+
+/* Every call on an unknown groupid fails with -ENOENT and never calls back. */
+static void
+lvol_ha_unknown_groupid(void)
+{
+	g_ha_cb_cnt = 0;
+	CU_ASSERT(spdk_lvs_ha_hold(9999) == -ENOENT);
+	CU_ASSERT(spdk_lvs_ha_release(9999, ha_cb, NULL) == -ENOENT);
+	CU_ASSERT(spdk_lvs_ha_fence(9999, ha_cb, NULL) == -ENOENT);
+	CU_ASSERT(spdk_lvs_ha_unfence(9999) == -ENOENT);
+	CU_ASSERT(spdk_lvs_ha_is_fenced(9999) == false);
+	CU_ASSERT(g_ha_cb_cnt == 0);
+}
+
+/* Hold engages once, and only on a leading lvs. */
+static void
+lvol_ha_hold_leader_once(void)
+{
+	struct spdk_lvol_store *lvs = ha_alloc_lvs(11, true, NODE_PRIMARY);
+
+	CU_ASSERT(spdk_lvs_ha_hold(11) == 0);
+	CU_ASSERT(lvs->ha_held == true);
+	CU_ASSERT(g_ha_bs_hold_cnt == 1);
+	CU_ASSERT(spdk_lvs_ha_hold(11) == 0);
+	CU_ASSERT(g_ha_bs_hold_cnt == 1);
+	CU_ASSERT(g_ha_port_block_cnt == 0);
+	ha_free_lvs(lvs);
+
+	lvs = ha_alloc_lvs(12, false, NODE_SECONDARY);
+	CU_ASSERT(spdk_lvs_ha_hold(12) == 0);
+	CU_ASSERT(lvs->ha_held == false);
+	CU_ASSERT(g_ha_bs_hold_cnt == 0);
+	ha_free_lvs(lvs);
+}
+
+/* Grant: release the hold, stay leader, callback once. */
+static void
+lvol_ha_release_grant(void)
+{
+	struct spdk_lvol_store *lvs = ha_alloc_lvs(13, true, NODE_PRIMARY);
+
+	CU_ASSERT(spdk_lvs_ha_hold(13) == 0);
+	CU_ASSERT(spdk_lvs_ha_release(13, ha_cb, NULL) == 0);
+	CU_ASSERT(lvs->ha_held == false);
+	CU_ASSERT(lvs->leader == true);
+	CU_ASSERT(g_ha_bs_release_cnt == 1);
+	CU_ASSERT(g_ha_cb_cnt == 1);
+	CU_ASSERT(g_ha_port_block_cnt == 0);
+	/* NULL callback is allowed. */
+	CU_ASSERT(spdk_lvs_ha_release(13, NULL, NULL) == 0);
+	ha_free_lvs(lvs);
+}
+
+/* Fence: non-leader, ports blocked, blobstore fenced, held IO released as path error. */
+static void
+lvol_ha_fence(void)
+{
+	struct spdk_lvol_store *lvs = ha_alloc_lvs(14, true, NODE_PRIMARY);
+	struct spdk_lvol lvol = { .leader = true };
+
+	TAILQ_INSERT_TAIL(&lvs->lvols, &lvol, link);
+	CU_ASSERT(spdk_lvs_ha_hold(14) == 0);
+	CU_ASSERT(spdk_lvs_ha_fence(14, ha_cb, NULL) == 0);
+	CU_ASSERT(lvs->ha_fenced == true);
+	CU_ASSERT(lvs->ha_held == false);
+	CU_ASSERT(lvs->leader == false);
+	CU_ASSERT(lvol.leader == false);
+	CU_ASSERT(g_ha_bs_fenced_set == 1);
+	CU_ASSERT(g_ha_bs_leader_set == 0);
+	CU_ASSERT(g_ha_port_block_cnt == 2); /* client subsystem port and hublvol port */
+	CU_ASSERT(g_ha_bs_release_cnt == 1);
+	CU_ASSERT(g_ha_cb_cnt == 1);
+	CU_ASSERT(spdk_lvs_ha_is_fenced(14) == true);
+
+	/* A fenced lvs is not held again. */
+	CU_ASSERT(spdk_lvs_ha_hold(14) == 0);
+	CU_ASSERT(g_ha_bs_hold_cnt == 1);
+	TAILQ_REMOVE(&lvs->lvols, &lvol, link);
+	ha_free_lvs(lvs);
+
+	/* A tertiary only blocks its client port. */
+	lvs = ha_alloc_lvs(15, true, NODE_TERTIARY);
+	CU_ASSERT(spdk_lvs_ha_fence(15, NULL, NULL) == 0);
+	CU_ASSERT(g_ha_port_block_cnt == 1);
+	CU_ASSERT(g_ha_last_blocked_port == 4420);
+	ha_free_lvs(lvs);
+}
+
+/* Unfence clears the marker on the lvs and the blobstore; ports stay as they are. */
+static void
+lvol_ha_unfence(void)
+{
+	struct spdk_lvol_store *lvs = ha_alloc_lvs(16, true, NODE_PRIMARY);
+
+	CU_ASSERT(spdk_lvs_ha_fence(16, NULL, NULL) == 0);
+	g_ha_port_unblock_cnt = 0;
+	CU_ASSERT(spdk_lvs_ha_unfence(16) == 0);
+	CU_ASSERT(lvs->ha_fenced == false);
+	CU_ASSERT(g_ha_bs_fenced_set == 0);
+	CU_ASSERT(spdk_lvs_ha_is_fenced(16) == false);
+	CU_ASSERT(g_ha_port_unblock_cnt == 0);
+	ha_free_lvs(lvs);
+}
+
+/* The 10 s rule-removal poller never lifts the rules of a fenced lvs. */
+static void
+lvol_ha_rules_poller_respects_fence(void)
+{
+	struct spdk_lvol_store *lvs = ha_alloc_lvs(17, true, NODE_PRIMARY);
+	struct spdk_lvs_req *req;
+
+	lvs->ha_fenced = true;
+	req = calloc(1, sizeof(*req));
+	SPDK_CU_ASSERT_FATAL(req != NULL);
+	req->lvol_store = lvs;
+	spdk_lvs_remove_rules_poller(req);
+	CU_ASSERT(g_ha_port_unblock_cnt == 0);
+
+	lvs->ha_fenced = false;
+	req = calloc(1, sizeof(*req));
+	SPDK_CU_ASSERT_FATAL(req != NULL);
+	req->lvol_store = lvs;
+	spdk_lvs_remove_rules_poller(req);
+	CU_ASSERT(g_ha_port_unblock_cnt == 1);
+	ha_free_lvs(lvs);
+}
+
+/* END two-node arbitration */
+
+
 int
 main(int argc, char **argv)
 {
@@ -3795,6 +4023,15 @@ main(int argc, char **argv)
 	unsigned int	num_failures;
 
 	CU_initialize_registry();
+
+	/* Two-node arbitration: run alone with -s lvol_ha. */
+	suite = CU_add_suite("lvol_ha", NULL, NULL);
+	CU_ADD_TEST(suite, lvol_ha_unknown_groupid);
+	CU_ADD_TEST(suite, lvol_ha_hold_leader_once);
+	CU_ADD_TEST(suite, lvol_ha_release_grant);
+	CU_ADD_TEST(suite, lvol_ha_fence);
+	CU_ADD_TEST(suite, lvol_ha_unfence);
+	CU_ADD_TEST(suite, lvol_ha_rules_poller_respects_fence);
 
 	suite = CU_add_suite("lvol", NULL, NULL);
 
