@@ -546,7 +546,11 @@ blob_execute_queued_io(struct spdk_io_channel_iter *i)
 
 		if (args->blob == ctx->blob) {
 			TAILQ_REMOVE(&ch->queued_io, op, link);
-			if (!ctx->blob->failed_on_update && bs->is_leader) {
+			if (bs->ha_fenced) {
+				/* Two-node arbitration: a fenced LVS returns held IO as a path
+				 * error, so hosts retry on the peer's path (never EIO). */
+				bs_user_op_abort(op, -ENOTCONN);
+			} else if (!ctx->blob->failed_on_update && bs->is_leader) {
 				bs_user_op_execute(op);
 			} else {
 				SPDK_NOTICELOG("The IO return with EIO error due to leader or failed update.\n");
@@ -10897,6 +10901,108 @@ spdk_blob_freeze_on_conflict_send_msg(struct spdk_blob_store *bs,
 	spdk_thread_send_msg(bs->md_thread, bs_freeze_on_conflict_msg, ctx);
 	return 0;
 }
+
+/* START two-node arbitration hold / release */
+
+static void
+bs_ha_hold_msg(void *arg)
+{
+	struct spdk_blob_store *bs = arg;
+	struct spdk_blob *blob;
+	int n = 0;
+
+	RB_FOREACH(blob, spdk_blob_tree, &bs->open_blobs) {
+		if (blob->data_ro || blob->md_ro || blob->ha_held) {
+			continue;
+		}
+		blob->ha_held = true;
+		blob->frozen_refcnt++;
+		n++;
+	}
+	SPDK_NOTICELOG("HA hold: %d blobs hold new IO.
+", n);
+}
+
+int
+spdk_bs_ha_hold_send_msg(struct spdk_blob_store *bs)
+{
+	return spdk_thread_send_msg(bs->md_thread, bs_ha_hold_msg, bs);
+}
+
+struct spdk_bs_ha_release_ctx {
+	struct spdk_blob_store	*bs;
+	spdk_blob_op_complete	cb_fn;
+	void			*cb_arg;
+	int			remaining;
+};
+
+static void
+bs_ha_release_one_done(void *cb_arg, int bserrno)
+{
+	struct spdk_bs_ha_release_ctx *ctx = cb_arg;
+
+	if (bserrno != 0) {
+		SPDK_ERRLOG("HA release: unfreeze failed, rc=%d
+", bserrno);
+	}
+	if (--ctx->remaining == 0) {
+		if (ctx->cb_fn) {
+			ctx->cb_fn(ctx->cb_arg, 0);
+		}
+		free(ctx);
+	}
+}
+
+static void
+bs_ha_release_msg(void *arg)
+{
+	struct spdk_bs_ha_release_ctx *ctx = arg;
+	struct spdk_blob *blob;
+	int n = 0;
+
+	ctx->remaining = 1; /* held until every unfreeze is issued */
+	RB_FOREACH(blob, spdk_blob_tree, &ctx->bs->open_blobs) {
+		if (!blob->ha_held) {
+			continue;
+		}
+		blob->ha_held = false;
+		ctx->remaining++;
+		n++;
+		blob_unfreeze_io(blob, bs_ha_release_one_done, ctx);
+	}
+	SPDK_NOTICELOG("HA release: %d blobs released, fenced=%d leader=%d.
+",
+		       n, (int)ctx->bs->ha_fenced, (int)ctx->bs->is_leader);
+	bs_ha_release_one_done(ctx, 0);
+}
+
+int
+spdk_bs_ha_release_send_msg(struct spdk_blob_store *bs,
+			    spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_bs_ha_release_ctx *ctx;
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		return -ENOMEM;
+	}
+	ctx->bs = bs;
+	ctx->cb_fn = cb_fn;
+	ctx->cb_arg = cb_arg;
+	if (spdk_thread_send_msg(bs->md_thread, bs_ha_release_msg, ctx) != 0) {
+		free(ctx);
+		return -ENOMEM;
+	}
+	return 0;
+}
+
+void
+spdk_bs_set_ha_fenced(struct spdk_blob_store *bs, bool fenced)
+{
+	bs->ha_fenced = fenced;
+}
+
+/* END two-node arbitration hold / release */
 
 void
 blob_freeze_on_failover(struct spdk_blob *blob)

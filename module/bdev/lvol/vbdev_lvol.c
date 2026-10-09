@@ -1149,6 +1149,15 @@ lvol_op_comp(void *cb_arg, int bserrno)
 	struct spdk_lvol_store *lvs = lvol->lvol_store;
 	__atomic_sub_fetch(&lvs->current_io_t, 1, __ATOMIC_SEQ_CST);
 
+	if (bserrno == -ENOTCONN && lvs->ha_fenced) {
+		/* Two-node arbitration: IO held while the LVS awaited a verdict and then
+		 * fenced. Return ANA inaccessible so the host retries on the peer's path
+		 * (sbcli docs/design/two-node-arbitration.md, invariant 7). */
+		spdk_bdev_io_complete_nvme_status(bdev_io, 0, SPDK_NVME_SCT_PATH,
+						  SPDK_NVME_SC_ASYMMETRIC_ACCESS_INACCESSIBLE);
+		return;
+	}
+
 	if (bserrno != 0) {
 
 		uint64_t offset = bdev_io->u.bdev.offset_blocks;

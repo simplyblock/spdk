@@ -566,6 +566,19 @@ int spdk_blob_freeze_on_conflict_send_msg(struct spdk_blob_store *bs,
 		  spdk_blob_op_complete cb_fn, void *cb_arg);
 
 void spdk_lvs_unfreeze_on_conflict_msg(struct spdk_blob_store *bs);
+
+/*
+ * Two-node arbitration (sbcli docs/design/two-node-arbitration.md).
+ * hold: on the md thread, freeze every writable open blob once (writes queue in the
+ *   frozen-IO queue); blobs already held are skipped.
+ * release: on the md thread, unfreeze every held blob once; queued IO then executes if
+ *   the blobstore is leader, or is returned with -ENOTCONN if the blobstore is fenced.
+ *   cb_fn runs on the md thread after all held blobs have drained their queues.
+ */
+int spdk_bs_ha_hold_send_msg(struct spdk_blob_store *bs);
+int spdk_bs_ha_release_send_msg(struct spdk_blob_store *bs,
+				spdk_blob_op_complete cb_fn, void *cb_arg);
+void spdk_bs_set_ha_fenced(struct spdk_blob_store *bs, bool fenced);
 /**
  * Initialize a blobstore on the given device.
  *

@@ -363,6 +363,11 @@ struct spdk_lvol_store {
 	uint64_t			timeout_trigger;
 	bool 				trigger_leader_sent;
 	bool				special_send_signal;
+	/* Two-node arbitration (sbcli docs/design/two-node-arbitration.md):
+	 * ha_held: client writes are held in the frozen-IO queue awaiting a verdict;
+	 * ha_fenced: the LVS was fenced; its ports stay blocked and no timer lifts the rules. */
+	bool				ha_held;
+	bool				ha_fenced;
 	bool 				read_only;
 	bool				skip_redirecting;
 	node_role_t 		node_role;
