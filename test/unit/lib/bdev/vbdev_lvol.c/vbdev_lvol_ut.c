@@ -142,9 +142,35 @@ spdk_bdev_io_get_io_channel(struct spdk_bdev_io *bdev_io)
 	return g_ch;	
 }
 
+/* The hub desc of the reservation tests hands out real channels on an io_device,
+ * so a channel that is never released shows up as a device that cannot be
+ * unregistered, which is what keeps bdev_nvme from deleting a hub path. */
+#define UT_HUB_DESC ((struct spdk_bdev_desc *)0x2)
+static int g_ut_hub_devs[32];
+static int *g_ut_hub_dev = &g_ut_hub_devs[0];
+static int g_ut_hub_ndev;
+static bool g_ut_hub_registered;
+static int g_ut_hub_channels;
+
+static int
+ut_hub_ch_create(void *io_device, void *ctx_buf)
+{
+	g_ut_hub_channels++;
+	return 0;
+}
+
+static void
+ut_hub_ch_destroy(void *io_device, void *ctx_buf)
+{
+	g_ut_hub_channels--;
+}
+
 struct spdk_io_channel *
 spdk_bdev_get_io_channel(struct spdk_bdev_desc *desc)
 {
+	if (desc == UT_HUB_DESC) {
+		return g_ut_hub_registered ? spdk_get_io_channel(g_ut_hub_dev) : NULL;
+	}
 	if (desc != NULL) {
 		return (struct spdk_io_channel *)0x1;
 	}
@@ -2510,6 +2536,14 @@ spdk_lvs_set_refresh_cb(spdk_lvs_refresh_cb cb_fn, void *ctx)
 	g_lvs_refresh_fn = cb_fn;
 }
 
+static spdk_lvs_hub_close_cb g_lvs_hub_close_fn;
+
+void
+spdk_lvs_set_hub_close_cb(spdk_lvs_hub_close_cb cb_fn, void *ctx)
+{
+	g_lvs_hub_close_fn = cb_fn;
+}
+
 static int g_resv_put_rc;
 static int g_resv_put_calls;
 static struct spdk_bdev *g_resv_changed_bdev;
@@ -2611,6 +2645,791 @@ ut_lvol_resv_store(void)
 	lvol.resv_cache = NULL;
 }
 
+/* Reservation state over the hub connection */
+struct ut_hub_cmd {
+	struct spdk_nvme_cmd	cmd;
+	void			*buf;
+	size_t			nbytes;
+	spdk_bdev_io_completion_cb cb;
+	void			*cb_arg;
+};
+static struct ut_hub_cmd g_hub_cmds[8];
+static int g_hub_ncmds;
+static struct spdk_bdev_io g_hub_io;
+static uint32_t g_hub_io_cdw0;
+static int g_hub_io_sct, g_hub_io_sc;
+
+int
+spdk_bdev_nvme_io_passthru(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
+			   const struct spdk_nvme_cmd *cmd, void *buf, size_t nbytes,
+			   spdk_bdev_io_completion_cb cb, void *cb_arg)
+{
+	struct ut_hub_cmd *c;
+
+	SPDK_CU_ASSERT_FATAL(g_hub_ncmds < (int)SPDK_COUNTOF(g_hub_cmds));
+	c = &g_hub_cmds[g_hub_ncmds++];
+	c->cmd = *cmd;
+	c->buf = buf;
+	c->nbytes = nbytes;
+	c->cb = cb;
+	c->cb_arg = cb_arg;
+	return 0;
+}
+
+void
+spdk_bdev_io_get_nvme_status(const struct spdk_bdev_io *bdev_io, uint32_t *cdw0, int *sct, int *sc)
+{
+	*cdw0 = g_hub_io_cdw0;
+	*sct = g_hub_io_sct;
+	*sc = g_hub_io_sc;
+}
+
+static uint32_t g_done_cdw0;
+static int g_done_sct = -1, g_done_sc = -1;
+static int g_done_calls;
+
+void
+spdk_bdev_io_complete_nvme_status(struct spdk_bdev_io *bdev_io, uint32_t cdw0, int sct, int sc)
+{
+	g_done_cdw0 = cdw0;
+	g_done_sct = sct;
+	g_done_sc = sc;
+	g_done_calls++;
+}
+
+/* Answer the oldest outstanding hub command, copying data into its buffer */
+static struct spdk_nvme_cmd
+ut_hub_answer(uint32_t cdw0, int sct, int sc, const void *data, size_t len)
+{
+	struct ut_hub_cmd c;
+
+	SPDK_CU_ASSERT_FATAL(g_hub_ncmds > 0);
+	c = g_hub_cmds[0];
+	memmove(&g_hub_cmds[0], &g_hub_cmds[1], sizeof(g_hub_cmds[0]) * (g_hub_ncmds - 1));
+	g_hub_ncmds--;
+	if (data != NULL) {
+		SPDK_CU_ASSERT_FATAL(len <= c.nbytes);
+		memcpy(c.buf, data, len);
+	}
+	g_hub_io_cdw0 = cdw0;
+	g_hub_io_sct = sct;
+	g_hub_io_sc = sc;
+	c.cb(&g_hub_io, sct == SPDK_NVME_SCT_GENERIC && sc == SPDK_NVME_SC_SUCCESS, c.cb_arg);
+	poll_threads();
+	return c.cmd;
+}
+
+/* A 32-byte encoded state with no registrants, the given generation and key */
+static size_t
+ut_resv_enc(uint8_t *buf, uint64_t generation, uint64_t crkey)
+{
+	memset(buf, 0, 32);
+	memcpy(buf, "SBRV", 4);
+	buf[4] = 1;
+	to_le64(&buf[16], generation);
+	to_le64(&buf[24], crkey);
+	return 32;
+}
+
+static uint64_t
+ut_cached_generation(struct spdk_bdev *bdev)
+{
+	uint8_t out[64];
+	size_t len = sizeof(out);
+
+	if (vbdev_lvol_resv_get(bdev, out, &len) != 0 || len < 32) {
+		return UINT64_MAX;
+	}
+	return from_le64(&out[16]);
+}
+
+struct ut_resv_node {
+	struct spdk_lvol_store lvs;
+	struct lvol_store_bdev lvs_bdev;
+	struct spdk_lvol lvol;
+	struct spdk_bdev bdev;
+};
+
+static void
+ut_resv_node_init(struct ut_resv_node *n, bool leader)
+{
+	memset(n, 0, sizeof(*n));
+	TAILQ_INIT(&n->lvs.lvols);
+	n->lvs.thread = spdk_get_thread();
+	n->lvs.leader = leader;
+	n->lvs.node_role = leader ? NODE_PRIMARY : NODE_SECONDARY;
+	n->lvol.lvol_store = &n->lvs;
+	n->lvol.blob_id = 9;
+	n->lvol.map_id = 3;
+	n->lvol.blob = (struct spdk_blob *)0x1;
+	n->lvol.bdev = &n->bdev;
+	n->lvol.leader = leader;
+	TAILQ_INSERT_TAIL(&n->lvs.lvols, &n->lvol, link);
+	n->lvs.lvol_map.lvol[3] = &n->lvol;
+	n->bdev.module = &g_lvol_if;
+	n->bdev.ctxt = &n->lvol;
+	n->lvs_bdev.lvs = &n->lvs;
+	TAILQ_INSERT_TAIL(&g_spdk_lvol_pairs, &n->lvs_bdev, lvol_stores);
+	/* A device of its own, so a channel leaked by one test cannot hold the next */
+	SPDK_CU_ASSERT_FATAL(g_ut_hub_ndev < (int)SPDK_COUNTOF(g_ut_hub_devs));
+	g_ut_hub_dev = &g_ut_hub_devs[g_ut_hub_ndev++];
+	g_ut_hub_channels = 0;
+	spdk_io_device_register(g_ut_hub_dev, ut_hub_ch_create, ut_hub_ch_destroy, 0, "ut_hub");
+	g_ut_hub_registered = true;
+	g_hub_ncmds = 0;
+	g_resv_changed_calls = 0;
+	g_resv_xattr_set = false;
+	vbdev_lvol_set_resv_changed_cb(ut_resv_changed, NULL);
+}
+
+static bool g_ut_hub_unregistered;
+
+static void
+ut_hub_unregistered(void *io_device)
+{
+	g_ut_hub_unregistered = true;
+}
+
+/* Unregister the hub device the way bdev_nvme does when it deletes a hub path:
+ * it completes only once every channel on it has been released. */
+static bool
+ut_hub_unregister(void)
+{
+	if (!g_ut_hub_registered) {
+		return g_ut_hub_unregistered;
+	}
+	g_ut_hub_registered = false;
+	g_ut_hub_unregistered = false;
+	spdk_io_device_unregister(g_ut_hub_dev, ut_hub_unregistered);
+	poll_threads();
+	return g_ut_hub_unregistered;
+}
+
+static void
+ut_resv_node_fini(struct ut_resv_node *n)
+{
+	/* The lvolstore goes away as _vbdev_lvs_remove_cb has it go */
+	vbdev_lvol_resv_hub_detach(&n->lvs_bdev);
+	poll_threads();
+	CU_ASSERT(ut_hub_unregister());
+	TAILQ_REMOVE(&g_spdk_lvol_pairs, &n->lvs_bdev, lvol_stores);
+	pthread_mutex_lock(&g_resv_mutex);
+	free(n->lvol.resv_cache);
+	n->lvol.resv_cache = NULL;
+	pthread_mutex_unlock(&g_resv_mutex);
+	vbdev_lvol_set_resv_changed_cb(NULL, NULL);
+	g_hub_ncmds = 0;
+}
+
+static void
+ut_lvol_resv_generation_order(void)
+{
+	struct ut_resv_node n;
+	uint8_t buf[32];
+
+	ut_resv_node_init(&n, false);
+
+	/* A newer state replaces the copy and says so; an older or equal one is ignored */
+	CU_ASSERT(vbdev_lvol_resv_install(&n.bdev, buf, ut_resv_enc(buf, 5, 0xa)) == 1);
+	CU_ASSERT(ut_cached_generation(&n.bdev) == 5);
+	CU_ASSERT(g_resv_changed_calls == 1);
+	CU_ASSERT(vbdev_lvol_resv_install(&n.bdev, buf, ut_resv_enc(buf, 4, 0xb)) == 0);
+	CU_ASSERT(vbdev_lvol_resv_install(&n.bdev, buf, ut_resv_enc(buf, 5, 0xc)) == 0);
+	CU_ASSERT(ut_cached_generation(&n.bdev) == 5);
+	CU_ASSERT(g_resv_changed_calls == 1);
+	CU_ASSERT(vbdev_lvol_resv_install(&n.bdev, buf, ut_resv_enc(buf, 7, 0xd)) == 1);
+	CU_ASSERT(ut_cached_generation(&n.bdev) == 7);
+
+	/* Rereading metadata that is older than what this node already holds keeps it */
+	g_resv_xattr_len = ut_resv_enc(g_resv_xattr, 6, 0xe);
+	g_resv_xattr_set = true;
+	vbdev_lvol_resv_refresh(&n.lvol);
+	CU_ASSERT(ut_cached_generation(&n.bdev) == 7);
+	g_resv_xattr_len = ut_resv_enc(g_resv_xattr, 8, 0xf);
+	vbdev_lvol_resv_refresh(&n.lvol);
+	CU_ASSERT(ut_cached_generation(&n.bdev) == 8);
+
+	/* The leader owns the state: nothing is installed over it */
+	n.lvol.leader = true;
+	CU_ASSERT(vbdev_lvol_resv_install(&n.bdev, buf, ut_resv_enc(buf, 9, 0x1)) == -EPERM);
+	CU_ASSERT(vbdev_lvol_resv_install(&n.bdev, "garbage", 7) == -EPERM);
+	n.lvol.leader = false;
+	CU_ASSERT(vbdev_lvol_resv_install(&n.bdev, "garbage", 7) == -EINVAL);
+
+	ut_resv_node_fini(&n);
+}
+
+static const struct vbdev_lvol_resv_exec_msg *g_exec_msg_seen;
+static struct vbdev_lvol_resv_exec_msg g_exec_msg_copy;
+static struct spdk_bdev *g_exec_bdev;
+static vbdev_lvol_resv_exec_done g_exec_done;
+static void *g_exec_done_arg;
+
+static void
+ut_resv_exec(struct spdk_bdev *bdev, const struct vbdev_lvol_resv_exec_msg *msg,
+	     vbdev_lvol_resv_exec_done done, void *done_arg, void *ctx)
+{
+	g_exec_bdev = bdev;
+	g_exec_msg_seen = msg;
+	g_exec_msg_copy = *msg;
+	g_exec_done = done;
+	g_exec_done_arg = done_arg;
+}
+
+static void
+ut_lvol_hub_resv_leader(void)
+{
+	struct ut_resv_node n;
+	struct spdk_lvol hub = {};
+	struct spdk_bdev_io *io;
+	struct vbdev_lvol_resv_exec_msg msg = {};
+	uint8_t buf[4096], enc[32];
+	uint32_t epoch;
+
+	ut_resv_node_init(&n, true);
+	hub.lvol_store = &n.lvs;
+	hub.hublvol = true;
+	io = calloc(1, sizeof(*io) + sizeof(struct vbdev_lvol_io));
+	SPDK_CU_ASSERT_FATAL(io != NULL);
+	io->type = SPDK_BDEV_IO_TYPE_NVME_IO;
+	g_resv_put_calls = 0;
+	g_done_calls = 0;
+
+	/* The epoch changes with every stored change */
+	io->u.nvme_passthru.cmd.opc = VBDEV_LVOL_HUB_OPC_RESV_EPOCH;
+	io->u.nvme_passthru.cmd.cdw10 = 3;
+	vbdev_lvol_hub_resv_request(&hub, io);
+	CU_ASSERT(g_done_calls == 1);
+	CU_ASSERT(g_done_sct == SPDK_NVME_SCT_GENERIC && g_done_sc == SPDK_NVME_SC_SUCCESS);
+	epoch = g_done_cdw0;
+	vbdev_lvol_resv_put(&n.bdev, enc, ut_resv_enc(enc, 4, 0x44), ut_resv_put_done, NULL);
+	poll_threads();
+	CU_ASSERT(g_resv_put_rc == 0);
+	vbdev_lvol_hub_resv_request(&hub, io);
+	CU_ASSERT(g_done_calls == 2);
+	CU_ASSERT(g_done_cdw0 != epoch);
+
+	/* A fetch returns the lvol's stored state and its length */
+	io->u.nvme_passthru.cmd.opc = VBDEV_LVOL_HUB_OPC_RESV_FETCH;
+	io->u.nvme_passthru.buf = buf;
+	io->u.nvme_passthru.nbytes = sizeof(buf);
+	vbdev_lvol_hub_resv_request(&hub, io);
+	CU_ASSERT(g_done_calls == 3);
+	CU_ASSERT(g_done_sc == SPDK_NVME_SC_SUCCESS);
+	CU_ASSERT(g_done_cdw0 == 32);
+	CU_ASSERT(memcmp(buf, enc, 32) == 0);
+
+	/* An exec reaches the registered executor as the host it names, and its answer
+	 * is the command's status */
+	vbdev_lvol_set_resv_exec_cb(ut_resv_exec, NULL);
+	msg.magic = VBDEV_LVOL_RESV_EXEC_MAGIC;
+	msg.version = 1;
+	msg.opc = SPDK_NVME_OPC_RESERVATION_ACQUIRE;
+	msg.cdw10 = 0x201;
+	msg.data_len = 16;
+	msg.data[0] = 0x44;
+	snprintf(msg.hostnqn, sizeof(msg.hostnqn), "nqn.host-b");
+	memcpy(buf, &msg, sizeof(msg));
+	io->u.nvme_passthru.cmd.opc = VBDEV_LVOL_HUB_OPC_RESV_EXEC;
+	io->u.nvme_passthru.nbytes = sizeof(msg);
+	vbdev_lvol_hub_resv_request(&hub, io);
+	CU_ASSERT(g_done_calls == 3);
+	CU_ASSERT(g_exec_bdev == &n.bdev);
+	CU_ASSERT(g_exec_msg_copy.opc == SPDK_NVME_OPC_RESERVATION_ACQUIRE);
+	CU_ASSERT(g_exec_msg_copy.cdw10 == 0x201);
+	CU_ASSERT(g_exec_msg_copy.data[0] == 0x44);
+	CU_ASSERT(strcmp(g_exec_msg_copy.hostnqn, "nqn.host-b") == 0);
+	g_exec_done(g_exec_done_arg, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_RESERVATION_CONFLICT);
+	poll_threads();
+	CU_ASSERT(g_done_calls == 4);
+	CU_ASSERT(g_done_sc == SPDK_NVME_SC_RESERVATION_CONFLICT);
+
+	/* A message that is not one is refused, as is an unknown map id */
+	buf[0] ^= 0xff;
+	vbdev_lvol_hub_resv_request(&hub, io);
+	CU_ASSERT(g_done_calls == 5);
+	CU_ASSERT(g_done_sc == SPDK_NVME_SC_INVALID_FIELD);
+	io->u.nvme_passthru.cmd.opc = VBDEV_LVOL_HUB_OPC_RESV_EPOCH;
+	io->u.nvme_passthru.cmd.cdw10 = 17;
+	vbdev_lvol_hub_resv_request(&hub, io);
+	CU_ASSERT(g_done_sc == SPDK_NVME_SC_INVALID_FIELD);
+
+	/* 0xffff is one past the map: whatever follows it in memory is never taken for an
+	 * lvol. The hub descriptor follows it, so make that look like one. */
+	SPDK_CU_ASSERT_FATAL((char *)&n.lvs.hub_dev == (char *)n.lvs.lvol_map.lvol +
+			     SPDK_COUNTOF(n.lvs.lvol_map.lvol) * sizeof(n.lvs.lvol_map.lvol[0]));
+	n.lvs.hub_dev.desc = (struct spdk_bdev_desc *)&n.lvol;
+	io->u.nvme_passthru.cmd.cdw10 = 0xffff;
+	vbdev_lvol_hub_resv_request(&hub, io);
+	CU_ASSERT(g_done_sc == SPDK_NVME_SC_INVALID_FIELD);
+	n.lvs.hub_dev.desc = NULL;
+
+	/* A node that is not the leader does not answer for the state */
+	n.lvs.leader = false;
+	io->u.nvme_passthru.cmd.cdw10 = 3;
+	vbdev_lvol_hub_resv_request(&hub, io);
+	CU_ASSERT(g_done_sc == SPDK_NVME_SC_NAMESPACE_NOT_READY);
+
+	vbdev_lvol_set_resv_exec_cb(NULL, NULL);
+	free(io);
+	ut_resv_node_fini(&n);
+}
+
+/* The leader's nvmf target hands a reservation command arriving on its hublvol to the
+ * bdev layer through spdk_bdev_nvme_iov_passthru_md (lib/nvmf/ctrlr_bdev.c), which
+ * gates on NVME_IO support but submits an I/O of type NVME_IOV_MD with the data in
+ * iovs (lib/bdev/bdev.c). This builds the I/O exactly that way and submits it through
+ * the lvol bdev's own submit_request, the path a command from another node takes. */
+static void
+ut_lvol_hub_resv_as_nvmf_submits(void)
+{
+	struct ut_resv_node n;
+	struct spdk_lvol hub = {};
+	struct spdk_bdev hub_bdev = {};
+	struct spdk_bdev_io *io;
+	uint8_t buf[4096], enc[32];
+	struct iovec iov[2];
+	int calls;
+
+	ut_resv_node_init(&n, true);
+	hub.lvol_store = &n.lvs;
+	hub.hublvol = true;
+	hub.blob = (struct spdk_blob *)0x1;
+	hub_bdev.ctxt = &hub;
+	hub_bdev.fn_table = &vbdev_lvol_fn_table;
+	hub_bdev.module = &g_lvol_if;
+
+	/* What spdk_bdev_nvme_iov_passthru_md checks before it submits */
+	CU_ASSERT(hub_bdev.fn_table->io_type_supported(&hub, SPDK_BDEV_IO_TYPE_NVME_IO));
+
+	io = calloc(1, sizeof(*io) + sizeof(struct vbdev_lvol_io));
+	SPDK_CU_ASSERT_FATAL(io != NULL);
+	io->bdev = &hub_bdev;
+	io->type = SPDK_BDEV_IO_TYPE_NVME_IOV_MD;
+	io->u.nvme_passthru.cmd.opc = VBDEV_LVOL_HUB_OPC_RESV_EPOCH;
+	io->u.nvme_passthru.cmd.cdw10 = 3;
+	io->u.nvme_passthru.iovs = NULL;
+	io->u.nvme_passthru.iovcnt = 0;
+	io->u.nvme_passthru.nbytes = 0;
+	io->u.nvme_passthru.md_buf = NULL;
+	io->u.nvme_passthru.md_len = 0;
+	io->internal.status = SPDK_BDEV_IO_STATUS_PENDING;
+	calls = g_done_calls;
+
+	hub_bdev.fn_table->submit_request(g_ch, io);
+	CU_ASSERT(g_done_calls == calls + 1);
+	CU_ASSERT(g_done_sct == SPDK_NVME_SCT_GENERIC && g_done_sc == SPDK_NVME_SC_SUCCESS);
+	CU_ASSERT(io->internal.status != SPDK_BDEV_IO_STATUS_FAILED);
+
+	/* A fetch writes the stored state into the request's iovs, split as nvmf may */
+	vbdev_lvol_resv_put(&n.bdev, enc, ut_resv_enc(enc, 4, 0x44), ut_resv_put_done, NULL);
+	poll_threads();
+	CU_ASSERT(g_resv_put_rc == 0);
+	memset(buf, 0, sizeof(buf));
+	iov[0].iov_base = buf;
+	iov[0].iov_len = 16;
+	iov[1].iov_base = buf + 16;
+	iov[1].iov_len = sizeof(buf) - 16;
+	io->u.nvme_passthru.cmd.opc = VBDEV_LVOL_HUB_OPC_RESV_FETCH;
+	io->u.nvme_passthru.iovs = iov;
+	io->u.nvme_passthru.iovcnt = 2;
+	io->u.nvme_passthru.nbytes = sizeof(buf);
+	calls = g_done_calls;
+	hub_bdev.fn_table->submit_request(g_ch, io);
+	CU_ASSERT(g_done_calls == calls + 1);
+	CU_ASSERT(g_done_sc == SPDK_NVME_SC_SUCCESS);
+	CU_ASSERT(g_done_cdw0 == 32);
+	CU_ASSERT(memcmp(buf, enc, 32) == 0);
+
+	free(io);
+	ut_resv_node_fini(&n);
+}
+
+/* A hub that keeps failing must not be asked every poll: the first failure is retried
+ * on the next poll, and each further one doubles the polls skipped, up to a cap. The
+ * first success asks every poll again. */
+static void
+ut_lvol_resv_sync_backoff(void)
+{
+	struct ut_resv_node n;
+	int fails, skipped, k;
+
+	ut_resv_node_init(&n, false);
+	n.lvs.hub_dev.state = HUBLVOL_CONNECTED;
+	n.lvs.hub_dev.desc = (struct spdk_bdev_desc *)0x2;
+
+	for (fails = 1; fails <= 10; fails++) {
+		vbdev_lvol_resv_sync_lvs(&n.lvs_bdev);
+		SPDK_CU_ASSERT_FATAL(g_hub_ncmds == 1);
+		CU_ASSERT(g_hub_cmds[0].cmd.opc == VBDEV_LVOL_HUB_OPC_RESV_EPOCH);
+		ut_hub_answer(0, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_INTERNAL_DEVICE_ERROR, NULL, 0);
+		CU_ASSERT(g_hub_ncmds == 0);
+		/* After the f-th failure in a row, 2^(f-1) - 1 polls send nothing, capped */
+		skipped = spdk_min((1 << (fails - 1)) - 1, VBDEV_LVOL_RESV_SYNC_MAX_SKIP);
+		for (k = 0; k < skipped; k++) {
+			vbdev_lvol_resv_sync_lvs(&n.lvs_bdev);
+			CU_ASSERT(g_hub_ncmds == 0);
+		}
+	}
+
+	/* The first success asks on every poll again */
+	vbdev_lvol_resv_sync_lvs(&n.lvs_bdev);
+	SPDK_CU_ASSERT_FATAL(g_hub_ncmds == 1);
+	ut_hub_answer(0x10001, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS, NULL, 0);
+	SPDK_CU_ASSERT_FATAL(g_hub_ncmds == 1);	/* the fetch of the unseen epoch */
+	ut_hub_answer(0, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS, NULL, 0);
+	CU_ASSERT(g_hub_ncmds == 0);
+	vbdev_lvol_resv_sync_lvs(&n.lvs_bdev);
+	CU_ASSERT(g_hub_ncmds == 1);
+	ut_hub_answer(0x10001, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS, NULL, 0);
+	CU_ASSERT(g_hub_ncmds == 0);
+
+	ut_resv_node_fini(&n);
+}
+
+static void
+ut_lvol_resv_sync_from_leader(void)
+{
+	struct ut_resv_node n;
+	struct spdk_nvme_cmd cmd;
+	uint8_t enc[32];
+
+	ut_resv_node_init(&n, false);
+	n.lvs.hub_dev.state = HUBLVOL_CONNECTED;
+	n.lvs.hub_dev.desc = (struct spdk_bdev_desc *)0x2;
+
+	/* The first poll asks the leader for its epoch, and an unseen one fetches every lvol */
+	vbdev_lvol_resv_sync_lvs(&n.lvs_bdev);
+	SPDK_CU_ASSERT_FATAL(g_hub_ncmds == 1);
+	CU_ASSERT(g_hub_cmds[0].cmd.opc == VBDEV_LVOL_HUB_OPC_RESV_EPOCH);
+	CU_ASSERT(g_hub_cmds[0].cmd.cdw10 == 3);
+	/* One poll at a time */
+	vbdev_lvol_resv_sync_lvs(&n.lvs_bdev);
+	CU_ASSERT(g_hub_ncmds == 1);
+	ut_hub_answer(0x10001, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS, NULL, 0);
+	SPDK_CU_ASSERT_FATAL(g_hub_ncmds == 1);
+	CU_ASSERT(g_hub_cmds[0].cmd.opc == VBDEV_LVOL_HUB_OPC_RESV_FETCH);
+	CU_ASSERT(g_hub_cmds[0].cmd.cdw10 == 3);
+	cmd = ut_hub_answer(32, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS, enc,
+			    ut_resv_enc(enc, 3, 0x33));
+	CU_ASSERT(ut_cached_generation(&n.bdev) == 3);
+	CU_ASSERT(g_resv_changed_calls == 1);
+	CU_ASSERT(g_resv_changed_bdev == &n.bdev);
+
+	/* The same epoch fetches nothing */
+	vbdev_lvol_resv_sync_lvs(&n.lvs_bdev);
+	ut_hub_answer(0x10001, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS, NULL, 0);
+	CU_ASSERT(g_hub_ncmds == 0);
+
+	/* A changed epoch fetches again; a state older than the one held is not applied */
+	vbdev_lvol_resv_sync_lvs(&n.lvs_bdev);
+	ut_hub_answer(0x10002, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS, NULL, 0);
+	SPDK_CU_ASSERT_FATAL(g_hub_ncmds == 1);
+	ut_hub_answer(32, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS, enc, ut_resv_enc(enc, 2, 0x22));
+	CU_ASSERT(ut_cached_generation(&n.bdev) == 3);
+	CU_ASSERT(g_resv_changed_calls == 1);
+
+	/* A failed fetch is retried on the next poll, though the epoch did not change */
+	vbdev_lvol_resv_sync_lvs(&n.lvs_bdev);
+	ut_hub_answer(0x10003, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS, NULL, 0);
+	ut_hub_answer(0, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_NAMESPACE_NOT_READY, NULL, 0);
+	vbdev_lvol_resv_sync_lvs(&n.lvs_bdev);
+	ut_hub_answer(0x10003, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS, NULL, 0);
+	SPDK_CU_ASSERT_FATAL(g_hub_ncmds == 1);
+	ut_hub_answer(32, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS, enc, ut_resv_enc(enc, 4, 0x44));
+	CU_ASSERT(ut_cached_generation(&n.bdev) == 4);
+
+	/* No hub, or this node is the leader: nothing is asked */
+	n.lvs.hub_dev.state = HUBLVOL_DISCONNECTED;
+	vbdev_lvol_resv_sync_lvs(&n.lvs_bdev);
+	CU_ASSERT(g_hub_ncmds == 0);
+	n.lvs.hub_dev.state = HUBLVOL_CONNECTED;
+	n.lvs.leader = true;
+	vbdev_lvol_resv_sync_lvs(&n.lvs_bdev);
+	CU_ASSERT(g_hub_ncmds == 0);
+	(void)cmd;
+
+	ut_resv_node_fini(&n);
+}
+
+/* A hub that disconnects gives back its channel, once the command in flight on it
+ * has finished, so bdev_nvme can delete the hub path (lab-talos, 2026-10-11: "NVMe
+ * path 'LVS_2/hublvol' still exists after delete", and the node restart aborted). */
+static void
+ut_lvol_resv_hub_released_on_disconnect(void)
+{
+	struct ut_resv_node n;
+
+	ut_resv_node_init(&n, false);
+	n.lvs.hub_dev.state = HUBLVOL_CONNECTED;
+	n.lvs.hub_dev.desc = UT_HUB_DESC;
+
+	vbdev_lvol_resv_sync_lvs(&n.lvs_bdev);
+	SPDK_CU_ASSERT_FATAL(g_hub_ncmds == 1);
+	CU_ASSERT(g_ut_hub_channels == 1);
+
+	/* The hub goes away while the epoch request is still out */
+	n.lvs.hub_dev.state = HUBLVOL_NOT_CONNECTED;
+	vbdev_lvol_resv_sync_poll(NULL);
+	poll_threads();
+	CU_ASSERT(g_ut_hub_channels == 1);	/* not while a command uses it */
+	ut_hub_answer(0, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_ABORTED_SQ_DELETION, NULL, 0);
+	vbdev_lvol_resv_sync_poll(NULL);
+	poll_threads();
+	CU_ASSERT(g_ut_hub_channels == 0);
+	CU_ASSERT(ut_hub_unregister());
+
+	ut_resv_node_fini(&n);
+}
+
+/* A node that becomes the leader asks no one, so its channel on the hub goes back,
+ * though the hub was not reported gone */
+static void
+ut_lvol_resv_hub_released_on_leadership(void)
+{
+	struct ut_resv_node n;
+
+	ut_resv_node_init(&n, false);
+	n.lvs.hub_dev.state = HUBLVOL_CONNECTED;
+	n.lvs.hub_dev.desc = UT_HUB_DESC;
+
+	vbdev_lvol_resv_sync_lvs(&n.lvs_bdev);
+	ut_hub_answer(0x10001, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS, NULL, 0);
+	ut_hub_answer(0, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_ABORTED_SQ_DELETION, NULL, 0);
+	CU_ASSERT(g_ut_hub_channels == 1);
+
+	n.lvs.leader = true;
+	vbdev_lvol_resv_sync_poll(NULL);
+	poll_threads();
+	CU_ASSERT(g_ut_hub_channels == 0);
+	CU_ASSERT(ut_hub_unregister());
+
+	ut_resv_node_fini(&n);
+}
+
+/* Removing the lvolstore gives back the hub channel it held */
+static void
+ut_lvol_resv_hub_released_on_lvs_remove(void)
+{
+	struct ut_resv_node n;
+	struct lvol_store_bdev *lb;
+	struct spdk_lvs_req *req;
+
+	ut_resv_node_init(&n, false);
+	n.lvs.hub_dev.state = HUBLVOL_CONNECTED;
+	n.lvs.hub_dev.desc = UT_HUB_DESC;
+	TAILQ_REMOVE(&g_spdk_lvol_pairs, &n.lvs_bdev, lvol_stores);
+	lb = calloc(1, sizeof(*lb));
+	req = calloc(1, sizeof(*req));
+	SPDK_CU_ASSERT_FATAL(lb != NULL && req != NULL);
+	lb->lvs = &n.lvs;
+	lb->req = req;
+	TAILQ_INSERT_TAIL(&g_spdk_lvol_pairs, lb, lvol_stores);
+
+	vbdev_lvol_resv_sync_lvs(lb);
+	SPDK_CU_ASSERT_FATAL(g_hub_ncmds == 1);
+	ut_hub_answer(0x10001, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS, NULL, 0);
+	ut_hub_answer(0, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_ABORTED_SQ_DELETION, NULL, 0);
+	CU_ASSERT(g_ut_hub_channels == 1);
+
+	_vbdev_lvs_remove_cb(lb, 0);	/* frees lb and req */
+	poll_threads();
+	CU_ASSERT(g_ut_hub_channels == 0);
+	CU_ASSERT(ut_hub_unregister());
+
+	TAILQ_INSERT_TAIL(&g_spdk_lvol_pairs, &n.lvs_bdev, lvol_stores);
+	ut_resv_node_fini(&n);
+}
+
+/* The lvol library closes the hub descriptor and opens a new one, which can come back
+ * at the same address: the channel got on the closed one goes back at the close and
+ * is not used for the new hub */
+static void
+ut_lvol_resv_hub_released_on_close(void)
+{
+	struct ut_resv_node n;
+
+	ut_resv_node_init(&n, false);
+	n.lvs.hub_dev.state = HUBLVOL_CONNECTED;
+	n.lvs.hub_dev.desc = UT_HUB_DESC;
+
+	vbdev_lvol_resv_sync_lvs(&n.lvs_bdev);
+	ut_hub_answer(0x10001, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS, NULL, 0);
+	ut_hub_answer(0, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_ABORTED_SQ_DELETION, NULL, 0);
+	CU_ASSERT(g_ut_hub_channels == 1);
+
+	vbdev_lvol_on_hub_close(&n.lvs, NULL);
+	poll_threads();
+	CU_ASSERT(g_ut_hub_channels == 0);
+
+	/* The hub is back, its descriptor at the same address: a new channel is got */
+	vbdev_lvol_resv_sync_lvs(&n.lvs_bdev);
+	SPDK_CU_ASSERT_FATAL(g_hub_ncmds == 1);
+	CU_ASSERT(g_ut_hub_channels == 1);
+	ut_hub_answer(0x10001, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS, NULL, 0);
+	/* The earlier fetch failed, so the same epoch fetches again */
+	SPDK_CU_ASSERT_FATAL(g_hub_ncmds == 1);
+	ut_hub_answer(0, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_ABORTED_SQ_DELETION, NULL, 0);
+
+	ut_resv_node_fini(&n);
+}
+
+/* The lvolstore goes away while a command is out on the hub: the command completes
+ * without reaching it, and the channel goes back after it */
+static void
+ut_lvol_resv_hub_command_outlives_lvs(void)
+{
+	struct ut_resv_node n;
+	struct lvol_store_bdev *lb;
+	struct spdk_lvs_req *req;
+
+	ut_resv_node_init(&n, false);
+	n.lvs.hub_dev.state = HUBLVOL_CONNECTED;
+	n.lvs.hub_dev.desc = UT_HUB_DESC;
+	TAILQ_REMOVE(&g_spdk_lvol_pairs, &n.lvs_bdev, lvol_stores);
+	lb = calloc(1, sizeof(*lb));
+	req = calloc(1, sizeof(*req));
+	SPDK_CU_ASSERT_FATAL(lb != NULL && req != NULL);
+	lb->lvs = &n.lvs;
+	lb->req = req;
+	TAILQ_INSERT_TAIL(&g_spdk_lvol_pairs, lb, lvol_stores);
+
+	vbdev_lvol_resv_sync_lvs(lb);
+	SPDK_CU_ASSERT_FATAL(g_hub_ncmds == 1);
+	_vbdev_lvs_remove_cb(lb, 0);	/* frees lb while the epoch request is out */
+	poll_threads();
+	CU_ASSERT(g_ut_hub_channels == 1);	/* not while a command uses it */
+	/* The answer would start a fetch of every lvol if it reached the lvolstore */
+	ut_hub_answer(0x10009, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS, NULL, 0);
+	CU_ASSERT(g_hub_ncmds == 0);
+	CU_ASSERT(g_ut_hub_channels == 0);
+	CU_ASSERT(ut_hub_unregister());
+
+	TAILQ_INSERT_TAIL(&g_spdk_lvol_pairs, &n.lvs_bdev, lvol_stores);
+	ut_resv_node_fini(&n);
+}
+
+static int g_fwd_rc = 1;
+static uint8_t g_fwd_sct, g_fwd_sc;
+
+static void
+ut_resv_forward_done(void *cb_arg, int rc, uint8_t sct, uint8_t sc)
+{
+	g_fwd_rc = rc;
+	g_fwd_sct = sct;
+	g_fwd_sc = sc;
+}
+
+/* A restarted target starts with the C library's default seed, as a fresh process does:
+ * its epoch incarnation must not repeat the one before the restart */
+static void
+ut_lvol_resv_epoch_incarnation(void)
+{
+	struct lvol_store_bdev lvs_bdev = {};
+	uint32_t first, epoch;
+	bool repeated = true;
+	int i;
+
+	srand(1);
+	first = vbdev_lvol_resv_epoch(&lvs_bdev);
+	CU_ASSERT(first != 0);
+	for (i = 0; i < 8; i++) {
+		srand(1);
+		lvs_bdev.resv_epoch = 0;
+		epoch = vbdev_lvol_resv_epoch(&lvs_bdev);
+		CU_ASSERT((epoch & 0xffff) == 0 && epoch != 0);
+		if (epoch != first) {
+			repeated = false;
+		}
+	}
+	CU_ASSERT(!repeated);
+}
+
+static void
+ut_lvol_resv_forward(void)
+{
+	struct ut_resv_node n;
+	struct vbdev_lvol_resv_exec_msg msg = {}, sent;
+	uint8_t enc[32];
+
+	ut_resv_node_init(&n, false);
+	n.lvs.hub_dev.state = HUBLVOL_CONNECTED;
+	n.lvs.hub_dev.desc = (struct spdk_bdev_desc *)0x2;
+	msg.magic = VBDEV_LVOL_RESV_EXEC_MAGIC;
+	msg.version = 1;
+	msg.opc = SPDK_NVME_OPC_RESERVATION_REGISTER;
+	msg.data_len = 16;
+	msg.data[8] = 0x55;
+
+	/* The command goes to the leader, then the state it left is fetched and installed
+	 * before the answer is given */
+	g_fwd_rc = 1;
+	vbdev_lvol_resv_forward(&n.bdev, &msg, ut_resv_forward_done, NULL);
+	poll_threads();
+	SPDK_CU_ASSERT_FATAL(g_hub_ncmds == 1);
+	CU_ASSERT(g_hub_cmds[0].cmd.opc == VBDEV_LVOL_HUB_OPC_RESV_EXEC);
+	CU_ASSERT(g_hub_cmds[0].cmd.cdw10 == 3);
+	SPDK_CU_ASSERT_FATAL(g_hub_cmds[0].nbytes >= sizeof(msg));
+	memcpy(&sent, g_hub_cmds[0].buf, sizeof(sent));
+	CU_ASSERT(sent.opc == SPDK_NVME_OPC_RESERVATION_REGISTER && sent.data[8] == 0x55);
+	ut_hub_answer(0, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS, NULL, 0);
+	CU_ASSERT(g_fwd_rc == 1);
+	SPDK_CU_ASSERT_FATAL(g_hub_ncmds == 1);
+	CU_ASSERT(g_hub_cmds[0].cmd.opc == VBDEV_LVOL_HUB_OPC_RESV_FETCH);
+	ut_hub_answer(32, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS, enc, ut_resv_enc(enc, 6, 0x55));
+	CU_ASSERT(g_fwd_rc == 0);
+	CU_ASSERT(g_fwd_sct == SPDK_NVME_SCT_GENERIC && g_fwd_sc == SPDK_NVME_SC_SUCCESS);
+	CU_ASSERT(ut_cached_generation(&n.bdev) == 6);
+
+	/* A fetch that fails is asked again: the answer waits for the state */
+	vbdev_lvol_resv_forward(&n.bdev, &msg, ut_resv_forward_done, NULL);
+	poll_threads();
+	g_fwd_rc = 1;
+	ut_hub_answer(0, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS, NULL, 0);
+	ut_hub_answer(0, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_INTERNAL_DEVICE_ERROR, NULL, 0);
+	CU_ASSERT(g_fwd_rc == 1);
+	SPDK_CU_ASSERT_FATAL(g_hub_ncmds == 1);
+	CU_ASSERT(g_hub_cmds[0].cmd.opc == VBDEV_LVOL_HUB_OPC_RESV_FETCH);
+	ut_hub_answer(32, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS, enc, ut_resv_enc(enc, 7, 0x55));
+	CU_ASSERT(g_fwd_rc == 0);
+	CU_ASSERT(g_fwd_sc == SPDK_NVME_SC_SUCCESS);
+	CU_ASSERT(ut_cached_generation(&n.bdev) == 7);
+
+	/* State that cannot be installed is fetched again too, and a forward whose state
+	 * never arrives fails rather than answering with what this node no longer
+	 * enforces */
+	vbdev_lvol_resv_forward(&n.bdev, &msg, ut_resv_forward_done, NULL);
+	poll_threads();
+	g_fwd_rc = 1;
+	ut_hub_answer(0, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS, NULL, 0);
+	ut_hub_answer(7, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS, "garbage", 7);
+	CU_ASSERT(g_fwd_rc == 1);
+	while (g_hub_ncmds > 0 && g_fwd_rc == 1) {
+		ut_hub_answer(0, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_INTERNAL_DEVICE_ERROR, NULL, 0);
+	}
+	CU_ASSERT(g_fwd_rc == -EIO);
+	CU_ASSERT(g_hub_ncmds == 0);
+	CU_ASSERT(ut_cached_generation(&n.bdev) == 7);
+
+	/* The leader's refusal is the answer */
+	vbdev_lvol_resv_forward(&n.bdev, &msg, ut_resv_forward_done, NULL);
+	poll_threads();
+	ut_hub_answer(0, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_RESERVATION_CONFLICT, NULL, 0);
+	ut_hub_answer(32, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS, enc, ut_resv_enc(enc, 6, 0x55));
+	CU_ASSERT(g_fwd_rc == 0);
+	CU_ASSERT(g_fwd_sc == SPDK_NVME_SC_RESERVATION_CONFLICT);
+
+	/* Without a hub there is nobody to forward to */
+	n.lvs.hub_dev.state = HUBLVOL_DISCONNECTED;
+	vbdev_lvol_resv_forward(&n.bdev, &msg, ut_resv_forward_done, NULL);
+	poll_threads();
+	CU_ASSERT(g_fwd_rc == -ENOTCONN);
+	CU_ASSERT(g_hub_ncmds == 0);
+
+	ut_resv_node_fini(&n);
+}
+
+
 int
 main(int argc, char **argv)
 {
@@ -2622,6 +3441,18 @@ main(int argc, char **argv)
 	suite = CU_add_suite("lvol", NULL, NULL);
 
 	CU_ADD_TEST(suite, ut_lvol_resv_store);
+	CU_ADD_TEST(suite, ut_lvol_resv_generation_order);
+	CU_ADD_TEST(suite, ut_lvol_hub_resv_leader);
+	CU_ADD_TEST(suite, ut_lvol_resv_sync_from_leader);
+	CU_ADD_TEST(suite, ut_lvol_hub_resv_as_nvmf_submits);
+	CU_ADD_TEST(suite, ut_lvol_resv_sync_backoff);
+	CU_ADD_TEST(suite, ut_lvol_resv_hub_released_on_disconnect);
+	CU_ADD_TEST(suite, ut_lvol_resv_hub_released_on_leadership);
+	CU_ADD_TEST(suite, ut_lvol_resv_hub_released_on_lvs_remove);
+	CU_ADD_TEST(suite, ut_lvol_resv_hub_released_on_close);
+	CU_ADD_TEST(suite, ut_lvol_resv_hub_command_outlives_lvs);
+	CU_ADD_TEST(suite, ut_lvol_resv_epoch_incarnation);
+	CU_ADD_TEST(suite, ut_lvol_resv_forward);
 	CU_ADD_TEST(suite, ut_lvs_init);
 	CU_ADD_TEST(suite, ut_lvol_init);
 	CU_ADD_TEST(suite, ut_lvol_snapshot);

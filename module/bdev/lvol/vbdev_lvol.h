@@ -14,11 +14,20 @@
 
 #include "spdk_internal/lvolstore.h"
 
+struct vbdev_lvol_resv_hub;
+
 struct lvol_store_bdev {
 	struct spdk_lvol_store	*lvs;
 	struct spdk_bdev	*bdev;
 	struct spdk_lvs_req	*req;
 	bool			removal_in_progress;
+
+	/* Reservation state over the hub connection (vbdev_lvol.c). On the leader, the
+	 * epoch that changes with every stored change. On another node, the hub channel
+	 * it asks through and the poll in progress, kept apart from this struct so that
+	 * a command still in flight when the lvolstore goes away does not reach it. */
+	uint32_t		resv_epoch;
+	struct vbdev_lvol_resv_hub	*resv_hub;
 
 	TAILQ_ENTRY(lvol_store_bdev)	lvol_stores;
 };
@@ -187,6 +196,84 @@ void vbdev_lvol_resv_put(struct spdk_bdev *bdev, const void *buf, size_t len,
 
 /* Set the function told when stored reservation state may have changed. */
 void vbdev_lvol_set_resv_changed_cb(vbdev_lvol_resv_changed_cb cb_fn, void *ctx);
+
+/*
+ * The reservation state of an lvol is owned by its leader. Another node serving the
+ * lvol reaches the leader over the hub connection with vendor-specific NVMe I/O
+ * commands on the hublvol, CDW10 bits 15:0 naming the lvol by its map id:
+ *
+ *   RESV_EPOCH  no data. Completion dword 0 is the leader's reservation epoch for
+ *               the lvolstore, which changes with every stored change.
+ *   RESV_EXEC   host to controller: struct vbdev_lvol_resv_exec_msg. The leader
+ *               executes the command as the host it names, and its status is the
+ *               command's.
+ *   RESV_FETCH  controller to host: the lvol's stored state. Completion dword 0
+ *               is its length, 0 when none is stored.
+ *
+ * A node that is not the leader answers Namespace Not Ready.
+ */
+#define VBDEV_LVOL_HUB_OPC_RESV_EPOCH	0xC4
+#define VBDEV_LVOL_HUB_OPC_RESV_EXEC	0xC5
+#define VBDEV_LVOL_HUB_OPC_RESV_FETCH	0xC6
+#define VBDEV_LVOL_HUB_RESV_FETCH_LEN	4096
+#define VBDEV_LVOL_RESV_EXEC_MAGIC	0x58524253u	/* "SBRX" read as little-endian */
+#define VBDEV_LVOL_RESV_EXEC_VERSION	1
+/* How often a node that is not the leader asks for the epoch */
+#define VBDEV_LVOL_RESV_SYNC_PERIOD_US	200000
+/* Polls a non-leader at most skips after hub failures in a row: 50 polls, 10 s */
+#define VBDEV_LVOL_RESV_SYNC_MAX_SKIP	50
+/* How often the state a forwarded command left is fetched before the forward fails */
+#define VBDEV_LVOL_RESV_FWD_FETCHES	3
+
+/* A reservation command forwarded to the leader */
+struct vbdev_lvol_resv_exec_msg {
+	uint32_t	magic;
+	uint8_t		version;
+	uint8_t		opc;		/* Register, Acquire, or Release */
+	uint16_t	data_len;	/* bytes of data used, at most 16 */
+	uint32_t	cdw10;
+	uint32_t	cdw11;
+	uint8_t		hostid[16];	/* the host the command acts as */
+	uint8_t		data[16];	/* the command's data structure */
+	char		hostnqn[224];
+};
+SPDK_STATIC_ASSERT(sizeof(struct vbdev_lvol_resv_exec_msg) == 272, "exec message size");
+
+/* Answer of an executed command: its NVMe status */
+typedef void (*vbdev_lvol_resv_exec_done)(void *done_arg, uint8_t sct, uint8_t sc);
+
+/* Called on the leader for a RESV_EXEC naming an lvol bdev. done must be called once. */
+typedef void (*vbdev_lvol_resv_exec_cb)(struct spdk_bdev *bdev,
+					const struct vbdev_lvol_resv_exec_msg *msg,
+					vbdev_lvol_resv_exec_done done, void *done_arg, void *ctx);
+
+/* Set the function that executes forwarded reservation commands on the leader. */
+void vbdev_lvol_set_resv_exec_cb(vbdev_lvol_resv_exec_cb cb_fn, void *ctx);
+
+/* Whether this node is the leader of the lvol, and so owns its reservation state. */
+bool vbdev_lvol_resv_is_leader(struct spdk_bdev *bdev);
+
+/*
+ * Replace the lvol's reservation state with state the leader returned, if it is
+ * newer than what this node holds (by the generation of its encoding), and say so
+ * through the changed callback. Returns 1 when installed, 0 when it is not newer,
+ * -EPERM on the leader, -EINVAL for a buffer that is not an encoding, or -ENODEV.
+ */
+int vbdev_lvol_resv_install(struct spdk_bdev *bdev, const void *buf, size_t len);
+
+/* Completion of vbdev_lvol_resv_forward(): rc is 0 when the leader answered and the
+ * state it left is installed here, and sct and sc are then its status. A nonzero rc
+ * says nothing about whether the leader executed the command. */
+typedef void (*vbdev_lvol_resv_forward_cb)(void *cb_arg, int rc, uint8_t sct, uint8_t sc);
+
+/*
+ * Send a reservation command to the lvol's leader over the hub connection, then
+ * fetch the state the leader stored and install it, so the answer reaches the
+ * caller with this node's state already current. cb_fn is called on the calling
+ * thread. -ENOTCONN when there is no hub connection.
+ */
+void vbdev_lvol_resv_forward(struct spdk_bdev *bdev, const struct vbdev_lvol_resv_exec_msg *msg,
+			     vbdev_lvol_resv_forward_cb cb_fn, void *cb_arg);
 
 int vbdev_lvol_esnap_dev_create(void *bs_ctx, void *blob_ctx, struct spdk_blob *blob,
 				const void *esnap_id, uint32_t id_len,

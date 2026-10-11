@@ -10,10 +10,16 @@
 #include "spdk/string.h"
 #include "spdk/uuid.h"
 #include "spdk/blob.h"
+#include "spdk/endian.h"
 #include "spdk_internal/thread.h"
 #include "vbdev_lvol.h"
 
+#include <sys/random.h>
+
 static void vbdev_lvol_resv_refresh(struct spdk_lvol *lvol);
+static void vbdev_lvol_hub_resv_request(struct spdk_lvol *hub, struct spdk_bdev_io *bdev_io);
+static void vbdev_lvol_resv_hub_detach(struct lvol_store_bdev *lvs_bdev);
+static bool vbdev_lvol_resv_lvs_known(struct lvol_store_bdev *lvs_bdev);
 
 
 #define ID_SHIFT_AMOUNT       48                   // Number of bits to shift for ID extraction
@@ -376,6 +382,7 @@ _vbdev_lvs_remove_cb(void *cb_arg, int lvserrno)
 	}
 
 	TAILQ_REMOVE(&g_spdk_lvol_pairs, lvs_bdev, lvol_stores);
+	vbdev_lvol_resv_hub_detach(lvs_bdev);
 	free(lvs_bdev);
 
 	if (req->cb_fn != NULL) {
@@ -1121,6 +1128,9 @@ vbdev_lvol_io_type_supported(void *ctx, enum spdk_bdev_io_type io_type)
 	case SPDK_BDEV_IO_TYPE_SEEK_DATA:
 	case SPDK_BDEV_IO_TYPE_SEEK_HOLE:
 		return true;
+	case SPDK_BDEV_IO_TYPE_NVME_IO:
+		/* The hublvol carries the reservation commands of the other nodes */
+		return lvol->hublvol;
 	default:
 		return false;
 	}
@@ -2059,6 +2069,16 @@ vbdev_lvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_
 	struct spdk_lvol_store *lvs = lvol->lvol_store;
 	bool io_type = check_IO_type(bdev_io->type);
 	enum freeze_io_result result;
+
+	/* A reservation command of another node. The nvmf target submits I/O passthru
+	 * through spdk_bdev_nvme_iov_passthru_md, which gates on NVME_IO support but
+	 * arrives here as NVME_IOV_MD with the data in iovs; a local caller of
+	 * spdk_bdev_nvme_io_passthru arrives as NVME_IO. */
+	if (spdk_unlikely(bdev_io->type == SPDK_BDEV_IO_TYPE_NVME_IO ||
+			  bdev_io->type == SPDK_BDEV_IO_TYPE_NVME_IOV_MD)) {
+		vbdev_lvol_hub_resv_request(lvol, bdev_io);
+		return;
+	}
 
 	if (lvol->freezed && io_type) {
 		result = spdk_lvol_freeze_io(lvol, ch, bdev_io, vbdev_lvol_dequeue_io);
@@ -3117,6 +3137,30 @@ vbdev_lvol_set_read_only(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, vo
 static pthread_mutex_t g_resv_mutex = PTHREAD_MUTEX_INITIALIZER;
 static vbdev_lvol_resv_changed_cb g_resv_changed_cb;
 static void *g_resv_changed_ctx;
+static vbdev_lvol_resv_exec_cb g_resv_exec_cb;
+static void *g_resv_exec_ctx;
+static struct spdk_poller *g_resv_sync_poller;
+
+/* The generation of an encoded state (lib/nvmf's compact encoding), if buf is one */
+static bool
+vbdev_lvol_resv_generation(const void *buf, size_t len, uint64_t *generation)
+{
+	if (buf == NULL || len < 32 || memcmp(buf, "SBRV", 4) != 0) {
+		return false;
+	}
+	*generation = from_le64((const uint8_t *)buf + 16);
+	return true;
+}
+
+/* Whether new is an encoded state older than the encoded state held */
+static bool
+vbdev_lvol_resv_older(const void *new, size_t new_len, const void *held, size_t held_len)
+{
+	uint64_t ng, hg;
+
+	return vbdev_lvol_resv_generation(new, new_len, &ng) &&
+	       vbdev_lvol_resv_generation(held, held_len, &hg) && ng < hg;
+}
 
 /* Read the xattr into the lvol's copy. Runs on the lvolstore's thread. */
 static void
@@ -3139,6 +3183,12 @@ vbdev_lvol_resv_refresh(struct spdk_lvol *lvol)
 	}
 
 	pthread_mutex_lock(&g_resv_mutex);
+	if (vbdev_lvol_resv_older(copy, copy ? len : 0, lvol->resv_cache, lvol->resv_cache_len)) {
+		/* Metadata read before the leader's latest change reached this node */
+		pthread_mutex_unlock(&g_resv_mutex);
+		free(copy);
+		return;
+	}
 	free(lvol->resv_cache);
 	lvol->resv_cache = copy;
 	lvol->resv_cache_len = copy ? len : 0;
@@ -3183,6 +3233,14 @@ vbdev_lvol_on_lvs_refresh(struct spdk_lvol_store *lvs, struct spdk_lvol *lvol, v
 	if (ctx == NULL) {
 		SPDK_ERRLOG("Cannot refresh the reservation state of lvolstore %s\n", lvs->name);
 		return;
+	}
+	if (lvs->leader) {
+		struct lvol_store_bdev *lvs_bdev = vbdev_get_lvs_bdev_by_lvs(lvs);
+
+		/* A new leader starts a new incarnation of the epoch */
+		if (lvs_bdev != NULL) {
+			lvs_bdev->resv_epoch = 0;
+		}
 	}
 	ctx->lvs = lvs;
 	ctx->blob_id = lvol ? lvol->blob_id : SPDK_BLOBID_INVALID;
@@ -3264,6 +3322,39 @@ vbdev_lvol_resv_find(struct spdk_lvol_store *lvs, spdk_blob_id blob_id)
 	return NULL;
 }
 
+/*
+ * The leader's epoch: a random incarnation in the high half, so that a restarted or
+ * newly elected leader does not repeat a value another node remembers, and a counter
+ * in the low half that changes with every stored change. The incarnation comes from
+ * the kernel: nothing seeds rand() in the target, so every process would draw the
+ * same one.
+ */
+static uint32_t
+vbdev_lvol_resv_epoch(struct lvol_store_bdev *lvs_bdev)
+{
+	uint32_t r;
+
+	if (lvs_bdev->resv_epoch == 0) {
+		if (getrandom(&r, sizeof(r), 0) != sizeof(r)) {
+			r = (uint32_t)rand() ^ (uint32_t)spdk_get_ticks();
+		}
+		lvs_bdev->resv_epoch = ((r & 0x7fff) + 1) << 16;
+	}
+	return lvs_bdev->resv_epoch;
+}
+
+static void
+vbdev_lvol_resv_epoch_bump(struct lvol_store_bdev *lvs_bdev)
+{
+	uint32_t epoch;
+
+	if (lvs_bdev == NULL) {
+		return;
+	}
+	epoch = vbdev_lvol_resv_epoch(lvs_bdev);
+	lvs_bdev->resv_epoch = (epoch & 0xffff0000u) | ((epoch + 1) & 0xffffu);
+}
+
 static void
 vbdev_lvol_resv_put_synced(void *arg, int rc)
 {
@@ -3272,6 +3363,7 @@ vbdev_lvol_resv_put_synced(void *arg, int rc)
 
 	if (rc == 0 && lvol != NULL) {
 		vbdev_lvol_resv_refresh(lvol);
+		vbdev_lvol_resv_epoch_bump(vbdev_get_lvs_bdev_by_lvs(ctx->lvs));
 	}
 	vbdev_lvol_resv_put_finish(ctx, rc);
 }
@@ -3342,10 +3434,821 @@ vbdev_lvol_set_resv_changed_cb(vbdev_lvol_resv_changed_cb cb_fn, void *ctx)
 	g_resv_changed_ctx = ctx;
 }
 
+void
+vbdev_lvol_set_resv_exec_cb(vbdev_lvol_resv_exec_cb cb_fn, void *ctx)
+{
+	g_resv_exec_cb = cb_fn;
+	g_resv_exec_ctx = ctx;
+}
+
+bool
+vbdev_lvol_resv_is_leader(struct spdk_bdev *bdev)
+{
+	struct spdk_lvol *lvol = vbdev_lvol_get_from_bdev(bdev);
+
+	return lvol != NULL && lvol->leader;
+}
+
+int
+vbdev_lvol_resv_install(struct spdk_bdev *bdev, const void *buf, size_t len)
+{
+	struct spdk_lvol *lvol = vbdev_lvol_get_from_bdev(bdev);
+	uint64_t generation, held;
+	void *copy;
+
+	if (lvol == NULL) {
+		return -ENODEV;
+	}
+	if (lvol->leader) {
+		return -EPERM;
+	}
+	if (!vbdev_lvol_resv_generation(buf, len, &generation)) {
+		return -EINVAL;
+	}
+	copy = malloc(len);
+	if (copy == NULL) {
+		return -ENOMEM;
+	}
+	memcpy(copy, buf, len);
+
+	pthread_mutex_lock(&g_resv_mutex);
+	if (vbdev_lvol_resv_generation(lvol->resv_cache, lvol->resv_cache_len, &held) &&
+	    generation <= held) {
+		pthread_mutex_unlock(&g_resv_mutex);
+		free(copy);
+		return 0;
+	}
+	free(lvol->resv_cache);
+	lvol->resv_cache = copy;
+	lvol->resv_cache_len = len;
+	pthread_mutex_unlock(&g_resv_mutex);
+
+	if (g_resv_changed_cb && lvol->bdev) {
+		g_resv_changed_cb(lvol->bdev, g_resv_changed_ctx);
+	}
+	return 1;
+}
+
+/* Copy between a passthrough command's data and a buffer */
+static size_t
+vbdev_lvol_hub_io_len(struct spdk_bdev_io *bdev_io)
+{
+	size_t len = 0;
+	int i;
+
+	if (bdev_io->u.nvme_passthru.iovcnt > 0) {
+		for (i = 0; i < bdev_io->u.nvme_passthru.iovcnt; i++) {
+			len += bdev_io->u.nvme_passthru.iovs[i].iov_len;
+		}
+		return len;
+	}
+	return bdev_io->u.nvme_passthru.buf ? bdev_io->u.nvme_passthru.nbytes : 0;
+}
+
+static void
+vbdev_lvol_hub_io_copy(struct spdk_bdev_io *bdev_io, void *buf, size_t len, bool to_io)
+{
+	struct spdk_iov_xfer ix;
+
+	if (bdev_io->u.nvme_passthru.iovcnt > 0) {
+		spdk_iov_xfer_init(&ix, bdev_io->u.nvme_passthru.iovs, bdev_io->u.nvme_passthru.iovcnt);
+		if (to_io) {
+			spdk_iov_xfer_from_buf(&ix, buf, len);
+		} else {
+			spdk_iov_xfer_to_buf(&ix, buf, len);
+		}
+	} else if (to_io) {
+		memcpy(bdev_io->u.nvme_passthru.buf, buf, len);
+	} else {
+		memcpy(buf, bdev_io->u.nvme_passthru.buf, len);
+	}
+}
+
+static void
+vbdev_lvol_hub_resv_complete(struct spdk_bdev_io *bdev_io, uint32_t cdw0, uint8_t sc)
+{
+	spdk_bdev_io_complete_nvme_status(bdev_io, cdw0, SPDK_NVME_SCT_GENERIC, sc);
+}
+
+struct vbdev_lvol_hub_resv_exec {
+	struct spdk_bdev_io			*bdev_io;
+	struct vbdev_lvol_resv_exec_msg		msg;
+};
+
+static void
+vbdev_lvol_hub_resv_exec_done(void *done_arg, uint8_t sct, uint8_t sc)
+{
+	struct vbdev_lvol_hub_resv_exec *ctx = done_arg;
+
+	spdk_bdev_io_complete_nvme_status(ctx->bdev_io, 0, sct, sc);
+	free(ctx);
+}
+
+/* A reservation command of another node, arriving on this node's hublvol */
+static void
+vbdev_lvol_hub_resv_request(struct spdk_lvol *hub, struct spdk_bdev_io *bdev_io)
+{
+	struct spdk_lvol_store *lvs = hub->lvol_store;
+	struct spdk_nvme_cmd *cmd = &bdev_io->u.nvme_passthru.cmd;
+	uint16_t id = cmd->cdw10 & 0xffff;
+	struct spdk_lvol *org;
+	struct vbdev_lvol_hub_resv_exec *ctx;
+	struct lvol_store_bdev *lvs_bdev;
+	uint8_t state[VBDEV_LVOL_HUB_RESV_FETCH_LEN];
+	size_t len;
+
+	if (!hub->hublvol) {
+		vbdev_lvol_hub_resv_complete(bdev_io, 0, SPDK_NVME_SC_INVALID_OPCODE);
+		return;
+	}
+	if (!lvs->leader) {
+		/* Only the leader answers for the state; the asking node polls again */
+		vbdev_lvol_hub_resv_complete(bdev_io, 0, SPDK_NVME_SC_NAMESPACE_NOT_READY);
+		return;
+	}
+	org = id != 0 && id < SPDK_COUNTOF(lvs->lvol_map.lvol) ? lvs->lvol_map.lvol[id] : NULL;
+	if (org == NULL) {
+		vbdev_lvol_hub_resv_complete(bdev_io, 0, SPDK_NVME_SC_INVALID_FIELD);
+		return;
+	}
+
+	switch (cmd->opc) {
+	case VBDEV_LVOL_HUB_OPC_RESV_EPOCH:
+		lvs_bdev = vbdev_get_lvs_bdev_by_lvs(lvs);
+		vbdev_lvol_hub_resv_complete(bdev_io, lvs_bdev ? vbdev_lvol_resv_epoch(lvs_bdev) : 0,
+					     SPDK_NVME_SC_SUCCESS);
+		return;
+	case VBDEV_LVOL_HUB_OPC_RESV_FETCH:
+		pthread_mutex_lock(&g_resv_mutex);
+		len = org->resv_cache ? org->resv_cache_len : 0;
+		if (len > sizeof(state) || len > vbdev_lvol_hub_io_len(bdev_io)) {
+			pthread_mutex_unlock(&g_resv_mutex);
+			vbdev_lvol_hub_resv_complete(bdev_io, 0, SPDK_NVME_SC_INVALID_FIELD);
+			return;
+		}
+		if (len > 0) {
+			memcpy(state, org->resv_cache, len);
+		}
+		pthread_mutex_unlock(&g_resv_mutex);
+		if (len > 0) {
+			vbdev_lvol_hub_io_copy(bdev_io, state, len, true);
+		}
+		vbdev_lvol_hub_resv_complete(bdev_io, (uint32_t)len, SPDK_NVME_SC_SUCCESS);
+		return;
+	case VBDEV_LVOL_HUB_OPC_RESV_EXEC:
+		if (g_resv_exec_cb == NULL || org->bdev == NULL) {
+			vbdev_lvol_hub_resv_complete(bdev_io, 0, SPDK_NVME_SC_INVALID_OPCODE);
+			return;
+		}
+		if (vbdev_lvol_hub_io_len(bdev_io) < sizeof(struct vbdev_lvol_resv_exec_msg)) {
+			vbdev_lvol_hub_resv_complete(bdev_io, 0, SPDK_NVME_SC_INVALID_FIELD);
+			return;
+		}
+		ctx = calloc(1, sizeof(*ctx));
+		if (ctx == NULL) {
+			vbdev_lvol_hub_resv_complete(bdev_io, 0, SPDK_NVME_SC_INTERNAL_DEVICE_ERROR);
+			return;
+		}
+		ctx->bdev_io = bdev_io;
+		vbdev_lvol_hub_io_copy(bdev_io, &ctx->msg, sizeof(ctx->msg), false);
+		ctx->msg.hostnqn[sizeof(ctx->msg.hostnqn) - 1] = '\0';
+		if (from_le32(&ctx->msg.magic) != VBDEV_LVOL_RESV_EXEC_MAGIC ||
+		    ctx->msg.version != VBDEV_LVOL_RESV_EXEC_VERSION ||
+		    ctx->msg.data_len > sizeof(ctx->msg.data)) {
+			free(ctx);
+			vbdev_lvol_hub_resv_complete(bdev_io, 0, SPDK_NVME_SC_INVALID_FIELD);
+			return;
+		}
+		g_resv_exec_cb(org->bdev, &ctx->msg, vbdev_lvol_hub_resv_exec_done, ctx, g_resv_exec_ctx);
+		return;
+	default:
+		vbdev_lvol_hub_resv_complete(bdev_io, 0, SPDK_NVME_SC_INVALID_OPCODE);
+		return;
+	}
+}
+
+/* What a node that is not the leader keeps to ask the leader over the hub: the I/O
+ * channel on the hub's descriptor, the thread it was got on and is given back on,
+ * the commands in flight on it, and the poll in progress. It is allocated apart from
+ * its lvol_store_bdev so that a command completing after the lvolstore went away
+ * finds lvs_bdev NULL instead of freed memory, and it is freed once nothing holds it.
+ *
+ * The channel goes back as soon as nothing is in flight on it and the hub it was got
+ * on is no longer the usable one: bdev_nvme cannot delete a hub path while a channel
+ * on it is held, and a node restart then aborts on the secondary. */
+struct vbdev_lvol_resv_hub {
+	struct lvol_store_bdev	*lvs_bdev;	/* NULL once the lvolstore is gone */
+	struct spdk_bdev_desc	*desc;
+	struct spdk_io_channel	*ch;
+	struct spdk_thread	*thread;
+	uint32_t		inflight;
+	bool			release;	/* give ch back once nothing is in flight */
+	bool			detach_pending;	/* the lvolstore went away on another thread */
+
+	uint32_t		epoch_seen;
+	bool			epoch_valid;
+	bool			sync_busy;
+	bool			fetch_failed;
+	uint32_t		fetch_pending;
+
+	/* A hub that keeps failing is asked less often: fail_streak sync rounds in a row
+	 * failed, and skip_polls polls pass before the next ask. */
+	uint32_t		fail_streak;
+	uint32_t		skip_polls;
+};
+
+/* How a sync round with the leader ended. The first failure is retried on the next
+ * poll and each further one doubles the polls skipped, up to
+ * VBDEV_LVOL_RESV_SYNC_MAX_SKIP, so a leader that cannot answer is not asked every
+ * 200 ms; the state of the streak is logged when it starts and when it ends, not on
+ * every poll. */
+static void
+vbdev_lvol_resv_sync_round_done(struct vbdev_lvol_resv_hub *hub, bool ok)
+{
+	const char *lvs = hub->lvs_bdev != NULL && hub->lvs_bdev->lvs != NULL ?
+			  hub->lvs_bdev->lvs->name : "?";
+	uint32_t shift;
+
+	if (ok) {
+		if (hub->fail_streak > 0) {
+			SPDK_NOTICELOG("Lvolstore %s: reservation sync with the leader works again "
+				       "after %u failed rounds\n", lvs, hub->fail_streak);
+		}
+		hub->fail_streak = 0;
+		hub->skip_polls = 0;
+		return;
+	}
+	if (hub->fail_streak == 0) {
+		SPDK_NOTICELOG("Lvolstore %s: reservation sync with the leader failed; asking "
+			       "less often until it answers\n", lvs);
+	}
+	if (hub->fail_streak < UINT32_MAX) {
+		hub->fail_streak++;
+	}
+	shift = spdk_min(hub->fail_streak - 1, 16u);
+	hub->skip_polls = spdk_min((1u << shift) - 1, (uint32_t)VBDEV_LVOL_RESV_SYNC_MAX_SKIP);
+}
+
+static struct vbdev_lvol_resv_hub *
+vbdev_lvol_resv_hub_of(struct lvol_store_bdev *lvs_bdev)
+{
+	if (lvs_bdev->resv_hub == NULL) {
+		lvs_bdev->resv_hub = calloc(1, sizeof(*lvs_bdev->resv_hub));
+		if (lvs_bdev->resv_hub != NULL) {
+			lvs_bdev->resv_hub->lvs_bdev = lvs_bdev;
+		}
+	}
+	return lvs_bdev->resv_hub;
+}
+
+/* Gives the channel back when it is due, and frees the hub once its lvolstore is gone
+ * and nothing holds it. Runs on hub->thread whenever hub->ch is set. */
+static void
+vbdev_lvol_resv_hub_settle(struct vbdev_lvol_resv_hub *hub)
+{
+	if (hub->ch != NULL && hub->inflight == 0 && (hub->release || hub->lvs_bdev == NULL)) {
+		spdk_put_io_channel(hub->ch);
+		hub->ch = NULL;
+		hub->desc = NULL;
+		hub->release = false;
+	}
+	if (hub->lvs_bdev == NULL && hub->ch == NULL && hub->inflight == 0 && !hub->detach_pending) {
+		free(hub);
+	}
+}
+
+/* The channel to the leader's hublvol, kept per lvolstore while that hub stays
+ * connected. NULL while the hub is not usable, and while a channel got on an earlier
+ * hub still has commands in flight. Runs on the lvolstore's thread. */
+static struct spdk_io_channel *
+vbdev_lvol_resv_hub_channel(struct lvol_store_bdev *lvs_bdev)
+{
+	struct spdk_redirect_dev *dev = &lvs_bdev->lvs->hub_dev;
+	struct vbdev_lvol_resv_hub *hub = vbdev_lvol_resv_hub_of(lvs_bdev);
+
+	if (hub == NULL) {
+		return NULL;
+	}
+	if (hub->ch != NULL &&
+	    (hub->release || dev->state != HUBLVOL_CONNECTED || dev->desc != hub->desc)) {
+		hub->release = true;
+		vbdev_lvol_resv_hub_settle(hub);
+		if (hub->ch != NULL) {
+			return NULL;
+		}
+	}
+	if (dev->state != HUBLVOL_CONNECTED || dev->desc == NULL) {
+		return NULL;
+	}
+	if (hub->ch == NULL) {
+		hub->ch = spdk_bdev_get_io_channel(dev->desc);
+		if (hub->ch == NULL) {
+			return NULL;
+		}
+		hub->desc = dev->desc;
+		hub->thread = spdk_get_thread();
+	}
+	return hub->ch;
+}
+
+/* Gives the channel back once nothing is in flight on it: the hub was closed or lost.
+ * Runs on the lvolstore's thread, where the channel was got. */
+static void
+vbdev_lvol_resv_hub_release_msg(void *arg)
+{
+	struct lvol_store_bdev *lvs_bdev = arg;
+
+	/* The lvolstore may have been unloaded while the message was queued */
+	if (!vbdev_lvol_resv_lvs_known(lvs_bdev) || lvs_bdev->resv_hub == NULL ||
+	    lvs_bdev->resv_hub->ch == NULL) {
+		return;
+	}
+	lvs_bdev->resv_hub->release = true;
+	vbdev_lvol_resv_hub_settle(lvs_bdev->resv_hub);
+}
+
+/* The lvol library is about to close an lvolstore's hub descriptor, on its own
+ * thread. The release is queued to the lvolstore's thread before the close, so it
+ * runs before any later use of a descriptor that may reuse the same address. */
+static void
+vbdev_lvol_on_hub_close(struct spdk_lvol_store *lvs, void *ctx)
+{
+	struct lvol_store_bdev *lvs_bdev = vbdev_get_lvs_bdev_by_lvs(lvs);
+
+	if (lvs_bdev == NULL || lvs_bdev->resv_hub == NULL || lvs_bdev->resv_hub->ch == NULL) {
+		return;
+	}
+	spdk_thread_send_msg(lvs->thread, vbdev_lvol_resv_hub_release_msg, lvs_bdev);
+}
+
+static void
+vbdev_lvol_resv_hub_detach_msg(void *arg)
+{
+	struct vbdev_lvol_resv_hub *hub = arg;
+
+	hub->detach_pending = false;
+	vbdev_lvol_resv_hub_settle(hub);
+}
+
+/* The lvolstore is going away: its hub channel goes back once nothing is in flight,
+ * and the commands still out complete without it. */
+static void
+vbdev_lvol_resv_hub_detach(struct lvol_store_bdev *lvs_bdev)
+{
+	struct vbdev_lvol_resv_hub *hub = lvs_bdev->resv_hub;
+
+	if (hub == NULL) {
+		return;
+	}
+	lvs_bdev->resv_hub = NULL;
+	hub->lvs_bdev = NULL;
+	if (hub->thread == NULL || hub->thread == spdk_get_thread()) {
+		vbdev_lvol_resv_hub_settle(hub);
+		return;
+	}
+	hub->detach_pending = true;
+	spdk_thread_send_msg(hub->thread, vbdev_lvol_resv_hub_detach_msg, hub);
+}
+
+/* A hub command in flight, counted on its hub until it completes */
+struct vbdev_lvol_resv_hub_req {
+	struct vbdev_lvol_resv_hub	*hub;
+	spdk_bdev_io_completion_cb	cb;
+	void				*cb_arg;
+};
+
+static void
+vbdev_lvol_resv_hub_cmd_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct vbdev_lvol_resv_hub_req *req = cb_arg;
+	struct vbdev_lvol_resv_hub *hub = req->hub;
+
+	assert(hub->inflight > 0);
+	hub->inflight--;
+	req->cb(bdev_io, success, req->cb_arg);
+	free(req);
+	vbdev_lvol_resv_hub_settle(hub);
+}
+
+static int
+vbdev_lvol_resv_hub_cmd(struct lvol_store_bdev *lvs_bdev, uint8_t opc, uint16_t map_id,
+			void *buf, size_t len, spdk_bdev_io_completion_cb cb, void *cb_arg)
+{
+	struct spdk_io_channel *ch = vbdev_lvol_resv_hub_channel(lvs_bdev);
+	struct vbdev_lvol_resv_hub *hub = lvs_bdev->resv_hub;
+	struct vbdev_lvol_resv_hub_req *req;
+	struct spdk_nvme_cmd cmd = {};
+	int rc;
+
+	if (ch == NULL) {
+		return -ENOTCONN;
+	}
+	req = calloc(1, sizeof(*req));
+	if (req == NULL) {
+		return -ENOMEM;
+	}
+	req->hub = hub;
+	req->cb = cb;
+	req->cb_arg = cb_arg;
+	cmd.opc = opc;
+	cmd.cdw10 = map_id;
+	if (len > 0) {
+		cmd.cdw12 = (uint32_t)(len / 4) - 1;	/* data length in dwords, 0's based */
+	}
+	hub->inflight++;
+	rc = spdk_bdev_nvme_io_passthru(hub->desc, ch, &cmd, buf, len,
+					vbdev_lvol_resv_hub_cmd_done, req);
+	if (rc != 0) {
+		hub->inflight--;
+		free(req);
+		vbdev_lvol_resv_hub_settle(hub);
+	}
+	return rc;
+}
+
+/* The status of a finished hub command, freeing it */
+static bool
+vbdev_lvol_resv_hub_status(struct spdk_bdev_io *bdev_io, uint32_t *cdw0, uint8_t *sct, uint8_t *sc)
+{
+	int isct, isc;
+
+	spdk_bdev_io_get_nvme_status(bdev_io, cdw0, &isct, &isc);
+	spdk_bdev_free_io(bdev_io);
+	*sct = (uint8_t)isct;
+	*sc = (uint8_t)isc;
+	return isct == SPDK_NVME_SCT_GENERIC && isc == SPDK_NVME_SC_SUCCESS;
+}
+
+static bool
+vbdev_lvol_resv_lvs_known(struct lvol_store_bdev *lvs_bdev)
+{
+	struct lvol_store_bdev *it;
+
+	TAILQ_FOREACH(it, &g_spdk_lvol_pairs, lvol_stores) {
+		if (it == lvs_bdev) {
+			return true;
+		}
+	}
+	return false;
+}
+
+struct vbdev_lvol_resv_fetch {
+	struct vbdev_lvol_resv_hub	*hub;
+	spdk_blob_id		blob_id;
+	uint8_t			*buf;
+	/* Set for the fetch that follows a forwarded command */
+	struct vbdev_lvol_resv_fwd	*fwd;
+};
+
+struct vbdev_lvol_resv_fwd {
+	struct lvol_store_bdev		*lvs_bdev;
+	struct vbdev_lvol_resv_hub	*hub;	/* set once the exec is on the hub */
+	spdk_blob_id			blob_id;
+	uint16_t			map_id;
+	uint8_t				*buf;
+	struct spdk_thread		*thread;
+	vbdev_lvol_resv_forward_cb	cb_fn;
+	void				*cb_arg;
+	int				rc;
+	uint8_t				sct;
+	uint8_t				sc;
+	uint8_t				fetches;
+};
+
+static void vbdev_lvol_resv_forward_finish(struct vbdev_lvol_resv_fwd *fwd, int rc);
+static int vbdev_lvol_resv_fetch(struct lvol_store_bdev *lvs_bdev, struct spdk_lvol *lvol,
+				 struct vbdev_lvol_resv_fwd *fwd);
+
+/*
+ * After a forwarded command, the state the leader left has to be installed before the
+ * host hears the answer. A fetch that fails, or whose state cannot be installed, is
+ * asked again; a forward whose state never arrives fails.
+ */
+static void
+vbdev_lvol_resv_forward_fetched(struct vbdev_lvol_resv_fwd *fwd,
+				struct lvol_store_bdev *lvs_bdev, struct spdk_lvol *lvol,
+				bool installed)
+{
+	if (lvs_bdev == NULL) {
+		vbdev_lvol_resv_forward_finish(fwd, -ENODEV);
+	} else if (installed) {
+		vbdev_lvol_resv_forward_finish(fwd, 0);
+	} else if (lvol == NULL) {
+		vbdev_lvol_resv_forward_finish(fwd, -ENODEV);
+	} else if (++fwd->fetches >= VBDEV_LVOL_RESV_FWD_FETCHES ||
+		   vbdev_lvol_resv_fetch(lvs_bdev, lvol, fwd) != 0) {
+		SPDK_ERRLOG("The state a forwarded reservation command left could not be fetched\n");
+		vbdev_lvol_resv_forward_finish(fwd, -EIO);
+	}
+}
+
+static void
+vbdev_lvol_resv_fetch_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct vbdev_lvol_resv_fetch *f = cb_arg;
+	struct vbdev_lvol_resv_hub *hub = f->hub;
+	struct lvol_store_bdev *lvs_bdev = hub->lvs_bdev;
+	struct spdk_lvol *lvol = NULL;
+	uint32_t len;
+	uint8_t sct, sc;
+	bool ok = vbdev_lvol_resv_hub_status(bdev_io, &len, &sct, &sc);
+	bool installed = false;
+	int rc;
+
+	if (lvs_bdev != NULL) {
+		lvol = vbdev_lvol_resv_find(lvs_bdev->lvs, f->blob_id);
+	}
+	if (ok && len == 0) {
+		/* The leader holds no state for the lvol: there is nothing to enforce */
+		installed = true;
+	} else if (ok && len <= VBDEV_LVOL_HUB_RESV_FETCH_LEN && lvol != NULL &&
+		   lvol->bdev != NULL) {
+		/* An older state than the one held is not installed, and need not be; a
+		 * node that became the leader meanwhile holds the stored state itself */
+		rc = vbdev_lvol_resv_install(lvol->bdev, f->buf, len);
+		installed = rc >= 0 || rc == -EPERM;
+	}
+
+	if (f->fwd != NULL) {
+		vbdev_lvol_resv_forward_fetched(f->fwd, lvs_bdev, lvol, installed);
+	} else {
+		if (!ok) {
+			hub->fetch_failed = true;
+		}
+		assert(hub->fetch_pending > 0);
+		if (--hub->fetch_pending == 0) {
+			if (!hub->fetch_failed) {
+				hub->epoch_valid = true;
+			}
+			hub->sync_busy = false;
+			vbdev_lvol_resv_sync_round_done(hub, !hub->fetch_failed);
+		}
+	}
+	spdk_dma_free(f->buf);
+	free(f);
+}
+
+static int
+vbdev_lvol_resv_fetch(struct lvol_store_bdev *lvs_bdev, struct spdk_lvol *lvol,
+		      struct vbdev_lvol_resv_fwd *fwd)
+{
+	struct vbdev_lvol_resv_fetch *f;
+	int rc;
+
+	f = calloc(1, sizeof(*f));
+	if (f == NULL) {
+		return -ENOMEM;
+	}
+	f->buf = spdk_dma_zmalloc(VBDEV_LVOL_HUB_RESV_FETCH_LEN, 0x1000, NULL);
+	if (f->buf == NULL) {
+		free(f);
+		return -ENOMEM;
+	}
+	f->hub = vbdev_lvol_resv_hub_of(lvs_bdev);
+	if (f->hub == NULL) {
+		spdk_dma_free(f->buf);
+		free(f);
+		return -ENOMEM;
+	}
+	f->blob_id = lvol->blob_id;
+	f->fwd = fwd;
+	rc = vbdev_lvol_resv_hub_cmd(lvs_bdev, VBDEV_LVOL_HUB_OPC_RESV_FETCH, lvol->map_id, f->buf,
+				     VBDEV_LVOL_HUB_RESV_FETCH_LEN, vbdev_lvol_resv_fetch_done, f);
+	if (rc != 0) {
+		spdk_dma_free(f->buf);
+		free(f);
+	}
+	return rc;
+}
+
+static void
+vbdev_lvol_resv_epoch_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct vbdev_lvol_resv_hub *hub = cb_arg;
+	struct lvol_store_bdev *lvs_bdev = hub->lvs_bdev;
+	struct spdk_lvol *lvol;
+	uint32_t epoch;
+	uint8_t sct, sc;
+
+	if (!vbdev_lvol_resv_hub_status(bdev_io, &epoch, &sct, &sc) || lvs_bdev == NULL) {
+		hub->sync_busy = false;
+		if (lvs_bdev != NULL) {
+			vbdev_lvol_resv_sync_round_done(hub, false);
+		}
+		return;
+	}
+	if (hub->epoch_valid && epoch == hub->epoch_seen && !hub->fetch_failed) {
+		hub->sync_busy = false;
+		vbdev_lvol_resv_sync_round_done(hub, true);
+		return;
+	}
+
+	/* The leader stored a change, or this node has not fetched since it started
+	 * asking: fetch every lvol's state, keeping only what is newer */
+	hub->epoch_seen = epoch;
+	hub->epoch_valid = false;
+	hub->fetch_failed = false;
+	hub->fetch_pending = 1;	/* held until every fetch is issued */
+	TAILQ_FOREACH(lvol, &lvs_bdev->lvs->lvols, link) {
+		if (lvol->map_id == 0 || lvol->bdev == NULL || lvol->hublvol) {
+			continue;
+		}
+		hub->fetch_pending++;
+		if (vbdev_lvol_resv_fetch(lvs_bdev, lvol, NULL) != 0) {
+			hub->fetch_pending--;
+			hub->fetch_failed = true;
+		}
+	}
+	if (--hub->fetch_pending == 0) {
+		hub->epoch_valid = !hub->fetch_failed;
+		hub->sync_busy = false;
+		vbdev_lvol_resv_sync_round_done(hub, !hub->fetch_failed);
+	}
+}
+
+/* One poll of a node that is not the leader: ask the leader's epoch over the hub,
+ * and fetch the lvols' state when it changed. Runs on the lvolstore's thread. */
+static void
+vbdev_lvol_resv_sync_lvs(struct lvol_store_bdev *lvs_bdev)
+{
+	struct spdk_lvol_store *lvs = lvs_bdev->lvs;
+	struct spdk_lvol *lvol;
+	uint16_t map_id = 0;
+
+	struct vbdev_lvol_resv_hub *hub;
+
+	if (lvs == NULL || lvs->leader) {
+		return;
+	}
+	hub = vbdev_lvol_resv_hub_of(lvs_bdev);
+	if (hub == NULL || hub->sync_busy) {
+		return;
+	}
+	if (hub->skip_polls > 0) {
+		hub->skip_polls--;
+		return;
+	}
+	TAILQ_FOREACH(lvol, &lvs->lvols, link) {
+		if (lvol->map_id != 0 && !lvol->hublvol) {
+			map_id = lvol->map_id;
+			break;
+		}
+	}
+	if (map_id == 0) {
+		return;
+	}
+	hub->sync_busy = true;
+	if (vbdev_lvol_resv_hub_cmd(lvs_bdev, VBDEV_LVOL_HUB_OPC_RESV_EPOCH, map_id, NULL, 0,
+				    vbdev_lvol_resv_epoch_done, hub) != 0) {
+		hub->sync_busy = false;
+		vbdev_lvol_resv_sync_round_done(hub, false);
+	}
+}
+
+static void
+vbdev_lvol_resv_sync_msg(void *arg)
+{
+	struct lvol_store_bdev *lvs_bdev = arg;
+
+	/* The lvolstore may have been unloaded while the message was queued */
+	if (vbdev_lvol_resv_lvs_known(lvs_bdev)) {
+		vbdev_lvol_resv_sync_lvs(lvs_bdev);
+	}
+}
+
+static int
+vbdev_lvol_resv_sync_poll(void *arg)
+{
+	struct lvol_store_bdev *lvs_bdev;
+
+	if (g_resv_changed_cb == NULL) {
+		return SPDK_POLLER_IDLE;
+	}
+	TAILQ_FOREACH(lvs_bdev, &g_spdk_lvol_pairs, lvol_stores) {
+		struct vbdev_lvol_resv_hub *hub = lvs_bdev->resv_hub;
+
+		if (lvs_bdev->lvs == NULL) {
+			continue;
+		}
+		/* A channel on a hub that is gone or replaced goes back, as does one this
+		 * node kept from before it became the leader, which asks no one */
+		if (hub != NULL && hub->ch != NULL &&
+		    (lvs_bdev->lvs->leader || lvs_bdev->lvs->hub_dev.state != HUBLVOL_CONNECTED ||
+		     lvs_bdev->lvs->hub_dev.desc != hub->desc)) {
+			spdk_thread_send_msg(lvs_bdev->lvs->thread, vbdev_lvol_resv_hub_release_msg,
+					     lvs_bdev);
+			continue;
+		}
+		if (lvs_bdev->lvs->leader || (hub != NULL && hub->sync_busy) ||
+		    lvs_bdev->lvs->hub_dev.state != HUBLVOL_CONNECTED) {
+			continue;
+		}
+		spdk_thread_send_msg(lvs_bdev->lvs->thread, vbdev_lvol_resv_sync_msg, lvs_bdev);
+	}
+	return SPDK_POLLER_BUSY;
+}
+
+static void
+vbdev_lvol_resv_forward_complete(void *arg)
+{
+	struct vbdev_lvol_resv_fwd *fwd = arg;
+
+	fwd->cb_fn(fwd->cb_arg, fwd->rc, fwd->sct, fwd->sc);
+	spdk_dma_free(fwd->buf);
+	free(fwd);
+}
+
+static void
+vbdev_lvol_resv_forward_finish(struct vbdev_lvol_resv_fwd *fwd, int rc)
+{
+	fwd->rc = rc;
+	spdk_thread_send_msg(fwd->thread, vbdev_lvol_resv_forward_complete, fwd);
+}
+
+static void
+vbdev_lvol_resv_exec_sent(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct vbdev_lvol_resv_fwd *fwd = cb_arg;
+	struct spdk_lvol *lvol;
+	uint32_t cdw0;
+
+	struct lvol_store_bdev *lvs_bdev = fwd->hub->lvs_bdev;
+
+	vbdev_lvol_resv_hub_status(bdev_io, &cdw0, &fwd->sct, &fwd->sc);
+	if (lvs_bdev == NULL) {
+		vbdev_lvol_resv_forward_finish(fwd, -ENODEV);
+		return;
+	}
+	/* Whatever the leader answered, fetch the state it holds now, so this node
+	 * enforces it before the host hears the answer */
+	lvol = vbdev_lvol_resv_find(lvs_bdev->lvs, fwd->blob_id);
+	if (lvol == NULL) {
+		vbdev_lvol_resv_forward_finish(fwd, -ENODEV);
+	} else if (vbdev_lvol_resv_fetch(lvs_bdev, lvol, fwd) != 0) {
+		vbdev_lvol_resv_forward_finish(fwd, -EIO);
+	}
+}
+
+static void
+vbdev_lvol_resv_forward_msg(void *arg)
+{
+	struct vbdev_lvol_resv_fwd *fwd = arg;
+	int rc;
+
+	if (!vbdev_lvol_resv_lvs_known(fwd->lvs_bdev)) {
+		vbdev_lvol_resv_forward_finish(fwd, -ENODEV);
+		return;
+	}
+	fwd->hub = vbdev_lvol_resv_hub_of(fwd->lvs_bdev);
+	rc = vbdev_lvol_resv_hub_cmd(fwd->lvs_bdev, VBDEV_LVOL_HUB_OPC_RESV_EXEC, fwd->map_id,
+				     fwd->buf, 512, vbdev_lvol_resv_exec_sent, fwd);
+	if (rc != 0) {
+		vbdev_lvol_resv_forward_finish(fwd, rc);
+	}
+}
+
+void
+vbdev_lvol_resv_forward(struct spdk_bdev *bdev, const struct vbdev_lvol_resv_exec_msg *msg,
+			vbdev_lvol_resv_forward_cb cb_fn, void *cb_arg)
+{
+	struct spdk_lvol *lvol = vbdev_lvol_get_from_bdev(bdev);
+	struct lvol_store_bdev *lvs_bdev = lvol ? vbdev_get_lvs_bdev_by_lvs(lvol->lvol_store) : NULL;
+	struct vbdev_lvol_resv_fwd *fwd;
+
+	if (lvs_bdev == NULL || lvol->map_id == 0) {
+		cb_fn(cb_arg, -ENODEV, 0, 0);
+		return;
+	}
+	fwd = calloc(1, sizeof(*fwd));
+	if (fwd == NULL) {
+		cb_fn(cb_arg, -ENOMEM, 0, 0);
+		return;
+	}
+	fwd->buf = spdk_dma_zmalloc(512, 0x1000, NULL);
+	if (fwd->buf == NULL) {
+		free(fwd);
+		cb_fn(cb_arg, -ENOMEM, 0, 0);
+		return;
+	}
+	memcpy(fwd->buf, msg, sizeof(*msg));
+	fwd->lvs_bdev = lvs_bdev;
+	fwd->blob_id = lvol->blob_id;
+	fwd->map_id = lvol->map_id;
+	fwd->thread = spdk_get_thread();
+	fwd->cb_fn = cb_fn;
+	fwd->cb_arg = cb_arg;
+	spdk_thread_send_msg(lvol->lvol_store->thread, vbdev_lvol_resv_forward_msg, fwd);
+}
+
 static int
 vbdev_lvs_init(void)
 {
 	spdk_lvs_set_refresh_cb(vbdev_lvol_on_lvs_refresh, NULL);
+	spdk_lvs_set_hub_close_cb(vbdev_lvol_on_hub_close, NULL);
+	if (g_resv_sync_poller == NULL) {
+		g_resv_sync_poller = SPDK_POLLER_REGISTER(vbdev_lvol_resv_sync_poll, NULL,
+				     VBDEV_LVOL_RESV_SYNC_PERIOD_US);
+	}
 	return 0;
 }
 
@@ -3389,6 +4292,7 @@ static void
 vbdev_lvs_fini_start(void)
 {
 	g_shutdown_started = true;
+	spdk_poller_unregister(&g_resv_sync_poller);
 
 	vbdev_lvs_fini_start_iter(vbdev_lvol_store_first());
 }
