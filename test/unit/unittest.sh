@@ -50,6 +50,7 @@ function unittest_blob() {
 function unittest_event() {
 	$valgrind $testdir/lib/event/app.c/app_ut
 	$valgrind $testdir/lib/event/reactor.c/reactor_ut
+	$valgrind $testdir/lib/event/nvmf_lvol_resv.c/nvmf_lvol_resv_ut
 }
 
 function unittest_ftl() {
