@@ -2464,6 +2464,153 @@ ut_lvol_set_external_parent(void)
 	CU_ASSERT(g_lvolerrno == 0);
 }
 
+/*
+ * The reservation store: a recording blob xattr, a sync that succeeds, and the
+ * refresh function lib/lvol would call.
+ */
+static uint8_t g_resv_xattr[256];
+static size_t g_resv_xattr_len;
+static bool g_resv_xattr_set;
+static int g_resv_sync_calls;
+static spdk_lvs_refresh_cb g_lvs_refresh_fn;
+
+int
+spdk_blob_set_xattr(struct spdk_blob *blob, const char *name, const void *value, uint16_t value_len)
+{
+	SPDK_CU_ASSERT_FATAL(value_len <= sizeof(g_resv_xattr));
+	CU_ASSERT(strcmp(name, VBDEV_LVOL_RESV_XATTR) == 0);
+	memcpy(g_resv_xattr, value, value_len);
+	g_resv_xattr_len = value_len;
+	g_resv_xattr_set = true;
+	return 0;
+}
+
+void
+spdk_blob_sync_md(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	g_resv_sync_calls++;
+	cb_fn(cb_arg, 0);
+}
+
+int
+spdk_blob_get_xattr_value(struct spdk_blob *blob, const char *name, const void **value,
+			  size_t *value_len)
+{
+	if (!g_resv_xattr_set || strcmp(name, VBDEV_LVOL_RESV_XATTR) != 0) {
+		return -ENOENT;
+	}
+	*value = g_resv_xattr;
+	*value_len = g_resv_xattr_len;
+	return 0;
+}
+
+void
+spdk_lvs_set_refresh_cb(spdk_lvs_refresh_cb cb_fn, void *ctx)
+{
+	g_lvs_refresh_fn = cb_fn;
+}
+
+static int g_resv_put_rc;
+static int g_resv_put_calls;
+static struct spdk_bdev *g_resv_changed_bdev;
+static int g_resv_changed_calls;
+
+static void
+ut_resv_put_done(void *cb_arg, int rc)
+{
+	g_resv_put_rc = rc;
+	g_resv_put_calls++;
+}
+
+static void
+ut_resv_changed(struct spdk_bdev *bdev, void *ctx)
+{
+	g_resv_changed_bdev = bdev;
+	g_resv_changed_calls++;
+}
+
+static void
+ut_lvol_resv_store(void)
+{
+	struct spdk_lvol_store lvs = {};
+	struct spdk_lvol lvol = {};
+	struct spdk_bdev bdev = {}, other = {};
+	uint8_t out[16];
+	size_t len;
+
+	g_resv_xattr_set = false;
+	g_resv_sync_calls = 0;
+	g_resv_put_calls = 0;
+	g_resv_changed_calls = 0;
+
+	TAILQ_INIT(&lvs.lvols);
+	lvs.thread = spdk_get_thread();
+	lvol.lvol_store = &lvs;
+	lvol.blob_id = 7;
+	lvol.blob = (struct spdk_blob *)0x1;
+	lvol.bdev = &bdev;
+	TAILQ_INSERT_TAIL(&lvs.lvols, &lvol, link);
+	bdev.module = &g_lvol_if;
+	bdev.ctxt = &lvol;
+	other.module = NULL;
+
+	/* Module init hooks the refresh into lib/lvol */
+	CU_ASSERT(vbdev_lvs_init() == 0);
+	CU_ASSERT(g_lvs_refresh_fn == vbdev_lvol_on_lvs_refresh);
+
+	CU_ASSERT(vbdev_lvol_is_lvol_bdev(&bdev));
+	CU_ASSERT(!vbdev_lvol_is_lvol_bdev(&other));
+	len = sizeof(out);
+	CU_ASSERT(vbdev_lvol_resv_get(&other, out, &len) == -ENODEV);
+	len = sizeof(out);
+	CU_ASSERT(vbdev_lvol_resv_get(&bdev, out, &len) == -ENOENT);
+
+	/* A non-leader may not write the metadata */
+	lvol.leader = false;
+	vbdev_lvol_resv_put(&bdev, "state-1", 7, ut_resv_put_done, NULL);
+	poll_threads();
+	CU_ASSERT(g_resv_put_calls == 1);
+	CU_ASSERT(g_resv_put_rc == -EPERM);
+	CU_ASSERT(!g_resv_xattr_set);
+	CU_ASSERT(g_resv_sync_calls == 0);
+
+	/* The leader writes and syncs, and the copy follows */
+	lvol.leader = true;
+	vbdev_lvol_resv_put(&bdev, "state-1", 7, ut_resv_put_done, NULL);
+	poll_threads();
+	CU_ASSERT(g_resv_put_calls == 2);
+	CU_ASSERT(g_resv_put_rc == 0);
+	CU_ASSERT(g_resv_sync_calls == 1);
+	CU_ASSERT(g_resv_xattr_len == 7 && memcmp(g_resv_xattr, "state-1", 7) == 0);
+	len = sizeof(out);
+	CU_ASSERT(vbdev_lvol_resv_get(&bdev, out, &len) == 0);
+	CU_ASSERT(len == 7 && memcmp(out, "state-1", 7) == 0);
+	len = 3;
+	CU_ASSERT(vbdev_lvol_resv_get(&bdev, out, &len) == -ENOBUFS);
+	CU_ASSERT(len == 7);
+
+	/* Another node wrote; this one rereads on a refresh and says so */
+	memcpy(g_resv_xattr, "state-two", 9);
+	g_resv_xattr_len = 9;
+	vbdev_lvol_set_resv_changed_cb(ut_resv_changed, NULL);
+	g_lvs_refresh_fn(&lvs, NULL, NULL);
+	poll_threads();
+	CU_ASSERT(g_resv_changed_calls == 1);
+	CU_ASSERT(g_resv_changed_bdev == &bdev);
+	len = sizeof(out);
+	CU_ASSERT(vbdev_lvol_resv_get(&bdev, out, &len) == 0);
+	CU_ASSERT(len == 9 && memcmp(out, "state-two", 9) == 0);
+
+	/* A refresh of one lvol by its blob */
+	g_lvs_refresh_fn(&lvs, &lvol, NULL);
+	poll_threads();
+	CU_ASSERT(g_resv_changed_calls == 2);
+
+	vbdev_lvol_set_resv_changed_cb(NULL, NULL);
+	free(lvol.resv_cache);
+	lvol.resv_cache = NULL;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -2474,6 +2621,7 @@ main(int argc, char **argv)
 
 	suite = CU_add_suite("lvol", NULL, NULL);
 
+	CU_ADD_TEST(suite, ut_lvol_resv_store);
 	CU_ADD_TEST(suite, ut_lvs_init);
 	CU_ADD_TEST(suite, ut_lvol_init);
 	CU_ADD_TEST(suite, ut_lvol_snapshot);

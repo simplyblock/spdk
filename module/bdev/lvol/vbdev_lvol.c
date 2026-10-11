@@ -13,6 +13,8 @@
 #include "spdk_internal/thread.h"
 #include "vbdev_lvol.h"
 
+static void vbdev_lvol_resv_refresh(struct spdk_lvol *lvol);
+
 
 #define ID_SHIFT_AMOUNT       48                   // Number of bits to shift for ID extraction
 #define OFFSET_MASK_48_BITS   ((1ULL << ID_SHIFT_AMOUNT) - 1)  // Mask for the lower 48 bits
@@ -2389,6 +2391,8 @@ _create_lvol_disk(struct spdk_lvol *lvol, bool destroy)
 		return rc;
 	}
 	lvol->bdev = bdev;
+	/* Before any NVMe-oF namespace on this bdev loads its reservation state */
+	vbdev_lvol_resv_refresh(lvol);
 
 	alias = spdk_sprintf_alloc("%s/%s", lvs_bdev->lvs->name, lvol->name);
 	if (alias == NULL) {
@@ -3100,9 +3104,248 @@ vbdev_lvol_set_read_only(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, vo
 	spdk_lvol_set_read_only(lvol, _vbdev_lvol_set_read_only_cb, req);
 }
 
+/*
+ * NVMe-oF reservation state in the lvol's blob metadata.
+ *
+ * The leader writes it as an xattr and syncs the metadata; every node reads it on
+ * the lvolstore's thread when the lvol bdev is created and whenever the metadata
+ * may have changed under it (lib/lvol's refresh notification), and keeps a copy
+ * that vbdev_lvol_resv_get() hands out from any thread.
+ */
+#define VBDEV_LVOL_RESV_XATTR	"nvmf_resv"
+
+static pthread_mutex_t g_resv_mutex = PTHREAD_MUTEX_INITIALIZER;
+static vbdev_lvol_resv_changed_cb g_resv_changed_cb;
+static void *g_resv_changed_ctx;
+
+/* Read the xattr into the lvol's copy. Runs on the lvolstore's thread. */
+static void
+vbdev_lvol_resv_refresh(struct spdk_lvol *lvol)
+{
+	const void *value = NULL;
+	size_t len = 0;
+	void *copy = NULL;
+
+	if (lvol->blob == NULL ||
+	    spdk_blob_get_xattr_value(lvol->blob, VBDEV_LVOL_RESV_XATTR, &value, &len) != 0) {
+		len = 0;
+	} else if (len > 0) {
+		copy = malloc(len);
+		if (copy == NULL) {
+			SPDK_ERRLOG("Cannot copy the reservation state of lvol %s\n", lvol->unique_id);
+			return;
+		}
+		memcpy(copy, value, len);
+	}
+
+	pthread_mutex_lock(&g_resv_mutex);
+	free(lvol->resv_cache);
+	lvol->resv_cache = copy;
+	lvol->resv_cache_len = copy ? len : 0;
+	pthread_mutex_unlock(&g_resv_mutex);
+}
+
+struct vbdev_lvol_resv_refresh_ctx {
+	struct spdk_lvol_store	*lvs;
+	spdk_blob_id		blob_id;	/* SPDK_BLOBID_INVALID for every lvol */
+};
+
+static void
+vbdev_lvol_resv_refresh_lvol_and_notify(struct spdk_lvol *lvol)
+{
+	vbdev_lvol_resv_refresh(lvol);
+	if (g_resv_changed_cb && lvol->bdev) {
+		g_resv_changed_cb(lvol->bdev, g_resv_changed_ctx);
+	}
+}
+
+static void
+vbdev_lvol_resv_refresh_msg(void *arg)
+{
+	struct vbdev_lvol_resv_refresh_ctx *ctx = arg;
+	struct spdk_lvol *lvol;
+
+	TAILQ_FOREACH(lvol, &ctx->lvs->lvols, link) {
+		if (ctx->blob_id == SPDK_BLOBID_INVALID || lvol->blob_id == ctx->blob_id) {
+			vbdev_lvol_resv_refresh_lvol_and_notify(lvol);
+		}
+	}
+	free(ctx);
+}
+
+/* lib/lvol: this node became a leader, or reread the metadata as a non-leader */
+static void
+vbdev_lvol_on_lvs_refresh(struct spdk_lvol_store *lvs, struct spdk_lvol *lvol, void *unused)
+{
+	struct vbdev_lvol_resv_refresh_ctx *ctx;
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL) {
+		SPDK_ERRLOG("Cannot refresh the reservation state of lvolstore %s\n", lvs->name);
+		return;
+	}
+	ctx->lvs = lvs;
+	ctx->blob_id = lvol ? lvol->blob_id : SPDK_BLOBID_INVALID;
+	if (spdk_get_thread() == lvs->thread) {
+		vbdev_lvol_resv_refresh_msg(ctx);
+	} else {
+		spdk_thread_send_msg(lvs->thread, vbdev_lvol_resv_refresh_msg, ctx);
+	}
+}
+
+bool
+vbdev_lvol_is_lvol_bdev(struct spdk_bdev *bdev)
+{
+	return bdev != NULL && vbdev_lvol_get_from_bdev(bdev) != NULL;
+}
+
+int
+vbdev_lvol_resv_get(struct spdk_bdev *bdev, void *buf, size_t *len)
+{
+	struct spdk_lvol *lvol = vbdev_lvol_get_from_bdev(bdev);
+	int rc = 0;
+
+	if (lvol == NULL) {
+		return -ENODEV;
+	}
+
+	pthread_mutex_lock(&g_resv_mutex);
+	if (lvol->resv_cache == NULL) {
+		rc = -ENOENT;
+	} else if (*len < lvol->resv_cache_len) {
+		*len = lvol->resv_cache_len;
+		rc = -ENOBUFS;
+	} else {
+		memcpy(buf, lvol->resv_cache, lvol->resv_cache_len);
+		*len = lvol->resv_cache_len;
+	}
+	pthread_mutex_unlock(&g_resv_mutex);
+
+	return rc;
+}
+
+struct vbdev_lvol_resv_put_ctx {
+	struct spdk_lvol_store	*lvs;
+	spdk_blob_id		blob_id;
+	struct spdk_thread	*thread;
+	vbdev_lvol_resv_cb	cb_fn;
+	void			*cb_arg;
+	int			rc;
+	size_t			len;
+	uint8_t			buf[];
+};
+
+static void
+vbdev_lvol_resv_put_complete(void *arg)
+{
+	struct vbdev_lvol_resv_put_ctx *ctx = arg;
+
+	ctx->cb_fn(ctx->cb_arg, ctx->rc);
+	free(ctx);
+}
+
+static void
+vbdev_lvol_resv_put_finish(struct vbdev_lvol_resv_put_ctx *ctx, int rc)
+{
+	ctx->rc = rc;
+	spdk_thread_send_msg(ctx->thread, vbdev_lvol_resv_put_complete, ctx);
+}
+
+static struct spdk_lvol *
+vbdev_lvol_resv_find(struct spdk_lvol_store *lvs, spdk_blob_id blob_id)
+{
+	struct spdk_lvol *lvol;
+
+	TAILQ_FOREACH(lvol, &lvs->lvols, link) {
+		if (lvol->blob_id == blob_id) {
+			return lvol;
+		}
+	}
+	return NULL;
+}
+
+static void
+vbdev_lvol_resv_put_synced(void *arg, int rc)
+{
+	struct vbdev_lvol_resv_put_ctx *ctx = arg;
+	struct spdk_lvol *lvol = vbdev_lvol_resv_find(ctx->lvs, ctx->blob_id);
+
+	if (rc == 0 && lvol != NULL) {
+		vbdev_lvol_resv_refresh(lvol);
+	}
+	vbdev_lvol_resv_put_finish(ctx, rc);
+}
+
+static void
+vbdev_lvol_resv_put_msg(void *arg)
+{
+	struct vbdev_lvol_resv_put_ctx *ctx = arg;
+	struct spdk_lvol *lvol = vbdev_lvol_resv_find(ctx->lvs, ctx->blob_id);
+	int rc;
+
+	if (lvol == NULL || lvol->blob == NULL) {
+		vbdev_lvol_resv_put_finish(ctx, -ENODEV);
+		return;
+	}
+	/* Leadership may have moved while the message was queued */
+	if (!lvol->leader) {
+		vbdev_lvol_resv_put_finish(ctx, -EPERM);
+		return;
+	}
+	rc = spdk_blob_set_xattr(lvol->blob, VBDEV_LVOL_RESV_XATTR, ctx->buf, (uint16_t)ctx->len);
+	if (rc != 0) {
+		vbdev_lvol_resv_put_finish(ctx, rc);
+		return;
+	}
+	spdk_blob_sync_md(lvol->blob, vbdev_lvol_resv_put_synced, ctx);
+}
+
+void
+vbdev_lvol_resv_put(struct spdk_bdev *bdev, const void *buf, size_t len,
+		    vbdev_lvol_resv_cb cb_fn, void *cb_arg)
+{
+	struct spdk_lvol *lvol = vbdev_lvol_get_from_bdev(bdev);
+	struct vbdev_lvol_resv_put_ctx *ctx;
+
+	if (lvol == NULL) {
+		cb_fn(cb_arg, -ENODEV);
+		return;
+	}
+	if (!lvol->leader) {
+		cb_fn(cb_arg, -EPERM);
+		return;
+	}
+	if (len > UINT16_MAX) {
+		cb_fn(cb_arg, -EINVAL);
+		return;
+	}
+	ctx = calloc(1, sizeof(*ctx) + len);
+	if (ctx == NULL) {
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+	ctx->lvs = lvol->lvol_store;
+	ctx->blob_id = lvol->blob_id;
+	ctx->thread = spdk_get_thread();
+	ctx->cb_fn = cb_fn;
+	ctx->cb_arg = cb_arg;
+	ctx->len = len;
+	memcpy(ctx->buf, buf, len);
+
+	spdk_thread_send_msg(lvol->lvol_store->thread, vbdev_lvol_resv_put_msg, ctx);
+}
+
+void
+vbdev_lvol_set_resv_changed_cb(vbdev_lvol_resv_changed_cb cb_fn, void *ctx)
+{
+	g_resv_changed_cb = cb_fn;
+	g_resv_changed_ctx = ctx;
+}
+
 static int
 vbdev_lvs_init(void)
 {
+	spdk_lvs_set_refresh_cb(vbdev_lvol_on_lvs_refresh, NULL);
 	return 0;
 }
 

@@ -15,6 +15,8 @@
 #include "spdk_internal/thread.h"
 #include "spdk/nvmf.h"
 
+static void lvs_notify_refresh(struct spdk_lvol_store *lvs, struct spdk_lvol *lvol);
+
 /* Default blob channel opts for lvol */
 #define SPDK_LVOL_BLOB_OPTS_CHANNEL_OPS 12000
 #define SPDK_LVOL_TRANSFER_TERMINATE_TIMEOUT 12 // 12 seconds timeout for final step of transfer
@@ -188,6 +190,7 @@ lvol_alloc(struct spdk_lvol_store *lvs, const char *name, bool thin_provision,
 static void
 lvol_free(struct spdk_lvol *lvol)
 {
+	free(lvol->resv_cache);
 	free(lvol);
 }
 
@@ -2854,6 +2857,10 @@ lvs_update_live_cb(void *cb_arg, int lvolerrno)
 {
 	struct spdk_lvs_req *req = (struct spdk_lvs_req *)cb_arg;
 
+	if (lvolerrno == 0) {
+		/* The non-leader reread the metadata the leader wrote */
+		lvs_notify_refresh(req->lvol_store, NULL);
+	}
 	if (req->cb_fn) {
 		req->cb_fn(req->cb_arg, lvolerrno);
 	}
@@ -8289,6 +8296,26 @@ spdk_lvs_check_active_process(struct spdk_lvol_store *lvs, struct spdk_lvol *lvo
 	return;
 }
 
+static spdk_lvs_refresh_cb g_lvs_refresh_cb;
+static void *g_lvs_refresh_ctx;
+
+void
+spdk_lvs_set_refresh_cb(spdk_lvs_refresh_cb cb_fn, void *ctx)
+{
+	g_lvs_refresh_cb = cb_fn;
+	g_lvs_refresh_ctx = ctx;
+}
+
+static void
+lvs_notify_refresh(struct spdk_lvol_store *lvs, struct spdk_lvol *lvol)
+{
+	spdk_lvs_refresh_cb cb_fn = g_lvs_refresh_cb;
+
+	if (cb_fn) {
+		cb_fn(lvs, lvol, g_lvs_refresh_ctx);
+	}
+}
+
 void
 spdk_lvs_set_leader(struct spdk_lvol_store *lvs, bool leader)
 {
@@ -8321,6 +8348,7 @@ spdk_lvol_set_leader(struct spdk_lvol *lvol)
 	lvol->failed_on_update = false;
 	lvol->update_in_progress = false;
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
+	lvs_notify_refresh(lvol->lvol_store, lvol);
 }
 
 void
@@ -8384,6 +8412,10 @@ spdk_lvol_set_leader_cpl(void *cb_arg, int lvolerrno)
 
 	if (ana_restore_port) {
 		lvs_ha_ana_request((uint16_t)ana_restore_port, false);
+	}
+
+	if (lvs_leader) {
+		lvs_notify_refresh(lvs, NULL);
 	}
 
 	if (tmp_lvs) {

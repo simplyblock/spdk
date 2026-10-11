@@ -153,6 +153,41 @@ struct lvol_store_bdev *vbdev_get_lvs_bdev_by_lvs(struct spdk_lvol_store *lvs);
 
 struct spdk_lvol *vbdev_lvol_get_from_bdev(struct spdk_bdev *bdev);
 
+/*
+ * NVMe-oF reservation state kept with the lvol, in its blob's metadata on the shared
+ * lvolstore, so every node serving the lvol sees the same state. The bytes are the
+ * NVMe-oF target's encoding; this module stores them and does not read them.
+ */
+
+/* Callback of vbdev_lvol_resv_put(). */
+typedef void (*vbdev_lvol_resv_cb)(void *cb_arg, int rc);
+
+/* Called, on the lvolstore's thread, when an lvol bdev's stored reservation state
+ * may have changed under this node. */
+typedef void (*vbdev_lvol_resv_changed_cb)(struct spdk_bdev *bdev, void *ctx);
+
+/* Whether the bdev is an lvol, and so can keep reservation state. */
+bool vbdev_lvol_is_lvol_bdev(struct spdk_bdev *bdev);
+
+/*
+ * Copy the reservation state last read or written into buf.
+ * Returns 0, -ENODEV if bdev is not an lvol, -ENOENT if none is stored, or
+ * -ENOBUFS if *len is too small; *len is set to the stored length on success and
+ * on -ENOBUFS.
+ */
+int vbdev_lvol_resv_get(struct spdk_bdev *bdev, void *buf, size_t *len);
+
+/*
+ * Store reservation state in the lvol's blob metadata. Only the lvol's leader
+ * writes the metadata, so on any other node this fails with -EPERM. cb_fn is
+ * called on the calling thread once the metadata is synced, or on failure.
+ */
+void vbdev_lvol_resv_put(struct spdk_bdev *bdev, const void *buf, size_t len,
+			 vbdev_lvol_resv_cb cb_fn, void *cb_arg);
+
+/* Set the function told when stored reservation state may have changed. */
+void vbdev_lvol_set_resv_changed_cb(vbdev_lvol_resv_changed_cb cb_fn, void *ctx);
+
 int vbdev_lvol_esnap_dev_create(void *bs_ctx, void *blob_ctx, struct spdk_blob *blob,
 				const void *esnap_id, uint32_t id_len,
 				struct spdk_bs_dev **_bs_dev);
