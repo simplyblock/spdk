@@ -4479,12 +4479,28 @@ spdk_lvs_IO_hublvol(void *cb_arg)
 	return 0;
 }
 
+static spdk_lvs_hub_close_cb g_lvs_hub_close_cb;
+static void *g_lvs_hub_close_ctx;
+
+void
+spdk_lvs_set_hub_close_cb(spdk_lvs_hub_close_cb cb_fn, void *ctx)
+{
+	g_lvs_hub_close_cb = cb_fn;
+	g_lvs_hub_close_ctx = ctx;
+}
+
 static void
 spdk_delayed_close_hub_bdev(void *arg)
 {
 	struct spdk_lvol_store *lvs = arg;
 	struct spdk_hublvol_channels *hublvol_ch, *tmp;
+	spdk_lvs_hub_close_cb close_cb = g_lvs_hub_close_cb;
+
 	if (lvs->hub_dev.desc) {
+		/* Channels held outside this library on the descriptor go back first */
+		if (close_cb) {
+			close_cb(lvs, g_lvs_hub_close_ctx);
+		}
 		spdk_bdev_close(lvs->hub_dev.desc);
 		lvs->hub_dev.desc = NULL;
 	}

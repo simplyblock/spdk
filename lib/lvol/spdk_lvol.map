@@ -4,6 +4,7 @@
 	# public functions
 	spdk_lvs_opts_init;
 	spdk_lvs_set_refresh_cb;
+	spdk_lvs_set_hub_close_cb;
 	spdk_lvs_init;
 	spdk_lvs_rename;
 	spdk_lvs_unload;

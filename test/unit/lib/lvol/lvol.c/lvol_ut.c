@@ -4607,6 +4607,39 @@ ut_lvs_refresh(struct spdk_lvol_store *lvs, struct spdk_lvol *lvol, void *ctx)
 	g_refresh_ctx = ctx;
 }
 
+static int g_hub_close_calls;
+static bool g_hub_close_saw_desc;
+
+static void
+ut_hub_close(struct spdk_lvol_store *lvs, void *ctx)
+{
+	g_hub_close_calls++;
+	g_hub_close_saw_desc = lvs->hub_dev.desc != NULL;
+}
+
+/* Whoever holds a channel on the hub descriptor is told before the descriptor closes,
+ * so the hub's NVMe path can be deleted; a store without a hub descriptor tells nobody */
+static void
+lvs_hub_close_notification(void)
+{
+	struct spdk_lvol_store lvs = {};
+
+	TAILQ_INIT(&lvs.hublvol_channels);
+	lvs.node_role = NODE_PRIMARY;	/* no reopen after the close */
+	lvs.hub_dev.desc = (struct spdk_bdev_desc *)0x2;
+	spdk_lvs_set_hub_close_cb(ut_hub_close, NULL);
+
+	spdk_delayed_close_hub_bdev(&lvs);
+	CU_ASSERT(g_hub_close_calls == 1);
+	CU_ASSERT(g_hub_close_saw_desc);
+	CU_ASSERT(lvs.hub_dev.desc == NULL);
+
+	spdk_delayed_close_hub_bdev(&lvs);
+	CU_ASSERT(g_hub_close_calls == 1);
+
+	spdk_lvs_set_hub_close_cb(NULL, NULL);
+}
+
 static void
 lvs_refresh_notification(void)
 {
@@ -4692,6 +4725,7 @@ main(int argc, char **argv)
 	suite = CU_add_suite("lvol", NULL, NULL);
 
 	CU_ADD_TEST(suite, lvs_refresh_notification);
+	CU_ADD_TEST(suite, lvs_hub_close_notification);
 	CU_ADD_TEST(suite, lvs_init_unload_success);
 	CU_ADD_TEST(suite, lvs_init_destroy_success);
 	CU_ADD_TEST(suite, lvs_init_opts_success);
