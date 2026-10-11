@@ -1542,7 +1542,7 @@ void spdk_nvmf_poll_group_dump_stat(struct spdk_nvmf_poll_group *group,
 void spdk_nvmf_rdma_init_hooks(struct spdk_nvme_rdma_hooks *hooks);
 
 /* Maximum number of registrants supported per namespace */
-#define SPDK_NVMF_MAX_NUM_REGISTRANTS		16
+#define SPDK_NVMF_MAX_NUM_REGISTRANTS		64
 
 struct spdk_nvmf_registrant_info {
 	uint64_t		rkey;

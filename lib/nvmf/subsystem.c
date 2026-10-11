@@ -2823,22 +2823,71 @@ nvmf_ns_reservation_restore(struct spdk_nvmf_ns *ns, struct spdk_nvmf_reservatio
 	return 0;
 }
 
+/*
+ * The JSON writer flushes its 4 KiB buffer as it fills, so one document can arrive
+ * in several calls. It is collected here and written to the file once, whole.
+ */
+struct nvmf_ns_json_buf {
+	char	*data;
+	size_t	len;
+	size_t	cap;
+};
+
 static int
 nvmf_ns_json_write_cb(void *cb_ctx, const void *data, size_t size)
 {
-	char *file = cb_ctx;
-	size_t rc;
-	FILE *fd;
+	struct nvmf_ns_json_buf *buf = cb_ctx;
+	char *grown;
+	size_t cap;
 
-	fd = fopen(file, "w");
+	if (buf->len + size > buf->cap) {
+		cap = spdk_max(buf->cap * 2, buf->len + size);
+		grown = realloc(buf->data, cap);
+		if (!grown) {
+			return -ENOMEM;
+		}
+		buf->data = grown;
+		buf->cap = cap;
+	}
+	memcpy(buf->data + buf->len, data, size);
+	buf->len += size;
+
+	return 0;
+}
+
+/* Replace the file with the document through a temporary file and a rename, so a
+ * crash mid-write leaves either the old reservation state or the new one. */
+static int
+nvmf_ns_json_write_file(const char *file, const struct nvmf_ns_json_buf *buf)
+{
+	char tmp[PATH_MAX];
+	FILE *fd;
+	int rc = 0;
+
+	if (snprintf(tmp, sizeof(tmp), "%s.tmp", file) >= (int)sizeof(tmp)) {
+		return -ENAMETOOLONG;
+	}
+	fd = fopen(tmp, "w");
 	if (!fd) {
-		SPDK_ERRLOG("Can't open file %s for write\n", file);
+		SPDK_ERRLOG("Can't open file %s for write\n", tmp);
 		return -ENOENT;
 	}
-	rc = fwrite(data, 1, size, fd);
+	if (buf->len && fwrite(buf->data, 1, buf->len, fd) != buf->len) {
+		rc = -EIO;
+	}
+	if (rc == 0 && (fflush(fd) != 0 || fsync(fileno(fd)) != 0)) {
+		rc = -errno;
+	}
 	fclose(fd);
+	if (rc == 0 && rename(tmp, file) != 0) {
+		rc = -errno;
+	}
+	if (rc != 0) {
+		SPDK_ERRLOG("Can't write reservation file %s: %d\n", file, rc);
+		unlink(tmp);
+	}
 
-	return rc == size ? 0 : -1;
+	return rc;
 }
 
 static int
@@ -2846,11 +2895,12 @@ nvmf_ns_reservation_update_json(const struct spdk_nvmf_ns *ns,
 				const struct spdk_nvmf_reservation_info *info)
 {
 	const char *file = ns->ptpl_file;
+	struct nvmf_ns_json_buf buf = { 0 };
 	struct spdk_json_write_ctx *w;
 	uint32_t i;
 	int rc = 0;
 
-	w = spdk_json_write_begin(nvmf_ns_json_write_cb, (void *)file, 0);
+	w = spdk_json_write_begin(nvmf_ns_json_write_cb, &buf, 0);
 	if (w == NULL) {
 		return -ENOMEM;
 	}
@@ -2878,6 +2928,10 @@ nvmf_ns_reservation_update_json(const struct spdk_nvmf_ns *ns,
 
 exit:
 	rc = spdk_json_write_end(w);
+	if (rc == 0) {
+		rc = nvmf_ns_json_write_file(file, &buf);
+	}
+	free(buf.data);
 	return rc;
 }
 
@@ -3044,6 +3098,16 @@ nvmf_ns_reservation_add_registrant(struct spdk_nvmf_ns *ns,
 				   uint64_t nrkey)
 {
 	struct spdk_nvmf_registrant *reg;
+	uint32_t count = 0;
+
+	TAILQ_FOREACH(reg, &ns->registrants, link) {
+		count++;
+	}
+	if (count >= SPDK_NVMF_MAX_NUM_REGISTRANTS) {
+		SPDK_ERRLOG("Namespace %u already has the maximum of %u registrants, host %s not "
+			    "registered\n", ns->nsid, SPDK_NVMF_MAX_NUM_REGISTRANTS, ctrlr->hostnqn);
+		return -ENOSPC;
+	}
 
 	reg = calloc(1, sizeof(*reg));
 	if (!reg) {
@@ -3212,6 +3276,16 @@ nvmf_ns_reservation_register(struct spdk_nvmf_ns *ns,
 
 	/* current Host Identifier has registrant or not */
 	reg = nvmf_ns_reservation_get_registrant(ns, &ctrlr->hostid);
+
+	/*
+	 * The Linux host releases its key with Replace and a new key of zero, the
+	 * SCSI convention its persistent reservation API follows. For a registered
+	 * host that is an unregistration, checked like Unregister; an unregistered
+	 * host still cannot register a zero key.
+	 */
+	if (rrega == SPDK_NVME_RESERVE_REPLACE_KEY && key.nrkey == 0 && reg != NULL) {
+		rrega = SPDK_NVME_RESERVE_UNREGISTER_KEY;
+	}
 
 	switch (rrega) {
 	case SPDK_NVME_RESERVE_REGISTER_KEY:

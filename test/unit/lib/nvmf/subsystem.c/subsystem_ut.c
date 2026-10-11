@@ -41,9 +41,15 @@ DEFINE_STUB_V(spdk_nvmf_send_discovery_log_notice,
 	      (struct spdk_nvmf_tgt *tgt, const char *hostnqn));
 DEFINE_STUB(spdk_nvmf_qpair_disconnect, int, (struct spdk_nvmf_qpair *qpair), 0);
 
-DEFINE_STUB(spdk_nvmf_request_complete,
-	    int,
-	    (struct spdk_nvmf_request *req), 0);
+/* Counted, so a test can tell whether a request has completed yet. */
+static uint32_t g_request_complete_count;
+
+int
+spdk_nvmf_request_complete(struct spdk_nvmf_request *req)
+{
+	g_request_complete_count++;
+	return 0;
+}
 
 DEFINE_STUB(nvmf_ctrlr_async_event_ana_change_notice,
 	    int,
@@ -1204,6 +1210,150 @@ test_reservation_acquire_preempt_1(void)
 	ut_reservation_deinit();
 }
 
+/*
+ * The Linux host releases its key with Register action Replace and a new key of
+ * zero (nvme_pr_register(bdev, key, 0)). Treated as Invalid Field, no client ever
+ * left the registrant table. A registered host's Replace with a zero key
+ * unregisters it, as Unregister does.
+ */
+static void
+test_reservation_replace_with_zero_key_unregisters(void)
+{
+	struct spdk_nvmf_request *req;
+	struct spdk_nvme_cpl *rsp;
+	struct spdk_nvmf_registrant *reg;
+
+	ut_reservation_init();
+
+	req = ut_reservation_build_req(16);
+	rsp = &req->rsp->nvme_cpl;
+	SPDK_CU_ASSERT_FATAL(req != NULL);
+
+	ut_reservation_build_registrants();
+
+	/* Host A holds a registrants-only reservation; B and C are registered. */
+	ut_reservation_build_acquire_request(req, SPDK_NVME_RESERVE_ACQUIRE, 0,
+					     SPDK_NVME_RESERVE_EXCLUSIVE_ACCESS_REG_ONLY, 0xa1, 0x0);
+	nvmf_ns_reservation_acquire(&g_ns, &g_ctrlr1_A, req);
+	SPDK_CU_ASSERT_FATAL(rsp->status.sc == SPDK_NVME_SC_SUCCESS);
+
+	/* TEST CASE: B replaces its key with zero and is unregistered. */
+	ut_reservation_build_register_request(req, SPDK_NVME_RESERVE_REPLACE_KEY,
+					      0, 0, 0xb1, 0);
+	nvmf_ns_reservation_register(&g_ns, &g_ctrlr_B, req);
+	CU_ASSERT(rsp->status.sc == SPDK_NVME_SC_SUCCESS);
+	reg = nvmf_ns_reservation_get_registrant(&g_ns, &g_ctrlr_B.hostid);
+	CU_ASSERT(reg == NULL);
+
+	/* TEST CASE: C, with the wrong current key and IEKEY clear, is refused. */
+	ut_reservation_build_register_request(req, SPDK_NVME_RESERVE_REPLACE_KEY,
+					      0, 0, 0xff, 0);
+	nvmf_ns_reservation_register(&g_ns, &g_ctrlr_C, req);
+	CU_ASSERT(rsp->status.sc == SPDK_NVME_SC_RESERVATION_CONFLICT);
+	reg = nvmf_ns_reservation_get_registrant(&g_ns, &g_ctrlr_C.hostid);
+	CU_ASSERT(reg != NULL);
+
+	/* TEST CASE: C, with IEKEY set, is unregistered whatever its current key. */
+	ut_reservation_build_register_request(req, SPDK_NVME_RESERVE_REPLACE_KEY,
+					      1, 0, 0xff, 0);
+	nvmf_ns_reservation_register(&g_ns, &g_ctrlr_C, req);
+	CU_ASSERT(rsp->status.sc == SPDK_NVME_SC_SUCCESS);
+	reg = nvmf_ns_reservation_get_registrant(&g_ns, &g_ctrlr_C.hostid);
+	CU_ASSERT(reg == NULL);
+
+	/* TEST CASE: B, no longer registered, cannot register a zero key. */
+	ut_reservation_build_register_request(req, SPDK_NVME_RESERVE_REPLACE_KEY,
+					      1, 0, 0, 0);
+	nvmf_ns_reservation_register(&g_ns, &g_ctrlr_B, req);
+	CU_ASSERT(rsp->status.sc == SPDK_NVME_SC_INVALID_FIELD);
+	reg = nvmf_ns_reservation_get_registrant(&g_ns, &g_ctrlr_B.hostid);
+	CU_ASSERT(reg == NULL);
+
+	/* TEST CASE: the holder, A, releases its key the same way, and the
+	 * reservation goes with its last registration. */
+	ut_reservation_build_register_request(req, SPDK_NVME_RESERVE_REPLACE_KEY,
+					      0, 0, 0xa1, 0);
+	nvmf_ns_reservation_register(&g_ns, &g_ctrlr1_A, req);
+	CU_ASSERT(rsp->status.sc == SPDK_NVME_SC_SUCCESS);
+	reg = nvmf_ns_reservation_get_registrant(&g_ns, &g_ctrlr1_A.hostid);
+	CU_ASSERT(reg == NULL);
+	CU_ASSERT(g_ns.holder == NULL);
+	CU_ASSERT(g_ns.rtype == 0);
+
+	ut_reservation_free_req(req);
+	ut_reservation_deinit();
+}
+
+/*
+ * Every node that opens a pNFS volume registers on its namespace, so sixteen
+ * registrants capped an RWX volume at about fourteen nodes. The limit is also
+ * enforced: a registration past it fails, rather than being accepted and then
+ * overflowing the fixed-size arrays the table is copied into.
+ */
+static void
+test_reservation_registrant_limit(void)
+{
+	struct spdk_nvmf_request *req;
+	struct spdk_nvme_cpl *rsp;
+	struct spdk_nvmf_ctrlr *ctrlrs;
+	struct spdk_nvmf_reservation_info info;
+	struct spdk_nvmf_registrant *reg;
+	uint32_t i, count;
+	int rc;
+
+	CU_ASSERT(SPDK_NVMF_MAX_NUM_REGISTRANTS >= 64);
+
+	ut_reservation_init();
+	req = ut_reservation_build_req(16);
+	rsp = &req->rsp->nvme_cpl;
+
+	ctrlrs = calloc(SPDK_NVMF_MAX_NUM_REGISTRANTS + 1, sizeof(*ctrlrs));
+	SPDK_CU_ASSERT_FATAL(ctrlrs != NULL);
+	for (i = 0; i <= SPDK_NVMF_MAX_NUM_REGISTRANTS; i++) {
+		spdk_uuid_generate(&ctrlrs[i].hostid);
+		TAILQ_INIT(&ctrlrs[i].log_head);
+		ctrlrs[i].subsys = &g_subsystem;
+	}
+
+	for (i = 0; i < SPDK_NVMF_MAX_NUM_REGISTRANTS; i++) {
+		ut_reservation_build_register_request(req, SPDK_NVME_RESERVE_REGISTER_KEY,
+						      0, 0, 0, 0x1000 + i);
+		nvmf_ns_reservation_register(&g_ns, &ctrlrs[i], req);
+		SPDK_CU_ASSERT_FATAL(rsp->status.sc == SPDK_NVME_SC_SUCCESS);
+	}
+
+	/* TEST CASE: one past the limit is refused, and the table is unchanged. */
+	ut_reservation_build_register_request(req, SPDK_NVME_RESERVE_REGISTER_KEY,
+					      0, 0, 0, 0x2000);
+	nvmf_ns_reservation_register(&g_ns, &ctrlrs[SPDK_NVMF_MAX_NUM_REGISTRANTS], req);
+	SPDK_CU_ASSERT_FATAL(rsp->status.sc != SPDK_NVME_SC_SUCCESS);
+	reg = nvmf_ns_reservation_get_registrant(&g_ns,
+			&ctrlrs[SPDK_NVMF_MAX_NUM_REGISTRANTS].hostid);
+	CU_ASSERT(reg == NULL);
+	count = 0;
+	TAILQ_FOREACH(reg, &g_ns.registrants, link) {
+		count++;
+	}
+	CU_ASSERT(count == SPDK_NVMF_MAX_NUM_REGISTRANTS);
+
+	/* TEST CASE: a full table persists and loads back whole. */
+	g_ns.ptpl_file = "/tmp/Ns1PR-limit.cfg";
+	g_ns.ptpl_activated = true;
+	rc = nvmf_ns_update_reservation_info(&g_ns);
+	CU_ASSERT(rc == 0);
+	memset(&info, 0, sizeof(info));
+	rc = nvmf_ns_reservation_load(&g_ns, &info);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(info.num_regs == SPDK_NVMF_MAX_NUM_REGISTRANTS);
+	unlink(g_ns.ptpl_file);
+	g_ns.ptpl_file = NULL;
+	g_ns.ptpl_activated = false;
+
+	free(ctrlrs);
+	ut_reservation_free_req(req);
+	ut_reservation_deinit();
+}
+
 static void
 test_reservation_acquire_release_with_ptpl(void)
 {
@@ -2243,6 +2393,8 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_reservation_release_notification_write_exclusive);
 	CU_ADD_TEST(suite, test_reservation_clear_notification);
 	CU_ADD_TEST(suite, test_reservation_preempt_notification);
+	CU_ADD_TEST(suite, test_reservation_replace_with_zero_key_unregisters);
+	CU_ADD_TEST(suite, test_reservation_registrant_limit);
 	CU_ADD_TEST(suite, test_spdk_nvmf_ns_event);
 	CU_ADD_TEST(suite, test_nvmf_ns_reservation_add_remove_registrant);
 	CU_ADD_TEST(suite, test_nvmf_subsystem_add_ctrlr);
