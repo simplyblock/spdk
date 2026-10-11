@@ -1575,6 +1575,22 @@ bdev_nvme_check_retry_io(struct nvme_bdev_io *bio,
 	return true;
 }
 
+/* The NVMe base specification reserves I/O opcodes 80h to FFh for vendor-specific commands */
+#define BDEV_NVME_VENDOR_IO_OPC_FIRST	0x80
+
+static inline bool
+bdev_nvme_io_is_vendor_passthru(struct spdk_bdev_io *bdev_io)
+{
+	switch (bdev_io->type) {
+	case SPDK_BDEV_IO_TYPE_NVME_IO:
+	case SPDK_BDEV_IO_TYPE_NVME_IO_MD:
+	case SPDK_BDEV_IO_TYPE_NVME_IOV_MD:
+		return bdev_io->u.nvme_passthru.cmd.opc >= BDEV_NVME_VENDOR_IO_OPC_FIRST;
+	default:
+		return false;
+	}
+}
+
 static inline void
 bdev_nvme_io_complete_nvme_status(struct nvme_bdev_io *bio,
 				  const struct spdk_nvme_cpl *cpl)
@@ -1604,6 +1620,13 @@ bdev_nvme_io_complete_nvme_status(struct nvme_bdev_io *bio,
 	if (cpl->status.dnr != 0 || spdk_nvme_cpl_is_aborted_by_request(cpl) ||
 	    (g_opts.bdev_retry_count != -1 && bio->retry_count >= g_opts.bdev_retry_count)) {
 		SPDK_NOTICELOG("MPDBG io_complete bio=%p GATE1 fail-up (dnr/aborted_by_req/retry_exhausted)\n", bio);
+		goto complete;
+	}
+
+	/* A vendor-specific I/O passthru command is its caller's: what a failure means and
+	 * whether running it again is safe are not this layer's to decide, so it is failed
+	 * up rather than retried. */
+	if (bdev_nvme_io_is_vendor_passthru(bdev_io)) {
 		goto complete;
 	}
 
