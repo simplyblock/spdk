@@ -160,9 +160,9 @@ struct spdk_blob {
 	TAILQ_HEAD(, spdk_blob_persist_ctx) pending_persists;
 	TAILQ_HEAD(, spdk_blob_persist_ctx) persists_to_complete;
 
-	/* Extent pages of this blob with a cluster insert in progress. Only one
-	 * insert per extent page runs at a time, so two inserts never write the
-	 * same extent page together. Used only on the md thread. */
+	/* Extent pages of this blob with cluster inserts in progress. Only one
+	 * write per extent page is in flight, so two writes never race on the
+	 * same extent page. Used only on the md thread. */
 	RB_HEAD(blob_ep_insert_tree, blob_ep_insert) ep_inserts;
 
 	/* Number of data clusters retrieved from extent table,
@@ -296,6 +296,9 @@ struct spdk_bs_channel {
 
 	/* User ops waiting for a free cluster allocation slot. */
 	TAILQ_HEAD(, spdk_bs_request_set) need_cluster_alloc;
+	uint32_t			num_need_cluster_alloc;
+	uint32_t			max_need_cluster_alloc;	/* since the queue was last empty */
+	uint64_t			need_cluster_alloc_tsc;	/* when the queue became non-empty */
 	TAILQ_HEAD(, spdk_bs_request_set) queued_io;
 
 	RB_HEAD(blob_esnap_channel_tree, blob_esnap_channel) esnap_channels;
