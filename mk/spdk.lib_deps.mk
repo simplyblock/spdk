@@ -187,7 +187,7 @@ ifeq ($(CONFIG_UBLK),y)
 DEPDIRS-event_ublk := init ublk event_bdev
 endif
 DEPDIRS-event_nvmf := init nvme nvmf event_bdev event_scheduler event_sock event_keyring \
-		      thread log bdev util $(JSON_LIBS)
+		      thread log bdev util bdev_lvol $(JSON_LIBS)
 DEPDIRS-event_scsi := init scsi event_bdev
 
 DEPDIRS-event_iscsi := init iscsi event_scheduler event_scsi event_sock

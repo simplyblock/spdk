@@ -517,6 +517,7 @@ nvmf_tgt_advance_state(void)
 			spdk_nvmf_tgt_destroy(g_spdk_nvmf_tgt, nvmf_tgt_destroy_done, NULL);
 			break;
 		case NVMF_TGT_STOPPED:
+			nvmf_lvol_resv_fini();
 			spdk_subsystem_fini_next();
 			return;
 		case NVMF_TGT_ERROR:
@@ -530,6 +531,8 @@ nvmf_tgt_advance_state(void)
 static void
 nvmf_subsystem_init(void)
 {
+	/* Before the first namespace is added, which loads its reservation state */
+	nvmf_lvol_resv_init();
 	g_tgt_state = NVMF_TGT_INIT_NONE;
 	nvmf_tgt_advance_state();
 }

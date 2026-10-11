@@ -30,4 +30,8 @@ extern struct spdk_nvmf_tgt *g_spdk_nvmf_tgt;
 
 extern struct spdk_cpuset *g_poll_groups_mask;
 
+/* Keep lvol namespaces' reservation state in the lvol (nvmf_lvol_resv.c) */
+void nvmf_lvol_resv_init(void);
+void nvmf_lvol_resv_fini(void);
+
 #endif
