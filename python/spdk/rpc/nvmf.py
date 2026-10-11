@@ -571,6 +571,26 @@ def nvmf_subsystem_remove_ns(client, nqn, nsid, tgt_name=None):
     return client.call('nvmf_subsystem_remove_ns', params)
 
 
+def nvmf_ns_reload_reservation(client, nqn, nsid, tgt_name=None):
+    """Reload a namespace's reservation state from its store.
+
+    Args:
+        nqn: Subsystem NQN.
+        nsid: Namespace ID.
+        tgt_name: name of the parent NVMe-oF target (optional).
+
+    Returns:
+        True or False
+    """
+    params = {'nqn': nqn,
+              'nsid': nsid}
+
+    if tgt_name:
+        params['tgt_name'] = tgt_name
+
+    return client.call('nvmf_ns_reload_reservation', params)
+
+
 def nvmf_ns_visible(visible, client, nqn, nsid, host, tgt_name=None):
     """Set visibility of namespace for a host's controllers
 

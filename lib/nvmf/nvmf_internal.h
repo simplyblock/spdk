@@ -203,6 +203,8 @@ struct spdk_nvmf_ns {
 	/* current reservation holder, only valid if reservation type can only have one holder */
 	struct spdk_nvmf_registrant *holder;
 	struct spdk_nvmf_reservation_preempt_abort_info *preempt_abort;
+	/* Reloads waiting for the reservation commands queued on this namespace */
+	struct nvmf_ns_reservation_reload *reservation_reloads;
 	/* Persist Through Power Loss file which contains the persistent reservation */
 	char *ptpl_file;
 	/* Persist Through Power Loss feature is enabled */

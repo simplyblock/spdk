@@ -1560,6 +1560,14 @@ struct spdk_nvmf_reservation_info {
 	struct spdk_nvmf_registrant_info	registrants[SPDK_NVMF_MAX_NUM_REGISTRANTS];
 };
 
+/**
+ * Completion of an asynchronous reservation update.
+ *
+ * \param cb_arg Argument passed to the update.
+ * \param rc 0 once the new state is durable, negated errno on failure.
+ */
+typedef void (*spdk_nvmf_ns_reservation_update_cb)(void *cb_arg, int rc);
+
 struct spdk_nvmf_ns_reservation_ops {
 	/* Checks if the namespace supports the Persist Through Power Loss capability. */
 	bool (*is_ptpl_capable)(const struct spdk_nvmf_ns *ns);
@@ -1573,7 +1581,84 @@ struct spdk_nvmf_ns_reservation_ops {
 	 * The new reservation information is returned via the info parameter.
 	 * Returns 0 on success, negated errno on failure. */
 	int (*load)(const struct spdk_nvmf_ns *ns, struct spdk_nvmf_reservation_info *info);
+
+	/* Optional. Stores the new reservation information asynchronously and is used
+	 * instead of update when set. It is called on the subsystem's thread and must
+	 * call cb_fn on that thread. The reservation command completes, and the poll
+	 * groups see the new state, only after cb_fn reports success. On failure the
+	 * namespace's reservation state is rolled back to what it was before the
+	 * command, and the command fails with Internal Device Error. */
+	void (*update_async)(const struct spdk_nvmf_ns *ns,
+			     const struct spdk_nvmf_reservation_info *info,
+			     spdk_nvmf_ns_reservation_update_cb cb_fn, void *cb_arg);
+
+	/* Optional. True when the namespace's reservation state is shared with other
+	 * targets serving the same storage. Every change is then stored, not only
+	 * those Persist Through Power Loss covers, and load replaces the namespace's
+	 * state with whatever it returns. */
+	bool (*is_shared)(const struct spdk_nvmf_ns *ns);
 };
+
+/**
+ * The reservation operations the target uses when none are set: the JSON file
+ * named by the namespace's ptpl_file.
+ */
+const struct spdk_nvmf_ns_reservation_ops *spdk_nvmf_get_default_ns_reservation_ops(void);
+
+/**
+ * Completion of a reservation reload.
+ *
+ * \param cb_arg Argument passed to spdk_nvmf_ns_reload_reservation().
+ * \param rc 0 on success, negated errno on failure.
+ */
+typedef void (*spdk_nvmf_ns_reservation_reload_cb)(void *cb_arg, int rc);
+
+/**
+ * Replace a live namespace's reservation state with what the reservation
+ * operations' load returns, and update the poll groups.
+ *
+ * The reload runs on the subsystem's thread after every reservation command
+ * already queued on the namespace has completed. cb_fn is called on the thread
+ * that called this function.
+ *
+ * \param subsystem The subsystem.
+ * \param nsid The namespace.
+ * \param cb_fn Called when the reload is done.
+ * \param cb_arg Argument passed to cb_fn.
+ *
+ * \return 0 if the reload was started, -ENOENT if there is no such namespace,
+ * or -ENOMEM.
+ */
+int spdk_nvmf_ns_reload_reservation(struct spdk_nvmf_subsystem *subsystem, uint32_t nsid,
+				    spdk_nvmf_ns_reservation_reload_cb cb_fn, void *cb_arg);
+
+/* Largest buffer spdk_nvmf_reservation_info_encode() needs. */
+#define SPDK_NVMF_RESERVATION_INFO_ENCODED_MAX_LEN	(32 + SPDK_NVMF_MAX_NUM_REGISTRANTS * 24)
+
+/**
+ * Encode reservation information in a compact, versioned, little-endian form,
+ * for a store that keeps it outside a JSON file. The bdev UUID is not encoded.
+ *
+ * \param info The reservation information.
+ * \param generation A counter the store keeps, returned by decode.
+ * \param buf Destination.
+ * \param buf_len Size of buf.
+ *
+ * \return The encoded length, or 0 if buf is too small or info is inconsistent
+ * (more registrants than the limit, or a holder that is not a registrant).
+ */
+size_t spdk_nvmf_reservation_info_encode(const struct spdk_nvmf_reservation_info *info,
+		uint64_t generation, void *buf, size_t buf_len);
+
+/**
+ * Decode what spdk_nvmf_reservation_info_encode() produced. bdev_uuid is left
+ * empty.
+ *
+ * \return 0 on success, -EINVAL if buf is not a valid encoding, or
+ * -EPROTONOSUPPORT if it was written by a newer version.
+ */
+int spdk_nvmf_reservation_info_decode(const void *buf, size_t len,
+				      struct spdk_nvmf_reservation_info *info, uint64_t *generation);
 
 /**
  * Set custom handlers for namespace reservation operations.

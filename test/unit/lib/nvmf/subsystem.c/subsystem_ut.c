@@ -14,6 +14,19 @@
 #include "nvmf/subsystem.c"
 #include "nvmf/transport.c"
 
+/* Store the namespace's state through the reservation operations, as the PTPL path does */
+static int
+nvmf_ns_update_reservation_info(struct spdk_nvmf_ns *ns)
+{
+	struct spdk_nvmf_reservation_info info;
+
+	if (!ns->bdev || !nvmf_ns_is_ptpl_capable(ns)) {
+		return 0;
+	}
+	nvmf_ns_reservation_info_build(ns, &info);
+	return nvmf_ns_reservation_update(ns, &info);
+}
+
 SPDK_LOG_REGISTER_COMPONENT(nvmf)
 
 DEFINE_STUB(spdk_bdev_module_claim_bdev,
@@ -3865,6 +3878,364 @@ test_nvmf_reservation_custom_ops(void)
 	ut_reservation_deinit();
 }
 
+/*
+ * Shared reservation state: an asynchronous store, rollback, reload of a live
+ * namespace, and the encoding a store keeps. The store is faked here; the deferred
+ * callback stands in for a write that becomes durable later.
+ */
+static spdk_nvmf_ns_reservation_update_cb g_async_cb;
+static void *g_async_cb_arg;
+static struct spdk_nvmf_reservation_info g_async_info;
+static int g_async_calls;
+static bool g_shared;
+
+static void
+ut_update_async(const struct spdk_nvmf_ns *ns, const struct spdk_nvmf_reservation_info *info,
+		spdk_nvmf_ns_reservation_update_cb cb_fn, void *cb_arg)
+{
+	g_async_info = *info;
+	g_async_cb = cb_fn;
+	g_async_cb_arg = cb_arg;
+	g_async_calls++;
+}
+
+static bool
+ut_is_shared(const struct spdk_nvmf_ns *ns)
+{
+	return g_shared;
+}
+
+static void
+ut_async_complete(int rc)
+{
+	spdk_nvmf_ns_reservation_update_cb cb = g_async_cb;
+
+	SPDK_CU_ASSERT_FATAL(cb != NULL);
+	g_async_cb = NULL;
+	cb(g_async_cb_arg, rc);
+}
+
+struct ut_resv_env {
+	struct spdk_nvmf_qpair qpair;
+	struct spdk_nvmf_tgt tgt;
+	struct spdk_io_channel *ch;
+	struct spdk_nvmf_subsystem_pg_ns_info *pg_ns;
+};
+
+static void
+ut_resv_env_init(struct ut_resv_env *env, const struct spdk_nvmf_ns_reservation_ops *ops)
+{
+	struct spdk_nvmf_poll_group *pg;
+
+	memset(env, 0, sizeof(*env));
+	g_subsystem.thread = spdk_get_thread();
+	SPDK_CU_ASSERT_FATAL(g_subsystem.thread != NULL);
+	spdk_nvmf_set_custom_ns_reservation_ops(ops);
+	ut_reservation_init();
+	g_subsystem.tgt = &env->tgt;
+	spdk_io_device_register(&env->tgt, nvmf_tgt_reservation_create_poll_group,
+				nvmf_tgt_reservation_destroy_poll_group,
+				sizeof(struct spdk_nvmf_poll_group), NULL);
+	env->ch = spdk_get_io_channel(&env->tgt);
+	SPDK_CU_ASSERT_FATAL(env->ch);
+	pg = spdk_io_channel_get_ctx(env->ch);
+	env->qpair.group = pg;
+	env->pg_ns = &pg->sgroups[g_subsystem.id].ns_info[g_ns.nsid - 1];
+	g_async_cb = NULL;
+	g_async_calls = 0;
+	g_shared = false;
+	g_ns_pg_update = 0;
+}
+
+static void
+ut_resv_env_fini(struct ut_resv_env *env)
+{
+	spdk_put_io_channel(env->ch);
+	spdk_io_device_unregister(&env->tgt, NULL);
+	poll_threads();
+	g_subsystem.tgt = NULL;
+	g_subsystem.thread = NULL;
+	ut_reservation_deinit();
+	spdk_nvmf_set_custom_ns_reservation_ops(spdk_nvmf_get_default_ns_reservation_ops());
+}
+
+static struct spdk_nvmf_request *
+ut_resv_env_req(struct ut_resv_env *env, struct spdk_nvmf_ctrlr *ctrlr)
+{
+	struct spdk_nvmf_request *req = ut_reservation_build_req(16);
+
+	SPDK_CU_ASSERT_FATAL(req != NULL);
+	req->qpair = &env->qpair;
+	req->qpair->ctrlr = ctrlr;
+	req->cmd->nvme_cmd.nsid = g_ns.nsid;
+	return req;
+}
+
+static void
+test_reservation_async_update(void)
+{
+	struct spdk_nvmf_ns_reservation_ops ops = {
+		.is_ptpl_capable = ut_is_ptpl_capable,
+		.update = ut_update_reservation,
+		.load = ut_load_reservation,
+		.update_async = ut_update_async,
+	};
+	struct ut_resv_env env;
+	struct spdk_nvmf_request *req;
+	struct spdk_nvme_cpl *rsp;
+
+	ut_resv_env_init(&env, &ops);
+	req = ut_resv_env_req(&env, &g_ctrlr1_A);
+	rsp = &req->rsp->nvme_cpl;
+
+	/* The command runs, the store is asked, and nothing else happens until it answers */
+	ut_reservation_build_register_request(req, SPDK_NVME_RESERVE_REGISTER_KEY, 0, 0, 0, 0xa1);
+	nvmf_ns_reservation_request(req);
+	poll_threads();
+	CU_ASSERT(g_async_calls == 1);
+	CU_ASSERT(g_async_info.num_regs == 1);
+	CU_ASSERT(g_async_info.registrants[0].rkey == 0xa1);
+	CU_ASSERT(nvmf_ns_reservation_get_registrant(&g_ns, &g_ctrlr1_A.hostid) != NULL);
+	CU_ASSERT(g_ns_pg_update == 0);
+	CU_ASSERT(reservations_get_count(&g_ns) == 1);
+
+	/* Durable: the poll groups get the state and the command completes */
+	ut_async_complete(0);
+	poll_threads();
+	CU_ASSERT(rsp->status.sc == SPDK_NVME_SC_SUCCESS);
+	CU_ASSERT(g_ns_pg_update == 1);
+	CU_ASSERT(reservations_get_count(&g_ns) == 0);
+	CU_ASSERT(spdk_uuid_compare(&env.pg_ns->reg_hostid[0], &g_ctrlr1_A.hostid) == 0);
+
+	ut_reservation_free_req(req);
+	ut_resv_env_fini(&env);
+}
+
+static void
+test_reservation_async_update_failure_rolls_back(void)
+{
+	struct spdk_nvmf_ns_reservation_ops ops = {
+		.is_ptpl_capable = ut_is_ptpl_capable,
+		.update = ut_update_reservation,
+		.load = ut_load_reservation,
+		.update_async = ut_update_async,
+	};
+	struct ut_resv_env env;
+	struct spdk_nvmf_request *req;
+	struct spdk_nvme_cpl *rsp;
+
+	ut_resv_env_init(&env, &ops);
+	req = ut_resv_env_req(&env, &g_ctrlr1_A);
+	rsp = &req->rsp->nvme_cpl;
+
+	/* Registered and durable */
+	ut_reservation_build_register_request(req, SPDK_NVME_RESERVE_REGISTER_KEY, 0, 0, 0, 0xa1);
+	nvmf_ns_reservation_request(req);
+	poll_threads();
+	ut_async_complete(0);
+	poll_threads();
+	SPDK_CU_ASSERT_FATAL(rsp->status.sc == SPDK_NVME_SC_SUCCESS);
+
+	/* Acquire, then the store fails: the acquire is undone and reported */
+	ut_reservation_build_acquire_request(req, SPDK_NVME_RESERVE_ACQUIRE, 0,
+					     SPDK_NVME_RESERVE_WRITE_EXCLUSIVE, 0xa1, 0x0);
+	g_ns.ptpl_activated = 1;
+	nvmf_ns_reservation_request(req);
+	poll_threads();
+	CU_ASSERT(g_async_calls == 2);
+	CU_ASSERT(g_ns.rtype == SPDK_NVME_RESERVE_WRITE_EXCLUSIVE);
+	ut_async_complete(-EIO);
+	poll_threads();
+	CU_ASSERT(rsp->status.sc == SPDK_NVME_SC_INTERNAL_DEVICE_ERROR);
+	CU_ASSERT(g_ns.rtype == 0);
+	CU_ASSERT(g_ns.crkey == 0);
+	CU_ASSERT(g_ns.holder == NULL);
+	CU_ASSERT(nvmf_ns_reservation_get_registrant(&g_ns, &g_ctrlr1_A.hostid) != NULL);
+	CU_ASSERT(g_ns_pg_update == 1);
+	CU_ASSERT(env.pg_ns->rtype == 0);
+	CU_ASSERT(reservations_get_count(&g_ns) == 0);
+
+	ut_reservation_free_req(req);
+	ut_resv_env_fini(&env);
+}
+
+static void
+test_reservation_shared_persists_every_change(void)
+{
+	struct spdk_nvmf_ns_reservation_ops ops = {
+		.is_ptpl_capable = ut_is_ptpl_capable,
+		.update = ut_update_reservation,
+		.load = ut_load_reservation,
+		.update_async = ut_update_async,
+		.is_shared = ut_is_shared,
+	};
+	struct ut_resv_env env;
+	struct spdk_nvmf_request *req;
+
+	ut_resv_env_init(&env, &ops);
+	g_shared = true;
+	req = ut_resv_env_req(&env, &g_ctrlr1_A);
+
+	ut_reservation_build_register_request(req, SPDK_NVME_RESERVE_REGISTER_KEY, 0, 0, 0, 0xa1);
+	nvmf_ns_reservation_request(req);
+	poll_threads();
+	ut_async_complete(0);
+	poll_threads();
+
+	/* No PTPL, yet the acquire of a shared namespace is stored */
+	SPDK_CU_ASSERT_FATAL(g_ns.ptpl_activated == 0);
+	ut_reservation_build_acquire_request(req, SPDK_NVME_RESERVE_ACQUIRE, 0,
+					     SPDK_NVME_RESERVE_WRITE_EXCLUSIVE, 0xa1, 0x0);
+	nvmf_ns_reservation_request(req);
+	poll_threads();
+	CU_ASSERT(g_async_calls == 2);
+	CU_ASSERT(g_async_info.rtype == SPDK_NVME_RESERVE_WRITE_EXCLUSIVE);
+	ut_async_complete(0);
+	poll_threads();
+	CU_ASSERT(req->rsp->nvme_cpl.status.sc == SPDK_NVME_SC_SUCCESS);
+
+	ut_reservation_free_req(req);
+	ut_resv_env_fini(&env);
+}
+
+static int g_reload_rc;
+static int g_reload_calls;
+
+static void
+ut_reload_done(void *cb_arg, int rc)
+{
+	g_reload_rc = rc;
+	g_reload_calls++;
+}
+
+static void
+test_reservation_reload_live_namespace(void)
+{
+	struct spdk_nvmf_ns_reservation_ops ops = {
+		.is_ptpl_capable = ut_is_ptpl_capable,
+		.update = ut_update_reservation,
+		.load = ut_load_reservation,
+		.update_async = ut_update_async,
+		.is_shared = ut_is_shared,
+	};
+	struct ut_resv_env env;
+	struct spdk_nvmf_request *req;
+	struct spdk_nvmf_reservation_info info = {};
+	int rc;
+
+	ut_resv_env_init(&env, &ops);
+	g_shared = true;
+	req = ut_resv_env_req(&env, &g_ctrlr1_A);
+
+	/* A has registered locally */
+	ut_reservation_build_register_request(req, SPDK_NVME_RESERVE_REGISTER_KEY, 0, 0, 0, 0xa1);
+	nvmf_ns_reservation_request(req);
+	poll_threads();
+	ut_async_complete(0);
+	poll_threads();
+	SPDK_CU_ASSERT_FATAL(nvmf_ns_reservation_get_registrant(&g_ns, &g_ctrlr1_A.hostid) != NULL);
+
+	/* The store now says B holds the namespace and A is gone */
+	spdk_uuid_fmt_lower(info.bdev_uuid, sizeof(info.bdev_uuid), spdk_bdev_get_uuid(g_ns.bdev));
+	info.num_regs = 1;
+	info.registrants[0].rkey = 0xb1;
+	spdk_uuid_fmt_lower(info.registrants[0].host_uuid, sizeof(info.registrants[0].host_uuid),
+			    &g_ctrlr_B.hostid);
+	info.crkey = 0xb1;
+	info.rtype = SPDK_NVME_RESERVE_WRITE_EXCLUSIVE;
+	memcpy(info.holder_uuid, info.registrants[0].host_uuid, sizeof(info.holder_uuid));
+	g_resv_info = info;
+
+	g_reload_calls = 0;
+	g_reload_rc = -1;
+	rc = spdk_nvmf_ns_reload_reservation(&g_subsystem, g_ns.nsid, ut_reload_done, NULL);
+	CU_ASSERT(rc == 0);
+	poll_threads();
+	CU_ASSERT(g_reload_calls == 1);
+	CU_ASSERT(g_reload_rc == 0);
+	CU_ASSERT(nvmf_ns_reservation_get_registrant(&g_ns, &g_ctrlr1_A.hostid) == NULL);
+	SPDK_CU_ASSERT_FATAL(nvmf_ns_reservation_get_registrant(&g_ns, &g_ctrlr_B.hostid) != NULL);
+	CU_ASSERT(g_ns.holder == nvmf_ns_reservation_get_registrant(&g_ns, &g_ctrlr_B.hostid));
+	CU_ASSERT(g_ns.crkey == 0xb1);
+	CU_ASSERT(env.pg_ns->rtype == SPDK_NVME_RESERVE_WRITE_EXCLUSIVE);
+	CU_ASSERT(spdk_uuid_compare(&env.pg_ns->holder_id, &g_ctrlr_B.hostid) == 0);
+
+	/* A reload waits for a command whose store write is still in flight */
+	ut_reservation_build_register_request(req, SPDK_NVME_RESERVE_REGISTER_KEY, 0, 0, 0, 0xa1);
+	nvmf_ns_reservation_request(req);
+	poll_threads();
+	SPDK_CU_ASSERT_FATAL(g_async_cb != NULL);
+	rc = spdk_nvmf_ns_reload_reservation(&g_subsystem, g_ns.nsid, ut_reload_done, NULL);
+	CU_ASSERT(rc == 0);
+	poll_threads();
+	CU_ASSERT(g_reload_calls == 1);
+	ut_async_complete(0);
+	poll_threads();
+	CU_ASSERT(g_reload_calls == 2);
+	/* The store still holds B only, so the reload drops A's newer local registration */
+	CU_ASSERT(nvmf_ns_reservation_get_registrant(&g_ns, &g_ctrlr1_A.hostid) == NULL);
+
+	/* An unknown namespace is refused */
+	CU_ASSERT(spdk_nvmf_ns_reload_reservation(&g_subsystem, 99, ut_reload_done, NULL) == -ENOENT);
+
+	ut_reservation_free_req(req);
+	ut_resv_env_fini(&env);
+}
+
+static void
+test_reservation_info_encoding(void)
+{
+	struct spdk_nvmf_reservation_info in = {}, out = {};
+	uint8_t buf[SPDK_NVMF_RESERVATION_INFO_ENCODED_MAX_LEN];
+	struct spdk_uuid a, b;
+	uint64_t gen = 0;
+	size_t len;
+
+	spdk_uuid_generate(&a);
+	spdk_uuid_generate(&b);
+	in.num_regs = 2;
+	in.registrants[0].rkey = 0x0100000000000001ULL;
+	spdk_uuid_fmt_lower(in.registrants[0].host_uuid, sizeof(in.registrants[0].host_uuid), &a);
+	in.registrants[1].rkey = 0x42;
+	spdk_uuid_fmt_lower(in.registrants[1].host_uuid, sizeof(in.registrants[1].host_uuid), &b);
+	in.crkey = 0x42;
+	in.rtype = SPDK_NVME_RESERVE_EXCLUSIVE_ACCESS_REG_ONLY;
+	in.ptpl_activated = 1;
+	memcpy(in.holder_uuid, in.registrants[1].host_uuid, sizeof(in.holder_uuid));
+
+	len = spdk_nvmf_reservation_info_encode(&in, 7, buf, sizeof(buf));
+	SPDK_CU_ASSERT_FATAL(len > 0 && len <= sizeof(buf));
+	CU_ASSERT(spdk_nvmf_reservation_info_decode(buf, len, &out, &gen) == 0);
+	CU_ASSERT(gen == 7);
+	CU_ASSERT(out.num_regs == 2);
+	CU_ASSERT(out.crkey == 0x42);
+	CU_ASSERT(out.rtype == SPDK_NVME_RESERVE_EXCLUSIVE_ACCESS_REG_ONLY);
+	CU_ASSERT(out.ptpl_activated == 1);
+	CU_ASSERT(out.registrants[0].rkey == 0x0100000000000001ULL);
+	CU_ASSERT(strcmp(out.registrants[1].host_uuid, in.registrants[1].host_uuid) == 0);
+	CU_ASSERT(strcmp(out.holder_uuid, in.holder_uuid) == 0);
+
+	/* No reservation: no holder */
+	in.rtype = 0;
+	in.crkey = 0;
+	memset(in.holder_uuid, 0, sizeof(in.holder_uuid));
+	len = spdk_nvmf_reservation_info_encode(&in, 8, buf, sizeof(buf));
+	SPDK_CU_ASSERT_FATAL(len > 0);
+	CU_ASSERT(spdk_nvmf_reservation_info_decode(buf, len, &out, &gen) == 0);
+	CU_ASSERT(out.holder_uuid[0] == '\0');
+	CU_ASSERT(gen == 8);
+
+	/* Truncated, wrong magic, and a newer version are refused */
+	CU_ASSERT(spdk_nvmf_reservation_info_decode(buf, len - 1, &out, &gen) == -EINVAL);
+	CU_ASSERT(spdk_nvmf_reservation_info_encode(&in, 8, buf, 4) == 0);
+	len = spdk_nvmf_reservation_info_encode(&in, 8, buf, sizeof(buf));
+	buf[0] ^= 0xff;
+	CU_ASSERT(spdk_nvmf_reservation_info_decode(buf, len, &out, &gen) == -EINVAL);
+	buf[0] ^= 0xff;
+	buf[4] = 0x7f;
+	CU_ASSERT(spdk_nvmf_reservation_info_decode(buf, len, &out, &gen) == -EPROTONOSUPPORT);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -3907,6 +4278,11 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_nvmf_ns_reservation_restore);
 	CU_ADD_TEST(suite, test_nvmf_subsystem_state_change);
 	CU_ADD_TEST(suite, test_nvmf_reservation_custom_ops);
+	CU_ADD_TEST(suite, test_reservation_async_update);
+	CU_ADD_TEST(suite, test_reservation_async_update_failure_rolls_back);
+	CU_ADD_TEST(suite, test_reservation_shared_persists_every_change);
+	CU_ADD_TEST(suite, test_reservation_reload_live_namespace);
+	CU_ADD_TEST(suite, test_reservation_info_encoding);
 
 	allocate_threads(1);
 	set_thread(0);

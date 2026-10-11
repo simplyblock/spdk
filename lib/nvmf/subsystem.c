@@ -22,9 +22,15 @@
 
 #define __SPDK_BDEV_MODULE_ONLY
 #include "spdk/bdev_module.h"
+#include "spdk/endian.h"
 #include "spdk/log.h"
 #include "spdk_internal/utf.h"
 #include "spdk_internal/usdt.h"
+
+static bool nvmf_ns_reservation_is_shared(const struct spdk_nvmf_ns *ns);
+static struct spdk_nvmf_ns_reservation_ops g_reservation_ops;
+static void nvmf_ns_reservation_reloads_kick(struct spdk_nvmf_ns *ns);
+static void nvmf_ns_reservation_reloads_fail(struct spdk_nvmf_ns *ns, int rc);
 
 #define MODEL_NUMBER_DEFAULT "SPDK bdev Controller"
 #define NVMF_SUBSYSTEM_DEFAULT_NAMESPACES 32
@@ -1961,6 +1967,7 @@ spdk_nvmf_subsystem_remove_ns(struct spdk_nvmf_subsystem *subsystem, uint32_t ns
 		nvmf_ns_remove_host(ns, host);
 	}
 
+	nvmf_ns_reservation_reloads_fail(ns, -ENODEV);
 	free(ns->ptpl_file);
 	free(ns->preempt_abort);
 	nvmf_ns_reservation_clear_all_registrants(ns);
@@ -2437,7 +2444,7 @@ spdk_nvmf_subsystem_add_ns_ext(struct spdk_nvmf_subsystem *subsystem, const char
 		}
 	}
 
-	if (nvmf_ns_is_ptpl_capable(ns)) {
+	if (nvmf_ns_is_ptpl_capable(ns) || nvmf_ns_reservation_is_shared(ns)) {
 		rc = nvmf_ns_reservation_load(ns, &info);
 		if (rc) {
 			SPDK_ERRLOG("Subsystem load reservation failed\n");
@@ -2946,7 +2953,7 @@ nvmf_ns_reservation_restore(struct spdk_nvmf_ns *ns, struct spdk_nvmf_reservatio
 		      ns->nsid, info->ptpl_activated, info->num_regs);
 
 	/* it's not an error */
-	if (!info->ptpl_activated || !info->num_regs) {
+	if ((!info->ptpl_activated && !nvmf_ns_reservation_is_shared(ns)) || !info->num_regs) {
 		return 0;
 	}
 
@@ -2960,8 +2967,10 @@ nvmf_ns_reservation_restore(struct spdk_nvmf_ns *ns, struct spdk_nvmf_reservatio
 		return -EINVAL;
 	}
 
-	spdk_uuid_parse(&bdev_uuid, info->bdev_uuid);
-	if (spdk_uuid_compare(&bdev_uuid, spdk_bdev_get_uuid(ns->bdev))) {
+	/* A store that keeps the state with the bdev itself does not record its UUID */
+	if (info->bdev_uuid[0] != '\0' &&
+	    (spdk_uuid_parse(&bdev_uuid, info->bdev_uuid) ||
+	     spdk_uuid_compare(&bdev_uuid, spdk_bdev_get_uuid(ns->bdev)))) {
 		SPDK_ERRLOG("Existing bdev UUID is not same with configuration file\n");
 		return -EINVAL;
 	}
@@ -3113,42 +3122,98 @@ exit:
 	return rc;
 }
 
-static int
-nvmf_ns_update_reservation_info(struct spdk_nvmf_ns *ns)
+/* The namespace's reservation state, as the reservation operations store it */
+static void
+nvmf_ns_reservation_info_build(struct spdk_nvmf_ns *ns, struct spdk_nvmf_reservation_info *info)
 {
-	struct spdk_nvmf_reservation_info info;
 	struct spdk_nvmf_registrant *reg, *tmp;
 	uint32_t i = 0;
 
-	assert(ns != NULL);
-
-	if (!ns->bdev || !nvmf_ns_is_ptpl_capable(ns)) {
-		return 0;
-	}
-
-	memset(&info, 0, sizeof(info));
-	spdk_uuid_fmt_lower(info.bdev_uuid, sizeof(info.bdev_uuid), spdk_bdev_get_uuid(ns->bdev));
+	memset(info, 0, sizeof(*info));
+	spdk_uuid_fmt_lower(info->bdev_uuid, sizeof(info->bdev_uuid), spdk_bdev_get_uuid(ns->bdev));
 
 	if (ns->rtype) {
-		info.rtype = ns->rtype;
-		info.crkey = ns->crkey;
+		info->rtype = ns->rtype;
+		info->crkey = ns->crkey;
 		if (!nvmf_ns_reservation_all_registrants_type(ns)) {
 			assert(ns->holder != NULL);
-			spdk_uuid_fmt_lower(info.holder_uuid, sizeof(info.holder_uuid), &ns->holder->hostid);
+			spdk_uuid_fmt_lower(info->holder_uuid, sizeof(info->holder_uuid), &ns->holder->hostid);
 		}
 	}
 
 	TAILQ_FOREACH_SAFE(reg, &ns->registrants, link, tmp) {
-		spdk_uuid_fmt_lower(info.registrants[i].host_uuid, sizeof(info.registrants[i].host_uuid),
+		assert(i < SPDK_NVMF_MAX_NUM_REGISTRANTS);
+		spdk_uuid_fmt_lower(info->registrants[i].host_uuid, sizeof(info->registrants[i].host_uuid),
 				    &reg->hostid);
-		info.registrants[i++].rkey = reg->rkey;
+		info->registrants[i++].rkey = reg->rkey;
 	}
 
-	info.num_regs = i;
-	info.ptpl_activated = ns->ptpl_activated;
-
-	return nvmf_ns_reservation_update(ns, &info);
+	info->num_regs = i;
+	info->ptpl_activated = ns->ptpl_activated;
 }
+
+/*
+ * Replace the namespace's reservation state with info: the rollback of a command
+ * whose state could not be stored, and the reload of state another target changed.
+ */
+static int
+nvmf_ns_reservation_apply(struct spdk_nvmf_ns *ns, const struct spdk_nvmf_reservation_info *info)
+{
+	struct spdk_nvmf_registrant *reg, *holder = NULL;
+	struct spdk_uuid holder_uuid = {};
+	uint32_t i;
+
+	if (info->num_regs > SPDK_NVMF_MAX_NUM_REGISTRANTS) {
+		return -EINVAL;
+	}
+	if (info->rtype && info->holder_uuid[0] != '\0' &&
+	    spdk_uuid_parse(&holder_uuid, info->holder_uuid)) {
+		return -EINVAL;
+	}
+
+	nvmf_ns_reservation_clear_all_registrants(ns);
+	ns->holder = NULL;
+	ns->rtype = 0;
+	ns->crkey = 0;
+	ns->ptpl_activated = info->ptpl_activated;
+	ns->gen++;
+
+	for (i = 0; i < info->num_regs; i++) {
+		reg = calloc(1, sizeof(*reg));
+		if (!reg) {
+			nvmf_ns_reservation_clear_all_registrants(ns);
+			return -ENOMEM;
+		}
+		if (spdk_uuid_parse(&reg->hostid, info->registrants[i].host_uuid)) {
+			free(reg);
+			nvmf_ns_reservation_clear_all_registrants(ns);
+			return -EINVAL;
+		}
+		reg->rkey = info->registrants[i].rkey;
+		TAILQ_INSERT_TAIL(&ns->registrants, reg, link);
+		if (info->rtype && !spdk_uuid_compare(&holder_uuid, &reg->hostid)) {
+			holder = reg;
+		}
+	}
+
+	if (info->rtype) {
+		ns->rtype = info->rtype;
+		ns->crkey = info->crkey;
+		if (nvmf_ns_reservation_all_registrants_type(ns)) {
+			ns->holder = TAILQ_FIRST(&ns->registrants);
+		} else {
+			ns->holder = holder;
+		}
+		if (ns->holder == NULL) {
+			/* A reservation without a holder among the registrants is not one */
+			ns->rtype = 0;
+			ns->crkey = 0;
+		}
+	}
+
+	return 0;
+}
+
 
 static struct spdk_nvmf_registrant *
 nvmf_ns_reservation_get_registrant(struct spdk_nvmf_ns *ns,
@@ -4123,6 +4188,10 @@ _nvmf_ns_reservation_update_done(struct spdk_nvmf_subsystem *subsystem,
 			SPDK_ERRLOG("ns_reservation failed internal device error\n");
 			req->rsp->nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 			break;
+		case -EIO:
+			SPDK_ERRLOG("ns_reservation state could not be stored\n");
+			req->rsp->nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+			break;
 		case -ETIMEDOUT:
 			SPDK_ERRLOG("ns_reservation failed due to time out: %i\n", status);
 			req->rsp->nvme_cpl.status.sc = SPDK_NVME_SC_COMMAND_INTERRUPTED;
@@ -4161,10 +4230,59 @@ _nvmf_ns_reservation_update_done(struct spdk_nvmf_subsystem *subsystem,
 		 */
 		spdk_thread_send_msg(subsystem->thread, nvmf_ns_reservation_request,
 				     STAILQ_FIRST(&ns->reservations));
+	} else {
+		nvmf_ns_reservation_reloads_kick(ns);
 	}
 
 	/* Complete the request on the original pg */
 	spdk_thread_send_msg(group->thread, nvmf_ns_reservation_complete, req);
+}
+
+/*
+ * A command whose new state is being stored. The snapshot is the state before the
+ * command, restored when the store fails.
+ */
+struct nvmf_ns_reservation_persist {
+	struct spdk_nvmf_request		*req;
+	struct spdk_nvmf_ns			*ns;
+	struct spdk_nvmf_reservation_info	snapshot;
+	struct spdk_nvmf_reservation_info	info;
+};
+
+static bool
+nvmf_ns_reservation_stores(struct spdk_nvmf_ns *ns)
+{
+	return ns->bdev && (nvmf_ns_is_ptpl_capable(ns) || nvmf_ns_reservation_is_shared(ns));
+}
+
+static void
+nvmf_ns_reservation_persisted(void *cb_arg, int rc)
+{
+	struct nvmf_ns_reservation_persist *ctx = cb_arg;
+	struct spdk_nvmf_request *req = ctx->req;
+	struct spdk_nvmf_ns *ns = ctx->ns;
+	struct spdk_nvmf_subsystem *subsystem = ns->subsystem;
+	int status;
+
+	assert(subsystem->thread == spdk_get_thread());
+
+	if (rc != 0) {
+		SPDK_ERRLOG("Storing the reservation state of nsid %u failed (%d); rolling back\n",
+			    ns->nsid, rc);
+		if (nvmf_ns_reservation_apply(ns, &ctx->snapshot) != 0) {
+			SPDK_ERRLOG("Rolling back the reservation state of nsid %u failed\n", ns->nsid);
+		}
+		free(ctx);
+		/* The poll groups never saw the change, so there is nothing to update */
+		_nvmf_ns_reservation_update_done(subsystem, req, -EIO);
+		return;
+	}
+
+	free(ctx);
+	status = nvmf_subsystem_update_ns(subsystem, _nvmf_ns_reservation_update_done, req);
+	if (status != 0) {
+		_nvmf_ns_reservation_update_done(subsystem, req, status);
+	}
 }
 
 static void
@@ -4174,6 +4292,7 @@ nvmf_ns_reservation_update_state(struct spdk_nvmf_ns *ns,
 				 enum spdk_nvme_nvm_opcode opc)
 {
 	bool update_sgroup = false;
+	struct nvmf_ns_reservation_persist *persist = NULL;
 	int status = 0;
 
 	/* All reservation state modifications must be queued to serialize them */
@@ -4184,6 +4303,17 @@ nvmf_ns_reservation_update_state(struct spdk_nvmf_ns *ns,
 	/* The head is in-progress, others must wait */
 	if (req != STAILQ_FIRST(&ns->reservations)) {
 		return;
+	}
+
+	if (nvmf_ns_reservation_stores(ns)) {
+		persist = calloc(1, sizeof(*persist));
+		if (persist == NULL) {
+			_nvmf_ns_reservation_update_done(ctrlr->subsys, req, -ENOMEM);
+			return;
+		}
+		persist->req = req;
+		persist->ns = ns;
+		nvmf_ns_reservation_info_build(ns, &persist->snapshot);
 	}
 
 	switch (opc) {
@@ -4200,21 +4330,172 @@ nvmf_ns_reservation_update_state(struct spdk_nvmf_ns *ns,
 		break;
 	}
 
-	/* update reservation information to subsystem's poll group */
+	/* store the new state, then update reservation information to subsystem's poll group */
 	if (update_sgroup) {
-		if (ns->ptpl_activated || opc == SPDK_NVME_OPC_RESERVATION_REGISTER) {
-			if (nvmf_ns_update_reservation_info(ns) != 0) {
-				SPDK_NOTICELOG("Failed to update reservation info for nsid %u\n", ns->nsid);
-				req->rsp->nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+		if (persist != NULL &&
+		    (ns->ptpl_activated || opc == SPDK_NVME_OPC_RESERVATION_REGISTER ||
+		     nvmf_ns_reservation_is_shared(ns))) {
+			nvmf_ns_reservation_info_build(ns, &persist->info);
+			if (g_reservation_ops.update_async != NULL) {
+				g_reservation_ops.update_async(ns, &persist->info,
+							       nvmf_ns_reservation_persisted, persist);
+			} else {
+				nvmf_ns_reservation_persisted(persist,
+							      nvmf_ns_reservation_update(ns, &persist->info));
 			}
+			return;
 		}
+		free(persist);
 		status = nvmf_subsystem_update_ns(ctrlr->subsys, _nvmf_ns_reservation_update_done, req);
 		if (status == 0) {
 			return;
 		}
+		_nvmf_ns_reservation_update_done(ctrlr->subsys, req, status);
+		return;
 	}
 
+	free(persist);
 	_nvmf_ns_reservation_update_done(ctrlr->subsys, req, status);
+}
+
+/*
+ * A reload replaces a namespace's reservation state with the stored state, for a
+ * store shared with other targets that may have changed it. It waits for the
+ * commands queued on the namespace, so it never lands between a command and the
+ * write of its result.
+ */
+struct nvmf_ns_reservation_reload {
+	struct spdk_nvmf_subsystem		*subsystem;
+	uint32_t				nsid;
+	spdk_nvmf_ns_reservation_reload_cb	cb_fn;
+	void					*cb_arg;
+	struct spdk_thread			*thread;
+	int					rc;
+	struct nvmf_ns_reservation_reload	*next;
+};
+
+static void
+nvmf_ns_reservation_reload_complete(void *arg)
+{
+	struct nvmf_ns_reservation_reload *ctx = arg;
+
+	if (ctx->cb_fn) {
+		ctx->cb_fn(ctx->cb_arg, ctx->rc);
+	}
+	free(ctx);
+}
+
+static void
+nvmf_ns_reservation_reload_finish(struct nvmf_ns_reservation_reload *ctx, int rc)
+{
+	ctx->rc = rc;
+	spdk_thread_send_msg(ctx->thread, nvmf_ns_reservation_reload_complete, ctx);
+}
+
+static void
+nvmf_ns_reservation_reload_pg_done(struct spdk_nvmf_subsystem *subsystem, void *cb_arg, int status)
+{
+	nvmf_ns_reservation_reload_finish(cb_arg, status);
+}
+
+static void
+nvmf_ns_reservation_reload_msg(void *arg)
+{
+	struct nvmf_ns_reservation_reload *ctx = arg;
+	struct spdk_nvmf_reservation_info *info;
+	struct spdk_nvmf_ns *ns;
+	int rc;
+
+	ns = _nvmf_subsystem_get_ns(ctx->subsystem, ctx->nsid);
+	if (ns == NULL) {
+		nvmf_ns_reservation_reload_finish(ctx, -ENOENT);
+		return;
+	}
+	if (!STAILQ_EMPTY(&ns->reservations)) {
+		/* Run when the queue drains, in the order the reloads came */
+		struct nvmf_ns_reservation_reload **tail = &ns->reservation_reloads;
+
+		while (*tail) {
+			tail = &(*tail)->next;
+		}
+		ctx->next = NULL;
+		*tail = ctx;
+		return;
+	}
+
+	info = calloc(1, sizeof(*info));
+	if (info == NULL) {
+		nvmf_ns_reservation_reload_finish(ctx, -ENOMEM);
+		return;
+	}
+	rc = nvmf_ns_reservation_load(ns, info);
+	if (rc == 0) {
+		rc = nvmf_ns_reservation_apply(ns, info);
+	}
+	free(info);
+	if (rc != 0) {
+		SPDK_ERRLOG("Reloading the reservation state of nsid %u failed (%d)\n", ns->nsid, rc);
+		nvmf_ns_reservation_reload_finish(ctx, rc);
+		return;
+	}
+
+	rc = nvmf_subsystem_update_ns(ctx->subsystem, nvmf_ns_reservation_reload_pg_done, ctx);
+	if (rc != 0) {
+		nvmf_ns_reservation_reload_finish(ctx, rc);
+	}
+}
+
+static void
+nvmf_ns_reservation_reloads_kick(struct spdk_nvmf_ns *ns)
+{
+	struct nvmf_ns_reservation_reload *ctx = ns->reservation_reloads;
+
+	ns->reservation_reloads = NULL;
+	while (ctx) {
+		struct nvmf_ns_reservation_reload *next = ctx->next;
+
+		ctx->next = NULL;
+		spdk_thread_send_msg(ns->subsystem->thread, nvmf_ns_reservation_reload_msg, ctx);
+		ctx = next;
+	}
+}
+
+static void
+nvmf_ns_reservation_reloads_fail(struct spdk_nvmf_ns *ns, int rc)
+{
+	struct nvmf_ns_reservation_reload *ctx = ns->reservation_reloads;
+
+	ns->reservation_reloads = NULL;
+	while (ctx) {
+		struct nvmf_ns_reservation_reload *next = ctx->next;
+
+		nvmf_ns_reservation_reload_finish(ctx, rc);
+		ctx = next;
+	}
+}
+
+int
+spdk_nvmf_ns_reload_reservation(struct spdk_nvmf_subsystem *subsystem, uint32_t nsid,
+				spdk_nvmf_ns_reservation_reload_cb cb_fn, void *cb_arg)
+{
+	struct nvmf_ns_reservation_reload *ctx;
+
+	if (_nvmf_subsystem_get_ns(subsystem, nsid) == NULL) {
+		return -ENOENT;
+	}
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL) {
+		return -ENOMEM;
+	}
+	ctx->subsystem = subsystem;
+	ctx->nsid = nsid;
+	ctx->cb_fn = cb_fn;
+	ctx->cb_arg = cb_arg;
+	ctx->thread = spdk_get_thread();
+
+	spdk_thread_send_msg(subsystem->thread, nvmf_ns_reservation_reload_msg, ctx);
+	return 0;
 }
 
 void
@@ -4249,11 +4530,149 @@ nvmf_ns_is_ptpl_capable_json(const struct spdk_nvmf_ns *ns)
 	return ns->ptpl_file != NULL;
 }
 
+static const struct spdk_nvmf_ns_reservation_ops g_default_reservation_ops = {
+	.is_ptpl_capable = nvmf_ns_is_ptpl_capable_json,
+	.update = nvmf_ns_reservation_update_json,
+	.load = nvmf_ns_reservation_load_json,
+};
+
 static struct spdk_nvmf_ns_reservation_ops g_reservation_ops = {
 	.is_ptpl_capable = nvmf_ns_is_ptpl_capable_json,
 	.update = nvmf_ns_reservation_update_json,
 	.load = nvmf_ns_reservation_load_json,
 };
+
+const struct spdk_nvmf_ns_reservation_ops *
+spdk_nvmf_get_default_ns_reservation_ops(void)
+{
+	return &g_default_reservation_ops;
+}
+
+/*
+ * The compact encoding of struct spdk_nvmf_reservation_info, all little-endian:
+ *
+ *   0  magic "SBRV"     8  num_regs (16)   16  generation (64)
+ *   4  version (8)     10  reserved (16)   24  crkey (64)
+ *   5  flags (8): bit 0 is ptpl_activated  12  reserved (32)
+ *   6  rtype (8)
+ *   7  holder (8): index into the registrants, or 0xff for none
+ *  32  num_regs entries of host identifier (16 bytes) and rkey (64)
+ */
+#define NVMF_RESV_ENC_MAGIC		0x56524253u	/* "SBRV" read as little-endian */
+#define NVMF_RESV_ENC_VERSION		1
+#define NVMF_RESV_ENC_HEADER_LEN	32
+#define NVMF_RESV_ENC_ENTRY_LEN		24
+#define NVMF_RESV_ENC_NO_HOLDER		0xff
+SPDK_STATIC_ASSERT(SPDK_NVMF_MAX_NUM_REGISTRANTS < NVMF_RESV_ENC_NO_HOLDER, "holder index");
+SPDK_STATIC_ASSERT(SPDK_NVMF_RESERVATION_INFO_ENCODED_MAX_LEN ==
+		   NVMF_RESV_ENC_HEADER_LEN + SPDK_NVMF_MAX_NUM_REGISTRANTS * NVMF_RESV_ENC_ENTRY_LEN,
+		   "encoded length");
+
+size_t
+spdk_nvmf_reservation_info_encode(const struct spdk_nvmf_reservation_info *info,
+				  uint64_t generation, void *buf, size_t buf_len)
+{
+	uint8_t *p = buf;
+	size_t len;
+	uint32_t i;
+	uint8_t holder = NVMF_RESV_ENC_NO_HOLDER;
+	struct spdk_uuid uuid;
+
+	if (info->num_regs > SPDK_NVMF_MAX_NUM_REGISTRANTS) {
+		return 0;
+	}
+	len = NVMF_RESV_ENC_HEADER_LEN + (size_t)info->num_regs * NVMF_RESV_ENC_ENTRY_LEN;
+	if (buf_len < len) {
+		return 0;
+	}
+	if (info->rtype && info->holder_uuid[0] != '\0') {
+		for (i = 0; i < info->num_regs; i++) {
+			if (!strncmp(info->holder_uuid, info->registrants[i].host_uuid,
+				     SPDK_UUID_STRING_LEN)) {
+				holder = (uint8_t)i;
+				break;
+			}
+		}
+		if (holder == NVMF_RESV_ENC_NO_HOLDER) {
+			return 0;
+		}
+	}
+
+	memset(p, 0, len);
+	to_le32(p, NVMF_RESV_ENC_MAGIC);
+	p[4] = NVMF_RESV_ENC_VERSION;
+	p[5] = info->ptpl_activated ? 1 : 0;
+	p[6] = info->rtype;
+	p[7] = holder;
+	to_le16(p + 8, info->num_regs);
+	to_le64(p + 16, generation);
+	to_le64(p + 24, info->crkey);
+	for (i = 0; i < info->num_regs; i++) {
+		uint8_t *e = p + NVMF_RESV_ENC_HEADER_LEN + i * NVMF_RESV_ENC_ENTRY_LEN;
+
+		if (spdk_uuid_parse(&uuid, info->registrants[i].host_uuid)) {
+			return 0;
+		}
+		memcpy(e, &uuid, sizeof(uuid));
+		to_le64(e + 16, info->registrants[i].rkey);
+	}
+
+	return len;
+}
+
+int
+spdk_nvmf_reservation_info_decode(const void *buf, size_t len,
+				  struct spdk_nvmf_reservation_info *info, uint64_t *generation)
+{
+	const uint8_t *p = buf;
+	uint16_t num_regs;
+	uint8_t holder;
+	struct spdk_uuid uuid;
+	uint32_t i;
+
+	if (len < NVMF_RESV_ENC_HEADER_LEN || from_le32(p) != NVMF_RESV_ENC_MAGIC) {
+		return -EINVAL;
+	}
+	if (p[4] != NVMF_RESV_ENC_VERSION) {
+		return -EPROTONOSUPPORT;
+	}
+	num_regs = from_le16(p + 8);
+	holder = p[7];
+	if (num_regs > SPDK_NVMF_MAX_NUM_REGISTRANTS ||
+	    len != NVMF_RESV_ENC_HEADER_LEN + (size_t)num_regs * NVMF_RESV_ENC_ENTRY_LEN ||
+	    (holder != NVMF_RESV_ENC_NO_HOLDER && holder >= num_regs)) {
+		return -EINVAL;
+	}
+
+	memset(info, 0, sizeof(*info));
+	info->ptpl_activated = p[5] & 1;
+	info->rtype = p[6];
+	info->num_regs = (uint8_t)num_regs;
+	info->crkey = from_le64(p + 24);
+	for (i = 0; i < num_regs; i++) {
+		const uint8_t *e = p + NVMF_RESV_ENC_HEADER_LEN + i * NVMF_RESV_ENC_ENTRY_LEN;
+
+		memcpy(&uuid, e, sizeof(uuid));
+		spdk_uuid_fmt_lower(info->registrants[i].host_uuid,
+				    sizeof(info->registrants[i].host_uuid), &uuid);
+		info->registrants[i].rkey = from_le64(e + 16);
+	}
+	if (info->rtype && holder != NVMF_RESV_ENC_NO_HOLDER) {
+		memcpy(info->holder_uuid, info->registrants[holder].host_uuid,
+		       sizeof(info->holder_uuid));
+	}
+	if (generation) {
+		*generation = from_le64(p + 16);
+	}
+
+	return 0;
+}
+
+static bool
+nvmf_ns_reservation_is_shared(const struct spdk_nvmf_ns *ns)
+{
+	return g_reservation_ops.is_shared != NULL && g_reservation_ops.is_shared(ns);
+}
 
 bool
 nvmf_ns_is_ptpl_capable(const struct spdk_nvmf_ns *ns)
