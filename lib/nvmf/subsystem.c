@@ -3217,7 +3217,7 @@ nvmf_ns_reservation_apply(struct spdk_nvmf_ns *ns, const struct spdk_nvmf_reserv
 
 static struct spdk_nvmf_registrant *
 nvmf_ns_reservation_get_registrant(struct spdk_nvmf_ns *ns,
-				   struct spdk_uuid *uuid)
+				   const struct spdk_uuid *uuid)
 {
 	struct spdk_nvmf_registrant *reg, *tmp;
 
@@ -3255,7 +3255,7 @@ static uint32_t
 nvmf_ns_reservation_get_all_other_hostid(struct spdk_nvmf_ns *ns,
 		struct spdk_uuid *hostid_list,
 		uint32_t max_num_hostid,
-		struct spdk_uuid *current_hostid)
+		const struct spdk_uuid *current_hostid)
 {
 	struct spdk_nvmf_registrant *reg, *tmp;
 	uint32_t num_hostid = 0;
@@ -3335,10 +3335,19 @@ nvmf_ns_reservation_registrant_is_holder(struct spdk_nvmf_ns *ns,
 	return (ns->holder == reg);
 }
 
+/*
+ * The host a reservation command acts as: the controller's host for a command
+ * that arrived here, or the host another target forwarded it for.
+ */
+struct nvmf_resv_issuer {
+	const struct spdk_uuid	*hostid;
+	const char		*hostnqn;
+};
+
 static int
-nvmf_ns_reservation_add_registrant(struct spdk_nvmf_ns *ns,
-				   struct spdk_nvmf_ctrlr *ctrlr,
-				   uint64_t nrkey)
+nvmf_ns_reservation_add_host_registrant(struct spdk_nvmf_ns *ns,
+					const struct nvmf_resv_issuer *who,
+					uint64_t nrkey)
 {
 	struct spdk_nvmf_registrant *reg;
 	uint32_t count = 0;
@@ -3348,7 +3357,7 @@ nvmf_ns_reservation_add_registrant(struct spdk_nvmf_ns *ns,
 	}
 	if (count >= SPDK_NVMF_MAX_NUM_REGISTRANTS) {
 		SPDK_ERRLOG("Namespace %u already has the maximum of %u registrants, host %s not "
-			    "registered\n", ns->nsid, SPDK_NVMF_MAX_NUM_REGISTRANTS, ctrlr->hostnqn);
+			    "registered\n", ns->nsid, SPDK_NVMF_MAX_NUM_REGISTRANTS, who->hostnqn);
 		return -ENOSPC;
 	}
 
@@ -3359,11 +3368,22 @@ nvmf_ns_reservation_add_registrant(struct spdk_nvmf_ns *ns,
 
 	reg->rkey = nrkey;
 	/* set hostid for the registrant */
-	spdk_uuid_copy(&reg->hostid, &ctrlr->hostid);
+	spdk_uuid_copy(&reg->hostid, who->hostid);
 	TAILQ_INSERT_TAIL(&ns->registrants, reg, link);
 	ns->gen++;
 
 	return 0;
+}
+
+/* The registrant of a controller's host; the unit tests call it */
+static int __attribute__((unused))
+nvmf_ns_reservation_add_registrant(struct spdk_nvmf_ns *ns,
+				   struct spdk_nvmf_ctrlr *ctrlr,
+				   uint64_t nrkey)
+{
+	struct nvmf_resv_issuer who = { .hostid = &ctrlr->hostid, .hostnqn = ctrlr->hostnqn };
+
+	return nvmf_ns_reservation_add_host_registrant(ns, &who, nrkey);
 }
 
 static void
@@ -3478,9 +3498,9 @@ nvmf_ns_reservation_acquire_reservation(struct spdk_nvmf_ns *ns, uint64_t rkey,
 }
 
 static bool
-nvmf_ns_reservation_register(struct spdk_nvmf_ns *ns,
-			     struct spdk_nvmf_ctrlr *ctrlr,
-			     struct spdk_nvmf_request *req)
+nvmf_ns_reservation_register_as(struct spdk_nvmf_ns *ns,
+			        const struct nvmf_resv_issuer *who,
+			        struct spdk_nvmf_request *req)
 {
 	struct spdk_nvme_reservation_register_data key = { 0 };
 	struct spdk_nvme_cmd *cmd = &req->cmd->nvme_cmd;
@@ -3511,7 +3531,7 @@ nvmf_ns_reservation_register(struct spdk_nvmf_ns *ns,
 		      rrega, iekey, cptpl, key.crkey, key.nrkey);
 	SPDK_NOTICELOG("REGISTER: NSID %u, RREGA %u, IEKEY %u, CPTPL %u, "
 		       "NRKEY 0x%"PRIx64", NRKEY 0x%"PRIx64", nqn:%s, host:%s\n",
-		       ns->nsid, rrega, iekey, cptpl, key.crkey, key.nrkey, ctrlr->subsys->subnqn, ctrlr->hostnqn);
+		       ns->nsid, rrega, iekey, cptpl, key.crkey, key.nrkey, ns->subsystem->subnqn, who->hostnqn);
 
 	if (cptpl == SPDK_NVME_RESERVE_PTPL_CLEAR_POWER_ON) {
 		/* True to OFF state, and need to be updated in the configuration file */
@@ -3531,7 +3551,7 @@ nvmf_ns_reservation_register(struct spdk_nvmf_ns *ns,
 	}
 
 	/* current Host Identifier has registrant or not */
-	reg = nvmf_ns_reservation_get_registrant(ns, &ctrlr->hostid);
+	reg = nvmf_ns_reservation_get_registrant(ns, who->hostid);
 
 	/*
 	 * The Linux host releases its key with Replace and a new key of zero, the
@@ -3552,9 +3572,9 @@ nvmf_ns_reservation_register(struct spdk_nvmf_ns *ns,
 				status = SPDK_NVME_SC_INVALID_FIELD;
 				goto exit;
 			}
-			rc = nvmf_ns_reservation_add_registrant(ns, ctrlr, key.nrkey);
+			rc = nvmf_ns_reservation_add_host_registrant(ns, who, key.nrkey);
 			if (rc < 0) {
-				SPDK_NOTICELOG("1- Failed to add registrant for host %s\n", ctrlr->hostnqn);
+				SPDK_NOTICELOG("1- Failed to add registrant for host %s\n", who->hostnqn);
 				status = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 				goto exit;
 			}
@@ -3581,7 +3601,7 @@ nvmf_ns_reservation_register(struct spdk_nvmf_ns *ns,
 		rtype = ns->rtype;
 		num_hostid = nvmf_ns_reservation_get_all_other_hostid(ns, hostid_list,
 				SPDK_NVMF_MAX_NUM_REGISTRANTS,
-				&ctrlr->hostid);
+				who->hostid);
 
 		nvmf_ns_reservation_remove_registrant(ns, reg);
 
@@ -3617,9 +3637,9 @@ nvmf_ns_reservation_register(struct spdk_nvmf_ns *ns,
 			}
 		} else if (iekey) { /* No registrant but IEKEY is set */
 			/* new registrant */
-			rc = nvmf_ns_reservation_add_registrant(ns, ctrlr, key.nrkey);
+			rc = nvmf_ns_reservation_add_host_registrant(ns, who, key.nrkey);
 			if (rc < 0) {
-				SPDK_NOTICELOG("2-Failed to add registrant for host %s\n", ctrlr->hostnqn);
+				SPDK_NOTICELOG("2-Failed to add registrant for host %s\n", who->hostnqn);
 				status = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 				goto exit;
 			}
@@ -3643,10 +3663,21 @@ exit:
 	return update_sgroup;
 }
 
+/* The command acting as the host of the controller it arrived on; the unit tests call it */
+static bool __attribute__((unused))
+nvmf_ns_reservation_register(struct spdk_nvmf_ns *ns,
+			     struct spdk_nvmf_ctrlr *ctrlr,
+			     struct spdk_nvmf_request *req)
+{
+	struct nvmf_resv_issuer who = { .hostid = &ctrlr->hostid, .hostnqn = ctrlr->hostnqn };
+
+	return nvmf_ns_reservation_register_as(ns, &who, req);
+}
+
 static bool
-nvmf_ns_reservation_acquire(struct spdk_nvmf_ns *ns,
-			    struct spdk_nvmf_ctrlr *ctrlr,
-			    struct spdk_nvmf_request *req)
+nvmf_ns_reservation_acquire_as(struct spdk_nvmf_ns *ns,
+			       const struct nvmf_resv_issuer *who,
+			       struct spdk_nvmf_request *req)
 {
 	struct spdk_nvme_reservation_acquire_data key = { 0 };
 	struct spdk_nvme_cmd *cmd = &req->cmd->nvme_cmd;
@@ -3684,8 +3715,8 @@ nvmf_ns_reservation_acquire(struct spdk_nvmf_ns *ns,
 		      racqa, iekey, rtype, key.crkey, key.prkey);
 	SPDK_NOTICELOG("ACQUIRE: NSID %u, RACQA %u, IEKEY %u, RTYPE %u, "
 		       "NRKEY 0x%"PRIx64", PRKEY 0x%"PRIx64", nqn:%s, host:%s\n",
-		       ns->nsid, racqa, iekey, rtype, key.crkey, key.prkey, ctrlr->subsys->subnqn,
-		       ctrlr->hostnqn);
+		       ns->nsid, racqa, iekey, rtype, key.crkey, key.prkey, ns->subsystem->subnqn,
+		       who->hostnqn);
 
 	if (iekey || rtype > SPDK_NVME_RESERVE_EXCLUSIVE_ACCESS_ALL_REGS) {
 		SPDK_ERRLOG("Ignore existing key field set to 1\n");
@@ -3694,7 +3725,7 @@ nvmf_ns_reservation_acquire(struct spdk_nvmf_ns *ns,
 		goto exit;
 	}
 
-	reg = nvmf_ns_reservation_get_registrant(ns, &ctrlr->hostid);
+	reg = nvmf_ns_reservation_get_registrant(ns, who->hostid);
 	/* must be registrant and CRKEY must match */
 	if (!reg || reg->rkey != key.crkey) {
 		SPDK_ERRLOG("No registrant or current key doesn't match "
@@ -3742,7 +3773,7 @@ nvmf_ns_reservation_acquire(struct spdk_nvmf_ns *ns,
 		 */
 		num_hostid = nvmf_ns_reservation_get_all_other_hostid(ns, hostid_list,
 				SPDK_NVMF_MAX_NUM_REGISTRANTS,
-				&ctrlr->hostid);
+				who->hostid);
 
 		/* no reservation holder */
 		if (!ns->holder) {
@@ -3801,7 +3832,7 @@ exit:
 	if (update_sgroup && is_preempt) {
 		new_num_hostid = nvmf_ns_reservation_get_all_other_hostid(ns, new_hostid_list,
 				 SPDK_NVMF_MAX_NUM_REGISTRANTS,
-				 &ctrlr->hostid);
+				 who->hostid);
 		/* Preempt notification occurs on the unregistered controllers
 		 * other than the controller who issued the command.
 		 */
@@ -3846,10 +3877,21 @@ exit:
 	return update_sgroup;
 }
 
-static bool
-nvmf_ns_reservation_release(struct spdk_nvmf_ns *ns,
+/* The command acting as the host of the controller it arrived on; the unit tests call it */
+static bool __attribute__((unused))
+nvmf_ns_reservation_acquire(struct spdk_nvmf_ns *ns,
 			    struct spdk_nvmf_ctrlr *ctrlr,
 			    struct spdk_nvmf_request *req)
+{
+	struct nvmf_resv_issuer who = { .hostid = &ctrlr->hostid, .hostnqn = ctrlr->hostnqn };
+
+	return nvmf_ns_reservation_acquire_as(ns, &who, req);
+}
+
+static bool
+nvmf_ns_reservation_release_as(struct spdk_nvmf_ns *ns,
+			       const struct nvmf_resv_issuer *who,
+			       struct spdk_nvmf_request *req)
 {
 	struct spdk_nvme_cmd *cmd = &req->cmd->nvme_cmd;
 	uint8_t rrela, iekey, rtype;
@@ -3879,8 +3921,8 @@ nvmf_ns_reservation_release(struct spdk_nvmf_ns *ns,
 		      "CRKEY 0x%"PRIx64"\n",  rrela, iekey, rtype, crkey);
 	SPDK_NOTICELOG("RELEASE: NSID %u, RRELA %u, IEKEY %u, RTYPE %u, "
 		       "CRKEY 0x%"PRIx64", nqn:%s, host:%s\n",
-		       ns->nsid, rrela, iekey, rtype, crkey, ctrlr->subsys->subnqn,
-		       ctrlr->hostnqn);
+		       ns->nsid, rrela, iekey, rtype, crkey, ns->subsystem->subnqn,
+		       who->hostnqn);
 
 	if (iekey) {
 		SPDK_ERRLOG("Ignore existing key field set to 1\n");
@@ -3889,7 +3931,7 @@ nvmf_ns_reservation_release(struct spdk_nvmf_ns *ns,
 		goto exit;
 	}
 
-	reg = nvmf_ns_reservation_get_registrant(ns, &ctrlr->hostid);
+	reg = nvmf_ns_reservation_get_registrant(ns, who->hostid);
 	if (!reg || reg->rkey != crkey) {
 		SPDK_ERRLOG("No registrant or current key doesn't match "
 			    "with existing registrant key\n");
@@ -3900,14 +3942,14 @@ nvmf_ns_reservation_release(struct spdk_nvmf_ns *ns,
 
 	num_hostid = nvmf_ns_reservation_get_all_other_hostid(ns, hostid_list,
 			SPDK_NVMF_MAX_NUM_REGISTRANTS,
-			&ctrlr->hostid);
+			who->hostid);
 
 	switch (rrela) {
 	case SPDK_NVME_RESERVE_RELEASE:
 		if (!ns->holder) {
 			SPDK_DEBUGLOG(nvmf, "RELEASE: no holder\n");
 			SPDK_NOTICELOG("RELEASE: NSID %u, no holder, nqn:%s, host:%s\n",
-				       ns->nsid, ctrlr->subsys->subnqn, ctrlr->hostnqn);
+				       ns->nsid, ns->subsystem->subnqn, who->hostnqn);
 			update_sgroup = false;
 			goto exit;
 		}
@@ -3954,6 +3996,17 @@ exit:
 	req->rsp->nvme_cpl.status.sct = SPDK_NVME_SCT_GENERIC;
 	req->rsp->nvme_cpl.status.sc = status;
 	return update_sgroup;
+}
+
+/* The command acting as the host of the controller it arrived on; the unit tests call it */
+static bool __attribute__((unused))
+nvmf_ns_reservation_release(struct spdk_nvmf_ns *ns,
+			    struct spdk_nvmf_ctrlr *ctrlr,
+			    struct spdk_nvmf_request *req)
+{
+	struct nvmf_resv_issuer who = { .hostid = &ctrlr->hostid, .hostnqn = ctrlr->hostnqn };
+
+	return nvmf_ns_reservation_release_as(ns, &who, req);
 }
 
 static void
@@ -4167,12 +4220,78 @@ ns_reservation_sched_next_io_wait_check(struct spdk_nvmf_ns *ns)
 		SPDK_POLLER_REGISTER(ns_reservation_next_io_wait_check, ns, NS_RESERVATION_IO_WAIT_CHECK_INTERVAL);
 }
 
+/*
+ * A command executed on behalf of a host with no controller here, for another
+ * target that forwarded it (spdk_nvmf_ns_reservation_execute()). Its request has no
+ * qpair, which is how the reservation path tells it apart.
+ */
+struct nvmf_ns_reservation_exec {
+	struct spdk_nvmf_request		req;
+	union nvmf_h2c_msg			cmd;
+	union nvmf_c2h_msg			rsp;
+	uint8_t					data[16];
+	struct spdk_uuid			hostid;
+	char					hostnqn[SPDK_NVMF_NQN_MAX_LEN + 1];
+	struct spdk_nvmf_subsystem		*subsystem;
+	struct spdk_thread			*thread;
+	spdk_nvmf_ns_reservation_execute_cb	cb_fn;
+	void					*cb_arg;
+};
+
+static inline struct nvmf_ns_reservation_exec *
+nvmf_ns_reservation_exec_of(struct spdk_nvmf_request *req)
+{
+	return req->qpair == NULL ? SPDK_CONTAINEROF(req, struct nvmf_ns_reservation_exec, req) : NULL;
+}
+
+static void
+nvmf_ns_reservation_exec_complete(void *arg)
+{
+	struct nvmf_ns_reservation_exec *exec = arg;
+
+	exec->cb_fn(exec->cb_arg, &exec->rsp.nvme_cpl.status);
+	free(exec);
+}
+
+static void nvmf_ns_reservation_reloads_kick(struct spdk_nvmf_ns *ns);
+
+/* The head of the namespace's queue is done: start the next, and complete it */
+static void
+nvmf_ns_reservation_finish(struct spdk_nvmf_subsystem *subsystem, struct spdk_nvmf_ns *ns,
+			   struct spdk_nvmf_request *req)
+{
+	struct nvmf_ns_reservation_exec *exec = nvmf_ns_reservation_exec_of(req);
+
+	assert(req->reservation_queued == true);
+	assert(req == STAILQ_FIRST(&ns->reservations));
+
+	/* req is complete, remove from queue and continue if there's others */
+	STAILQ_REMOVE_HEAD(&ns->reservations, reservation_link);
+	req->reservation_queued = false;
+	if (!STAILQ_EMPTY(&ns->reservations)) {
+		/* NOTE: we leave the next on the queue to prevent any in-flight
+		 * requests moving from pg->thread to subsystem->thread from
+		 * executing before the next one
+		 */
+		spdk_thread_send_msg(subsystem->thread, nvmf_ns_reservation_request,
+				     STAILQ_FIRST(&ns->reservations));
+	} else {
+		nvmf_ns_reservation_reloads_kick(ns);
+	}
+
+	if (exec != NULL) {
+		spdk_thread_send_msg(exec->thread, nvmf_ns_reservation_exec_complete, exec);
+		return;
+	}
+	/* Complete the request on the original pg */
+	spdk_thread_send_msg(req->qpair->group->thread, nvmf_ns_reservation_complete, req);
+}
+
 static void
 _nvmf_ns_reservation_update_done(struct spdk_nvmf_subsystem *subsystem,
 				 void *cb_arg, int status)
 {
 	struct spdk_nvmf_request *req = (struct spdk_nvmf_request *)cb_arg;
-	struct spdk_nvmf_poll_group *group = req->qpair->group;
 	struct spdk_nvme_cmd *cmd = &req->cmd->nvme_cmd;
 	struct spdk_nvmf_ns *ns;
 
@@ -4220,22 +4339,7 @@ _nvmf_ns_reservation_update_done(struct spdk_nvmf_subsystem *subsystem,
 		return;
 	}
 
-	/* req is complete, remove from queue and continue if there's others */
-	STAILQ_REMOVE_HEAD(&ns->reservations, reservation_link);
-	req->reservation_queued = false;
-	if (!STAILQ_EMPTY(&ns->reservations)) {
-		/* NOTE: we leave the next on the queue to prevent any in-flight
-		 * requests moving from pg->thread to subsystem->thread from
-		 * executing before the next one
-		 */
-		spdk_thread_send_msg(subsystem->thread, nvmf_ns_reservation_request,
-				     STAILQ_FIRST(&ns->reservations));
-	} else {
-		nvmf_ns_reservation_reloads_kick(ns);
-	}
-
-	/* Complete the request on the original pg */
-	spdk_thread_send_msg(group->thread, nvmf_ns_reservation_complete, req);
+	nvmf_ns_reservation_finish(subsystem, ns, req);
 }
 
 /*
@@ -4285,9 +4389,97 @@ nvmf_ns_reservation_persisted(void *cb_arg, int rc)
 	}
 }
 
+/*
+ * A command handed to the target that owns the namespace's shared state. Its
+ * answer is the command's status, and the state it returns replaces this target's
+ * before the command completes.
+ */
+struct nvmf_ns_reservation_forwarded {
+	struct spdk_nvmf_request	*req;
+	struct spdk_nvmf_ns		*ns;
+};
+
+static void
+nvmf_ns_reservation_forward_pg_done(struct spdk_nvmf_subsystem *subsystem, void *cb_arg,
+				   int status)
+{
+	struct spdk_nvmf_request *req = cb_arg;
+	struct spdk_nvmf_ns *ns = _nvmf_subsystem_get_ns(subsystem, req->cmd->nvme_cmd.nsid);
+
+	if (status != 0) {
+		/* The owner executed the command; the poll groups catch up on the next update */
+		SPDK_ERRLOG("Updating the poll groups after a forwarded reservation command failed: %d\n",
+			    status);
+	}
+	assert(ns != NULL);
+	nvmf_ns_reservation_finish(subsystem, ns, req);
+}
+
+static void
+nvmf_ns_reservation_forwarded_done(void *cb_arg, const struct spdk_nvme_status *status,
+				   const struct spdk_nvmf_reservation_info *info)
+{
+	struct nvmf_ns_reservation_forwarded *ctx = cb_arg;
+	struct spdk_nvmf_request *req = ctx->req;
+	struct spdk_nvmf_ns *ns = ctx->ns;
+	struct spdk_nvmf_subsystem *subsystem = ns->subsystem;
+
+	assert(subsystem->thread == spdk_get_thread());
+	free(ctx);
+
+	req->rsp->nvme_cpl.status.sct = status->sct;
+	req->rsp->nvme_cpl.status.sc = status->sc;
+	req->rsp->nvme_cpl.status.dnr = status->dnr;
+
+	if (info != NULL) {
+		if (nvmf_ns_reservation_apply(ns, info) != 0) {
+			SPDK_ERRLOG("Applying the reservation state returned for nsid %u failed\n", ns->nsid);
+		} else if (nvmf_subsystem_update_ns(subsystem, nvmf_ns_reservation_forward_pg_done,
+						    req) == 0) {
+			return;
+		}
+	}
+	nvmf_ns_reservation_finish(subsystem, ns, req);
+}
+
+/*
+ * Hand the command to the target owning the shared state. Returns 0 when it took
+ * the command, -EAGAIN when this target owns the state, or a negated errno.
+ */
+static int
+nvmf_ns_reservation_forward(struct spdk_nvmf_ns *ns, const struct nvmf_resv_issuer *who,
+			    struct spdk_nvmf_request *req)
+{
+	struct nvmf_ns_reservation_forwarded *ctx;
+	uint8_t data[16] = {};
+	size_t len = 0;
+	int rc;
+
+	if (req->iovcnt > 0) {
+		struct spdk_iov_xfer ix;
+
+		len = spdk_min(req->length, (uint32_t)sizeof(data));
+		spdk_iov_xfer_init(&ix, req->iov, req->iovcnt);
+		spdk_iov_xfer_to_buf(&ix, data, len);
+	}
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL) {
+		return -ENOMEM;
+	}
+	ctx->req = req;
+	ctx->ns = ns;
+	rc = g_reservation_ops.forward(ns, who->hostid, who->hostnqn, &req->cmd->nvme_cmd, data, len,
+				       nvmf_ns_reservation_forwarded_done, ctx);
+	if (rc != 0) {
+		free(ctx);
+	}
+	return rc;
+}
+
 static void
 nvmf_ns_reservation_update_state(struct spdk_nvmf_ns *ns,
-				 struct spdk_nvmf_ctrlr *ctrlr,
+				 const struct nvmf_resv_issuer *who,
 				 struct spdk_nvmf_request *req,
 				 enum spdk_nvme_nvm_opcode opc)
 {
@@ -4305,10 +4497,25 @@ nvmf_ns_reservation_update_state(struct spdk_nvmf_ns *ns,
 		return;
 	}
 
+	/* A shared state is changed only where it is owned; a command executed for another
+	 * target is never forwarded again */
+	if (g_reservation_ops.forward != NULL && req->qpair != NULL &&
+	    nvmf_ns_reservation_is_shared(ns)) {
+		status = nvmf_ns_reservation_forward(ns, who, req);
+		if (status == 0) {
+			return;
+		}
+		if (status != -EAGAIN) {
+			_nvmf_ns_reservation_update_done(ns->subsystem, req, status);
+			return;
+		}
+		status = 0;
+	}
+
 	if (nvmf_ns_reservation_stores(ns)) {
 		persist = calloc(1, sizeof(*persist));
 		if (persist == NULL) {
-			_nvmf_ns_reservation_update_done(ctrlr->subsys, req, -ENOMEM);
+			_nvmf_ns_reservation_update_done(ns->subsystem, req, -ENOMEM);
 			return;
 		}
 		persist->req = req;
@@ -4318,13 +4525,13 @@ nvmf_ns_reservation_update_state(struct spdk_nvmf_ns *ns,
 
 	switch (opc) {
 	case SPDK_NVME_OPC_RESERVATION_REGISTER:
-		update_sgroup = nvmf_ns_reservation_register(ns, ctrlr, req);
+		update_sgroup = nvmf_ns_reservation_register_as(ns, who, req);
 		break;
 	case SPDK_NVME_OPC_RESERVATION_ACQUIRE:
-		update_sgroup = nvmf_ns_reservation_acquire(ns, ctrlr, req);
+		update_sgroup = nvmf_ns_reservation_acquire_as(ns, who, req);
 		break;
 	case SPDK_NVME_OPC_RESERVATION_RELEASE:
-		update_sgroup = nvmf_ns_reservation_release(ns, ctrlr, req);
+		update_sgroup = nvmf_ns_reservation_release_as(ns, who, req);
 		break;
 	default:
 		break;
@@ -4346,16 +4553,16 @@ nvmf_ns_reservation_update_state(struct spdk_nvmf_ns *ns,
 			return;
 		}
 		free(persist);
-		status = nvmf_subsystem_update_ns(ctrlr->subsys, _nvmf_ns_reservation_update_done, req);
+		status = nvmf_subsystem_update_ns(ns->subsystem, _nvmf_ns_reservation_update_done, req);
 		if (status == 0) {
 			return;
 		}
-		_nvmf_ns_reservation_update_done(ctrlr->subsys, req, status);
+		_nvmf_ns_reservation_update_done(ns->subsystem, req, status);
 		return;
 	}
 
 	free(persist);
-	_nvmf_ns_reservation_update_done(ctrlr->subsys, req, status);
+	_nvmf_ns_reservation_update_done(ns->subsystem, req, status);
 }
 
 /*
@@ -4498,17 +4705,85 @@ spdk_nvmf_ns_reload_reservation(struct spdk_nvmf_subsystem *subsystem, uint32_t 
 	return 0;
 }
 
+int
+spdk_nvmf_ns_reservation_execute(struct spdk_nvmf_subsystem *subsystem, uint32_t nsid,
+				 const struct spdk_uuid *hostid, const char *hostnqn,
+				 const struct spdk_nvme_cmd *cmd, const void *data,
+				 size_t data_len, spdk_nvmf_ns_reservation_execute_cb cb_fn,
+				 void *cb_arg)
+{
+	struct nvmf_ns_reservation_exec *exec;
+
+	switch (cmd->opc) {
+	case SPDK_NVME_OPC_RESERVATION_REGISTER:
+	case SPDK_NVME_OPC_RESERVATION_ACQUIRE:
+	case SPDK_NVME_OPC_RESERVATION_RELEASE:
+		break;
+	default:
+		return -EINVAL;
+	}
+	if (data_len > sizeof(exec->data) || (data_len > 0 && data == NULL)) {
+		return -EINVAL;
+	}
+	if (_nvmf_subsystem_get_ns(subsystem, nsid) == NULL) {
+		return -ENOENT;
+	}
+
+	exec = calloc(1, sizeof(*exec));
+	if (exec == NULL) {
+		return -ENOMEM;
+	}
+	exec->cmd.nvme_cmd = *cmd;
+	exec->cmd.nvme_cmd.nsid = nsid;
+	if (data_len > 0) {
+		memcpy(exec->data, data, data_len);
+		exec->req.iov[0].iov_base = exec->data;
+		exec->req.iov[0].iov_len = data_len;
+		exec->req.iovcnt = 1;
+		exec->req.length = (uint32_t)data_len;
+	}
+	exec->req.cmd = &exec->cmd;
+	exec->req.rsp = &exec->rsp;
+	spdk_uuid_copy(&exec->hostid, hostid);
+	snprintf(exec->hostnqn, sizeof(exec->hostnqn), "%s", hostnqn ? hostnqn : "");
+	exec->subsystem = subsystem;
+	exec->thread = spdk_get_thread();
+	exec->cb_fn = cb_fn;
+	exec->cb_arg = cb_arg;
+
+	spdk_thread_send_msg(subsystem->thread, nvmf_ns_reservation_request, &exec->req);
+	return 0;
+}
+
 void
 nvmf_ns_reservation_request(void *ctx)
 {
 	struct spdk_nvmf_request *req = (struct spdk_nvmf_request *)ctx;
 	struct spdk_nvme_cmd *cmd = &req->cmd->nvme_cmd;
-	struct spdk_nvmf_ctrlr *ctrlr = req->qpair->ctrlr;
+	struct nvmf_ns_reservation_exec *exec = nvmf_ns_reservation_exec_of(req);
+	struct spdk_nvmf_subsystem *subsystem;
+	struct nvmf_resv_issuer who;
 	uint32_t nsid;
 	struct spdk_nvmf_ns *ns;
 
+	if (exec != NULL) {
+		subsystem = exec->subsystem;
+		who.hostid = &exec->hostid;
+		who.hostnqn = exec->hostnqn;
+	} else {
+		subsystem = req->qpair->ctrlr->subsys;
+		who.hostid = &req->qpair->ctrlr->hostid;
+		who.hostnqn = req->qpair->ctrlr->hostnqn;
+	}
+
 	nsid = cmd->nsid;
-	ns = _nvmf_subsystem_get_ns(ctrlr->subsys, nsid);
+	ns = _nvmf_subsystem_get_ns(subsystem, nsid);
+	if (exec != NULL && ns == NULL) {
+		/* Removed while the forwarded command was on its way */
+		req->rsp->nvme_cpl.status.sc = SPDK_NVME_SC_INVALID_NAMESPACE_OR_FORMAT;
+		spdk_thread_send_msg(exec->thread, nvmf_ns_reservation_exec_complete, exec);
+		return;
+	}
 	assert(ns != NULL);
 
 	/* Report is a read-only command and can always be executed */
@@ -4520,7 +4795,7 @@ nvmf_ns_reservation_request(void *ctx)
 		/* Remaining commands modify reservation state and must be serialized.
 		 * These complete asynchronously after state propagates to poll groups
 		 */
-		nvmf_ns_reservation_update_state(ns, ctrlr, req, cmd->opc);
+		nvmf_ns_reservation_update_state(ns, &who, req, cmd->opc);
 	}
 }
 

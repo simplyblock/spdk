@@ -1568,6 +1568,19 @@ struct spdk_nvmf_reservation_info {
  */
 typedef void (*spdk_nvmf_ns_reservation_update_cb)(void *cb_arg, int rc);
 
+/**
+ * Completion of a reservation command forwarded to another target.
+ *
+ * \param cb_arg Argument passed to the forward operation.
+ * \param status The command's status as the other target completed it.
+ * \param info The namespace's reservation state after the command, or NULL when
+ * the other target did not return it. The forwarding target applies it before it
+ * completes the command.
+ */
+typedef void (*spdk_nvmf_ns_reservation_forward_cb)(void *cb_arg,
+		const struct spdk_nvme_status *status,
+		const struct spdk_nvmf_reservation_info *info);
+
 struct spdk_nvmf_ns_reservation_ops {
 	/* Checks if the namespace supports the Persist Through Power Loss capability. */
 	bool (*is_ptpl_capable)(const struct spdk_nvmf_ns *ns);
@@ -1597,6 +1610,18 @@ struct spdk_nvmf_ns_reservation_ops {
 	 * those Persist Through Power Loss covers, and load replaces the namespace's
 	 * state with whatever it returns. */
 	bool (*is_shared)(const struct spdk_nvmf_ns *ns);
+
+	/* Optional. Carries a Register, Acquire, or Release that arrived on this target
+	 * to the target that owns the namespace's shared state, which executes it as the
+	 * host that sent it (spdk_nvmf_ns_reservation_execute()). Called on the
+	 * subsystem's thread with the command at the head of the namespace's reservation
+	 * queue. Returns 0 when the command was taken, and cb_fn is then called on the
+	 * subsystem's thread; -EAGAIN when this target owns the state and executes the
+	 * command itself; any other negated errno fails the command. */
+	int (*forward)(const struct spdk_nvmf_ns *ns, const struct spdk_uuid *hostid,
+		       const char *hostnqn, const struct spdk_nvme_cmd *cmd,
+		       const void *data, size_t data_len,
+		       spdk_nvmf_ns_reservation_forward_cb cb_fn, void *cb_arg);
 };
 
 /**
@@ -1631,6 +1656,45 @@ typedef void (*spdk_nvmf_ns_reservation_reload_cb)(void *cb_arg, int rc);
  */
 int spdk_nvmf_ns_reload_reservation(struct spdk_nvmf_subsystem *subsystem, uint32_t nsid,
 				    spdk_nvmf_ns_reservation_reload_cb cb_fn, void *cb_arg);
+
+/**
+ * Completion of spdk_nvmf_ns_reservation_execute().
+ *
+ * \param cb_arg Argument passed to spdk_nvmf_ns_reservation_execute().
+ * \param status The command's status, as a controller would have completed it.
+ */
+typedef void (*spdk_nvmf_ns_reservation_execute_cb)(void *cb_arg,
+		const struct spdk_nvme_status *status);
+
+/**
+ * Execute a Reservation Register, Acquire, or Release on a namespace on behalf of
+ * a host that has no controller on this target, as the target owning a shared
+ * reservation state does for a command another target forwarded to it.
+ *
+ * The command is queued with the namespace's other reservation commands, stored
+ * like them, and never forwarded again. cb_fn is called on the thread that called
+ * this function.
+ *
+ * \param subsystem The subsystem.
+ * \param nsid The namespace.
+ * \param hostid The host identifier the command acts as.
+ * \param hostnqn The host's NQN, for logging.
+ * \param cmd The command. Its opcode selects the operation and its CDW10 the
+ * action; nsid is ignored.
+ * \param data The command's data: the register or acquire data structure, or
+ * the release's current key.
+ * \param data_len Length of data, at most 16 bytes.
+ * \param cb_fn Called with the command's status.
+ * \param cb_arg Argument passed to cb_fn.
+ *
+ * \return 0 if the command was queued, -EINVAL for another opcode or a data
+ * length over 16 bytes, -ENOENT if there is no such namespace, or -ENOMEM.
+ */
+int spdk_nvmf_ns_reservation_execute(struct spdk_nvmf_subsystem *subsystem, uint32_t nsid,
+				     const struct spdk_uuid *hostid, const char *hostnqn,
+				     const struct spdk_nvme_cmd *cmd, const void *data,
+				     size_t data_len, spdk_nvmf_ns_reservation_execute_cb cb_fn,
+				     void *cb_arg);
 
 /* Largest buffer spdk_nvmf_reservation_info_encode() needs. */
 #define SPDK_NVMF_RESERVATION_INFO_ENCODED_MAX_LEN	(32 + SPDK_NVMF_MAX_NUM_REGISTRANTS * 24)
