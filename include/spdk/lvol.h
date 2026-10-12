@@ -339,8 +339,11 @@ void spdk_lvs_set_signal_switch(struct spdk_lvol_store *lvs);
  * thread once held IO has drained; it is not called when -ENOENT is returned.
  *  hold:    a leading LVS holds client IO in the frozen-IO queue (no port change).
  *  release: grant; held IO executes on the (still leading) LVS.
- *  fence:   non-leader, LVS ports blocked, held IO returned as a path error
- *           (ANA inaccessible); the 10 s rule-removal poller leaves a fenced LVS blocked.
+ *  fence:   non-leader, the client (subsystem) port blocked, held IO returned as a path
+ *           error (ANA inaccessible). The hublvol (inter-node) port is NOT blocked: the
+ *           returning peer must be able to reconnect to it to resync, otherwise its restart
+ *           and the unfence (which waits for that resync) deadlock. A fenced blobstore
+ *           rejects writes, so a hublvol connection cannot write through a fenced LVS.
  *  unfence: clears the fence marker; ports are reopened by the control plane's
  *           restart flow, not here.
  */

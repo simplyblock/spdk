@@ -3621,13 +3621,10 @@ spdk_lvs_remove_rules_poller(void *cb_arg)
 	struct spdk_lvs_req *req = cb_arg;
 	struct spdk_lvol_store *lvs = req->lvol_store;
 	spdk_poller_unregister(&req->poller);
-	if (lvs->ha_fenced) {
-		/* Two-node arbitration: a fenced LVS stays blocked until the control
-		 * plane unfences it and re-admits the node (invariant 6). */
-		SPDK_NOTICELOG("Rule removal skipped: lvs groupid %" PRIu64 " is fenced.\n", lvs->groupid);
-	} else {
-		remove_reject_hublvol_port(lvs->hublvol_port);
-	}
+	/* Only the hublvol port rule is lifted here, also on a fenced LVS: the two-node
+	 * fence blocks just the client port (which this poller never touches), and the
+	 * hublvol port must reopen so that the returning peer can resync. */
+	remove_reject_hublvol_port(lvs->hublvol_port);
 	free(req);
 	return -1;
 }
@@ -3985,10 +3982,9 @@ spdk_lvs_ha_fence(uint64_t groupid, spdk_lvs_ha_cb cb_fn, void *cb_arg)
 	}
 	lvs->ha_fenced = true;
 	lvs->ha_held = false;
+	/* Client port only: blocking the hublvol port too would stop the returning peer
+	 * from reconnecting and resyncing, and unfence waits for that resync (deadlock). */
 	block_port(lvs->subsystem_port);
-	if (lvs->node_role != NODE_TERTIARY && lvs->hublvol_port != 0) {
-		block_port(lvs->hublvol_port);
-	}
 	lvs->update_in_progress = false;
 	lvs->leader = false;
 	spdk_bs_set_ha_fenced(lvs->blobstore, true);

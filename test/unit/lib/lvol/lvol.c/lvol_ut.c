@@ -3927,7 +3927,8 @@ lvol_ha_release_grant(void)
 	ha_free_lvs(lvs);
 }
 
-/* Fence: non-leader, ports blocked, blobstore fenced, held IO released as path error. */
+/* Fence: non-leader, client port blocked (never the hublvol port), blobstore fenced,
+ * held IO released as path error. */
 static void
 lvol_ha_fence(void)
 {
@@ -3943,7 +3944,10 @@ lvol_ha_fence(void)
 	CU_ASSERT(lvol.leader == false);
 	CU_ASSERT(g_ha_bs_fenced_set == 1);
 	CU_ASSERT(g_ha_bs_leader_set == 0);
-	CU_ASSERT(g_ha_port_block_cnt == 2); /* client subsystem port and hublvol port */
+	/* Only the client subsystem port: the returning peer must be able to reach the
+	 * hublvol port to resync, and unfence waits for that resync. */
+	CU_ASSERT(g_ha_port_block_cnt == 1);
+	CU_ASSERT(g_ha_last_blocked_port == 4420);
 	CU_ASSERT(g_ha_bs_release_cnt == 1);
 	CU_ASSERT(g_ha_cb_cnt == 1);
 	CU_ASSERT(spdk_lvs_ha_is_fenced(14) == true);
@@ -3954,7 +3958,7 @@ lvol_ha_fence(void)
 	TAILQ_REMOVE(&lvs->lvols, &lvol, link);
 	ha_free_lvs(lvs);
 
-	/* A tertiary only blocks its client port. */
+	/* A tertiary blocks its client port too. */
 	lvs = ha_alloc_lvs(15, true, NODE_TERTIARY);
 	CU_ASSERT(spdk_lvs_ha_fence(15, NULL, NULL) == 0);
 	CU_ASSERT(g_ha_port_block_cnt == 1);
@@ -3978,19 +3982,25 @@ lvol_ha_unfence(void)
 	ha_free_lvs(lvs);
 }
 
-/* The 10 s rule-removal poller never lifts the rules of a fenced lvs. */
+/* The 10 s rule-removal poller only ever lifts the hublvol port rule, on a fenced lvs
+ * too (the fence does not own that port); the fence's client-port block is untouched. */
 static void
 lvol_ha_rules_poller_respects_fence(void)
 {
 	struct spdk_lvol_store *lvs = ha_alloc_lvs(17, true, NODE_PRIMARY);
 	struct spdk_lvs_req *req;
 
-	lvs->ha_fenced = true;
+	CU_ASSERT(spdk_lvs_ha_fence(17, NULL, NULL) == 0);
+	CU_ASSERT(g_ha_port_block_cnt == 1);
+	CU_ASSERT(g_ha_last_blocked_port == 4420);
 	req = calloc(1, sizeof(*req));
 	SPDK_CU_ASSERT_FATAL(req != NULL);
 	req->lvol_store = lvs;
 	spdk_lvs_remove_rules_poller(req);
-	CU_ASSERT(g_ha_port_unblock_cnt == 0);
+	CU_ASSERT(g_ha_port_unblock_cnt == 1); /* the hublvol port rule */
+	CU_ASSERT(g_ha_port_block_cnt == 1);   /* nothing re-blocked */
+	CU_ASSERT(lvs->ha_fenced == true);
+	g_ha_port_unblock_cnt = 0;
 
 	lvs->ha_fenced = false;
 	req = calloc(1, sizeof(*req));
