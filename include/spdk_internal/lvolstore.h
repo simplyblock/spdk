@@ -353,9 +353,12 @@ struct spdk_lvol_store {
 	/* Two-node arbitration (sbcli docs/design/two-node-arbitration.md):
 	 * ha_held: client writes are held in the frozen-IO queue awaiting a verdict;
 	 * ha_fenced: the LVS was fenced; its client port stays blocked (the hublvol port is
-	 *            never blocked by the fence, so the returning peer can reconnect). */
+	 *            never blocked by the fence, so the returning peer can reconnect);
+	 * ha_demoted: set when the control plane demotes the LVS (spdk_set_leader_all with
+	 *            leader=false), cleared on promotion; consumed by spdk_lvs_ha_take_demoted. */
 	bool				ha_held;
 	bool				ha_fenced;
+	bool				ha_demoted;
 	bool 				read_only;
 	bool				skip_redirecting;
 	node_role_t 		node_role;

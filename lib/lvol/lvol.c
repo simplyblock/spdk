@@ -4032,6 +4032,35 @@ spdk_lvs_ha_is_fenced(uint64_t groupid)
 	return fenced;
 }
 
+int
+spdk_lvs_ha_is_leader(uint64_t groupid)
+{
+	struct spdk_lvol_store *lvs;
+	int rc;
+
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+	lvs = lvs_ha_find_locked(groupid);
+	rc = lvs == NULL ? -ENOENT : (lvs->leader ? 1 : 0);
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+	return rc;
+}
+
+bool
+spdk_lvs_ha_take_demoted(uint64_t groupid)
+{
+	struct spdk_lvol_store *lvs;
+	bool demoted = false;
+
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+	lvs = lvs_ha_find_locked(groupid);
+	if (lvs != NULL && lvs->ha_demoted) {
+		demoted = true;
+		lvs->ha_demoted = false;
+	}
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+	return demoted;
+}
+
 /* END two-node arbitration */
 
 int
@@ -7948,6 +7977,9 @@ spdk_lvol_set_leader_cpl(void *cb_arg, int lvolerrno)
 		}
 	}
 	lvs->leader = lvs_leader;
+	/* Two-node arbitration: a demoted LVS no longer writes, so it holds
+	 * no solo grant; the JC resets its HA state (spdk_lvs_ha_take_demoted). */
+	lvs->ha_demoted = !lvs_leader;
 
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
 

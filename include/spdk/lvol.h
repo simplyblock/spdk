@@ -346,6 +346,10 @@ void spdk_lvs_set_signal_switch(struct spdk_lvol_store *lvs);
  *           rejects writes, so a hublvol connection cannot write through a fenced LVS.
  *  unfence: clears the fence marker; ports are reopened by the control plane's
  *           restart flow, not here.
+ *  is_leader:     1 if the LVS leads, 0 if not, -ENOENT.
+ *  take_demoted:  true once after the control plane demoted the LVS to follower
+ *                 (spdk_set_leader_all with leader=false) and it was not promoted since;
+ *                 the JC resets the LVS's HA state then (a follower holds no solo grant).
  */
 typedef void (*spdk_lvs_ha_cb)(void *cb_arg, int rc);
 int spdk_lvs_ha_hold(uint64_t groupid);
@@ -353,6 +357,8 @@ int spdk_lvs_ha_release(uint64_t groupid, spdk_lvs_ha_cb cb_fn, void *cb_arg);
 int spdk_lvs_ha_fence(uint64_t groupid, spdk_lvs_ha_cb cb_fn, void *cb_arg);
 int spdk_lvs_ha_unfence(uint64_t groupid);
 bool spdk_lvs_ha_is_fenced(uint64_t groupid);
+int spdk_lvs_ha_is_leader(uint64_t groupid);
+bool spdk_lvs_ha_take_demoted(uint64_t groupid);
 void spdk_lvs_open_hub_bdev(void * cb_arg);
 void spdk_lvs_connect_hublvol(struct spdk_lvol_store *lvs, const char *remote_bdev);
 void spdk_lvs_set_read_only(struct spdk_lvol_store *lvs, bool status);

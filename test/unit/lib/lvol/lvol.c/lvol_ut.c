@@ -3788,6 +3788,14 @@ static int g_ha_port_unblock_cnt;
 static int g_ha_last_blocked_port;
 static int g_ha_cb_cnt;
 
+/* spdk_set_leader_all (demotion test) links the hublvol reconnect path; never called there
+ * for a primary lvs. */
+DEFINE_STUB(spdk_bdev_open_ext, int, (const char *bdev_name, bool write,
+				      spdk_bdev_event_cb_t event_cb, void *event_ctx, struct spdk_bdev_desc **desc), -ENODEV);
+DEFINE_STUB_V(spdk_bdev_close, (struct spdk_bdev_desc *desc));
+DEFINE_STUB_V(spdk_bs_drain_channel_queued, (struct spdk_blob_store *bs,
+		struct spdk_hublvol_channels *ch_list, int count, spdk_drain_op_cpl cb_fn, void *cb_arg));
+
 int
 spdk_bs_ha_hold_send_msg(struct spdk_blob_store *bs)
 {
@@ -3885,6 +3893,8 @@ lvol_ha_unknown_groupid(void)
 	CU_ASSERT(spdk_lvs_ha_fence(9999, ha_cb, NULL) == -ENOENT);
 	CU_ASSERT(spdk_lvs_ha_unfence(9999) == -ENOENT);
 	CU_ASSERT(spdk_lvs_ha_is_fenced(9999) == false);
+	CU_ASSERT(spdk_lvs_ha_is_leader(9999) == -ENOENT);
+	CU_ASSERT(spdk_lvs_ha_take_demoted(9999) == false);
 	CU_ASSERT(g_ha_cb_cnt == 0);
 }
 
@@ -4011,6 +4021,42 @@ lvol_ha_rules_poller_respects_fence(void)
 	ha_free_lvs(lvs);
 }
 
+/* is_leader follows lvs->leader; a fenced lvs is not a leader. */
+static void
+lvol_ha_is_leader(void)
+{
+	struct spdk_lvol_store *lvs = ha_alloc_lvs(18, true, NODE_PRIMARY);
+
+	CU_ASSERT(spdk_lvs_ha_is_leader(18) == 1);
+	CU_ASSERT(spdk_lvs_ha_fence(18, NULL, NULL) == 0);
+	CU_ASSERT(spdk_lvs_ha_is_leader(18) == 0);
+	ha_free_lvs(lvs);
+}
+
+/* A control-plane demotion (spdk_set_leader_all, leader=false) is reported once to the
+ * JC through take_demoted; a promotion clears a pending report. */
+static void
+lvol_ha_demotion_reported_once(void)
+{
+	struct spdk_lvol_store *lvs = ha_alloc_lvs(19, true, NODE_PRIMARY);
+
+	CU_ASSERT(spdk_lvs_ha_take_demoted(19) == false);
+	spdk_set_leader_all(lvs, false, true);
+	CU_ASSERT(lvs->leader == false);
+	CU_ASSERT(spdk_lvs_ha_take_demoted(19) == true);
+	CU_ASSERT(spdk_lvs_ha_take_demoted(19) == false);
+
+	spdk_set_leader_all(lvs, false, true);
+	spdk_set_leader_all(lvs, true, false);
+	CU_ASSERT(lvs->leader == true);
+	CU_ASSERT(spdk_lvs_ha_take_demoted(19) == false);
+
+	/* The fence demotes internally, not through the control plane: not reported. */
+	CU_ASSERT(spdk_lvs_ha_fence(19, NULL, NULL) == 0);
+	CU_ASSERT(spdk_lvs_ha_take_demoted(19) == false);
+	ha_free_lvs(lvs);
+}
+
 /* END two-node arbitration */
 
 
@@ -4030,6 +4076,8 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, lvol_ha_fence);
 	CU_ADD_TEST(suite, lvol_ha_unfence);
 	CU_ADD_TEST(suite, lvol_ha_rules_poller_respects_fence);
+	CU_ADD_TEST(suite, lvol_ha_is_leader);
+	CU_ADD_TEST(suite, lvol_ha_demotion_reported_once);
 
 	suite = CU_add_suite("lvol", NULL, NULL);
 
