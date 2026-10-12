@@ -275,6 +275,17 @@ struct spdk_bs_cluster_alloc {
 	TAILQ_HEAD(, spdk_bs_request_set) waiting;
 };
 
+/* Time (us) of each step of one cluster allocation, until its user write is done. */
+struct spdk_bs_cow_stat {
+	uint64_t	slot_wait;	/* waiting for a free allocation slot */
+	uint64_t	read;		/* CoW read from the backing dev */
+	uint64_t	cow_write;	/* CoW write of the data ranges */
+	uint64_t	md_queue;	/* insert waiting for its extent page batch */
+	uint64_t	md_write;	/* extent page / md write of the batch */
+	uint64_t	user_write;	/* user write after the cluster is inserted */
+	uint64_t	total;
+};
+
 struct spdk_bs_channel {
 	struct spdk_bs_request_set	*req_mem;
 	TAILQ_HEAD(, spdk_bs_request_set) reqs;
@@ -299,6 +310,15 @@ struct spdk_bs_channel {
 	uint32_t			num_need_cluster_alloc;
 	uint32_t			max_need_cluster_alloc;	/* since the queue was last empty */
 	uint64_t			need_cluster_alloc_tsc;	/* when the queue became non-empty */
+	/* Queue time of the op being restarted from need_cluster_alloc, or 0. */
+	uint64_t			resumed_slot_wait_tsc;
+
+	/* Cluster allocation timing over the current interval (sum and max). */
+	struct spdk_bs_cow_stat		cow_stat_sum;
+	struct spdk_bs_cow_stat		cow_stat_max;
+	uint32_t			cow_stat_count;
+	uint64_t			cow_stat_tsc;	/* interval start */
+
 	TAILQ_HEAD(, spdk_bs_request_set) queued_io;
 
 	RB_HEAD(blob_esnap_channel_tree, blob_esnap_channel) esnap_channels;

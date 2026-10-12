@@ -34,8 +34,8 @@ static int bs_register_md_thread(struct spdk_blob_store *bs);
 static int bs_unregister_md_thread(struct spdk_blob_store *bs);
 static void blob_close_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno);
 static void blob_insert_cluster_on_md_thread(struct spdk_blob *blob, uint32_t cluster_num,
-		uint64_t cluster, uint32_t *extent_page, struct spdk_blob_md_page *page,
-		bool copy, spdk_blob_op_complete cb_fn, void *cb_arg);
+		uint64_t cluster, uint32_t *extent_page, uint64_t *md_start_tsc,
+		struct spdk_blob_md_page *page, bool copy, spdk_blob_op_complete cb_fn, void *cb_arg);
 static void blob_free_cluster_on_md_thread(struct spdk_blob *blob, uint32_t cluster_num,
 		uint32_t extent_page, struct spdk_blob_md_page *page, spdk_blob_op_complete cb_fn, void *cb_arg);
 
@@ -3628,6 +3628,28 @@ struct spdk_blob_copy_cluster_ctx {
 	struct spdk_bs_cluster_alloc *alloc;
 	bool data_written;	/* CoW data was written to new_cluster */
 	int insert_rc;		/* insert error kept while the cluster is cleared */
+	/* Step times, for the allocation timing (see bs_cow_stat_add()). */
+	uint64_t slot_wait_us;	/* time the op waited for a free slot */
+	uint64_t start_tsc;	/* slot taken */
+	uint64_t read_tsc;	/* CoW read done */
+	uint64_t cow_tsc;	/* CoW write done, insert sent to the md thread */
+	uint64_t md_start_tsc;	/* write of the insert's batch started (set by the md thread) */
+	uint64_t insert_tsc;	/* insert done */
+};
+
+/*
+ * Timing of one cluster allocation, carried to the completion of the user
+ * write that started it.
+ */
+struct bs_cow_trace {
+	spdk_blob_op_complete	cb_fn;	/* the user op's own completion */
+	void			*cb_arg;
+	struct spdk_bs_channel	*ch;
+	spdk_blob_id		blob_id;
+	uint32_t		cluster_num;
+	uint64_t		start_tsc;
+	uint64_t		user_tsc;	/* user write restarted */
+	struct spdk_bs_cow_stat	t;
 };
 
 struct spdk_blob_free_cluster_ctx {
@@ -3679,8 +3701,11 @@ bs_cluster_alloc_put(struct spdk_bs_channel *ch, struct spdk_bs_cluster_alloc *a
 static void
 bs_cluster_alloc_wait(struct spdk_bs_channel *ch, spdk_bs_user_op_t *op)
 {
+	struct spdk_bs_request_set *set = (struct spdk_bs_request_set *)op;
+
+	set->u.user_op.queued_tsc = spdk_get_ticks();
 	if (ch->num_need_cluster_alloc == 0) {
-		ch->need_cluster_alloc_tsc = spdk_get_ticks();
+		ch->need_cluster_alloc_tsc = set->u.user_op.queued_tsc;
 		ch->max_need_cluster_alloc = 0;
 	}
 	TAILQ_INSERT_TAIL(&ch->need_cluster_alloc, op, link);
@@ -3710,8 +3735,133 @@ bs_cluster_alloc_resume(struct spdk_bs_channel *ch)
 					       ch->max_need_cluster_alloc);
 			}
 		}
+		/* bs_allocate_and_copy_cluster() takes the slot wait from here. */
+		ch->resumed_slot_wait_tsc = ((struct spdk_bs_request_set *)op)->u.user_op.queued_tsc;
 		bs_user_op_execute(op);
+		ch->resumed_slot_wait_tsc = 0;
 	}
+}
+
+static uint64_t
+bs_tsc_diff_us(uint64_t start, uint64_t end)
+{
+	return (start == 0 || end < start) ? 0 : bs_ticks_to_us(end - start);
+}
+
+static void
+bs_cow_stat_print(const char *what, struct spdk_bs_channel *ch, const struct spdk_bs_cow_stat *t,
+		  uint32_t div)
+{
+	SPDK_NOTICELOG("%s on %s: n=%u slot_wait=%" PRIu64 " read=%" PRIu64 " cow_write=%" PRIu64
+		       " md_queue=%" PRIu64 " md_write=%" PRIu64 " user_write=%" PRIu64
+		       " total=%" PRIu64 " (us)\n",
+		       what, spdk_thread_get_name(spdk_get_thread()), ch->cow_stat_count,
+		       t->slot_wait / div, t->read / div, t->cow_write / div, t->md_queue / div,
+		       t->md_write / div, t->user_write / div, t->total / div);
+}
+
+/*
+ * Account one finished cluster allocation. Prints it when it took more than
+ * half a second, and once a second (while allocations happen) the average and
+ * max of each step on this channel.
+ */
+static void
+bs_cow_stat_add(struct bs_cow_trace *trace)
+{
+	const uint64_t slow_us = 500 * 1000;
+	const uint64_t interval_us = 1000 * 1000;
+	struct spdk_bs_channel *ch = trace->ch;
+	struct spdk_bs_cow_stat *t = &trace->t;
+	struct spdk_bs_cow_stat *sum = &ch->cow_stat_sum;
+	struct spdk_bs_cow_stat *max = &ch->cow_stat_max;
+	uint64_t now = spdk_get_ticks();
+
+	if (t->total > slow_us) {
+		SPDK_NOTICELOG("CoW slow: blob 0x%" PRIx64 " cl %u slot_wait=%" PRIu64 " read=%" PRIu64
+			       " cow_write=%" PRIu64 " md_queue=%" PRIu64 " md_write=%" PRIu64
+			       " user_write=%" PRIu64 " total=%" PRIu64 " (us)\n",
+			       trace->blob_id, trace->cluster_num, t->slot_wait, t->read, t->cow_write,
+			       t->md_queue, t->md_write, t->user_write, t->total);
+	}
+
+	sum->slot_wait += t->slot_wait;
+	sum->read += t->read;
+	sum->cow_write += t->cow_write;
+	sum->md_queue += t->md_queue;
+	sum->md_write += t->md_write;
+	sum->user_write += t->user_write;
+	sum->total += t->total;
+	max->slot_wait = spdk_max(max->slot_wait, t->slot_wait);
+	max->read = spdk_max(max->read, t->read);
+	max->cow_write = spdk_max(max->cow_write, t->cow_write);
+	max->md_queue = spdk_max(max->md_queue, t->md_queue);
+	max->md_write = spdk_max(max->md_write, t->md_write);
+	max->user_write = spdk_max(max->user_write, t->user_write);
+	max->total = spdk_max(max->total, t->total);
+	ch->cow_stat_count++;
+
+	if (ch->cow_stat_tsc == 0) {
+		ch->cow_stat_tsc = now;
+	} else if (bs_ticks_to_us(now - ch->cow_stat_tsc) >= interval_us) {
+		bs_cow_stat_print("CoW stat avg", ch, sum, ch->cow_stat_count);
+		bs_cow_stat_print("CoW stat max", ch, max, 1);
+		memset(sum, 0, sizeof(*sum));
+		memset(max, 0, sizeof(*max));
+		ch->cow_stat_count = 0;
+		ch->cow_stat_tsc = now;
+	}
+}
+
+/* The user write that started the allocation is done. */
+static void
+bs_cow_trace_cpl(void *cb_arg, int bserrno)
+{
+	struct bs_cow_trace *trace = cb_arg;
+	uint64_t now = spdk_get_ticks();
+
+	if (bserrno == 0) {
+		trace->t.user_write = bs_tsc_diff_us(trace->user_tsc, now);
+		trace->t.total = trace->t.slot_wait + bs_tsc_diff_us(trace->start_tsc, now);
+		bs_cow_stat_add(trace);
+	}
+
+	trace->cb_fn(trace->cb_arg, bserrno);
+	free(trace);
+}
+
+/*
+ * Wrap the completion of the user op that started the allocation, so the
+ * timing covers its write too. Without memory the op just runs untraced.
+ */
+static void
+bs_cow_trace_start(struct spdk_blob_copy_cluster_ctx *ctx, struct spdk_bs_channel *ch,
+		   spdk_bs_user_op_t *op)
+{
+	struct spdk_bs_request_set *set = (struct spdk_bs_request_set *)op;
+	struct bs_cow_trace *trace;
+
+	assert(set->cpl.type == SPDK_BS_CPL_TYPE_BLOB_BASIC);
+
+	trace = calloc(1, sizeof(*trace));
+	if (trace == NULL) {
+		return;
+	}
+
+	trace->cb_fn = set->cpl.u.blob_basic.cb_fn;
+	trace->cb_arg = set->cpl.u.blob_basic.cb_arg;
+	trace->ch = ch;
+	trace->blob_id = ctx->blob->id;
+	trace->cluster_num = ctx->alloc->cluster_num;
+	trace->start_tsc = ctx->start_tsc;
+	trace->user_tsc = spdk_get_ticks();
+	trace->t.slot_wait = ctx->slot_wait_us;
+	trace->t.read = bs_tsc_diff_us(ctx->start_tsc, ctx->read_tsc);
+	trace->t.cow_write = bs_tsc_diff_us(ctx->read_tsc, ctx->cow_tsc);
+	trace->t.md_queue = bs_tsc_diff_us(ctx->cow_tsc, ctx->md_start_tsc);
+	trace->t.md_write = bs_tsc_diff_us(ctx->md_start_tsc, ctx->insert_tsc);
+
+	set->cpl.u.blob_basic.cb_fn = bs_cow_trace_cpl;
+	set->cpl.u.blob_basic.cb_arg = trace;
 }
 
 static void
@@ -3725,6 +3875,11 @@ blob_allocate_and_copy_cluster_cpl(void *cb_arg, int bserrno)
 
 	TAILQ_INIT(&requests);
 	TAILQ_SWAP(&ctx->alloc->waiting, &requests, spdk_bs_request_set, link);
+
+	/* The first op started this allocation: time it until its write is done. */
+	if (bserrno == 0 && !TAILQ_EMPTY(&requests)) {
+		bs_cow_trace_start(ctx, ch, TAILQ_FIRST(&requests));
+	}
 
 	/* Free the slot before running the ops again, so they see this
 	 * cluster as done (or start a new allocation if it failed). */
@@ -3819,6 +3974,8 @@ blob_insert_cluster_cpl(void *cb_arg, int bserrno)
 {
 	struct spdk_blob_copy_cluster_ctx *ctx = cb_arg;
 
+	ctx->insert_tsc = spdk_get_ticks();
+
 	if (bserrno) {
 		if (bserrno == -EEXIST) {
 			/* The metadata insert failed because another thread
@@ -3858,9 +4015,11 @@ blob_write_copy_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 
 	cluster_number = bs_page_to_cluster(ctx->blob->bs, ctx->page);
 	ctx->data_written = true;
+	ctx->cow_tsc = spdk_get_ticks();
 
 	blob_insert_cluster_on_md_thread(ctx->blob, cluster_number, ctx->new_cluster,
-					 &ctx->new_extent_page, ctx->new_cluster_page, true, blob_insert_cluster_cpl, ctx);
+					 &ctx->new_extent_page, &ctx->md_start_tsc, ctx->new_cluster_page,
+					 true, blob_insert_cluster_cpl, ctx);
 }
 
 /*
@@ -3934,6 +4093,8 @@ blob_write_copy(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	uint64_t cluster_lba;
 	int nranges, i;
 
+	ctx->read_tsc = spdk_get_ticks();
+
 	if (bserrno != 0) {
 		/* The read failed, so jump to the final completion handler */
 		bs_sequence_finish(seq, bserrno);
@@ -3979,6 +4140,7 @@ blob_copy(struct spdk_blob_copy_cluster_ctx *ctx, spdk_bs_user_op_t *op, uint64_
 	struct spdk_blob *blob = ctx->blob;
 	uint64_t lba_count = bs_dev_byte_to_lba(blob->back_bs_dev, blob->bs->cluster_sz);
 
+	ctx->read_tsc = ctx->start_tsc;	/* the copy has no separate read */
 	bs_sequence_copy_dev(ctx->seq,
 			     bs_cluster_to_lba(blob->bs, ctx->new_cluster),
 			     src_lba,
@@ -4000,11 +4162,16 @@ bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 	bool can_copy;
 	bool is_valid_range;
 	uint64_t copy_src_lba;
+	uint64_t resumed_tsc;
 	int rc;
 
 	struct spdk_bs_cluster_alloc *alloc;
 
 	ch = spdk_io_channel_get_ctx(_ch);
+
+	/* Set when this op was restarted after waiting for a free slot. */
+	resumed_tsc = ch->resumed_slot_wait_tsc;
+	ch->resumed_slot_wait_tsc = 0;
 
 	/* Round the io_unit offset down to the first page in the cluster */
 	cluster_start_page = bs_io_unit_to_cluster_start(blob, io_unit);
@@ -4099,6 +4266,8 @@ bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 	ctx->alloc = bs_cluster_alloc_get(ch, blob->id, cluster_number);
 	ctx->new_cluster_page = ctx->alloc->page;
 	TAILQ_INSERT_TAIL(&ctx->alloc->waiting, op, link);
+	ctx->start_tsc = spdk_get_ticks();
+	ctx->slot_wait_us = bs_tsc_diff_us(resumed_tsc, ctx->start_tsc);
 
 	if (blob->parent_id != SPDK_BLOBID_INVALID && !is_zeroes) {
 		if (can_copy) {
@@ -4112,8 +4281,12 @@ bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 		}
 
 	} else {
+		/* Nothing to copy. */
+		ctx->read_tsc = ctx->start_tsc;
+		ctx->cow_tsc = ctx->start_tsc;
 		blob_insert_cluster_on_md_thread(ctx->blob, cluster_number, ctx->new_cluster,
-						 &ctx->new_extent_page, ctx->new_cluster_page, false, blob_insert_cluster_cpl, ctx);
+						 &ctx->new_extent_page, &ctx->md_start_tsc, ctx->new_cluster_page,
+						 false, blob_insert_cluster_cpl, ctx);
 	}
 }
 
@@ -4863,6 +5036,11 @@ bs_channel_create(void *io_device, void *ctx_buf)
 
 	TAILQ_INIT(&channel->need_cluster_alloc);
 	channel->num_need_cluster_alloc = 0;
+	channel->resumed_slot_wait_tsc = 0;
+	memset(&channel->cow_stat_sum, 0, sizeof(channel->cow_stat_sum));
+	memset(&channel->cow_stat_max, 0, sizeof(channel->cow_stat_max));
+	channel->cow_stat_count = 0;
+	channel->cow_stat_tsc = 0;
 	TAILQ_INIT(&channel->queued_io);
 	RB_INIT(&channel->esnap_channels);
 
@@ -13376,6 +13554,8 @@ struct spdk_blob_cluster_op_ctx {
 	uint32_t		extent_page;	/* extent page on disk */
 	/* Caller's copy of extent_page; set to 0 when the md thread releases it. */
 	uint32_t		*extent_page_ret;
+	/* Caller's timestamp, set when the write of this insert's batch starts. */
+	uint64_t		*md_start_tsc_ret;
 	struct spdk_blob_md_page *page; /* preallocated extent page */
 	int			rc;
 	bool		copy;
@@ -13766,6 +13946,9 @@ blob_insert_batch_run(void *arg)
 
 		TAILQ_INSERT_TAIL(&ep_insert->batch, ctx, link);
 		ep_insert->batch_size++;
+		if (ctx->md_start_tsc_ret != NULL) {
+			*ctx->md_start_tsc_ret = ep_insert->batch_tsc;
+		}
 		if (ep_insert->oldest_tsc == 0) {
 			ep_insert->oldest_tsc = ctx->queued_tsc;
 		}
@@ -13893,8 +14076,9 @@ blob_insert_cluster_msg(void *arg)
  */
 static void
 blob_insert_cluster_on_md_thread(struct spdk_blob *blob, uint32_t cluster_num,
-				 uint64_t cluster, uint32_t *extent_page, struct spdk_blob_md_page *page,
-				 bool copy, spdk_blob_op_complete cb_fn, void *cb_arg)
+				 uint64_t cluster, uint32_t *extent_page, uint64_t *md_start_tsc,
+				 struct spdk_blob_md_page *page, bool copy, spdk_blob_op_complete cb_fn,
+				 void *cb_arg)
 {
 	struct spdk_blob_cluster_op_ctx *ctx;
 
@@ -13910,6 +14094,7 @@ blob_insert_cluster_on_md_thread(struct spdk_blob *blob, uint32_t cluster_num,
 	ctx->cluster = cluster;
 	ctx->extent_page = *extent_page;
 	ctx->extent_page_ret = extent_page;
+	ctx->md_start_tsc_ret = md_start_tsc;
 	ctx->page = page;
 	ctx->cb_fn = cb_fn;
 	ctx->cb_arg = cb_arg;
