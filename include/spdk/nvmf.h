@@ -1547,6 +1547,8 @@ void spdk_nvmf_rdma_init_hooks(struct spdk_nvme_rdma_hooks *hooks);
 struct spdk_nvmf_registrant_info {
 	uint64_t		rkey;
 	char			host_uuid[SPDK_UUID_STRING_LEN];
+	/* Same-key Registers held by the host; 0 is read as 1 */
+	uint32_t		reg_count;
 };
 
 struct spdk_nvmf_reservation_info {
@@ -1697,7 +1699,7 @@ int spdk_nvmf_ns_reservation_execute(struct spdk_nvmf_subsystem *subsystem, uint
 				     void *cb_arg);
 
 /* Largest buffer spdk_nvmf_reservation_info_encode() needs. */
-#define SPDK_NVMF_RESERVATION_INFO_ENCODED_MAX_LEN	(32 + SPDK_NVMF_MAX_NUM_REGISTRANTS * 24)
+#define SPDK_NVMF_RESERVATION_INFO_ENCODED_MAX_LEN	(32 + SPDK_NVMF_MAX_NUM_REGISTRANTS * 32)
 
 /**
  * Encode reservation information in a compact, versioned, little-endian form,

@@ -2807,6 +2807,7 @@ spdk_nvmf_subsystem_get_max_cntlid(const struct spdk_nvmf_subsystem *subsystem)
 struct _nvmf_ns_registrant {
 	uint64_t		rkey;
 	char			*host_uuid;
+	uint32_t		reg_count;
 };
 
 struct _nvmf_ns_registrants {
@@ -2826,6 +2827,7 @@ struct _nvmf_ns_reservation {
 static const struct spdk_json_object_decoder nvmf_ns_pr_reg_decoders[] = {
 	{"rkey", offsetof(struct _nvmf_ns_registrant, rkey), spdk_json_decode_uint64},
 	{"host_uuid", offsetof(struct _nvmf_ns_registrant, host_uuid), spdk_json_decode_string},
+	{"reg_count", offsetof(struct _nvmf_ns_registrant, reg_count), spdk_json_decode_uint32, true},
 };
 
 static int
@@ -2923,6 +2925,7 @@ nvmf_ns_reservation_load_json(const struct spdk_nvmf_ns *ns,
 	info->num_regs = res.regs.num_regs;
 	for (i = 0; i < res.regs.num_regs; i++) {
 		info->registrants[i].rkey = res.regs.reg[i].rkey;
+		info->registrants[i].reg_count = res.regs.reg[i].reg_count ? res.regs.reg[i].reg_count : 1;
 		snprintf(info->registrants[i].host_uuid, sizeof(info->registrants[i].host_uuid), "%s",
 			 res.regs.reg[i].host_uuid);
 	}
@@ -2993,6 +2996,7 @@ nvmf_ns_reservation_restore(struct spdk_nvmf_ns *ns, struct spdk_nvmf_reservatio
 		}
 		spdk_uuid_parse(&reg->hostid, info->registrants[i].host_uuid);
 		reg->rkey = info->registrants[i].rkey;
+		reg->reg_count = info->registrants[i].reg_count ? info->registrants[i].reg_count : 1;
 		TAILQ_INSERT_TAIL(&ns->registrants, reg, link);
 		if (info->crkey != 0 && !spdk_uuid_compare(&holder_uuid, &reg->hostid)) {
 			holder = reg;
@@ -3108,6 +3112,8 @@ nvmf_ns_reservation_update_json(const struct spdk_nvmf_ns *ns,
 		spdk_json_write_object_begin(w);
 		spdk_json_write_named_uint64(w, "rkey", info->registrants[i].rkey);
 		spdk_json_write_named_string(w, "host_uuid", info->registrants[i].host_uuid);
+		spdk_json_write_named_uint32(w, "reg_count",
+					     info->registrants[i].reg_count ? info->registrants[i].reg_count : 1);
 		spdk_json_write_object_end(w);
 	}
 	spdk_json_write_array_end(w);
@@ -3145,6 +3151,7 @@ nvmf_ns_reservation_info_build(struct spdk_nvmf_ns *ns, struct spdk_nvmf_reserva
 		assert(i < SPDK_NVMF_MAX_NUM_REGISTRANTS);
 		spdk_uuid_fmt_lower(info->registrants[i].host_uuid, sizeof(info->registrants[i].host_uuid),
 				    &reg->hostid);
+		info->registrants[i].reg_count = reg->reg_count;
 		info->registrants[i++].rkey = reg->rkey;
 	}
 
@@ -3190,6 +3197,7 @@ nvmf_ns_reservation_apply(struct spdk_nvmf_ns *ns, const struct spdk_nvmf_reserv
 			return -EINVAL;
 		}
 		reg->rkey = info->registrants[i].rkey;
+		reg->reg_count = info->registrants[i].reg_count ? info->registrants[i].reg_count : 1;
 		TAILQ_INSERT_TAIL(&ns->registrants, reg, link);
 		if (info->rtype && !spdk_uuid_compare(&holder_uuid, &reg->hostid)) {
 			holder = reg;
@@ -3367,6 +3375,7 @@ nvmf_ns_reservation_add_host_registrant(struct spdk_nvmf_ns *ns,
 	}
 
 	reg->rkey = nrkey;
+	reg->reg_count = 1;
 	/* set hostid for the registrant */
 	spdk_uuid_copy(&reg->hostid, who->hostid);
 	TAILQ_INSERT_TAIL(&ns->registrants, reg, link);
@@ -3502,6 +3511,7 @@ nvmf_ns_reservation_register_as(struct spdk_nvmf_ns *ns,
 			        const struct nvmf_resv_issuer *who,
 			        struct spdk_nvmf_request *req)
 {
+	bool release = false;
 	struct spdk_nvme_reservation_register_data key = { 0 };
 	struct spdk_nvme_cmd *cmd = &req->cmd->nvme_cmd;
 	uint8_t rrega, iekey, cptpl, rtype;
@@ -3561,6 +3571,7 @@ nvmf_ns_reservation_register_as(struct spdk_nvmf_ns *ns,
 	 */
 	if (rrega == SPDK_NVME_RESERVE_REPLACE_KEY && key.nrkey == 0 && reg != NULL) {
 		rrega = SPDK_NVME_RESERVE_UNREGISTER_KEY;
+		release = true;
 	}
 
 	switch (rrega) {
@@ -3588,6 +3599,8 @@ nvmf_ns_reservation_register_as(struct spdk_nvmf_ns *ns,
 				status = SPDK_NVME_SC_RESERVATION_CONFLICT;
 				goto exit;
 			}
+			reg->reg_count++;
+			ns->resv_count_changed = true;
 		}
 		break;
 	case SPDK_NVME_RESERVE_UNREGISTER_KEY:
@@ -3596,6 +3609,12 @@ nvmf_ns_reservation_register_as(struct spdk_nvmf_ns *ns,
 				    "with existing registrant key\n");
 			status = SPDK_NVME_SC_RESERVATION_CONFLICT;
 			goto exit;
+		}
+		/* A release only gives back one of the host's same-key Registers */
+		if (release && reg->reg_count > 1) {
+			reg->reg_count--;
+			ns->resv_count_changed = true;
+			break;
 		}
 
 		rtype = ns->rtype;
@@ -3632,6 +3651,9 @@ nvmf_ns_reservation_register_as(struct spdk_nvmf_ns *ns,
 				goto exit;
 			}
 			reg->rkey = key.nrkey;
+			/* Earlier same-key Registers were under the old key, and their releases
+			 * no longer match the current key: one registration remains */
+			reg->reg_count = 1;
 			if (nvmf_ns_reservation_registrant_is_holder(ns, reg)) {
 				ns->crkey = key.nrkey;
 			}
@@ -4351,6 +4373,8 @@ struct nvmf_ns_reservation_persist {
 	struct spdk_nvmf_ns			*ns;
 	struct spdk_nvmf_reservation_info	snapshot;
 	struct spdk_nvmf_reservation_info	info;
+	/* Whether the change reaches the poll groups, or only the store */
+	bool					update_pg;
 };
 
 static bool
@@ -4382,6 +4406,11 @@ nvmf_ns_reservation_persisted(void *cb_arg, int rc)
 		return;
 	}
 
+	if (!ctx->update_pg) {
+		free(ctx);
+		_nvmf_ns_reservation_update_done(subsystem, req, 0);
+		return;
+	}
 	free(ctx);
 	status = nvmf_subsystem_update_ns(subsystem, _nvmf_ns_reservation_update_done, req);
 	if (status != 0) {
@@ -4483,6 +4512,7 @@ nvmf_ns_reservation_update_state(struct spdk_nvmf_ns *ns,
 				 struct spdk_nvmf_request *req,
 				 enum spdk_nvme_nvm_opcode opc)
 {
+	bool count_only;
 	bool update_sgroup = false;
 	struct nvmf_ns_reservation_persist *persist = NULL;
 	int status = 0;
@@ -4537,11 +4567,17 @@ nvmf_ns_reservation_update_state(struct spdk_nvmf_ns *ns,
 		break;
 	}
 
+	/* A command that changed only a registrant's count is stored, and the poll
+	 * groups are left alone */
+	count_only = !update_sgroup && ns->resv_count_changed;
+	ns->resv_count_changed = false;
+
 	/* store the new state, then update reservation information to subsystem's poll group */
-	if (update_sgroup) {
+	if (update_sgroup || count_only) {
 		if (persist != NULL &&
 		    (ns->ptpl_activated || opc == SPDK_NVME_OPC_RESERVATION_REGISTER ||
 		     nvmf_ns_reservation_is_shared(ns))) {
+			persist->update_pg = update_sgroup;
 			nvmf_ns_reservation_info_build(ns, &persist->info);
 			if (g_reservation_ops.update_async != NULL) {
 				g_reservation_ops.update_async(ns, &persist->info,
@@ -4553,6 +4589,10 @@ nvmf_ns_reservation_update_state(struct spdk_nvmf_ns *ns,
 			return;
 		}
 		free(persist);
+		if (count_only) {
+			_nvmf_ns_reservation_update_done(ns->subsystem, req, 0);
+			return;
+		}
 		status = nvmf_subsystem_update_ns(ns->subsystem, _nvmf_ns_reservation_update_done, req);
 		if (status == 0) {
 			return;
@@ -4831,12 +4871,13 @@ spdk_nvmf_get_default_ns_reservation_ops(void)
  *   5  flags (8): bit 0 is ptpl_activated  12  reserved (32)
  *   6  rtype (8)
  *   7  holder (8): index into the registrants, or 0xff for none
- *  32  num_regs entries of host identifier (16 bytes) and rkey (64)
+ *  32  num_regs entries of host identifier (16 bytes), rkey (64), the count
+ *      of same-key Registers (32), and 32 reserved bits
  */
 #define NVMF_RESV_ENC_MAGIC		0x56524253u	/* "SBRV" read as little-endian */
 #define NVMF_RESV_ENC_VERSION		1
 #define NVMF_RESV_ENC_HEADER_LEN	32
-#define NVMF_RESV_ENC_ENTRY_LEN		24
+#define NVMF_RESV_ENC_ENTRY_LEN		32
 #define NVMF_RESV_ENC_NO_HOLDER		0xff
 SPDK_STATIC_ASSERT(SPDK_NVMF_MAX_NUM_REGISTRANTS < NVMF_RESV_ENC_NO_HOLDER, "holder index");
 SPDK_STATIC_ASSERT(SPDK_NVMF_RESERVATION_INFO_ENCODED_MAX_LEN ==
@@ -4890,6 +4931,7 @@ spdk_nvmf_reservation_info_encode(const struct spdk_nvmf_reservation_info *info,
 		}
 		memcpy(e, &uuid, sizeof(uuid));
 		to_le64(e + 16, info->registrants[i].rkey);
+		to_le32(e + 24, info->registrants[i].reg_count ? info->registrants[i].reg_count : 1);
 	}
 
 	return len;
@@ -4931,6 +4973,10 @@ spdk_nvmf_reservation_info_decode(const void *buf, size_t len,
 		spdk_uuid_fmt_lower(info->registrants[i].host_uuid,
 				    sizeof(info->registrants[i].host_uuid), &uuid);
 		info->registrants[i].rkey = from_le64(e + 16);
+		info->registrants[i].reg_count = from_le32(e + 24);
+		if (info->registrants[i].reg_count == 0) {
+			info->registrants[i].reg_count = 1;
+		}
 	}
 	if (info->rtype && holder != NVMF_RESV_ENC_NO_HOLDER) {
 		memcpy(info->holder_uuid, info->registrants[holder].host_uuid,

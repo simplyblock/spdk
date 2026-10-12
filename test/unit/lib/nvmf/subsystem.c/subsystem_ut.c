@@ -4182,6 +4182,158 @@ test_reservation_reload_live_namespace(void)
 	ut_resv_env_fini(&env);
 }
 
+/*
+ * Without pnfs-os 0006 a Linux pNFS client can hold two device nodes for one
+ * namespace, and each registers the same key: the second Register is a no-op
+ * success. Its release is a Replace with a zero key. Taken as an unregistration
+ * at once, freeing one node removed the registration the other node still uses.
+ * A host's same-key Registers are counted, and that release only unregisters at
+ * zero. An explicit Unregister, a preempt, and a different key are unchanged.
+ */
+static void
+ut_reservation_register(struct spdk_nvmf_request *req, struct spdk_nvmf_ctrlr *ctrlr,
+			uint8_t rrega, uint8_t iekey, uint64_t crkey, uint64_t nrkey)
+{
+	ut_reservation_build_register_request(req, rrega, iekey, 0, crkey, nrkey);
+	nvmf_ns_reservation_register(&g_ns, ctrlr, req);
+}
+
+static void
+test_reservation_same_key_registers_are_counted(void)
+{
+	struct spdk_nvmf_request *req;
+	struct spdk_nvme_cpl *rsp;
+
+	ut_reservation_init();
+	req = ut_reservation_build_req(16);
+	SPDK_CU_ASSERT_FATAL(req != NULL);
+	rsp = &req->rsp->nvme_cpl;
+
+	/* Two Registers with the same key, then the first release keeps it */
+	ut_reservation_register(req, &g_ctrlr1_A, SPDK_NVME_RESERVE_REGISTER_KEY, 0, 0, 0xa1);
+	SPDK_CU_ASSERT_FATAL(rsp->status.sc == SPDK_NVME_SC_SUCCESS);
+	ut_reservation_register(req, &g_ctrlr1_A, SPDK_NVME_RESERVE_REGISTER_KEY, 0, 0, 0xa1);
+	SPDK_CU_ASSERT_FATAL(rsp->status.sc == SPDK_NVME_SC_SUCCESS);
+	ut_reservation_register(req, &g_ctrlr1_A, SPDK_NVME_RESERVE_REPLACE_KEY, 0, 0xa1, 0);
+	CU_ASSERT(rsp->status.sc == SPDK_NVME_SC_SUCCESS);
+	CU_ASSERT(nvmf_ns_reservation_get_registrant(&g_ns, &g_ctrlr1_A.hostid) != NULL);
+	/* ...and the second release unregisters */
+	ut_reservation_register(req, &g_ctrlr1_A, SPDK_NVME_RESERVE_REPLACE_KEY, 0, 0xa1, 0);
+	CU_ASSERT(rsp->status.sc == SPDK_NVME_SC_SUCCESS);
+	CU_ASSERT(nvmf_ns_reservation_get_registrant(&g_ns, &g_ctrlr1_A.hostid) == NULL);
+
+	/* An explicit Unregister ignores the count */
+	ut_reservation_register(req, &g_ctrlr1_A, SPDK_NVME_RESERVE_REGISTER_KEY, 0, 0, 0xa1);
+	ut_reservation_register(req, &g_ctrlr1_A, SPDK_NVME_RESERVE_REGISTER_KEY, 0, 0, 0xa1);
+	ut_reservation_register(req, &g_ctrlr1_A, SPDK_NVME_RESERVE_UNREGISTER_KEY, 0, 0xa1, 0);
+	CU_ASSERT(rsp->status.sc == SPDK_NVME_SC_SUCCESS);
+	CU_ASSERT(nvmf_ns_reservation_get_registrant(&g_ns, &g_ctrlr1_A.hostid) == NULL);
+
+	/* A preempt removes a counted registration */
+	ut_reservation_register(req, &g_ctrlr1_A, SPDK_NVME_RESERVE_REGISTER_KEY, 0, 0, 0xa1);
+	ut_reservation_register(req, &g_ctrlr1_A, SPDK_NVME_RESERVE_REGISTER_KEY, 0, 0, 0xa1);
+	ut_reservation_register(req, &g_ctrlr_B, SPDK_NVME_RESERVE_REGISTER_KEY, 0, 0, 0xb1);
+	ut_reservation_build_acquire_request(req, SPDK_NVME_RESERVE_PREEMPT, 0,
+					     SPDK_NVME_RESERVE_EXCLUSIVE_ACCESS_REG_ONLY, 0xb1, 0xa1);
+	nvmf_ns_reservation_acquire(&g_ns, &g_ctrlr_B, req);
+	CU_ASSERT(rsp->status.sc == SPDK_NVME_SC_SUCCESS);
+	CU_ASSERT(nvmf_ns_reservation_get_registrant(&g_ns, &g_ctrlr1_A.hostid) == NULL);
+
+	/* A different key from a registered host is still a conflict */
+	ut_reservation_register(req, &g_ctrlr_C, SPDK_NVME_RESERVE_REGISTER_KEY, 0, 0, 0xc1);
+	ut_reservation_register(req, &g_ctrlr_C, SPDK_NVME_RESERVE_REGISTER_KEY, 0, 0, 0xc2);
+	CU_ASSERT(rsp->status.sc == SPDK_NVME_SC_RESERVATION_CONFLICT);
+
+	/* A Replace to a new key leaves one registration under it: earlier holders of
+	 * the old key release with a current key that no longer matches */
+	ut_reservation_register(req, &g_ctrlr_C, SPDK_NVME_RESERVE_REGISTER_KEY, 0, 0, 0xc1);
+	ut_reservation_register(req, &g_ctrlr_C, SPDK_NVME_RESERVE_REPLACE_KEY, 0, 0xc1, 0xc3);
+	CU_ASSERT(rsp->status.sc == SPDK_NVME_SC_SUCCESS);
+	ut_reservation_register(req, &g_ctrlr_C, SPDK_NVME_RESERVE_REPLACE_KEY, 0, 0xc3, 0);
+	CU_ASSERT(rsp->status.sc == SPDK_NVME_SC_SUCCESS);
+	CU_ASSERT(nvmf_ns_reservation_get_registrant(&g_ns, &g_ctrlr_C.hostid) == NULL);
+
+	ut_reservation_free_req(req);
+	ut_reservation_deinit();
+}
+
+/* The count survives the persisted state: the JSON file and the compact encoding */
+static void
+test_reservation_register_count_is_persisted(void)
+{
+	struct spdk_nvmf_request *req;
+	struct spdk_nvme_cpl *rsp;
+	struct spdk_nvmf_reservation_info info, out;
+	uint8_t buf[SPDK_NVMF_RESERVATION_INFO_ENCODED_MAX_LEN];
+	char bdev_uuid[SPDK_UUID_STRING_LEN], host_uuid[SPDK_UUID_STRING_LEN];
+	uint64_t gen = 0;
+	size_t len;
+	FILE *f;
+	int rc;
+
+	ut_reservation_init();
+	req = ut_reservation_build_req(16);
+	SPDK_CU_ASSERT_FATAL(req != NULL);
+	rsp = &req->rsp->nvme_cpl;
+
+	/* JSON: two Registers with PTPL, persisted, loaded back into a cleared namespace */
+	g_ns.ptpl_file = "/tmp/Ns1PR-count.cfg";
+	ut_reservation_build_register_request(req, SPDK_NVME_RESERVE_REGISTER_KEY, 0,
+					      SPDK_NVME_RESERVE_PTPL_PERSIST_POWER_LOSS, 0, 0xa1);
+	nvmf_ns_reservation_register(&g_ns, &g_ctrlr1_A, req);
+	nvmf_ns_reservation_register(&g_ns, &g_ctrlr1_A, req);
+	SPDK_CU_ASSERT_FATAL(rsp->status.sc == SPDK_NVME_SC_SUCCESS);
+	SPDK_CU_ASSERT_FATAL(nvmf_ns_update_reservation_info(&g_ns) == 0);
+	rc = nvmf_ns_reservation_load(&g_ns, &info);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+	SPDK_CU_ASSERT_FATAL(nvmf_ns_reservation_apply(&g_ns, &info) == 0);
+	ut_reservation_register(req, &g_ctrlr1_A, SPDK_NVME_RESERVE_REPLACE_KEY, 0, 0xa1, 0);
+	CU_ASSERT(nvmf_ns_reservation_get_registrant(&g_ns, &g_ctrlr1_A.hostid) != NULL);
+
+	/* A file written before the count existed loads as one registration */
+	spdk_uuid_fmt_lower(bdev_uuid, sizeof(bdev_uuid), spdk_bdev_get_uuid(g_ns.bdev));
+	spdk_uuid_fmt_lower(host_uuid, sizeof(host_uuid), &g_ctrlr1_A.hostid);
+	f = fopen(g_ns.ptpl_file, "w");
+	SPDK_CU_ASSERT_FATAL(f != NULL);
+	fprintf(f, "{\"ptpl\": true, \"rtype\": 0, \"crkey\": 0, \"bdev_uuid\": \"%s\", "
+		"\"holder_uuid\": \"\", \"registrants\": [{\"rkey\": %u, \"host_uuid\": \"%s\"}]}",
+		bdev_uuid, 0xa1, host_uuid);
+	fclose(f);
+	rc = nvmf_ns_reservation_load(&g_ns, &info);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+	SPDK_CU_ASSERT_FATAL(nvmf_ns_reservation_apply(&g_ns, &info) == 0);
+	ut_reservation_register(req, &g_ctrlr1_A, SPDK_NVME_RESERVE_REPLACE_KEY, 0, 0xa1, 0);
+	CU_ASSERT(nvmf_ns_reservation_get_registrant(&g_ns, &g_ctrlr1_A.hostid) == NULL);
+	unlink(g_ns.ptpl_file);
+	g_ns.ptpl_file = NULL;
+
+	/* Encoding: two Registers, encoded, decoded, applied */
+	ut_reservation_register(req, &g_ctrlr1_A, SPDK_NVME_RESERVE_REGISTER_KEY, 0, 0, 0xa1);
+	ut_reservation_register(req, &g_ctrlr1_A, SPDK_NVME_RESERVE_REGISTER_KEY, 0, 0, 0xa1);
+	nvmf_ns_reservation_info_build(&g_ns, &info);
+	len = spdk_nvmf_reservation_info_encode(&info, 1, buf, sizeof(buf));
+	SPDK_CU_ASSERT_FATAL(len == 32 + 32);
+	CU_ASSERT(buf[4] == 1);
+	CU_ASSERT(buf[32 + 24] == 2);
+	SPDK_CU_ASSERT_FATAL(spdk_nvmf_reservation_info_decode(buf, len, &out, &gen) == 0);
+	SPDK_CU_ASSERT_FATAL(nvmf_ns_reservation_apply(&g_ns, &out) == 0);
+	ut_reservation_register(req, &g_ctrlr1_A, SPDK_NVME_RESERVE_REPLACE_KEY, 0, 0xa1, 0);
+	CU_ASSERT(nvmf_ns_reservation_get_registrant(&g_ns, &g_ctrlr1_A.hostid) != NULL);
+
+	/* Entries are 32 bytes: 24-byte entries without a count are refused */
+	memset(buf, 0, sizeof(buf));
+	memcpy(buf, "SBRV", 4);
+	buf[4] = 1;
+	buf[7] = 0xff;
+	buf[8] = 1;
+	memcpy(buf + 32, &g_ctrlr1_A.hostid, 16);
+	buf[48] = 0xa1;
+	CU_ASSERT(spdk_nvmf_reservation_info_decode(buf, 32 + 24, &out, &gen) == -EINVAL);
+
+	ut_reservation_free_req(req);
+	ut_reservation_deinit();
+}
+
 static void
 test_reservation_info_encoding(void)
 {
@@ -4503,6 +4655,8 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_reservation_request_preempt_abort_basic);
 	CU_ADD_TEST(suite, test_reservation_request_preempt_abort_timeout);
 	CU_ADD_TEST(suite, test_reservation_replace_with_zero_key_unregisters);
+	CU_ADD_TEST(suite, test_reservation_same_key_registers_are_counted);
+	CU_ADD_TEST(suite, test_reservation_register_count_is_persisted);
 	CU_ADD_TEST(suite, test_reservation_registrant_limit);
 	CU_ADD_TEST(suite, test_spdk_nvmf_ns_event);
 	CU_ADD_TEST(suite, test_nvmf_ns_reservation_add_remove_registrant);

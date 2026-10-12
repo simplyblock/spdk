@@ -164,6 +164,12 @@ struct spdk_nvmf_registrant {
 	struct spdk_uuid hostid;
 	/* Registration key */
 	uint64_t rkey;
+	/*
+	 * Successful Registers of rkey from this host. A Linux pNFS client registers
+	 * the same key once per device node it holds for the namespace, and releases
+	 * each with a Replace to a zero key, which unregisters only at zero.
+	 */
+	uint32_t reg_count;
 };
 
 struct spdk_nvmf_reservation_preempt_abort_info {
@@ -209,6 +215,9 @@ struct spdk_nvmf_ns {
 	char *ptpl_file;
 	/* Persist Through Power Loss feature is enabled */
 	bool ptpl_activated;
+	/* Set by a command that changed only a registrant's count: stored, but the
+	 * poll groups, which never see the count, are not updated */
+	bool resv_count_changed;
 	/* ZCOPY supported on bdev device */
 	bool zcopy;
 	/* Command Set Identifier */

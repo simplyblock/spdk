@@ -29,7 +29,7 @@ groups. A reload waits until the namespace's queued reservation commands have
 completed, so it never lands between a command and the write of its result.
 
 `spdk_nvmf_reservation_info_encode()` and `_decode()` give a compact, versioned,
-little-endian encoding with a generation counter, at most 1568 bytes for 64
+little-endian encoding with a generation counter, at most 2080 bytes for 64
 registrants.
 
 **Step 2, the lvol module and its glue.** `vbdev_lvol` keeps the encoded state in
@@ -132,8 +132,9 @@ through a third node's path.
   fetch everything.
 - **The leader crashes after the durable write.** The host's command never
   completed and is retried. The new leader loads the written state, so the retry
-  runs on current state; Register with the same key, Acquire of a held reservation,
-  and a Preempt of an already-removed key are idempotent.
+  runs on current state; Acquire of a held reservation and a Preempt of an
+  already-removed key are idempotent. A Register with the same key is counted
+  again, so the host's next release leaves it registered with a count of one.
 - **Preempt and Abort.** The leader waits only for the preempted host's commands
   that it executes itself. Commands in flight on another node are not waited for.
 

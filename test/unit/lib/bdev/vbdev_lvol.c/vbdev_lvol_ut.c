@@ -3087,6 +3087,46 @@ ut_lvol_resv_sync_backoff(void)
 	ut_resv_node_fini(&n);
 }
 
+/*
+ * A non-leader keeps the leader's state as the bytes it fetched, so a registrant's
+ * same-key Register count (lib/nvmf's encoding) reaches every node
+ * unchanged.
+ */
+static void
+ut_lvol_resv_fetch_keeps_register_count(void)
+{
+	struct ut_resv_node n;
+	uint8_t enc[64], out[128];
+	size_t len = sizeof(out);
+
+	ut_resv_node_init(&n, false);
+	n.lvs.hub_dev.state = HUBLVOL_CONNECTED;
+	n.lvs.hub_dev.desc = (struct spdk_bdev_desc *)0x2;
+
+	memset(enc, 0, sizeof(enc));
+	memcpy(enc, "SBRV", 4);
+	enc[4] = 2;
+	enc[7] = 0xff;
+	enc[8] = 1;
+	to_le64(&enc[16], 5);
+	memset(&enc[32], 0x5a, 16);
+	to_le64(&enc[48], 0xa1);
+	to_le32(&enc[56], 3);
+
+	vbdev_lvol_resv_sync_lvs(&n.lvs_bdev);
+	ut_hub_answer(0x10001, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS, NULL, 0);
+	SPDK_CU_ASSERT_FATAL(g_hub_ncmds == 1);
+	CU_ASSERT(g_hub_cmds[0].cmd.opc == VBDEV_LVOL_HUB_OPC_RESV_FETCH);
+	ut_hub_answer(sizeof(enc), SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS, enc, sizeof(enc));
+
+	SPDK_CU_ASSERT_FATAL(vbdev_lvol_resv_get(&n.bdev, out, &len) == 0);
+	CU_ASSERT(len == sizeof(enc));
+	CU_ASSERT(memcmp(out, enc, sizeof(enc)) == 0);
+	CU_ASSERT(from_le32(&out[56]) == 3);
+
+	ut_resv_node_fini(&n);
+}
+
 static void
 ut_lvol_resv_sync_from_leader(void)
 {
@@ -3444,6 +3484,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, ut_lvol_resv_generation_order);
 	CU_ADD_TEST(suite, ut_lvol_hub_resv_leader);
 	CU_ADD_TEST(suite, ut_lvol_resv_sync_from_leader);
+	CU_ADD_TEST(suite, ut_lvol_resv_fetch_keeps_register_count);
 	CU_ADD_TEST(suite, ut_lvol_hub_resv_as_nvmf_submits);
 	CU_ADD_TEST(suite, ut_lvol_resv_sync_backoff);
 	CU_ADD_TEST(suite, ut_lvol_resv_hub_released_on_disconnect);
