@@ -3002,6 +3002,12 @@ spdk_lvol_update_on_failover(struct spdk_lvol_store *lvs, struct spdk_lvol *lvol
 		return;
 	}
 
+	if (lvs->ha_takeover_blocked && !lvs->leader) {
+		/* Two-node arbitration: no takeover by IO after a fence (review on #76, point 3). */
+		pthread_mutex_unlock(&g_lvol_stores_mutex);
+		return;
+	}
+
 	if (!lvol->update_in_progress) {
 		assert(lvol->leader == false);
 		lvol->update_in_progress = true;
@@ -3920,10 +3926,279 @@ lvs_ha_find_locked(uint64_t groupid)
 	return NULL;
 }
 
+/*
+ * ANA state of the client listeners of a fenced LVS (review on #76, point 4).
+ *
+ * The fence blocks the LVS client port and fails held/new writes with an ANA-inaccessible
+ * path status, but the listener itself kept reporting its previous ANA state, so a host
+ * reading the ANA log page still saw the path as usable. The fence therefore also sets
+ * the ANA state of every listener on its client port to inaccessible, and the unfence
+ * restores the state each listener had before (only if it is still inaccessible, i.e.
+ * nobody changed it meanwhile). Done on the app thread like the nvmf RPCs: pause the
+ * subsystem (no namespace, so held IO is not waited for), set the state, resume.
+ * Only the fence that owns the port block (ha_fence_port) changes ANA.
+ */
+
+#define LVS_HA_ANA_MAX_SAVED 256
+#define LVS_HA_ANA_PAUSE_RETRY_US 10000
+#define LVS_HA_ANA_PAUSE_RETRIES 200
+
+struct lvs_ha_ana_saved {
+	uint16_t			port;
+	char				nqn[SPDK_NVMF_NQN_MAX_LEN + 1];
+	struct spdk_nvme_transport_id	trid;
+	enum spdk_nvme_ana_state	state;
+};
+
+/* app thread only */
+static struct lvs_ha_ana_saved g_lvs_ha_ana_saved[LVS_HA_ANA_MAX_SAVED];
+
+struct lvs_ha_ana_item {
+	struct spdk_nvmf_tgt		*tgt;
+	char				nqn[SPDK_NVMF_NQN_MAX_LEN + 1];
+	struct spdk_nvme_transport_id	trid;
+};
+
+struct lvs_ha_ana_ctx {
+	uint16_t		port;
+	bool			inaccessible;
+	struct lvs_ha_ana_item	*items;
+	int			n_items;
+	int			cur;
+	int			retries;
+	struct spdk_poller	*retry_poller;
+	struct spdk_nvmf_subsystem *subsystem;
+};
+
+static void lvs_ha_ana_next(struct lvs_ha_ana_ctx *ctx);
+
+/* Listener identity without pulling in the nvme library. */
+static bool
+lvs_ha_trid_equal(const struct spdk_nvme_transport_id *a, const struct spdk_nvme_transport_id *b)
+{
+	return a->trtype == b->trtype && strcmp(a->traddr, b->traddr) == 0 &&
+	       strcmp(a->trsvcid, b->trsvcid) == 0;
+}
+
+static struct lvs_ha_ana_saved *
+lvs_ha_ana_find_saved(uint16_t port, const char *nqn, const struct spdk_nvme_transport_id *trid)
+{
+	for (int i = 0; i < LVS_HA_ANA_MAX_SAVED; i++) {
+		struct lvs_ha_ana_saved *s = &g_lvs_ha_ana_saved[i];
+
+		if (s->port == port && strcmp(s->nqn, nqn) == 0 &&
+		    lvs_ha_trid_equal(&s->trid, trid)) {
+			return s;
+		}
+	}
+	return NULL;
+}
+
+static void
+lvs_ha_ana_resumed(struct spdk_nvmf_subsystem *subsystem, void *cb_arg, int status)
+{
+	struct lvs_ha_ana_ctx *ctx = cb_arg;
+
+	ctx->cur++;
+	lvs_ha_ana_next(ctx);
+}
+
+static void
+lvs_ha_ana_resume(struct lvs_ha_ana_ctx *ctx)
+{
+	if (spdk_nvmf_subsystem_resume(ctx->subsystem, lvs_ha_ana_resumed, ctx) != 0) {
+		SPDK_ERRLOG("HA ANA: could not resume subsystem %s\n", ctx->items[ctx->cur].nqn);
+		ctx->cur++;
+		lvs_ha_ana_next(ctx);
+	}
+}
+
+static void
+lvs_ha_ana_set_done(void *cb_arg, int status)
+{
+	struct lvs_ha_ana_ctx *ctx = cb_arg;
+	struct lvs_ha_ana_item *it = &ctx->items[ctx->cur];
+
+	if (status != 0) {
+		SPDK_ERRLOG("HA ANA: setting %s on %s port %u failed: %d\n",
+			    ctx->inaccessible ? "inaccessible" : "previous state", it->nqn, ctx->port, status);
+	} else {
+		SPDK_NOTICELOG("HA ANA: %s port %u set %s\n", it->nqn, ctx->port,
+			       ctx->inaccessible ? "inaccessible" : "back to its previous state");
+	}
+	lvs_ha_ana_resume(ctx);
+}
+
+static void
+lvs_ha_ana_paused(struct spdk_nvmf_subsystem *subsystem, void *cb_arg, int status)
+{
+	struct lvs_ha_ana_ctx *ctx = cb_arg;
+	struct lvs_ha_ana_item *it = &ctx->items[ctx->cur];
+	struct lvs_ha_ana_saved *saved;
+	enum spdk_nvme_ana_state cur_state = SPDK_NVME_ANA_OPTIMIZED_STATE;
+
+	if (spdk_nvmf_subsystem_get_ana_state(subsystem, &it->trid, 1, &cur_state) != 0) {
+		lvs_ha_ana_resume(ctx);
+		return;
+	}
+	saved = lvs_ha_ana_find_saved(ctx->port, it->nqn, &it->trid);
+	if (ctx->inaccessible) {
+		if (cur_state == SPDK_NVME_ANA_INACCESSIBLE_STATE) {
+			lvs_ha_ana_resume(ctx);
+			return;
+		}
+		if (saved == NULL) {
+			struct spdk_nvme_transport_id none = {};
+
+			saved = lvs_ha_ana_find_saved(0, "", &none);
+		}
+		if (saved != NULL) {
+			saved->port = ctx->port;
+			snprintf(saved->nqn, sizeof(saved->nqn), "%s", it->nqn);
+			saved->trid = it->trid;
+			saved->state = cur_state;
+		} else {
+			SPDK_ERRLOG("HA ANA: no room to save the state of %s port %u\n", it->nqn, ctx->port);
+		}
+		spdk_nvmf_subsystem_set_ana_state(subsystem, &it->trid, SPDK_NVME_ANA_INACCESSIBLE_STATE,
+						  0, lvs_ha_ana_set_done, ctx);
+		return;
+	}
+	/* Restore: only what this fence set, and only if nobody changed it since. */
+	if (saved == NULL || cur_state != SPDK_NVME_ANA_INACCESSIBLE_STATE) {
+		if (saved != NULL) {
+			memset(saved, 0, sizeof(*saved));
+		}
+		lvs_ha_ana_resume(ctx);
+		return;
+	}
+	cur_state = saved->state;
+	memset(saved, 0, sizeof(*saved));
+	spdk_nvmf_subsystem_set_ana_state(subsystem, &it->trid, cur_state, 0, lvs_ha_ana_set_done, ctx);
+}
+
+static int
+lvs_ha_ana_retry(void *arg)
+{
+	struct lvs_ha_ana_ctx *ctx = arg;
+
+	spdk_poller_unregister(&ctx->retry_poller);
+	lvs_ha_ana_next(ctx);
+	return SPDK_POLLER_BUSY;
+}
+
+static void
+lvs_ha_ana_next(struct lvs_ha_ana_ctx *ctx)
+{
+	struct lvs_ha_ana_item *it;
+	int rc;
+
+	if (ctx->cur >= ctx->n_items) {
+		free(ctx->items);
+		free(ctx);
+		return;
+	}
+	it = &ctx->items[ctx->cur];
+	ctx->subsystem = spdk_nvmf_tgt_find_subsystem(it->tgt, it->nqn);
+	if (ctx->subsystem == NULL) {
+		ctx->cur++;
+		lvs_ha_ana_next(ctx);
+		return;
+	}
+	rc = spdk_nvmf_subsystem_pause(ctx->subsystem, 0, lvs_ha_ana_paused, ctx);
+	if (rc == -EBUSY && ctx->retries++ < LVS_HA_ANA_PAUSE_RETRIES) {
+		/* Another state change (e.g. a control-plane RPC) is in progress. */
+		ctx->retry_poller = spdk_poller_register(lvs_ha_ana_retry, ctx, LVS_HA_ANA_PAUSE_RETRY_US);
+		return;
+	}
+	if (rc != 0) {
+		SPDK_ERRLOG("HA ANA: could not pause subsystem %s: %d\n", it->nqn, rc);
+		ctx->cur++;
+		lvs_ha_ana_next(ctx);
+		return;
+	}
+	ctx->retries = 0;
+}
+
+static void
+lvs_ha_ana_msg(void *arg)
+{
+	struct lvs_ha_ana_ctx *ctx = arg;
+	struct spdk_nvmf_tgt *tgt;
+	struct spdk_nvmf_subsystem *subsystem;
+	struct spdk_nvmf_subsystem_listener *listener;
+	int cap = 0;
+
+	for (tgt = spdk_nvmf_get_first_tgt(); tgt != NULL; tgt = spdk_nvmf_get_next_tgt(tgt)) {
+		for (subsystem = spdk_nvmf_subsystem_get_first(tgt); subsystem != NULL;
+		     subsystem = spdk_nvmf_subsystem_get_next(subsystem)) {
+			if (!spdk_nvmf_subsystem_get_ana_reporting(subsystem)) {
+				continue;
+			}
+			for (listener = spdk_nvmf_subsystem_get_first_listener(subsystem); listener != NULL;
+			     listener = spdk_nvmf_subsystem_get_next_listener(subsystem, listener)) {
+				const struct spdk_nvme_transport_id *trid =
+					spdk_nvmf_subsystem_listener_get_trid(listener);
+				struct lvs_ha_ana_item *items;
+
+				if (trid == NULL || (uint16_t)atoi(trid->trsvcid) != ctx->port) {
+					continue;
+				}
+				if (ctx->n_items == cap) {
+					cap = cap ? cap * 2 : 16;
+					items = realloc(ctx->items, cap * sizeof(*items));
+					if (items == NULL) {
+						SPDK_ERRLOG("HA ANA: out of memory\n");
+						goto run;
+					}
+					ctx->items = items;
+				}
+				ctx->items[ctx->n_items].tgt = tgt;
+				snprintf(ctx->items[ctx->n_items].nqn, sizeof(ctx->items[0].nqn), "%s",
+					 spdk_nvmf_subsystem_get_nqn(subsystem));
+				ctx->items[ctx->n_items].trid = *trid;
+				ctx->n_items++;
+			}
+		}
+	}
+run:
+	lvs_ha_ana_next(ctx);
+}
+
+/* Never called with g_lvol_stores_mutex held. */
+static void
+lvs_ha_ana_request(uint16_t port, bool inaccessible)
+{
+	struct lvs_ha_ana_ctx *ctx;
+	struct spdk_thread *app = spdk_thread_get_app_thread();
+
+	if (port == 0 || app == NULL) {
+		return;
+	}
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL) {
+		SPDK_ERRLOG("HA ANA: out of memory (port %u)\n", port);
+		return;
+	}
+	ctx->port = port;
+	ctx->inaccessible = inaccessible;
+	if (spdk_thread_send_msg(app, lvs_ha_ana_msg, ctx) != 0) {
+		free(ctx);
+	}
+}
+
+/*
+ * Mutex rule (review on #76, point 2): the HA calls below change the lvstore state under
+ * g_lvol_stores_mutex, but send messages (blobstore sync, ANA change) only after dropping
+ * it. The blobstore applies the latest desired hold state on its md thread, so syncs that
+ * race still converge on the last decision.
+ */
+
 int
 spdk_lvs_ha_hold(uint64_t groupid)
 {
 	struct spdk_lvol_store *lvs;
+	struct spdk_blob_store *bs = NULL;
 	int rc = 0;
 
 	pthread_mutex_lock(&g_lvol_stores_mutex);
@@ -3933,13 +4208,21 @@ spdk_lvs_ha_hold(uint64_t groupid)
 	} else if (lvs->leader && !lvs->ha_held && !lvs->ha_fenced) {
 		/* Only a leading LVS serves client writes; a follower has nothing to hold. */
 		lvs->ha_held = true;
-		rc = spdk_bs_ha_hold_send_msg(lvs->blobstore);
-		if (rc != 0) {
-			lvs->ha_held = false;
-		}
-		SPDK_NOTICELOG("HA hold on lvs groupid %" PRIu64 " rc=%d\n", groupid, rc);
+		bs = lvs->blobstore;
+		spdk_bs_ha_set_hold(bs, true);
 	}
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
+	if (bs == NULL) {
+		return rc;
+	}
+	rc = spdk_bs_ha_sync_send_msg(bs, NULL, NULL);
+	if (rc != 0) {
+		pthread_mutex_lock(&g_lvol_stores_mutex);
+		lvs->ha_held = false;
+		spdk_bs_ha_set_hold(bs, false);
+		pthread_mutex_unlock(&g_lvol_stores_mutex);
+	}
+	SPDK_NOTICELOG("HA hold on lvs groupid %" PRIu64 " rc=%d\n", groupid, rc);
 	return rc;
 }
 
@@ -3952,6 +4235,7 @@ int
 spdk_lvs_ha_release(uint64_t groupid, spdk_lvs_ha_cb cb_fn, void *cb_arg)
 {
 	struct spdk_lvol_store *lvs;
+	struct spdk_blob_store *bs;
 	int rc;
 
 	pthread_mutex_lock(&g_lvol_stores_mutex);
@@ -3961,9 +4245,12 @@ spdk_lvs_ha_release(uint64_t groupid, spdk_lvs_ha_cb cb_fn, void *cb_arg)
 		return -ENOENT;
 	}
 	lvs->ha_held = false;
-	rc = spdk_bs_ha_release_send_msg(lvs->blobstore, cb_fn ? cb_fn : lvs_ha_noop_cb, cb_arg);
-	SPDK_NOTICELOG("HA release (grant) on lvs groupid %" PRIu64 " rc=%d\n", groupid, rc);
+	bs = lvs->blobstore;
+	spdk_bs_ha_set_hold(bs, false);
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
+
+	rc = spdk_bs_ha_sync_send_msg(bs, cb_fn ? cb_fn : lvs_ha_noop_cb, cb_arg);
+	SPDK_NOTICELOG("HA release (grant) on lvs groupid %" PRIu64 " rc=%d\n", groupid, rc);
 	return rc;
 }
 
@@ -3994,6 +4281,8 @@ spdk_lvs_ha_fence(uint64_t groupid, spdk_lvs_ha_cb cb_fn, void *cb_arg)
 {
 	struct spdk_lvol_store *lvs;
 	struct spdk_lvol *lvol;
+	struct spdk_blob_store *bs;
+	uint16_t ana_port = 0;
 	int rc;
 
 	pthread_mutex_lock(&g_lvol_stores_mutex);
@@ -4009,31 +4298,41 @@ spdk_lvs_ha_fence(uint64_t groupid, spdk_lvs_ha_cb cb_fn, void *cb_arg)
 	 * repeated fence keeps the ownership of the first one. */
 	if (!lvs->ha_fenced) {
 		int port = lvs->subsystem_port;
+		bool other = port > 0 && lvs_ha_port_fenced_by_other_locked(lvs, port);
 
 		lvs->ha_fence_port = 0;
-		if (port > 0 && (!lvs_ha_port_blocked(port) ||
-				 lvs_ha_port_fenced_by_other_locked(lvs, port))) {
+		if (port > 0 && (!lvs_ha_port_blocked(port) || other)) {
 			lvs->ha_fence_port = port;
+			/* The first owner of the port changes the listeners' ANA state. */
+			ana_port = other ? 0 : (uint16_t)port;
 		}
 	}
 	lvs->ha_fenced = true;
 	lvs->ha_held = false;
+	lvs->ha_ana_restore_port = 0;
+	/* Review on #76, point 3: leadership after a fence comes only from the control
+	 * plane (bdev_lvol_set_leader), never from a takeover triggered by incoming IO. */
+	lvs->ha_takeover_blocked = true;
 	/* Client port only: blocking the hublvol port too would stop the returning peer
 	 * from reconnecting and resyncing, and unfence waits for that resync (deadlock). */
 	block_port(lvs->subsystem_port);
 	lvs->update_in_progress = false;
 	lvs->leader = false;
-	spdk_bs_set_ha_fenced(lvs->blobstore, true);
-	spdk_bs_set_leader(lvs->blobstore, false);
+	bs = lvs->blobstore;
+	spdk_bs_set_ha_fenced(bs, true);
+	spdk_bs_set_leader(bs, false);
+	spdk_bs_ha_set_hold(bs, false);
 	TAILQ_FOREACH(lvol, &lvs->lvols, link) {
 		lvol->leader = false;
 		lvol->update_in_progress = false;
 	}
-	/* Release whatever was held: with ha_fenced set it completes as a path error. */
-	rc = spdk_bs_ha_release_send_msg(lvs->blobstore, cb_fn ? cb_fn : lvs_ha_noop_cb, cb_arg);
-	SPDK_NOTICELOG("HA fence on lvs groupid %" PRIu64 " (%s) rc=%d\n", groupid,
-		       node_role_to_string(lvs->node_role), rc);
+	SPDK_NOTICELOG("HA fence on lvs groupid %" PRIu64 " (%s)\n", groupid,
+		       node_role_to_string(lvs->node_role));
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
+
+	/* Release whatever was held: with ha_fenced set it completes as a path error. */
+	rc = spdk_bs_ha_sync_send_msg(bs, cb_fn ? cb_fn : lvs_ha_noop_cb, cb_arg);
+	lvs_ha_ana_request(ana_port, true);
 	return rc;
 }
 
@@ -4041,6 +4340,7 @@ int
 spdk_lvs_ha_unfence(uint64_t groupid)
 {
 	struct spdk_lvol_store *lvs;
+	uint16_t ana_port = 0;
 
 	pthread_mutex_lock(&g_lvol_stores_mutex);
 	lvs = lvs_ha_find_locked(groupid);
@@ -4058,6 +4358,7 @@ spdk_lvs_ha_unfence(uint64_t groupid)
 		 * A port shared with another LVS that is still fenced stays blocked until that
 		 * one is unfenced too; a block this fence did not apply is left alone. */
 		if (port > 0 && !lvs_ha_port_fenced_by_other_locked(lvs, port)) {
+			ana_port = (uint16_t)port;
 			if (spdk_nvmf_port_unblock((uint16_t)port)) {
 				SPDK_NOTICELOG("HA unfence on lvs groupid %" PRIu64 ": client port %d unblocked\n",
 					       groupid, port);
@@ -4067,10 +4368,27 @@ spdk_lvs_ha_unfence(uint64_t groupid)
 			}
 		}
 	}
+	/* ha_takeover_blocked stays set: the LVS is not leader after the fence, and only the
+	 * control plane's bdev_lvol_set_leader decides which node leads it again. A
+	 * secondary/tertiary serves its clients by redirecting to the leader, so its ANA
+	 * state comes back now; a primary that does not lead cannot redirect, so its
+	 * listeners stay inaccessible until that leadership set. */
+	if (ana_port != 0 && lvs->node_role == NODE_PRIMARY && !lvs->leader) {
+		lvs->ha_ana_restore_port = ana_port;
+		ana_port = 0;
+	}
 	spdk_bs_set_ha_fenced(lvs->blobstore, false);
 	SPDK_NOTICELOG("HA unfence on lvs groupid %" PRIu64 "\n", groupid);
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
+
+	lvs_ha_ana_request(ana_port, false);
 	return 0;
+}
+
+bool
+spdk_lvs_ha_takeover_blocked(struct spdk_lvol_store *lvs)
+{
+	return __atomic_load_n(&lvs->ha_takeover_blocked, __ATOMIC_SEQ_CST);
 }
 
 bool
@@ -7927,6 +8245,13 @@ spdk_lvs_check_active_process(struct spdk_lvol_store *lvs, struct spdk_lvol *lvo
 		return;
 	}
 
+	if (lvs->ha_takeover_blocked) {
+		/* Two-node arbitration: fenced (or fenced and re-admitted, but not yet given
+		 * leadership by the control plane): no takeover by IO (review on #76, point 3). */
+		pthread_mutex_unlock(&g_lvol_stores_mutex);
+		return;
+	}
+
 	if (!lvs->update_in_progress && lvs->retry_on_update <= 3) {
 		req = calloc(1, sizeof(*req));
 		if (req == NULL) {
@@ -8005,6 +8330,7 @@ spdk_lvol_set_leader_cpl(void *cb_arg, int lvolerrno)
 	struct spdk_lvol_store *tmp_lvs = NULL;
 	bool lvs_leader = req->lvs_state;
 	struct spdk_lvol *lvol;
+	int ana_restore_port;
 
 
 	if (lvolerrno < 0 ) {
@@ -8034,8 +8360,15 @@ spdk_lvol_set_leader_cpl(void *cb_arg, int lvolerrno)
 	/* Two-node arbitration: a demoted LVS no longer writes, so it holds
 	 * no solo grant; the JC resets its HA state (spdk_lvs_ha_take_demoted). */
 	lvs->ha_demoted = !lvs_leader;
+	/* The control plane set the leadership explicitly: IO may again drive the normal
+	 * failover takeover on this LVS (review on #76, point 3). */
+	__atomic_store_n(&lvs->ha_takeover_blocked, false, __ATOMIC_SEQ_CST);
+	ana_restore_port = lvs->ha_ana_restore_port;
+	lvs->ha_ana_restore_port = 0;
 
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
+
+	lvs_ha_ana_request((uint16_t)ana_restore_port, false);
 
 	if (tmp_lvs) {
 		if (tmp_lvs->hub_dev.state != HUBLVOL_CONNECTED) {

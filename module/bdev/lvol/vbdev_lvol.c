@@ -1931,6 +1931,25 @@ vbdev_redirect_after_migrate(struct spdk_lvol *lvol, struct spdk_io_channel *ch,
 }
 
 
+/*
+ * Two-node arbitration (review on #76, point 3): after a fence, incoming IO must not
+ * start a leadership takeover (an lvstore update on failover); only the control plane
+ * gives the LVS its leadership back (bdev_lvol_set_leader). Until then IO that would
+ * need this node to lead completes with an ANA-inaccessible path error, so the host
+ * retries on the path of the node that leads.
+ */
+static bool
+vbdev_lvol_ha_takeover_rejected(struct spdk_lvol_store *lvs, struct spdk_lvol *lvol,
+				struct spdk_bdev_io *bdev_io)
+{
+	if ((lvs->leader && lvol->leader) || !spdk_lvs_ha_takeover_blocked(lvs)) {
+		return false;
+	}
+	spdk_bdev_io_complete_nvme_status(bdev_io, 0, SPDK_NVME_SCT_PATH,
+					  SPDK_NVME_SC_ASYMMETRIC_ACCESS_INACCESSIBLE);
+	return true;
+}
+
 static void
 vbdev_hublvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io) {
 	struct spdk_lvol *lvol = bdev_io->bdev->ctxt;
@@ -1956,6 +1975,11 @@ vbdev_hublvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bd
 								id, offset, bdev_io->u.bdev.num_blocks, bdev_io->type);
 		__atomic_sub_fetch(&lvs->current_io_t, 1, __ATOMIC_SEQ_CST);
 		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		return;
+	}
+
+	if (io_type && vbdev_lvol_ha_takeover_rejected(lvs, org_lvol, bdev_io)) {
+		__atomic_sub_fetch(&lvs->current_io_t, 1, __ATOMIC_SEQ_CST);
 		return;
 	}
 
@@ -2086,6 +2110,10 @@ vbdev_lvol_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_
 		__atomic_add_fetch(&lvs->current_io, 1, __ATOMIC_SEQ_CST);
 		__atomic_add_fetch(&lvs->current_io_t, 1, __ATOMIC_SEQ_CST);
 		vbdev_hublvol_submit_request(ch, bdev_io);
+		return;
+	}
+
+	if (io_type && vbdev_lvol_ha_takeover_rejected(lvs, lvol, bdev_io)) {
 		return;
 	}
 

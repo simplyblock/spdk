@@ -3818,24 +3818,215 @@ static int g_ha_cb_cnt;
 DEFINE_STUB(spdk_bdev_open_ext, int, (const char *bdev_name, bool write,
 				      spdk_bdev_event_cb_t event_cb, void *event_ctx, struct spdk_bdev_desc **desc), -ENODEV);
 DEFINE_STUB_V(spdk_bdev_close, (struct spdk_bdev_desc *desc));
+/* The failover-update path behind spdk_lvs_check_active_process / spdk_lvol_update_on_failover
+ * (reachable from the takeover-latch test; never reached while the latch holds). */
+DEFINE_STUB_V(spdk_bs_update_on_failover, (struct spdk_blob_store *bs, spdk_bs_op_complete cb_fn,
+		void *cb_arg));
+DEFINE_STUB_V(spdk_blob_update_on_failover_send_msg, (struct spdk_blob *blob,
+		spdk_blob_op_complete cb_fn, void *cb_arg));
+DEFINE_STUB_V(spdk_blob_update_failed_cleanup, (struct spdk_blob *blob,
+		spdk_blob_op_complete cb_fn, void *cb_arg));
 DEFINE_STUB_V(spdk_bs_drain_channel_queued, (struct spdk_blob_store *bs,
 		struct spdk_hublvol_channels *ch_list, int count, spdk_drain_op_cpl cb_fn, void *cb_arg));
 
-int
-spdk_bs_ha_hold_send_msg(struct spdk_blob_store *bs)
+/* Review on #76, point 2: count every message sent while g_lvol_stores_mutex is held. */
+static int g_ha_msg_under_mutex;
+static bool g_ha_bs_hold_wanted;
+
+static void
+ha_check_mutex_free(void)
 {
-	g_ha_bs_hold_cnt++;
-	return 0;
+	if (pthread_mutex_trylock(&g_lvol_stores_mutex) == 0) {
+		pthread_mutex_unlock(&g_lvol_stores_mutex);
+	} else {
+		g_ha_msg_under_mutex++;
+	}
 }
 
-int
-spdk_bs_ha_release_send_msg(struct spdk_blob_store *bs, spdk_blob_op_complete cb_fn, void *cb_arg)
+void
+spdk_bs_ha_set_hold(struct spdk_blob_store *bs, bool hold)
 {
-	g_ha_bs_release_cnt++;
+	g_ha_bs_hold_wanted = hold;
+}
+
+/* The md-thread sync, applied at once: a hold when the desired state is held, else a
+ * release whose callback runs after the drain. */
+int
+spdk_bs_ha_sync_send_msg(struct spdk_blob_store *bs, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	ha_check_mutex_free();
+	if (g_ha_bs_hold_wanted) {
+		g_ha_bs_hold_cnt++;
+	} else {
+		g_ha_bs_release_cnt++;
+	}
 	if (cb_fn) {
 		cb_fn(cb_arg, 0);
 	}
 	return 0;
+}
+
+/* new_md_journal: leadership changes complete through the md journal activation. */
+void
+spdk_bs_activate_md_journal(struct spdk_blob_store *bs, bool state, bool lvs_state,
+			    spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	cb_fn(cb_arg, 0);
+}
+
+/* A small model of the nvmf target for the fence's ANA change (review on #76, point 4):
+ * one target, subsystems with one listener each. */
+struct ha_fake_subsys {
+	char				nqn[64];
+	struct spdk_nvme_transport_id	trid;
+	enum spdk_nvme_ana_state	state;
+	bool				ana_reporting;
+	int				paused;
+};
+#define HA_MAX_SUBSYS 4
+static struct ha_fake_subsys g_ha_subsys[HA_MAX_SUBSYS];
+static int g_ha_n_subsys;
+static int g_ha_pause_busy;	/* pause answers -EBUSY this many times first */
+static int g_ha_set_ana_cnt;
+#define HA_FAKE_TGT ((struct spdk_nvmf_tgt *)0x1)
+
+static void
+ha_add_subsys(const char *nqn, uint16_t port, enum spdk_nvme_ana_state state)
+{
+	struct ha_fake_subsys *s = &g_ha_subsys[g_ha_n_subsys++];
+
+	snprintf(s->nqn, sizeof(s->nqn), "%s", nqn);
+	s->trid.trtype = SPDK_NVME_TRANSPORT_TCP;
+	snprintf(s->trid.traddr, sizeof(s->trid.traddr), "10.0.0.1");
+	snprintf(s->trid.trsvcid, sizeof(s->trid.trsvcid), "%u", port);
+	s->state = state;
+	s->ana_reporting = true;
+}
+
+static void
+ha_reset_nvmf(void)
+{
+	poll_threads();
+	memset(g_ha_subsys, 0, sizeof(g_ha_subsys));
+	memset(g_lvs_ha_ana_saved, 0, sizeof(g_lvs_ha_ana_saved));
+	g_ha_n_subsys = 0;
+	g_ha_pause_busy = 0;
+	g_ha_set_ana_cnt = 0;
+}
+
+struct spdk_nvmf_tgt *
+spdk_nvmf_get_first_tgt(void)
+{
+	return HA_FAKE_TGT;
+}
+
+struct spdk_nvmf_tgt *
+spdk_nvmf_get_next_tgt(struct spdk_nvmf_tgt *prev)
+{
+	return NULL;
+}
+
+struct spdk_nvmf_subsystem *
+spdk_nvmf_subsystem_get_first(struct spdk_nvmf_tgt *tgt)
+{
+	return g_ha_n_subsys ? (struct spdk_nvmf_subsystem *)&g_ha_subsys[0] : NULL;
+}
+
+struct spdk_nvmf_subsystem *
+spdk_nvmf_subsystem_get_next(struct spdk_nvmf_subsystem *subsystem)
+{
+	struct ha_fake_subsys *s = (struct ha_fake_subsys *)subsystem;
+
+	return s + 1 < &g_ha_subsys[g_ha_n_subsys] ? (struct spdk_nvmf_subsystem *)(s + 1) : NULL;
+}
+
+bool
+spdk_nvmf_subsystem_get_ana_reporting(struct spdk_nvmf_subsystem *subsystem)
+{
+	return ((struct ha_fake_subsys *)subsystem)->ana_reporting;
+}
+
+struct spdk_nvmf_subsystem_listener *
+spdk_nvmf_subsystem_get_first_listener(struct spdk_nvmf_subsystem *subsystem)
+{
+	return (struct spdk_nvmf_subsystem_listener *)subsystem;
+}
+
+struct spdk_nvmf_subsystem_listener *
+spdk_nvmf_subsystem_get_next_listener(struct spdk_nvmf_subsystem *subsystem,
+				      struct spdk_nvmf_subsystem_listener *prev_listener)
+{
+	return NULL;
+}
+
+const struct spdk_nvme_transport_id *
+spdk_nvmf_subsystem_listener_get_trid(struct spdk_nvmf_subsystem_listener *listener)
+{
+	return &((struct ha_fake_subsys *)listener)->trid;
+}
+
+const char *
+spdk_nvmf_subsystem_get_nqn(const struct spdk_nvmf_subsystem *subsystem)
+{
+	return ((const struct ha_fake_subsys *)subsystem)->nqn;
+}
+
+struct spdk_nvmf_subsystem *
+spdk_nvmf_tgt_find_subsystem(struct spdk_nvmf_tgt *tgt, const char *subnqn)
+{
+	for (int i = 0; i < g_ha_n_subsys; i++) {
+		if (strcmp(g_ha_subsys[i].nqn, subnqn) == 0) {
+			return (struct spdk_nvmf_subsystem *)&g_ha_subsys[i];
+		}
+	}
+	return NULL;
+}
+
+int
+spdk_nvmf_subsystem_pause(struct spdk_nvmf_subsystem *subsystem, uint32_t nsid,
+			  spdk_nvmf_subsystem_state_change_done cb_fn, void *cb_arg)
+{
+	CU_ASSERT(nsid == 0); /* never waits for (held) namespace IO */
+	if (g_ha_pause_busy > 0) {
+		g_ha_pause_busy--;
+		return -EBUSY;
+	}
+	((struct ha_fake_subsys *)subsystem)->paused++;
+	cb_fn(subsystem, cb_arg, 0);
+	return 0;
+}
+
+int
+spdk_nvmf_subsystem_resume(struct spdk_nvmf_subsystem *subsystem,
+			   spdk_nvmf_subsystem_state_change_done cb_fn, void *cb_arg)
+{
+	((struct ha_fake_subsys *)subsystem)->paused--;
+	cb_fn(subsystem, cb_arg, 0);
+	return 0;
+}
+
+int
+spdk_nvmf_subsystem_get_ana_state(struct spdk_nvmf_subsystem *subsystem,
+				  const struct spdk_nvme_transport_id *trid, uint32_t anagrpid,
+				  enum spdk_nvme_ana_state *ana_state)
+{
+	*ana_state = ((struct ha_fake_subsys *)subsystem)->state;
+	return 0;
+}
+
+void
+spdk_nvmf_subsystem_set_ana_state(struct spdk_nvmf_subsystem *subsystem,
+				  const struct spdk_nvme_transport_id *trid,
+				  enum spdk_nvme_ana_state ana_state, uint32_t anagrpid,
+				  spdk_nvmf_tgt_subsystem_listen_done_fn cb_fn, void *cb_arg)
+{
+	struct ha_fake_subsys *s = (struct ha_fake_subsys *)subsystem;
+
+	CU_ASSERT(s->paused == 1);
+	CU_ASSERT(anagrpid == 0);
+	s->state = ana_state;
+	g_ha_set_ana_cnt++;
+	cb_fn(cb_arg, 0);
 }
 
 void
@@ -3897,6 +4088,12 @@ ha_cb(void *cb_arg, int rc)
 	g_ha_cb_cnt++;
 }
 
+static void
+ha_set_leader_done(void *cb_arg, int lvolerrno)
+{
+	*(int *)cb_arg = lvolerrno;
+}
+
 static struct spdk_lvol_store *
 ha_alloc_lvs(uint64_t groupid, bool leader, node_role_t role)
 {
@@ -3916,6 +4113,7 @@ ha_alloc_lvs(uint64_t groupid, bool leader, node_role_t role)
 	g_ha_bs_fenced_set = g_ha_bs_leader_set = -1;
 	g_ha_last_blocked_port = 0;
 	g_ha_cb_cnt = 0;
+	g_ha_bs_hold_wanted = false;
 	memset(g_ha_blocked, 0, sizeof(g_ha_blocked));
 	return lvs;
 }
@@ -4179,21 +4377,171 @@ static void
 lvol_ha_demotion_reported_once(void)
 {
 	struct spdk_lvol_store *lvs = ha_alloc_lvs(19, true, NODE_PRIMARY);
+	int rc = 99;
 
 	CU_ASSERT(spdk_lvs_ha_take_demoted(19) == false);
-	spdk_set_leader_all(lvs, false, true);
+	spdk_set_leader_all(lvs, false, true, ha_set_leader_done, &rc);
 	CU_ASSERT(lvs->leader == false);
 	CU_ASSERT(spdk_lvs_ha_take_demoted(19) == true);
 	CU_ASSERT(spdk_lvs_ha_take_demoted(19) == false);
 
-	spdk_set_leader_all(lvs, false, true);
-	spdk_set_leader_all(lvs, true, false);
+	spdk_set_leader_all(lvs, false, true, ha_set_leader_done, &rc);
+	spdk_set_leader_all(lvs, true, false, ha_set_leader_done, &rc);
 	CU_ASSERT(lvs->leader == true);
 	CU_ASSERT(spdk_lvs_ha_take_demoted(19) == false);
 
 	/* The fence demotes internally, not through the control plane: not reported. */
 	CU_ASSERT(spdk_lvs_ha_fence(19, NULL, NULL) == 0);
 	CU_ASSERT(spdk_lvs_ha_take_demoted(19) == false);
+	ha_free_lvs(lvs);
+}
+
+/* Review on #76, point 2: hold, release, fence and unfence send no message while
+ * g_lvol_stores_mutex is held. */
+static void
+lvol_ha_no_msg_under_mutex(void)
+{
+	struct spdk_lvol_store *lvs = ha_alloc_lvs(30, true, NODE_PRIMARY);
+
+	ha_reset_nvmf();
+	g_ha_msg_under_mutex = 0;
+	CU_ASSERT(spdk_lvs_ha_hold(30) == 0);
+	CU_ASSERT(spdk_lvs_ha_release(30, ha_cb, NULL) == 0);
+	CU_ASSERT(spdk_lvs_ha_hold(30) == 0);
+	CU_ASSERT(spdk_lvs_ha_fence(30, ha_cb, NULL) == 0);
+	CU_ASSERT(spdk_lvs_ha_unfence(30) == 0);
+	poll_threads();
+	CU_ASSERT(g_ha_msg_under_mutex == 0);
+	CU_ASSERT(g_ha_bs_hold_cnt == 2);
+	CU_ASSERT(g_ha_bs_release_cnt == 2);
+	ha_free_lvs(lvs);
+}
+
+/* Review on #76, point 3: after a fence, incoming IO does not start a leadership
+ * takeover (lvstore update on failover), also not after the unfence; only an explicit
+ * leadership set by the control plane lifts that. */
+static void
+lvol_ha_fence_blocks_io_takeover(void)
+{
+	struct spdk_lvol_store *lvs = ha_alloc_lvs(31, true, NODE_PRIMARY);
+	struct spdk_lvol lvol = { .leader = true };
+	int rc = 99;
+
+	ha_reset_nvmf();
+	lvol.lvol_store = lvs;
+	TAILQ_INSERT_TAIL(&lvs->lvols, &lvol, link);
+	CU_ASSERT(spdk_lvs_ha_takeover_blocked(lvs) == false);
+	CU_ASSERT(spdk_lvs_ha_fence(31, NULL, NULL) == 0);
+	CU_ASSERT(spdk_lvs_ha_takeover_blocked(lvs) == true);
+
+	/* IO on the non-leading LVS: no update starts. */
+	spdk_lvs_check_active_process(lvs, &lvol, 1);
+	CU_ASSERT(lvs->update_in_progress == false);
+	spdk_lvol_update_on_failover(lvs, &lvol, false);
+	CU_ASSERT(lvol.update_in_progress == false);
+
+	CU_ASSERT(spdk_lvs_ha_unfence(31) == 0);
+	CU_ASSERT(spdk_lvs_ha_takeover_blocked(lvs) == true);
+	spdk_lvs_check_active_process(lvs, &lvol, 1);
+	CU_ASSERT(lvs->update_in_progress == false);
+
+	/* The control plane sets the leadership: the latch is gone. */
+	spdk_set_leader_all(lvs, true, false, ha_set_leader_done, &rc);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(lvs->leader == true);
+	CU_ASSERT(spdk_lvs_ha_takeover_blocked(lvs) == false);
+	TAILQ_REMOVE(&lvs->lvols, &lvol, link);
+	ha_free_lvs(lvs);
+}
+
+/* Review on #76, point 4: the fence sets the ANA state of the listeners on its client
+ * port to inaccessible (other ports untouched); for a secondary the unfence restores the
+ * previous state. The subsystem is paused without a namespace, so held IO is not
+ * waited for. */
+static void
+lvol_ha_fence_sets_ana_inaccessible(void)
+{
+	struct spdk_lvol_store *lvs = ha_alloc_lvs(32, false, NODE_SECONDARY);
+
+	ha_reset_nvmf();
+	ha_add_subsys("nqn.ha:vol1", 4420, SPDK_NVME_ANA_NON_OPTIMIZED_STATE);
+	ha_add_subsys("nqn.ha:vol2", 4420, SPDK_NVME_ANA_OPTIMIZED_STATE);
+	ha_add_subsys("nqn.ha:other", 4426, SPDK_NVME_ANA_OPTIMIZED_STATE);
+	g_ha_pause_busy = 1; /* another state change in progress: retried */
+
+	CU_ASSERT(spdk_lvs_ha_fence(32, NULL, NULL) == 0);
+	poll_threads();
+	spdk_delay_us(20 * 1000);
+	poll_threads();
+	CU_ASSERT(g_ha_subsys[0].state == SPDK_NVME_ANA_INACCESSIBLE_STATE);
+	CU_ASSERT(g_ha_subsys[1].state == SPDK_NVME_ANA_INACCESSIBLE_STATE);
+	CU_ASSERT(g_ha_subsys[2].state == SPDK_NVME_ANA_OPTIMIZED_STATE);
+	CU_ASSERT(g_ha_subsys[0].paused == 0 && g_ha_subsys[1].paused == 0);
+
+	CU_ASSERT(spdk_lvs_ha_unfence(32) == 0);
+	poll_threads();
+	CU_ASSERT(g_ha_subsys[0].state == SPDK_NVME_ANA_NON_OPTIMIZED_STATE);
+	CU_ASSERT(g_ha_subsys[1].state == SPDK_NVME_ANA_OPTIMIZED_STATE);
+	CU_ASSERT(g_ha_subsys[2].state == SPDK_NVME_ANA_OPTIMIZED_STATE);
+	ha_free_lvs(lvs);
+}
+
+/* A primary that does not lead after the unfence cannot redirect, so its listeners stay
+ * inaccessible until the control plane sets the leadership; then they are restored. */
+static void
+lvol_ha_primary_ana_restored_on_leadership(void)
+{
+	struct spdk_lvol_store *lvs = ha_alloc_lvs(33, true, NODE_PRIMARY);
+	int rc = 99;
+
+	ha_reset_nvmf();
+	ha_add_subsys("nqn.ha:vol1", 4420, SPDK_NVME_ANA_OPTIMIZED_STATE);
+	CU_ASSERT(spdk_lvs_ha_fence(33, NULL, NULL) == 0);
+	poll_threads();
+	CU_ASSERT(g_ha_subsys[0].state == SPDK_NVME_ANA_INACCESSIBLE_STATE);
+
+	CU_ASSERT(spdk_lvs_ha_unfence(33) == 0);
+	poll_threads();
+	CU_ASSERT(g_ha_subsys[0].state == SPDK_NVME_ANA_INACCESSIBLE_STATE);
+	CU_ASSERT(lvs->ha_ana_restore_port == 4420);
+
+	spdk_set_leader_all(lvs, true, false, ha_set_leader_done, &rc);
+	poll_threads();
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_ha_subsys[0].state == SPDK_NVME_ANA_OPTIMIZED_STATE);
+	CU_ASSERT(lvs->ha_ana_restore_port == 0);
+	ha_free_lvs(lvs);
+}
+
+/* A state the control plane set while fenced is kept; a port someone else blocked
+ * before the fence is not the fence's, so its ANA state is not touched either. */
+static void
+lvol_ha_ana_respects_foreign_changes(void)
+{
+	struct spdk_lvol_store *lvs = ha_alloc_lvs(34, false, NODE_SECONDARY);
+
+	ha_reset_nvmf();
+	ha_add_subsys("nqn.ha:vol1", 4420, SPDK_NVME_ANA_OPTIMIZED_STATE);
+	CU_ASSERT(spdk_lvs_ha_fence(34, NULL, NULL) == 0);
+	poll_threads();
+	CU_ASSERT(g_ha_subsys[0].state == SPDK_NVME_ANA_INACCESSIBLE_STATE);
+	g_ha_subsys[0].state = SPDK_NVME_ANA_NON_OPTIMIZED_STATE; /* the control plane */
+	CU_ASSERT(spdk_lvs_ha_unfence(34) == 0);
+	poll_threads();
+	CU_ASSERT(g_ha_subsys[0].state == SPDK_NVME_ANA_NON_OPTIMIZED_STATE);
+	ha_free_lvs(lvs);
+
+	lvs = ha_alloc_lvs(35, false, NODE_SECONDARY);
+	ha_reset_nvmf();
+	ha_add_subsys("nqn.ha:vol1", 4420, SPDK_NVME_ANA_OPTIMIZED_STATE);
+	CU_ASSERT(spdk_nvmf_port_block(4420, false));
+	CU_ASSERT(spdk_lvs_ha_fence(35, NULL, NULL) == 0);
+	poll_threads();
+	CU_ASSERT(g_ha_set_ana_cnt == 0);
+	CU_ASSERT(g_ha_subsys[0].state == SPDK_NVME_ANA_OPTIMIZED_STATE);
+	CU_ASSERT(spdk_lvs_ha_unfence(35) == 0);
+	poll_threads();
+	CU_ASSERT(g_ha_set_ana_cnt == 0);
 	ha_free_lvs(lvs);
 }
 
@@ -4223,6 +4571,11 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, lvol_ha_rules_poller_respects_fence);
 	CU_ADD_TEST(suite, lvol_ha_is_leader);
 	CU_ADD_TEST(suite, lvol_ha_demotion_reported_once);
+	CU_ADD_TEST(suite, lvol_ha_no_msg_under_mutex);
+	CU_ADD_TEST(suite, lvol_ha_fence_blocks_io_takeover);
+	CU_ADD_TEST(suite, lvol_ha_fence_sets_ana_inaccessible);
+	CU_ADD_TEST(suite, lvol_ha_primary_ana_restored_on_leadership);
+	CU_ADD_TEST(suite, lvol_ha_ana_respects_foreign_changes);
 
 	suite = CU_add_suite("lvol", NULL, NULL);
 

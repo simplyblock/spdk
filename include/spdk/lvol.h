@@ -359,6 +359,14 @@ int spdk_lvs_ha_unfence(uint64_t groupid);
 bool spdk_lvs_ha_is_fenced(uint64_t groupid);
 int spdk_lvs_ha_is_leader(uint64_t groupid);
 bool spdk_lvs_ha_take_demoted(uint64_t groupid);
+
+/**
+ * Two-node arbitration: true while IO on this lvstore must not start a leadership
+ * takeover (an lvstore update on failover). Set by the fence; cleared only when the
+ * control plane sets the leadership explicitly (bdev_lvol_set_leader). The IO path
+ * completes such IO with an ANA-inaccessible path error instead.
+ */
+bool spdk_lvs_ha_takeover_blocked(struct spdk_lvol_store *lvs);
 void spdk_lvs_open_hub_bdev(void * cb_arg);
 void spdk_lvs_connect_hublvol(struct spdk_lvol_store *lvs, const char *remote_bdev);
 void spdk_lvs_set_read_only(struct spdk_lvol_store *lvs, bool status);

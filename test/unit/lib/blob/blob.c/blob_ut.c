@@ -10168,6 +10168,21 @@ ha_release_done(void *cb_arg, int bserrno)
 	g_ha_release_cb_rc = bserrno;
 }
 
+/* The lvol layer's sequence: record the decision, then sync on the md thread. */
+static int
+ha_hold(struct spdk_blob_store *bs)
+{
+	spdk_bs_ha_set_hold(bs, true);
+	return spdk_bs_ha_sync_send_msg(bs, NULL, NULL);
+}
+
+static int
+ha_release(struct spdk_blob_store *bs, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	spdk_bs_ha_set_hold(bs, false);
+	return spdk_bs_ha_sync_send_msg(bs, cb_fn, cb_arg);
+}
+
 static struct spdk_io_channel *
 ha_setup_blob(struct spdk_blob *blob)
 {
@@ -10209,7 +10224,7 @@ blob_ha_not_engaged(void)
 	CU_ASSERT(rc == 0);
 
 	/* A release without a hold is a no-op whose callback still runs once. */
-	CU_ASSERT(spdk_bs_ha_release_send_msg(blob->bs, ha_release_done, NULL) == 0);
+	CU_ASSERT(ha_release(blob->bs, ha_release_done, NULL) == 0);
 	poll_threads();
 	CU_ASSERT(g_ha_release_cb_cnt == 1);
 	CU_ASSERT(g_ha_release_cb_rc == 0);
@@ -10226,13 +10241,13 @@ blob_ha_hold_queues_writes(void)
 	uint8_t payload[BLOCKLEN];
 	int rc = 99;
 
-	CU_ASSERT(spdk_bs_ha_hold_send_msg(blob->bs) == 0);
+	CU_ASSERT(ha_hold(blob->bs) == 0);
 	poll_threads();
 	CU_ASSERT(blob->ha_held == true);
 	CU_ASSERT(blob->frozen_refcnt == 1);
 
 	/* A second hold does not freeze again. */
-	CU_ASSERT(spdk_bs_ha_hold_send_msg(blob->bs) == 0);
+	CU_ASSERT(ha_hold(blob->bs) == 0);
 	poll_threads();
 	CU_ASSERT(blob->frozen_refcnt == 1);
 
@@ -10241,7 +10256,7 @@ blob_ha_hold_queues_writes(void)
 	poll_threads();
 	CU_ASSERT(rc == 99); /* held: neither completed nor failed */
 
-	CU_ASSERT(spdk_bs_ha_release_send_msg(blob->bs, ha_release_done, NULL) == 0);
+	CU_ASSERT(ha_release(blob->bs, ha_release_done, NULL) == 0);
 	poll_threads();
 	CU_ASSERT(rc == 0);
 	CU_ASSERT(g_ha_release_cb_cnt == 1);
@@ -10259,7 +10274,7 @@ blob_ha_release_in_order(void)
 	uint8_t first[BLOCKLEN], second[BLOCKLEN], readback[BLOCKLEN];
 	int rc1 = 99, rc2 = 99, rcr = 99;
 
-	CU_ASSERT(spdk_bs_ha_hold_send_msg(blob->bs) == 0);
+	CU_ASSERT(ha_hold(blob->bs) == 0);
 	poll_threads();
 	memset(first, 0xa1, sizeof(first));
 	memset(second, 0xb2, sizeof(second));
@@ -10268,7 +10283,7 @@ blob_ha_release_in_order(void)
 	poll_threads();
 	CU_ASSERT(rc1 == 99 && rc2 == 99);
 
-	CU_ASSERT(spdk_bs_ha_release_send_msg(blob->bs, ha_release_done, NULL) == 0);
+	CU_ASSERT(ha_release(blob->bs, ha_release_done, NULL) == 0);
 	poll_threads();
 	CU_ASSERT(rc1 == 0 && rc2 == 0);
 	CU_ASSERT(g_ha_release_cb_cnt == 1);
@@ -10289,7 +10304,7 @@ blob_ha_hold_skips_read_only(void)
 	struct spdk_io_channel *channel = ha_setup_blob(blob);
 
 	blob->data_ro = true;
-	CU_ASSERT(spdk_bs_ha_hold_send_msg(blob->bs) == 0);
+	CU_ASSERT(ha_hold(blob->bs) == 0);
 	poll_threads();
 	CU_ASSERT(blob->ha_held == false);
 	CU_ASSERT(blob->frozen_refcnt == 0);
@@ -10306,7 +10321,7 @@ blob_ha_fence_aborts_held_io(void)
 	uint8_t payload[BLOCKLEN];
 	int rc = 99;
 
-	CU_ASSERT(spdk_bs_ha_hold_send_msg(blob->bs) == 0);
+	CU_ASSERT(ha_hold(blob->bs) == 0);
 	poll_threads();
 	memset(payload, 0x33, sizeof(payload));
 	spdk_blob_io_write(blob, channel, payload, 0, 1, blob_op_complete, &rc);
@@ -10314,7 +10329,7 @@ blob_ha_fence_aborts_held_io(void)
 	CU_ASSERT(rc == 99);
 
 	spdk_bs_set_ha_fenced(blob->bs, true);
-	CU_ASSERT(spdk_bs_ha_release_send_msg(blob->bs, ha_release_done, NULL) == 0);
+	CU_ASSERT(ha_release(blob->bs, ha_release_done, NULL) == 0);
 	poll_threads();
 	CU_ASSERT(rc == -ENOTCONN);
 	CU_ASSERT(rc != -EIO);
@@ -10370,6 +10385,99 @@ blob_ha_fenced_rejects_writes(void)
 	ha_teardown_blob(blob->bs, channel);
 }
 
+/* Review on #76, point 2: the lvol layer decides under its mutex and syncs after it,
+ * so a hold's sync and a grant's sync can arrive in either order. Each sync applies
+ * the latest decision: a grant that overtook its hold never leaves blobs held. */
+static void
+blob_ha_sync_converges_on_last_decision(void)
+{
+	struct spdk_blob *blob = g_blob;
+	struct spdk_io_channel *channel = ha_setup_blob(blob);
+	uint8_t payload[BLOCKLEN];
+	int rc = 99;
+
+	spdk_bs_ha_set_hold(blob->bs, true);	/* hold decided */
+	spdk_bs_ha_set_hold(blob->bs, false);	/* grant decided right after */
+	/* The grant's sync is delivered first, the hold's second. */
+	CU_ASSERT(spdk_bs_ha_sync_send_msg(blob->bs, ha_release_done, NULL) == 0);
+	CU_ASSERT(spdk_bs_ha_sync_send_msg(blob->bs, NULL, NULL) == 0);
+	poll_threads();
+	CU_ASSERT(blob->ha_held == false);
+	CU_ASSERT(blob->frozen_refcnt == 0);
+	CU_ASSERT(g_ha_release_cb_cnt == 1);
+
+	memset(payload, 0x66, sizeof(payload));
+	spdk_blob_io_write(blob, channel, payload, 0, 1, blob_op_complete, &rc);
+	poll_threads();
+	CU_ASSERT(rc == 0);
+	ha_teardown_blob(blob->bs, channel);
+}
+
+/* Review on #76, point 5: held writes never wait for the host's IO timeout. If no
+ * verdict and no fence comes (a wedged JC), the backstop returns them as path errors
+ * after 5 s and rejects new writes the same way, until the next decision. */
+static void
+blob_ha_hold_backstop(void)
+{
+	struct spdk_blob *blob = g_blob;
+	struct spdk_io_channel *channel = ha_setup_blob(blob);
+	uint8_t payload[BLOCKLEN];
+	int rc = 99;
+
+	CU_ASSERT(ha_hold(blob->bs) == 0);
+	poll_threads();
+	memset(payload, 0x77, sizeof(payload));
+	spdk_blob_io_write(blob, channel, payload, 0, 1, blob_op_complete, &rc);
+	poll_threads();
+	CU_ASSERT(rc == 99);
+
+	/* Inside hold_ms nothing happens. */
+	spdk_delay_us(2500 * 1000);
+	poll_threads();
+	CU_ASSERT(rc == 99);
+
+	spdk_delay_us(2600 * 1000);
+	poll_threads();
+	CU_ASSERT(rc == -ENOTCONN);
+	CU_ASSERT(blob->ha_held == false);
+	CU_ASSERT(blob->frozen_refcnt == 0);
+	CU_ASSERT(blob->bs->ha_hold_expired == true);
+
+	rc = 99;
+	spdk_blob_io_write(blob, channel, payload, 0, 1, blob_op_complete, &rc);
+	poll_threads();
+	CU_ASSERT(rc == -ENOTCONN);
+
+	/* A grant ends the expired state. */
+	CU_ASSERT(ha_release(blob->bs, ha_release_done, NULL) == 0);
+	poll_threads();
+	CU_ASSERT(blob->bs->ha_hold_expired == false);
+	rc = 99;
+	spdk_blob_io_write(blob, channel, payload, 0, 1, blob_op_complete, &rc);
+	poll_threads();
+	CU_ASSERT(rc == 0);
+	ha_teardown_blob(blob->bs, channel);
+}
+
+/* A decided hold does not fire the backstop. */
+static void
+blob_ha_backstop_cancelled_by_release(void)
+{
+	struct spdk_blob *blob = g_blob;
+	struct spdk_io_channel *channel = ha_setup_blob(blob);
+
+	CU_ASSERT(ha_hold(blob->bs) == 0);
+	poll_threads();
+	CU_ASSERT(blob->bs->ha_hold_poller != NULL);
+	CU_ASSERT(ha_release(blob->bs, ha_release_done, NULL) == 0);
+	poll_threads();
+	CU_ASSERT(blob->bs->ha_hold_poller == NULL);
+	spdk_delay_us(6000 * 1000);
+	poll_threads();
+	CU_ASSERT(blob->bs->ha_hold_expired == false);
+	ha_teardown_blob(blob->bs, channel);
+}
+
 /* END two-node arbitration */
 
 
@@ -10399,6 +10507,9 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, blob_ha_hold_skips_read_only);
 	CU_ADD_TEST(suite, blob_ha_fence_aborts_held_io);
 	CU_ADD_TEST(suite, blob_ha_fenced_rejects_writes);
+	CU_ADD_TEST(suite, blob_ha_sync_converges_on_last_decision);
+	CU_ADD_TEST(suite, blob_ha_hold_backstop);
+	CU_ADD_TEST(suite, blob_ha_backstop_cancelled_by_release);
 
 	for (i = 0; i < SPDK_COUNTOF(configs); ++i) {
 		config = &configs[i];
