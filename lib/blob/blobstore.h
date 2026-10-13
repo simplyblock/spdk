@@ -111,6 +111,9 @@ struct spdk_blob_list {
 struct spdk_blob {
 	struct spdk_blob_store *bs;
 
+	/* Two-node arbitration: frozen once by a hold (spdk_bs_ha_sync_send_msg), released once. */
+	bool  ha_held;
+
 	int priority_class; // to save the lvol's priority class across cluster allocations
 	bool  failed_on_update;
 	uint32_t	open_ref;
@@ -224,6 +227,15 @@ struct spdk_blob_store {
 	 * Only when the distrib internal force state changes, it will be set to false.
 	 */
 	bool				is_leader;
+	/* Two-node arbitration: held IO is returned as a path error (-ENOTCONN), not EIO. */
+	bool				ha_fenced;
+	/* Two-node arbitration: desired hold state, written by the lvol layer, applied on
+	 * the md thread by spdk_bs_ha_sync_send_msg. */
+	bool				ha_hold_wanted;
+	/* Two-node arbitration: the hold outlived its backstop; writes are path errors
+	 * until the next sync. md thread only. */
+	bool				ha_hold_expired;
+	struct spdk_poller		*ha_hold_poller;
 	node_role_t 		node_role;
 	bool				read_only;
 	bool 				stop;

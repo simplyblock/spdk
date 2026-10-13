@@ -350,6 +350,29 @@ struct spdk_lvol_store {
 	uint64_t			timeout_trigger;
 	bool 				trigger_leader_sent;
 	bool				special_send_signal;
+	/* Two-node arbitration (sbcli docs/design/two-node-arbitration.md):
+	 * ha_held: client writes are held in the frozen-IO queue awaiting a verdict;
+	 * ha_fenced: the LVS was fenced; its client port stays blocked (the hublvol port is
+	 *            never blocked by the fence, so the returning peer can reconnect);
+	 * ha_demoted: set when the control plane demotes the LVS (spdk_set_leader_all with
+	 *            leader=false), cleared on promotion; consumed by spdk_lvs_ha_take_demoted;
+	 * ha_fence_port: the client port this LVS's fence blocked and therefore owns (0: the
+	 *            fence blocked nothing of its own, e.g. the port was already blocked by
+	 *            someone else). spdk_lvs_ha_unfence lifts only this block. */
+	bool				ha_held;
+	bool				ha_fenced;
+	bool				ha_demoted;
+	int				ha_fence_port;
+	/* ha_takeover_blocked: set by the fence; while set, IO on this LVS never starts a
+	 *            leadership takeover (lvstore update on failover). Only an explicit
+	 *            leadership set by the control plane (bdev_lvol_set_leader) clears it.
+	 *            Until then such IO completes with an ANA-inaccessible path error. */
+	bool				ha_takeover_blocked;
+	/* ha_ana_restore_port: client port whose listeners' ANA state the fence set to
+	 *            inaccessible and that waits for the control plane's leadership set
+	 *            before it is restored (primary role only: a primary that does not lead
+	 *            cannot redirect, so it must not look accessible before that). */
+	int				ha_ana_restore_port;
 	bool 				read_only;
 	bool				skip_redirecting;
 	node_role_t 		node_role;

@@ -3776,6 +3776,778 @@ s3_merge_rejects_busy_tdev(void)
 	free(lvs);
 }
 
+/* START two-node arbitration (sbcli docs/design/two-node-arbitration.md) */
+
+/* Recording fakes for the blobstore and nvmf calls the lvs HA API makes. */
+static int g_ha_bs_hold_cnt;
+static int g_ha_bs_release_cnt;
+static int g_ha_bs_fenced_set = -1;
+static int g_ha_bs_leader_set = -1;
+static int g_ha_port_block_cnt;
+static int g_ha_port_unblock_cnt;
+static int g_ha_last_blocked_port;
+/* A small model of nvmf's blocked-port set (a set: blocking twice is one entry). */
+#define HA_MAX_PORTS 8
+static uint16_t g_ha_blocked[HA_MAX_PORTS];
+
+static bool
+ha_port_is_blocked(uint16_t port)
+{
+	for (int i = 0; i < HA_MAX_PORTS; i++) {
+		if (g_ha_blocked[i] == port) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static int
+ha_num_blocked(void)
+{
+	int n = 0;
+
+	for (int i = 0; i < HA_MAX_PORTS; i++) {
+		n += g_ha_blocked[i] != 0;
+	}
+	return n;
+}
+static int g_ha_cb_cnt;
+
+/* spdk_set_leader_all (demotion test) links the hublvol reconnect path; never called there
+ * for a primary lvs. */
+DEFINE_STUB(spdk_bdev_open_ext, int, (const char *bdev_name, bool write,
+				      spdk_bdev_event_cb_t event_cb, void *event_ctx, struct spdk_bdev_desc **desc), -ENODEV);
+DEFINE_STUB_V(spdk_bdev_close, (struct spdk_bdev_desc *desc));
+/* The failover-update path behind spdk_lvs_check_active_process / spdk_lvol_update_on_failover
+ * (reachable from the takeover-latch test; never reached while the latch holds). */
+DEFINE_STUB_V(spdk_bs_update_on_failover, (struct spdk_blob_store *bs, spdk_bs_op_complete cb_fn,
+		void *cb_arg));
+DEFINE_STUB_V(spdk_blob_update_on_failover_send_msg, (struct spdk_blob *blob,
+		spdk_blob_op_complete cb_fn, void *cb_arg));
+DEFINE_STUB_V(spdk_blob_update_failed_cleanup, (struct spdk_blob *blob,
+		spdk_blob_op_complete cb_fn, void *cb_arg));
+DEFINE_STUB_V(spdk_bs_drain_channel_queued, (struct spdk_blob_store *bs,
+		struct spdk_hublvol_channels *ch_list, int count, spdk_drain_op_cpl cb_fn, void *cb_arg));
+
+/* Review on #76, point 2: count every message sent while g_lvol_stores_mutex is held. */
+static int g_ha_msg_under_mutex;
+static bool g_ha_bs_hold_wanted;
+
+static void
+ha_check_mutex_free(void)
+{
+	if (pthread_mutex_trylock(&g_lvol_stores_mutex) == 0) {
+		pthread_mutex_unlock(&g_lvol_stores_mutex);
+	} else {
+		g_ha_msg_under_mutex++;
+	}
+}
+
+void
+spdk_bs_ha_set_hold(struct spdk_blob_store *bs, bool hold)
+{
+	g_ha_bs_hold_wanted = hold;
+}
+
+/* The md-thread sync, applied at once: a hold when the desired state is held, else a
+ * release whose callback runs after the drain. */
+int
+spdk_bs_ha_sync_send_msg(struct spdk_blob_store *bs, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	ha_check_mutex_free();
+	if (g_ha_bs_hold_wanted) {
+		g_ha_bs_hold_cnt++;
+	} else {
+		g_ha_bs_release_cnt++;
+	}
+	if (cb_fn) {
+		cb_fn(cb_arg, 0);
+	}
+	return 0;
+}
+
+/* new_md_journal: leadership changes complete through the md journal activation. */
+void
+spdk_bs_activate_md_journal(struct spdk_blob_store *bs, bool state, bool lvs_state,
+			    spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	cb_fn(cb_arg, 0);
+}
+
+/* A small model of the nvmf target for the fence's ANA change (review on #76, point 4):
+ * one target, subsystems with one listener each. */
+struct ha_fake_subsys {
+	char				nqn[64];
+	struct spdk_nvme_transport_id	trid;
+	enum spdk_nvme_ana_state	state;
+	bool				ana_reporting;
+	int				paused;
+};
+#define HA_MAX_SUBSYS 4
+static struct ha_fake_subsys g_ha_subsys[HA_MAX_SUBSYS];
+static int g_ha_n_subsys;
+static int g_ha_pause_busy;	/* pause answers -EBUSY this many times first */
+static int g_ha_set_ana_cnt;
+#define HA_FAKE_TGT ((struct spdk_nvmf_tgt *)0x1)
+
+static void
+ha_add_subsys(const char *nqn, uint16_t port, enum spdk_nvme_ana_state state)
+{
+	struct ha_fake_subsys *s = &g_ha_subsys[g_ha_n_subsys++];
+
+	snprintf(s->nqn, sizeof(s->nqn), "%s", nqn);
+	s->trid.trtype = SPDK_NVME_TRANSPORT_TCP;
+	snprintf(s->trid.traddr, sizeof(s->trid.traddr), "10.0.0.1");
+	snprintf(s->trid.trsvcid, sizeof(s->trid.trsvcid), "%u", port);
+	s->state = state;
+	s->ana_reporting = true;
+}
+
+static void
+ha_reset_nvmf(void)
+{
+	poll_threads();
+	memset(g_ha_subsys, 0, sizeof(g_ha_subsys));
+	memset(g_lvs_ha_ana_saved, 0, sizeof(g_lvs_ha_ana_saved));
+	g_ha_n_subsys = 0;
+	g_ha_pause_busy = 0;
+	g_ha_set_ana_cnt = 0;
+}
+
+struct spdk_nvmf_tgt *
+spdk_nvmf_get_first_tgt(void)
+{
+	return HA_FAKE_TGT;
+}
+
+struct spdk_nvmf_tgt *
+spdk_nvmf_get_next_tgt(struct spdk_nvmf_tgt *prev)
+{
+	return NULL;
+}
+
+struct spdk_nvmf_subsystem *
+spdk_nvmf_subsystem_get_first(struct spdk_nvmf_tgt *tgt)
+{
+	return g_ha_n_subsys ? (struct spdk_nvmf_subsystem *)&g_ha_subsys[0] : NULL;
+}
+
+struct spdk_nvmf_subsystem *
+spdk_nvmf_subsystem_get_next(struct spdk_nvmf_subsystem *subsystem)
+{
+	struct ha_fake_subsys *s = (struct ha_fake_subsys *)subsystem;
+
+	return s + 1 < &g_ha_subsys[g_ha_n_subsys] ? (struct spdk_nvmf_subsystem *)(s + 1) : NULL;
+}
+
+bool
+spdk_nvmf_subsystem_get_ana_reporting(struct spdk_nvmf_subsystem *subsystem)
+{
+	return ((struct ha_fake_subsys *)subsystem)->ana_reporting;
+}
+
+struct spdk_nvmf_subsystem_listener *
+spdk_nvmf_subsystem_get_first_listener(struct spdk_nvmf_subsystem *subsystem)
+{
+	return (struct spdk_nvmf_subsystem_listener *)subsystem;
+}
+
+struct spdk_nvmf_subsystem_listener *
+spdk_nvmf_subsystem_get_next_listener(struct spdk_nvmf_subsystem *subsystem,
+				      struct spdk_nvmf_subsystem_listener *prev_listener)
+{
+	return NULL;
+}
+
+const struct spdk_nvme_transport_id *
+spdk_nvmf_subsystem_listener_get_trid(struct spdk_nvmf_subsystem_listener *listener)
+{
+	return &((struct ha_fake_subsys *)listener)->trid;
+}
+
+const char *
+spdk_nvmf_subsystem_get_nqn(const struct spdk_nvmf_subsystem *subsystem)
+{
+	return ((const struct ha_fake_subsys *)subsystem)->nqn;
+}
+
+struct spdk_nvmf_subsystem *
+spdk_nvmf_tgt_find_subsystem(struct spdk_nvmf_tgt *tgt, const char *subnqn)
+{
+	for (int i = 0; i < g_ha_n_subsys; i++) {
+		if (strcmp(g_ha_subsys[i].nqn, subnqn) == 0) {
+			return (struct spdk_nvmf_subsystem *)&g_ha_subsys[i];
+		}
+	}
+	return NULL;
+}
+
+int
+spdk_nvmf_subsystem_pause(struct spdk_nvmf_subsystem *subsystem, uint32_t nsid,
+			  spdk_nvmf_subsystem_state_change_done cb_fn, void *cb_arg)
+{
+	CU_ASSERT(nsid == 0); /* never waits for (held) namespace IO */
+	if (g_ha_pause_busy > 0) {
+		g_ha_pause_busy--;
+		return -EBUSY;
+	}
+	((struct ha_fake_subsys *)subsystem)->paused++;
+	cb_fn(subsystem, cb_arg, 0);
+	return 0;
+}
+
+int
+spdk_nvmf_subsystem_resume(struct spdk_nvmf_subsystem *subsystem,
+			   spdk_nvmf_subsystem_state_change_done cb_fn, void *cb_arg)
+{
+	((struct ha_fake_subsys *)subsystem)->paused--;
+	cb_fn(subsystem, cb_arg, 0);
+	return 0;
+}
+
+int
+spdk_nvmf_subsystem_get_ana_state(struct spdk_nvmf_subsystem *subsystem,
+				  const struct spdk_nvme_transport_id *trid, uint32_t anagrpid,
+				  enum spdk_nvme_ana_state *ana_state)
+{
+	*ana_state = ((struct ha_fake_subsys *)subsystem)->state;
+	return 0;
+}
+
+void
+spdk_nvmf_subsystem_set_ana_state(struct spdk_nvmf_subsystem *subsystem,
+				  const struct spdk_nvme_transport_id *trid,
+				  enum spdk_nvme_ana_state ana_state, uint32_t anagrpid,
+				  spdk_nvmf_tgt_subsystem_listen_done_fn cb_fn, void *cb_arg)
+{
+	struct ha_fake_subsys *s = (struct ha_fake_subsys *)subsystem;
+
+	CU_ASSERT(s->paused == 1);
+	CU_ASSERT(anagrpid == 0);
+	s->state = ana_state;
+	g_ha_set_ana_cnt++;
+	cb_fn(cb_arg, 0);
+}
+
+void
+spdk_bs_set_ha_fenced(struct spdk_blob_store *bs, bool fenced)
+{
+	g_ha_bs_fenced_set = fenced;
+}
+
+void
+spdk_bs_set_leader(struct spdk_blob_store *bs, bool state)
+{
+	g_ha_bs_leader_set = state;
+}
+
+bool
+spdk_nvmf_port_block(uint16_t port, bool is_reject)
+{
+	g_ha_port_block_cnt++;
+	g_ha_last_blocked_port = port;
+	if (port != 0 && !ha_port_is_blocked(port)) {
+		for (int i = 0; i < HA_MAX_PORTS; i++) {
+			if (g_ha_blocked[i] == 0) {
+				g_ha_blocked[i] = port;
+				break;
+			}
+		}
+	}
+	return true;
+}
+
+bool
+spdk_nvmf_port_unblock(uint16_t port)
+{
+	g_ha_port_unblock_cnt++;
+	for (int i = 0; i < HA_MAX_PORTS; i++) {
+		if (g_ha_blocked[i] == port) {
+			g_ha_blocked[i] = 0;
+		}
+	}
+	return true;
+}
+
+bool
+spdk_nvmf_check_port_permission(uint16_t port, bool *is_reject)
+{
+	*is_reject = false;
+	return !ha_port_is_blocked(port);
+}
+
+const char *
+node_role_to_string(node_role_t role)
+{
+	return role == NODE_PRIMARY ? "primary" : role == NODE_SECONDARY ? "secondary" : "tertiary";
+}
+
+static void
+ha_cb(void *cb_arg, int rc)
+{
+	g_ha_cb_cnt++;
+}
+
+static void
+ha_set_leader_done(void *cb_arg, int lvolerrno)
+{
+	*(int *)cb_arg = lvolerrno;
+}
+
+static struct spdk_lvol_store *
+ha_alloc_lvs(uint64_t groupid, bool leader, node_role_t role)
+{
+	struct spdk_lvol_store *lvs = calloc(1, sizeof(*lvs));
+
+	SPDK_CU_ASSERT_FATAL(lvs != NULL);
+	TAILQ_INIT(&lvs->lvols);
+	snprintf(lvs->name, sizeof(lvs->name), "ha_lvs_%" PRIu64, groupid);
+	lvs->groupid = groupid;
+	lvs->leader = leader;
+	lvs->node_role = role;
+	lvs->subsystem_port = 4420;
+	lvs->hublvol_port = 4430;
+	lvs->blobstore = (struct spdk_blob_store *)0x1;
+	SPDK_CU_ASSERT_FATAL(add_lvs_to_list(lvs) == 0);
+	g_ha_bs_hold_cnt = g_ha_bs_release_cnt = g_ha_port_block_cnt = g_ha_port_unblock_cnt = 0;
+	g_ha_bs_fenced_set = g_ha_bs_leader_set = -1;
+	g_ha_last_blocked_port = 0;
+	g_ha_cb_cnt = 0;
+	g_ha_bs_hold_wanted = false;
+	memset(g_ha_blocked, 0, sizeof(g_ha_blocked));
+	return lvs;
+}
+
+static void
+ha_free_lvs(struct spdk_lvol_store *lvs)
+{
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+	TAILQ_REMOVE(&g_lvol_stores, lvs, link);
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+	free(lvs);
+}
+
+/* Every call on an unknown groupid fails with -ENOENT and never calls back. */
+static void
+lvol_ha_unknown_groupid(void)
+{
+	g_ha_cb_cnt = 0;
+	CU_ASSERT(spdk_lvs_ha_hold(9999) == -ENOENT);
+	CU_ASSERT(spdk_lvs_ha_release(9999, ha_cb, NULL) == -ENOENT);
+	CU_ASSERT(spdk_lvs_ha_fence(9999, ha_cb, NULL) == -ENOENT);
+	CU_ASSERT(spdk_lvs_ha_unfence(9999) == -ENOENT);
+	CU_ASSERT(spdk_lvs_ha_is_fenced(9999) == false);
+	CU_ASSERT(spdk_lvs_ha_is_leader(9999) == -ENOENT);
+	CU_ASSERT(spdk_lvs_ha_take_demoted(9999) == false);
+	CU_ASSERT(g_ha_cb_cnt == 0);
+}
+
+/* Hold engages once, and only on a leading lvs. */
+static void
+lvol_ha_hold_leader_once(void)
+{
+	struct spdk_lvol_store *lvs = ha_alloc_lvs(11, true, NODE_PRIMARY);
+
+	CU_ASSERT(spdk_lvs_ha_hold(11) == 0);
+	CU_ASSERT(lvs->ha_held == true);
+	CU_ASSERT(g_ha_bs_hold_cnt == 1);
+	CU_ASSERT(spdk_lvs_ha_hold(11) == 0);
+	CU_ASSERT(g_ha_bs_hold_cnt == 1);
+	CU_ASSERT(g_ha_port_block_cnt == 0);
+	ha_free_lvs(lvs);
+
+	lvs = ha_alloc_lvs(12, false, NODE_SECONDARY);
+	CU_ASSERT(spdk_lvs_ha_hold(12) == 0);
+	CU_ASSERT(lvs->ha_held == false);
+	CU_ASSERT(g_ha_bs_hold_cnt == 0);
+	ha_free_lvs(lvs);
+}
+
+/* Grant: release the hold, stay leader, callback once. */
+static void
+lvol_ha_release_grant(void)
+{
+	struct spdk_lvol_store *lvs = ha_alloc_lvs(13, true, NODE_PRIMARY);
+
+	CU_ASSERT(spdk_lvs_ha_hold(13) == 0);
+	CU_ASSERT(spdk_lvs_ha_release(13, ha_cb, NULL) == 0);
+	CU_ASSERT(lvs->ha_held == false);
+	CU_ASSERT(lvs->leader == true);
+	CU_ASSERT(g_ha_bs_release_cnt == 1);
+	CU_ASSERT(g_ha_cb_cnt == 1);
+	CU_ASSERT(g_ha_port_block_cnt == 0);
+	/* NULL callback is allowed. */
+	CU_ASSERT(spdk_lvs_ha_release(13, NULL, NULL) == 0);
+	ha_free_lvs(lvs);
+}
+
+/* Fence: non-leader, client port blocked (never the hublvol port), blobstore fenced,
+ * held IO released as path error. */
+static void
+lvol_ha_fence(void)
+{
+	struct spdk_lvol_store *lvs = ha_alloc_lvs(14, true, NODE_PRIMARY);
+	struct spdk_lvol lvol = { .leader = true };
+
+	TAILQ_INSERT_TAIL(&lvs->lvols, &lvol, link);
+	CU_ASSERT(spdk_lvs_ha_hold(14) == 0);
+	CU_ASSERT(spdk_lvs_ha_fence(14, ha_cb, NULL) == 0);
+	CU_ASSERT(lvs->ha_fenced == true);
+	CU_ASSERT(lvs->ha_held == false);
+	CU_ASSERT(lvs->leader == false);
+	CU_ASSERT(lvol.leader == false);
+	CU_ASSERT(g_ha_bs_fenced_set == 1);
+	CU_ASSERT(g_ha_bs_leader_set == 0);
+	/* Only the client subsystem port: the returning peer must be able to reach the
+	 * hublvol port to resync, and unfence waits for that resync. */
+	CU_ASSERT(g_ha_port_block_cnt == 1);
+	CU_ASSERT(g_ha_last_blocked_port == 4420);
+	CU_ASSERT(g_ha_bs_release_cnt == 1);
+	CU_ASSERT(g_ha_cb_cnt == 1);
+	CU_ASSERT(spdk_lvs_ha_is_fenced(14) == true);
+
+	/* A fenced lvs is not held again. */
+	CU_ASSERT(spdk_lvs_ha_hold(14) == 0);
+	CU_ASSERT(g_ha_bs_hold_cnt == 1);
+	TAILQ_REMOVE(&lvs->lvols, &lvol, link);
+	ha_free_lvs(lvs);
+
+	/* A tertiary blocks its client port too. */
+	lvs = ha_alloc_lvs(15, true, NODE_TERTIARY);
+	CU_ASSERT(spdk_lvs_ha_fence(15, NULL, NULL) == 0);
+	CU_ASSERT(g_ha_port_block_cnt == 1);
+	CU_ASSERT(g_ha_last_blocked_port == 4420);
+	ha_free_lvs(lvs);
+}
+
+/* Unfence clears the marker on the lvs and the blobstore and lifts the client-port
+ * block its fence applied (campaign c3, F8): fence then unfence leaves no port blocked. */
+static void
+lvol_ha_unfence(void)
+{
+	struct spdk_lvol_store *lvs = ha_alloc_lvs(16, true, NODE_PRIMARY);
+
+	CU_ASSERT(spdk_lvs_ha_fence(16, NULL, NULL) == 0);
+	CU_ASSERT(ha_port_is_blocked(4420));
+	CU_ASSERT(lvs->ha_fence_port == 4420);
+	g_ha_port_unblock_cnt = 0;
+	CU_ASSERT(spdk_lvs_ha_unfence(16) == 0);
+	CU_ASSERT(lvs->ha_fenced == false);
+	CU_ASSERT(lvs->ha_fence_port == 0);
+	CU_ASSERT(g_ha_bs_fenced_set == 0);
+	CU_ASSERT(spdk_lvs_ha_is_fenced(16) == false);
+	CU_ASSERT(g_ha_port_unblock_cnt == 1);
+	CU_ASSERT(ha_num_blocked() == 0);
+
+	/* Idempotent: a second unfence (the arbiter retries) unblocks nothing more. */
+	CU_ASSERT(spdk_lvs_ha_unfence(16) == 0);
+	CU_ASSERT(g_ha_port_unblock_cnt == 1);
+	ha_free_lvs(lvs);
+}
+
+/* A repeated fence (a new epoch, or a self-fence followed by the arbiter's jc_fence)
+ * keeps the ownership of the first one; one unfence still clears the port. */
+static void
+lvol_ha_refence_then_unfence(void)
+{
+	struct spdk_lvol_store *lvs = ha_alloc_lvs(20, true, NODE_PRIMARY);
+
+	CU_ASSERT(spdk_lvs_ha_fence(20, NULL, NULL) == 0);
+	CU_ASSERT(spdk_lvs_ha_fence(20, NULL, NULL) == 0);
+	CU_ASSERT(lvs->ha_fence_port == 4420);
+	CU_ASSERT(spdk_lvs_ha_unfence(20) == 0);
+	CU_ASSERT(ha_num_blocked() == 0);
+	ha_free_lvs(lvs);
+}
+
+/* A self-fence of every LVS (the JC's stall fence: leader and follower LVS, each with
+ * its own client port) followed by the re-admit's unfence leaves no port blocked. */
+static void
+lvol_ha_stall_fence_all_then_unfence(void)
+{
+	struct spdk_lvol_store *a = ha_alloc_lvs(21, true, NODE_PRIMARY);
+	struct spdk_lvol_store *b = ha_alloc_lvs(22, false, NODE_SECONDARY);
+
+	a->subsystem_port = 4424;
+	b->subsystem_port = 4426;
+	CU_ASSERT(spdk_lvs_ha_fence(21, NULL, NULL) == 0);
+	CU_ASSERT(spdk_lvs_ha_fence(22, NULL, NULL) == 0);
+	CU_ASSERT(ha_port_is_blocked(4424) && ha_port_is_blocked(4426));
+	CU_ASSERT(spdk_lvs_ha_unfence(21) == 0);
+	CU_ASSERT(!ha_port_is_blocked(4424) && ha_port_is_blocked(4426));
+	CU_ASSERT(spdk_lvs_ha_unfence(22) == 0);
+	CU_ASSERT(ha_num_blocked() == 0);
+	ha_free_lvs(a);
+	ha_free_lvs(b);
+}
+
+/* A block someone else set before the fence (the control plane's restart flow, a
+ * writer conflict) is not the fence's: unfence leaves it in place. */
+static void
+lvol_ha_foreign_block_kept(void)
+{
+	struct spdk_lvol_store *lvs = ha_alloc_lvs(23, true, NODE_PRIMARY);
+
+	CU_ASSERT(spdk_nvmf_port_block(4420, false));
+	CU_ASSERT(spdk_lvs_ha_fence(23, NULL, NULL) == 0);
+	CU_ASSERT(lvs->ha_fence_port == 0);
+	g_ha_port_unblock_cnt = 0;
+	CU_ASSERT(spdk_lvs_ha_unfence(23) == 0);
+	CU_ASSERT(g_ha_port_unblock_cnt == 0);
+	CU_ASSERT(ha_port_is_blocked(4420));
+	ha_free_lvs(lvs);
+}
+
+/* Two LVS on one client port: the port stays blocked until both are unfenced. */
+static void
+lvol_ha_shared_port_until_last_unfence(void)
+{
+	struct spdk_lvol_store *a = ha_alloc_lvs(24, true, NODE_PRIMARY);
+	struct spdk_lvol_store *b = ha_alloc_lvs(25, false, NODE_SECONDARY);
+
+	CU_ASSERT(spdk_lvs_ha_fence(24, NULL, NULL) == 0);
+	CU_ASSERT(spdk_lvs_ha_fence(25, NULL, NULL) == 0);
+	CU_ASSERT(a->ha_fence_port == 4420 && b->ha_fence_port == 4420);
+	CU_ASSERT(spdk_lvs_ha_unfence(25) == 0);
+	CU_ASSERT(ha_port_is_blocked(4420));
+	CU_ASSERT(spdk_lvs_ha_unfence(24) == 0);
+	CU_ASSERT(!ha_port_is_blocked(4420));
+	ha_free_lvs(a);
+	ha_free_lvs(b);
+}
+
+/* Unfence of an LVS that was never fenced touches no port. */
+static void
+lvol_ha_unfence_without_fence(void)
+{
+	struct spdk_lvol_store *lvs = ha_alloc_lvs(26, true, NODE_PRIMARY);
+
+	CU_ASSERT(spdk_nvmf_port_block(4420, true));
+	g_ha_port_unblock_cnt = 0;
+	CU_ASSERT(spdk_lvs_ha_unfence(26) == 0);
+	CU_ASSERT(g_ha_port_unblock_cnt == 0);
+	CU_ASSERT(ha_port_is_blocked(4420));
+	ha_free_lvs(lvs);
+}
+
+/* The 10 s rule-removal poller only ever lifts the hublvol port rule, on a fenced lvs
+ * too (the fence does not own that port); the fence's client-port block is untouched. */
+static void
+lvol_ha_rules_poller_respects_fence(void)
+{
+	struct spdk_lvol_store *lvs = ha_alloc_lvs(17, true, NODE_PRIMARY);
+	struct spdk_lvs_req *req;
+
+	CU_ASSERT(spdk_lvs_ha_fence(17, NULL, NULL) == 0);
+	CU_ASSERT(g_ha_port_block_cnt == 1);
+	CU_ASSERT(g_ha_last_blocked_port == 4420);
+	req = calloc(1, sizeof(*req));
+	SPDK_CU_ASSERT_FATAL(req != NULL);
+	req->lvol_store = lvs;
+	spdk_lvs_remove_rules_poller(req);
+	CU_ASSERT(g_ha_port_unblock_cnt == 1); /* the hublvol port rule */
+	CU_ASSERT(g_ha_port_block_cnt == 1);   /* nothing re-blocked */
+	CU_ASSERT(lvs->ha_fenced == true);
+	g_ha_port_unblock_cnt = 0;
+
+	lvs->ha_fenced = false;
+	req = calloc(1, sizeof(*req));
+	SPDK_CU_ASSERT_FATAL(req != NULL);
+	req->lvol_store = lvs;
+	spdk_lvs_remove_rules_poller(req);
+	CU_ASSERT(g_ha_port_unblock_cnt == 1);
+	ha_free_lvs(lvs);
+}
+
+/* is_leader follows lvs->leader; a fenced lvs is not a leader. */
+static void
+lvol_ha_is_leader(void)
+{
+	struct spdk_lvol_store *lvs = ha_alloc_lvs(18, true, NODE_PRIMARY);
+
+	CU_ASSERT(spdk_lvs_ha_is_leader(18) == 1);
+	CU_ASSERT(spdk_lvs_ha_fence(18, NULL, NULL) == 0);
+	CU_ASSERT(spdk_lvs_ha_is_leader(18) == 0);
+	ha_free_lvs(lvs);
+}
+
+/* A control-plane demotion (spdk_set_leader_all, leader=false) is reported once to the
+ * JC through take_demoted; a promotion clears a pending report. */
+static void
+lvol_ha_demotion_reported_once(void)
+{
+	struct spdk_lvol_store *lvs = ha_alloc_lvs(19, true, NODE_PRIMARY);
+	int rc = 99;
+
+	CU_ASSERT(spdk_lvs_ha_take_demoted(19) == false);
+	spdk_set_leader_all(lvs, false, true, ha_set_leader_done, &rc);
+	CU_ASSERT(lvs->leader == false);
+	CU_ASSERT(spdk_lvs_ha_take_demoted(19) == true);
+	CU_ASSERT(spdk_lvs_ha_take_demoted(19) == false);
+
+	spdk_set_leader_all(lvs, false, true, ha_set_leader_done, &rc);
+	spdk_set_leader_all(lvs, true, false, ha_set_leader_done, &rc);
+	CU_ASSERT(lvs->leader == true);
+	CU_ASSERT(spdk_lvs_ha_take_demoted(19) == false);
+
+	/* The fence demotes internally, not through the control plane: not reported. */
+	CU_ASSERT(spdk_lvs_ha_fence(19, NULL, NULL) == 0);
+	CU_ASSERT(spdk_lvs_ha_take_demoted(19) == false);
+	ha_free_lvs(lvs);
+}
+
+/* Review on #76, point 2: hold, release, fence and unfence send no message while
+ * g_lvol_stores_mutex is held. */
+static void
+lvol_ha_no_msg_under_mutex(void)
+{
+	struct spdk_lvol_store *lvs = ha_alloc_lvs(30, true, NODE_PRIMARY);
+
+	ha_reset_nvmf();
+	g_ha_msg_under_mutex = 0;
+	CU_ASSERT(spdk_lvs_ha_hold(30) == 0);
+	CU_ASSERT(spdk_lvs_ha_release(30, ha_cb, NULL) == 0);
+	CU_ASSERT(spdk_lvs_ha_hold(30) == 0);
+	CU_ASSERT(spdk_lvs_ha_fence(30, ha_cb, NULL) == 0);
+	CU_ASSERT(spdk_lvs_ha_unfence(30) == 0);
+	poll_threads();
+	CU_ASSERT(g_ha_msg_under_mutex == 0);
+	CU_ASSERT(g_ha_bs_hold_cnt == 2);
+	CU_ASSERT(g_ha_bs_release_cnt == 2);
+	ha_free_lvs(lvs);
+}
+
+/* Review on #76, point 3: after a fence, incoming IO does not start a leadership
+ * takeover (lvstore update on failover), also not after the unfence; only an explicit
+ * leadership set by the control plane lifts that. */
+static void
+lvol_ha_fence_blocks_io_takeover(void)
+{
+	struct spdk_lvol_store *lvs = ha_alloc_lvs(31, true, NODE_PRIMARY);
+	struct spdk_lvol lvol = { .leader = true };
+	int rc = 99;
+
+	ha_reset_nvmf();
+	lvol.lvol_store = lvs;
+	TAILQ_INSERT_TAIL(&lvs->lvols, &lvol, link);
+	CU_ASSERT(spdk_lvs_ha_takeover_blocked(lvs) == false);
+	CU_ASSERT(spdk_lvs_ha_fence(31, NULL, NULL) == 0);
+	CU_ASSERT(spdk_lvs_ha_takeover_blocked(lvs) == true);
+
+	/* IO on the non-leading LVS: no update starts. */
+	spdk_lvs_check_active_process(lvs, &lvol, 1);
+	CU_ASSERT(lvs->update_in_progress == false);
+	spdk_lvol_update_on_failover(lvs, &lvol, false);
+	CU_ASSERT(lvol.update_in_progress == false);
+
+	CU_ASSERT(spdk_lvs_ha_unfence(31) == 0);
+	CU_ASSERT(spdk_lvs_ha_takeover_blocked(lvs) == true);
+	spdk_lvs_check_active_process(lvs, &lvol, 1);
+	CU_ASSERT(lvs->update_in_progress == false);
+
+	/* The control plane sets the leadership: the latch is gone. */
+	spdk_set_leader_all(lvs, true, false, ha_set_leader_done, &rc);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(lvs->leader == true);
+	CU_ASSERT(spdk_lvs_ha_takeover_blocked(lvs) == false);
+	TAILQ_REMOVE(&lvs->lvols, &lvol, link);
+	ha_free_lvs(lvs);
+}
+
+/* Review on #76, point 4: the fence sets the ANA state of the listeners on its client
+ * port to inaccessible (other ports untouched); for a secondary the unfence restores the
+ * previous state. The subsystem is paused without a namespace, so held IO is not
+ * waited for. */
+static void
+lvol_ha_fence_sets_ana_inaccessible(void)
+{
+	struct spdk_lvol_store *lvs = ha_alloc_lvs(32, false, NODE_SECONDARY);
+
+	ha_reset_nvmf();
+	ha_add_subsys("nqn.ha:vol1", 4420, SPDK_NVME_ANA_NON_OPTIMIZED_STATE);
+	ha_add_subsys("nqn.ha:vol2", 4420, SPDK_NVME_ANA_OPTIMIZED_STATE);
+	ha_add_subsys("nqn.ha:other", 4426, SPDK_NVME_ANA_OPTIMIZED_STATE);
+	g_ha_pause_busy = 1; /* another state change in progress: retried */
+
+	CU_ASSERT(spdk_lvs_ha_fence(32, NULL, NULL) == 0);
+	poll_threads();
+	spdk_delay_us(20 * 1000);
+	poll_threads();
+	CU_ASSERT(g_ha_subsys[0].state == SPDK_NVME_ANA_INACCESSIBLE_STATE);
+	CU_ASSERT(g_ha_subsys[1].state == SPDK_NVME_ANA_INACCESSIBLE_STATE);
+	CU_ASSERT(g_ha_subsys[2].state == SPDK_NVME_ANA_OPTIMIZED_STATE);
+	CU_ASSERT(g_ha_subsys[0].paused == 0 && g_ha_subsys[1].paused == 0);
+
+	CU_ASSERT(spdk_lvs_ha_unfence(32) == 0);
+	poll_threads();
+	CU_ASSERT(g_ha_subsys[0].state == SPDK_NVME_ANA_NON_OPTIMIZED_STATE);
+	CU_ASSERT(g_ha_subsys[1].state == SPDK_NVME_ANA_OPTIMIZED_STATE);
+	CU_ASSERT(g_ha_subsys[2].state == SPDK_NVME_ANA_OPTIMIZED_STATE);
+	ha_free_lvs(lvs);
+}
+
+/* A primary that does not lead after the unfence cannot redirect, so its listeners stay
+ * inaccessible until the control plane sets the leadership; then they are restored. */
+static void
+lvol_ha_primary_ana_restored_on_leadership(void)
+{
+	struct spdk_lvol_store *lvs = ha_alloc_lvs(33, true, NODE_PRIMARY);
+	int rc = 99;
+
+	ha_reset_nvmf();
+	ha_add_subsys("nqn.ha:vol1", 4420, SPDK_NVME_ANA_OPTIMIZED_STATE);
+	CU_ASSERT(spdk_lvs_ha_fence(33, NULL, NULL) == 0);
+	poll_threads();
+	CU_ASSERT(g_ha_subsys[0].state == SPDK_NVME_ANA_INACCESSIBLE_STATE);
+
+	CU_ASSERT(spdk_lvs_ha_unfence(33) == 0);
+	poll_threads();
+	CU_ASSERT(g_ha_subsys[0].state == SPDK_NVME_ANA_INACCESSIBLE_STATE);
+	CU_ASSERT(lvs->ha_ana_restore_port == 4420);
+
+	spdk_set_leader_all(lvs, true, false, ha_set_leader_done, &rc);
+	poll_threads();
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_ha_subsys[0].state == SPDK_NVME_ANA_OPTIMIZED_STATE);
+	CU_ASSERT(lvs->ha_ana_restore_port == 0);
+	ha_free_lvs(lvs);
+}
+
+/* A state the control plane set while fenced is kept; a port someone else blocked
+ * before the fence is not the fence's, so its ANA state is not touched either. */
+static void
+lvol_ha_ana_respects_foreign_changes(void)
+{
+	struct spdk_lvol_store *lvs = ha_alloc_lvs(34, false, NODE_SECONDARY);
+
+	ha_reset_nvmf();
+	ha_add_subsys("nqn.ha:vol1", 4420, SPDK_NVME_ANA_OPTIMIZED_STATE);
+	CU_ASSERT(spdk_lvs_ha_fence(34, NULL, NULL) == 0);
+	poll_threads();
+	CU_ASSERT(g_ha_subsys[0].state == SPDK_NVME_ANA_INACCESSIBLE_STATE);
+	g_ha_subsys[0].state = SPDK_NVME_ANA_NON_OPTIMIZED_STATE; /* the control plane */
+	CU_ASSERT(spdk_lvs_ha_unfence(34) == 0);
+	poll_threads();
+	CU_ASSERT(g_ha_subsys[0].state == SPDK_NVME_ANA_NON_OPTIMIZED_STATE);
+	ha_free_lvs(lvs);
+
+	lvs = ha_alloc_lvs(35, false, NODE_SECONDARY);
+	ha_reset_nvmf();
+	ha_add_subsys("nqn.ha:vol1", 4420, SPDK_NVME_ANA_OPTIMIZED_STATE);
+	CU_ASSERT(spdk_nvmf_port_block(4420, false));
+	CU_ASSERT(spdk_lvs_ha_fence(35, NULL, NULL) == 0);
+	poll_threads();
+	CU_ASSERT(g_ha_set_ana_cnt == 0);
+	CU_ASSERT(g_ha_subsys[0].state == SPDK_NVME_ANA_OPTIMIZED_STATE);
+	CU_ASSERT(spdk_lvs_ha_unfence(35) == 0);
+	poll_threads();
+	CU_ASSERT(g_ha_set_ana_cnt == 0);
+	ha_free_lvs(lvs);
+}
+
+/* END two-node arbitration */
+
+
 int
 main(int argc, char **argv)
 {
@@ -3783,6 +4555,27 @@ main(int argc, char **argv)
 	unsigned int	num_failures;
 
 	CU_initialize_registry();
+
+	/* Two-node arbitration: run alone with -s lvol_ha. */
+	suite = CU_add_suite("lvol_ha", NULL, NULL);
+	CU_ADD_TEST(suite, lvol_ha_unknown_groupid);
+	CU_ADD_TEST(suite, lvol_ha_hold_leader_once);
+	CU_ADD_TEST(suite, lvol_ha_release_grant);
+	CU_ADD_TEST(suite, lvol_ha_fence);
+	CU_ADD_TEST(suite, lvol_ha_unfence);
+	CU_ADD_TEST(suite, lvol_ha_refence_then_unfence);
+	CU_ADD_TEST(suite, lvol_ha_stall_fence_all_then_unfence);
+	CU_ADD_TEST(suite, lvol_ha_foreign_block_kept);
+	CU_ADD_TEST(suite, lvol_ha_shared_port_until_last_unfence);
+	CU_ADD_TEST(suite, lvol_ha_unfence_without_fence);
+	CU_ADD_TEST(suite, lvol_ha_rules_poller_respects_fence);
+	CU_ADD_TEST(suite, lvol_ha_is_leader);
+	CU_ADD_TEST(suite, lvol_ha_demotion_reported_once);
+	CU_ADD_TEST(suite, lvol_ha_no_msg_under_mutex);
+	CU_ADD_TEST(suite, lvol_ha_fence_blocks_io_takeover);
+	CU_ADD_TEST(suite, lvol_ha_fence_sets_ana_inaccessible);
+	CU_ADD_TEST(suite, lvol_ha_primary_ana_restored_on_leadership);
+	CU_ADD_TEST(suite, lvol_ha_ana_respects_foreign_changes);
 
 	suite = CU_add_suite("lvol", NULL, NULL);
 

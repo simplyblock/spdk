@@ -331,6 +331,42 @@ bool spdk_lvs_trigger_leadership_switch(uint64_t *groupid);
 bool spdk_lvs_queued_rsp(struct spdk_lvol_store *lvs, struct spdk_bdev_io *bdev_io);
 void spdk_lvs_set_opts(struct spdk_lvol_store *lvs, uint64_t groupid, uint64_t port, uint64_t hublvol_port, char *role);
 void spdk_lvs_set_signal_switch(struct spdk_lvol_store *lvs);
+
+/*
+ * Two-node arbitration (sbcli docs/design/two-node-arbitration.md). groupid is the
+ * jm_vuid of the LVS journal. Callable from any SPDK thread. Each returns 0 on success,
+ * -ENOENT if no LVS has that groupid. cb_fn (may be NULL) runs on the blobstore md
+ * thread once held IO has drained; it is not called when -ENOENT is returned.
+ *  hold:    a leading LVS holds client IO in the frozen-IO queue (no port change).
+ *  release: grant; held IO executes on the (still leading) LVS.
+ *  fence:   non-leader, the client (subsystem) port blocked, held IO returned as a path
+ *           error (ANA inaccessible). The hublvol (inter-node) port is NOT blocked: the
+ *           returning peer must be able to reconnect to it to resync, otherwise its restart
+ *           and the unfence (which waits for that resync) deadlock. A fenced blobstore
+ *           rejects writes, so a hublvol connection cannot write through a fenced LVS.
+ *  unfence: clears the fence marker; ports are reopened by the control plane's
+ *           restart flow, not here.
+ *  is_leader:     1 if the LVS leads, 0 if not, -ENOENT.
+ *  take_demoted:  true once after the control plane demoted the LVS to follower
+ *                 (spdk_set_leader_all with leader=false) and it was not promoted since;
+ *                 the JC resets the LVS's HA state then (a follower holds no solo grant).
+ */
+typedef void (*spdk_lvs_ha_cb)(void *cb_arg, int rc);
+int spdk_lvs_ha_hold(uint64_t groupid);
+int spdk_lvs_ha_release(uint64_t groupid, spdk_lvs_ha_cb cb_fn, void *cb_arg);
+int spdk_lvs_ha_fence(uint64_t groupid, spdk_lvs_ha_cb cb_fn, void *cb_arg);
+int spdk_lvs_ha_unfence(uint64_t groupid);
+bool spdk_lvs_ha_is_fenced(uint64_t groupid);
+int spdk_lvs_ha_is_leader(uint64_t groupid);
+bool spdk_lvs_ha_take_demoted(uint64_t groupid);
+
+/**
+ * Two-node arbitration: true while IO on this lvstore must not start a leadership
+ * takeover (an lvstore update on failover). Set by the fence; cleared only when the
+ * control plane sets the leadership explicitly (bdev_lvol_set_leader). The IO path
+ * completes such IO with an ANA-inaccessible path error instead.
+ */
+bool spdk_lvs_ha_takeover_blocked(struct spdk_lvol_store *lvs);
 void spdk_lvs_open_hub_bdev(void * cb_arg);
 void spdk_lvs_connect_hublvol(struct spdk_lvol_store *lvs, const char *remote_bdev);
 void spdk_lvs_set_read_only(struct spdk_lvol_store *lvs, bool status);

@@ -566,7 +566,12 @@ blob_execute_queued_io(struct spdk_io_channel_iter *i)
 
 		if (args->blob == ctx->blob) {
 			TAILQ_REMOVE(&ch->queued_io, op, link);
-			if (!ctx->blob->failed_on_update && bs->is_leader) {
+			if (bs->ha_fenced || bs->ha_hold_expired) {
+				/* Two-node arbitration: a fenced LVS (or an expired hold) returns
+				 * held IO as a path error, so hosts retry on the peer's path
+				 * (never EIO). */
+				bs_user_op_abort(op, -ENOTCONN);
+			} else if (!ctx->blob->failed_on_update && bs->is_leader) {
 				bs_user_op_execute(op);
 			} else {
 				SPDK_NOTICELOG("The IO return with EIO error due to leader or failed update.\n");
@@ -4673,6 +4678,13 @@ blob_request_submit_op(struct spdk_blob *blob, struct spdk_io_channel *_channel,
 		return;
 	}
 
+	if ((blob->bs->ha_fenced || blob->bs->ha_hold_expired) && op_type != SPDK_BLOB_READ) {
+		/* Two-node arbitration: a fenced LVS takes no writes; the host retries
+		 * on the peer's path (path error, never EIO). */
+		cb_fn(cb_arg, -ENOTCONN);
+		return;
+	}
+
 	if (blob->failed_on_update) {
 		SPDK_NOTICELOG("FAILED IO on update filed condition.\n");
 		cb_fn(cb_arg, -EIO);
@@ -4811,6 +4823,13 @@ blob_request_submit_rw_iov(struct spdk_blob *blob, struct spdk_io_channel *_chan
 		cb_fn(cb_arg, -EIO);
 		return;
 	}
+
+	if ((blob->bs->ha_fenced || blob->bs->ha_hold_expired) && !read) {
+		/* Two-node arbitration: see blob_request_submit_op. */
+		cb_fn(cb_arg, -ENOTCONN);
+		return;
+	}
+
 
 	if (blob->failed_on_update) {
 		SPDK_NOTICELOG("FAILED IO on update filed condition at LBA: %" PRIu64 " blob: %" PRIu64 " \n", blob->id, offset);
@@ -5261,6 +5280,7 @@ bs_free(struct spdk_blob_store *bs)
 	bs_blob_list_free(bs);
 	bs->stop = true;
 	spdk_poller_unregister(&bs->poller);
+	spdk_poller_unregister(&bs->ha_hold_poller);
 
 	//TODO we need to wait here to destroy md journal completed
 	if (bs->md_journal) {
@@ -11683,6 +11703,184 @@ spdk_blob_freeze_on_conflict_send_msg(struct spdk_blob_store *bs,
 	spdk_thread_send_msg(bs->md_thread, bs_freeze_on_conflict_msg, ctx);
 	return 0;
 }
+
+/* START two-node arbitration hold / release */
+
+/*
+ * The lvol layer records the desired hold state (spdk_bs_ha_set_hold) under its own
+ * mutex and sends spdk_bs_ha_sync_send_msg only after dropping it (review on #76: no
+ * message is sent while a mutex is held). Each sync message applies the latest desired
+ * state on the md thread, so two syncs that arrive in any order still converge on the
+ * last decision (a hold followed by a grant never leaves blobs held).
+ */
+
+#define BS_HA_HOLD_BACKSTOP_US (5ULL * 1000 * 1000)
+
+static void bs_ha_release_held(struct spdk_blob_store *bs, spdk_blob_op_complete cb_fn,
+			       void *cb_arg);
+
+/* Backstop: a hold is decided by the JC within hold_ms (2.5 s): a verdict releases it,
+ * otherwise the JC fences at the deadline. If the JC itself is wedged, the held writes
+ * would stay queued until the host's IO timeout. After BS_HA_HOLD_BACKSTOP_US the md
+ * thread returns them as path errors and rejects new writes the same way (as if fenced),
+ * until the next sync (grant, fence, new hold). */
+static int
+bs_ha_hold_backstop(void *arg)
+{
+	struct spdk_blob_store *bs = arg;
+
+	spdk_poller_unregister(&bs->ha_hold_poller);
+	if (!__atomic_load_n(&bs->ha_hold_wanted, __ATOMIC_SEQ_CST)) {
+		return SPDK_POLLER_BUSY;
+	}
+	SPDK_ERRLOG("HA hold not decided within %llu ms: held writes return as path errors\n",
+		    (unsigned long long)(BS_HA_HOLD_BACKSTOP_US / 1000));
+	bs->ha_hold_expired = true;
+	bs_ha_release_held(bs, NULL, NULL);
+	return SPDK_POLLER_BUSY;
+}
+
+static void
+bs_ha_hold_apply(struct spdk_blob_store *bs)
+{
+	struct spdk_blob *blob;
+	int n = 0;
+
+	RB_FOREACH(blob, spdk_blob_tree, &bs->open_blobs) {
+		if (blob->data_ro || blob->md_ro || blob->ha_held) {
+			continue;
+		}
+		blob->ha_held = true;
+		blob->frozen_refcnt++;
+		n++;
+	}
+	if (n > 0 && bs->ha_hold_poller == NULL) {
+		bs->ha_hold_poller = spdk_poller_register(bs_ha_hold_backstop, bs,
+				     BS_HA_HOLD_BACKSTOP_US);
+	}
+	SPDK_NOTICELOG("HA hold: %d blobs hold new IO.\n", n);
+}
+
+struct spdk_bs_ha_release_ctx {
+	struct spdk_blob_store	*bs;
+	spdk_blob_op_complete	cb_fn;
+	void			*cb_arg;
+	int			remaining;
+};
+
+static void
+bs_ha_release_one_done(void *cb_arg, int bserrno)
+{
+	struct spdk_bs_ha_release_ctx *ctx = cb_arg;
+
+	if (bserrno != 0) {
+		SPDK_ERRLOG("HA release: unfreeze failed, rc=%d\n", bserrno);
+	}
+	if (--ctx->remaining == 0) {
+		if (ctx->cb_fn) {
+			ctx->cb_fn(ctx->cb_arg, 0);
+		}
+		free(ctx);
+	}
+}
+
+/* Unfreeze every held blob once; cb_fn runs after all of them have drained. Queued IO
+ * executes if the blobstore is leader, or returns -ENOTCONN (path error) if it is fenced
+ * or the hold backstop expired. */
+static void
+bs_ha_release_held(struct spdk_blob_store *bs, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_bs_ha_release_ctx *ctx;
+	struct spdk_blob *blob;
+	int n = 0;
+
+	spdk_poller_unregister(&bs->ha_hold_poller);
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		SPDK_ERRLOG("HA release: out of memory\n");
+		if (cb_fn) {
+			cb_fn(cb_arg, -ENOMEM);
+		}
+		return;
+	}
+	ctx->bs = bs;
+	ctx->cb_fn = cb_fn;
+	ctx->cb_arg = cb_arg;
+	ctx->remaining = 1; /* held until every unfreeze is issued */
+	RB_FOREACH(blob, spdk_blob_tree, &bs->open_blobs) {
+		if (!blob->ha_held) {
+			continue;
+		}
+		blob->ha_held = false;
+		ctx->remaining++;
+		n++;
+		blob_unfreeze_io(blob, bs_ha_release_one_done, ctx);
+	}
+	SPDK_NOTICELOG("HA release: %d blobs released, fenced=%d expired=%d leader=%d.\n",
+		       n, (int)bs->ha_fenced, (int)bs->ha_hold_expired, (int)bs->is_leader);
+	bs_ha_release_one_done(ctx, 0);
+}
+
+struct spdk_bs_ha_sync_ctx {
+	struct spdk_blob_store	*bs;
+	spdk_blob_op_complete	cb_fn;
+	void			*cb_arg;
+};
+
+static void
+bs_ha_sync_msg(void *arg)
+{
+	struct spdk_bs_ha_sync_ctx *ctx = arg;
+	struct spdk_blob_store *bs = ctx->bs;
+	spdk_blob_op_complete cb_fn = ctx->cb_fn;
+	void *cb_arg = ctx->cb_arg;
+
+	free(ctx);
+	/* Any decision ends an expired backstop: a new hold restarts it, a grant serves
+	 * again, a fence rejects through ha_fenced. */
+	bs->ha_hold_expired = false;
+	if (__atomic_load_n(&bs->ha_hold_wanted, __ATOMIC_SEQ_CST)) {
+		bs_ha_hold_apply(bs);
+		if (cb_fn) {
+			cb_fn(cb_arg, 0);
+		}
+		return;
+	}
+	bs_ha_release_held(bs, cb_fn, cb_arg);
+}
+
+void
+spdk_bs_ha_set_hold(struct spdk_blob_store *bs, bool hold)
+{
+	__atomic_store_n(&bs->ha_hold_wanted, hold, __ATOMIC_SEQ_CST);
+}
+
+int
+spdk_bs_ha_sync_send_msg(struct spdk_blob_store *bs, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_bs_ha_sync_ctx *ctx;
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		return -ENOMEM;
+	}
+	ctx->bs = bs;
+	ctx->cb_fn = cb_fn;
+	ctx->cb_arg = cb_arg;
+	if (spdk_thread_send_msg(bs->md_thread, bs_ha_sync_msg, ctx) != 0) {
+		free(ctx);
+		return -ENOMEM;
+	}
+	return 0;
+}
+
+void
+spdk_bs_set_ha_fenced(struct spdk_blob_store *bs, bool fenced)
+{
+	__atomic_store_n(&bs->ha_fenced, fenced, __ATOMIC_SEQ_CST);
+}
+
+/* END two-node arbitration hold / release */
 
 void
 blob_freeze_on_failover(struct spdk_blob *blob)
