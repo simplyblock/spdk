@@ -3786,6 +3786,31 @@ static int g_ha_bs_leader_set = -1;
 static int g_ha_port_block_cnt;
 static int g_ha_port_unblock_cnt;
 static int g_ha_last_blocked_port;
+/* A small model of nvmf's blocked-port set (a set: blocking twice is one entry). */
+#define HA_MAX_PORTS 8
+static uint16_t g_ha_blocked[HA_MAX_PORTS];
+
+static bool
+ha_port_is_blocked(uint16_t port)
+{
+	for (int i = 0; i < HA_MAX_PORTS; i++) {
+		if (g_ha_blocked[i] == port) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static int
+ha_num_blocked(void)
+{
+	int n = 0;
+
+	for (int i = 0; i < HA_MAX_PORTS; i++) {
+		n += g_ha_blocked[i] != 0;
+	}
+	return n;
+}
 static int g_ha_cb_cnt;
 
 /* spdk_set_leader_all (demotion test) links the hublvol reconnect path; never called there
@@ -3830,6 +3855,14 @@ spdk_nvmf_port_block(uint16_t port, bool is_reject)
 {
 	g_ha_port_block_cnt++;
 	g_ha_last_blocked_port = port;
+	if (port != 0 && !ha_port_is_blocked(port)) {
+		for (int i = 0; i < HA_MAX_PORTS; i++) {
+			if (g_ha_blocked[i] == 0) {
+				g_ha_blocked[i] = port;
+				break;
+			}
+		}
+	}
 	return true;
 }
 
@@ -3837,7 +3870,19 @@ bool
 spdk_nvmf_port_unblock(uint16_t port)
 {
 	g_ha_port_unblock_cnt++;
+	for (int i = 0; i < HA_MAX_PORTS; i++) {
+		if (g_ha_blocked[i] == port) {
+			g_ha_blocked[i] = 0;
+		}
+	}
 	return true;
+}
+
+bool
+spdk_nvmf_check_port_permission(uint16_t port, bool *is_reject)
+{
+	*is_reject = false;
+	return !ha_port_is_blocked(port);
 }
 
 const char *
@@ -3871,6 +3916,7 @@ ha_alloc_lvs(uint64_t groupid, bool leader, node_role_t role)
 	g_ha_bs_fenced_set = g_ha_bs_leader_set = -1;
 	g_ha_last_blocked_port = 0;
 	g_ha_cb_cnt = 0;
+	memset(g_ha_blocked, 0, sizeof(g_ha_blocked));
 	return lvs;
 }
 
@@ -3976,19 +4022,113 @@ lvol_ha_fence(void)
 	ha_free_lvs(lvs);
 }
 
-/* Unfence clears the marker on the lvs and the blobstore; ports stay as they are. */
+/* Unfence clears the marker on the lvs and the blobstore and lifts the client-port
+ * block its fence applied (campaign c3, F8): fence then unfence leaves no port blocked. */
 static void
 lvol_ha_unfence(void)
 {
 	struct spdk_lvol_store *lvs = ha_alloc_lvs(16, true, NODE_PRIMARY);
 
 	CU_ASSERT(spdk_lvs_ha_fence(16, NULL, NULL) == 0);
+	CU_ASSERT(ha_port_is_blocked(4420));
+	CU_ASSERT(lvs->ha_fence_port == 4420);
 	g_ha_port_unblock_cnt = 0;
 	CU_ASSERT(spdk_lvs_ha_unfence(16) == 0);
 	CU_ASSERT(lvs->ha_fenced == false);
+	CU_ASSERT(lvs->ha_fence_port == 0);
 	CU_ASSERT(g_ha_bs_fenced_set == 0);
 	CU_ASSERT(spdk_lvs_ha_is_fenced(16) == false);
+	CU_ASSERT(g_ha_port_unblock_cnt == 1);
+	CU_ASSERT(ha_num_blocked() == 0);
+
+	/* Idempotent: a second unfence (the arbiter retries) unblocks nothing more. */
+	CU_ASSERT(spdk_lvs_ha_unfence(16) == 0);
+	CU_ASSERT(g_ha_port_unblock_cnt == 1);
+	ha_free_lvs(lvs);
+}
+
+/* A repeated fence (a new epoch, or a self-fence followed by the arbiter's jc_fence)
+ * keeps the ownership of the first one; one unfence still clears the port. */
+static void
+lvol_ha_refence_then_unfence(void)
+{
+	struct spdk_lvol_store *lvs = ha_alloc_lvs(20, true, NODE_PRIMARY);
+
+	CU_ASSERT(spdk_lvs_ha_fence(20, NULL, NULL) == 0);
+	CU_ASSERT(spdk_lvs_ha_fence(20, NULL, NULL) == 0);
+	CU_ASSERT(lvs->ha_fence_port == 4420);
+	CU_ASSERT(spdk_lvs_ha_unfence(20) == 0);
+	CU_ASSERT(ha_num_blocked() == 0);
+	ha_free_lvs(lvs);
+}
+
+/* A self-fence of every LVS (the JC's stall fence: leader and follower LVS, each with
+ * its own client port) followed by the re-admit's unfence leaves no port blocked. */
+static void
+lvol_ha_stall_fence_all_then_unfence(void)
+{
+	struct spdk_lvol_store *a = ha_alloc_lvs(21, true, NODE_PRIMARY);
+	struct spdk_lvol_store *b = ha_alloc_lvs(22, false, NODE_SECONDARY);
+
+	a->subsystem_port = 4424;
+	b->subsystem_port = 4426;
+	CU_ASSERT(spdk_lvs_ha_fence(21, NULL, NULL) == 0);
+	CU_ASSERT(spdk_lvs_ha_fence(22, NULL, NULL) == 0);
+	CU_ASSERT(ha_port_is_blocked(4424) && ha_port_is_blocked(4426));
+	CU_ASSERT(spdk_lvs_ha_unfence(21) == 0);
+	CU_ASSERT(!ha_port_is_blocked(4424) && ha_port_is_blocked(4426));
+	CU_ASSERT(spdk_lvs_ha_unfence(22) == 0);
+	CU_ASSERT(ha_num_blocked() == 0);
+	ha_free_lvs(a);
+	ha_free_lvs(b);
+}
+
+/* A block someone else set before the fence (the control plane's restart flow, a
+ * writer conflict) is not the fence's: unfence leaves it in place. */
+static void
+lvol_ha_foreign_block_kept(void)
+{
+	struct spdk_lvol_store *lvs = ha_alloc_lvs(23, true, NODE_PRIMARY);
+
+	CU_ASSERT(spdk_nvmf_port_block(4420, false));
+	CU_ASSERT(spdk_lvs_ha_fence(23, NULL, NULL) == 0);
+	CU_ASSERT(lvs->ha_fence_port == 0);
+	g_ha_port_unblock_cnt = 0;
+	CU_ASSERT(spdk_lvs_ha_unfence(23) == 0);
 	CU_ASSERT(g_ha_port_unblock_cnt == 0);
+	CU_ASSERT(ha_port_is_blocked(4420));
+	ha_free_lvs(lvs);
+}
+
+/* Two LVS on one client port: the port stays blocked until both are unfenced. */
+static void
+lvol_ha_shared_port_until_last_unfence(void)
+{
+	struct spdk_lvol_store *a = ha_alloc_lvs(24, true, NODE_PRIMARY);
+	struct spdk_lvol_store *b = ha_alloc_lvs(25, false, NODE_SECONDARY);
+
+	CU_ASSERT(spdk_lvs_ha_fence(24, NULL, NULL) == 0);
+	CU_ASSERT(spdk_lvs_ha_fence(25, NULL, NULL) == 0);
+	CU_ASSERT(a->ha_fence_port == 4420 && b->ha_fence_port == 4420);
+	CU_ASSERT(spdk_lvs_ha_unfence(25) == 0);
+	CU_ASSERT(ha_port_is_blocked(4420));
+	CU_ASSERT(spdk_lvs_ha_unfence(24) == 0);
+	CU_ASSERT(!ha_port_is_blocked(4420));
+	ha_free_lvs(a);
+	ha_free_lvs(b);
+}
+
+/* Unfence of an LVS that was never fenced touches no port. */
+static void
+lvol_ha_unfence_without_fence(void)
+{
+	struct spdk_lvol_store *lvs = ha_alloc_lvs(26, true, NODE_PRIMARY);
+
+	CU_ASSERT(spdk_nvmf_port_block(4420, true));
+	g_ha_port_unblock_cnt = 0;
+	CU_ASSERT(spdk_lvs_ha_unfence(26) == 0);
+	CU_ASSERT(g_ha_port_unblock_cnt == 0);
+	CU_ASSERT(ha_port_is_blocked(4420));
 	ha_free_lvs(lvs);
 }
 
@@ -4075,6 +4215,11 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, lvol_ha_release_grant);
 	CU_ADD_TEST(suite, lvol_ha_fence);
 	CU_ADD_TEST(suite, lvol_ha_unfence);
+	CU_ADD_TEST(suite, lvol_ha_refence_then_unfence);
+	CU_ADD_TEST(suite, lvol_ha_stall_fence_all_then_unfence);
+	CU_ADD_TEST(suite, lvol_ha_foreign_block_kept);
+	CU_ADD_TEST(suite, lvol_ha_shared_port_until_last_unfence);
+	CU_ADD_TEST(suite, lvol_ha_unfence_without_fence);
 	CU_ADD_TEST(suite, lvol_ha_rules_poller_respects_fence);
 	CU_ADD_TEST(suite, lvol_ha_is_leader);
 	CU_ADD_TEST(suite, lvol_ha_demotion_reported_once);

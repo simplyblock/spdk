@@ -355,10 +355,14 @@ struct spdk_lvol_store {
 	 * ha_fenced: the LVS was fenced; its client port stays blocked (the hublvol port is
 	 *            never blocked by the fence, so the returning peer can reconnect);
 	 * ha_demoted: set when the control plane demotes the LVS (spdk_set_leader_all with
-	 *            leader=false), cleared on promotion; consumed by spdk_lvs_ha_take_demoted. */
+	 *            leader=false), cleared on promotion; consumed by spdk_lvs_ha_take_demoted;
+	 * ha_fence_port: the client port this LVS's fence blocked and therefore owns (0: the
+	 *            fence blocked nothing of its own, e.g. the port was already blocked by
+	 *            someone else). spdk_lvs_ha_unfence lifts only this block. */
 	bool				ha_held;
 	bool				ha_fenced;
 	bool				ha_demoted;
+	int				ha_fence_port;
 	bool 				read_only;
 	bool				skip_redirecting;
 	node_role_t 		node_role;

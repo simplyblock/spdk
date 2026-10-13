@@ -3967,6 +3967,28 @@ spdk_lvs_ha_release(uint64_t groupid, spdk_lvs_ha_cb cb_fn, void *cb_arg)
 	return rc;
 }
 
+/* Another fenced LVS of this node owns the fence block on this port. */
+static bool
+lvs_ha_port_fenced_by_other_locked(struct spdk_lvol_store *self, int port)
+{
+	struct spdk_lvol_store *lvs;
+
+	TAILQ_FOREACH(lvs, &g_lvol_stores, link) {
+		if (lvs != self && lvs->ha_fenced && lvs->ha_fence_port == port) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool
+lvs_ha_port_blocked(int port)
+{
+	bool is_reject = false;
+
+	return port > 0 && !spdk_nvmf_check_port_permission((uint16_t)port, &is_reject);
+}
+
 int
 spdk_lvs_ha_fence(uint64_t groupid, spdk_lvs_ha_cb cb_fn, void *cb_arg)
 {
@@ -3979,6 +4001,20 @@ spdk_lvs_ha_fence(uint64_t groupid, spdk_lvs_ha_cb cb_fn, void *cb_arg)
 	if (lvs == NULL) {
 		pthread_mutex_unlock(&g_lvol_stores_mutex);
 		return -ENOENT;
+	}
+	/* Ownership of the client-port block (campaign c3, F8): the fence owns the block
+	 * when it is the one that blocks the port, or when another fenced LVS of this node
+	 * already owns it (a shared port). A port that was blocked by someone else before
+	 * (the control plane's restart flow, a writer conflict) is not ours to lift. A
+	 * repeated fence keeps the ownership of the first one. */
+	if (!lvs->ha_fenced) {
+		int port = lvs->subsystem_port;
+
+		lvs->ha_fence_port = 0;
+		if (port > 0 && (!lvs_ha_port_blocked(port) ||
+				 lvs_ha_port_fenced_by_other_locked(lvs, port))) {
+			lvs->ha_fence_port = port;
+		}
 	}
 	lvs->ha_fenced = true;
 	lvs->ha_held = false;
@@ -4012,7 +4048,25 @@ spdk_lvs_ha_unfence(uint64_t groupid)
 		pthread_mutex_unlock(&g_lvol_stores_mutex);
 		return -ENOENT;
 	}
-	lvs->ha_fenced = false;
+	if (lvs->ha_fenced) {
+		int port = lvs->ha_fence_port;
+
+		lvs->ha_fenced = false;
+		lvs->ha_fence_port = 0;
+		/* Lift the block this fence applied (campaign c3, F8: unfence used to leave the
+		 * client port blocked, so a re-admitted node stayed unreachable for clients).
+		 * A port shared with another LVS that is still fenced stays blocked until that
+		 * one is unfenced too; a block this fence did not apply is left alone. */
+		if (port > 0 && !lvs_ha_port_fenced_by_other_locked(lvs, port)) {
+			if (spdk_nvmf_port_unblock((uint16_t)port)) {
+				SPDK_NOTICELOG("HA unfence on lvs groupid %" PRIu64 ": client port %d unblocked\n",
+					       groupid, port);
+			} else {
+				SPDK_ERRLOG("HA unfence on lvs groupid %" PRIu64 ": could not unblock client port %d\n",
+					    groupid, port);
+			}
+		}
+	}
 	spdk_bs_set_ha_fenced(lvs->blobstore, false);
 	SPDK_NOTICELOG("HA unfence on lvs groupid %" PRIu64 "\n", groupid);
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
