@@ -17,14 +17,15 @@
  *   SPDK_NOTICELOG   - normal processing (state changes, batches, recovery,
  *                      leadership, start/stop)
  *   MDJ_IO_NOTICELOG - normal processing per metadata write / per journal
- *                      slot. Also NOTICE, but very frequent under load:
+ *                      slot / per HOME, ZERO or examine batch / per HOME
+ *                      barrier. Also NOTICE, but very frequent under load:
  *                      build with -DMD_JOURNAL_IO_LOG=0 to silence only these.
  *
  * The drain poller runs every 1 ms, so its per-tick checks do not log;
  * only real work and state changes are logged there.
  */
 #ifndef MD_JOURNAL_IO_LOG
-#define MD_JOURNAL_IO_LOG 1
+#define MD_JOURNAL_IO_LOG 0
 #endif
 
 #define MDJ_IO_NOTICELOG(...)				\
@@ -423,8 +424,8 @@ md_journal_release_ordered(struct spdk_bs_md_journal *jr)
 		TAILQ_REMOVE(&jr->reorder_queue, elem, link);
 
 		if (elem->state == MD_JOURNAL_ELEM_JOURNAL_FAILED) {
-			SPDK_NOTICELOG("md_journal: failed journal write released without HOME: "
-				       "slot=%u seq=%" PRIu64 "\n", elem->slot, elem->seq);
+			SPDK_ERRLOG("md_journal: failed journal write released without HOME: "
+				    "slot=%u seq=%" PRIu64 "\n", elem->slot, elem->seq);
 			md_journal_put_free_elem(jr, elem);
 			jr->next_home_seq++;
 			continue;
@@ -500,8 +501,8 @@ md_journal_write_cpl_v2(spdk_bs_sequence_t *seq, void *cb_arg, int bserron)
 		SPDK_ERRLOG("md_journal: examine direct HOME write failed: rc=%d lba=%" PRIu64 "\n",
 			    bserron, req->entry.lba);
 	} else {
-		SPDK_NOTICELOG("md_journal: examine direct HOME write done: lba=%" PRIu64 "\n",
-			       req->entry.lba);
+		MDJ_IO_NOTICELOG("md_journal: examine direct HOME write done: lba=%" PRIu64 "\n",
+			         req->entry.lba);
 	}
 
 	cb_fn(seq, _cb_arg, bserron);
@@ -590,8 +591,8 @@ md_journal_batch_write_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserron)
 			SPDK_ERRLOG("md_journal: examine direct HOME batch failed: rc=%d count=%u\n",
 				    bserron, batch->count);
 		} else {
-			SPDK_NOTICELOG("md_journal: examine direct HOME batch done: count=%u\n",
-				       batch->count);
+			MDJ_IO_NOTICELOG("md_journal: examine direct HOME batch done: count=%u\n",
+				         batch->count);
 		}
 		batch->cb_fn(batch->seq, batch->cb_arg, bserron);
 		free(batch->entry);
@@ -665,8 +666,8 @@ md_journal_submit_batch(struct md_journal_batch *batch)
 	entry = batch->entry;
 
 	if (jr->examine) {
-		SPDK_NOTICELOG("md_journal: examine batch written directly HOME (no journal): count=%u\n",
-			       batch->count);
+		MDJ_IO_NOTICELOG("md_journal: examine batch written directly HOME (no journal): count=%u\n",
+			         batch->count);
 		for (uint32_t i = 0; i < batch->count; i++) {
 			if (entry[i].type == MD_JOURNAL_WRITE) {
 				bs_batch_write_dev(io_batch, entry[i].payload, entry[i].lba, entry[i].lba_count);
@@ -805,8 +806,8 @@ md_journal_complete_home_waiters(struct spdk_bs_md_journal *jr, int rc)
 				    " home_durable_seq=%" PRIu64 "\n", rc, waiter->target_seq,
 				    jr->home_durable_seq);
 		} else {
-			SPDK_NOTICELOG("md_journal: HOME waiter completed: target_seq=%" PRIu64 "\n",
-				       waiter->target_seq);
+			MDJ_IO_NOTICELOG("md_journal: HOME waiter completed: target_seq=%" PRIu64 "\n",
+				         waiter->target_seq);
 		}
 
 		waiter->cb_fn(waiter->seq, waiter->cb_arg, rc);
@@ -864,8 +865,8 @@ bs_md_journal_write(struct spdk_bs_md_journal *jr, spdk_bs_sequence_t *seq, void
 	if (jr->examine) {
 		elem = md_journal_hash_get(jr, lba);
 		if (elem) {
-			SPDK_NOTICELOG("md_journal: examine write updates overlay page: lba=%" PRIu64
-				       " overlay seq=%" PRIu64 " slot=%u\n", lba, elem->seq, elem->slot);
+			MDJ_IO_NOTICELOG("md_journal: examine write updates overlay page: lba=%" PRIu64
+				         " overlay seq=%" PRIu64 " slot=%u\n", lba, elem->seq, elem->slot);
 			if (type == MD_JOURNAL_WRITE) {
 				memcpy(elem->page, payload, BS_MD_JOURNAL_PAGE_SIZE);
 			} else {
@@ -880,8 +881,8 @@ bs_md_journal_write(struct spdk_bs_md_journal *jr, spdk_bs_sequence_t *seq, void
 			return;
 		}
 
-		SPDK_NOTICELOG("md_journal: examine write directly HOME (no journal): lba=%" PRIu64
-			       " type=%s\n", lba, type == MD_JOURNAL_WRITE ? "WRITE" : "ZEROS");
+		MDJ_IO_NOTICELOG("md_journal: examine write directly HOME (no journal): lba=%" PRIu64
+			         " type=%s\n", lba, type == MD_JOURNAL_WRITE ? "WRITE" : "ZEROS");
 
 		req->type = MD_JOURNAL_WAIT_SINGLE;
 		req->entry.payload = payload;
@@ -1043,8 +1044,8 @@ bs_md_journal_batch_write(struct md_journal_batch *batch, void *payload, uint64_
 	if (batch->journal->examine) {
 		elmnt = md_journal_hash_get(batch->journal, lba);
 		if (elmnt) {
-			SPDK_NOTICELOG("md_journal: examine batch write updates overlay page: lba=%" PRIu64
-				       " overlay seq=%" PRIu64 " slot=%u\n", lba, elmnt->seq, elmnt->slot);
+			MDJ_IO_NOTICELOG("md_journal: examine batch write updates overlay page: lba=%" PRIu64
+				         " overlay seq=%" PRIu64 " slot=%u\n", lba, elmnt->seq, elmnt->slot);
 			if (type == MD_JOURNAL_WRITE) {
 				memcpy(elmnt->page, payload, BS_MD_JOURNAL_PAGE_SIZE);
 			} else {
@@ -1197,9 +1198,9 @@ md_journal_process_home_waiters(struct spdk_bs_md_journal *jr)
 
 		TAILQ_REMOVE(&jr->home_wait_queue, waiter, link);
 
-		SPDK_NOTICELOG("md_journal: HOME barrier reached: target_seq=%" PRIu64
-			       " home_durable_seq=%" PRIu64 "\n",
-			       waiter->target_seq, jr->home_durable_seq);
+		MDJ_IO_NOTICELOG("md_journal: HOME barrier reached: target_seq=%" PRIu64
+			         " home_durable_seq=%" PRIu64 "\n",
+			         waiter->target_seq, jr->home_durable_seq);
 
 		waiter->cb_fn(waiter->seq, waiter->cb_arg, 0);
 
@@ -1293,11 +1294,11 @@ spdk_md_journal_batch_drain_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserr
 		jr->home_durable_seq = drain_batch->items[drain_batch->elem_count - 1]->seq;
 	}
 
-	SPDK_NOTICELOG("md_journal: HOME drain batch done: elements=%u first_seq=%" PRIu64
-		       " last_seq=%" PRIu64 " home_durable_seq=%" PRIu64 " drain_gen=%u\n",
-		       drain_batch->elem_count, drain_batch->items[0]->seq,
-		       drain_batch->items[drain_batch->elem_count - 1]->seq,
-		       jr->home_durable_seq, jr->next_drain_gen);
+	MDJ_IO_NOTICELOG("md_journal: HOME drain batch done: elements=%u first_seq=%" PRIu64
+		         " last_seq=%" PRIu64 " home_durable_seq=%" PRIu64 " drain_gen=%u\n",
+		         drain_batch->elem_count, drain_batch->items[0]->seq,
+		         drain_batch->items[drain_batch->elem_count - 1]->seq,
+		         jr->home_durable_seq, jr->next_drain_gen);
 
 	md_journal_process_home_waiters(jr);
 
@@ -1358,8 +1359,8 @@ spdk_md_journal_write_batch_drain(struct spdk_bs_md_journal *jr)
 		bs_batch_write_dev(batch, elem->page, elem->hdr->target_lba, elem->hdr->lba_count);
 	}
 
-	SPDK_NOTICELOG("md_journal: HOME drain batch submit: elements=%u home_writes=%u skipped=%u\n",
-		       drain_batch->elem_count, home_writes, drain_batch->elem_count - home_writes);
+	MDJ_IO_NOTICELOG("md_journal: HOME drain batch submit: elements=%u home_writes=%u skipped=%u\n",
+		         drain_batch->elem_count, home_writes, drain_batch->elem_count - home_writes);
 
 	bs_batch_close(batch);
 
@@ -1452,10 +1453,10 @@ md_journal_start_drain_batch(struct spdk_bs_md_journal *jr, bool force)
 	 */
 	md_journal_mark_latest(batch);
 
-	SPDK_NOTICELOG("md_journal: HOME drain batch start: elements=%u first_seq=%" PRIu64
-		       " last_seq=%" PRIu64 " force=%d home_queue_empty=%d\n",
-		       batch->elem_count, batch->items[0]->seq,
-		       batch->items[batch->elem_count - 1]->seq, force, TAILQ_EMPTY(&jr->home_queue));
+	MDJ_IO_NOTICELOG("md_journal: HOME drain batch start: elements=%u first_seq=%" PRIu64
+		         " last_seq=%" PRIu64 " force=%d home_queue_empty=%d\n",
+		         batch->elem_count, batch->items[0]->seq,
+		         batch->items[batch->elem_count - 1]->seq, force, TAILQ_EMPTY(&jr->home_queue));
 
 	jr->active_drain_batch = true;
 
@@ -1522,8 +1523,8 @@ spdk_md_journal_submit_zeroes_v2_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int 
 		return;
 	}
 
-	SPDK_NOTICELOG("md_journal: ZERO batch done (phase 2): elements=%u returned to free, free=%u\n",
-		       zero_batch->elem_count, jr->free_count + zero_batch->elem_count);
+	MDJ_IO_NOTICELOG("md_journal: ZERO batch done (phase 2): elements=%u returned to free, free=%u\n",
+		         zero_batch->elem_count, jr->free_count + zero_batch->elem_count);
 
 	for (i = 0; i < zero_batch->elem_count; i++) {
 		elem = zero_batch->items[i];
@@ -1608,8 +1609,8 @@ spdk_md_journal_submit_zeroes_v1_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int 
 		bs_batch_write_zeroes_dev(batch, journal_lba, lba_count);
 	}
 
-	SPDK_NOTICELOG("md_journal: ZERO phase 1 done, phase 2 submit: newest slots=%u of %u\n",
-		       latest, zero_batch->elem_count);
+	MDJ_IO_NOTICELOG("md_journal: ZERO phase 1 done, phase 2 submit: newest slots=%u of %u\n",
+		         latest, zero_batch->elem_count);
 
 	bs_batch_close(batch);
 }
@@ -1671,9 +1672,9 @@ spdk_md_journal_submit_zeroes(struct spdk_bs_md_journal *jr)
 		zero_batch->items[zero_batch->elem_count++] = elem;
 	}
 
-	SPDK_NOTICELOG("md_journal: ZERO batch start (phase 1): drain_gen=%u elements=%u "
-		       "superseded=%u newest=%u\n", gen, zero_batch->elem_count, superseded,
-		       zero_batch->elem_count - superseded);
+	MDJ_IO_NOTICELOG("md_journal: ZERO batch start (phase 1): drain_gen=%u elements=%u "
+		         "superseded=%u newest=%u\n", gen, zero_batch->elem_count, superseded,
+		         zero_batch->elem_count - superseded);
 
 	jr->active_zero_batch = true;
 
@@ -2481,8 +2482,8 @@ md_journal_confirm_home_drain(struct spdk_bs_md_journal *jr, uint64_t target_seq
 		return -ENOMEM;
 	}
 
-	SPDK_NOTICELOG("md_journal: HOME barrier wait: target_seq=%" PRIu64 " home_durable_seq=%" PRIu64
-		       " - forcing HOME drain\n", target_seq, jr->home_durable_seq);
+	MDJ_IO_NOTICELOG("md_journal: HOME barrier wait: target_seq=%" PRIu64 " home_durable_seq=%" PRIu64
+		         " - forcing HOME drain\n", target_seq, jr->home_durable_seq);
 
 	waiter->target_seq = target_seq;
 	waiter->cb_fn = cb_fn;

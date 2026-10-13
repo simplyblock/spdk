@@ -137,6 +137,7 @@ struct spdk_bs_request_set {
 			spdk_blob_op_complete	cb_fn;
 			void			*cb_arg;
 			void			*payload; /* cast to iov for readv/writev */
+			uint64_t		queued_tsc; /* queued for a cluster allocation slot */
 		} user_op;
 	} u;
 	/* Pointer to ext_io_opts passed by the user */
