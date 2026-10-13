@@ -4317,10 +4317,15 @@ spdk_lvs_ha_fence(uint64_t groupid, spdk_lvs_ha_cb cb_fn, void *cb_arg)
 	 * from reconnecting and resyncing, and unfence waits for that resync (deadlock). */
 	block_port(lvs->subsystem_port);
 	lvs->update_in_progress = false;
-	lvs->leader = false;
 	bs = lvs->blobstore;
 	spdk_bs_set_ha_fenced(bs, true);
+	/* Demote like every other non-leader transition: the md journal is told
+	 * old state -> false (paused) before lvs->leader changes, so a fenced node
+	 * no longer journals metadata and set_leader(true) later takes the normal
+	 * promotion path. A demotion completes inline (no message sent). */
 	spdk_bs_set_leader(bs, false);
+	spdk_bs_activate_md_journal(bs, lvs->leader, false, spdk_lvs_md_journal_signal_cpl, NULL);
+	lvs->leader = false;
 	spdk_bs_ha_set_hold(bs, false);
 	TAILQ_FOREACH(lvol, &lvs->lvols, link) {
 		lvol->leader = false;

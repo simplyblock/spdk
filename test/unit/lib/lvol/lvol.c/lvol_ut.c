@@ -3867,10 +3867,17 @@ spdk_bs_ha_sync_send_msg(struct spdk_blob_store *bs, spdk_blob_op_complete cb_fn
 }
 
 /* new_md_journal: leadership changes complete through the md journal activation. */
+static int g_ha_mdj_cnt;
+static int g_ha_mdj_old = -1;
+static int g_ha_mdj_new = -1;
+
 void
 spdk_bs_activate_md_journal(struct spdk_blob_store *bs, bool state, bool lvs_state,
 			    spdk_blob_op_complete cb_fn, void *cb_arg)
 {
+	g_ha_mdj_cnt++;
+	g_ha_mdj_old = state;
+	g_ha_mdj_new = lvs_state;
 	cb_fn(cb_arg, 0);
 }
 
@@ -4191,7 +4198,13 @@ lvol_ha_fence(void)
 
 	TAILQ_INSERT_TAIL(&lvs->lvols, &lvol, link);
 	CU_ASSERT(spdk_lvs_ha_hold(14) == 0);
+	g_ha_mdj_cnt = 0;
+	g_ha_mdj_old = g_ha_mdj_new = -1;
 	CU_ASSERT(spdk_lvs_ha_fence(14, ha_cb, NULL) == 0);
+	/* The md journal is paused with the old leader state (true -> false). */
+	CU_ASSERT(g_ha_mdj_cnt == 1);
+	CU_ASSERT(g_ha_mdj_old == 1);
+	CU_ASSERT(g_ha_mdj_new == 0);
 	CU_ASSERT(lvs->ha_fenced == true);
 	CU_ASSERT(lvs->ha_held == false);
 	CU_ASSERT(lvs->leader == false);
