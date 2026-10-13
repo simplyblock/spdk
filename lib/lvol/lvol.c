@@ -3913,11 +3913,17 @@ spdk_lvs_set_signal_switch(struct spdk_lvol_store *lvs)
 
 /* START two-node arbitration (sbcli docs/design/two-node-arbitration.md) */
 
+/* Set by the first spdk_lvs_ha_* call on this node. Only the JC's two-node arbitration
+ * (dual-node configuration) calls them; on every other node it stays false, and
+ * spdk_lvol_set_leader_cpl runs the completion it had before two-node arbitration. */
+static bool g_lvs_ha_active = false;
+
 static struct spdk_lvol_store *
 lvs_ha_find_locked(uint64_t groupid)
 {
 	struct spdk_lvol_store *lvs;
 
+	__atomic_store_n(&g_lvs_ha_active, true, __ATOMIC_SEQ_CST);
 	TAILQ_FOREACH(lvs, &g_lvol_stores, link) {
 		if (lvs->groupid == groupid) {
 			return lvs;
@@ -8362,18 +8368,23 @@ spdk_lvol_set_leader_cpl(void *cb_arg, int lvolerrno)
 		}
 	}
 	lvs->leader = lvs_leader;
-	/* Two-node arbitration: a demoted LVS no longer writes, so it holds
-	 * no solo grant; the JC resets its HA state (spdk_lvs_ha_take_demoted). */
-	lvs->ha_demoted = !lvs_leader;
-	/* The control plane set the leadership explicitly: IO may again drive the normal
-	 * failover takeover on this LVS (review on #76, point 3). */
-	__atomic_store_n(&lvs->ha_takeover_blocked, false, __ATOMIC_SEQ_CST);
-	ana_restore_port = lvs->ha_ana_restore_port;
-	lvs->ha_ana_restore_port = 0;
+	ana_restore_port = 0;
+	if (__atomic_load_n(&g_lvs_ha_active, __ATOMIC_SEQ_CST)) {
+		/* Two-node arbitration: a demoted LVS no longer writes, so it holds
+		 * no solo grant; the JC resets its HA state (spdk_lvs_ha_take_demoted). */
+		lvs->ha_demoted = !lvs_leader;
+		/* The control plane set the leadership explicitly: IO may again drive the normal
+		 * failover takeover on this LVS (review on #76, point 3). */
+		__atomic_store_n(&lvs->ha_takeover_blocked, false, __ATOMIC_SEQ_CST);
+		ana_restore_port = lvs->ha_ana_restore_port;
+		lvs->ha_ana_restore_port = 0;
+	}
 
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
 
-	lvs_ha_ana_request((uint16_t)ana_restore_port, false);
+	if (ana_restore_port) {
+		lvs_ha_ana_request((uint16_t)ana_restore_port, false);
+	}
 
 	if (tmp_lvs) {
 		if (tmp_lvs->hub_dev.state != HUBLVOL_CONNECTED) {

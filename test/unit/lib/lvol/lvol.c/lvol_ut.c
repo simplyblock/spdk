@@ -4409,6 +4409,30 @@ lvol_ha_demotion_reported_once(void)
 	ha_free_lvs(lvs);
 }
 
+/* A node that never used two-node arbitration (no spdk_lvs_ha_* call): a leadership change
+ * through the control plane completes exactly as before, without touching any HA field. */
+static void
+lvol_ha_set_leader_untouched_without_ha(void)
+{
+	struct spdk_lvol_store *lvs = ha_alloc_lvs(31, true, NODE_PRIMARY);
+	bool saved = g_lvs_ha_active;
+	int rc = 99;
+
+	g_lvs_ha_active = false;
+	lvs->ha_takeover_blocked = true;
+	lvs->ha_ana_restore_port = 4420;
+	spdk_set_leader_all(lvs, false, true, ha_set_leader_done, &rc);
+	CU_ASSERT(lvs->leader == false);
+	CU_ASSERT(lvs->ha_demoted == false);
+	CU_ASSERT(lvs->ha_takeover_blocked == true);
+	CU_ASSERT(lvs->ha_ana_restore_port == 4420);
+	CU_ASSERT(g_lvs_ha_active == false);
+	lvs->ha_takeover_blocked = false;
+	lvs->ha_ana_restore_port = 0;
+	g_lvs_ha_active = saved;
+	ha_free_lvs(lvs);
+}
+
 /* Review on #76, point 2: hold, release, fence and unfence send no message while
  * g_lvol_stores_mutex is held. */
 static void
@@ -4584,6 +4608,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, lvol_ha_rules_poller_respects_fence);
 	CU_ADD_TEST(suite, lvol_ha_is_leader);
 	CU_ADD_TEST(suite, lvol_ha_demotion_reported_once);
+	CU_ADD_TEST(suite, lvol_ha_set_leader_untouched_without_ha);
 	CU_ADD_TEST(suite, lvol_ha_no_msg_under_mutex);
 	CU_ADD_TEST(suite, lvol_ha_fence_blocks_io_takeover);
 	CU_ADD_TEST(suite, lvol_ha_fence_sets_ana_inaccessible);
