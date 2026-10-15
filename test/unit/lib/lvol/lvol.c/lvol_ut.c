@@ -3883,13 +3883,22 @@ spdk_bs_activate_md_journal(struct spdk_blob_store *bs, bool state, bool lvs_sta
 
 /* A small model of the nvmf target for the fence's ANA change (review on #76, point 4):
  * one target, subsystems with one listener each. */
+#define HA_MAX_GRP 4
 struct ha_fake_subsys {
 	char				nqn[64];
 	struct spdk_nvme_transport_id	trid;
-	enum spdk_nvme_ana_state	state;
+	enum spdk_nvme_ana_state	state;		/* ANA group 1 */
+	enum spdk_nvme_ana_state	grp_more[HA_MAX_GRP - 1];	/* ANA groups 2.. */
+	uint32_t			n_grp;
 	bool				ana_reporting;
 	int				paused;
 };
+
+static enum spdk_nvme_ana_state *
+ha_grp(struct ha_fake_subsys *s, uint32_t anagrpid)
+{
+	return anagrpid == 1 ? &s->state : &s->grp_more[anagrpid - 2];
+}
 #define HA_MAX_SUBSYS 4
 static struct ha_fake_subsys g_ha_subsys[HA_MAX_SUBSYS];
 static int g_ha_n_subsys;
@@ -3907,6 +3916,7 @@ ha_add_subsys(const char *nqn, uint16_t port, enum spdk_nvme_ana_state state)
 	snprintf(s->trid.traddr, sizeof(s->trid.traddr), "10.0.0.1");
 	snprintf(s->trid.trsvcid, sizeof(s->trid.trsvcid), "%u", port);
 	s->state = state;
+	s->n_grp = 1;
 	s->ana_reporting = true;
 }
 
@@ -3915,6 +3925,9 @@ ha_reset_nvmf(void)
 {
 	poll_threads();
 	memset(g_ha_subsys, 0, sizeof(g_ha_subsys));
+	for (int i = 0; i < LVS_HA_ANA_MAX_SAVED; i++) {
+		free(g_lvs_ha_ana_saved[i].states);
+	}
 	memset(g_lvs_ha_ana_saved, 0, sizeof(g_lvs_ha_ana_saved));
 	g_ha_n_subsys = 0;
 	g_ha_pause_busy = 0;
@@ -4017,8 +4030,19 @@ spdk_nvmf_subsystem_get_ana_state(struct spdk_nvmf_subsystem *subsystem,
 				  const struct spdk_nvme_transport_id *trid, uint32_t anagrpid,
 				  enum spdk_nvme_ana_state *ana_state)
 {
-	*ana_state = ((struct ha_fake_subsys *)subsystem)->state;
+	struct ha_fake_subsys *s = (struct ha_fake_subsys *)subsystem;
+
+	if (anagrpid == 0 || anagrpid > s->n_grp) {
+		return -EINVAL;
+	}
+	*ana_state = *ha_grp(s, anagrpid);
 	return 0;
+}
+
+uint32_t
+spdk_nvmf_subsystem_get_max_nsid(struct spdk_nvmf_subsystem *subsystem)
+{
+	return ((struct ha_fake_subsys *)subsystem)->n_grp;
 }
 
 void
@@ -4030,8 +4054,14 @@ spdk_nvmf_subsystem_set_ana_state(struct spdk_nvmf_subsystem *subsystem,
 	struct ha_fake_subsys *s = (struct ha_fake_subsys *)subsystem;
 
 	CU_ASSERT(s->paused == 1);
-	CU_ASSERT(anagrpid == 0);
-	s->state = ana_state;
+	CU_ASSERT(anagrpid <= s->n_grp);
+	if (anagrpid == 0) {
+		for (uint32_t g = 1; g <= s->n_grp; g++) {
+			*ha_grp(s, g) = ana_state;
+		}
+	} else {
+		*ha_grp(s, anagrpid) = ana_state;
+	}
 	g_ha_set_ana_cnt++;
 	cb_fn(cb_arg, 0);
 }
@@ -4582,6 +4612,39 @@ lvol_ha_ana_respects_foreign_changes(void)
 	ha_free_lvs(lvs);
 }
 
+/* Campaign c7b, F18: the fence sets every ANA group of the listener inaccessible, so the
+ * unfence restores every group to its own previous state; a group the control plane set
+ * meanwhile is kept. Before, only group 1 was saved and checked, and when the control plane
+ * had already set group 1, groups 2.. stayed inaccessible. */
+static void
+lvol_ha_ana_restores_every_group(void)
+{
+	struct spdk_lvol_store *lvs = ha_alloc_lvs(36, false, NODE_SECONDARY);
+	struct ha_fake_subsys *s;
+
+	ha_reset_nvmf();
+	ha_add_subsys("nqn.ha:shared", 4420, SPDK_NVME_ANA_OPTIMIZED_STATE);
+	s = &g_ha_subsys[0];
+	s->n_grp = 3;
+	s->grp_more[0] = SPDK_NVME_ANA_NON_OPTIMIZED_STATE;	/* group 2 */
+	s->grp_more[1] = SPDK_NVME_ANA_OPTIMIZED_STATE;		/* group 3 */
+
+	CU_ASSERT(spdk_lvs_ha_fence(36, NULL, NULL) == 0);
+	poll_threads();
+	CU_ASSERT(s->state == SPDK_NVME_ANA_INACCESSIBLE_STATE);
+	CU_ASSERT(s->grp_more[0] == SPDK_NVME_ANA_INACCESSIBLE_STATE);
+	CU_ASSERT(s->grp_more[1] == SPDK_NVME_ANA_INACCESSIBLE_STATE);
+
+	s->state = SPDK_NVME_ANA_NON_OPTIMIZED_STATE;	/* the control plane set group 1 */
+	CU_ASSERT(spdk_lvs_ha_unfence(36) == 0);
+	poll_threads();
+	CU_ASSERT(s->state == SPDK_NVME_ANA_NON_OPTIMIZED_STATE);	/* kept */
+	CU_ASSERT(s->grp_more[0] == SPDK_NVME_ANA_NON_OPTIMIZED_STATE);	/* restored */
+	CU_ASSERT(s->grp_more[1] == SPDK_NVME_ANA_OPTIMIZED_STATE);	/* restored */
+	CU_ASSERT(s->paused == 0);
+	ha_free_lvs(lvs);
+}
+
 /* END two-node arbitration */
 
 
@@ -4614,6 +4677,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, lvol_ha_fence_sets_ana_inaccessible);
 	CU_ADD_TEST(suite, lvol_ha_primary_ana_restored_on_leadership);
 	CU_ADD_TEST(suite, lvol_ha_ana_respects_foreign_changes);
+	CU_ADD_TEST(suite, lvol_ha_ana_restores_every_group);
 
 	suite = CU_add_suite("lvol", NULL, NULL);
 
