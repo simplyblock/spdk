@@ -3389,7 +3389,7 @@ vbdev_lvol_resv_put_msg(void *arg)
 		vbdev_lvol_resv_put_finish(ctx, rc);
 		return;
 	}
-	spdk_blob_sync_md(lvol->blob, vbdev_lvol_resv_put_synced, ctx);
+	spdk_blob_sync_md(lvol->blob, true, vbdev_lvol_resv_put_synced, ctx);
 }
 
 void

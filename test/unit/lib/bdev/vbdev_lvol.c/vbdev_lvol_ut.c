@@ -52,8 +52,6 @@ DEFINE_STUB_V(spdk_lvs_grow_live, (struct spdk_lvol_store *lvs,
 DEFINE_STUB_V(spdk_change_redirect_state, (struct spdk_lvol_store *lvs, bool disconnect));
 DEFINE_STUB_V(spdk_lvs_check_active_process, (struct spdk_lvol_store *lvs, struct spdk_lvol *lvol, uint8_t type));
 DEFINE_STUB(spdk_lvs_ha_takeover_blocked, bool, (struct spdk_lvol_store *lvs), false);
-DEFINE_STUB_V(spdk_bdev_io_complete_nvme_status, (struct spdk_bdev_io *bdev_io, uint32_t cdw0, int sct,
-		int sc));
 DEFINE_STUB_V(spdk_sub_stat_ext, (struct spdk_io_channel *ch));
 DEFINE_STUB_V(spdk_lvs_store_hublvol_channel, (struct spdk_lvol_store *lvs, struct spdk_io_channel *ch));
 DEFINE_STUB_V(spdk_lvol_rediret_io_change_state, (struct spdk_lvol *lvol));
@@ -2512,7 +2510,7 @@ spdk_blob_set_xattr(struct spdk_blob *blob, const char *name, const void *value,
 }
 
 void
-spdk_blob_sync_md(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+spdk_blob_sync_md(struct spdk_blob *blob, bool md_drain, spdk_blob_op_complete cb_fn, void *cb_arg)
 {
 	g_resv_sync_calls++;
 	cb_fn(cb_arg, 0);
