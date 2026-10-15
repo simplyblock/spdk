@@ -6,7 +6,7 @@
 SPDK_ROOT_DIR := $(abspath $(CURDIR)/../../../..)
 include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 
-DIRS-y = app.c reactor.c
+DIRS-y = app.c reactor.c nvmf_lvol_resv.c
 
 .PHONY: all clean $(DIRS-y)
 

@@ -8741,6 +8741,46 @@ Example response:
 }
 ~~~
 
+### nvmf_ns_reload_reservation method {#rpc_nvmf_ns_reload_reservation}
+
+Replace a namespace's reservation state with the state its store holds, and update
+the poll groups. The reload waits until the namespace's queued reservation commands
+have completed.
+
+#### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+nqn                     | Required | string      | Subsystem NQN
+nsid                    | Required | number      | Namespace ID
+tgt_name                | Optional | string      | Parent NVMe-oF target name.
+
+#### Example
+
+Example request:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "nvmf_ns_reload_reservation",
+  "params": {
+    "nqn": "nqn.2016-06.io.spdk:cnode1",
+    "nsid": 1
+  }
+}
+~~~
+
+Example response:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+~~~
+
 ### nvmf_subsystem_set_ns_ana_group method {#rpc_nvmf_subsystem_set_ns_ana_group}
 
 Change ANA group ID of a namespace in a subsystem.

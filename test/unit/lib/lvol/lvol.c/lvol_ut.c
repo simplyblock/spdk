@@ -4585,6 +4585,110 @@ lvol_ha_ana_respects_foreign_changes(void)
 /* END two-node arbitration */
 
 
+/*
+ * A refresh tells the reservation store (and anything else keeping state in lvol
+ * metadata) that it may have changed under this node: on becoming the leader of an
+ * lvol or of the lvolstore, and after a non-leader rereads the metadata.
+ */
+static int g_refresh_calls;
+static struct spdk_lvol_store *g_refresh_lvs;
+static struct spdk_lvol *g_refresh_lvol;
+static void *g_refresh_ctx;
+
+static void
+ut_lvs_refresh(struct spdk_lvol_store *lvs, struct spdk_lvol *lvol, void *ctx)
+{
+	g_refresh_calls++;
+	g_refresh_lvs = lvs;
+	g_refresh_lvol = lvol;
+	g_refresh_ctx = ctx;
+}
+
+static int g_hub_close_calls;
+static bool g_hub_close_saw_desc;
+
+static void
+ut_hub_close(struct spdk_lvol_store *lvs, void *ctx)
+{
+	g_hub_close_calls++;
+	g_hub_close_saw_desc = lvs->hub_dev.desc != NULL;
+}
+
+/* Whoever holds a channel on the hub descriptor is told before the descriptor closes,
+ * so the hub's NVMe path can be deleted; a store without a hub descriptor tells nobody */
+static void
+lvs_hub_close_notification(void)
+{
+	struct spdk_lvol_store lvs = {};
+
+	TAILQ_INIT(&lvs.hublvol_channels);
+	lvs.node_role = NODE_PRIMARY;	/* no reopen after the close */
+	lvs.hub_dev.desc = (struct spdk_bdev_desc *)0x2;
+	spdk_lvs_set_hub_close_cb(ut_hub_close, NULL);
+
+	spdk_delayed_close_hub_bdev(&lvs);
+	CU_ASSERT(g_hub_close_calls == 1);
+	CU_ASSERT(g_hub_close_saw_desc);
+	CU_ASSERT(lvs.hub_dev.desc == NULL);
+
+	spdk_delayed_close_hub_bdev(&lvs);
+	CU_ASSERT(g_hub_close_calls == 1);
+
+	spdk_lvs_set_hub_close_cb(NULL, NULL);
+}
+
+static void
+lvs_refresh_notification(void)
+{
+	struct spdk_lvol_store lvs = {};
+	struct spdk_lvol lvol = { .lvol_store = &lvs };
+	struct spdk_lvs_req *req;
+	int ctx;
+	int rc;
+
+	g_refresh_calls = 0;
+	spdk_lvs_set_refresh_cb(ut_lvs_refresh, &ctx);
+
+	/* An lvol whose failover update finished becomes its leader */
+	spdk_lvol_set_leader(&lvol);
+	CU_ASSERT(g_refresh_calls == 1);
+	CU_ASSERT(g_refresh_lvs == &lvs);
+	CU_ASSERT(g_refresh_lvol == &lvol);
+	CU_ASSERT(g_refresh_ctx == &ctx);
+	CU_ASSERT(lvol.leader == true);
+
+	/* The control plane makes this node the leader of the whole lvolstore */
+	rc = -1;
+	spdk_set_leader_all(&lvs, true, false, ha_set_leader_done, &rc);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_refresh_calls == 2);
+	CU_ASSERT(g_refresh_lvs == &lvs);
+	CU_ASSERT(g_refresh_lvol == NULL);
+
+	/* ... and not when it takes leadership away */
+	rc = -1;
+	spdk_set_leader_all(&lvs, false, true, ha_set_leader_done, &rc);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_refresh_calls == 2);
+
+	/* A non-leader rereads the metadata */
+	req = calloc(1, sizeof(*req));
+	SPDK_CU_ASSERT_FATAL(req != NULL);
+	req->lvol_store = &lvs;
+	lvs_update_live_cb(req, 0);
+	CU_ASSERT(g_refresh_calls == 3);
+	CU_ASSERT(g_refresh_lvol == NULL);
+
+	/* A failed reread changed nothing */
+	req = calloc(1, sizeof(*req));
+	SPDK_CU_ASSERT_FATAL(req != NULL);
+	req->lvol_store = &lvs;
+	lvs_update_live_cb(req, -EIO);
+	CU_ASSERT(g_refresh_calls == 3);
+
+	spdk_lvs_set_refresh_cb(NULL, NULL);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -4617,6 +4721,8 @@ main(int argc, char **argv)
 
 	suite = CU_add_suite("lvol", NULL, NULL);
 
+	CU_ADD_TEST(suite, lvs_refresh_notification);
+	CU_ADD_TEST(suite, lvs_hub_close_notification);
 	CU_ADD_TEST(suite, lvs_init_unload_success);
 	CU_ADD_TEST(suite, lvs_init_destroy_success);
 	CU_ADD_TEST(suite, lvs_init_opts_success);

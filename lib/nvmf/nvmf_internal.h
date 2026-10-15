@@ -131,6 +131,12 @@ struct spdk_nvmf_subsystem_pg_ns_info {
 	struct spdk_uuid		reg_hostid[SPDK_NVMF_MAX_NUM_REGISTRANTS];
 	uint64_t			num_blocks;
 	uint32_t			anagrpid;
+	struct {
+		/* Generational counter for preempted hostids list */
+		uint32_t			hostids_gen;
+		/* Count of IOs preempt-and-abort is waiting on */
+		uint64_t			io_waiting;
+	} preempt_abort;
 
 	/* I/O outstanding to this namespace */
 	uint64_t			io_outstanding;
@@ -158,7 +164,28 @@ struct spdk_nvmf_registrant {
 	struct spdk_uuid hostid;
 	/* Registration key */
 	uint64_t rkey;
+	/*
+	 * Successful Registers of rkey from this host. A Linux pNFS client registers
+	 * the same key once per device node it holds for the namespace, and releases
+	 * each with a Replace to a zero key, which unregisters only at zero.
+	 */
+	uint32_t reg_count;
 };
+
+struct spdk_nvmf_reservation_preempt_abort_info {
+	/* preempted controllers */
+	struct spdk_uuid hostids[SPDK_NVMF_MAX_NUM_REGISTRANTS];
+	struct {
+		uint8_t io_waiting_done:	1; /* IO waiting is complete */
+		uint8_t rsvd_1:			7;
+	};
+	uint8_t rsvd_2[2];
+	uint8_t hostids_cnt;
+	uint32_t hostids_gen; /* Generational counter every time the list changes */
+	struct spdk_poller *io_waiting_timer;
+	uint64_t io_waiting_timeout_ticks;
+};
+SPDK_STATIC_ASSERT(SPDK_NVMF_MAX_NUM_REGISTRANTS <= UINT8_MAX, "hostids_cnt storage type");
 
 struct spdk_nvmf_ns {
 	uint32_t nsid;
@@ -173,16 +200,24 @@ struct spdk_nvmf_ns {
 	uint32_t gen;
 	/* registrants head */
 	TAILQ_HEAD(, spdk_nvmf_registrant) registrants;
+	/* Queued reservation requests: head is in-progress, rest are pending */
+	STAILQ_HEAD(, spdk_nvmf_request) reservations;
 	/* current reservation key */
 	uint64_t crkey;
 	/* reservation type */
 	enum spdk_nvme_reservation_type rtype;
 	/* current reservation holder, only valid if reservation type can only have one holder */
 	struct spdk_nvmf_registrant *holder;
+	struct spdk_nvmf_reservation_preempt_abort_info *preempt_abort;
+	/* Reloads waiting for the reservation commands queued on this namespace */
+	struct nvmf_ns_reservation_reload *reservation_reloads;
 	/* Persist Through Power Loss file which contains the persistent reservation */
 	char *ptpl_file;
 	/* Persist Through Power Loss feature is enabled */
 	bool ptpl_activated;
+	/* Set by a command that changed only a registrant's count: stored, but the
+	 * poll groups, which never see the count, are not updated */
+	bool resv_count_changed;
 	/* ZCOPY supported on bdev device */
 	bool zcopy;
 	/* Command Set Identifier */
@@ -439,6 +474,8 @@ struct spdk_nvmf_subsystem_listener *nvmf_subsystem_find_listener(
 	struct spdk_nvmf_subsystem *subsystem,
 	const struct spdk_nvme_transport_id *trid);
 bool nvmf_subsystem_zone_append_supported(struct spdk_nvmf_subsystem *subsystem);
+int nvmf_subsystem_poll_group_update_ns_reservation(const struct spdk_nvmf_ns *ns,
+		struct spdk_nvmf_subsystem_pg_ns_info *pg_ns);
 struct spdk_nvmf_listener *nvmf_transport_find_listener(
 	struct spdk_nvmf_transport *transport,
 	const struct spdk_nvme_transport_id *trid);

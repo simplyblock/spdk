@@ -9,7 +9,8 @@ include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 SO_VER := 6
 SO_MINOR := 0
 
-C_SRCS = nvmf_rpc.c nvmf_tgt.c
+C_SRCS = nvmf_rpc.c nvmf_tgt.c nvmf_lvol_resv.c
+CFLAGS += -I$(SPDK_ROOT_DIR)/module/bdev
 LIBNAME = event_nvmf
 
 SPDK_MAP_FILE = $(SPDK_ROOT_DIR)/mk/spdk_blank.map

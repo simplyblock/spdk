@@ -409,6 +409,10 @@ struct spdk_lvol {
 	char				uuid_str[SPDK_UUID_STRING_LEN];
 	int priority_class;
 	struct spdk_bdev		*bdev;
+	/* An NVMe-oF reservation state kept in the blob's xattr, as last read or
+	 * written on the lvolstore's thread (vbdev_lvol.c) */
+	void				*resv_cache;
+	size_t				resv_cache_len;
 	int				ref_count;
 	bool				action_in_progress;
 	enum blob_clear_method		clear_method;

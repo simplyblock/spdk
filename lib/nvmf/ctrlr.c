@@ -3498,6 +3498,31 @@ nvmf_qpair_abort_pending_zcopy_reqs(struct spdk_nvmf_qpair *qpair)
 	}
 }
 
+static bool
+nvmf_qpair_cid_is_reservation(const struct spdk_nvmf_qpair *qpair, uint16_t cid)
+{
+	struct spdk_nvmf_request *req;
+	struct spdk_nvme_cmd *cmd;
+
+	TAILQ_FOREACH(req, &qpair->outstanding, link) {
+		cmd = &req->cmd->nvme_cmd;
+
+		if (cmd->cid != cid) {
+			continue;
+		}
+		switch (cmd->opc) {
+		case SPDK_NVME_OPC_RESERVATION_REGISTER:
+		case SPDK_NVME_OPC_RESERVATION_ACQUIRE:
+		case SPDK_NVME_OPC_RESERVATION_RELEASE:
+		case SPDK_NVME_OPC_RESERVATION_REPORT:
+			return true;
+		default:
+			return false;
+		}
+	}
+	return false;
+}
+
 static void
 nvmf_qpair_abort_request(struct spdk_nvmf_qpair *qpair, struct spdk_nvmf_request *req)
 {
@@ -3508,6 +3533,13 @@ nvmf_qpair_abort_request(struct spdk_nvmf_qpair *qpair, struct spdk_nvmf_request
 			      qpair->ctrlr, qpair->qid, cid);
 		req->rsp->nvme_cpl.cdw0 &= ~1U; /* Command successfully aborted */
 
+		spdk_nvmf_request_complete(req);
+		return;
+	}
+	if (nvmf_qpair_cid_is_reservation(qpair, cid)) {
+		/* We don't support aborting reservation requests, leave completion as not-aborted */
+		SPDK_DEBUGLOG(nvmf, "abort ctrlr=%p sqid=%u cid=%u for reservation not supported\n",
+			      qpair->ctrlr, qpair->qid, cid);
 		spdk_nvmf_request_complete(req);
 		return;
 	}
@@ -4720,6 +4752,10 @@ _nvmf_request_complete(void *ctx)
 	opcode = req->cmd->nvmf_cmd.opcode;
 
 	qpair = req->qpair;
+
+	/* request should not be on a ns reservations list */
+	assert(req->reservation_queued == false);
+
 	if (spdk_likely(qpair->ctrlr)) {
 		sgroup = &qpair->group->sgroups[qpair->ctrlr->subsys->id];
 		assert(sgroup != NULL);
@@ -4740,6 +4776,26 @@ _nvmf_request_complete(void *ctx)
 		}
 	} else if (spdk_unlikely(nvmf_request_is_fabric_connect(req))) {
 		sgroup = nvmf_subsystem_pg_from_connect_cmd(req);
+	}
+
+	/* Check if this IO is being waited on by a reservation command */
+	if (spdk_unlikely(req->reservation_waiting)) {
+		if (sgroup && (nsid - 1 < sgroup->num_ns)) {
+			ns_info = &sgroup->ns_info[nsid - 1];
+			if (ns_info->preempt_abort.io_waiting > 0) {
+				ns_info->preempt_abort.io_waiting--;
+			} else {
+				SPDK_ERRLOG(
+					"Request on reservation IO waiting but pg ns_info (%p) is not waiting\n",
+					ns_info);
+			}
+		} else if (!sgroup) {
+			SPDK_ERRLOG(
+				"Request on reservation IO waiting but qpair (%p) detached from controller\n",
+				qpair);
+		} else {
+			SPDK_ERRLOG("Request on reservation IO waiting but invalid nsid: %u\n", nsid);
+		}
 	}
 
 	if (SPDK_DEBUGLOG_FLAG_ENABLED("nvmf")) {
