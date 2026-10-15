@@ -4778,7 +4778,7 @@ _nvmf_request_complete(void *ctx)
 		sgroup = nvmf_subsystem_pg_from_connect_cmd(req);
 	}
 
-	/* Check if this IO is being waited on by a reservation commnd */
+	/* Check if this IO is being waited on by a reservation command */
 	if (spdk_unlikely(req->reservation_waiting)) {
 		if (sgroup && (nsid - 1 < sgroup->num_ns)) {
 			ns_info = &sgroup->ns_info[nsid - 1];

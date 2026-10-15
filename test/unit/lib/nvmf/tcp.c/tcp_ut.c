@@ -1593,7 +1593,7 @@ test_nvmf_tcp_tls_generate_tls_psk(void)
 }
 
 static void
-test_nvmf_tcp_get_request_resuse_flags(void)
+test_nvmf_tcp_get_request_reuse_flags(void)
 {
 	struct spdk_nvmf_tcp_qpair tqpair = {};
 	struct spdk_nvmf_tcp_req tcp_req1 = {};
@@ -1658,7 +1658,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_nvmf_tcp_tls_generate_psk_id);
 	CU_ADD_TEST(suite, test_nvmf_tcp_tls_generate_retained_psk);
 	CU_ADD_TEST(suite, test_nvmf_tcp_tls_generate_tls_psk);
-	CU_ADD_TEST(suite, test_nvmf_tcp_get_request_resuse_flags);
+	CU_ADD_TEST(suite, test_nvmf_tcp_get_request_reuse_flags);
 
 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
 	CU_cleanup_registry();
