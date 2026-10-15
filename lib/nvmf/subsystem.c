@@ -3167,6 +3167,7 @@ static int
 nvmf_ns_reservation_apply(struct spdk_nvmf_ns *ns, const struct spdk_nvmf_reservation_info *info)
 {
 	struct spdk_nvmf_registrant *reg, *holder = NULL;
+	TAILQ_HEAD(, spdk_nvmf_registrant) regs = TAILQ_HEAD_INITIALIZER(regs);
 	struct spdk_uuid holder_uuid = {};
 	uint32_t i;
 
@@ -3178,30 +3179,37 @@ nvmf_ns_reservation_apply(struct spdk_nvmf_ns *ns, const struct spdk_nvmf_reserv
 		return -EINVAL;
 	}
 
+	/* Every registrant is parsed and allocated before the namespace changes: a state
+	 * that cannot be applied leaves the one in force, rather than none at all */
+	for (i = 0; i < info->num_regs; i++) {
+		reg = calloc(1, sizeof(*reg));
+		if (!reg || spdk_uuid_parse(&reg->hostid, info->registrants[i].host_uuid)) {
+			int rc = reg ? -EINVAL : -ENOMEM;
+
+			free(reg);
+			while ((reg = TAILQ_FIRST(&regs)) != NULL) {
+				TAILQ_REMOVE(&regs, reg, link);
+				free(reg);
+			}
+			return rc;
+		}
+		reg->rkey = info->registrants[i].rkey;
+		reg->reg_count = info->registrants[i].reg_count ? info->registrants[i].reg_count : 1;
+		TAILQ_INSERT_TAIL(&regs, reg, link);
+		if (info->rtype && !spdk_uuid_compare(&holder_uuid, &reg->hostid)) {
+			holder = reg;
+		}
+	}
+
 	nvmf_ns_reservation_clear_all_registrants(ns);
 	ns->holder = NULL;
 	ns->rtype = 0;
 	ns->crkey = 0;
 	ns->ptpl_activated = info->ptpl_activated;
 	ns->gen++;
-
-	for (i = 0; i < info->num_regs; i++) {
-		reg = calloc(1, sizeof(*reg));
-		if (!reg) {
-			nvmf_ns_reservation_clear_all_registrants(ns);
-			return -ENOMEM;
-		}
-		if (spdk_uuid_parse(&reg->hostid, info->registrants[i].host_uuid)) {
-			free(reg);
-			nvmf_ns_reservation_clear_all_registrants(ns);
-			return -EINVAL;
-		}
-		reg->rkey = info->registrants[i].rkey;
-		reg->reg_count = info->registrants[i].reg_count ? info->registrants[i].reg_count : 1;
+	while ((reg = TAILQ_FIRST(&regs)) != NULL) {
+		TAILQ_REMOVE(&regs, reg, link);
 		TAILQ_INSERT_TAIL(&ns->registrants, reg, link);
-		if (info->rtype && !spdk_uuid_compare(&holder_uuid, &reg->hostid)) {
-			holder = reg;
-		}
 	}
 
 	if (info->rtype) {
@@ -4466,6 +4474,15 @@ nvmf_ns_reservation_forwarded_done(void *cb_arg, const struct spdk_nvme_status *
 		} else if (nvmf_subsystem_update_ns(subsystem, nvmf_ns_reservation_forward_pg_done,
 						    req) == 0) {
 			return;
+		} else {
+			SPDK_ERRLOG("Updating the poll groups for nsid %u failed\n", ns->nsid);
+		}
+		/* The leader's success would report a reservation this target does not
+		 * enforce; the host retries instead */
+		if (spdk_nvme_cpl_is_success(&req->rsp->nvme_cpl)) {
+			req->rsp->nvme_cpl.status.sct = SPDK_NVME_SCT_GENERIC;
+			req->rsp->nvme_cpl.status.sc = SPDK_NVME_SC_NAMESPACE_NOT_READY;
+			req->rsp->nvme_cpl.status.dnr = 0;
 		}
 	}
 	nvmf_ns_reservation_finish(subsystem, ns, req);

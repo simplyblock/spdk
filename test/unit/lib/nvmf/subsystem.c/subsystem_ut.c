@@ -4505,6 +4505,22 @@ test_reservation_forwarded_on_nonleader(void)
 	CU_ASSERT(nvmf_ns_reservation_get_registrant(&g_ns, &g_ctrlr1_A.hostid)->rkey == 0xa1);
 	CU_ASSERT(reservations_get_count(&g_ns) == 0);
 
+	/* The leader's success with a state this target cannot apply is not the command's
+	 * status: the host would believe in a reservation nothing here enforces. It hears
+	 * Namespace Not Ready and retries. (Copilot review on #77, 4282821619.) */
+	ut_reservation_build_register_request(req, SPDK_NVME_RESERVE_REGISTER_KEY, 0, 0, 0, 0xc3);
+	nvmf_ns_reservation_request(req);
+	poll_threads();
+	CU_ASSERT(g_fwd_calls == 3);
+	snprintf(leader_state.registrants[0].host_uuid, sizeof(leader_state.registrants[0].host_uuid),
+		 "not-a-uuid");
+	ut_forward_complete(SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS, &leader_state);
+	poll_threads();
+	CU_ASSERT(rsp->status.sct == SPDK_NVME_SCT_GENERIC);
+	CU_ASSERT(rsp->status.sc == SPDK_NVME_SC_NAMESPACE_NOT_READY);
+	CU_ASSERT(rsp->status.dnr == 0);
+	CU_ASSERT(nvmf_ns_reservation_get_registrant(&g_ns, &g_ctrlr1_A.hostid)->rkey == 0xa1);
+
 	ut_reservation_free_req(req);
 	ut_resv_env_fini(&env);
 	ut_forward_reset(0);

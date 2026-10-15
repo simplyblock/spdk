@@ -156,6 +156,61 @@ test_update_keeps_state_it_cannot_read(void)
 	CU_ASSERT(g_put_calls == 0);
 }
 
+static struct spdk_nvme_status g_fwd_status;
+static bool g_fwd_had_info;
+static int g_fwd_calls;
+
+static void
+ut_forward_done(void *cb_arg, const struct spdk_nvme_status *status,
+		const struct spdk_nvmf_reservation_info *info)
+{
+	g_fwd_status = *status;
+	g_fwd_had_info = info != NULL;
+	g_fwd_calls++;
+}
+
+static void
+ut_forwarded(int rc, uint8_t sct, uint8_t sc)
+{
+	struct nvmf_lvol_resv_forwarded *ctx = calloc(1, sizeof(*ctx));
+
+	SPDK_CU_ASSERT_FATAL(ctx != NULL);
+	ctx->bdev = &g_bdev;
+	ctx->cb_fn = ut_forward_done;
+	g_fwd_calls = 0;
+	nvmf_lvol_resv_forwarded(ctx, rc, sct, sc);
+	CU_ASSERT(g_fwd_calls == 1);
+}
+
+static void
+test_forwarded_state_it_cannot_read(void)
+{
+	/* The leader's success comes back with the state it left */
+	g_get_rc = 0;
+	g_stored[0] = 3;
+	g_stored_len = 1;
+	g_decode_rc = 0;
+	ut_forwarded(0, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS);
+	CU_ASSERT(g_fwd_status.sc == SPDK_NVME_SC_SUCCESS);
+	CU_ASSERT(g_fwd_had_info);
+
+	/* A state this node cannot decode is not reported as the leader's success: the
+	 * host would hold a reservation this node does not enforce. (Copilot review on
+	 * #77, 4282821619.) */
+	g_decode_rc = -EPROTONOSUPPORT;
+	ut_forwarded(0, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS);
+	CU_ASSERT(g_fwd_status.sct == SPDK_NVME_SCT_GENERIC);
+	CU_ASSERT(g_fwd_status.sc == SPDK_NVME_SC_NAMESPACE_NOT_READY);
+	CU_ASSERT(!g_fwd_had_info);
+	g_decode_rc = 0;
+
+	/* No state at all is an empty state, which applies */
+	g_get_rc = -ENOENT;
+	ut_forwarded(0, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS);
+	CU_ASSERT(g_fwd_status.sc == SPDK_NVME_SC_SUCCESS);
+	CU_ASSERT(g_fwd_had_info);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -168,6 +223,7 @@ main(int argc, char **argv)
 
 	CU_ADD_TEST(suite, test_update_carries_the_next_generation);
 	CU_ADD_TEST(suite, test_update_keeps_state_it_cannot_read);
+	CU_ADD_TEST(suite, test_forwarded_state_it_cannot_read);
 
 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
 	CU_cleanup_registry();

@@ -403,6 +403,7 @@ _vbdev_lvs_remove_lvol_cb(void *cb_arg, int lvolerrno)
 	}
 
 	if (TAILQ_EMPTY(&lvs->lvols)) {
+		vbdev_lvol_resv_hub_detach(lvs_bdev);
 		spdk_lvs_destroy(lvs, _vbdev_lvs_remove_cb, lvs_bdev);
 		return;
 	}
@@ -447,6 +448,7 @@ _vbdev_lvs_remove_bdev_unregistered_cb(void *cb_arg, int bdeverrno)
 
 	/* Lvol store can be unloaded once all lvols are closed. */
 	if (_vbdev_lvs_are_lvols_closed(lvs)) {
+		vbdev_lvol_resv_hub_detach(lvs_bdev);
 		spdk_lvs_unload(lvs, _vbdev_lvs_remove_cb, lvs_bdev);
 	}
 }
@@ -484,6 +486,10 @@ _vbdev_lvs_remove(struct spdk_lvol_store *lvs, spdk_lvs_op_complete cb_fn, void 
 	lvs_bdev->req = req;
 
 	if (_vbdev_lvs_are_lvols_closed(lvs)) {
+		/* The reservation hub lets go of the lvolstore before it is unloaded or destroyed:
+		 * both free it before they complete, and a hub command completing in between would
+		 * otherwise follow lvs_bdev into freed memory. Detaching again later is a no-op. */
+		vbdev_lvol_resv_hub_detach(lvs_bdev);
 		if (destroy) {
 			spdk_lvs_destroy(lvs, _vbdev_lvs_remove_cb, lvs_bdev);
 			return;
@@ -690,6 +696,7 @@ _vbdev_lvol_unregister_cb(void *ctx, int lvolerrno)
 	struct lvol_store_bdev *lvs_bdev = lvol_bdev->lvs_bdev;
 
 	if (g_shutdown_started && _vbdev_lvs_are_lvols_closed(lvs_bdev->lvs)) {
+		vbdev_lvol_resv_hub_detach(lvs_bdev);
 		spdk_lvs_unload(lvs_bdev->lvs, _vbdev_lvol_unregister_unload_lvs, lvol_bdev);
 		return;
 	}
@@ -3152,6 +3159,33 @@ vbdev_lvol_resv_generation(const void *buf, size_t len, uint64_t *generation)
 	return true;
 }
 
+/*
+ * Whether buf is a state lib/nvmf can decode (spdk_nvmf_reservation_info_decode): the
+ * version this target writes, at most 64 registrants of 32 bytes after the 32-byte
+ * header and exactly that many, and a holder that is one of them. A state that fails
+ * this is never installed: the namespace could not apply it, and a node holding it
+ * would keep enforcing what it held before while reporting the state as current.
+ */
+#define VBDEV_LVOL_RESV_ENC_VERSION	1
+#define VBDEV_LVOL_RESV_ENC_MAX_REGS	64
+#define VBDEV_LVOL_RESV_ENC_NO_HOLDER	0xff
+
+static bool
+vbdev_lvol_resv_well_formed(const void *buf, size_t len)
+{
+	const uint8_t *p = buf;
+	uint64_t generation;
+	uint16_t num_regs;
+
+	if (!vbdev_lvol_resv_generation(buf, len, &generation) ||
+	    p[4] != VBDEV_LVOL_RESV_ENC_VERSION) {
+		return false;
+	}
+	num_regs = from_le16(p + 8);
+	return num_regs <= VBDEV_LVOL_RESV_ENC_MAX_REGS && len == 32 + (size_t)num_regs * 32 &&
+	       (p[7] == VBDEV_LVOL_RESV_ENC_NO_HOLDER || p[7] < num_regs);
+}
+
 /* Whether new is an encoded state older than the encoded state held */
 static bool
 vbdev_lvol_resv_older(const void *new, size_t new_len, const void *held, size_t held_len)
@@ -3162,7 +3196,15 @@ vbdev_lvol_resv_older(const void *new, size_t new_len, const void *held, size_t 
 	       vbdev_lvol_resv_generation(held, held_len, &hg) && ng < hg;
 }
 
-/* Read the xattr into the lvol's copy. Runs on the lvolstore's thread. */
+/*
+ * Read the xattr into the lvol's copy. Runs on the lvolstore's thread.
+ *
+ * Metadata without the xattr keeps the copy: nothing removes the xattr, so its absence
+ * is never newer than what this node holds. A follower keeps the state it fetched
+ * from the leader in the copy only (the blob it opened is never reparsed), and every
+ * metadata reread would otherwise empty it, and the node would stop enforcing the
+ * leader's reservations until the leader changed them again.
+ */
 static void
 vbdev_lvol_resv_refresh(struct spdk_lvol *lvol)
 {
@@ -3171,19 +3213,19 @@ vbdev_lvol_resv_refresh(struct spdk_lvol *lvol)
 	void *copy = NULL;
 
 	if (lvol->blob == NULL ||
-	    spdk_blob_get_xattr_value(lvol->blob, VBDEV_LVOL_RESV_XATTR, &value, &len) != 0) {
-		len = 0;
-	} else if (len > 0) {
-		copy = malloc(len);
-		if (copy == NULL) {
-			SPDK_ERRLOG("Cannot copy the reservation state of lvol %s\n", lvol->unique_id);
-			return;
-		}
-		memcpy(copy, value, len);
+	    spdk_blob_get_xattr_value(lvol->blob, VBDEV_LVOL_RESV_XATTR, &value, &len) != 0 ||
+	    len == 0) {
+		return;
 	}
+	copy = malloc(len);
+	if (copy == NULL) {
+		SPDK_ERRLOG("Cannot copy the reservation state of lvol %s\n", lvol->unique_id);
+		return;
+	}
+	memcpy(copy, value, len);
 
 	pthread_mutex_lock(&g_resv_mutex);
-	if (vbdev_lvol_resv_older(copy, copy ? len : 0, lvol->resv_cache, lvol->resv_cache_len)) {
+	if (vbdev_lvol_resv_older(copy, len, lvol->resv_cache, lvol->resv_cache_len)) {
 		/* Metadata read before the leader's latest change reached this node */
 		pthread_mutex_unlock(&g_resv_mutex);
 		free(copy);
@@ -3191,7 +3233,7 @@ vbdev_lvol_resv_refresh(struct spdk_lvol *lvol)
 	}
 	free(lvol->resv_cache);
 	lvol->resv_cache = copy;
-	lvol->resv_cache_len = copy ? len : 0;
+	lvol->resv_cache_len = len;
 	pthread_mutex_unlock(&g_resv_mutex);
 }
 
@@ -3289,6 +3331,13 @@ struct vbdev_lvol_resv_put_ctx {
 	vbdev_lvol_resv_cb	cb_fn;
 	void			*cb_arg;
 	int			rc;
+	/* The lvol's next copy, allocated before anything is committed, so a stored
+	 * state always becomes the copy the next update and every fetch read */
+	void			*cache;
+	/* The xattr before this store, restored if the store fails */
+	void			*prev;
+	size_t			prev_len;
+	bool			had_prev;
 	size_t			len;
 	uint8_t			buf[];
 };
@@ -3299,6 +3348,8 @@ vbdev_lvol_resv_put_complete(void *arg)
 	struct vbdev_lvol_resv_put_ctx *ctx = arg;
 
 	ctx->cb_fn(ctx->cb_arg, ctx->rc);
+	free(ctx->cache);
+	free(ctx->prev);
 	free(ctx);
 }
 
@@ -3356,13 +3407,67 @@ vbdev_lvol_resv_epoch_bump(struct lvol_store_bdev *lvs_bdev)
 }
 
 static void
+vbdev_lvol_resv_put_restored(void *arg, int rc)
+{
+	struct vbdev_lvol_resv_put_ctx *ctx = arg;
+
+	if (rc != 0) {
+		SPDK_ERRLOG("Restoring the reservation state of a failed store failed: %s\n",
+			    spdk_strerror(-rc));
+	}
+	vbdev_lvol_resv_put_finish(ctx, ctx->rc);
+}
+
+/*
+ * A store whose sync failed leaves its value in the blob's dirty metadata, which the
+ * next sync of the blob for any reason would persist, though the namespace rolled the
+ * change back. The previous value, or its absence, goes back and is synced, so the
+ * metadata on disk and in memory is the state the namespace holds.
+ */
+static void
+vbdev_lvol_resv_put_restore(struct vbdev_lvol_resv_put_ctx *ctx, struct spdk_lvol *lvol, int rc)
+{
+	int rrc;
+
+	ctx->rc = rc;
+	if (lvol == NULL || lvol->blob == NULL) {
+		vbdev_lvol_resv_put_finish(ctx, rc);
+		return;
+	}
+	if (ctx->had_prev) {
+		rrc = spdk_blob_set_xattr(lvol->blob, VBDEV_LVOL_RESV_XATTR, ctx->prev,
+					  (uint16_t)ctx->prev_len);
+	} else {
+		rrc = spdk_blob_remove_xattr(lvol->blob, VBDEV_LVOL_RESV_XATTR);
+	}
+	if (rrc != 0 && rrc != -ENOENT) {
+		SPDK_ERRLOG("Cannot restore the reservation state of lvol %s: %s\n", lvol->unique_id,
+			    spdk_strerror(-rrc));
+		vbdev_lvol_resv_put_finish(ctx, rc);
+		return;
+	}
+	spdk_blob_sync_md(lvol->blob, true, vbdev_lvol_resv_put_restored, ctx);
+}
+
+static void
 vbdev_lvol_resv_put_synced(void *arg, int rc)
 {
 	struct vbdev_lvol_resv_put_ctx *ctx = arg;
 	struct spdk_lvol *lvol = vbdev_lvol_resv_find(ctx->lvs, ctx->blob_id);
 
-	if (rc == 0 && lvol != NULL) {
-		vbdev_lvol_resv_refresh(lvol);
+	if (rc != 0) {
+		vbdev_lvol_resv_put_restore(ctx, lvol, rc);
+		return;
+	}
+	if (lvol != NULL) {
+		/* The stored state becomes the copy without another allocation that could
+		 * fail and leave the copy a generation behind what is committed */
+		pthread_mutex_lock(&g_resv_mutex);
+		free(lvol->resv_cache);
+		lvol->resv_cache = ctx->cache;
+		lvol->resv_cache_len = ctx->len;
+		ctx->cache = NULL;
+		pthread_mutex_unlock(&g_resv_mutex);
 		vbdev_lvol_resv_epoch_bump(vbdev_get_lvs_bdev_by_lvs(ctx->lvs));
 	}
 	vbdev_lvol_resv_put_finish(ctx, rc);
@@ -3373,6 +3478,8 @@ vbdev_lvol_resv_put_msg(void *arg)
 {
 	struct vbdev_lvol_resv_put_ctx *ctx = arg;
 	struct spdk_lvol *lvol = vbdev_lvol_resv_find(ctx->lvs, ctx->blob_id);
+	const void *prev;
+	size_t prev_len;
 	int rc;
 
 	if (lvol == NULL || lvol->blob == NULL) {
@@ -3383,6 +3490,16 @@ vbdev_lvol_resv_put_msg(void *arg)
 	if (!lvol->leader) {
 		vbdev_lvol_resv_put_finish(ctx, -EPERM);
 		return;
+	}
+	if (spdk_blob_get_xattr_value(lvol->blob, VBDEV_LVOL_RESV_XATTR, &prev, &prev_len) == 0) {
+		ctx->prev = malloc(prev_len > 0 ? prev_len : 1);
+		if (ctx->prev == NULL) {
+			vbdev_lvol_resv_put_finish(ctx, -ENOMEM);
+			return;
+		}
+		memcpy(ctx->prev, prev, prev_len);
+		ctx->prev_len = prev_len;
+		ctx->had_prev = true;
 	}
 	rc = spdk_blob_set_xattr(lvol->blob, VBDEV_LVOL_RESV_XATTR, ctx->buf, (uint16_t)ctx->len);
 	if (rc != 0) {
@@ -3416,6 +3533,13 @@ vbdev_lvol_resv_put(struct spdk_bdev *bdev, const void *buf, size_t len,
 		cb_fn(cb_arg, -ENOMEM);
 		return;
 	}
+	ctx->cache = malloc(len > 0 ? len : 1);
+	if (ctx->cache == NULL) {
+		free(ctx);
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+	memcpy(ctx->cache, buf, len);
 	ctx->lvs = lvol->lvol_store;
 	ctx->blob_id = lvol->blob_id;
 	ctx->thread = spdk_get_thread();
@@ -3462,7 +3586,8 @@ vbdev_lvol_resv_install(struct spdk_bdev *bdev, const void *buf, size_t len)
 	if (lvol->leader) {
 		return -EPERM;
 	}
-	if (!vbdev_lvol_resv_generation(buf, len, &generation)) {
+	if (!vbdev_lvol_resv_well_formed(buf, len) ||
+	    !vbdev_lvol_resv_generation(buf, len, &generation)) {
 		return -EINVAL;
 	}
 	copy = malloc(len);
@@ -3489,14 +3614,22 @@ vbdev_lvol_resv_install(struct spdk_bdev *bdev, const void *buf, size_t len)
 	return 1;
 }
 
-/* Copy between a passthrough command's data and a buffer */
+/* Copy between a passthrough command's data and a buffer. Only NVME_IOV_MD carries
+ * its data in iovs; NVME_IO carries it in buf, and a recycled bdev_io keeps the iovs
+ * and iovcnt of whatever used it before, so the type decides, not iovcnt. */
+static bool
+vbdev_lvol_hub_io_has_iovs(struct spdk_bdev_io *bdev_io)
+{
+	return bdev_io->type == SPDK_BDEV_IO_TYPE_NVME_IOV_MD;
+}
+
 static size_t
 vbdev_lvol_hub_io_len(struct spdk_bdev_io *bdev_io)
 {
 	size_t len = 0;
 	int i;
 
-	if (bdev_io->u.nvme_passthru.iovcnt > 0) {
+	if (vbdev_lvol_hub_io_has_iovs(bdev_io)) {
 		for (i = 0; i < bdev_io->u.nvme_passthru.iovcnt; i++) {
 			len += bdev_io->u.nvme_passthru.iovs[i].iov_len;
 		}
@@ -3510,7 +3643,7 @@ vbdev_lvol_hub_io_copy(struct spdk_bdev_io *bdev_io, void *buf, size_t len, bool
 {
 	struct spdk_iov_xfer ix;
 
-	if (bdev_io->u.nvme_passthru.iovcnt > 0) {
+	if (vbdev_lvol_hub_io_has_iovs(bdev_io)) {
 		spdk_iov_xfer_init(&ix, bdev_io->u.nvme_passthru.iovs, bdev_io->u.nvme_passthru.iovcnt);
 		if (to_io) {
 			spdk_iov_xfer_from_buf(&ix, buf, len);
@@ -3972,7 +4105,10 @@ vbdev_lvol_resv_fetch_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_
 	if (f->fwd != NULL) {
 		vbdev_lvol_resv_forward_fetched(f->fwd, lvs_bdev, lvol, installed);
 	} else {
-		if (!ok) {
+		/* A state that arrived but could not be installed fails the round like a
+		 * fetch that failed: otherwise the epoch is taken as seen and the state is
+		 * never asked for again while the leader's epoch stays the same. */
+		if (!ok || (!installed && lvol != NULL && lvol->bdev != NULL)) {
 			hub->fetch_failed = true;
 		}
 		assert(hub->fetch_pending > 0);
@@ -4279,6 +4415,7 @@ vbdev_lvs_fini_start_iter(struct lvol_store_bdev *lvs_bdev)
 		lvs = lvs_bdev->lvs;
 
 		if (_vbdev_lvs_are_lvols_closed(lvs)) {
+			vbdev_lvol_resv_hub_detach(lvs_bdev);
 			spdk_lvs_unload(lvs, vbdev_lvs_fini_start_unload_cb, lvs_bdev);
 			return;
 		}

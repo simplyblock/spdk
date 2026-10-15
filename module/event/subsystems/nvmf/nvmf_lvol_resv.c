@@ -183,6 +183,12 @@ nvmf_lvol_resv_forwarded(void *cb_arg, int rc, uint8_t sct, uint8_t sc)
 		/* The state the leader holds now, which the forward installed */
 		ctx->cb_fn(ctx->cb_arg, &status, &info);
 	} else {
+		/* The leader executed the command, but this node cannot apply the state it
+		 * left: answering with the leader's status would report a reservation this
+		 * node does not enforce. The host retries, and the retry finds the state. */
+		SPDK_ERRLOG("The reservation state a forwarded command left cannot be read\n");
+		status.sct = SPDK_NVME_SCT_GENERIC;
+		status.sc = SPDK_NVME_SC_NAMESPACE_NOT_READY;
 		ctx->cb_fn(ctx->cb_arg, &status, NULL);
 	}
 	free(ctx);
