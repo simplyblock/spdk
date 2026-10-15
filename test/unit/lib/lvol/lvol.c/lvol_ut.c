@@ -38,9 +38,6 @@ blob_check_io_inflaight(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, voi
 
 
 DEFINE_STUB(spdk_bdev_get_name, const char *, (const struct spdk_bdev *bdev), NULL);
-/* Reached through spdk_set_leader_all() in lvs_refresh_notification */
-DEFINE_STUB_V(spdk_bs_set_leader, (struct spdk_blob_store *bs, bool state));
-DEFINE_STUB(node_role_to_string, const char *, (node_role_t role), "role");
 DEFINE_STUB(spdk_bdev_get_by_name, struct spdk_bdev *, (const char *name), NULL);
 DEFINE_STUB(spdk_blob_get_freeze_cnt, int, (struct spdk_blob *blob), 0);
 DEFINE_STUB(spdk_bdev_create_bs_dev_ro, int,
