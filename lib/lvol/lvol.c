@@ -4301,6 +4301,7 @@ spdk_lvs_ha_release(uint64_t groupid, spdk_lvs_ha_cb cb_fn, void *cb_arg)
 {
 	struct spdk_lvol_store *lvs;
 	struct spdk_blob_store *bs;
+	bool redirect_stopped = false;
 	int rc;
 
 	pthread_mutex_lock(&g_lvol_stores_mutex);
@@ -4312,10 +4313,22 @@ spdk_lvs_ha_release(uint64_t groupid, spdk_lvs_ha_cb cb_fn, void *cb_arg)
 	lvs->ha_held = false;
 	bs = lvs->blobstore;
 	spdk_bs_ha_set_hold(bs, false);
+	/* Campaign c8, F19: a grant means the peer is lost. A non-leader of this LVS stops
+	 * redirecting client IO over the hublvol to that peer right away (skip_redirecting, as
+	 * the hublvol failure path does; drain_in_action is not needed, review on #81), so the
+	 * next IO takes the existing IO-triggered takeover instead of waiting for the hublvol
+	 * controller's keep-alive to expire. Only reachable through the HA arbitration
+	 * (jc_grant_solo). */
+	if (lvs->node_role != NODE_PRIMARY && !lvs->leader &&
+	    !lvs->skip_redirecting && !lvs->hub_dev.drain_in_action) {
+		lvs->skip_redirecting = true;
+		redirect_stopped = true;
+	}
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
 
 	rc = spdk_bs_ha_sync_send_msg(bs, cb_fn ? cb_fn : lvs_ha_noop_cb, cb_arg);
-	SPDK_NOTICELOG("HA release (grant) on lvs groupid %" PRIu64 " rc=%d\n", groupid, rc);
+	SPDK_NOTICELOG("HA release (grant) on lvs groupid %" PRIu64 " rc=%d%s\n", groupid, rc,
+		       redirect_stopped ? ", hublvol redirect to the lost peer stopped" : "");
 	return rc;
 }
 

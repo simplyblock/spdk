@@ -4215,6 +4215,46 @@ lvol_ha_release_grant(void)
 	CU_ASSERT(g_ha_port_block_cnt == 0);
 	/* NULL callback is allowed. */
 	CU_ASSERT(spdk_lvs_ha_release(13, NULL, NULL) == 0);
+	/* A leader never redirected; its hublvol state is left alone (F19). */
+	CU_ASSERT(lvs->skip_redirecting == false);
+	CU_ASSERT(lvs->hub_dev.drain_in_action == false);
+	ha_free_lvs(lvs);
+}
+
+/* Campaign c8, F19: a grant on a non-leader secondary stops the hublvol redirect to the
+ * lost peer at once (the hublvol failure path's state), so the next IO takes over instead
+ * of waiting for the hublvol controller's keep-alive. */
+static void
+lvol_ha_release_stops_redirect_on_secondary(void)
+{
+	struct spdk_lvol_store *lvs = ha_alloc_lvs(30, false, NODE_SECONDARY);
+
+	lvs->hub_dev.state = HUBLVOL_CONNECTED;
+	CU_ASSERT(spdk_lvs_ha_release(30, NULL, NULL) == 0);
+	CU_ASSERT(lvs->skip_redirecting == true);
+	/* Review on #81: drain_in_action is not set by the grant. */
+	CU_ASSERT(lvs->hub_dev.drain_in_action == false);
+	/* No port touched, no takeover latch: the survivor is granted, not fenced. */
+	CU_ASSERT(g_ha_port_block_cnt == 0);
+	CU_ASSERT(lvs->ha_takeover_blocked == false);
+	/* Idempotent: a second grant changes nothing. */
+	CU_ASSERT(spdk_lvs_ha_release(30, NULL, NULL) == 0);
+	CU_ASSERT(lvs->skip_redirecting == true);
+	CU_ASSERT(lvs->hub_dev.drain_in_action == false);
+	ha_free_lvs(lvs);
+
+	/* A primary that is not (yet) leader keeps its state: primaries never redirect. */
+	lvs = ha_alloc_lvs(31, false, NODE_PRIMARY);
+	CU_ASSERT(spdk_lvs_ha_release(31, NULL, NULL) == 0);
+	CU_ASSERT(lvs->skip_redirecting == false);
+	CU_ASSERT(lvs->hub_dev.drain_in_action == false);
+	ha_free_lvs(lvs);
+
+	/* A failover already in progress (drain_in_action) is not touched. */
+	lvs = ha_alloc_lvs(32, false, NODE_SECONDARY);
+	lvs->hub_dev.drain_in_action = true;
+	CU_ASSERT(spdk_lvs_ha_release(32, NULL, NULL) == 0);
+	CU_ASSERT(lvs->skip_redirecting == false);
 	ha_free_lvs(lvs);
 }
 
@@ -4661,6 +4701,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, lvol_ha_unknown_groupid);
 	CU_ADD_TEST(suite, lvol_ha_hold_leader_once);
 	CU_ADD_TEST(suite, lvol_ha_release_grant);
+	CU_ADD_TEST(suite, lvol_ha_release_stops_redirect_on_secondary);
 	CU_ADD_TEST(suite, lvol_ha_fence);
 	CU_ADD_TEST(suite, lvol_ha_unfence);
 	CU_ADD_TEST(suite, lvol_ha_refence_then_unfence);
