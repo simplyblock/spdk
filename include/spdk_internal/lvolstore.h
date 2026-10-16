@@ -215,10 +215,42 @@ struct spdk_lvs_poll_group {
 };
 
 
-struct spdk_lvs_xfer_frag {
-	struct spdk_lvs_xfer_req *req;
-	uint32_t idx;
+
+/*
+ * Transfer command: a special write of SPDK_LVOL_XFER_CMD_BLOCKS blocks at
+ * offset 0 of the destination lvol, sent through the transfer hub (migration
+ * and replication).
+ *
+ * The destination takes such a write as a command only when magic, name,
+ * version, type and count are all valid; anything else is written as normal
+ * data. One command fills exactly SPDK_LVOL_XFER_CMD_SIZE bytes.
+ */
+#define SPDK_LVOL_XFER_CMD_MAGIC	0x444D43584C4F564CULL	/* "LVOLXCMD" */
+#define SPDK_LVOL_XFER_CMD_NAME		"xfer_cmd:alloc_clusters"
+#define SPDK_LVOL_XFER_CMD_VERSION	1
+#define SPDK_LVOL_XFER_CMD_BLOCK_SIZE	4096
+#define SPDK_LVOL_XFER_CMD_BLOCKS	8
+#define SPDK_LVOL_XFER_CMD_SIZE		(SPDK_LVOL_XFER_CMD_BLOCKS * SPDK_LVOL_XFER_CMD_BLOCK_SIZE)
+
+enum spdk_lvol_xfer_cmd_type {
+	/* Allocate the listed cluster indexes on the destination blob. */
+	SPDK_LVOL_XFER_CMD_ALLOC_CLUSTERS = 1,
 };
+
+struct spdk_lvol_xfer_cmd_hdr {
+	uint64_t	magic;		/* SPDK_LVOL_XFER_CMD_MAGIC */
+	char		name[32];	/* SPDK_LVOL_XFER_CMD_NAME, NUL padded */
+	uint16_t	version;	/* SPDK_LVOL_XFER_CMD_VERSION */
+	uint16_t	type;		/* enum spdk_lvol_xfer_cmd_type */
+	uint32_t	count;		/* entries that follow the header */
+	uint32_t	reserved[4];
+	uint32_t	entries[];	/* cluster indexes */
+};
+SPDK_STATIC_ASSERT(sizeof(struct spdk_lvol_xfer_cmd_hdr) == 64, "Incorrect size");
+
+/* (32 KiB - 64) / 4 = 8176 clusters per command */
+#define SPDK_LVOL_XFER_CMD_MAX_ENTRIES \
+	((SPDK_LVOL_XFER_CMD_SIZE - sizeof(struct spdk_lvol_xfer_cmd_hdr)) / sizeof(uint32_t))
 
 struct spdk_lvs_xfer_req {
 	enum xfer_req_status status;
@@ -229,14 +261,6 @@ struct spdk_lvs_xfer_req {
 	uint64_t len;
 	void *payload;
 	int fragments_outstanding;
-	/* read->write PIPELINED path (replicate, non-special): each 64 KiB
-	 * fragment's hub write is issued the moment ITS read completes instead
-	 * of after ALL reads -- the request's read and write phases overlap.
-	 * frag_ctx is a per-request array (one slot per possible fragment)
-	 * allocated with the request pool. */
-	int reads_outstanding;
-	int writes_outstanding;
-	struct spdk_lvs_xfer_frag *frag_ctx;
 	int aggregated_status;
 	struct remote_lvol_info *rmt_lvol;
 	struct spdk_lvs_xfer *xfer;
@@ -272,10 +296,7 @@ struct spdk_lvs_xfer {
 	 * dispatcher pauses refilling every non-priority transfer window. */
 	bool priority;
 	bool priority_counted;
-	/* Special (geometry/spatial) IO cannot be split below the blob cluster:
-	 * the write side sends ONE cluster-sized IO per request instead of
-	 * 64 KiB fragments, and the dirty-bitmap partial path is refused. */
-	bool special_io;
+
 	TAILQ_ENTRY(spdk_lvs_xfer)	entry;
 
 	uint64_t page_size;
@@ -311,6 +332,11 @@ struct spdk_lvs_xfer {
 	uint32_t idx;
 	bool persist_swap;
 	uint32_t timeout_cnt;
+
+	/* XFER_STATE_ALLOC_CLUSTERS: next clusters[] index to put in a command,
+	 * and the number of commands sent. */
+	uint32_t alloc_next;
+	uint32_t alloc_cmds;
 };
 
 struct spdk_lvol_store {

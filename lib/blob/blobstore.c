@@ -4034,15 +4034,10 @@ blob_write_copy_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
  * new cluster relies on the same thing.
  */
 #define BLOB_COW_SCAN_UNIT	SPDK_BS_PAGE_SIZE	/* zero check granularity */
-#define BLOB_COW_MAX_WRITES	128		/* more ranges than this: write the whole cluster */
-
-struct blob_cow_range {
-	uint64_t	start;	/* byte offset in the cluster */
-	uint64_t	end;	/* byte offset after the range */
-};
+#define BLOB_COW_MAX_WRITES	64		/* more ranges than this: write the whole cluster */
 
 static bool
-blob_cow_unit_is_zero(const void *buf, size_t len)
+bs_data_unit_is_zero(const void *buf, size_t len)
 {
 	const uint64_t *w = buf;
 	uint64_t acc = 0;
@@ -4056,32 +4051,38 @@ blob_cow_unit_is_zero(const void *buf, size_t len)
 }
 
 /*
- * Find the ranges of the cluster buffer that hold data. A range is a run of
- * neighbouring blocks with data; any zero block ends it, and the next data
- * block starts a new range. Returns the number of ranges, or -1 when there are
- * more than BLOB_COW_MAX_WRITES (then the caller writes the whole cluster in
- * one IO).
+ * Find the ranges of a buffer that hold data. A range is a run of neighbouring
+ * units with data; any zero unit ends it, and the next data unit starts a new
+ * range. Returns the number of ranges, or -1 when there are more than
+ * max_ranges (then the caller sends the whole buffer). Used by CoW and by
+ * snapshot replication.
  */
-static int
-blob_cow_find_ranges(const uint8_t *buf, uint64_t cluster_sz, struct blob_cow_range *ranges)
+int
+spdk_bs_find_data_ranges(const void *buf, uint64_t len, uint32_t unit_size,
+			 uint64_t max_range_len, struct spdk_bs_data_range *ranges, int max_ranges)
 {
+	const uint8_t *p = buf;
 	uint64_t off;
 	int nranges = 0;
 
-	for (off = 0; off < cluster_sz; off += BLOB_COW_SCAN_UNIT) {
-		if (blob_cow_unit_is_zero(buf + off, BLOB_COW_SCAN_UNIT)) {
+	assert(unit_size != 0 && unit_size % sizeof(uint64_t) == 0);
+	assert(len % unit_size == 0);
+
+	for (off = 0; off < len; off += unit_size) {
+		if (bs_data_unit_is_zero(p + off, unit_size)) {
 			continue;
 		}
-		if (nranges > 0 && ranges[nranges - 1].end == off) {
-			/* Right after the previous range: extend it. */
-			ranges[nranges - 1].end = off + BLOB_COW_SCAN_UNIT;
+		if (nranges > 0 && ranges[nranges - 1].end == off &&
+		    (max_range_len == 0 || off - ranges[nranges - 1].start < max_range_len)) {
+			/* Right after the previous range, and it is not full: extend it. */
+			ranges[nranges - 1].end = off + unit_size;
 			continue;
 		}
-		if (nranges == BLOB_COW_MAX_WRITES) {
+		if (nranges == max_ranges) {
 			return -1;
 		}
 		ranges[nranges].start = off;
-		ranges[nranges].end = off + BLOB_COW_SCAN_UNIT;
+		ranges[nranges].end = off + unit_size;
 		nranges++;
 	}
 
@@ -4093,7 +4094,7 @@ blob_write_copy(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
 	struct spdk_blob_copy_cluster_ctx *ctx = cb_arg;
 	struct spdk_blob_store *bs = ctx->blob->bs;
-	struct blob_cow_range ranges[BLOB_COW_MAX_WRITES];
+	struct spdk_bs_data_range ranges[BLOB_COW_MAX_WRITES];
 	spdk_bs_batch_t *batch;
 	uint64_t cluster_lba;
 	int nranges, i;
@@ -4108,7 +4109,8 @@ blob_write_copy(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 
 	cluster_lba = bs_cluster_to_lba(bs, ctx->new_cluster);
 
-	nranges = blob_cow_find_ranges(ctx->buf, bs->cluster_sz, ranges);
+	nranges = spdk_bs_find_data_ranges(ctx->buf, bs->cluster_sz, BLOB_COW_SCAN_UNIT, 0,
+					   ranges, BLOB_COW_MAX_WRITES);
 	if (nranges < 0) {
 		/* Data is spread over the cluster: write whole cluster */
 		bs_sequence_write_dev(seq, ctx->buf, cluster_lba, bs_cluster_to_lba(bs, 1),
@@ -14301,6 +14303,446 @@ blob_insert_cluster_on_md_thread(struct spdk_blob *blob, uint32_t cluster_num,
 	spdk_thread_send_msg(blob->bs->md_thread, blob_insert_cluster_msg, ctx);
 }
 
+/* START spdk_blob_alloc_clusters */
+
+/* The transfer source cuts alloc commands at extent page boundaries with
+ * SPDK_BLOB_CLUSTERS_PER_EXTENT_PAGE. SPDK_EXTENTS_PER_EP is the largest power
+ * of two <= SPDK_EXTENTS_PER_EP_MAX (not a constant expression), so check that
+ * MAX lies in [X, 2X): then SPDK_EXTENTS_PER_EP == X. */
+SPDK_STATIC_ASSERT(SPDK_EXTENTS_PER_EP_MAX >= SPDK_BLOB_CLUSTERS_PER_EXTENT_PAGE &&
+		   SPDK_EXTENTS_PER_EP_MAX < 2 * SPDK_BLOB_CLUSTERS_PER_EXTENT_PAGE,
+		   "SPDK_BLOB_CLUSTERS_PER_EXTENT_PAGE must match SPDK_EXTENTS_PER_EP");
+
+/*
+ * Allocate a list of clusters the way a thick blob does on create/resize:
+ *  1. one pass under used_lock claims every cluster from the pool and puts it
+ *     in the cluster map (and claims a new extent page where one is needed);
+ *  2. the touched extent pages are written in parallel, in batches of
+ *     BLOB_ALLOC_CLUSTERS_EP_BATCH pages, one batch after the other;
+ *  3. the md is synced when the extent table changed (a new extent page was
+ *     claimed).
+ *
+ * All or nothing in memory: on any error the clusters and new extent pages of
+ * this call go back to the pools. Nothing is rewritten on disk: what reached
+ * the disk is consistent (an extent page lists its clusters; the extent table
+ * points to it or not), and an IO error ends in a failover, where the new
+ * leader rebuilds the used maps from the md. For that, no error may happen
+ * after the first write other than an IO error: everything is allocated
+ * before the claim.
+ *
+ * An IO-path insert into the same extent page must not write that page while
+ * ours is in flight (the older write could land last). Our pages are entered
+ * in blob->ep_inserts while the batch runs, like an IO-path batch in flight,
+ * so IO-path inserts queue behind them and run right after.
+ * Nothing waits: a blob that is frozen, or has an IO-path write of one of our
+ * pages already in flight when we start, fails with -EBUSY.
+ */
+/* Extent pages per write batch (md journal batch capacity). */
+#define BLOB_ALLOC_CLUSTERS_EP_BATCH	1024
+
+struct blob_alloc_clusters_ctx {
+	struct spdk_blob		*blob;
+	const uint32_t			*clusters;
+	uint32_t			count;
+	uint32_t			allocated;
+	uint32_t			skipped;
+	bool				new_extent_page;
+
+	/* Cluster indexes claimed by this call (allocated entries), for rollback. */
+	uint32_t			*claimed;
+
+	/* Touched extent pages (extent table index), all written by us. */
+	uint32_t			*eps;
+	bool				*ep_new;	/* page created by this call */
+	uint32_t			num_eps;
+	/* One entry per touched ep, one allocation. Ours to free: we remove them
+	 * from blob->ep_inserts ourselves, the IO path never frees them. */
+	struct blob_ep_insert		*ep_inserts;
+	uint32_t			ep_inserted;	/* entries in blob->ep_inserts */
+	uint32_t			ep_next;	/* next ep to write */
+	struct spdk_blob_md_page	*pages;		/* one write batch of pages */
+
+	spdk_blob_op_complete		cb_fn;
+	void				*cb_arg;
+};
+
+/*
+ * Undo this call in memory: take its clusters out of the map and give them,
+ * and the extent pages it created, back to the pools.
+ */
+static void
+blob_alloc_clusters_rollback(struct blob_alloc_clusters_ctx *ctx)
+{
+	struct spdk_blob *blob = ctx->blob;
+	struct spdk_blob_store *bs = blob->bs;
+	uint32_t *extent_page;
+	uint32_t i, idx, released_eps = 0;
+	uint64_t lba;
+
+	spdk_spin_lock(&bs->used_lock);
+	for (i = 0; i < ctx->allocated; i++) {
+		idx = ctx->claimed[i];
+		lba = blob->active.clusters[idx];
+		assert(lba != 0);
+		blob->active.clusters[idx] = 0;
+		blob->active.num_allocated_clusters--;
+		bs_release_cluster(bs, bs_lba_to_cluster(bs, lba));
+	}
+
+	for (i = 0; i < ctx->num_eps; i++) {
+		extent_page = &blob->active.extent_pages[ctx->eps[i]];
+		if (ctx->ep_new[i] && *extent_page != 0) {
+			bs_release_md_page(bs, *extent_page);
+			*extent_page = 0;
+			released_eps++;
+		}
+	}
+	spdk_spin_unlock(&bs->used_lock);
+
+	SPDK_NOTICELOG("blob 0x%" PRIx64 ": alloc clusters rolled back: %u cluster(s) and %u new "
+		       "extent page(s) released\n", blob->id, ctx->allocated, released_eps);
+}
+
+static void
+blob_alloc_clusters_finish(void *arg, int rc)
+{
+	struct blob_alloc_clusters_ctx *ctx = arg;
+
+	SPDK_DEBUGLOG(blob, "blob 0x%" PRIx64 ": alloc clusters: requested=%u allocated=%u "
+		      "already_allocated=%u extent_pages=%u new_extent_page=%d rc=%d\n",
+		      ctx->blob->id, ctx->count, ctx->allocated, ctx->skipped, ctx->num_eps,
+		      ctx->new_extent_page, rc);
+
+	/* New extent pages exist only if a cluster was claimed. */
+	if (rc != 0 && ctx->allocated > 0) {
+		blob_alloc_clusters_rollback(ctx);
+	}
+
+	spdk_free(ctx->pages);
+	/* Entries still in the tree were removed in eps_written. */
+	assert(ctx->ep_inserted == 0);
+	free(ctx->ep_inserts);
+	free(ctx->ep_new);
+	free(ctx->eps);
+	free(ctx->claimed);
+	ctx->cb_fn(ctx->cb_arg, rc);
+	free(ctx);
+}
+
+
+/* All extent page writes are done (cpl of the sequence). */
+static void
+blob_alloc_clusters_eps_written(void *cb_arg, int bserrno)
+{
+	struct blob_alloc_clusters_ctx *ctx = cb_arg;
+	struct spdk_blob *blob = ctx->blob;
+	uint32_t i;
+
+	/* Entries are freed in finish. */
+	for (i = 0; i < ctx->ep_inserted; i++) {
+		RB_REMOVE(blob_ep_insert_tree, &blob->ep_inserts, &ctx->ep_inserts[i]);
+	}
+	ctx->ep_inserted = 0;
+
+	if (bserrno != 0) {
+		blob_alloc_clusters_finish(ctx, bserrno);
+		return;
+	}
+
+	if (ctx->new_extent_page) {
+		/* The extent table now points to new extent pages. */
+		blob->state = SPDK_BLOB_STATE_DIRTY;
+		blob_sync_md(blob, false, blob_alloc_clusters_finish, ctx);
+		return;
+	}
+
+	blob_alloc_clusters_finish(ctx, 0);
+}
+
+/*
+ * Write the touched extent pages in batches of at most
+ * BLOB_ALLOC_CLUSTERS_EP_BATCH pages, one batch after the other on the same
+ * sequence (this is also the batch cpl). A sparse command touches up to one
+ * extent page per cluster; one batch that size would take most of the md
+ * journal ring. ctx->pages holds one batch and is reused: the previous batch
+ * is complete when the next one is built.
+ */
+static void
+blob_alloc_clusters_write_eps(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct blob_alloc_clusters_ctx *ctx = cb_arg;
+	struct spdk_blob *blob = ctx->blob;
+	struct spdk_blob_store *bs = blob->bs;
+	struct md_journal_batch *jr_batch = NULL;
+	spdk_bs_batch_t *batch = NULL;
+	struct spdk_blob_md_page *page;
+	uint64_t lba, lba_count = bs_byte_to_lba(bs, SPDK_BS_PAGE_SIZE);
+	uint32_t i, n, ep_index;
+
+	if (bserrno != 0 || ctx->ep_next == ctx->num_eps) {
+		bs_sequence_finish(seq, bserrno);
+		return;
+	}
+
+	n = spdk_min(ctx->num_eps - ctx->ep_next, BLOB_ALLOC_CLUSTERS_EP_BATCH);
+
+	if (bs->md_journal) {
+		jr_batch = bs_md_journal_sequence_to_batch(bs->md_journal, seq, n,
+				blob_alloc_clusters_write_eps, ctx);
+		if (jr_batch == NULL) {
+			/* Not an IO error: if an earlier batch was written, its pages
+			 * list clusters the rollback gives back without a failover.
+			 * Only -ENOMEM gets here while the journal is usable. */
+			SPDK_ERRLOG("blob 0x%" PRIx64 ": alloc clusters: cannot create md journal batch "
+				    "(%u of %u extent pages written)\n", blob->id, ctx->ep_next,
+				    ctx->num_eps);
+			bs_sequence_finish(seq, -ENOMEM);
+			return;
+		}
+	} else {
+		batch = bs_sequence_to_batch(seq, 0, blob_alloc_clusters_write_eps, ctx);
+	}
+
+	for (i = 0; i < n; i++) {
+		ep_index = ctx->eps[ctx->ep_next + i];
+
+		/* Same page layout as blob_write_extent_page(). */
+		page = &ctx->pages[i];
+		memset(page, 0, SPDK_BS_PAGE_SIZE);
+		page->next = SPDK_INVALID_MD_PAGE;
+		page->id = blob->id;
+		page->sequence_num = 0;
+		blob_serialize_extent_page(blob, (uint64_t)ep_index * SPDK_EXTENTS_PER_EP, page);
+		page->crc = blob_md_page_calc_crc(page);
+
+		lba = bs_md_page_to_lba(bs, blob->active.extent_pages[ep_index]);
+		bs->w_io++;
+		if (jr_batch != NULL) {
+			bs_md_journal_batch_write(jr_batch, page, lba, lba_count, MD_JOURNAL_WRITE);
+		} else {
+			bs_batch_write_dev(batch, page, lba, lba_count);
+		}
+	}
+	ctx->ep_next += n;
+
+	if (jr_batch != NULL) {
+		bs_md_journal_batch_close(jr_batch);
+	} else {
+		bs_batch_close(batch);
+	}
+}
+
+static void
+blob_alloc_clusters_persist(struct blob_alloc_clusters_ctx *ctx)
+{
+	struct spdk_blob *blob = ctx->blob;
+	spdk_bs_sequence_t *seq;
+	struct spdk_bs_cpl cpl;
+	uint32_t i;
+
+	cpl.type = SPDK_BS_CPL_TYPE_BLOB_BASIC;
+	cpl.u.blob_basic.cb_fn = blob_alloc_clusters_eps_written;
+	cpl.u.blob_basic.cb_arg = ctx;
+
+	seq = bs_sequence_start_bs(blob->bs->md_channel, &cpl);
+	if (seq == NULL) {
+		blob_alloc_clusters_finish(ctx, -ENOMEM);
+		return;
+	}
+
+	/* All our pages stay in ep_inserts until the last batch is done.
+	 * ctx->eps is unique and none of its pages was in ep_inserts at the start
+	 * (checked in spdk_blob_alloc_clusters), so every RB_INSERT inserts. */
+	for (i = 0; i < ctx->num_eps; i++) {
+		RB_INSERT(blob_ep_insert_tree, &blob->ep_inserts, &ctx->ep_inserts[i]);
+	}
+	ctx->ep_inserted = ctx->num_eps;
+
+	blob_alloc_clusters_write_eps(seq, ctx, 0);
+}
+
+/* Add the extent page of cluster idx to the touched list once. */
+static void
+blob_alloc_clusters_add_ep(struct blob_alloc_clusters_ctx *ctx, uint32_t idx)
+{
+	uint32_t ep_index = bs_cluster_to_extent_table_id(idx);
+	uint32_t j;
+
+	/* The source sends indexes in ascending order: a page above the last one
+	 * is new. A sparse command touches thousands of pages, so only out of
+	 * order input falls back to the full scan. */
+	if (ctx->num_eps == 0 || ctx->eps[ctx->num_eps - 1] < ep_index) {
+		ctx->eps[ctx->num_eps++] = ep_index;
+		return;
+	}
+	if (ctx->eps[ctx->num_eps - 1] == ep_index) {
+		return;
+	}
+	for (j = 0; j < ctx->num_eps; j++) {
+		if (ctx->eps[j] == ep_index) {
+			return;
+		}
+	}
+	ctx->eps[ctx->num_eps++] = ep_index;
+}
+
+void
+spdk_blob_alloc_clusters(struct spdk_blob *blob, const uint32_t *clusters, uint32_t count,
+			 spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	struct blob_alloc_clusters_ctx *ctx;
+	struct blob_ep_insert find = {};
+	uint32_t lfmd = 0;
+	uint32_t i, idx;
+	uint64_t cluster;
+	bool had_ep;
+	int rc = 0;
+
+	assert(spdk_get_thread() == blob->bs->md_thread);
+
+	if (count == 0) {
+		cb_fn(cb_arg, 0);
+		return;
+	}
+
+	if (blob->data_ro || blob->md_ro) {
+		SPDK_ERRLOG("blob 0x%" PRIx64 ": cannot allocate clusters on a read-only blob\n",
+			    blob->id);
+		cb_fn(cb_arg, -EPERM);
+		return;
+	}
+
+	if (blob->frozen_refcnt) {
+		/* A snapshot or clone operation owns the cluster map right now. */
+		SPDK_ERRLOG("blob 0x%" PRIx64 ": frozen, cannot allocate clusters\n", blob->id);
+		cb_fn(cb_arg, -EBUSY);
+		return;
+	}
+
+	for (i = 0; i < count; i++) {
+		if (clusters[i] >= blob->active.num_clusters) {
+			SPDK_ERRLOG("blob 0x%" PRIx64 ": cluster index %u out of range (%" PRIu64 " clusters)\n",
+				    blob->id, clusters[i], blob->active.num_clusters);
+			cb_fn(cb_arg, -EINVAL);
+			return;
+		}
+	}
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL) {
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+	ctx->blob = blob;
+	ctx->clusters = clusters;
+	ctx->count = count;
+	ctx->cb_fn = cb_fn;
+	ctx->cb_arg = cb_arg;
+
+	ctx->claimed = calloc(count, sizeof(*ctx->claimed));
+	if (ctx->claimed == NULL) {
+		blob_alloc_clusters_finish(ctx, -ENOMEM);
+		return;
+	}
+
+	if (blob->use_extent_table) {
+		/* Collect the extent pages the new clusters go into */
+		ctx->eps = calloc(count, sizeof(*ctx->eps));
+		ctx->ep_new = calloc(count, sizeof(*ctx->ep_new));
+		if (ctx->eps == NULL || ctx->ep_new == NULL) {
+			blob_alloc_clusters_finish(ctx, -ENOMEM);
+			return;
+		}
+
+		for (i = 0; i < count; i++) {
+			if (blob->active.clusters[clusters[i]] != 0) {
+				continue;
+			}
+			blob_alloc_clusters_add_ep(ctx, clusters[i]);
+		}
+		/* Pages that do not exist yet are created by this call (rollback). */
+		for (i = 0; i < ctx->num_eps; i++) {
+			ctx->ep_new[i] = blob->active.extent_pages[ctx->eps[i]] == 0;
+		}
+
+		/* No client IO reaches this lvol during the transfer, but the alloc
+		 * commands run in parallel: the source cuts them at extent page
+		 * boundaries so two commands never share a page. Should that ever
+		 * be broken, fail here: a second RB_INSERT of the same page would
+		 * not insert (and its RB_REMOVE corrupt the tree), and two writes of
+		 * one page in flight could land in the wrong order. */
+		for (i = 0; i < ctx->num_eps; i++) {
+			find.ep_index = ctx->eps[i];
+			if (RB_FIND(blob_ep_insert_tree, &blob->ep_inserts, &find) != NULL) {
+				SPDK_ERRLOG("blob 0x%" PRIx64 ": extent page %u has a write in flight, "
+					    "cannot allocate clusters now\n", blob->id, find.ep_index);
+				blob_alloc_clusters_finish(ctx, -EBUSY);
+				return;
+			}
+		}
+
+		if (ctx->num_eps > 0) {
+			ctx->ep_inserts = calloc(ctx->num_eps, sizeof(*ctx->ep_inserts));
+			/* Written by the device: DMA (huge page) memory, one write
+			 * batch of pages (a sparse command touches thousands). */
+			ctx->pages = spdk_zmalloc(spdk_min(ctx->num_eps, BLOB_ALLOC_CLUSTERS_EP_BATCH) *
+						  SPDK_BS_PAGE_SIZE, SPDK_BS_PAGE_SIZE,
+						  NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+			if (ctx->ep_inserts == NULL || ctx->pages == NULL) {
+				blob_alloc_clusters_finish(ctx, -ENOMEM);
+				return;
+			}
+			for (i = 0; i < ctx->num_eps; i++) {
+				ctx->ep_inserts[i].ep_index = ctx->eps[i];
+				ctx->ep_inserts[i].blob = blob;
+				TAILQ_INIT(&ctx->ep_inserts[i].waiting);
+				TAILQ_INIT(&ctx->ep_inserts[i].batch);
+			}
+		}
+	}
+
+	/* 1. Claim and insert every cluster in one pass. */
+	spdk_spin_lock(&blob->bs->used_lock);
+	for (i = 0; i < count; i++) {
+		idx = clusters[i];
+		if (blob->active.clusters[idx] != 0) {
+			ctx->skipped++;
+			continue;
+		}
+
+		had_ep = *bs_cluster_to_extent_page(blob, idx) != 0;
+		/* lfmd is not advanced: a claimed md page is no longer clear, so the
+		 * next search skips it (same as blob_resize). */
+		rc = bs_allocate_cluster(blob, idx, &cluster, &lfmd, true);
+		if (rc != 0) {
+			SPDK_ERRLOG("blob 0x%" PRIx64 ": no free cluster for index %u: %d\n",
+				    blob->id, idx, rc);
+			break;
+		}
+		ctx->claimed[ctx->allocated++] = idx;
+		if (!had_ep) {
+			ctx->new_extent_page = true;
+		}
+	}
+	spdk_spin_unlock(&blob->bs->used_lock);
+
+	if (rc != 0) {
+		blob_alloc_clusters_finish(ctx, rc);
+		return;
+	}
+
+	if (ctx->allocated == 0) {
+		/* Nothing new: all were allocated already. */
+		blob_alloc_clusters_finish(ctx, 0);
+		return;
+	}
+
+	/* 2./3. Write the extent pages, then sync the md if needed. */
+	blob_alloc_clusters_persist(ctx);
+}
+
+/* END spdk_blob_alloc_clusters */
+
 static void
 blob_free_cluster_msg(void *arg)
 {
@@ -16939,7 +17381,7 @@ spdk_read_cluster_data_xfer(struct spdk_blob *blob, void *buf, uint64_t offset, 
 }
 
 void
-prepare_s3_clusters(struct spdk_blob* blob, uint64_t *clusters, uint32_t num_clusters, int *count)
+spdk_blob_scan_used_clusters(struct spdk_blob* blob, uint64_t *clusters, uint32_t num_clusters, int *count)
 {
 	uint64_t i;
 	int fill_cluster_count = 0;

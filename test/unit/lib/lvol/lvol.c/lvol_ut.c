@@ -40,6 +40,40 @@ blob_check_io_inflaight(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, voi
 DEFINE_STUB(spdk_bdev_get_name, const char *, (const struct spdk_bdev *bdev), NULL);
 DEFINE_STUB(spdk_bdev_get_by_name, struct spdk_bdev *, (const char *name), NULL);
 DEFINE_STUB(spdk_blob_get_freeze_cnt, int, (struct spdk_blob *blob), 0);
+/* Same contract as the blobstore one (lib/blob is not linked here): ranges of
+ * non-zero units, a zero unit ends a range, -1 when there are more than
+ * max_ranges. */
+int
+spdk_bs_find_data_ranges(const void *buf, uint64_t len, uint32_t unit_size,
+			 uint64_t max_range_len, struct spdk_bs_data_range *ranges, int max_ranges)
+{
+	const uint8_t *p = buf;
+	uint64_t off, i;
+	int nranges = 0;
+	bool zero;
+
+	for (off = 0; off < len; off += unit_size) {
+		zero = true;
+		for (i = 0; i < unit_size && zero; i++) {
+			zero = p[off + i] == 0;
+		}
+		if (zero) {
+			continue;
+		}
+		if (nranges > 0 && ranges[nranges - 1].end == off &&
+		    (max_range_len == 0 || off - ranges[nranges - 1].start < max_range_len)) {
+			ranges[nranges - 1].end = off + unit_size;
+			continue;
+		}
+		if (nranges == max_ranges) {
+			return -1;
+		}
+		ranges[nranges].start = off;
+		ranges[nranges].end = off + unit_size;
+		nranges++;
+	}
+	return nranges;
+}
 DEFINE_STUB(spdk_bdev_create_bs_dev_ro, int,
 	    (const char *bdev_name, spdk_bdev_event_cb_t event_cb, void *event_ctx,
 	     struct spdk_bs_dev **bs_dev), -ENOTSUP);
@@ -63,14 +97,40 @@ DEFINE_STUB_V(spdk_blob_io_read, (struct spdk_blob *blob, struct spdk_io_channel
 DEFINE_STUB_V(spdk_blob_io_write, (struct spdk_blob *blob, struct spdk_io_channel *channel,
 		   void *payload, uint64_t offset, uint64_t length,
 		   spdk_blob_op_complete cb_fn, void *cb_arg));
-DEFINE_STUB_V(prepare_s3_clusters, (struct spdk_blob* blob, uint64_t *clusters, uint32_t num_clusters, int *count));
+DEFINE_STUB_V(spdk_blob_scan_used_clusters, (struct spdk_blob* blob, uint64_t *clusters, uint32_t num_clusters, int *count));
 
 DEFINE_STUB(spdk_bs_for_each_loaded_blob, int,(struct spdk_blob_store *bs,
 			     spdk_bs_loaded_blob_fn fn, void *cb_arg), 0);
 
-DEFINE_STUB(spdk_bdev_write_blocks, int,
-	    (struct spdk_bdev_desc *desc, struct spdk_io_channel *ch, void *buf, uint64_t offset_blocks,
-	     uint64_t num_blocks, spdk_bdev_io_completion_cb cb, void *cb_arg), 0);
+/* Records the remote writes (the transfer tests check them); returns
+ * g_ut_bdev_write_rc from write number g_ut_bdev_write_fail_at on (0: never). */
+#define UT_BDEV_WRITES_MAX 64
+struct ut_bdev_write {
+	void		*buf;
+	uint64_t	offset_blocks;
+	uint64_t	num_blocks;
+};
+static struct ut_bdev_write g_ut_bdev_writes[UT_BDEV_WRITES_MAX];
+static uint32_t g_ut_bdev_write_cnt;
+static uint32_t g_ut_bdev_write_fail_at;
+static int g_ut_bdev_write_rc;
+
+int
+spdk_bdev_write_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch, void *buf,
+		       uint64_t offset_blocks, uint64_t num_blocks, spdk_bdev_io_completion_cb cb,
+		       void *cb_arg)
+{
+	if (g_ut_bdev_write_fail_at != 0 && g_ut_bdev_write_cnt + 1 >= g_ut_bdev_write_fail_at) {
+		return g_ut_bdev_write_rc;
+	}
+	if (g_ut_bdev_write_cnt < UT_BDEV_WRITES_MAX) {
+		g_ut_bdev_writes[g_ut_bdev_write_cnt].buf = buf;
+		g_ut_bdev_writes[g_ut_bdev_write_cnt].offset_blocks = offset_blocks;
+		g_ut_bdev_writes[g_ut_bdev_write_cnt].num_blocks = num_blocks;
+	}
+	g_ut_bdev_write_cnt++;
+	return 0;
+}
 DEFINE_STUB(spdk_bdev_unmap_blocks, int,
 	    (struct spdk_bdev_desc *desc, struct spdk_io_channel *ch, uint64_t offset_blocks,
 	     uint64_t num_blocks, spdk_bdev_io_completion_cb cb, void *cb_arg), 0);

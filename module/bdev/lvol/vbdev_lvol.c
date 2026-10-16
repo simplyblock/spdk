@@ -10,6 +10,7 @@
 #include "spdk/string.h"
 #include "spdk/uuid.h"
 #include "spdk/blob.h"
+#include "spdk/util.h"
 #include "spdk_internal/thread.h"
 #include "vbdev_lvol.h"
 
@@ -1438,6 +1439,142 @@ lvol_write(struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct spdk_bdev_
 				num_pages, lvol_op_comp, bdev_io, &lvol_io->ext_io_opts);
 }
 
+/*
+ * Transfer commands (migration and replication), see spdk_lvol_xfer_cmd_hdr:
+ * a write of SPDK_LVOL_XFER_CMD_SIZE bytes at offset 0 through the transfer
+ * hub that holds a valid command is executed instead of written.
+ */
+struct vbdev_lvol_xfer_cmd_ctx {
+	struct spdk_lvol	*lvol;
+	struct spdk_bdev_io	*bdev_io;
+	struct spdk_thread	*thread;
+	/* Points into the write buffer, which stays valid until bdev_io is
+	 * completed; or into copy when the command spans several iovs. */
+	const uint32_t		*entries;
+	uint32_t		count;
+	int			rc;
+	uint8_t			*copy;
+};
+
+/*
+ * Complete a failed command. Not through lvol_op_comp: a failed command is not
+ * a path failure and must not start the failed-IO / demotion handling.
+ */
+static void
+vbdev_lvol_xfer_cmd_fail(struct spdk_bdev_io *bdev_io, enum spdk_bdev_io_status status)
+{
+	struct spdk_lvol *hub = bdev_io->bdev->ctxt;
+
+	__atomic_sub_fetch(&hub->lvol_store->current_io_t, 1, __ATOMIC_SEQ_CST);
+	spdk_bdev_io_complete(bdev_io, status);
+}
+
+static void
+vbdev_lvol_xfer_cmd_complete(void *arg)
+{
+	struct vbdev_lvol_xfer_cmd_ctx *ctx = arg;
+	struct spdk_bdev_io *bdev_io = ctx->bdev_io;
+
+	if (ctx->rc == 0) {
+		lvol_op_comp(bdev_io, 0);
+	} else {
+		SPDK_ERRLOG("lvol %s: transfer command (alloc %u clusters) failed: %d\n",
+			    ctx->lvol->name, ctx->count, ctx->rc);
+		vbdev_lvol_xfer_cmd_fail(bdev_io, ctx->rc == -ENOMEM ? SPDK_BDEV_IO_STATUS_NOMEM :
+					 SPDK_BDEV_IO_STATUS_FAILED);
+	}
+	spdk_free(ctx->copy);
+	free(ctx);
+}
+
+static void
+vbdev_lvol_xfer_alloc_cpl(void *cb_arg, int bserrno)
+{
+	struct vbdev_lvol_xfer_cmd_ctx *ctx = cb_arg;
+
+	ctx->rc = bserrno;
+	spdk_thread_send_msg(ctx->thread, vbdev_lvol_xfer_cmd_complete, ctx);
+}
+
+static void
+vbdev_lvol_xfer_alloc_on_md(void *arg)
+{
+	struct vbdev_lvol_xfer_cmd_ctx *ctx = arg;
+
+	spdk_blob_alloc_clusters(ctx->lvol->blob, ctx->entries, ctx->count,
+				 vbdev_lvol_xfer_alloc_cpl, ctx);
+}
+
+/*
+ * Returns true when bdev_io carries a valid transfer command; the command is
+ * then executed (or fails) and completes bdev_io. Returns false for any other
+ * write, which the caller writes as data. Once the header is valid, the IO is
+ * never written as data: that would put the command into the lvol at LBA 0.
+ */
+static bool
+vbdev_lvol_try_xfer_cmd(struct spdk_lvol *lvol, struct spdk_bdev_io *bdev_io)
+{
+	struct vbdev_lvol_xfer_cmd_ctx *ctx;
+	const struct spdk_lvol_xfer_cmd_hdr *cmd;
+	struct iovec *iov = &bdev_io->u.bdev.iovs[0];
+	size_t used;
+
+	if (bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen != SPDK_LVOL_XFER_CMD_SIZE ||
+	    bdev_io->u.bdev.iovcnt < 1 || iov->iov_len < sizeof(*cmd)) {
+		return false;
+	}
+
+	/* The header is in the first iov: check it there, nothing allocated yet. */
+	cmd = iov->iov_base;
+	if (cmd->magic != SPDK_LVOL_XFER_CMD_MAGIC ||
+	    strncmp(cmd->name, SPDK_LVOL_XFER_CMD_NAME, sizeof(cmd->name)) != 0 ||
+	    cmd->version != SPDK_LVOL_XFER_CMD_VERSION ||
+	    cmd->type != SPDK_LVOL_XFER_CMD_ALLOC_CLUSTERS ||
+	    cmd->count == 0 || cmd->count > SPDK_LVOL_XFER_CMD_MAX_ENTRIES) {
+		return false;
+	}
+
+	/* It is a command: from here on it completes as one, never as data. */
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL) {
+		SPDK_ERRLOG("lvol %s: transfer command: no memory for the context\n", lvol->name);
+		vbdev_lvol_xfer_cmd_fail(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		return true;
+	}
+
+	/* Header and the entries in use; the rest of the command is padding. */
+	used = sizeof(*cmd) + cmd->count * sizeof(uint32_t);
+
+	if (iov->iov_len >= used) {
+		/* Usual case: the entries are in the first iov, used in place. */
+		ctx->entries = cmd->entries;
+	} else {
+		/* Rare: the command spans several iovs. */
+		ctx->copy = spdk_malloc(used, 0, NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+		if (ctx->copy == NULL) {
+			SPDK_ERRLOG("lvol %s: transfer command: no memory to copy %zu bytes\n",
+				    lvol->name, used);
+			free(ctx);
+			vbdev_lvol_xfer_cmd_fail(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+			return true;
+		}
+		spdk_copy_iovs_to_buf(ctx->copy, used, bdev_io->u.bdev.iovs, bdev_io->u.bdev.iovcnt);
+		ctx->entries = ((const struct spdk_lvol_xfer_cmd_hdr *)ctx->copy)->entries;
+	}
+
+	ctx->lvol = lvol;
+	ctx->bdev_io = bdev_io;
+	ctx->thread = spdk_get_thread();
+	ctx->count = cmd->count;
+
+	SPDK_DEBUGLOG(vbdev_lvol, "lvol %s: transfer command: alloc %u clusters\n",
+		      lvol->name, ctx->count);
+
+	spdk_thread_send_msg(spdk_bs_get_md_thread(lvol->lvol_store->blobstore),
+			     vbdev_lvol_xfer_alloc_on_md, ctx);
+	return true;
+}
+
 static void
 hublvol_write(struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 {
@@ -1451,6 +1588,12 @@ hublvol_write(struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct spdk_bd
 	lvol_io->ext_io_opts.size = sizeof(lvol_io->ext_io_opts);
 	lvol_io->ext_io_opts.memory_domain = bdev_io->u.bdev.memory_domain;
 	lvol_io->ext_io_opts.memory_domain_ctx = bdev_io->u.bdev.memory_domain_ctx;
+
+	/* Transfer command (migration and replication): offset 0,
+	 * SPDK_LVOL_XFER_CMD_BLOCKS blocks. */
+	if (start_page == 0 && vbdev_lvol_try_xfer_cmd(lvol, bdev_io)) {
+		return;
+	}
 
 	if (lvol->migration_flag && start_page == 0 && num_pages == 1) {
 		//check if the migrate is completed signal recieved

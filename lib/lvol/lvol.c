@@ -4985,46 +4985,83 @@ fragment_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	}
 }
 
+/*
+ * Snapshot replication sends only the parts of a cluster that hold data, the
+ * same way CoW does on one node. The destination cluster was allocated by the
+ * XFER_STATE_ALLOC_CLUSTERS step, and a new cluster reads as zeroes, so the
+ * zero blocks need no write. Ranges are cut at XFER_MAX_WRITE_BYTES, so one
+ * range is one write; more than XFER_MAX_DATA_RANGES writes: the cluster is
+ * sent whole, as before.
+ */
+#define XFER_MAX_DATA_RANGES	64
+/* Largest write to the remote device: 32 blocks of 4 KiB. */
+#define XFER_MAX_WRITE_BYTES	(32 * 0x1000)
+
+/*
+ * Write the request's payload (the cluster, already read whole) to the remote
+ * device:
+ *  - no data range: nothing to send, the request is done;
+ *  - up to XFER_MAX_DATA_RANGES ranges: one write per range;
+ *  - more ranges: the whole payload, in writes of XFER_MAX_WRITE_BYTES.
+ */
 static int
 submit_req_fragments(struct spdk_lvs_xfer_req *req, struct remote_lvol_info *rmt)
 {
 	struct spdk_bdev_desc *desc = rmt->desc;
 	struct spdk_io_channel *ch = rmt->channel;
 	uint32_t blocklen = spdk_bdev_get_block_size(spdk_bdev_desc_get_bdev(desc));
-	uint64_t max_bytes = 16 * 0x1000;
-	uint32_t max_blocks = max_bytes / blocklen;
-	if (max_blocks == 0) {
-		max_blocks = 1;
-	}
-
-	uint32_t remaining = req->len;
-	uint64_t lba = req->dst_offset;
+	uint32_t max_blocks = spdk_max(XFER_MAX_WRITE_BYTES / blocklen, 1u);
+	struct spdk_bs_data_range ranges[XFER_MAX_DATA_RANGES];
 	uint8_t *payload = (uint8_t *)req->payload;
+	uint64_t start, end, n;
+	int nranges, i, rc;
+
 	req->fragments_outstanding = 0;
 	req->aggregated_status = 0;
 
-	while (remaining > 0) {
-		uint32_t frag_blocks = (remaining > max_blocks) ? max_blocks : remaining;
-		uint8_t *frag_payload = payload + ( (req->len - remaining) * blocklen );
+	nranges = spdk_bs_find_data_ranges(payload, (uint64_t)req->len * blocklen, blocklen,
+						   (uint64_t)max_blocks * blocklen,
+						   ranges, XFER_MAX_DATA_RANGES);
 
-		/* increment fragments counter before submit */
-		req->fragments_outstanding++;
-		// SPDK_NOTICELOG("1- Remote write I/O offset: %" PRIu64 " len: %" PRIu64 " frag: %d t %p\n", req->offset, req->len, req->fragments_outstanding, spdk_get_thread());
-		int rc = spdk_bdev_write_blocks(desc, ch, frag_payload, lba, frag_blocks,
-										fragment_write_cb, req);
-		if (rc != 0) {
-			/* synchronous failure - decrement fragments counter and record error */
-			req->fragments_outstanding--;
-			req->aggregated_status = -EIO;
-			/* handle rc: may want to abort remaining fragments -> but we'll
-			 * record failure and let outstanding fragments finish or cancel */
-			SPDK_ERRLOG("sync write submit failed rc=%d lba=%"PRIu64" blocks=%u\n", rc, lba, frag_blocks);
-			return rc;
+	if (nranges == 0) {
+		/* All zero: the allocated destination cluster already reads as zeroes. */
+		SPDK_DEBUGLOG(lvol, "replicate offset %" PRIu64 ": cluster is zero, nothing sent\n",
+			      req->offset);
+		set_req_status_and_queued(req, XFER_REQ_STATUS_DONE);
+		return 0;
+	}
+
+	if (nranges < 0) {
+		/* Too many ranges: the whole payload is one range. */
+		ranges[0].start = 0;
+		ranges[0].end = (uint64_t)req->len * blocklen;
+		nranges = 1;
+	}
+
+	SPDK_DEBUGLOG(lvol, "replicate offset %" PRIu64 ": %d range(s)\n", req->offset, nranges);
+
+	for (i = 0; i < nranges; i++) {
+		start = ranges[i].start / blocklen;
+		end = ranges[i].end / blocklen;
+		/* A found range is one write; only the whole payload is split. */
+		while (start < end) {
+			n = spdk_min(end - start, (uint64_t)max_blocks);
+
+			/* increment fragments counter before submit */
+			req->fragments_outstanding++;
+			rc = spdk_bdev_write_blocks(desc, ch, payload + start * blocklen,
+						    req->dst_offset + start, n, fragment_write_cb, req);
+			if (rc != 0) {
+				/* synchronous failure: the fragments in flight finish the
+				 * request with the error; none in flight, the caller does. */
+				req->fragments_outstanding--;
+				req->aggregated_status = -EIO;
+				SPDK_ERRLOG("sync write submit failed rc=%d lba=%" PRIu64 " blocks=%" PRIu64 "\n",
+					    rc, req->dst_offset + start, n);
+				return rc;
+			}
+			start += n;
 		}
-
-		/* advance */
-		remaining -= frag_blocks;
-		lba += frag_blocks;
 	}
 
 	return 0;
@@ -5040,10 +5077,8 @@ submit_rw_reqs_remote(struct spdk_lvs_xfer_req *req)
 	switch (req->action)
 	{
 		case REQ_ACTION_COPY_BACKUP:
-			/* read from local and write to remote. Special (geometry) IO
-			 * cannot be split below the blob cluster -- one cluster-sized
-			 * write per request instead of 64 KiB fragments. */
-			if (req->xfer->type == XFER_REPLICATE_SNAPSHOT && !req->xfer->special_io) {
+			/* read from local and write to remote.*/
+			if (req->xfer->type == XFER_REPLICATE_SNAPSHOT) {
 				rc = submit_req_fragments(req, req->rmt_lvol);
 				if (rc != 0) {
 					/* synchronous failure: decrement outstanding and recycle req */
@@ -5106,184 +5141,6 @@ local_op_comp(void *cb_arg, int bserrno)
 
 }
 
-static void
-fragment_read_cb(void *cb_arg, int bserrno)
-{
-	struct spdk_lvs_xfer_req *req = cb_arg;
-
-	if (bserrno != 0) {
-		SPDK_ERRLOG("Local read fragment failed at offset: %" PRIu64 " len: %" PRIu64 " frag: %d\n",
-				req->offset, req->len, req->fragments_outstanding);
-		req->aggregated_status = -EIO;
-	}
-
-	req->fragments_outstanding--;
-
-	if (req->fragments_outstanding == 0) {
-		if (req->aggregated_status != 0) {
-			SPDK_ERRLOG("Local read I/O failed at offset: %" PRIu64 " len: %" PRIu64 "\n",
-								req->offset, req->len);
-			set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
-			return;
-		}
-		/* whole payload filled: continue exactly where the monolithic
-		 * read's completion used to go */
-		local_op_comp(req, 0);
-	}
-}
-
-
-/* -------- read->write pipelined fragments (replicate, non-special) --------
- *
- * The barrier variant below (submit_read_fragments -> local_op_comp ->
- * submit_req_fragments) completes ALL of a request's reads before the first
- * hub write starts, so every request costs read_phase + write_phase.
- * Here each 64 KiB fragment's write is issued from ITS read completion:
- * the phases overlap and the request costs ~max(read, write) + one fragment.
- * All callbacks run on the owning poll-group thread -- no atomics needed. */
-
-#define XFER_FRAG_BYTES (16 * 0x1000)
-
-static void
-pipelined_finalize_if_done(struct spdk_lvs_xfer_req *req)
-{
-	if (req->reads_outstanding == 0 && req->writes_outstanding == 0) {
-		set_req_status_and_queued(req, req->aggregated_status == 0 ?
-					  XFER_REQ_STATUS_DONE : XFER_REQ_STATUS_FAILED);
-	}
-}
-
-static void
-pipelined_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
-{
-	struct spdk_lvs_xfer_frag *frag = cb_arg;
-	struct spdk_lvs_xfer_req *req = frag->req;
-
-	if (!success) {
-		SPDK_ERRLOG("Pipelined hub write failed at req offset %" PRIu64 " frag %u\n",
-			    req->offset, frag->idx);
-		req->aggregated_status = -EIO;
-	}
-	spdk_bdev_free_io(bdev_io);
-	req->writes_outstanding--;
-	pipelined_finalize_if_done(req);
-}
-
-static void
-pipelined_read_cb(void *cb_arg, int bserrno)
-{
-	struct spdk_lvs_xfer_frag *frag = cb_arg;
-	struct spdk_lvs_xfer_req *req = frag->req;
-	struct spdk_lvs_xfer *xfer = req->xfer;
-	struct remote_lvol_info *rmt = req->rmt_lvol;
-	uint64_t frag_pages = XFER_FRAG_BYTES / xfer->page_size;
-	uint64_t off_pages = (uint64_t)frag->idx * frag_pages;
-	uint64_t len_pages;
-	int rc;
-
-	req->reads_outstanding--;
-
-	if (bserrno != 0) {
-		SPDK_ERRLOG("Pipelined read fragment failed at req offset %" PRIu64 " frag %u\n",
-			    req->offset, frag->idx);
-		req->aggregated_status = -EIO;
-	} else if (req->aggregated_status == 0) {
-		len_pages = req->len - off_pages;
-		if (len_pages > frag_pages) {
-			len_pages = frag_pages;
-		}
-		req->writes_outstanding++;
-		rc = spdk_bdev_write_blocks(rmt->desc, rmt->channel,
-					    (uint8_t *)req->payload + off_pages * xfer->page_size,
-					    req->dst_offset + off_pages, len_pages,
-					    pipelined_write_cb, frag);
-		if (rc != 0) {
-			SPDK_ERRLOG("Pipelined hub write submit failed rc=%d frag %u\n",
-				    rc, frag->idx);
-			req->writes_outstanding--;
-			req->aggregated_status = -EIO;
-		}
-	}
-	pipelined_finalize_if_done(req);
-}
-
-static int
-submit_pipelined_fragments(struct spdk_lvs_xfer_req *req)
-{
-	struct spdk_lvs_xfer *xfer = req->xfer;
-	struct spdk_io_channel *md_ch = req->rmt_lvol->md_channel;
-	uint64_t frag_pages = XFER_FRAG_BYTES / xfer->page_size;
-	uint64_t nfrags, k;
-
-	if (frag_pages == 0) {
-		frag_pages = 1;
-	}
-	nfrags = (req->len + frag_pages - 1) / frag_pages;
-
-	/* pre-count so an inline completion cannot observe 0 mid-submission */
-	req->aggregated_status = 0;
-	req->reads_outstanding = (int)nfrags;
-	req->writes_outstanding = 0;
-
-	for (k = 0; k < nfrags; k++) {
-		uint64_t off_pages = k * frag_pages;
-		uint64_t len_pages = req->len - off_pages;
-
-		if (len_pages > frag_pages) {
-			len_pages = frag_pages;
-		}
-		req->frag_ctx[k].req = req;
-		req->frag_ctx[k].idx = (uint32_t)k;
-		spdk_blob_io_read(xfer->lvol->blob, md_ch,
-				  (uint8_t *)req->payload + off_pages * xfer->page_size,
-				  req->offset + off_pages, len_pages,
-				  pipelined_read_cb, &req->frag_ctx[k]);
-	}
-	return 0;
-}
-
-static int
-submit_read_fragments(struct spdk_lvs_xfer_req *req)
-{
-	struct spdk_lvs_xfer *xfer = req->xfer;
-	struct spdk_io_channel *md_ch = req->rmt_lvol->md_channel;
-	uint64_t max_bytes = 16 * 0x1000;	/* same 64 KiB unit as the write fragments */
-	uint64_t frag_pages = max_bytes / xfer->page_size;
-	uint64_t remaining, offset;
-	uint8_t *payload = (uint8_t *)req->payload;
-
-	if (frag_pages == 0) {
-		frag_pages = 1;
-	}
-	// /* Special (geometry) IO must not be split below the blob cluster on the
-	//  * READ side either: one whole-request read, mirroring the single
-	//  * whole-cluster write. Partial transfer is already refused for it, so
-	//  * req->len is the full cluster here. */
-	// if (xfer->special_io) {
-	// 	frag_pages = req->len;
-	// }
-
-	/* Fill the payload with PARALLEL 64 KiB reads instead of one monolithic
-	 * cluster-sized read: a single 2 MiB spdk_blob_io_read serialized the whole
-	 * read phase per cluster, so read latency added linearly to every cluster
-	 * even when the window held plenty of them. Pre-count the fragments so an
-	 * early completion cannot observe outstanding==0 mid-submission. */
-	req->aggregated_status = 0;
-	req->fragments_outstanding = (int)((req->len + frag_pages - 1) / frag_pages);
-
-	remaining = req->len;
-	offset = req->offset;
-	while (remaining > 0) {
-		uint64_t n = (remaining > frag_pages) ? frag_pages : remaining;
-
-		spdk_blob_io_read(xfer->lvol->blob, md_ch,
-				  payload + ((req->len - remaining) * xfer->page_size),
-				  offset, n, fragment_read_cb, req);
-		offset += n;
-		remaining -= n;
-	}
-	return 0;
-}
 
 static int
 submit_rw_reqs_local(struct spdk_lvs_xfer_req *req)
@@ -5295,19 +5152,10 @@ submit_rw_reqs_local(struct spdk_lvs_xfer_req *req)
 	switch (req->action)
 	{
 		case REQ_ACTION_COPY_BACKUP:
-			/* Pipelined read->write when the geometry allows it. Special
-			 * IO keeps the barrier path (one cluster-sized write); a
-			 * block size that is not the blob page size would repeat
-			 * the pre-existing mixed-unit assumption, so it also stays
-			 * on the barrier path. */
-			if (xfer->type == XFER_REPLICATE_SNAPSHOT && !xfer->special_io &&
-			    req->frag_ctx != NULL && rmt->desc != NULL &&
-			    spdk_bdev_get_block_size(spdk_bdev_desc_get_bdev(rmt->desc)) ==
-			    xfer->page_size) {
-				return submit_pipelined_fragments(req);
-			}
-			// read from local (fragmented, parallel) and write to remote
-			return submit_read_fragments(req);
+			// read from local and write to remote
+			spdk_blob_io_read(xfer->lvol->blob, md_ch, req->payload, req->offset,
+								req->len, local_op_comp, req);
+			break;
 		case REQ_ACTION_COPY_RECOVER:
 			// read from remote and write to local
 			spdk_blob_io_write(xfer->lvol->blob, md_ch, req->payload, req->offset,
@@ -6034,6 +5882,129 @@ xfer_status_check(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req **preq, u
 	return 0;
 }
 
+/*
+ * Put the next cluster indexes to send (clusters[i] != 0, from alloc_next on)
+ * into one alloc command (SPDK_LVOL_XFER_CMD_SIZE bytes, up to
+ * SPDK_LVOL_XFER_CMD_MAX_ENTRIES indexes). Returns the number of entries, 0
+ * when none are left.
+ */
+static uint32_t
+xfer_build_alloc_cmd(struct spdk_lvs_xfer *xfer, void *buf)
+{
+	struct spdk_lvol_xfer_cmd_hdr *cmd = buf;
+	uint32_t n = 0, ep, last_ep = 0;
+
+	memset(buf, 0, SPDK_LVOL_XFER_CMD_SIZE);
+
+	/*
+	 * Commands run in parallel on the destination and each writes the extent
+	 * pages of its clusters: two commands must never share an extent page.
+	 * Start a new extent page only when all of it still fits (at most
+	 * SPDK_BLOB_CLUSTERS_PER_EXTENT_PAGE entries); otherwise that page starts
+	 * the next command.
+	 */
+	while (xfer->alloc_next < xfer->num_clusters) {
+		if (xfer->clusters[xfer->alloc_next] != 0) {
+			ep = xfer->alloc_next / SPDK_BLOB_CLUSTERS_PER_EXTENT_PAGE;
+			if (n > 0 && ep != last_ep &&
+			    SPDK_LVOL_XFER_CMD_MAX_ENTRIES - n < SPDK_BLOB_CLUSTERS_PER_EXTENT_PAGE) {
+				break;
+			}
+			assert(n < SPDK_LVOL_XFER_CMD_MAX_ENTRIES);
+			cmd->entries[n++] = xfer->alloc_next;
+			last_ep = ep;
+		}
+		xfer->alloc_next++;
+	}
+
+	if (n == 0) {
+		return 0;
+	}
+
+	cmd->magic = SPDK_LVOL_XFER_CMD_MAGIC;
+	snprintf(cmd->name, sizeof(cmd->name), "%s", SPDK_LVOL_XFER_CMD_NAME);
+	cmd->version = SPDK_LVOL_XFER_CMD_VERSION;
+	cmd->type = SPDK_LVOL_XFER_CMD_ALLOC_CLUSTERS;
+	cmd->count = n;
+
+	return n;
+}
+
+/*
+ * Migration and replication need 4 KiB pages: an alloc command is
+ * SPDK_LVOL_XFER_CMD_BLOCKS pages and must be exactly SPDK_LVOL_XFER_CMD_SIZE
+ * bytes (the destination takes nothing else as a command), and a migration
+ * payload (8 pages) must hold it. The destination offsets are in pages too, so
+ * the remote block size is the page size. Any other page size fails the task
+ * before a request is sent.
+ */
+static bool
+xfer_page_size_ok(struct spdk_lvs_xfer *xfer)
+{
+	if (xfer->page_size == SPDK_LVOL_XFER_CMD_BLOCK_SIZE) {
+		return true;
+	}
+
+	SPDK_ERRLOG("lvol %s %s: page size %" PRIu64 " is not supported, need %u\n",
+		    xfer->lvol->name, xfer_type_to_string(xfer->type), xfer->page_size,
+		    SPDK_LVOL_XFER_CMD_BLOCK_SIZE);
+	xfer->lvol->transfer_status = XFER_FAILED;
+	xfer->state = XFER_STATE_FAILED;
+	return false;
+}
+
+/*
+ * XFER_STATE_ALLOC_CLUSTERS, for migration and replication: before any data,
+ * send the destination the indexes of every cluster this task will send, as
+ * alloc commands (SPDK_LVOL_XFER_CMD_BLOCKS blocks at offset 0 through the
+ * transfer hub). The destination allocates them on its md thread and
+ * acknowledges a command only when its clusters are persistent. Data starts
+ * when every command is done.
+ */
+static int
+xfer_alloc_clusters_step(struct spdk_lvs_xfer *xfer)
+{
+	struct spdk_lvs_xfer_req *req;
+	int count = 0, rc;
+
+	while (true) {
+		rc = xfer_status_check(xfer, &req, xfer->idx, XFER_STATE_TRANSFER_CLUSTERS,
+				       xfer->cluster_batch);
+		if (rc != 0) {
+			if (xfer->state == XFER_STATE_TRANSFER_CLUSTERS) {
+				SPDK_NOTICELOG("lvol %s %s: destination clusters allocated (%u command(s))\n",
+					       xfer->lvol->name, xfer_type_to_string(xfer->type),
+					       xfer->alloc_cmds);
+			}
+			return count;
+		}
+
+		if (xfer_build_alloc_cmd(xfer, req->payload) == 0) {
+			/* Every command is sent; this req is not needed. */
+			if (xfer->idx == 0) {
+				/* No cluster to allocate at all. */
+				xfer->state = XFER_STATE_TRANSFER_CLUSTERS;
+				xfer_fill_queue(xfer, xfer->cluster_batch);
+			}
+			return count;
+		}
+
+		req->offset = 0;
+		req->len = SPDK_LVOL_XFER_CMD_BLOCKS;
+		req->dst_offset = (uint64_t)xfer->lvol->redirect_map_id << 48;
+		req->action = REQ_ACTION_WRITE;
+		req->status = XFER_REQ_STATUS_READY;
+		if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
+			SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
+			assert(false);
+		}
+		xfer->outstanding_io++;
+		xfer->idx++;
+		xfer->alloc_cmds++;
+		count++;
+	}
+}
+
 static int
 xfer_replication(struct spdk_lvs_xfer *xfer) {
 	struct spdk_lvs_xfer_req *req;
@@ -6056,16 +6027,28 @@ xfer_replication(struct spdk_lvs_xfer *xfer) {
 	{
 		case XFER_STATE_NONE:
 			struct spdk_lvol *lvol = xfer->lvol;
-			prepare_s3_clusters(lvol->blob, xfer->clusters, xfer->num_clusters, &count);
-			xfer->state = XFER_STATE_TRANSFER_CLUSTERS;
+			if (!xfer_page_size_ok(xfer)) {
+				return 0;
+			}
+			spdk_blob_scan_used_clusters(lvol->blob, xfer->clusters, xfer->num_clusters, &count);
+			if (count == 0) {
+				xfer->state = xfer->final_step ? XFER_STATE_SIGNAL_TRANSFER : XFER_STATE_DONE;
+				xfer_fill_queue(xfer, xfer->final_step ? 1 : 0);
+				return count;
+			}
+			xfer->state = XFER_STATE_ALLOC_CLUSTERS;
 			xfer_fill_queue(xfer, xfer->cluster_batch);
 			if (xfer->lvol->last_offset != 0) {
 				xfer->hold_idx = xfer->lvol->last_offset / xfer->page_per_cluster;
+				xfer->state = XFER_STATE_TRANSFER_CLUSTERS;
 				if (xfer->hold_idx >= xfer->num_clusters) {
 					xfer->state = XFER_STATE_DONE;
 				}
 			}
 			break;
+
+		case XFER_STATE_ALLOC_CLUSTERS:
+			return xfer_alloc_clusters_step(xfer);
 
 		case XFER_STATE_TRANSFER_CLUSTERS:
 			next_state = xfer->final_step ? XFER_STATE_SIGNAL_TRANSFER : XFER_STATE_DONE;
@@ -6197,14 +6180,25 @@ xfer_migration(struct spdk_lvs_xfer *xfer) {
 	{
 		case XFER_STATE_NONE:
 			struct spdk_lvol *lvol = xfer->lvol;
-			prepare_s3_clusters(lvol->blob, xfer->clusters, xfer->num_clusters, &count);
+			if (!xfer_page_size_ok(xfer)) {
+				return 0;
+			}
+			spdk_blob_scan_used_clusters(lvol->blob, xfer->clusters, xfer->num_clusters, &count);
 			SPDK_NOTICELOG("Number clusters %u to migrate and total clusters %" PRIu32 " for lvol %s\n", count, xfer->num_clusters, lvol->name);
-			xfer->state = XFER_STATE_TRANSFER_CLUSTERS;
+			if (count == 0) {
+				xfer->state = xfer->final_step ? XFER_STATE_SIGNAL_TRANSFER : XFER_STATE_DONE;
+				xfer_fill_queue(xfer, xfer->final_step ? 1 : 0);
+				return count;
+			}
+			xfer->state = XFER_STATE_ALLOC_CLUSTERS;
 			if (xfer->final_step) {
 				xfer->terminate_timeout = spdk_get_ticks() + (spdk_get_ticks_hz() * SPDK_LVOL_TRANSFER_TERMINATE_TIMEOUT);
 			}
 			xfer_fill_queue(xfer, xfer->cluster_batch);
 			break;
+
+		case XFER_STATE_ALLOC_CLUSTERS:
+			return xfer_alloc_clusters_step(xfer);
 
 		case XFER_STATE_TRANSFER_CLUSTERS:
 			next_state = xfer->final_step ? XFER_STATE_SIGNAL_TRANSFER : XFER_STATE_DONE;
@@ -6333,7 +6327,7 @@ xfer_s3_backup(struct spdk_lvs_xfer *xfer) {
 		case XFER_STATE_NONE:
 			if (xfer->idx < xfer->chain_count) {
 				struct spdk_lvol *lvol = xfer->chain[xfer->idx];
-				prepare_s3_clusters(lvol->blob, xfer->clusters, xfer->num_clusters, &count);
+				spdk_blob_scan_used_clusters(lvol->blob, xfer->clusters, xfer->num_clusters, &count);
 				xfer->idx++;
 				return 0;
 			}
