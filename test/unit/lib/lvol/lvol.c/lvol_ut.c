@@ -4232,14 +4232,15 @@ lvol_ha_release_stops_redirect_on_secondary(void)
 	lvs->hub_dev.state = HUBLVOL_CONNECTED;
 	CU_ASSERT(spdk_lvs_ha_release(30, NULL, NULL) == 0);
 	CU_ASSERT(lvs->skip_redirecting == true);
-	CU_ASSERT(lvs->hub_dev.drain_in_action == true);
+	/* Review on #81: drain_in_action is not set by the grant. */
+	CU_ASSERT(lvs->hub_dev.drain_in_action == false);
 	/* No port touched, no takeover latch: the survivor is granted, not fenced. */
 	CU_ASSERT(g_ha_port_block_cnt == 0);
 	CU_ASSERT(lvs->ha_takeover_blocked == false);
 	/* Idempotent: a second grant changes nothing. */
 	CU_ASSERT(spdk_lvs_ha_release(30, NULL, NULL) == 0);
 	CU_ASSERT(lvs->skip_redirecting == true);
-	CU_ASSERT(lvs->hub_dev.drain_in_action == true);
+	CU_ASSERT(lvs->hub_dev.drain_in_action == false);
 	ha_free_lvs(lvs);
 
 	/* A primary that is not (yet) leader keeps its state: primaries never redirect. */
