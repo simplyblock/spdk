@@ -3949,11 +3949,14 @@ lvs_ha_find_locked(uint64_t groupid)
 #define LVS_HA_ANA_PAUSE_RETRY_US 10000
 #define LVS_HA_ANA_PAUSE_RETRIES 200
 
+/* Campaign c7b, F18: the fence sets every ANA group of the listener inaccessible
+ * (anagrpid 0), so the state of every group is saved and restored, group by group. */
 struct lvs_ha_ana_saved {
 	uint16_t			port;
 	char				nqn[SPDK_NVMF_NQN_MAX_LEN + 1];
 	struct spdk_nvme_transport_id	trid;
-	enum spdk_nvme_ana_state	state;
+	uint32_t			n_groups;
+	enum spdk_nvme_ana_state	*states;	/* [n_groups], index = anagrpid - 1 */
 };
 
 /* app thread only */
@@ -3974,9 +3977,19 @@ struct lvs_ha_ana_ctx {
 	int			retries;
 	struct spdk_poller	*retry_poller;
 	struct spdk_nvmf_subsystem *subsystem;
+	struct lvs_ha_ana_saved	*restoring;	/* restore: the entry being applied */
+	uint32_t		grp;		/* restore: last group handled */
 };
 
 static void lvs_ha_ana_next(struct lvs_ha_ana_ctx *ctx);
+static void lvs_ha_ana_restore_next(struct lvs_ha_ana_ctx *ctx);
+
+static void
+lvs_ha_ana_saved_clear(struct lvs_ha_ana_saved *s)
+{
+	free(s->states);
+	memset(s, 0, sizeof(*s));
+}
 
 /* Listener identity without pulling in the nvme library. */
 static bool
@@ -4028,9 +4041,42 @@ lvs_ha_ana_set_done(void *cb_arg, int status)
 	if (status != 0) {
 		SPDK_ERRLOG("HA ANA: setting %s on %s port %u failed: %d\n",
 			    ctx->inaccessible ? "inaccessible" : "previous state", it->nqn, ctx->port, status);
-	} else {
-		SPDK_NOTICELOG("HA ANA: %s port %u set %s\n", it->nqn, ctx->port,
-			       ctx->inaccessible ? "inaccessible" : "back to its previous state");
+	} else if (ctx->inaccessible) {
+		SPDK_NOTICELOG("HA ANA: %s port %u set inaccessible\n", it->nqn, ctx->port);
+	}
+	if (!ctx->inaccessible) {
+		lvs_ha_ana_restore_next(ctx);
+		return;
+	}
+	lvs_ha_ana_resume(ctx);
+}
+
+/* Restore, group by group: a group goes back to its saved state only if it is still
+ * inaccessible, i.e. nobody (the control plane's failover/failback) changed it since. */
+static void
+lvs_ha_ana_restore_next(struct lvs_ha_ana_ctx *ctx)
+{
+	struct lvs_ha_ana_item *it = &ctx->items[ctx->cur];
+	struct lvs_ha_ana_saved *saved = ctx->restoring;
+	enum spdk_nvme_ana_state cur;
+
+	while (saved != NULL && ++ctx->grp <= saved->n_groups) {
+		enum spdk_nvme_ana_state want = saved->states[ctx->grp - 1];
+
+		if (want == SPDK_NVME_ANA_INACCESSIBLE_STATE ||
+		    spdk_nvmf_subsystem_get_ana_state(ctx->subsystem, &it->trid, ctx->grp, &cur) != 0 ||
+		    cur != SPDK_NVME_ANA_INACCESSIBLE_STATE) {
+			continue;
+		}
+		spdk_nvmf_subsystem_set_ana_state(ctx->subsystem, &it->trid, want, ctx->grp,
+						  lvs_ha_ana_set_done, ctx);
+		return;
+	}
+	if (saved != NULL) {
+		SPDK_NOTICELOG("HA ANA: %s port %u: ANA groups back to their previous state\n",
+			       it->nqn, ctx->port);
+		lvs_ha_ana_saved_clear(saved);
+		ctx->restoring = NULL;
 	}
 	lvs_ha_ana_resume(ctx);
 }
@@ -4041,46 +4087,59 @@ lvs_ha_ana_paused(struct spdk_nvmf_subsystem *subsystem, void *cb_arg, int statu
 	struct lvs_ha_ana_ctx *ctx = cb_arg;
 	struct lvs_ha_ana_item *it = &ctx->items[ctx->cur];
 	struct lvs_ha_ana_saved *saved;
-	enum spdk_nvme_ana_state cur_state = SPDK_NVME_ANA_OPTIMIZED_STATE;
+	uint32_t n_groups = spdk_nvmf_subsystem_get_max_nsid(subsystem);
 
-	if (spdk_nvmf_subsystem_get_ana_state(subsystem, &it->trid, 1, &cur_state) != 0) {
-		lvs_ha_ana_resume(ctx);
-		return;
-	}
 	saved = lvs_ha_ana_find_saved(ctx->port, it->nqn, &it->trid);
 	if (ctx->inaccessible) {
-		if (cur_state == SPDK_NVME_ANA_INACCESSIBLE_STATE) {
+		struct spdk_nvme_transport_id none = {};
+		enum spdk_nvme_ana_state *states;
+		bool any_accessible = false;
+
+		if (saved != NULL) {
+			/* A repeated fence keeps the states saved by the first one. */
+			spdk_nvmf_subsystem_set_ana_state(subsystem, &it->trid, SPDK_NVME_ANA_INACCESSIBLE_STATE,
+							  0, lvs_ha_ana_set_done, ctx);
+			return;
+		}
+		states = n_groups ? calloc(n_groups, sizeof(*states)) : NULL;
+		if (states == NULL) {
 			lvs_ha_ana_resume(ctx);
 			return;
 		}
-		if (saved == NULL) {
-			struct spdk_nvme_transport_id none = {};
-
-			saved = lvs_ha_ana_find_saved(0, "", &none);
+		for (uint32_t g = 1; g <= n_groups; g++) {
+			if (spdk_nvmf_subsystem_get_ana_state(subsystem, &it->trid, g, &states[g - 1]) != 0) {
+				states[g - 1] = SPDK_NVME_ANA_INACCESSIBLE_STATE;	/* nothing to restore */
+			}
+			any_accessible |= states[g - 1] != SPDK_NVME_ANA_INACCESSIBLE_STATE;
 		}
+		if (!any_accessible) {
+			free(states);
+			lvs_ha_ana_resume(ctx);
+			return;
+		}
+		saved = lvs_ha_ana_find_saved(0, "", &none);
 		if (saved != NULL) {
 			saved->port = ctx->port;
 			snprintf(saved->nqn, sizeof(saved->nqn), "%s", it->nqn);
 			saved->trid = it->trid;
-			saved->state = cur_state;
+			saved->n_groups = n_groups;
+			saved->states = states;
 		} else {
 			SPDK_ERRLOG("HA ANA: no room to save the state of %s port %u\n", it->nqn, ctx->port);
+			free(states);
 		}
 		spdk_nvmf_subsystem_set_ana_state(subsystem, &it->trid, SPDK_NVME_ANA_INACCESSIBLE_STATE,
 						  0, lvs_ha_ana_set_done, ctx);
 		return;
 	}
-	/* Restore: only what this fence set, and only if nobody changed it since. */
-	if (saved == NULL || cur_state != SPDK_NVME_ANA_INACCESSIBLE_STATE) {
-		if (saved != NULL) {
-			memset(saved, 0, sizeof(*saved));
-		}
+	/* Restore: only what this fence set, and only groups nobody changed since. */
+	if (saved == NULL) {
 		lvs_ha_ana_resume(ctx);
 		return;
 	}
-	cur_state = saved->state;
-	memset(saved, 0, sizeof(*saved));
-	spdk_nvmf_subsystem_set_ana_state(subsystem, &it->trid, cur_state, 0, lvs_ha_ana_set_done, ctx);
+	ctx->restoring = saved;
+	ctx->grp = 0;
+	lvs_ha_ana_restore_next(ctx);
 }
 
 static int
