@@ -71,6 +71,10 @@ struct nvme_tcp_poll_group {
 	TAILQ_HEAD(, nvme_tcp_qpair) needs_poll;
 	TAILQ_HEAD(, nvme_tcp_qpair) timeout_enabled;
 	struct spdk_nvme_tcp_stat stats;
+
+	/* Debug: reactor stall detector, see NVME_TCP_DBG_STALL_US */
+	uint64_t dbg_last_poll_tsc;
+	uint64_t dbg_stall_report_tsc;
 };
 
 /* NVMe TCP qpair extensions for spdk_nvme_qpair */
@@ -118,7 +122,33 @@ struct nvme_tcp_qpair {
 	uint64_t				icreq_timeout_tsc;
 
 	bool					shared_stats;
+
+	/* Debug: slow R2T -> H2C handling on this qpair, reported at most once
+	 * per NVME_TCP_DBG_REPORT_SEC and only if a slow H2C was seen */
+	uint64_t				dbg_report_tsc;
+	uint64_t				dbg_wait_ack_max_tsc;
+	uint64_t				dbg_send_max_tsc;
+	uint32_t				dbg_h2c_cnt;
+	uint32_t				dbg_h2c_slow;
 };
+
+#define NVME_TCP_DBG_REPORT_SEC		5
+#define NVME_TCP_DBG_H2C_SLOW_US	100000	/* R2T received -> all H2C data sent */
+#define NVME_TCP_DBG_STALL_US		50000	/* poll group not polled */
+
+static inline double
+nvme_tcp_dbg_tsc_to_ms(uint64_t tsc)
+{
+	return (double)tsc * 1000.0 / (double)spdk_get_ticks_hz();
+}
+
+static inline const char *
+nvme_tcp_dbg_thread_name(void)
+{
+	struct spdk_thread *thread = spdk_get_thread();
+
+	return thread ? spdk_thread_get_name(thread) : "none";
+}
 
 enum nvme_tcp_req_state {
 	NVME_TCP_REQ_FREE,
@@ -169,7 +199,10 @@ struct nvme_tcp_req {
 	struct nvme_tcp_qpair			*tqpair;
 	TAILQ_ENTRY(nvme_tcp_req)		link;
 	struct spdk_nvme_cpl			rsp;
-	uint8_t					rsvd1[32];
+	/* Debug: R2T received and first H2C queued, for the slow H2C report */
+	uint64_t				dbg_r2t_tsc;
+	uint64_t				dbg_h2c_tsc;
+	uint8_t					rsvd1[16];
 };
 SPDK_STATIC_ASSERT(sizeof(struct nvme_tcp_req) % SPDK_CACHE_LINE_SIZE == 0, "unaligned size");
 
@@ -224,6 +257,8 @@ nvme_tcp_req_get(struct nvme_tcp_qpair *tqpair)
 	tcp_req->active_r2ts = 0;
 	tcp_req->iovcnt = 0;
 	tcp_req->ordering.raw = 0;
+	tcp_req->dbg_r2t_tsc = 0;
+	tcp_req->dbg_h2c_tsc = 0;
 	memset(tcp_req->pdu, 0, sizeof(struct nvme_tcp_pdu));
 	memset(&tcp_req->rsp, 0, sizeof(struct spdk_nvme_cpl));
 
@@ -1706,6 +1741,48 @@ end:
 	nvme_tcp_qpair_send_h2c_term_req(tqpair, pdu, fes, error_offset);
 }
 
+/* Debug: all H2C data of one R2T was sent (with zero copy: released by the kernel).
+ * wait_ack = R2T received until the first H2C could be queued (waiting for the send
+ * ack of the command capsule), send = first H2C queued until the last one completed. */
+static void
+nvme_tcp_dbg_h2c_done(struct nvme_tcp_req *tcp_req)
+{
+	struct nvme_tcp_qpair *tqpair = tcp_req->tqpair;
+	struct spdk_nvme_qpair *qpair = &tqpair->qpair;
+	uint64_t now = spdk_get_ticks();
+	uint64_t hz = spdk_get_ticks_hz();
+
+	if (tcp_req->dbg_r2t_tsc && tcp_req->dbg_h2c_tsc) {
+		tqpair->dbg_wait_ack_max_tsc = spdk_max(tqpair->dbg_wait_ack_max_tsc,
+						      tcp_req->dbg_h2c_tsc - tcp_req->dbg_r2t_tsc);
+		tqpair->dbg_send_max_tsc = spdk_max(tqpair->dbg_send_max_tsc, now - tcp_req->dbg_h2c_tsc);
+		tqpair->dbg_h2c_cnt++;
+		if (now - tcp_req->dbg_r2t_tsc > NVME_TCP_DBG_H2C_SLOW_US * hz / SPDK_SEC_TO_USEC) {
+			tqpair->dbg_h2c_slow++;
+		}
+	}
+	tcp_req->dbg_r2t_tsc = 0;
+	tcp_req->dbg_h2c_tsc = 0;
+
+	if (now - tqpair->dbg_report_tsc < NVME_TCP_DBG_REPORT_SEC * hz) {
+		return;
+	}
+	if (tqpair->dbg_h2c_slow) {
+		SPDK_NOTICELOG("NVME_TCP_DBG slow H2C to %s:%s qid %u thread %s last %ds: h2c %u slow(>%dms) %u "
+			       "wait_ack max %.1fms send max %.1fms\n",
+			       qpair->ctrlr->trid.traddr, qpair->ctrlr->trid.trsvcid, qpair->id,
+			       nvme_tcp_dbg_thread_name(), NVME_TCP_DBG_REPORT_SEC,
+			       tqpair->dbg_h2c_cnt, NVME_TCP_DBG_H2C_SLOW_US / 1000, tqpair->dbg_h2c_slow,
+			       nvme_tcp_dbg_tsc_to_ms(tqpair->dbg_wait_ack_max_tsc),
+			       nvme_tcp_dbg_tsc_to_ms(tqpair->dbg_send_max_tsc));
+	}
+	tqpair->dbg_report_tsc = now;
+	tqpair->dbg_wait_ack_max_tsc = 0;
+	tqpair->dbg_send_max_tsc = 0;
+	tqpair->dbg_h2c_cnt = 0;
+	tqpair->dbg_h2c_slow = 0;
+}
+
 static void
 nvme_tcp_qpair_h2c_data_send_complete(void *cb_arg)
 {
@@ -1717,6 +1794,7 @@ nvme_tcp_qpair_h2c_data_send_complete(void *cb_arg)
 	if (tcp_req->r2tl_remain) {
 		nvme_tcp_send_h2c_data(tcp_req);
 	} else {
+		nvme_tcp_dbg_h2c_done(tcp_req);
 		assert(tcp_req->active_r2ts > 0);
 		tcp_req->active_r2ts--;
 		tcp_req->state = NVME_TCP_REQ_ACTIVE;
@@ -1749,6 +1827,10 @@ nvme_tcp_send_h2c_data(struct nvme_tcp_req *tcp_req)
 	struct nvme_tcp_pdu *rsp_pdu;
 	struct spdk_nvme_tcp_h2c_data_hdr *h2c_data;
 	uint32_t plen, pdo, alignment;
+
+	if (tcp_req->dbg_r2t_tsc && !tcp_req->dbg_h2c_tsc) {
+		tcp_req->dbg_h2c_tsc = spdk_get_ticks();
+	}
 
 	/* Reinit the send_ack and h2c_send_waiting_ack bits */
 	tcp_req->ordering.bits.send_ack = 0;
@@ -1865,6 +1947,8 @@ nvme_tcp_r2t_hdr_handle(struct nvme_tcp_qpair *tqpair, struct nvme_tcp_pdu *pdu)
 
 	tcp_req->ttag = r2t->ttag;
 	tcp_req->r2tl_remain = r2t->r2tl;
+	tcp_req->dbg_r2t_tsc = spdk_get_ticks();
+	tcp_req->dbg_h2c_tsc = 0;
 	nvme_tcp_qpair_set_recv_state(tqpair, NVME_TCP_PDU_RECV_STATE_AWAIT_PDU_READY);
 
 	if (spdk_likely(tcp_req->ordering.bits.send_ack)) {
@@ -2839,6 +2923,25 @@ nvme_tcp_poll_group_remove(struct spdk_nvme_transport_poll_group *tgroup,
 	return 0;
 }
 
+/* Debug: report when this poll group was not polled for a long time (reactor
+ * blocked), at most once per second per group */
+static void
+nvme_tcp_dbg_poll_gap(struct nvme_tcp_poll_group *group)
+{
+	uint64_t now = spdk_get_ticks();
+	uint64_t hz = spdk_get_ticks_hz();
+	uint64_t gap = now - group->dbg_last_poll_tsc;
+
+	if (spdk_unlikely(group->dbg_last_poll_tsc &&
+			  gap > NVME_TCP_DBG_STALL_US * hz / SPDK_SEC_TO_USEC &&
+			  (group->dbg_stall_report_tsc == 0 || now - group->dbg_stall_report_tsc > hz))) {
+		group->dbg_stall_report_tsc = now;
+		SPDK_NOTICELOG("NVME_TCP_DBG poll group %p thread %s stalled %.1fms\n",
+			       group, nvme_tcp_dbg_thread_name(), nvme_tcp_dbg_tsc_to_ms(gap));
+	}
+	group->dbg_last_poll_tsc = now;
+}
+
 static int64_t
 nvme_tcp_poll_group_process_completions(struct spdk_nvme_transport_poll_group *tgroup,
 					uint32_t completions_per_qpair, spdk_nvme_disconnected_qpair_cb disconnected_qpair_cb)
@@ -2851,6 +2954,8 @@ nvme_tcp_poll_group_process_completions(struct spdk_nvme_transport_poll_group *t
 	group->completions_per_qpair = completions_per_qpair;
 	group->num_completions = 0;
 	group->stats.polls++;
+
+	nvme_tcp_dbg_poll_gap(group);
 
 	num_events = spdk_sock_group_poll(group->sock_group);
 
