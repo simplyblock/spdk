@@ -27,6 +27,28 @@
 #include <libaio.h>
 #endif
 
+/* Debug stats for the aio stall investigation. Collected per channel (lock free,
+ * the channel is owned by one thread) and reported by the group poller at most
+ * once per AIO_DBG_REPORT_SEC per channel, and only if a threshold was crossed.
+ * All reports are prefixed with "AIO_DBG" so they can be grepped. */
+#define AIO_DBG_REPORT_SEC	5
+#define AIO_DBG_SUBMIT_SLOW_US	1000	/* io_submit() blocked in the kernel */
+#define AIO_DBG_CPL_SLOW_US	50000	/* submit -> completion seen by the poller */
+#define AIO_DBG_SYNC_SLOW_US	10000	/* fsync()/fallocate() on the reactor */
+#define AIO_DBG_POLL_GAP_US	20000	/* reactor did not run the aio poller */
+
+struct bdev_aio_dbg_stats {
+	uint64_t	ios;
+	uint64_t	inflight_max;
+	uint64_t	submit_max_tsc;
+	uint64_t	submit_slow;
+	uint64_t	submit_eagain;
+	uint64_t	cpl_max_tsc;
+	uint64_t	cpl_slow;
+	uint64_t	sync_max_tsc;
+	uint64_t	sync_slow;
+};
+
 struct bdev_aio_io_channel {
 	uint64_t				io_inflight;
 #ifdef __FreeBSD__
@@ -36,6 +58,7 @@ struct bdev_aio_io_channel {
 #endif
 	struct bdev_aio_group_channel		*group_ch;
 	TAILQ_ENTRY(bdev_aio_io_channel)	link;
+	struct bdev_aio_dbg_stats		dbg;
 };
 
 struct bdev_aio_group_channel {
@@ -46,6 +69,9 @@ struct bdev_aio_group_channel {
 	struct spdk_interrupt			*intr;
 	struct spdk_poller			*poller;
 	TAILQ_HEAD(, bdev_aio_io_channel)	io_ch_head;
+	uint64_t				dbg_last_poll_tsc;
+	uint64_t				dbg_poll_gap_max_tsc;
+	uint64_t				dbg_report_tsc;
 };
 
 struct bdev_aio_task {
@@ -56,7 +82,28 @@ struct bdev_aio_task {
 #endif
 	uint64_t			len;
 	struct bdev_aio_io_channel	*ch;
+	uint64_t			submit_tsc;
 };
+
+static inline uint64_t
+aio_dbg_us_to_tsc(uint64_t us)
+{
+	return us * spdk_get_ticks_hz() / SPDK_SEC_TO_USEC;
+}
+
+static inline double
+aio_dbg_tsc_to_ms(uint64_t tsc)
+{
+	return (double)tsc * 1000.0 / (double)spdk_get_ticks_hz();
+}
+
+static inline const char *
+aio_dbg_thread_name(void)
+{
+	struct spdk_thread *thread = spdk_get_thread();
+
+	return thread ? spdk_thread_get_name(thread) : "none";
+}
 
 struct file_disk {
 	struct bdev_aio_task	*reset_task;
@@ -230,6 +277,7 @@ bdev_aio_rw(enum spdk_bdev_io_type type, struct file_disk *fdisk,
 	    struct iovec *iov, int iovcnt, uint64_t nbytes, uint64_t offset)
 {
 	struct bdev_aio_io_channel *aio_ch = spdk_io_channel_get_ctx(ch);
+	uint64_t submit_tsc;
 	int rc;
 
 	if (type == SPDK_BDEV_IO_TYPE_READ) {
@@ -240,9 +288,16 @@ bdev_aio_rw(enum spdk_bdev_io_type type, struct file_disk *fdisk,
 			      iovcnt, nbytes, offset);
 	}
 
+	aio_task->submit_tsc = spdk_get_ticks();
 	rc = bdev_aio_submit_io(type, fdisk, ch, aio_task, iov, iovcnt, nbytes, offset);
+	submit_tsc = spdk_get_ticks() - aio_task->submit_tsc;
+	aio_ch->dbg.submit_max_tsc = spdk_max(aio_ch->dbg.submit_max_tsc, submit_tsc);
+	if (spdk_unlikely(submit_tsc > aio_dbg_us_to_tsc(AIO_DBG_SUBMIT_SLOW_US))) {
+		aio_ch->dbg.submit_slow++;
+	}
 	if (spdk_unlikely(rc < 0)) {
 		if (rc == -EAGAIN) {
+			aio_ch->dbg.submit_eagain++;
 			spdk_bdev_io_complete(spdk_bdev_io_from_ctx(aio_task), SPDK_BDEV_IO_STATUS_NOMEM);
 		} else {
 			spdk_bdev_io_complete_aio_status(spdk_bdev_io_from_ctx(aio_task), rc);
@@ -250,6 +305,8 @@ bdev_aio_rw(enum spdk_bdev_io_type type, struct file_disk *fdisk,
 		}
 	} else {
 		aio_ch->io_inflight++;
+		aio_ch->dbg.ios++;
+		aio_ch->dbg.inflight_max = spdk_max(aio_ch->dbg.inflight_max, aio_ch->io_inflight);
 	}
 }
 
@@ -452,15 +509,22 @@ bdev_aio_io_channel_poll(struct bdev_aio_io_channel *io_ch)
 	int nr, i, res = 0;
 	struct bdev_aio_task *aio_task;
 	struct io_event events[SPDK_AIO_QUEUE_DEPTH];
+	uint64_t now, lat_tsc;
 
 	nr = bdev_user_io_getevents(io_ch->io_ctx, SPDK_AIO_QUEUE_DEPTH, events);
-	if (nr < 0) {
+	if (nr <= 0) {
 		return 0;
 	}
 
+	now = spdk_get_ticks();
 	for (i = 0; i < nr; i++) {
 		aio_task = events[i].data;
 		aio_task->ch->io_inflight--;
+		lat_tsc = now - aio_task->submit_tsc;
+		io_ch->dbg.cpl_max_tsc = spdk_max(io_ch->dbg.cpl_max_tsc, lat_tsc);
+		if (spdk_unlikely(lat_tsc > aio_dbg_us_to_tsc(AIO_DBG_CPL_SLOW_US))) {
+			io_ch->dbg.cpl_slow++;
+		}
 		if (events[i].res == aio_task->len) {
 			spdk_bdev_io_complete(spdk_bdev_io_from_ctx(aio_task), SPDK_BDEV_IO_STATUS_SUCCESS);
 		} else {
@@ -488,15 +552,57 @@ bdev_aio_io_channel_poll(struct bdev_aio_io_channel *io_ch)
 }
 #endif
 
+static void
+bdev_aio_dbg_report(struct bdev_aio_group_channel *group_ch, uint64_t now)
+{
+	struct bdev_aio_io_channel *io_ch;
+	struct file_disk *fdisk;
+	struct bdev_aio_dbg_stats *s;
+	bool gap = group_ch->dbg_poll_gap_max_tsc > aio_dbg_us_to_tsc(AIO_DBG_POLL_GAP_US);
+
+	TAILQ_FOREACH(io_ch, &group_ch->io_ch_head, link) {
+		s = &io_ch->dbg;
+		if (gap || s->submit_slow || s->submit_eagain || s->cpl_slow || s->sync_slow) {
+			fdisk = spdk_io_channel_get_io_device(spdk_io_channel_from_ctx(io_ch));
+			SPDK_NOTICELOG("AIO_DBG %s thread %s last %ds: ios %" PRIu64 " inflight %" PRIu64 "/max %" PRIu64
+				       " | submit max %.3fms slow(>%dus) %" PRIu64 " eagain %" PRIu64
+				       " | cpl max %.1fms slow(>%dms) %" PRIu64
+				       " | sync(fsync/fallocate) max %.1fms slow %" PRIu64
+				       " | poll gap max %.1fms\n",
+				       fdisk->disk.name, aio_dbg_thread_name(), AIO_DBG_REPORT_SEC,
+				       s->ios, io_ch->io_inflight, s->inflight_max,
+				       aio_dbg_tsc_to_ms(s->submit_max_tsc), AIO_DBG_SUBMIT_SLOW_US, s->submit_slow, s->submit_eagain,
+				       aio_dbg_tsc_to_ms(s->cpl_max_tsc), AIO_DBG_CPL_SLOW_US / 1000, s->cpl_slow,
+				       aio_dbg_tsc_to_ms(s->sync_max_tsc), s->sync_slow,
+				       aio_dbg_tsc_to_ms(group_ch->dbg_poll_gap_max_tsc));
+		}
+		memset(s, 0, sizeof(*s));
+	}
+
+	group_ch->dbg_poll_gap_max_tsc = 0;
+	group_ch->dbg_report_tsc = now;
+}
+
 static int
 bdev_aio_group_poll(void *arg)
 {
 	struct bdev_aio_group_channel *group_ch = arg;
 	struct bdev_aio_io_channel *io_ch;
+	uint64_t now = spdk_get_ticks();
 	int nr = 0;
+
+	if (group_ch->dbg_last_poll_tsc) {
+		group_ch->dbg_poll_gap_max_tsc = spdk_max(group_ch->dbg_poll_gap_max_tsc,
+						 now - group_ch->dbg_last_poll_tsc);
+	}
+	group_ch->dbg_last_poll_tsc = now;
 
 	TAILQ_FOREACH(io_ch, &group_ch->io_ch_head, link) {
 		nr += bdev_aio_io_channel_poll(io_ch);
+	}
+
+	if (spdk_unlikely(now - group_ch->dbg_report_tsc > AIO_DBG_REPORT_SEC * spdk_get_ticks_hz())) {
+		bdev_aio_dbg_report(group_ch, now);
 	}
 
 	return nr > 0 ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
@@ -612,10 +718,24 @@ bdev_aio_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io,
 	}
 }
 
+/* fsync()/fallocate() run synchronously on the reactor, account how long they block it */
+static void
+bdev_aio_dbg_sync_done(struct spdk_io_channel *ch, uint64_t start_tsc)
+{
+	struct bdev_aio_io_channel *aio_ch = spdk_io_channel_get_ctx(ch);
+	uint64_t tsc = spdk_get_ticks() - start_tsc;
+
+	aio_ch->dbg.sync_max_tsc = spdk_max(aio_ch->dbg.sync_max_tsc, tsc);
+	if (spdk_unlikely(tsc > aio_dbg_us_to_tsc(AIO_DBG_SYNC_SLOW_US))) {
+		aio_ch->dbg.sync_slow++;
+	}
+}
+
 static int
 _bdev_aio_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 {
 	struct file_disk *fdisk = (struct file_disk *)bdev_io->bdev->ctxt;
+	uint64_t start_tsc;
 
 	switch (bdev_io->type) {
 	/* Read and write operations must be performed on buffers aligned to
@@ -635,8 +755,10 @@ _bdev_aio_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_i
 		return 0;
 
 	case SPDK_BDEV_IO_TYPE_FLUSH:
+		start_tsc = spdk_get_ticks();
 		bdev_aio_flush((struct file_disk *)bdev_io->bdev->ctxt,
 			       (struct bdev_aio_task *)bdev_io->driver_ctx);
+		bdev_aio_dbg_sync_done(ch, start_tsc);
 		return 0;
 
 	case SPDK_BDEV_IO_TYPE_RESET:
@@ -646,11 +768,15 @@ _bdev_aio_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_i
 
 #ifndef __FreeBSD__
 	case SPDK_BDEV_IO_TYPE_UNMAP:
+		start_tsc = spdk_get_ticks();
 		bdev_aio_unmap(bdev_io);
+		bdev_aio_dbg_sync_done(ch, start_tsc);
 		return 0;
 
 	case SPDK_BDEV_IO_TYPE_WRITE_ZEROES:
+		start_tsc = spdk_get_ticks();
 		bdev_aio_write_zeros(bdev_io);
+		bdev_aio_dbg_sync_done(ch, start_tsc);
 		return 0;
 #endif
 
@@ -876,6 +1002,7 @@ bdev_aio_group_create_cb(void *io_device, void *ctx_buf)
 		}
 	}
 
+	ch->dbg_report_tsc = spdk_get_ticks();
 	ch->poller = SPDK_POLLER_REGISTER(bdev_aio_group_poll, ch, 0);
 	spdk_poller_register_interrupt(ch->poller, NULL, NULL);
 

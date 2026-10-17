@@ -265,6 +265,14 @@ struct spdk_nvmf_tcp_req  {
 	uint64_t 				time;
 	struct time_per_state	tps;
 
+	/* Debug: split of state 6 for the delay-qpair print. R2T queued -> R2T written
+	 * to the socket -> first H2C header received -> last H2C header received. */
+	uint64_t				dbg_r2t_tsc;
+	uint64_t				dbg_r2t_sent_tsc;
+	uint64_t				dbg_h2c_first_tsc;
+	uint64_t				dbg_h2c_last_tsc;
+	uint32_t				dbg_h2c_pdus;
+
 	STAILQ_ENTRY(spdk_nvmf_tcp_req)		link;
 	TAILQ_ENTRY(spdk_nvmf_tcp_req)		state_link;
 	TAILQ_ENTRY(spdk_nvmf_tcp_req)		queued_link;
@@ -344,6 +352,9 @@ struct spdk_nvmf_tcp_qpair {
 	uint64_t 				time;
 	bool					rejected;
 	bool					in_rejection;
+
+	/* Debug: last time any byte was read from this socket */
+	uint64_t				dbg_last_rx_tsc;
 };
 
 struct spdk_nvmf_tcp_control_msg {
@@ -366,7 +377,32 @@ struct spdk_nvmf_tcp_poll_group {
 	struct spdk_io_channel			*accel_channel;
 	struct spdk_nvmf_tcp_control_msg_list	*control_msg_list;
 	TAILQ_ENTRY(spdk_nvmf_tcp_poll_group)	link;
+
+	/* Debug: gap between two polls of this group (reactor stall detector).
+	 * Max is kept per 1s window, the previous window is kept for the delay print. */
+	uint64_t				dbg_last_poll_tsc;
+	uint64_t				dbg_gap_max_tsc;
+	uint64_t				dbg_gap_prev_max_tsc;
+	uint64_t				dbg_gap_window_tsc;
+	uint64_t				dbg_stall_report_tsc;
 };
+
+/* Debug: report a poll group stall above this, at most once per second per group */
+#define NVMF_TCP_DBG_STALL_US	50000
+
+static inline double
+nvmf_tcp_dbg_tsc_to_ms(uint64_t tsc)
+{
+	return (double)tsc * 1000.0 / (double)spdk_get_ticks_hz();
+}
+
+static inline const char *
+nvmf_tcp_dbg_thread_name(void)
+{
+	struct spdk_thread *thread = spdk_get_thread();
+
+	return thread ? spdk_thread_get_name(thread) : "none";
+}
 
 struct spdk_nvmf_tcp_port {
 	const struct spdk_nvme_transport_id	*trid;
@@ -2112,6 +2148,12 @@ nvmf_tcp_h2c_data_hdr_handle(struct spdk_nvmf_tcp_transport *ttransport,
 
 	pdu->req = tcp_req;
 
+	tcp_req->dbg_h2c_last_tsc = spdk_get_ticks();
+	if (tcp_req->dbg_h2c_first_tsc == 0) {
+		tcp_req->dbg_h2c_first_tsc = tcp_req->dbg_h2c_last_tsc;
+	}
+	tcp_req->dbg_h2c_pdus++;
+
 	if (spdk_unlikely(tcp_req->req.dif_enabled)) {
 		pdu->dif_ctx = &tcp_req->req.dif.dif_ctx;
 	}
@@ -2200,6 +2242,7 @@ nvmf_tcp_r2t_complete(void *cb_arg)
 	tqpair = SPDK_CONTAINEROF(tcp_req->req.qpair, struct spdk_nvmf_tcp_qpair, qpair);
 	ttransport = SPDK_CONTAINEROF(tcp_req->req.qpair->transport,
 				      struct spdk_nvmf_tcp_transport, transport);
+	tcp_req->dbg_r2t_sent_tsc = spdk_get_ticks();
 	tcp_req->tps.time_per_state[tcp_req->state] = spdk_get_ticks() - tcp_req->tps.time_per_state[tcp_req->state];
 	nvmf_tcp_req_set_state(tcp_req, TCP_REQUEST_STATE_TRANSFERRING_HOST_TO_CONTROLLER);
 	if (tcp_req->tps.state[TCP_REQUEST_STATE_TRANSFERRING_HOST_TO_CONTROLLER] == 0) {
@@ -2245,6 +2288,7 @@ nvmf_tcp_send_r2t_pdu(struct spdk_nvmf_tcp_qpair *tqpair,
 	r2t->ttag = tcp_req->ttag;
 	r2t->r2to = tcp_req->h2c_offset;
 	r2t->r2tl = tcp_req->req.length;
+	tcp_req->dbg_r2t_tsc = spdk_get_ticks();
 	tcp_req->tps.time_per_state[tcp_req->state] = spdk_get_ticks() - tcp_req->tps.time_per_state[tcp_req->state];
 	nvmf_tcp_req_set_state(tcp_req, TCP_REQUEST_STATE_AWAITING_R2T_ACK);
 	if (tcp_req->tps.state[TCP_REQUEST_STATE_AWAITING_R2T_ACK] == 0) {
@@ -2710,6 +2754,7 @@ nvmf_tcp_sock_process(struct spdk_nvmf_tcp_qpair *tqpair)
 				nvmf_tcp_qpair_set_recv_state(tqpair, NVME_TCP_PDU_RECV_STATE_QUIESCING);
 				break;
 			} else if (rc > 0) {
+				tqpair->dbg_last_rx_tsc = spdk_get_ticks();
 				pdu->ch_valid_bytes += rc;
 				spdk_trace_record(TRACE_TCP_READ_FROM_SOCKET_DONE, tqpair->qpair.trace_id, rc, 0);
 			}
@@ -2733,6 +2778,7 @@ nvmf_tcp_sock_process(struct spdk_nvmf_tcp_qpair *tqpair)
 				nvmf_tcp_qpair_set_recv_state(tqpair, NVME_TCP_PDU_RECV_STATE_QUIESCING);
 				break;
 			} else if (rc > 0) {
+				tqpair->dbg_last_rx_tsc = spdk_get_ticks();
 				spdk_trace_record(TRACE_TCP_READ_FROM_SOCKET_DONE, tqpair->qpair.trace_id, rc, 0);
 				pdu->psh_valid_bytes += rc;
 			}
@@ -2769,6 +2815,9 @@ nvmf_tcp_sock_process(struct spdk_nvmf_tcp_qpair *tqpair)
 			if (rc < 0) {
 				nvmf_tcp_qpair_set_recv_state(tqpair, NVME_TCP_PDU_RECV_STATE_QUIESCING);
 				break;
+			}
+			if (rc > 0) {
+				tqpair->dbg_last_rx_tsc = spdk_get_ticks();
 			}
 			pdu->rw_offset += rc;
 
@@ -3300,10 +3349,28 @@ check_time(struct spdk_nvmf_tcp_req *tcp_req, struct spdk_nvmf_tcp_qpair *tqpair
 			char *uuid = spdk_nvmf_request_nqn(&tcp_req->req, 0);
 			uuid = (uuid) ? uuid : ""; // Handle NULL UUID
 			double duration_us = ((double)(current - tcp_req->time) * 1000.0) / (double)ticks_hz;
+			struct spdk_nvmf_tcp_poll_group *tgroup = tqpair->group;
+			char h2c[160] = "r2t none";
+
+			/* Split of state 6: r2t_write = R2T queued until written to the socket,
+			 * wait_h2c = R2T written until the first H2C header arrived (host side),
+			 * h2c_span = first to last H2C header. */
+			if (tcp_req->dbg_r2t_tsc) {
+				snprintf(h2c, sizeof(h2c), "r2t_write %.3fms wait_h2c %.3fms h2c_span %.3fms h2c_pdus %u",
+					 tcp_req->dbg_r2t_sent_tsc ? nvmf_tcp_dbg_tsc_to_ms(tcp_req->dbg_r2t_sent_tsc - tcp_req->dbg_r2t_tsc) : -1.0,
+					 (tcp_req->dbg_r2t_sent_tsc && tcp_req->dbg_h2c_first_tsc) ?
+					 nvmf_tcp_dbg_tsc_to_ms(tcp_req->dbg_h2c_first_tsc - tcp_req->dbg_r2t_sent_tsc) : -1.0,
+					 tcp_req->dbg_h2c_first_tsc ? nvmf_tcp_dbg_tsc_to_ms(tcp_req->dbg_h2c_last_tsc - tcp_req->dbg_h2c_first_tsc) : -1.0,
+					 tcp_req->dbg_h2c_pdus);
+			}
 			// Log relevant information
-			SPDK_NOTICELOG("delay-qpair %p ttag %d (QID %d) cp %d sp %d, state %d, time %.2f (ms), nqn %s\n",
+			SPDK_NOTICELOG("delay-qpair %p ttag %d (QID %d) cp %d sp %d, state %d, time %.2f (ms), %s, "
+				"last_rx %.1fms ago, pg_gap_max %.1fms, nqn %s\n",
 				tqpair, tcp_req->ttag, tqpair->qpair.qid, tqpair->initiator_port,
-				tqpair->target_port, tcp_req->state, duration_us, uuid);
+				tqpair->target_port, tcp_req->state, duration_us, h2c,
+				tqpair->dbg_last_rx_tsc ? nvmf_tcp_dbg_tsc_to_ms(current - tqpair->dbg_last_rx_tsc) : -1.0,
+				tgroup ? nvmf_tcp_dbg_tsc_to_ms(spdk_max(tgroup->dbg_gap_max_tsc, tgroup->dbg_gap_prev_max_tsc)) : -1.0,
+				uuid);
 			nvmf_tcp_dump_delay_req_status(tcp_req, tqpair);
 			spdk_nvme_print_command_s(tqpair->qpair.qid, &tcp_req->cmd);
 
@@ -3366,6 +3433,11 @@ nvmf_tcp_req_process(struct spdk_nvmf_tcp_transport *ttransport,
 			spdk_trace_record(TRACE_TCP_REQUEST_STATE_NEW, tqpair->qpair.trace_id, 0, (uintptr_t)tcp_req,
 					  tqpair->qpair.queue_depth);
 			tcp_req->time = spdk_get_ticks();
+			tcp_req->dbg_r2t_tsc = 0;
+			tcp_req->dbg_r2t_sent_tsc = 0;
+			tcp_req->dbg_h2c_first_tsc = 0;
+			tcp_req->dbg_h2c_last_tsc = 0;
+			tcp_req->dbg_h2c_pdus = 0;
 			tcp_req->tps.state[TCP_REQUEST_STATE_NEW] = 1;
 			tcp_req->tps.time_per_state[TCP_REQUEST_STATE_NEW] = spdk_get_ticks();
 			/* copy the cmd from the receive pdu */
@@ -3941,6 +4013,39 @@ nvmf_tcp_close_qpair(struct spdk_nvmf_qpair *qpair,
 	nvmf_tcp_qpair_destroy(tqpair);
 }
 
+/* Debug: the poll group is polled every reactor iteration, so a large gap
+ * between two polls means the reactor was blocked by something else */
+static void
+nvmf_tcp_dbg_poll_gap(struct spdk_nvmf_tcp_poll_group *tgroup)
+{
+	uint64_t now = spdk_get_ticks();
+	uint64_t hz = spdk_get_ticks_hz();
+	uint64_t gap;
+
+	if (spdk_unlikely(tgroup->dbg_last_poll_tsc == 0)) {
+		tgroup->dbg_last_poll_tsc = now;
+		tgroup->dbg_gap_window_tsc = now;
+		return;
+	}
+
+	gap = now - tgroup->dbg_last_poll_tsc;
+	tgroup->dbg_last_poll_tsc = now;
+	tgroup->dbg_gap_max_tsc = spdk_max(tgroup->dbg_gap_max_tsc, gap);
+
+	if (spdk_unlikely(gap > NVMF_TCP_DBG_STALL_US * hz / SPDK_SEC_TO_USEC &&
+			  (tgroup->dbg_stall_report_tsc == 0 || now - tgroup->dbg_stall_report_tsc > hz))) {
+		tgroup->dbg_stall_report_tsc = now;
+		SPDK_NOTICELOG("NVMF_TCP_DBG poll group %p thread %s stalled %.1fms\n",
+			       tgroup, nvmf_tcp_dbg_thread_name(), nvmf_tcp_dbg_tsc_to_ms(gap));
+	}
+
+	if (now - tgroup->dbg_gap_window_tsc > hz) {
+		tgroup->dbg_gap_prev_max_tsc = tgroup->dbg_gap_max_tsc;
+		tgroup->dbg_gap_max_tsc = 0;
+		tgroup->dbg_gap_window_tsc = now;
+	}
+}
+
 static int
 nvmf_tcp_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 {
@@ -3950,6 +4055,8 @@ nvmf_tcp_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 	int num_events;
 
 	tgroup = SPDK_CONTAINEROF(group, struct spdk_nvmf_tcp_poll_group, group);
+
+	nvmf_tcp_dbg_poll_gap(tgroup);
 
 	if (spdk_unlikely(TAILQ_EMPTY(&tgroup->qpairs))) {
 		return 0;
