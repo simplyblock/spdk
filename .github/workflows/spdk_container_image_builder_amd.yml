@@ -19,6 +19,16 @@ jobs:
     - name: Set branch name from triggered workflow
       run: echo "BRANCH_NAME=${{ github.event.workflow_run.head_branch }}" >> $GITHUB_ENV
 
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_HAMDI }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_HAMDI }}
+        aws-region: us-east-1
+
+    - name: Login to ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
 
     - name: Build the docker image
       run: docker build --file docker/Dockerfile_spdk --tag simplyblock/spdk-core:$BRANCH_NAME-amd64 .
@@ -31,17 +41,6 @@ jobs:
 
     - name: Push Images
       run: docker push simplyblock/spdk-core:$BRANCH_NAME-amd64
-
-    - name: Configure AWS Credentials
-      uses: aws-actions/configure-aws-credentials@v1
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_HAMDI }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_HAMDI }}
-        aws-region: us-east-1
-
-    - name: Login to ECR
-      id: login-ecr
-      uses: aws-actions/amazon-ecr-login@v2
 
     - name: Tag docker image
       run: docker tag simplyblock/spdk-core:$BRANCH_NAME-amd64 565979732541.dkr.ecr.us-east-1.amazonaws.com/spdk-core:$BRANCH_NAME-amd64
