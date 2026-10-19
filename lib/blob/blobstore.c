@@ -4036,6 +4036,9 @@ blob_write_copy_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 #define BLOB_COW_SCAN_UNIT	SPDK_BS_PAGE_SIZE	/* zero check granularity */
 #define BLOB_COW_MAX_WRITES	64		/* more ranges than this: write the whole cluster */
 
+/* Off for now (testing): CoW writes the whole cluster, zero parts included. */
+static bool g_blob_cow_skip_zero_ranges = false;
+
 static bool
 bs_data_unit_is_zero(const void *buf, size_t len)
 {
@@ -4109,10 +4112,12 @@ blob_write_copy(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 
 	cluster_lba = bs_cluster_to_lba(bs, ctx->new_cluster);
 
-	nranges = spdk_bs_find_data_ranges(ctx->buf, bs->cluster_sz, BLOB_COW_SCAN_UNIT, 0,
-					   ranges, BLOB_COW_MAX_WRITES);
+	nranges = g_blob_cow_skip_zero_ranges ?
+		  spdk_bs_find_data_ranges(ctx->buf, bs->cluster_sz, BLOB_COW_SCAN_UNIT, 0,
+					   ranges, BLOB_COW_MAX_WRITES) : -1;
 	if (nranges < 0) {
-		/* Data is spread over the cluster: write whole cluster */
+		/* Data is spread over the cluster, or zero parts are not skipped:
+		 * write whole cluster */
 		bs_sequence_write_dev(seq, ctx->buf, cluster_lba, bs_cluster_to_lba(bs, 1),
 				      blob_write_copy_cpl, ctx);
 		return;
@@ -8541,6 +8546,11 @@ struct bs_clear_free_clusters_ctx {
  * lvol poll group RPC, before any blobstore is used. */
 static uint32_t g_bs_cluster_alloc_threads;
 
+/* Off for now (testing): taking leadership (0 -> 1 set-leader, or the failover
+ * update) does not unmap the lowest free clusters. CoW writes whole clusters
+ * meanwhile (g_blob_cow_skip_zero_ranges). */
+static bool g_bs_clear_free_clusters_on_leader = false;
+
 void
 spdk_bs_set_cluster_alloc_threads(uint32_t num_threads)
 {
@@ -8604,6 +8614,13 @@ bs_clear_free_clusters(struct spdk_blob_store *bs, spdk_bs_sequence_t *seq,
 	const uint32_t max_len = spdk_max(2048 / bs_cluster_to_lba(bs, 1), 1);
 
 	assert(spdk_get_thread() == bs->md_thread);
+
+	if (!g_bs_clear_free_clusters_on_leader) {
+		SPDK_NOTICELOG("Unmap of the lowest free clusters on taking leadership is disabled, "
+			       "skipping\n");
+		cb_fn(seq, cb_arg, 0);
+		return;
+	}
 
 	max = bs_num_clear_clusters();
 	ctx = calloc(1, sizeof(*ctx));
