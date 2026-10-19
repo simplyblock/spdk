@@ -40,6 +40,40 @@ blob_check_io_inflaight(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, voi
 DEFINE_STUB(spdk_bdev_get_name, const char *, (const struct spdk_bdev *bdev), NULL);
 DEFINE_STUB(spdk_bdev_get_by_name, struct spdk_bdev *, (const char *name), NULL);
 DEFINE_STUB(spdk_blob_get_freeze_cnt, int, (struct spdk_blob *blob), 0);
+/* Same contract as the blobstore one (lib/blob is not linked here): ranges of
+ * non-zero units, a zero unit ends a range, -1 when there are more than
+ * max_ranges. */
+int
+spdk_bs_find_data_ranges(const void *buf, uint64_t len, uint32_t unit_size,
+			 uint64_t max_range_len, struct spdk_bs_data_range *ranges, int max_ranges)
+{
+	const uint8_t *p = buf;
+	uint64_t off, i;
+	int nranges = 0;
+	bool zero;
+
+	for (off = 0; off < len; off += unit_size) {
+		zero = true;
+		for (i = 0; i < unit_size && zero; i++) {
+			zero = p[off + i] == 0;
+		}
+		if (zero) {
+			continue;
+		}
+		if (nranges > 0 && ranges[nranges - 1].end == off &&
+		    (max_range_len == 0 || off - ranges[nranges - 1].start < max_range_len)) {
+			ranges[nranges - 1].end = off + unit_size;
+			continue;
+		}
+		if (nranges == max_ranges) {
+			return -1;
+		}
+		ranges[nranges].start = off;
+		ranges[nranges].end = off + unit_size;
+		nranges++;
+	}
+	return nranges;
+}
 DEFINE_STUB(spdk_bdev_create_bs_dev_ro, int,
 	    (const char *bdev_name, spdk_bdev_event_cb_t event_cb, void *event_ctx,
 	     struct spdk_bs_dev **bs_dev), -ENOTSUP);
@@ -63,14 +97,40 @@ DEFINE_STUB_V(spdk_blob_io_read, (struct spdk_blob *blob, struct spdk_io_channel
 DEFINE_STUB_V(spdk_blob_io_write, (struct spdk_blob *blob, struct spdk_io_channel *channel,
 		   void *payload, uint64_t offset, uint64_t length,
 		   spdk_blob_op_complete cb_fn, void *cb_arg));
-DEFINE_STUB_V(prepare_s3_clusters, (struct spdk_blob* blob, uint64_t *clusters, uint32_t num_clusters, int *count));
+DEFINE_STUB_V(spdk_blob_scan_used_clusters, (struct spdk_blob* blob, uint64_t *clusters, uint32_t num_clusters, int *count));
 
 DEFINE_STUB(spdk_bs_for_each_loaded_blob, int,(struct spdk_blob_store *bs,
 			     spdk_bs_loaded_blob_fn fn, void *cb_arg), 0);
 
-DEFINE_STUB(spdk_bdev_write_blocks, int,
-	    (struct spdk_bdev_desc *desc, struct spdk_io_channel *ch, void *buf, uint64_t offset_blocks,
-	     uint64_t num_blocks, spdk_bdev_io_completion_cb cb, void *cb_arg), 0);
+/* Records the remote writes (the transfer tests check them); returns
+ * g_ut_bdev_write_rc from write number g_ut_bdev_write_fail_at on (0: never). */
+#define UT_BDEV_WRITES_MAX 64
+struct ut_bdev_write {
+	void		*buf;
+	uint64_t	offset_blocks;
+	uint64_t	num_blocks;
+};
+static struct ut_bdev_write g_ut_bdev_writes[UT_BDEV_WRITES_MAX];
+static uint32_t g_ut_bdev_write_cnt;
+static uint32_t g_ut_bdev_write_fail_at;
+static int g_ut_bdev_write_rc;
+
+int
+spdk_bdev_write_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch, void *buf,
+		       uint64_t offset_blocks, uint64_t num_blocks, spdk_bdev_io_completion_cb cb,
+		       void *cb_arg)
+{
+	if (g_ut_bdev_write_fail_at != 0 && g_ut_bdev_write_cnt + 1 >= g_ut_bdev_write_fail_at) {
+		return g_ut_bdev_write_rc;
+	}
+	if (g_ut_bdev_write_cnt < UT_BDEV_WRITES_MAX) {
+		g_ut_bdev_writes[g_ut_bdev_write_cnt].buf = buf;
+		g_ut_bdev_writes[g_ut_bdev_write_cnt].offset_blocks = offset_blocks;
+		g_ut_bdev_writes[g_ut_bdev_write_cnt].num_blocks = num_blocks;
+	}
+	g_ut_bdev_write_cnt++;
+	return 0;
+}
 DEFINE_STUB(spdk_bdev_unmap_blocks, int,
 	    (struct spdk_bdev_desc *desc, struct spdk_io_channel *ch, uint64_t offset_blocks,
 	     uint64_t num_blocks, spdk_bdev_io_completion_cb cb, void *cb_arg), 0);
@@ -3883,13 +3943,22 @@ spdk_bs_activate_md_journal(struct spdk_blob_store *bs, bool state, bool lvs_sta
 
 /* A small model of the nvmf target for the fence's ANA change (review on #76, point 4):
  * one target, subsystems with one listener each. */
+#define HA_MAX_GRP 4
 struct ha_fake_subsys {
 	char				nqn[64];
 	struct spdk_nvme_transport_id	trid;
-	enum spdk_nvme_ana_state	state;
+	enum spdk_nvme_ana_state	state;		/* ANA group 1 */
+	enum spdk_nvme_ana_state	grp_more[HA_MAX_GRP - 1];	/* ANA groups 2.. */
+	uint32_t			n_grp;
 	bool				ana_reporting;
 	int				paused;
 };
+
+static enum spdk_nvme_ana_state *
+ha_grp(struct ha_fake_subsys *s, uint32_t anagrpid)
+{
+	return anagrpid == 1 ? &s->state : &s->grp_more[anagrpid - 2];
+}
 #define HA_MAX_SUBSYS 4
 static struct ha_fake_subsys g_ha_subsys[HA_MAX_SUBSYS];
 static int g_ha_n_subsys;
@@ -3907,6 +3976,7 @@ ha_add_subsys(const char *nqn, uint16_t port, enum spdk_nvme_ana_state state)
 	snprintf(s->trid.traddr, sizeof(s->trid.traddr), "10.0.0.1");
 	snprintf(s->trid.trsvcid, sizeof(s->trid.trsvcid), "%u", port);
 	s->state = state;
+	s->n_grp = 1;
 	s->ana_reporting = true;
 }
 
@@ -3915,6 +3985,9 @@ ha_reset_nvmf(void)
 {
 	poll_threads();
 	memset(g_ha_subsys, 0, sizeof(g_ha_subsys));
+	for (int i = 0; i < LVS_HA_ANA_MAX_SAVED; i++) {
+		free(g_lvs_ha_ana_saved[i].states);
+	}
 	memset(g_lvs_ha_ana_saved, 0, sizeof(g_lvs_ha_ana_saved));
 	g_ha_n_subsys = 0;
 	g_ha_pause_busy = 0;
@@ -4017,8 +4090,19 @@ spdk_nvmf_subsystem_get_ana_state(struct spdk_nvmf_subsystem *subsystem,
 				  const struct spdk_nvme_transport_id *trid, uint32_t anagrpid,
 				  enum spdk_nvme_ana_state *ana_state)
 {
-	*ana_state = ((struct ha_fake_subsys *)subsystem)->state;
+	struct ha_fake_subsys *s = (struct ha_fake_subsys *)subsystem;
+
+	if (anagrpid == 0 || anagrpid > s->n_grp) {
+		return -EINVAL;
+	}
+	*ana_state = *ha_grp(s, anagrpid);
 	return 0;
+}
+
+uint32_t
+spdk_nvmf_subsystem_get_max_nsid(struct spdk_nvmf_subsystem *subsystem)
+{
+	return ((struct ha_fake_subsys *)subsystem)->n_grp;
 }
 
 void
@@ -4030,8 +4114,14 @@ spdk_nvmf_subsystem_set_ana_state(struct spdk_nvmf_subsystem *subsystem,
 	struct ha_fake_subsys *s = (struct ha_fake_subsys *)subsystem;
 
 	CU_ASSERT(s->paused == 1);
-	CU_ASSERT(anagrpid == 0);
-	s->state = ana_state;
+	CU_ASSERT(anagrpid <= s->n_grp);
+	if (anagrpid == 0) {
+		for (uint32_t g = 1; g <= s->n_grp; g++) {
+			*ha_grp(s, g) = ana_state;
+		}
+	} else {
+		*ha_grp(s, anagrpid) = ana_state;
+	}
 	g_ha_set_ana_cnt++;
 	cb_fn(cb_arg, 0);
 }
@@ -4185,6 +4275,46 @@ lvol_ha_release_grant(void)
 	CU_ASSERT(g_ha_port_block_cnt == 0);
 	/* NULL callback is allowed. */
 	CU_ASSERT(spdk_lvs_ha_release(13, NULL, NULL) == 0);
+	/* A leader never redirected; its hublvol state is left alone (F19). */
+	CU_ASSERT(lvs->skip_redirecting == false);
+	CU_ASSERT(lvs->hub_dev.drain_in_action == false);
+	ha_free_lvs(lvs);
+}
+
+/* Campaign c8, F19: a grant on a non-leader secondary stops the hublvol redirect to the
+ * lost peer at once (the hublvol failure path's state), so the next IO takes over instead
+ * of waiting for the hublvol controller's keep-alive. */
+static void
+lvol_ha_release_stops_redirect_on_secondary(void)
+{
+	struct spdk_lvol_store *lvs = ha_alloc_lvs(30, false, NODE_SECONDARY);
+
+	lvs->hub_dev.state = HUBLVOL_CONNECTED;
+	CU_ASSERT(spdk_lvs_ha_release(30, NULL, NULL) == 0);
+	CU_ASSERT(lvs->skip_redirecting == true);
+	/* Review on #81: drain_in_action is not set by the grant. */
+	CU_ASSERT(lvs->hub_dev.drain_in_action == false);
+	/* No port touched, no takeover latch: the survivor is granted, not fenced. */
+	CU_ASSERT(g_ha_port_block_cnt == 0);
+	CU_ASSERT(lvs->ha_takeover_blocked == false);
+	/* Idempotent: a second grant changes nothing. */
+	CU_ASSERT(spdk_lvs_ha_release(30, NULL, NULL) == 0);
+	CU_ASSERT(lvs->skip_redirecting == true);
+	CU_ASSERT(lvs->hub_dev.drain_in_action == false);
+	ha_free_lvs(lvs);
+
+	/* A primary that is not (yet) leader keeps its state: primaries never redirect. */
+	lvs = ha_alloc_lvs(31, false, NODE_PRIMARY);
+	CU_ASSERT(spdk_lvs_ha_release(31, NULL, NULL) == 0);
+	CU_ASSERT(lvs->skip_redirecting == false);
+	CU_ASSERT(lvs->hub_dev.drain_in_action == false);
+	ha_free_lvs(lvs);
+
+	/* A failover already in progress (drain_in_action) is not touched. */
+	lvs = ha_alloc_lvs(32, false, NODE_SECONDARY);
+	lvs->hub_dev.drain_in_action = true;
+	CU_ASSERT(spdk_lvs_ha_release(32, NULL, NULL) == 0);
+	CU_ASSERT(lvs->skip_redirecting == false);
 	ha_free_lvs(lvs);
 }
 
@@ -4582,6 +4712,39 @@ lvol_ha_ana_respects_foreign_changes(void)
 	ha_free_lvs(lvs);
 }
 
+/* Campaign c7b, F18: the fence sets every ANA group of the listener inaccessible, so the
+ * unfence restores every group to its own previous state; a group the control plane set
+ * meanwhile is kept. Before, only group 1 was saved and checked, and when the control plane
+ * had already set group 1, groups 2.. stayed inaccessible. */
+static void
+lvol_ha_ana_restores_every_group(void)
+{
+	struct spdk_lvol_store *lvs = ha_alloc_lvs(36, false, NODE_SECONDARY);
+	struct ha_fake_subsys *s;
+
+	ha_reset_nvmf();
+	ha_add_subsys("nqn.ha:shared", 4420, SPDK_NVME_ANA_OPTIMIZED_STATE);
+	s = &g_ha_subsys[0];
+	s->n_grp = 3;
+	s->grp_more[0] = SPDK_NVME_ANA_NON_OPTIMIZED_STATE;	/* group 2 */
+	s->grp_more[1] = SPDK_NVME_ANA_OPTIMIZED_STATE;		/* group 3 */
+
+	CU_ASSERT(spdk_lvs_ha_fence(36, NULL, NULL) == 0);
+	poll_threads();
+	CU_ASSERT(s->state == SPDK_NVME_ANA_INACCESSIBLE_STATE);
+	CU_ASSERT(s->grp_more[0] == SPDK_NVME_ANA_INACCESSIBLE_STATE);
+	CU_ASSERT(s->grp_more[1] == SPDK_NVME_ANA_INACCESSIBLE_STATE);
+
+	s->state = SPDK_NVME_ANA_NON_OPTIMIZED_STATE;	/* the control plane set group 1 */
+	CU_ASSERT(spdk_lvs_ha_unfence(36) == 0);
+	poll_threads();
+	CU_ASSERT(s->state == SPDK_NVME_ANA_NON_OPTIMIZED_STATE);	/* kept */
+	CU_ASSERT(s->grp_more[0] == SPDK_NVME_ANA_NON_OPTIMIZED_STATE);	/* restored */
+	CU_ASSERT(s->grp_more[1] == SPDK_NVME_ANA_OPTIMIZED_STATE);	/* restored */
+	CU_ASSERT(s->paused == 0);
+	ha_free_lvs(lvs);
+}
+
 /* END two-node arbitration */
 
 
@@ -4702,6 +4865,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, lvol_ha_unknown_groupid);
 	CU_ADD_TEST(suite, lvol_ha_hold_leader_once);
 	CU_ADD_TEST(suite, lvol_ha_release_grant);
+	CU_ADD_TEST(suite, lvol_ha_release_stops_redirect_on_secondary);
 	CU_ADD_TEST(suite, lvol_ha_fence);
 	CU_ADD_TEST(suite, lvol_ha_unfence);
 	CU_ADD_TEST(suite, lvol_ha_refence_then_unfence);
@@ -4718,6 +4882,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, lvol_ha_fence_sets_ana_inaccessible);
 	CU_ADD_TEST(suite, lvol_ha_primary_ana_restored_on_leadership);
 	CU_ADD_TEST(suite, lvol_ha_ana_respects_foreign_changes);
+	CU_ADD_TEST(suite, lvol_ha_ana_restores_every_group);
 
 	suite = CU_add_suite("lvol", NULL, NULL);
 

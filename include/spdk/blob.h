@@ -102,6 +102,9 @@ enum xfer_state {
 	XFER_STATE_RECOVER_CLUSTERS,
 	XFER_STATE_DONE,
 	XFER_STATE_FAILED,
+	/* Destination clusters are allocated before any data is sent
+	 * (migration and replication). */
+	XFER_STATE_ALLOC_CLUSTERS,
 };
 
 enum req_action {
@@ -493,12 +496,65 @@ void spdk_bs_set_cluster_alloc_threads(uint32_t num_threads);
 node_role_t node_role_from_string(const char *str);
 const char *node_role_to_string(node_role_t role);
 void spdk_bs_set_read_only(struct spdk_blob_store *bs, bool state);
-void prepare_s3_clusters(struct spdk_blob* blob, uint64_t *clusters, uint32_t num_clusters, int *count);
+void spdk_blob_scan_used_clusters(struct spdk_blob* blob, uint64_t *clusters, uint32_t num_clusters, int *count);
 
 bool spdk_blob_get_offset_allocate(struct spdk_blob *blob, uint64_t offset);
 bool spdk_blob_check_offset_valid(struct spdk_blob *blob, uint64_t offset, uint64_t length);
-int spdk_read_cluster_data_xfer(struct spdk_blob *blob, void *buf, uint64_t offset, 
+int spdk_read_cluster_data_xfer(struct spdk_blob *blob, void *buf, uint64_t offset,
 			uint64_t length, enum xfer_type type, spdk_blob_op_complete cb_fn, void *cb_arg);
+
+/* Clusters covered by one extent page (SPDK_EXTENTS_PER_EP; checked at build). */
+#define SPDK_BLOB_CLUSTERS_PER_EXTENT_PAGE	512
+
+/* A run of neighbouring data units in a buffer, in bytes. */
+struct spdk_bs_data_range {
+	uint64_t	start;	/* byte offset in the buffer */
+	uint64_t	end;	/* byte offset after the range */
+};
+
+/**
+ * Find the parts of a buffer that hold data. The buffer is checked in units of
+ * unit_size bytes; a unit that is all zero ends the current range, and the next
+ * unit with data starts a new one. A range that reaches max_range_len bytes
+ * ends there too, so every range fits in one write.
+ *
+ * \param buf Buffer to scan.
+ * \param len Buffer length in bytes, a multiple of unit_size.
+ * \param unit_size Zero check granularity in bytes, a multiple of 8.
+ * \param max_range_len Largest range in bytes, a multiple of unit_size; 0 for
+ * no limit.
+ * \param ranges Array that receives the ranges.
+ * \param max_ranges Size of the ranges array.
+ *
+ * \return number of ranges (0 when the buffer is all zero), or -1 when the
+ * buffer has more than max_ranges ranges.
+ */
+int spdk_bs_find_data_ranges(const void *buf, uint64_t len, uint32_t unit_size,
+			     uint64_t max_range_len, struct spdk_bs_data_range *ranges,
+			     int max_ranges);
+
+/**
+ * Allocate the given clusters of a blob without writing data to them, the way a
+ * thick blob is allocated: claim them all in one pass, write each touched extent
+ * page once, sync the md when a new extent page was claimed. A new cluster
+ * reads as zeroes. Clusters that are already allocated are skipped, so the call
+ * can be repeated. Completes after the cluster map is persistent.
+ *
+ * Must be called on the blobstore md thread.
+ *
+ * \param blob Blob to allocate clusters for.
+ * \param clusters Cluster indexes in the blob. Not copied: must stay valid until
+ * cb_fn is called.
+ * \param count Number of entries in clusters.
+ * \param cb_fn Called on the md thread when all clusters are allocated or one failed:
+ * all or nothing: on any error no cluster of this call stays allocated.
+ * -ENOSPC no free cluster, -EBUSY the blob is
+ * frozen or one of its extent pages is being written (nothing done, try again),
+ * -EINVAL index out of range, -EPERM read-only blob.
+ * \param cb_arg Argument for cb_fn.
+ */
+void spdk_blob_alloc_clusters(struct spdk_blob *blob, const uint32_t *clusters, uint32_t count,
+			      spdk_blob_op_complete cb_fn, void *cb_arg);
 void spdk_bs_chain_snapshot_clone(struct spdk_blob *origblob, struct spdk_blob *clone,
 				 bool leader, bool update_in_progress,
 			    spdk_blob_op_complete cb_fn, void *cb_arg);
