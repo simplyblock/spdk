@@ -321,10 +321,11 @@ bs_md_journal_read_on_examine(struct spdk_bs_md_journal *jr,
 	}
 
 	/*
-	 * The hash table is a read overlay only while EXAMINE recovery
-	 * is active.
+	 * The hash table is a read overlay while EXAMINE is active: during the
+	 * examine read and after it, until the set-leader call uses or drops
+	 * the examine result (see bs_md_journal_examine_complete()).
 	 */
-	if (!jr->recovering || !jr->examine) {
+	if (!jr->examine) {
 		return false;
 	}
 
@@ -2042,11 +2043,55 @@ error:
 	return -ENOMEM;
 }
 
+/*
+ * The examine result: after the examine read, until the set-leader call.
+ *
+ * Examine is always followed by the set-leader RPC (0 -> 1 or 0 -> 0), and the
+ * old leader is demoted before the examine starts, so nothing writes the
+ * journal slots in between. The examine result is kept until that call:
+ *  - the valid slots (drain_batch->items), already read into elem->{hdr,page};
+ *  - the newest entry per LBA (the hash), also the read overlay;
+ *  - writes keep going directly HOME and patch the overlay page (examine).
+ * On 0 -> 1 the promotion uses it: HOME the newest per LBA, ZERO the valid
+ * slots, reset, without reading the 8192 slots again. On 0 -> 0 it is dropped.
+ * A failover recovery started any other way reads the slots again.
+ */
+static bool
+md_journal_examine_kept(struct spdk_bs_md_journal *jr)
+{
+	return jr->examine && !jr->recovering;
+}
+
+/* Drop the examine result; the valid slots stay on disk for the next leader. */
+static void
+md_journal_examine_drop(struct spdk_bs_md_journal *jr, const char *why)
+{
+	uint32_t valid = jr->drain_batch->elem_count;
+	int rc;
+
+	if (!md_journal_examine_kept(jr)) {
+		return;
+	}
+
+	rc = md_journal_hash_resize(jr, BS_MD_JOURNAL_HASH_SIZE);
+	if (rc != 0) {
+		/* The larger table keeps working; it is cleared on the next use. */
+		md_journal_hash_reset(jr);
+		SPDK_ERRLOG("md_journal: examine drop: hash resize rc=%d, keeping size %u\n",
+			    rc, jr->hash_size);
+	}
+
+	jr->drain_batch->elem_count = 0;
+	jr->zero_batch->elem_count = 0;
+	jr->examine = false;
+
+	SPDK_NOTICELOG("md_journal: examine result dropped (%s): %u valid entries stay on disk "
+		       "for the next leader\n", why, valid);
+}
+
 int
 bs_md_journal_examine_complete(struct spdk_bs_md_journal *jr)
 {
-	int rc;
-
 	if (jr == NULL) {
 		/* no journal on this blobstore: nothing to complete */
 		return -EINVAL;
@@ -2059,24 +2104,15 @@ bs_md_journal_examine_complete(struct spdk_bs_md_journal *jr)
 	}
 
 	/*
-	 * Examine no longer needs the journal overlay.
-	 * Return to the normal smaller hash table.
+	 * Keep the examine result for the set-leader call (see
+	 * md_journal_examine_kept()). The journal stays paused: a non-leader
+	 * does not journal; examine writes go directly HOME.
 	 */
-	rc = md_journal_hash_resize(jr, BS_MD_JOURNAL_HASH_SIZE);
-	if (rc != 0) {
-		SPDK_ERRLOG("md_journal: examine complete failed: hash resize rc=%d\n", rc);
-		return rc;
-	}
-
-	jr->drain_batch->elem_count = 0;
 	jr->zero_batch->elem_count = 0;
-
-	jr->examine = false;
 	jr->recovering = false;
-	jr->paused = false;
 
-	SPDK_NOTICELOG("md_journal: examine complete: overlay dropped, journal unpaused "
-		       "(valid entries stay on disk until the promotion/failover recovery)\n");
+	SPDK_NOTICELOG("md_journal: examine complete: %u valid entries kept until the set-leader "
+		       "call (overlay kept, writes go directly HOME)\n", jr->drain_batch->elem_count);
 
 	return 0;
 }
@@ -2107,6 +2143,13 @@ spdk_md_journal_update_zero_finished(spdk_bs_sequence_t *seq, void *cb_arg, int 
 		SPDK_ERRLOG("md_journal: recovery reset failed: rc=%d - journal stays paused\n", rc);
 		jr->update_cb_fn(seq, jr->update_cb_arg, rc);
 		return;
+	}
+
+	/* A recovery from the examine result kept the examine hash size. */
+	if (jr->hash_size != BS_MD_JOURNAL_HASH_SIZE &&
+	    md_journal_hash_resize(jr, BS_MD_JOURNAL_HASH_SIZE) != 0) {
+		md_journal_hash_reset(jr);
+		SPDK_ERRLOG("md_journal: recovery: hash resize failed, keeping size %u\n", jr->hash_size);
 	}
 
 	jr->paused = false;
@@ -2220,12 +2263,54 @@ spdk_md_journal_update_home_finished(spdk_bs_sequence_t *seq,
 }
 
 
+/*
+ * Recovery after the valid slots are known (drain_batch->items, read into
+ * elem->{hdr,page}) and the hash holds the newest entry per LBA: HOME the
+ * newest per LBA, then ZERO the valid slots (superseded first, then newest),
+ * then reset. No valid entries still goes through ZERO and reset.
+ */
+static void
+md_journal_recovery_apply(spdk_bs_sequence_t *seq, struct spdk_bs_md_journal *jr)
+{
+	struct md_journal_elem *elem;
+	spdk_bs_batch_t *batch;
+	uint32_t valid_count = jr->drain_batch->elem_count;
+	uint32_t home_writes = 0;
+	uint32_t i;
+
+	if (valid_count == 0) {
+		SPDK_NOTICELOG("md_journal: recovery: no valid entries, nothing to write HOME\n");
+		spdk_md_journal_update_home_finished(seq, jr, 0);
+		return;
+	}
+
+	batch = bs_sequence_to_batch(seq, 0, spdk_md_journal_update_home_finished, jr);
+
+	for (i = 0; i < jr->hash_size; i++) {
+		elem = jr->hash_table[i].elem;
+		if (!elem) {
+			continue;
+		}
+
+		MDJ_IO_NOTICELOG("md_journal: recovery HOME write (newest per LBA): slot=%u seq=%" PRIu64
+				 " lba=%" PRIu64 "\n", elem->slot, elem->seq, elem->hdr->target_lba);
+		jr->bs->w_io++;
+		home_writes++;
+
+		bs_batch_write_dev(batch, elem->page, elem->hdr->target_lba, elem->hdr->lba_count);
+	}
+
+	SPDK_NOTICELOG("md_journal: recovery HOME submit: %u LBAs (from %u valid entries)\n",
+		       home_writes, valid_count);
+
+	bs_batch_close(batch);
+}
+
 static void
 spdk_md_journal_update_read_finished(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
 	struct spdk_bs_md_journal *jr = cb_arg;
 	struct md_journal_elem *elem;
-	spdk_bs_batch_t *batch;
 	uint32_t expected_crc;
 	uint32_t valid_count = 0;
 	uint32_t empty_count = 0;
@@ -2326,38 +2411,7 @@ spdk_md_journal_update_read_finished(spdk_bs_sequence_t *seq, void *cb_arg, int 
 		return;
 	}
 
-	/*
-	 * No valid entries still requires ZERO of the complete journal.
-	 * Use the HOME completion as the transition to ZERO.
-	 */
-	if (valid_count == 0) {
-		SPDK_NOTICELOG("md_journal: recovery: no valid entries, nothing to write HOME\n");
-		spdk_md_journal_update_home_finished(seq, jr, 0);
-		return;
-	}
-
-	batch = bs_sequence_to_batch(seq, 0, spdk_md_journal_update_home_finished, jr);
-
-	uint32_t home_writes = 0;
-
-	for (i = 0; i < jr->hash_size; i++) {
-		elem = jr->hash_table[i].elem;
-		if (!elem) {
-			continue;
-		}
-
-		MDJ_IO_NOTICELOG("md_journal: recovery HOME write (newest per LBA): slot=%u seq=%" PRIu64
-				 " lba=%" PRIu64 "\n", elem->slot, elem->seq, elem->hdr->target_lba);
-		jr->bs->w_io++;
-		home_writes++;
-
-		bs_batch_write_dev(batch, elem->page, elem->hdr->target_lba, elem->hdr->lba_count);
-	}
-
-	SPDK_NOTICELOG("md_journal: recovery HOME submit: %u LBAs (from %u valid entries)\n",
-		       home_writes, valid_count);
-
-	bs_batch_close(batch);
+	md_journal_recovery_apply(seq, jr);
 	return;
 
 error:
@@ -2400,6 +2454,13 @@ bs_md_journal_recovery_on_failover(struct spdk_bs_md_journal *jr, spdk_bs_sequen
 			    "journal_inflight=%u home_active=%d zero_active=%d\n",
 			    jr->journal_inflight, jr->active_drain_batch, jr->active_zero_batch);
 		return -EBUSY;
+	}
+
+	if (md_journal_examine_kept(jr)) {
+		/* Not the set-leader promotion: the slots may have changed since
+		 * the examine, read them again (the read rebuilds everything). */
+		SPDK_NOTICELOG("md_journal: recovery start: examine result (%u valid entries) "
+			       "not used, reading the slots again\n", jr->drain_batch->elem_count);
 	}
 
 	SPDK_NOTICELOG("md_journal: recovery start (%s): pausing journal, reading %u slots\n",
@@ -2768,7 +2829,38 @@ md_journal_pause_msg(void *arg)
 		       TAILQ_EMPTY(&jr->home_queue), TAILQ_EMPTY(&jr->zero_queue));
 
 	jr->paused = true;
+	/* 0 -> 0 set-leader call after an examine: the examine result is not needed. */
+	md_journal_examine_drop(jr, "not leader");
 	md_journal_complete_home_waiters(jr, -EIO);
+}
+
+/*
+ * Set-leader promotion right after an examine: recover from the examine result
+ * (md_journal_examine_kept()) instead of reading the 8192 slots again.
+ */
+static int
+md_journal_promote_from_examine(struct spdk_bs_md_journal *jr, spdk_bs_sequence_t *seq,
+				spdk_bs_sequence_cpl cb_fn, void *cb_arg)
+{
+	if (jr->journal_inflight != 0 || jr->active_drain_batch || jr->active_zero_batch) {
+		SPDK_ERRLOG("md_journal: cannot promote from examine: journal_inflight=%u "
+			    "home_active=%d zero_active=%d\n", jr->journal_inflight,
+			    jr->active_drain_batch, jr->active_zero_batch);
+		return -EBUSY;
+	}
+
+	SPDK_NOTICELOG("md_journal: promotion from the examine result: %u valid entries, "
+		       "no journal read\n", jr->drain_batch->elem_count);
+
+	jr->update_cb_fn = cb_fn;
+	jr->update_cb_arg = cb_arg;
+	jr->recovering = true;
+	jr->paused = true;
+	/* From here writes are rejected until the reset unpauses the journal. */
+	jr->examine = false;
+
+	md_journal_recovery_apply(seq, jr);
+	return 0;
 }
 
 static void
@@ -2811,7 +2903,11 @@ bs_md_journal_leadership_change(struct spdk_bs_md_journal *jr, spdk_bs_sequence_
 	 */
 	if (!old_state && new_state) {
 		SPDK_NOTICELOG("md_journal: promotion: starting recovery before admitting writes\n");
-		rc = bs_md_journal_recovery_on_failover(jr, seq, cb_fn, cb_arg, false);
+		if (md_journal_examine_kept(jr)) {
+			rc = md_journal_promote_from_examine(jr, seq, cb_fn, cb_arg);
+		} else {
+			rc = bs_md_journal_recovery_on_failover(jr, seq, cb_fn, cb_arg, false);
+		}
 		if (rc != 0) {
 			SPDK_ERRLOG("md_journal: promotion recovery could not start: rc=%d - "
 				    "leadership is not taken\n", rc);

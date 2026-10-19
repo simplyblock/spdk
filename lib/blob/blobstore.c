@@ -4036,6 +4036,12 @@ blob_write_copy_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 #define BLOB_COW_SCAN_UNIT	SPDK_BS_PAGE_SIZE	/* zero check granularity */
 #define BLOB_COW_MAX_WRITES	128		/* more ranges than this: write the whole cluster */
 
+/* Off for now (testing): CoW writes the whole cluster, zero parts included, so
+ * it does not depend on the new cluster reading as zeroes (the lowest free
+ * clusters are no longer unmapped when this node becomes leader, see
+ * g_bs_clear_free_clusters_on_leader). */
+static bool g_blob_cow_skip_zero_ranges = false;
+
 struct blob_cow_range {
 	uint64_t	start;	/* byte offset in the cluster */
 	uint64_t	end;	/* byte offset after the range */
@@ -4108,9 +4114,11 @@ blob_write_copy(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 
 	cluster_lba = bs_cluster_to_lba(bs, ctx->new_cluster);
 
-	nranges = blob_cow_find_ranges(ctx->buf, bs->cluster_sz, ranges);
+	nranges = g_blob_cow_skip_zero_ranges ?
+		  blob_cow_find_ranges(ctx->buf, bs->cluster_sz, ranges) : -1;
 	if (nranges < 0) {
-		/* Data is spread over the cluster: write whole cluster */
+		/* Data is spread over the cluster, or zero parts are not skipped:
+		 * write whole cluster */
 		bs_sequence_write_dev(seq, ctx->buf, cluster_lba, bs_cluster_to_lba(bs, 1),
 				      blob_write_copy_cpl, ctx);
 		return;
@@ -8499,6 +8507,10 @@ struct bs_clear_free_clusters_ctx {
 	void			*cb_arg;
 };
 
+/* Off for now (testing): taking leadership does not unmap the lowest free
+ * clusters. CoW writes whole clusters meanwhile (g_blob_cow_skip_zero_ranges). */
+static bool g_bs_clear_free_clusters_on_leader = false;
+
 /* Threads that write to blobs (IO poll groups); 0 = not set. Set once by the
  * lvol poll group RPC, before any blobstore is used. */
 static uint32_t g_bs_cluster_alloc_threads;
@@ -8566,6 +8578,13 @@ bs_clear_free_clusters(struct spdk_blob_store *bs, spdk_bs_sequence_t *seq,
 	const uint32_t max_len = spdk_max(2048 / bs_cluster_to_lba(bs, 1), 1);
 
 	assert(spdk_get_thread() == bs->md_thread);
+
+	if (!g_bs_clear_free_clusters_on_leader) {
+		SPDK_NOTICELOG("Unmap of the lowest free clusters on taking leadership is disabled, "
+			       "skipping\n");
+		cb_fn(seq, cb_arg, 0);
+		return;
+	}
 
 	max = bs_num_clear_clusters();
 	ctx = calloc(1, sizeof(*ctx));
