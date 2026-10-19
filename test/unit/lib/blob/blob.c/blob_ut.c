@@ -9991,6 +9991,284 @@ blob_set_external_parent(void)
 	CU_ASSERT(g_bserrno == 0);
 }
 
+/* Write Zeroes on a thin blob backed by the zeroes device is answered from
+ * metadata where it can be: an unallocated cluster already reads as zeroes,
+ * and a whole allocated cluster is released the way Unmap releases one, so it
+ * reads as unallocated afterwards. Only partial clusters, clusters a clone
+ * reads from its parent, and clusters under a locked operation are still
+ * written with zeroes. Write Zeroes from a pNFS metadata server zeroing a
+ * new layout used to write every block of it through the device. */
+struct wz_fixture {
+	struct spdk_blob_store	*bs;
+	struct spdk_blob	*blob;
+	struct spdk_io_channel	*ch;
+	uint64_t		iu_per_cluster;
+	uint64_t		cluster_bytes;
+	uint64_t		iu_size;
+};
+
+#define WZ_CLUSTERS 4
+
+static void
+wz_setup(struct wz_fixture *f, bool thin)
+{
+	struct spdk_bs_dev *dev;
+	struct spdk_bs_opts bs_opts;
+	struct spdk_blob_opts opts;
+
+	dev = init_dev();
+	spdk_bs_opts_init(&bs_opts, sizeof(bs_opts));
+	/* Large clusters, so a metadata page write is much smaller than a cluster. */
+	bs_opts.cluster_sz = dev->blocklen * dev->blockcnt / (WZ_CLUSTERS * 2 + 1) /
+			     (1024 * 1024) * (1024 * 1024);
+	spdk_bs_init(dev, &bs_opts, bs_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
+	f->bs = g_bs;
+	f->iu_size = spdk_bs_get_io_unit_size(f->bs);
+	f->cluster_bytes = spdk_bs_get_cluster_size(f->bs);
+	f->iu_per_cluster = f->cluster_bytes / f->iu_size;
+	f->ch = spdk_bs_alloc_io_channel(f->bs);
+	SPDK_CU_ASSERT_FATAL(f->ch != NULL);
+
+	ut_spdk_blob_opts_init(&opts);
+	opts.thin_provision = thin;
+	opts.num_clusters = WZ_CLUSTERS;
+	f->blob = ut_blob_create_and_open(f->bs, &opts);
+}
+
+static void
+wz_teardown(struct wz_fixture *f)
+{
+	ut_blob_close_and_delete(f->bs, f->blob);
+	spdk_bs_free_io_channel(f->ch);
+	poll_threads();
+	spdk_bs_unload(f->bs, bs_op_complete, NULL);
+	poll_threads();
+	g_bs = NULL;
+}
+
+static void
+wz_fill(struct wz_fixture *f, struct spdk_blob *blob, uint64_t cluster, uint8_t pattern)
+{
+	uint8_t *buf = calloc(1, f->cluster_bytes);
+
+	SPDK_CU_ASSERT_FATAL(buf != NULL);
+	memset(buf, pattern, f->cluster_bytes);
+	g_bserrno = -1;
+	spdk_blob_io_write(blob, f->ch, buf, cluster * f->iu_per_cluster, f->iu_per_cluster,
+			   blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	free(buf);
+}
+
+static void
+wz_zero(struct wz_fixture *f, struct spdk_blob *blob, uint64_t offset, uint64_t length)
+{
+	g_bserrno = -1;
+	spdk_blob_io_write_zeroes(blob, f->ch, offset, length, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+}
+
+/* True when every byte of the io-unit range reads as `pattern`. */
+static bool
+wz_reads(struct wz_fixture *f, struct spdk_blob *blob, uint64_t offset, uint64_t length,
+	 uint8_t pattern)
+{
+	uint8_t *buf = calloc(1, length * f->iu_size);
+	bool ok = true;
+	uint64_t i;
+
+	SPDK_CU_ASSERT_FATAL(buf != NULL);
+	g_bserrno = -1;
+	spdk_blob_io_read(blob, f->ch, buf, offset, length, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	for (i = 0; i < length * f->iu_size; i++) {
+		if (buf[i] != pattern) {
+			ok = false;
+			break;
+		}
+	}
+	free(buf);
+	return ok;
+}
+
+static void
+blob_thin_write_zeroes_unallocated(void)
+{
+	struct wz_fixture f;
+	uint64_t free_before, written_before;
+
+	wz_setup(&f, true);
+	free_before = spdk_bs_free_cluster_count(f.bs);
+	written_before = g_dev_write_bytes;
+
+	/* a whole unallocated cluster and a partial one */
+	wz_zero(&f, f.blob, f.iu_per_cluster, f.iu_per_cluster);
+	wz_zero(&f, f.blob, 2 * f.iu_per_cluster + 3, 5);
+
+	CU_ASSERT(spdk_blob_get_num_allocated_clusters(f.blob) == 0);
+	CU_ASSERT(spdk_bs_free_cluster_count(f.bs) == free_before);
+	CU_ASSERT(g_dev_write_bytes == written_before);
+	CU_ASSERT(wz_reads(&f, f.blob, f.iu_per_cluster, f.iu_per_cluster, 0));
+	wz_teardown(&f);
+}
+
+static void
+blob_thin_write_zeroes_releases_whole_clusters(void)
+{
+	struct wz_fixture f;
+	uint64_t free_before, written_before;
+
+	wz_setup(&f, true);
+	wz_fill(&f, f.blob, 0, 0x11);
+	wz_fill(&f, f.blob, 1, 0x22);
+	wz_fill(&f, f.blob, 2, 0x33);
+	CU_ASSERT(spdk_blob_get_num_allocated_clusters(f.blob) == 3);
+	free_before = spdk_bs_free_cluster_count(f.bs);
+	written_before = g_dev_write_bytes;
+
+	wz_zero(&f, f.blob, f.iu_per_cluster, f.iu_per_cluster);
+
+	/* released, not written: only metadata pages reach the device */
+	CU_ASSERT(spdk_blob_get_num_allocated_clusters(f.blob) == 2);
+	CU_ASSERT(spdk_bs_free_cluster_count(f.bs) == free_before + 1);
+	CU_ASSERT(g_dev_write_bytes - written_before < f.cluster_bytes);
+	CU_ASSERT(wz_reads(&f, f.blob, f.iu_per_cluster, f.iu_per_cluster, 0));
+	CU_ASSERT(wz_reads(&f, f.blob, 0, f.iu_per_cluster, 0x11));
+	CU_ASSERT(wz_reads(&f, f.blob, 2 * f.iu_per_cluster, f.iu_per_cluster, 0x33));
+	wz_teardown(&f);
+}
+
+static void
+blob_thin_write_zeroes_partial_cluster_written(void)
+{
+	struct wz_fixture f;
+	uint64_t written_before;
+
+	wz_setup(&f, true);
+	wz_fill(&f, f.blob, 0, 0x44);
+	written_before = g_dev_write_bytes;
+
+	wz_zero(&f, f.blob, 3, 5);
+
+	CU_ASSERT(spdk_blob_get_num_allocated_clusters(f.blob) == 1);
+	CU_ASSERT(g_dev_write_bytes - written_before == 5 * f.iu_size);
+	CU_ASSERT(wz_reads(&f, f.blob, 3, 5, 0));
+	CU_ASSERT(wz_reads(&f, f.blob, 0, 3, 0x44));
+	CU_ASSERT(wz_reads(&f, f.blob, 8, f.iu_per_cluster - 8, 0x44));
+	wz_teardown(&f);
+}
+
+static void
+blob_thin_write_zeroes_locked_writes(void)
+{
+	struct wz_fixture f;
+	uint64_t written_before;
+
+	wz_setup(&f, true);
+	wz_fill(&f, f.blob, 1, 0x55);
+	written_before = g_dev_write_bytes;
+
+	f.blob->locked_operation_in_progress = true;
+	wz_zero(&f, f.blob, f.iu_per_cluster, f.iu_per_cluster);
+	f.blob->locked_operation_in_progress = false;
+
+	/* kept and written while a snapshot, clone, or migration holds the blob */
+	CU_ASSERT(spdk_blob_get_num_allocated_clusters(f.blob) == 1);
+	CU_ASSERT(g_dev_write_bytes - written_before >= f.cluster_bytes);
+	CU_ASSERT(wz_reads(&f, f.blob, f.iu_per_cluster, f.iu_per_cluster, 0));
+	wz_teardown(&f);
+}
+
+static void
+blob_thin_write_zeroes_clone_writes(void)
+{
+	struct wz_fixture f;
+	struct spdk_blob *clone;
+	spdk_blob_id snapid, cloneid;
+	uint64_t written_before;
+
+	wz_setup(&f, true);
+	wz_fill(&f, f.blob, 0, 0x66);
+
+	spdk_bs_create_snapshot(f.bs, spdk_blob_get_id(f.blob), NULL, blob_op_with_id_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	snapid = g_blobid;
+	spdk_bs_create_clone(f.bs, snapid, NULL, blob_op_with_id_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	cloneid = g_blobid;
+	spdk_bs_open_blob(f.bs, cloneid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	clone = g_blob;
+	CU_ASSERT(spdk_blob_get_num_allocated_clusters(clone) == 0);
+	written_before = g_dev_write_bytes;
+
+	/* the clone reads cluster 0 from its parent, so zeroes are really written */
+	wz_zero(&f, clone, 0, f.iu_per_cluster);
+
+	CU_ASSERT(spdk_blob_get_num_allocated_clusters(clone) == 1);
+	CU_ASSERT(g_dev_write_bytes - written_before >= f.cluster_bytes);
+	CU_ASSERT(wz_reads(&f, clone, 0, f.iu_per_cluster, 0));
+
+	ut_blob_close_and_delete(f.bs, clone);
+	wz_teardown(&f);
+}
+
+static void
+blob_thin_write_zeroes_mixed_range(void)
+{
+	struct wz_fixture f;
+	uint64_t free_before, written_before, edges;
+
+	wz_setup(&f, true);
+	wz_fill(&f, f.blob, 0, 0x71);
+	wz_fill(&f, f.blob, 1, 0x72);
+	wz_fill(&f, f.blob, 2, 0x73);
+	free_before = spdk_bs_free_cluster_count(f.bs);
+	written_before = g_dev_write_bytes;
+
+	/* from 4 io units before the end of cluster 0 to 6 into cluster 2 */
+	wz_zero(&f, f.blob, f.iu_per_cluster - 4, f.iu_per_cluster + 10);
+	edges = 10 * f.iu_size;
+
+	CU_ASSERT(spdk_blob_get_num_allocated_clusters(f.blob) == 2);
+	CU_ASSERT(spdk_bs_free_cluster_count(f.bs) == free_before + 1);
+	CU_ASSERT(g_dev_write_bytes - written_before >= edges);
+	CU_ASSERT(g_dev_write_bytes - written_before < edges + f.cluster_bytes);
+	CU_ASSERT(wz_reads(&f, f.blob, f.iu_per_cluster - 4, f.iu_per_cluster + 10, 0));
+	CU_ASSERT(wz_reads(&f, f.blob, 0, f.iu_per_cluster - 4, 0x71));
+	CU_ASSERT(wz_reads(&f, f.blob, 2 * f.iu_per_cluster + 6, f.iu_per_cluster - 6, 0x73));
+	wz_teardown(&f);
+}
+
+static void
+blob_thick_write_zeroes_writes(void)
+{
+	struct wz_fixture f;
+	uint64_t written_before;
+
+	wz_setup(&f, false);
+	wz_fill(&f, f.blob, 1, 0x7a);
+	written_before = g_dev_write_bytes;
+
+	/* a thick blob keeps its clusters: zeroes are written */
+	wz_zero(&f, f.blob, f.iu_per_cluster, f.iu_per_cluster);
+
+	CU_ASSERT(spdk_blob_get_num_allocated_clusters(f.blob) == WZ_CLUSTERS);
+	CU_ASSERT(g_dev_write_bytes - written_before >= f.cluster_bytes);
+	CU_ASSERT(wz_reads(&f, f.blob, f.iu_per_cluster, f.iu_per_cluster, 0));
+	wz_teardown(&f);
+}
+
 static void
 suite_bs_setup(void)
 {
@@ -10585,6 +10863,13 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite_bs, blob_thin_prov_rw);
 		CU_ADD_TEST(suite, blob_thin_prov_write_count_io);
 		CU_ADD_TEST(suite, blob_thin_prov_unmap_cluster);
+		CU_ADD_TEST(suite, blob_thin_write_zeroes_unallocated);
+		CU_ADD_TEST(suite, blob_thin_write_zeroes_releases_whole_clusters);
+		CU_ADD_TEST(suite, blob_thin_write_zeroes_partial_cluster_written);
+		CU_ADD_TEST(suite, blob_thin_write_zeroes_locked_writes);
+		CU_ADD_TEST(suite, blob_thin_write_zeroes_clone_writes);
+		CU_ADD_TEST(suite, blob_thin_write_zeroes_mixed_range);
+		CU_ADD_TEST(suite, blob_thick_write_zeroes_writes);
 		CU_ADD_TEST(suite_bs, blob_thin_prov_rle);
 		CU_ADD_TEST(suite_bs, blob_thin_prov_rw_iov);
 		CU_ADD_TEST(suite, bs_load_iter_test);

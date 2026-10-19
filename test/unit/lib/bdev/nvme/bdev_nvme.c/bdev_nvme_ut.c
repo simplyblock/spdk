@@ -5391,6 +5391,112 @@ test_concurrent_read_ana_log_page(void)
 	CU_ASSERT(nvme_ctrlr_get_by_name("nvme0") == NULL);
 }
 
+/* A vendor-specific I/O passthru command is not retried by bdev_nvme: its caller
+ * defines what the command means and owns retrying it. simplyblock's lvol module
+ * sends the reservation commands of step 3 this way, a forwarded Acquire among them,
+ * which must not run twice, and a hub that keeps failing them must not be hammered
+ * with bdev_retry_count retries per ask. A standard command failing the same way is
+ * still retried. */
+static void
+test_vendor_passthru_io_not_retried(void)
+{
+	struct nvme_path_id path = {};
+	struct spdk_nvme_ctrlr *ctrlr;
+	struct spdk_nvme_ctrlr_opts opts = {.hostnqn = UT_HOSTNQN};
+	struct nvme_bdev_ctrlr *nbdev_ctrlr;
+	struct nvme_ctrlr *nvme_ctrlr;
+	const int STRING_SIZE = 32;
+	const char *attached_names[STRING_SIZE];
+	struct nvme_bdev *nbdev;
+	struct spdk_bdev_io *bdev_io;
+	struct nvme_bdev_io *bio;
+	struct spdk_io_channel *ch;
+	struct nvme_bdev_channel *nbdev_ch;
+	struct nvme_io_path *io_path;
+	struct spdk_nvme_cpl cpl = {};
+	int rc;
+	struct spdk_bdev_nvme_ctrlr_opts bdev_opts = {0};
+
+	spdk_bdev_nvme_get_default_ctrlr_opts(&bdev_opts);
+	bdev_opts.multipath = false;
+
+	memset(attached_names, 0, sizeof(char *) * STRING_SIZE);
+	ut_init_trid(&path.trid);
+
+	set_thread(0);
+
+	ctrlr = ut_attach_ctrlr(&path.trid, 1, false, false);
+	SPDK_CU_ASSERT_FATAL(ctrlr != NULL);
+
+	g_ut_attach_ctrlr_status = 0;
+	g_ut_attach_bdev_count = 1;
+
+	rc = spdk_bdev_nvme_create(&path.trid, "nvme0", attached_names, STRING_SIZE,
+				   attach_ctrlr_done, NULL, &opts, &bdev_opts);
+	CU_ASSERT(rc == 0);
+
+	spdk_delay_us(1000);
+	poll_threads();
+
+	nbdev_ctrlr = nvme_bdev_ctrlr_get_by_name("nvme0");
+	SPDK_CU_ASSERT_FATAL(nbdev_ctrlr != NULL);
+	nvme_ctrlr = nvme_bdev_ctrlr_get_ctrlr(nbdev_ctrlr, &path.trid, opts.hostnqn);
+	CU_ASSERT(nvme_ctrlr != NULL);
+	nbdev = nvme_bdev_ctrlr_get_bdev(nbdev_ctrlr, 1);
+	CU_ASSERT(nbdev != NULL);
+
+	ch = spdk_get_io_channel(nbdev);
+	SPDK_CU_ASSERT_FATAL(ch != NULL);
+	nbdev_ch = spdk_io_channel_get_ctx(ch);
+	io_path = ut_get_io_path_by_ctrlr(nbdev_ch, nvme_ctrlr);
+	SPDK_CU_ASSERT_FATAL(io_path != NULL);
+
+	bdev_io = ut_alloc_bdev_io(SPDK_BDEV_IO_TYPE_NVME_IO, nbdev, ch);
+	bio = (struct nvme_bdev_io *)bdev_io->driver_ctx;
+	bio->io_path = io_path;
+	g_opts.bdev_retry_count = 2;
+	cpl.status.sct = SPDK_NVME_SCT_GENERIC;
+	cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+	cpl.status.dnr = 0;
+
+	/* Vendor-specific: failed up at once */
+	bdev_io->u.nvme_passthru.cmd.opc = 0xC4;
+	bdev_io->internal.f.in_submit_request = true;
+	bdev_nvme_queued_done(bio, &cpl);
+	CU_ASSERT(TAILQ_EMPTY(&nbdev_ch->retry_io_list));
+	CU_ASSERT(bdev_io->internal.f.in_submit_request == false);
+	CU_ASSERT(bdev_io->internal.status == SPDK_BDEV_IO_STATUS_NVME_ERROR);
+	if (!TAILQ_EMPTY(&nbdev_ch->retry_io_list)) {
+		TAILQ_REMOVE(&nbdev_ch->retry_io_list, bio, retry_link);
+	}
+
+	/* Standard: retried as before */
+	bdev_io->u.nvme_passthru.cmd.opc = SPDK_NVME_OPC_FLUSH;
+	bdev_io->internal.f.in_submit_request = true;
+	bio->retry_count = 0;
+	bio->io_path = io_path;
+	bdev_nvme_queued_done(bio, &cpl);
+	CU_ASSERT(bdev_io == spdk_bdev_io_from_ctx(TAILQ_FIRST(&nbdev_ch->retry_io_list)));
+	TAILQ_REMOVE(&nbdev_ch->retry_io_list, bio, retry_link);
+
+	free(bdev_io);
+
+	spdk_put_io_channel(ch);
+
+	poll_threads();
+
+	rc = bdev_nvme_delete("nvme0", &g_any_path, NULL, NULL);
+	CU_ASSERT(rc == 0);
+
+	poll_threads();
+	spdk_delay_us(1000);
+	poll_threads();
+
+	CU_ASSERT(nvme_bdev_ctrlr_get_by_name("nvme0") == NULL);
+
+	g_opts.bdev_retry_count = 0;
+}
+
 static void
 test_retry_io_for_ana_error(void)
 {
@@ -8291,6 +8397,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_retry_io_if_ana_state_is_updating);
 	CU_ADD_TEST(suite, test_retry_io_for_io_path_error);
 	CU_ADD_TEST(suite, test_retry_io_count);
+	CU_ADD_TEST(suite, test_vendor_passthru_io_not_retried);
 	CU_ADD_TEST(suite, test_concurrent_read_ana_log_page);
 	CU_ADD_TEST(suite, test_retry_io_for_ana_error);
 	CU_ADD_TEST(suite, test_check_io_error_resiliency_params);

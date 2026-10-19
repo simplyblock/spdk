@@ -437,6 +437,48 @@ void spdk_lvol_set_leader_failed_on_update(struct spdk_lvol *lvol);
 void spdk_lvol_set_leader(struct spdk_lvol *lvol);
 
 /**
+ * Called when state kept in an lvolstore's metadata may have changed under this
+ * node: it became the leader of an lvol or of the whole lvolstore, or, as a
+ * non-leader, it reread the lvolstore's metadata.
+ *
+ * \param lvs The lvolstore.
+ * \param lvol The lvol concerned, or NULL for every lvol of lvs.
+ * \param ctx The context passed to spdk_lvs_set_refresh_cb().
+ */
+typedef void (*spdk_lvs_refresh_cb)(struct spdk_lvol_store *lvs, struct spdk_lvol *lvol,
+				    void *ctx);
+
+/**
+ * Set the function told when lvolstore metadata may have changed under this node.
+ * There is one such function; a second call replaces the first. It is called on
+ * whichever thread made the change, without any lvol lock held.
+ *
+ * \param cb_fn The function, or NULL to stop.
+ * \param ctx Context passed to cb_fn.
+ */
+void spdk_lvs_set_refresh_cb(spdk_lvs_refresh_cb cb_fn, void *ctx);
+
+/**
+ * Called when an lvolstore's hub connection is about to be closed, before its
+ * descriptor is: whoever holds an I/O channel on that descriptor has to give it
+ * back, or the hub's NVMe path cannot be deleted.
+ *
+ * \param lvs The lvolstore.
+ * \param ctx The context passed to spdk_lvs_set_hub_close_cb().
+ */
+typedef void (*spdk_lvs_hub_close_cb)(struct spdk_lvol_store *lvs, void *ctx);
+
+/**
+ * Set the function told when an lvolstore's hub connection is about to be closed.
+ * There is one such function; a second call replaces the first. It is called on the
+ * thread that closes the hub.
+ *
+ * \param cb_fn The function, or NULL to stop.
+ * \param ctx Context passed to cb_fn.
+ */
+void spdk_lvs_set_hub_close_cb(spdk_lvs_hub_close_cb cb_fn, void *ctx);
+
+/**
  * set the leadership for all lvs and lvol.
  *
  * \param leader The lvs's flag to set as leader or non leader.

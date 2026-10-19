@@ -3300,6 +3300,19 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('-t', '--tgt-name', help='The name of the parent NVMe-oF target (optional)', type=str)
     p.set_defaults(func=nvmf_subsystem_remove_ns)
 
+    def nvmf_ns_reload_reservation(args):
+        rpc.nvmf.nvmf_ns_reload_reservation(args.client,
+                                            nqn=args.nqn,
+                                            nsid=args.nsid,
+                                            tgt_name=args.tgt_name)
+
+    p = subparsers.add_parser('nvmf_ns_reload_reservation',
+                              help='Reload a namespace\'s reservation state from its store')
+    p.add_argument('nqn', help='NVMe-oF subsystem NQN')
+    p.add_argument('nsid', help='The requested NSID', type=int)
+    p.add_argument('-t', '--tgt-name', help='The name of the parent NVMe-oF target (optional)', type=str)
+    p.set_defaults(func=nvmf_ns_reload_reservation)
+
     def nvmf_ns_add_host(args):
         rpc.nvmf.nvmf_ns_visible(True,
                                  args.client,

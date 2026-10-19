@@ -4486,6 +4486,75 @@ spdk_free_cluster_unmap_complete(void *cb_arg, int bserrno)
 				       ctx->extent_page, ctx->md_page, blob_free_cluster_cpl, ctx);
 }
 
+/* A thin blob whose unallocated clusters read from the zeroes device: there a
+ * cluster that is not allocated reads as zeroes, so zeroes need not be written
+ * to produce it. A clone reads unallocated clusters from its parent instead. */
+static bool
+blob_zeroes_from_backing(struct spdk_blob *blob)
+{
+	return spdk_blob_is_thin_provisioned(blob) && blob_backed_with_zeroes_dev(blob);
+}
+
+/* Whether an I/O of `length` io units at an allocated cluster may release it:
+ * the I/O covers the whole cluster, the blob reads unallocated clusters as
+ * zeroes, and no snapshot, clone, or migration holds the blob. */
+static bool
+blob_can_release_cluster(struct spdk_blob *blob, bool is_allocated, uint64_t length)
+{
+	return is_allocated && blob_zeroes_from_backing(blob) &&
+	       !blob->locked_operation_in_progress &&
+	       bs_io_units_per_cluster(blob) == length;
+}
+
+/* Releases the whole cluster at `offset` and completes `user_cpl` once it is
+ * gone. The order matters, so a reclaimed cluster never leaks old data and an
+ * incoming write cannot claim it early:
+ * 1. Unmap the underlying area.
+ * 2. Once the unmap completes, update and sync metadata freeing the cluster.
+ * 3. Once metadata update is done, complete the user request. */
+static void
+blob_release_cluster(struct spdk_io_channel *_ch, struct spdk_blob *blob, uint64_t offset,
+		     uint64_t lba, uint64_t lba_count, struct spdk_bs_cpl *user_cpl)
+{
+	struct spdk_blob_free_cluster_ctx *ctx;
+	struct spdk_bs_cpl cpl;
+	spdk_bs_batch_t *batch;
+
+	assert(offset % bs_io_units_per_cluster(blob) == 0);
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		user_cpl->u.blob_basic.cb_fn(user_cpl->u.blob_basic.cb_arg, -ENOMEM);
+		return;
+	}
+	ctx->blob = blob;
+	/* Round the io_unit offset down to the first page in the cluster */
+	ctx->page = bs_io_unit_to_cluster_start(blob, offset);
+	/* Which index in the metadata cluster array the cluster is at */
+	ctx->cluster_num = bs_io_unit_to_cluster_number(blob, offset);
+	ctx->seq = bs_sequence_start_bs(_ch, user_cpl);
+	if (!ctx->seq) {
+		free(ctx);
+		user_cpl->u.blob_basic.cb_fn(user_cpl->u.blob_basic.cb_arg, -ENOMEM);
+		return;
+	}
+	if (blob->use_extent_table) {
+		ctx->extent_page = *bs_cluster_to_extent_page(blob, ctx->cluster_num);
+	}
+
+	cpl.type = SPDK_BS_CPL_TYPE_BLOB_BASIC;
+	cpl.u.blob_basic.cb_fn = spdk_free_cluster_unmap_complete;
+	cpl.u.blob_basic.cb_arg = ctx;
+	batch = bs_batch_open(_ch, &cpl, blob);
+	if (!batch) {
+		bs_sequence_finish(ctx->seq, -ENOMEM);
+		free(ctx);
+		return;
+	}
+	bs_batch_unmap_dev(batch, lba, lba_count);
+	bs_batch_close(batch);
+}
+
 static void
 blob_request_submit_op_single(struct spdk_io_channel *_ch, struct spdk_blob *blob,
 			      void *payload, uint64_t offset, uint64_t length,
@@ -4544,6 +4613,18 @@ blob_request_submit_op_single(struct spdk_io_channel *_ch, struct spdk_blob *blo
 	}
 	case SPDK_BLOB_WRITE:
 	case SPDK_BLOB_WRITE_ZEROES: {
+		if (op_type == SPDK_BLOB_WRITE_ZEROES && blob_zeroes_from_backing(blob)) {
+			if (!is_allocated) {
+				/* The cluster already reads as zeroes from the zeroes device. */
+				cb_fn(cb_arg, 0);
+				return;
+			}
+			if (blob_can_release_cluster(blob, is_allocated, length)) {
+				/* Released like an Unmap, it reads as unallocated, hence zeroes. */
+				blob_release_cluster(_ch, blob, offset, lba, lba_count, &cpl);
+				break;
+			}
+		}
 		if (is_allocated) {
 			/* Write to the blob */
 			spdk_bs_batch_t *batch;
@@ -4582,61 +4663,16 @@ blob_request_submit_op_single(struct spdk_io_channel *_ch, struct spdk_blob *blo
 		break;
 	}
 	case SPDK_BLOB_UNMAP: {
-		struct spdk_blob_free_cluster_ctx *ctx = NULL;
 		spdk_bs_batch_t *batch;
 
 		/* if aligned with cluster release cluster */
-		if (spdk_blob_is_thin_provisioned(blob) && is_allocated &&
-			(!blob->locked_operation_in_progress) &&
-			blob_backed_with_zeroes_dev(blob) &&
-		    bs_io_units_per_cluster(blob) == length) {
-			// struct spdk_bs_channel *bs_channel = spdk_io_channel_get_ctx(_ch);
-			uint64_t cluster_start_page;
-			uint32_t cluster_number;
-
-			assert(offset % bs_io_units_per_cluster(blob) == 0);
-
-			/* Round the io_unit offset down to the first page in the cluster */
-			cluster_start_page = bs_io_unit_to_cluster_start(blob, offset);
-
-			/* Calculate which index in the metadata cluster array the corresponding
-			 * cluster is supposed to be at. */
-			cluster_number = bs_io_unit_to_cluster_number(blob, offset);
-
-			ctx = calloc(1, sizeof(*ctx));
-			if (!ctx) {
-				cb_fn(cb_arg, -ENOMEM);
-				return;
-			}
-			/* When freeing a cluster the flow should be (in order):
-			 * 1. Unmap the underlying area (so if the cluster is reclaimed in the future, it won't leak
-			 * old data)
-			 * 2. Once the unmap completes (to avoid any races with incoming writes that may claim the
-			 * cluster), update and sync metadata freeing the cluster
-			 * 3. Once metadata update is done, complete the user unmap request
-			 */
-			ctx->blob = blob;
-			ctx->page = cluster_start_page;
-			ctx->cluster_num = cluster_number;
-			// ctx->md_page = bs_channel->new_cluster_page;
-			ctx->seq = bs_sequence_start_bs(_ch, &cpl);
-			if (!ctx->seq) {
-				free(ctx);
-				cb_fn(cb_arg, -ENOMEM);
-				return;
-			}
-
-			if (blob->use_extent_table) {
-				ctx->extent_page = *bs_cluster_to_extent_page(blob, cluster_number);
-			}
-
-			cpl.u.blob_basic.cb_fn = spdk_free_cluster_unmap_complete;
-			cpl.u.blob_basic.cb_arg = ctx;
+		if (blob_can_release_cluster(blob, is_allocated, length)) {
+			blob_release_cluster(_ch, blob, offset, lba, lba_count, &cpl);
+			break;
 		}
 
 		batch = bs_batch_open(_ch, &cpl, blob);
 		if (!batch) {
-			free(ctx);
 			cb_fn(cb_arg, -ENOMEM);
 			return;
 		}
