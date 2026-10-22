@@ -2164,6 +2164,57 @@ spdk_md_journal_update_zero_finished(spdk_bs_sequence_t *seq, void *cb_arg, int 
 	jr->update_cb_fn(seq, jr->update_cb_arg, bserrno);
 }
 
+static void
+spdk_md_journal_update_unmap_finished(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct spdk_bs_md_journal *jr = cb_arg;
+
+	if (bserrno != 0) {
+		SPDK_ERRLOG("md_journal: recovery UNMAP failed: rc=%d - journal stays paused\n", bserrno);
+		jr->recovering = false;
+		jr->drain_batch->elem_count = 0;
+		jr->update_cb_fn(seq, jr->update_cb_arg, bserrno);
+		return;
+	}
+
+	SPDK_NOTICELOG("md_journal: recovery UNMAP done\n");
+
+	spdk_md_journal_update_zero_finished(seq, jr, 0);
+}
+
+/*
+ * Last step of the recovery: unmap the whole journal area with one request.
+ * The valid slots were zeroed in the two ZERO phases, so this clears the
+ * empty, partial and CRC-bad slots.
+ */
+static void
+spdk_md_journal_update_unmap(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct spdk_bs_md_journal *jr = cb_arg;
+	spdk_bs_batch_t *batch;
+	uint64_t journal_lba;
+	uint64_t lba_count;
+
+	if (bserrno != 0) {
+		SPDK_ERRLOG("md_journal: recovery ZERO phase 2 (newest slots) failed: rc=%d\n", bserrno);
+		spdk_md_journal_update_zero_finished(seq, jr, bserrno);
+		return;
+	}
+
+	batch = bs_sequence_to_batch(seq, 0, spdk_md_journal_update_unmap_finished, jr);
+
+	journal_lba = bs_page_to_lba(jr->bs, jr->md_journal_mask_start);
+	lba_count = bs_byte_to_lba(jr->bs, BS_MD_JOURNAL_ENTRY_SIZE) * BS_MD_JOURNAL_NUM_ELEMS;
+
+	jr->bs->w_io++;
+	bs_batch_unmap_dev(batch, journal_lba, lba_count);
+
+	SPDK_NOTICELOG("md_journal: recovery ZERO phase 2 done, UNMAP submit: lba=%" PRIu64
+		       " lba_count=%" PRIu64 " (%u slots)\n", journal_lba, lba_count, BS_MD_JOURNAL_NUM_ELEMS);
+
+	bs_batch_close(batch);
+}
+
 /* Second ZERO phase of the recovery: the newest slot per LBA. */
 static void
 spdk_md_journal_update_zero_latest(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
@@ -2182,7 +2233,7 @@ spdk_md_journal_update_zero_latest(spdk_bs_sequence_t *seq, void *cb_arg, int bs
 		return;
 	}
 
-	batch = bs_sequence_to_batch(seq, 0, spdk_md_journal_update_zero_finished, jr);
+	batch = bs_sequence_to_batch(seq, 0, spdk_md_journal_update_unmap, jr);
 
 	lba_count = bs_byte_to_lba(jr->bs, BS_MD_JOURNAL_ENTRY_SIZE);
 
@@ -2233,7 +2284,7 @@ spdk_md_journal_update_home_finished(spdk_bs_sequence_t *seq,
 	* HOME is durable.
 	*
 	* Zero all valid persistent journal slots discovered during
-	* recovery. Invalid/torn/CRC-bad slots are left untouched.
+	* recovery. The whole journal area is unmapped after the ZERO phases.
 	*
 	* Superseded entries are zeroed first, followed by the newest
 	* entry for each target LBA.
