@@ -4330,6 +4330,8 @@ struct op_split_ctx {
 	bool in_submit_ctx;
 	bool completed_in_submit_ctx;
 	bool done;
+	/* read class override for every piece, or -1 for the blob's own */
+	int priority_class;
 };
 
 static void
@@ -4388,8 +4390,9 @@ blob_request_submit_op_split_next(void *cb_arg, int bserrno)
 
 		switch (op_type) {
 		case SPDK_BLOB_READ:
-			spdk_blob_io_read(blob, ch, buf, offset, op_length,
-					  blob_request_submit_op_split_next, ctx);
+			spdk_blob_io_read_with_priority(blob, ch, buf, offset, op_length,
+							ctx->priority_class,
+							blob_request_submit_op_split_next, ctx);
 			break;
 		case SPDK_BLOB_WRITE:
 			spdk_blob_io_write(blob, ch, buf, offset, op_length,
@@ -4440,7 +4443,8 @@ blob_request_submit_op_split_next(void *cb_arg, int bserrno)
 static void
 blob_request_submit_op_split(struct spdk_io_channel *ch, struct spdk_blob *blob,
 			     void *payload, uint64_t offset, uint64_t length,
-			     spdk_blob_op_complete cb_fn, void *cb_arg, enum spdk_blob_op_type op_type)
+			     spdk_blob_op_complete cb_fn, void *cb_arg, enum spdk_blob_op_type op_type,
+			     int priority_class)
 {
 	struct op_split_ctx *ctx;
 	spdk_bs_sequence_t *seq;
@@ -4472,6 +4476,7 @@ blob_request_submit_op_split(struct spdk_io_channel *ch, struct spdk_blob *blob,
 	ctx->io_units_remaining = length;
 	ctx->op_type = op_type;
 	ctx->seq = seq;
+	ctx->priority_class = priority_class;
 
 	blob_request_submit_op_split_next(ctx, 0);
 }
@@ -4563,7 +4568,8 @@ blob_release_cluster(struct spdk_io_channel *_ch, struct spdk_blob *blob, uint64
 static void
 blob_request_submit_op_single(struct spdk_io_channel *_ch, struct spdk_blob *blob,
 			      void *payload, uint64_t offset, uint64_t length,
-			      spdk_blob_op_complete cb_fn, void *cb_arg, enum spdk_blob_op_type op_type)
+			      spdk_blob_op_complete cb_fn, void *cb_arg, enum spdk_blob_op_type op_type,
+			      int priority_class)
 {
 	struct spdk_bs_cpl cpl;
 	uint64_t lba;
@@ -4603,6 +4609,12 @@ blob_request_submit_op_single(struct spdk_io_channel *_ch, struct spdk_blob *blo
 		if (!batch) {
 			cb_fn(cb_arg, -ENOMEM);
 			return;
+		}
+		if (priority_class >= 0) {
+			/* Only this read: the blob's class, which every other reader
+			 * of it uses, stays as it is. A read that falls through to the
+			 * backing device still runs in that device's own class. */
+			batch->priority_class = priority_class;
 		}
 
 		if (is_allocated) {
@@ -4700,7 +4712,8 @@ blob_request_submit_op_single(struct spdk_io_channel *_ch, struct spdk_blob *blo
 static void
 blob_request_submit_op(struct spdk_blob *blob, struct spdk_io_channel *_channel,
 		       void *payload, uint64_t offset, uint64_t length,
-		       spdk_blob_op_complete cb_fn, void *cb_arg, enum spdk_blob_op_type op_type)
+		       spdk_blob_op_complete cb_fn, void *cb_arg, enum spdk_blob_op_type op_type,
+		       int priority_class)
 {
 	assert(blob != NULL);
 
@@ -4742,10 +4755,10 @@ blob_request_submit_op(struct spdk_blob *blob, struct spdk_io_channel *_channel,
 
 	if (length <= bs_num_io_units_to_cluster_boundary(blob, offset)) {
 		blob_request_submit_op_single(_channel, blob, payload, offset, length,
-					      cb_fn, cb_arg, op_type);
+					      cb_fn, cb_arg, op_type, priority_class);
 	} else {
 		blob_request_submit_op_split(_channel, blob, payload, offset, length,
-					     cb_fn, cb_arg, op_type);
+					     cb_fn, cb_arg, op_type, priority_class);
 	}
 }
 
@@ -10299,7 +10312,7 @@ bs_shallow_copy_cluster_find_next(void *cb_arg)
 		blob_request_submit_op_single(ctx->blob_channel, _blob, ctx->read_buff,
 					      bs_cluster_to_lba(_blob->bs, ctx->cluster),
 					      bs_dev_byte_to_lba(_blob->bs->dev, _blob->bs->cluster_sz),
-					      bs_shallow_copy_blob_read_cpl, ctx, SPDK_BLOB_READ);
+					      bs_shallow_copy_blob_read_cpl, ctx, SPDK_BLOB_READ, -1);
 	} else {
 		_blob->locked_operation_in_progress = false;
 		spdk_blob_close(_blob, bs_shallow_copy_cleanup_finish, ctx);
@@ -14994,7 +15007,7 @@ spdk_blob_io_unmap(struct spdk_blob *blob, struct spdk_io_channel *channel,
 		   uint64_t offset, uint64_t length, spdk_blob_op_complete cb_fn, void *cb_arg)
 {
 	blob_request_submit_op(blob, channel, NULL, offset, length, cb_fn, cb_arg,
-			       SPDK_BLOB_UNMAP);
+			       SPDK_BLOB_UNMAP, -1);
 }
 
 void
@@ -15002,7 +15015,7 @@ spdk_blob_io_write_zeroes(struct spdk_blob *blob, struct spdk_io_channel *channe
 			  uint64_t offset, uint64_t length, spdk_blob_op_complete cb_fn, void *cb_arg)
 {
 	blob_request_submit_op(blob, channel, NULL, offset, length, cb_fn, cb_arg,
-			       SPDK_BLOB_WRITE_ZEROES);
+			       SPDK_BLOB_WRITE_ZEROES, -1);
 }
 
 void
@@ -15011,7 +15024,7 @@ spdk_blob_io_write(struct spdk_blob *blob, struct spdk_io_channel *channel,
 		   spdk_blob_op_complete cb_fn, void *cb_arg)
 {
 	blob_request_submit_op(blob, channel, payload, offset, length, cb_fn, cb_arg,
-			       SPDK_BLOB_WRITE);
+			       SPDK_BLOB_WRITE, -1);
 }
 
 void
@@ -15020,7 +15033,20 @@ spdk_blob_io_read(struct spdk_blob *blob, struct spdk_io_channel *channel,
 		  spdk_blob_op_complete cb_fn, void *cb_arg)
 {
 	blob_request_submit_op(blob, channel, payload, offset, length, cb_fn, cb_arg,
-			       SPDK_BLOB_READ);
+			       SPDK_BLOB_READ, -1);
+}
+
+void
+spdk_blob_io_read_with_priority(struct spdk_blob *blob, struct spdk_io_channel *channel,
+				void *payload, uint64_t offset, uint64_t length, int priority_class,
+				spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	if (priority_class > MAX_PRIORITY_CLASS) {
+		cb_fn(cb_arg, -EINVAL);
+		return;
+	}
+	blob_request_submit_op(blob, channel, payload, offset, length, cb_fn, cb_arg,
+			       SPDK_BLOB_READ, priority_class);
 }
 
 void

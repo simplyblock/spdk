@@ -296,6 +296,11 @@ struct spdk_lvs_xfer {
 	 * dispatcher pauses refilling every non-priority transfer window. */
 	bool priority;
 	bool priority_counted;
+	/* IO priority class of the transfer's reads of the source blob, so the
+	 * reads are scheduled apart from client IO that reaches the same blob
+	 * (reads of a volume fall through to its snapshots). 0 keeps the blob's
+	 * own class. */
+	uint8_t priority_class;
 
 	TAILQ_ENTRY(spdk_lvs_xfer)	entry;
 

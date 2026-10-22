@@ -5248,8 +5248,10 @@ submit_rw_reqs_local(struct spdk_lvs_xfer_req *req)
 	{
 		case REQ_ACTION_COPY_BACKUP:
 			// read from local and write to remote
-			spdk_blob_io_read(xfer->lvol->blob, md_ch, req->payload, req->offset,
-								req->len, local_op_comp, req);
+			// in the transfer's own class when it has one, else the blob's (-1)
+			spdk_blob_io_read_with_priority(xfer->lvol->blob, md_ch, req->payload, req->offset,
+								req->len, xfer->priority_class ? (int)xfer->priority_class : -1,
+								local_op_comp, req);
 			break;
 		case REQ_ACTION_COPY_RECOVER:
 			// read from remote and write to local
@@ -7831,6 +7833,7 @@ spdk_lvol_transfer_delay(void *ctx) {
 int
 spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_batch, enum xfer_type type,
 				struct spdk_transfer_dev *tdev, const char *snapshot_name, uint32_t lvol_id,
+				uint8_t priority_class,
 				spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg) {
 	struct spdk_lvs_xfer *xfer, *task;	
 	struct spdk_lvol_store *lvs = lvol->lvol_store;	
@@ -7887,6 +7890,8 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
 	 * spends queued behind background snapshot transfers is added client
 	 * stall. Migration transfers are freeze-flows too. */
 	task->priority = task->final_step || type == XFER_MIGRATE_SNAPSHOT;
+	/* the RPC validates the range; an internal caller out of range gets the blob's */
+	task->priority_class = priority_class <= MAX_PRIORITY_CLASS ? priority_class : 0;
 
 	task->num_clusters = spdk_blob_get_num_clusters(lvol->blob);
 	task->clusters = calloc(task->num_clusters, sizeof(uint64_t));
