@@ -19,12 +19,6 @@ RUN cd spdk && git submodule update --init --depth 1
 RUN cd spdk && scripts/pkgdep.sh --rdma --pmem
 
 RUN mkdir /tmp/pmem
-RUN sed -i "s/^#define SPDK_JSONRPC_RECV_BUF_SIZE.*/#define SPDK_JSONRPC_RECV_BUF_SIZE\t(2 * 1024 * 1024)/" /root/spdk/lib/jsonrpc/jsonrpc_internal.h
-
-RUN sed -i "s/^#define SPDK_BDEV_QOS_MIN_IOS_PER_SEC.*/#define SPDK_BDEV_QOS_MIN_IOS_PER_SEC\t200/" /root/spdk/lib/bdev/bdev.c
-
-RUN sed -i "s/^#define SPDK_BDEV_QOS_TIMESLICE_IN_USEC.*/#define SPDK_BDEV_QOS_TIMESLICE_IN_USEC\t5000/" /root/spdk/lib/bdev/bdev.c
-
 RUN chmod +x /root/spdk/docker/crypto.sh
 RUN /root/spdk/docker/crypto.sh
 
