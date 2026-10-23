@@ -585,6 +585,102 @@ xfer_replicate_write_failure_fails_the_request(void)
 	free_xfer(xfer);
 }
 
+/* A replication FINAL step, started from the beginning as the final-step RPC
+ * starts it: the command-block page size, a snapshot name, and payloads sized
+ * for either path's signal write. The clock runs at a real time, because a deadline
+ * that was never set reads as 0 and only a clock past 0 exposes that. */
+static struct spdk_lvs_xfer *
+make_final_step_xfer(void)
+{
+	const int alloc[4] = {1, 1, 1, 1};
+	struct spdk_lvs_xfer *xfer = make_xfer(4, 4, alloc);
+
+	xfer->page_size = SPDK_LVOL_XFER_CMD_BLOCK_SIZE;
+	/* The migration path's signal write clears eight pages. */
+	xfer->page_per_cluster = 8;
+	for (int i = 0; i < xfer->cluster_batch; i++) {
+		free(xfer->reqs[i].payload);
+		xfer->reqs[i].payload = calloc(1, xfer->page_size * xfer->page_per_cluster);
+		SPDK_CU_ASSERT_FATAL(xfer->reqs[i].payload != NULL);
+	}
+	xfer->state = XFER_STATE_NONE;
+	xfer->final_step = true;
+	xfer->len = snprintf(xfer->snapshot_name, sizeof(xfer->snapshot_name), "LVS_1/LVOL_41");
+	return xfer;
+}
+
+/* The deadline of a replication final step starts with the step. It was set
+ * only on the migration path, so on this one it stayed 0, and the first
+ * status check after the first tick failed the cutover at offset 0 with
+ * "terminate timeout" -- every cross-cluster cutover, every attempt. */
+static void
+xfer_replicate_final_step_is_not_failed_by_an_unset_deadline(void)
+{
+	struct spdk_lvs_xfer *xfer;
+
+	MOCK_SET(spdk_get_ticks, 1000ULL * spdk_get_ticks_hz());
+	xfer = make_final_step_xfer();
+
+	xfer_replication(xfer);	/* NONE: no used clusters, on to the signal */
+	xfer_replication(xfer);	/* SIGNAL_TRANSFER: the signal is sent */
+
+	CU_ASSERT(xfer->state != XFER_STATE_FAILED);
+	CU_ASSERT(g_xfer_lvol.transfer_status != XFER_FAILED);
+	CU_ASSERT(xfer->signal_sent);
+	CU_ASSERT(drain_ready(xfer, NULL, 4) == 1);
+
+	free_xfer(xfer);
+	MOCK_CLEAR(spdk_get_ticks);
+}
+
+/* The deadline still ends a final step that makes no progress: one with no
+ * completion SPDK_LVOL_TRANSFER_TERMINATE_TIMEOUT seconds in fails. */
+static void
+xfer_replicate_final_step_fails_past_its_deadline(void)
+{
+	struct spdk_lvs_xfer *xfer;
+	uint64_t start = 1000ULL * spdk_get_ticks_hz();
+
+	MOCK_SET(spdk_get_ticks, start);
+	xfer = make_final_step_xfer();
+	xfer_replication(xfer);
+	xfer_replication(xfer);
+	/* Fatal: polling a failed task again destroys it. */
+	CU_ASSERT_FATAL(xfer->state != XFER_STATE_FAILED);
+
+	MOCK_SET(spdk_get_ticks, start + (SPDK_LVOL_TRANSFER_TERMINATE_TIMEOUT + 1) * spdk_get_ticks_hz());
+	xfer_replication(xfer);
+
+	CU_ASSERT(xfer->state == XFER_STATE_FAILED);
+	CU_ASSERT(g_xfer_lvol.transfer_status == XFER_FAILED);
+
+	free_xfer(xfer);
+	MOCK_CLEAR(spdk_get_ticks);
+}
+
+/* A migration final step with no used clusters goes straight to the signal,
+ * and its deadline was set only after that early return: the same unset
+ * deadline, on the empty-volume path. */
+static void
+xfer_migrate_final_step_without_clusters_is_not_failed_by_an_unset_deadline(void)
+{
+	struct spdk_lvs_xfer *xfer;
+
+	MOCK_SET(spdk_get_ticks, 1000ULL * spdk_get_ticks_hz());
+	xfer = make_final_step_xfer();
+	xfer->type = XFER_MIGRATE_SNAPSHOT;
+
+	xfer_migration(xfer);
+	xfer_migration(xfer);
+
+	CU_ASSERT(xfer->state != XFER_STATE_FAILED);
+	CU_ASSERT(g_xfer_lvol.transfer_status != XFER_FAILED);
+	CU_ASSERT(xfer->signal_sent);
+
+	free_xfer(xfer);
+	MOCK_CLEAR(spdk_get_ticks);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -609,6 +705,9 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, xfer_replicate_too_many_ranges_sends_whole_cluster);
 	CU_ADD_TEST(suite, xfer_replicate_submit_failure_fails_the_request);
 	CU_ADD_TEST(suite, xfer_replicate_write_failure_fails_the_request);
+	CU_ADD_TEST(suite, xfer_replicate_final_step_is_not_failed_by_an_unset_deadline);
+	CU_ADD_TEST(suite, xfer_replicate_final_step_fails_past_its_deadline);
+	CU_ADD_TEST(suite, xfer_migrate_final_step_without_clusters_is_not_failed_by_an_unset_deadline);
 
 	allocate_threads(1);
 	set_thread(0);
