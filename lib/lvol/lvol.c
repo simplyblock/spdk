@@ -5168,11 +5168,16 @@ xfer_wait_outstanding_io(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req **
 			if (xfer->outstanding_io == 0) {
 				xfer->lvol->transfer_status = XFER_FAILED;
 				xfer->state = XFER_STATE_FAILED;
-			} else {
-				// print current outstanding io timeout error
-				SPDK_ERRLOG("Task transfer timeout with outstanding io %u\n", xfer->outstanding_io);
+				return 0;
 			}
-			return 0;
+			/*
+			 * Outstanding completions still dereference xfer->reqs and xfer->pdus,
+			 * which destroy_xfer_task frees, so a stall must not be reported to the
+			 * caller as a finished drain. Advancing the stall clock keeps this to one
+			 * report per timeout window rather than one per poller tick.
+			 */
+			SPDK_ERRLOG("Task transfer timeout with outstanding io %u\n", xfer->outstanding_io);
+			xfer->timeout = current_time;
 		}
 		return -1;
 	}
