@@ -585,6 +585,224 @@ xfer_replicate_write_failure_fails_the_request(void)
 	free_xfer(xfer);
 }
 
+/*
+ * Partial (dirty-bitmap) replication. Real sizes: 4 KiB pages, 2 MiB clusters,
+ * so a dirty block (8 KiB) is two pages and a 64 KiB request is 16.
+ */
+#define UT_PPC		512
+#define UT_CLUSTER_SZ	(UT_PPC * 4096)
+
+static struct spdk_lvs_xfer *
+make_partial_xfer(int batch, uint32_t num_clusters, const int *alloc, struct blob_dirty_gen *gen)
+{
+	struct spdk_lvs_xfer *xfer = make_xfer(batch, num_clusters, alloc);
+
+	xfer->page_size = 4096;
+	xfer->page_per_cluster = UT_PPC;
+	for (int i = 0; i < batch; i++) {
+		free(xfer->reqs[i].payload);
+		xfer->reqs[i].payload = calloc(1, (size_t)UT_CLUSTER_SZ);
+		SPDK_CU_ASSERT_FATAL(xfer->reqs[i].payload != NULL);
+	}
+	g_ut_dirty_gen = gen;
+	g_ut_dirty_usable = true;
+	g_blob_read_only = true;	/* a snapshot */
+	xfer_setup_partial(xfer, 0, 0x42);
+	g_blob_read_only = false;
+	return xfer;
+}
+
+static void
+free_partial_xfer(struct spdk_lvs_xfer *xfer)
+{
+	free(xfer->ranges);
+	free(xfer->partial);
+	spdk_blob_dirty_gen_unref(xfer->dirty_gen);
+	free_xfer(xfer);
+	g_ut_dirty_gen = NULL;
+}
+
+/* Cluster 0: allocated, never written this epoch (no bitmap) -> whole.
+ * Cluster 1: one 8 KiB block at 8 KiB, and 100 KiB at 1 MiB -> partial.
+ * Cluster 2: written completely -> whole. */
+static struct blob_dirty_gen *
+make_gen_012(void)
+{
+	struct blob_dirty_gen *gen = blob_dirty_gen_create(UT_CLUSTER_SZ);
+
+	SPDK_CU_ASSERT_FATAL(gen != NULL);
+	blob_dirty_mark(gen, (uint64_t)UT_CLUSTER_SZ + 8192, 8192);
+	blob_dirty_mark(gen, (uint64_t)UT_CLUSTER_SZ + 1024 * 1024, 100 * 1024);
+	blob_dirty_mark(gen, 2ULL * UT_CLUSTER_SZ, UT_CLUSTER_SZ);
+	return gen;
+}
+
+/* Only a usable generation, on a fresh snapshot replication, is pinned. */
+static void
+xfer_partial_setup_gates(void)
+{
+	const int alloc[1] = {1};
+	struct blob_dirty_gen *gen = make_gen_012();
+	struct spdk_lvs_xfer *xfer;
+
+	xfer = make_partial_xfer(1, 1, alloc, gen);
+	CU_ASSERT(xfer->allow_partial);
+	CU_ASSERT(xfer->dirty_gen == gen);
+	CU_ASSERT(gen->refcnt == 2);
+	free_partial_xfer(xfer);
+	CU_ASSERT(gen->refcnt == 1);
+
+	/* unusable generation, resumed task, final step, migration: full */
+	xfer = make_xfer(1, 1, alloc);
+	g_blob_read_only = true;	/* each case below fails on its own condition */
+	g_ut_dirty_gen = gen;
+	g_ut_dirty_usable = false;
+	xfer->page_size = 4096;
+	xfer_setup_partial(xfer, 0, 0x42);
+	CU_ASSERT(!xfer->allow_partial && xfer->dirty_gen == NULL);
+	g_ut_dirty_usable = true;
+	xfer_setup_partial(xfer, 512, 0x42);
+	CU_ASSERT(!xfer->allow_partial && xfer->dirty_gen == NULL);
+	xfer->final_step = true;
+	xfer_setup_partial(xfer, 0, 0x42);
+	CU_ASSERT(!xfer->allow_partial && xfer->dirty_gen == NULL);
+	xfer->final_step = false;
+	xfer->type = XFER_MIGRATE_SNAPSHOT;
+	xfer_setup_partial(xfer, 0, 0x42);
+	CU_ASSERT(!xfer->allow_partial && xfer->dirty_gen == NULL);
+	/* a writable source: its generation keeps growing after the scan */
+	xfer->type = XFER_REPLICATE_SNAPSHOT;
+	g_blob_read_only = false;
+	xfer_setup_partial(xfer, 0, 0x42);
+	CU_ASSERT(!xfer->allow_partial && xfer->dirty_gen == NULL);
+	CU_ASSERT(gen->refcnt == 1);
+	free_partial_xfer(xfer);
+
+	blob_dirty_gen_free(gen);
+}
+
+/* Partial clusters are not pre-allocated on the destination: there they are
+ * built by CoW from the base, so the blocks the delta skips keep its data. */
+static void
+xfer_partial_alloc_skips_partial_clusters(void)
+{
+	const int alloc[3] = {1, 1, 1};
+	struct blob_dirty_gen *gen = make_gen_012();
+	struct spdk_lvs_xfer *xfer = make_partial_xfer(1, 3, alloc, gen);
+	struct spdk_lvol_xfer_cmd_hdr *cmd;
+	void *buf = calloc(1, SPDK_LVOL_XFER_CMD_SIZE);
+
+	SPDK_CU_ASSERT_FATAL(buf != NULL && xfer->allow_partial);
+	xfer_classify_partial(xfer);
+	CU_ASSERT(xfer->partial[0] == 0);
+	CU_ASSERT(xfer->partial[1] == 1);
+	CU_ASSERT(xfer->partial[2] == 0);
+	CU_ASSERT(xfer->partial_clusters == 1);
+
+	CU_ASSERT(xfer_build_alloc_cmd(xfer, buf) == 2);
+	cmd = buf;
+	CU_ASSERT(cmd->entries[0] == 0);
+	CU_ASSERT(cmd->entries[1] == 2);
+
+	free(buf);
+	free_partial_xfer(xfer);
+	blob_dirty_gen_free(gen);
+}
+
+/* Whole clusters go as one request; a partial cluster's coalesced ranges go as
+ * requests of at most 64 KiB (16 pages), marked partial. */
+static void
+xfer_partial_dispatch_splits_ranges(void)
+{
+	const int alloc[3] = {1, 1, 1};
+	struct blob_dirty_gen *gen = make_gen_012();
+	struct spdk_lvs_xfer *xfer = make_partial_xfer(8, 3, alloc, gen);
+	struct spdk_lvs_xfer_req *req;
+	const struct {
+		uint64_t offset, len;
+		bool partial;
+	} want[] = {
+		{0, UT_PPC, false},			/* cluster 0, whole */
+		{UT_PPC + 2, 2, true},			/* 8 KiB at 8 KiB */
+		{UT_PPC + 256, 16, true},		/* 1 MiB: 64 KiB ... */
+		{UT_PPC + 272, 10, true},		/* ... + 40 KiB (13 blocks) */
+		{2 * UT_PPC, UT_PPC, false},		/* cluster 2, whole */
+	};
+	uint32_t n = 0;
+
+	xfer_classify_partial(xfer);
+	xfer->state = XFER_STATE_TRANSFER_CLUSTERS;
+	xfer_replication(xfer);
+
+	while (spdk_ring_dequeue(xfer->ready_ring, (void **)&req, 1) == 1) {
+		SPDK_CU_ASSERT_FATAL(n < SPDK_COUNTOF(want));
+		CU_ASSERT(req->offset == want[n].offset);
+		CU_ASSERT(req->len == want[n].len);
+		CU_ASSERT(req->partial == want[n].partial);
+		CU_ASSERT(req->len * 4096 <= (want[n].partial ? 64 * 1024 : UT_CLUSTER_SZ));
+		n++;
+	}
+	CU_ASSERT(n == SPDK_COUNTOF(want));
+	CU_ASSERT(xfer->idx == SPDK_COUNTOF(want));
+
+	free_partial_xfer(xfer);
+	blob_dirty_gen_free(gen);
+}
+
+/* A partial request lands on blocks that hold the base's content: its zero
+ * blocks are written like any other; so are a resumed task's. */
+static void
+xfer_partial_and_resumed_requests_write_zeroes(void)
+{
+	struct spdk_lvs_xfer *xfer;
+	struct remote_lvol_info rmt;
+	struct spdk_lvs_xfer_req *req = make_cluster_req(&xfer, &rmt);
+
+	req->len = 16;			/* 64 KiB, all zero */
+	req->partial = true;
+	local_op_comp(req, 0);
+	CU_ASSERT(g_ut_bdev_write_cnt == 1);
+	check_write(req, 0, 0, 16);
+	complete_writes(req, true);
+	CU_ASSERT(req->status == XFER_REQ_STATUS_DONE);
+	free_xfer(xfer);
+
+	req = make_cluster_req(&xfer, &rmt);
+	xfer->no_zero_skip = true;	/* whole, all-zero cluster of a resumed task */
+	local_op_comp(req, 0);
+	check_whole_cluster(req);
+	complete_writes(req, true);
+	CU_ASSERT(req->status == XFER_REQ_STATUS_DONE);
+	free_xfer(xfer);
+}
+
+/* A resumed attempt starts at the lowest request not yet done: requests
+ * complete out of order, and one that completed late must not move the resume
+ * point past an earlier one still in flight -- or failed. */
+static void
+xfer_resume_offset_is_lowest_not_done(void)
+{
+	const int alloc[8] = {1, 1, 1, 1, 1, 1, 1, 1};
+	struct spdk_lvs_xfer *xfer = make_xfer(4, 8, alloc);
+	struct spdk_lvs_xfer_req *r = xfer->reqs;
+
+	xfer->hold_idx = 6;		/* clusters 0..5 dispatched */
+	r[0].offset = 2 * 4; r[0].status = XFER_REQ_STATUS_IN_FLIGHT;
+	r[1].offset = 5 * 4; r[1].status = XFER_REQ_STATUS_DONE;	/* the one reused */
+	r[2].offset = 3 * 4; r[2].status = XFER_REQ_STATUS_FAILED;
+	r[3].offset = 4 * 4; r[3].status = XFER_REQ_STATUS_READY;
+	CU_ASSERT(xfer_resume_offset(xfer, &r[1]) == 2 * 4);
+
+	r[0].status = XFER_REQ_STATUS_DONE;
+	CU_ASSERT(xfer_resume_offset(xfer, &r[1]) == 3 * 4);	/* the failed one */
+
+	r[2].status = XFER_REQ_STATUS_DONE;
+	r[3].status = XFER_REQ_STATUS_DONE;
+	CU_ASSERT(xfer_resume_offset(xfer, &r[1]) == 6 * 4);	/* next to send */
+
+	free_xfer(xfer);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -609,6 +827,11 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, xfer_replicate_too_many_ranges_sends_whole_cluster);
 	CU_ADD_TEST(suite, xfer_replicate_submit_failure_fails_the_request);
 	CU_ADD_TEST(suite, xfer_replicate_write_failure_fails_the_request);
+	CU_ADD_TEST(suite, xfer_partial_setup_gates);
+	CU_ADD_TEST(suite, xfer_partial_alloc_skips_partial_clusters);
+	CU_ADD_TEST(suite, xfer_partial_dispatch_splits_ranges);
+	CU_ADD_TEST(suite, xfer_partial_and_resumed_requests_write_zeroes);
+	CU_ADD_TEST(suite, xfer_resume_offset_is_lowest_not_done);
 
 	allocate_threads(1);
 	set_thread(0);

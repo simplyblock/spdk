@@ -262,6 +262,10 @@ struct spdk_lvs_xfer_req {
 	void *payload;
 	int fragments_outstanding;
 	int aggregated_status;
+	/* A dirty range of a cluster (partial transfer): it lands on a
+	 * destination cluster that holds the base's content, so every block of
+	 * it is written, zeroes included. */
+	bool partial;
 	struct remote_lvol_info *rmt_lvol;
 	struct spdk_lvs_xfer *xfer;
 	TAILQ_ENTRY(spdk_lvs_xfer_req)	entry;
@@ -342,6 +346,28 @@ struct spdk_lvs_xfer {
 	 * and the number of commands sent. */
 	uint32_t alloc_next;
 	uint32_t alloc_cmds;
+
+	/* Partial (dirty-bitmap) replication, see xfer_setup_partial. dirty_gen
+	 * is the snapshot's generation, pinned for the task's lifetime.
+	 * partial[i] marks the clusters sent as dirty ranges: they are not
+	 * pre-allocated on the destination, whose landing volume builds them by
+	 * CoW from the base it was cloned from. ranges[range_pos..num_ranges) of
+	 * range_cluster are still to send, range_done blocks of the current one
+	 * already sent, in requests of at most XFER_PARTIAL_MAX_BYTES. */
+	bool allow_partial;
+	struct blob_dirty_gen *dirty_gen;
+	uint8_t *partial;
+	struct blob_dirty_range *ranges;
+	uint32_t max_ranges;
+	uint32_t num_ranges;
+	uint32_t range_pos;
+	uint32_t range_done;
+	uint64_t range_cluster;
+	uint64_t partial_clusters;
+	/* The destination may hold non-zero content in clusters this task did
+	 * not just allocate (a resumed transfer skips the allocation step), so
+	 * zero ranges must be written too. */
+	bool no_zero_skip;
 };
 
 struct spdk_lvol_store {

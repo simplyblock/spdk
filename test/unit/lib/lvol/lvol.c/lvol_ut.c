@@ -14,6 +14,32 @@
 #include "common/lib/ut_multithread.c"
 #include "lvol/lvol.c"
 
+/* lvol.c calls into the dirty-bitmap module. blob_dirty.c is self-contained,
+ * so link the real code (the transfer tests need the real coalescing); the
+ * blob-layer entry points live in blobstore.c, which is not part of this
+ * binary, so the tests set what they return. */
+#include "blob/blob_dirty.c"
+static struct blob_dirty_gen *g_ut_dirty_gen;
+static bool g_ut_dirty_usable;
+struct blob_dirty_gen *
+spdk_blob_get_dirty_gen(struct spdk_blob *blob)
+{
+	(void)blob;
+	return g_ut_dirty_gen;
+}
+bool
+spdk_blob_dirty_gen_usable(struct spdk_blob *blob, const struct blob_dirty_gen *gen,
+			   spdk_blob_id base, const char **why)
+{
+	(void)blob;
+	(void)base;
+	if (why != NULL) {
+		*why = g_ut_dirty_usable ? NULL : "unusable (unit test)";
+	}
+	return gen != NULL && g_ut_dirty_usable;
+}
+DEFINE_STUB_V(spdk_bs_set_dirty_leader, (struct spdk_blob_store *bs, bool leader));
+
 void
 blob_check_io_inflaight(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
 {

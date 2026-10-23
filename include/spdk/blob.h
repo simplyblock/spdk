@@ -498,6 +498,56 @@ const char *node_role_to_string(node_role_t role);
 void spdk_bs_set_read_only(struct spdk_blob_store *bs, bool state);
 void spdk_blob_scan_used_clusters(struct spdk_blob* blob, uint64_t *clusters, uint32_t num_clusters, int *count);
 
+/* In-memory dirty tracking for partial snapshot replication (lib/blob/blob_dirty.c).
+ * A blob's dirty GENERATION records, at 8 KiB granularity, which blocks were
+ * written since the blob's epoch began (its first open without data, or the
+ * snapshot that rotated the generation onto it). Purely in memory: after a
+ * restart no generation exists and the transfer falls back to full clusters. */
+/* dirty-tracking granularity: one bit per this many bytes */
+#define SPDK_BLOB_DIRTY_BLOCK_SZ	(8 * 1024)
+
+struct blob_dirty_gen;
+
+struct blob_dirty_range {
+	uint32_t off;	/* in 8 KiB blocks, relative to the cluster start */
+	uint32_t len;	/* in 8 KiB blocks */
+};
+
+struct blob_dirty_gen *spdk_blob_get_dirty_gen(struct spdk_blob *blob);
+/* Pin a generation for the lifetime of a transfer task. The snapshot family
+ * cap frees generations older than the two newest snapshots, so a task that
+ * keeps a raw pointer across ticks MUST hold a reference. */
+void spdk_blob_dirty_gen_ref(struct blob_dirty_gen *gen);
+void spdk_blob_dirty_gen_unref(struct blob_dirty_gen *gen);
+bool spdk_blob_dirty_gen_complete(const struct blob_dirty_gen *gen);
+uint64_t spdk_blob_dirty_gen_id(const struct blob_dirty_gen *gen);
+uint64_t spdk_blob_dirty_gen_tracked(const struct blob_dirty_gen *gen);
+uint64_t spdk_blob_dirty_gen_bytes(const struct blob_dirty_gen *gen);
+/* The blob the generation's writes apply on top of: the snapshot whose
+ * creation started it, the clone's parent, or SPDK_BLOBID_INVALID for a blob
+ * that started empty. */
+spdk_blob_id spdk_blob_dirty_gen_base(const struct blob_dirty_gen *gen);
+uint64_t spdk_blob_dirty_gen_epoch(const struct blob_dirty_gen *gen);
+uint64_t spdk_bs_get_dirty_epoch(struct spdk_blob_store *bs);
+/* The lvol layer reports every change of the LVS leadership here. Dirty
+ * generations start only while the LVS leads, and a change in either direction
+ * ends the epoch every existing generation belongs to. */
+void spdk_bs_set_dirty_leader(struct spdk_blob_store *bs, bool leader);
+/* Data writes this node executed into the blobstore's blobs (see blobstore.h). */
+uint64_t spdk_bs_get_dirty_local_writes(struct spdk_blob_store *bs);
+uint32_t spdk_blob_dirty_max_ranges(const struct blob_dirty_gen *gen);
+/* Ranges to transfer for one cluster: -1 = no bitmap (send the whole
+ * cluster), otherwise the number of coalesced ranges written to out. */
+int spdk_blob_dirty_cluster_ranges(struct blob_dirty_gen *gen, uint64_t cluster_idx,
+				   struct blob_dirty_range *out, uint32_t max_out);
+/* Whether gen may drive a partial transfer of blob that lands on a copy of
+ * base: it saw every write since its epoch began (complete), that epoch began
+ * at base, and this node has led the blobstore without interruption since
+ * (a leadership change in either direction means writes may have gone through
+ * another node). *why names the first failed condition. */
+bool spdk_blob_dirty_gen_usable(struct spdk_blob *blob, const struct blob_dirty_gen *gen,
+				spdk_blob_id base, const char **why);
+
 bool spdk_blob_get_offset_allocate(struct spdk_blob *blob, uint64_t offset);
 bool spdk_blob_check_offset_valid(struct spdk_blob *blob, uint64_t offset, uint64_t length);
 int spdk_read_cluster_data_xfer(struct spdk_blob *blob, void *buf, uint64_t offset,

@@ -102,6 +102,16 @@ add_lvs_to_list(struct spdk_lvol_store *lvs)
 	return name_conflict ? -1 : 0;
 }
 
+/* Every change of the LVS leadership goes through here: the blobstore's dirty
+ * tracking follows it (spdk_bs_set_dirty_leader), and a leadership change in
+ * either direction ends the epoch of every dirty generation on this node. */
+static void
+lvs_set_leader(struct spdk_lvol_store *lvs, bool leader)
+{
+	lvs->leader = leader;
+	spdk_bs_set_dirty_leader(lvs->blobstore, leader);
+}
+
 static struct spdk_lvol_store *
 lvs_alloc(void)
 {
@@ -124,7 +134,7 @@ lvs_alloc(void)
 	lvs->queue_failed_rsp = false;
 
 	lvs->load_esnaps = false;
-	lvs->leader = false;
+	lvs_set_leader(lvs, false);
 	lvs->read_only = false;
 	RB_INIT(&lvs->degraded_lvol_sets_tree);
 	lvs->thread = spdk_get_thread();
@@ -3688,7 +3698,7 @@ spdk_lvs_unfreeze_on_conflict(struct spdk_lvol_store *lvs)
 
 	spdk_bs_set_leader(lvs->blobstore, false);
 	spdk_bs_activate_md_journal(lvs->blobstore, lvs->leader, false, spdk_lvs_md_journal_signal_cpl, NULL);
-	lvs->leader = false;
+	lvs_set_leader(lvs, false);
 
 	TAILQ_FOREACH(lvol, &lvs->lvols, link) {
 		lvol->leader = false;
@@ -3784,7 +3794,7 @@ spdk_lvs_change_leader_state(uint64_t groupid)
 				lvs->timeout_trigger = 1;
 				spdk_bs_set_leader(lvs->blobstore, false);
 				spdk_bs_activate_md_journal(lvs->blobstore, lvs->leader, false, spdk_lvs_md_journal_signal_cpl, NULL);
-				lvs->leader = false;
+				lvs_set_leader(lvs, false);
 
 				TAILQ_FOREACH(lvol, &lvs->lvols, link) {
 					lvol->leader = false;
@@ -3854,7 +3864,7 @@ spdk_lvs_queued_failed_IO(struct spdk_lvol_store *lvs)
 		// we should send the signal to the md journal but no need to wait bcs we have 10 seconds until next failover at minmum
 		spdk_bs_set_leader(lvs->blobstore, false);
 		spdk_bs_activate_md_journal(lvs->blobstore, lvs->leader, false, spdk_lvs_md_journal_signal_cpl, NULL);
-		lvs->leader = false;
+		lvs_set_leader(lvs, false);
 
 		TAILQ_FOREACH(lvol, &lvs->lvols, link) {
 			lvol->leader = false;
@@ -4410,7 +4420,7 @@ spdk_lvs_ha_fence(uint64_t groupid, spdk_lvs_ha_cb cb_fn, void *cb_arg)
 	 * promotion path. A demotion completes inline (no message sent). */
 	spdk_bs_set_leader(bs, false);
 	spdk_bs_activate_md_journal(bs, lvs->leader, false, spdk_lvs_md_journal_signal_cpl, NULL);
-	lvs->leader = false;
+	lvs_set_leader(lvs, false);
 	spdk_bs_ha_set_hold(bs, false);
 	TAILQ_FOREACH(lvol, &lvs->lvols, link) {
 		lvol->leader = false;
@@ -5114,9 +5124,15 @@ submit_req_fragments(struct spdk_lvs_xfer_req *req, struct remote_lvol_info *rmt
 	req->fragments_outstanding = 0;
 	req->aggregated_status = 0;
 
-	nranges = spdk_bs_find_data_ranges(payload, (uint64_t)req->len * blocklen, blocklen,
+	if (req->partial || req->xfer->no_zero_skip) {
+		/* The destination block holds the base's content (or may), not
+		 * zeroes: a zero block must be written like any other. */
+		nranges = -1;
+	} else {
+		nranges = spdk_bs_find_data_ranges(payload, (uint64_t)req->len * blocklen, blocklen,
 						   (uint64_t)max_blocks * blocklen,
 						   ranges, XFER_MAX_DATA_RANGES);
+	}
 
 	if (nranges == 0) {
 		/* All zero: the allocated destination cluster already reads as zeroes. */
@@ -5719,6 +5735,11 @@ destroy_xfer_task_tmo(void *arg) {
 		free(xfer->chain_s3_ids);
 	if (xfer->old_clusters)
 		free(xfer->old_clusters);
+	free(xfer->ranges);
+	free(xfer->partial);
+	/* release the pinned dirty generation (no-op when NULL) */
+	spdk_blob_dirty_gen_unref(xfer->dirty_gen);
+	xfer->dirty_gen = NULL;
 	free(xfer);
 	return -1;
 }
@@ -6001,7 +6022,11 @@ xfer_build_alloc_cmd(struct spdk_lvs_xfer *xfer, void *buf)
 	 * the next command.
 	 */
 	while (xfer->alloc_next < xfer->num_clusters) {
-		if (xfer->clusters[xfer->alloc_next] != 0) {
+		/* A partial cluster is not allocated here: a fresh cluster reads as
+		 * zeroes, and the blocks the delta does not carry must read as the
+		 * base's. The landing volume's first write to it does the CoW. */
+		if (xfer->clusters[xfer->alloc_next] != 0 &&
+		    !(xfer->partial != NULL && xfer->partial[xfer->alloc_next])) {
 			ep = xfer->alloc_next / SPDK_BLOB_CLUSTERS_PER_EXTENT_PAGE;
 			if (n > 0 && ep != last_ep &&
 			    SPDK_LVOL_XFER_CMD_MAX_ENTRIES - n < SPDK_BLOB_CLUSTERS_PER_EXTENT_PAGE) {
@@ -6102,6 +6127,186 @@ xfer_alloc_clusters_step(struct spdk_lvs_xfer *xfer)
 	}
 }
 
+/*
+ * Where a later attempt may resume (lvol->last_offset, reported as the
+ * transfer's offset): the lowest offset of a request not yet done -- dispatched,
+ * in flight or failed -- or, with none outstanding, the next cluster to send.
+ * Requests complete out of order: resuming from the request that happened to
+ * complete last skipped earlier clusters still in flight, and if one of those
+ * then failed, the destination kept a fresh (zero) cluster there. done is the
+ * request just taken back from the free ring.
+ */
+static uint64_t
+xfer_resume_offset(struct spdk_lvs_xfer *xfer, const struct spdk_lvs_xfer_req *done)
+{
+	uint64_t low = (uint64_t)xfer->hold_idx * xfer->page_per_cluster;
+
+	for (int i = 0; i < xfer->cluster_batch; i++) {
+		const struct spdk_lvs_xfer_req *r = &xfer->reqs[i];
+		enum xfer_req_status st = __atomic_load_n(&r->status, __ATOMIC_ACQUIRE);
+
+		if (r == done) {
+			continue;
+		}
+		if ((st == XFER_REQ_STATUS_READY || st == XFER_REQ_STATUS_IN_FLIGHT ||
+		     st == XFER_REQ_STATUS_FAILED) && r->offset < low) {
+			low = r->offset;
+		}
+	}
+	return low;
+}
+
+/* Largest request of a partial transfer: one source read and at most two
+ * destination writes (XFER_MAX_WRITE_BYTES) each. */
+#define XFER_PARTIAL_MAX_BYTES	(64 * 1024)
+
+/*
+ * Decide whether this task sends dirty ranges instead of whole clusters, and
+ * pin the generation that drives it. Everything that could make the delta
+ * incomplete falls back to full clusters, which is always correct:
+ *  - only snapshot replication of a fresh (not resumed) task: a resumed task
+ *    may find destination clusters an earlier full attempt allocated fresh,
+ *    where a range write would leave zeroes instead of the base's content;
+ *  - the generation must be usable against partial_base, the blob the
+ *    destination's landing volume holds a copy of (spdk_blob_dirty_gen_usable:
+ *    complete, same leadership epoch, started at that base);
+ *  - the dirty block must be a whole number of transfer pages.
+ * What the blob layer cannot see -- writes a non-leader executed locally, and
+ * that the landing volume really is a clone of the base's copy -- the caller
+ * (the control plane) must guarantee before passing allow_partial.
+ */
+static void
+xfer_setup_partial(struct spdk_lvs_xfer *xfer, uint64_t offset, uint64_t partial_base)
+{
+	struct spdk_lvol *lvol = xfer->lvol;
+	struct blob_dirty_gen *gen = spdk_blob_get_dirty_gen(lvol->blob);
+	const char *why = NULL;
+
+	if (xfer->type != XFER_REPLICATE_SNAPSHOT || xfer->final_step) {
+		why = "only snapshot replication sends dirty ranges";
+	} else if (!spdk_blob_is_read_only(lvol->blob)) {
+		/* a writable blob's generation keeps growing after the scan */
+		why = "the source is not a read-only snapshot";
+	} else if (offset != 0) {
+		why = "a resumed transfer sends full clusters";
+	} else if (xfer->page_size == 0 || SPDK_BLOB_DIRTY_BLOCK_SZ % xfer->page_size != 0) {
+		why = "dirty block is not a whole number of pages";
+	} else if (spdk_blob_dirty_gen_usable(lvol->blob, gen, (spdk_blob_id)partial_base, &why)) {
+		xfer->max_ranges = spdk_blob_dirty_max_ranges(gen);
+		xfer->ranges = calloc(xfer->max_ranges, sizeof(*xfer->ranges));
+		xfer->partial = calloc(xfer->num_clusters, sizeof(*xfer->partial));
+		if (xfer->ranges == NULL || xfer->partial == NULL) {
+			free(xfer->ranges);
+			free(xfer->partial);
+			xfer->ranges = NULL;
+			xfer->partial = NULL;
+			why = "out of memory";
+		} else {
+			/* Pin it: the family cap in the blob layer frees generations
+			 * older than the two newest snapshots, and this task walks the
+			 * bitmaps across many poller ticks. */
+			spdk_blob_dirty_gen_ref(gen);
+			xfer->dirty_gen = gen;
+			xfer->allow_partial = true;
+			SPDK_NOTICELOG("Transfer lvol %s: dirty-bitmap partial transfer (gen %" PRIu64
+				       ", base 0x%" PRIx64 ", %" PRIu64 " tracked clusters, %" PRIu64
+				       " dirty bytes)\n", lvol->name, spdk_blob_dirty_gen_id(gen),
+				       partial_base, spdk_blob_dirty_gen_tracked(gen),
+				       spdk_blob_dirty_gen_bytes(gen));
+			return;
+		}
+	}
+	SPDK_NOTICELOG("Transfer lvol %s: partial requested (base 0x%" PRIx64 "), sending full "
+		       "clusters: %s\n", lvol->name, partial_base, why);
+}
+
+/* Fill ranges with cluster idx's dirty ranges. False: no usable bitmap for it
+ * (send it whole). */
+static bool
+xfer_load_ranges(struct spdk_lvs_xfer *xfer, uint64_t idx)
+{
+	int nr = spdk_blob_dirty_cluster_ranges(xfer->dirty_gen, idx, xfer->ranges,
+						xfer->max_ranges);
+
+	if (nr <= 0) {
+		xfer->num_ranges = 0;
+		xfer->range_pos = 0;
+		return false;
+	}
+	xfer->num_ranges = (uint32_t)nr;
+	xfer->range_pos = 0;
+	xfer->range_done = 0;
+	xfer->range_cluster = idx;
+	return true;
+}
+
+/* Mark the clusters sent as dirty ranges: those with a bitmap that does not
+ * cover the whole cluster. Every other used cluster is sent whole and
+ * allocated on the destination first, as in a full transfer. */
+static void
+xfer_classify_partial(struct spdk_lvs_xfer *xfer)
+{
+	uint64_t blocks = (uint64_t)xfer->page_per_cluster * xfer->page_size / SPDK_BLOB_DIRTY_BLOCK_SZ;
+	uint64_t i, full = 0;
+
+	for (i = 0; i < xfer->num_clusters; i++) {
+		if (xfer->clusters[i] == 0) {
+			continue;
+		}
+		if (!xfer_load_ranges(xfer, i)) {
+			full++;
+			continue;
+		}
+		if (xfer->num_ranges == 1 && xfer->ranges[0].off == 0 && xfer->ranges[0].len == blocks) {
+			full++;
+			continue;
+		}
+		xfer->partial[i] = 1;
+		xfer->partial_clusters++;
+	}
+	xfer->num_ranges = 0;
+	xfer->range_pos = 0;
+	SPDK_NOTICELOG("Transfer lvol %s: %" PRIu64 " cluster(s) as dirty ranges, %" PRIu64
+		       " whole\n", xfer->lvol->name, xfer->partial_clusters, full);
+}
+
+/* Enqueue the next piece of the current dirty range: at most
+ * XFER_PARTIAL_MAX_BYTES, so a dense run never becomes one large read. */
+static void
+xfer_enqueue_range_req(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req *req)
+{
+	const struct blob_dirty_range *r = &xfer->ranges[xfer->range_pos];
+	uint64_t pages_per_block = SPDK_BLOB_DIRTY_BLOCK_SZ / xfer->page_size;
+	uint32_t max_blocks = spdk_max(XFER_PARTIAL_MAX_BYTES / SPDK_BLOB_DIRTY_BLOCK_SZ, 1u);
+	uint32_t n = spdk_min(r->len - xfer->range_done, max_blocks);
+
+	req->offset = xfer->range_cluster * xfer->page_per_cluster +
+		      (uint64_t)(r->off + xfer->range_done) * pages_per_block;
+	req->len = (uint64_t)n * pages_per_block;
+	req->dst_offset = req->offset;
+	if (xfer->lvol->redirect_map_id != 0) {
+		req->dst_offset = ((uint64_t)(xfer->lvol->redirect_map_id) << 48) | req->offset;
+	}
+	req->partial = true;
+	req->action = REQ_ACTION_COPY_BACKUP;
+	req->status = XFER_REQ_STATUS_READY;
+
+	xfer->range_done += n;
+	if (xfer->range_done == r->len) {
+		xfer->range_pos++;
+		xfer->range_done = 0;
+	}
+
+	if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
+		SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
+		assert(false);
+	}
+	xfer->lvol->xfer_partial_reqs++;
+	xfer->lvol->xfer_pages_sent += req->len;
+	xfer->outstanding_io++;
+	xfer->idx++;
+}
+
 static int
 xfer_replication(struct spdk_lvs_xfer *xfer) {
 	struct spdk_lvs_xfer_req *req;
@@ -6138,6 +6343,9 @@ xfer_replication(struct spdk_lvs_xfer *xfer) {
 				xfer_fill_queue(xfer, xfer->final_step ? 1 : 0);
 				return count;
 			}
+			if (xfer->allow_partial) {
+				xfer_classify_partial(xfer);
+			}
 			xfer->state = XFER_STATE_ALLOC_CLUSTERS;
 			xfer_fill_queue(xfer, xfer->cluster_batch);
 			if (xfer->lvol->last_offset != 0) {
@@ -6172,7 +6380,15 @@ xfer_replication(struct spdk_lvs_xfer *xfer) {
 					return count;
 				}
 
-				xfer->lvol->last_offset = req->offset;
+				xfer->lvol->last_offset = xfer_resume_offset(xfer, req);
+				req->partial = false;
+
+				if (xfer->range_pos < xfer->num_ranges) {
+					/* the rest of the current cluster's dirty ranges */
+					xfer_enqueue_range_req(xfer, req);
+					count++;
+					continue;
+				}
 
 				// prepare req
 				memset(req->payload, 0, xfer->page_size * xfer->page_per_cluster);
@@ -6181,6 +6397,21 @@ xfer_replication(struct spdk_lvs_xfer *xfer) {
 					for (uint32_t i = xfer->hold_idx; i < xfer->num_clusters; i++) {
 						if (xfer->clusters[i] == 0) {
 							continue;
+						}
+
+						if (xfer->partial != NULL && xfer->partial[i]) {
+							if (xfer_load_ranges(xfer, i)) {
+								/* bitmap-driven: only the dirty ranges travel */
+								is_allocate = true;
+								xfer->hold_idx = i + 1;
+								xfer_enqueue_range_req(xfer, req);
+								count++;
+								break;
+							}
+							/* Not pre-allocated: sent whole below, it
+							 * lands on the base's content, so its zero
+							 * blocks must be written too. */
+							req->partial = true;
 						}
 
 						is_allocate = true;
@@ -7840,7 +8071,7 @@ spdk_lvol_transfer_delay(void *ctx) {
 int
 spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_batch, enum xfer_type type,
 				struct spdk_transfer_dev *tdev, const char *snapshot_name, uint32_t lvol_id,
-				uint8_t priority_class,
+				uint8_t priority_class, bool allow_partial, uint64_t partial_base,
 				spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg) {
 	struct spdk_lvs_xfer *xfer, *task;	
 	struct spdk_lvol_store *lvs = lvol->lvol_store;	
@@ -7926,6 +8157,14 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
 	rc = spdk_lvol_create_backup_task(task, tdev);
 	if (rc != 0) {
 		return rc;
+	}
+
+	/* A resumed transfer skips the allocation step: the destination
+	 * clusters it writes may hold the base's content (CoW of an earlier
+	 * partial attempt) rather than read as zeroes. */
+	task->no_zero_skip = offset != 0 || allow_partial || partial_base != 0;
+	if (allow_partial) {
+		xfer_setup_partial(task, offset, partial_base);
 	}
 
 	if (task->priority && !task->priority_counted) {
@@ -8416,7 +8655,7 @@ spdk_lvs_set_leader(struct spdk_lvol_store *lvs, bool leader)
 
 	pthread_mutex_lock(&g_lvol_stores_mutex);
 
-	lvs->leader = leader;
+	lvs_set_leader(lvs, leader);
 	lvs->update_in_progress = false;
 	lvs->retry_on_update = 0;
 
@@ -8489,7 +8728,7 @@ spdk_lvol_set_leader_cpl(void *cb_arg, int lvolerrno)
 			lvs->hub_dev.drain_in_action = false;
 		}
 	}
-	lvs->leader = lvs_leader;
+	lvs_set_leader(lvs, lvs_leader);
 	ana_restore_port = 0;
 	if (__atomic_load_n(&g_lvs_ha_active, __ATOMIC_SEQ_CST)) {
 		/* Two-node arbitration: a demoted LVS no longer writes, so it holds

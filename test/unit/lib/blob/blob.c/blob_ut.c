@@ -19,6 +19,7 @@
 #include "blob/request.c"
 #include "blob/zeroes.c"
 #include "blob/blob_bs_dev.c"
+#include "blob/blob_dirty.c"
 #include "esnap_dev.c"
 #define BLOCKLEN DEV_BUFFER_BLOCKLEN
 
