@@ -130,6 +130,8 @@ struct spdk_blob {
 	 * the snapshot at rotation (bs_snapshot_swap_cluster_maps), freed in
 	 * blob_free(). */
 	struct blob_dirty_gen *dirty_gen;
+	/* spdk_blob_merge_base is running (dirty_gen is detached meanwhile) */
+	bool dirty_merging;
 
 	enum spdk_blob_state		state;
 

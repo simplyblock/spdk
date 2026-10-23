@@ -8225,7 +8225,8 @@ lvol_merge_base_on_md(void *arg)
  * Destination side of a partial snapshot replication: fill the landing
  * volume's pre-allocated clusters with the base's content wherever the
  * transfer did not write (spdk_blob_merge_base). Leader only: a non-leader's
- * md is not authoritative and its writes are not tracked.
+ * md is not authoritative and its writes are not tracked. The callback runs on
+ * the calling thread. See spdk_lvol_merge_base_start for the job form.
  */
 void
 spdk_lvol_merge_base(struct spdk_lvol *lvol, spdk_lvol_merge_complete cb_fn, void *cb_arg)
@@ -8248,6 +8249,36 @@ spdk_lvol_merge_base(struct spdk_lvol *lvol, spdk_lvol_merge_complete cb_fn, voi
 	req->cb_arg = cb_arg;
 	spdk_thread_send_msg(spdk_bs_get_md_thread(lvol->lvol_store->blobstore),
 			     lvol_merge_base_on_md, req);
+}
+
+static void
+lvol_merge_job_cpl(void *cb_arg, const struct spdk_blob_merge_stats *stats, int lvolerrno)
+{
+	struct spdk_lvol *lvol = cb_arg;
+
+	lvol->merge_stats = *stats;
+	lvol->merge_rc = lvolerrno;
+	lvol->merge_ms = (spdk_get_ticks() - lvol->merge_start_ticks) * 1000 / spdk_get_ticks_hz();
+	lvol->merge_state = lvolerrno == 0 ? LVOL_MERGE_DONE : LVOL_MERGE_FAILED;
+}
+
+/*
+ * Start the merge of a landing lvol as a job, idempotently: a running job is
+ * left alone, a finished one is not repeated (its result stays readable), a
+ * failed one is started again. The state is read from lvol->merge_state.
+ */
+void
+spdk_lvol_merge_base_start(struct spdk_lvol *lvol)
+{
+	if (lvol->merge_state == LVOL_MERGE_RUNNING || lvol->merge_state == LVOL_MERGE_DONE) {
+		return;
+	}
+	memset(&lvol->merge_stats, 0, sizeof(lvol->merge_stats));
+	lvol->merge_rc = 0;
+	lvol->merge_ms = 0;
+	lvol->merge_start_ticks = spdk_get_ticks();
+	lvol->merge_state = LVOL_MERGE_RUNNING;
+	spdk_lvol_merge_base(lvol, lvol_merge_job_cpl, lvol);
 }
 
 int

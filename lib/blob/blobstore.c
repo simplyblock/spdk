@@ -4632,7 +4632,7 @@ blob_dirty_gen_reparent(struct spdk_blob *blob, spdk_blob_id new_parent)
 
 /* START spdk_blob_merge_base */
 
-#define BLOB_MERGE_QD		32
+#define BLOB_MERGE_QD		64
 #define BLOB_MERGE_CHUNK	(512 * 1024)
 
 struct blob_merge_ctx;
@@ -4736,6 +4736,7 @@ blob_merge_finish(struct blob_merge_ctx *ctx)
 	struct spdk_blob *blob = ctx->blob;
 
 	blob->dirty_gen = ctx->gen;
+	blob->dirty_merging = false;
 	if (ctx->rc == 0) {
 		ctx->gen->merge_pending = false;
 	}
@@ -4843,6 +4844,11 @@ spdk_blob_merge_base(struct spdk_blob *blob, spdk_blob_merge_complete cb_fn, voi
 		cb_fn(cb_arg, &none, -EPERM);
 		return;
 	}
+	if (blob->dirty_merging) {
+		/* its generation is detached: it is not lost, a merge holds it */
+		cb_fn(cb_arg, &none, -EBUSY);
+		return;
+	}
 	if (gen == NULL || !spdk_blob_dirty_gen_complete(gen)) {
 		/* what arrived is unknown: the transfer must be repeated */
 		cb_fn(cb_arg, &none, -ESTALE);
@@ -4912,6 +4918,7 @@ spdk_blob_merge_base(struct spdk_blob *blob, spdk_blob_merge_complete cb_fn, voi
 	 * marking them would make every block of a partial cluster look written.
 	 * Nothing else writes to a landing blob between its transfer and here. */
 	blob->dirty_gen = NULL;
+	blob->dirty_merging = true;
 	blob_merge_pump(ctx);
 }
 

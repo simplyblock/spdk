@@ -34,6 +34,7 @@ from dbx_test import (CLUSTER_SZ, SOCK_A, SOCK_B, VOL_MIB, chunk_diff,  # noqa: 
                       host_connect, md5_dev, nvmf_up, rpc, sh, start_tgt,
                       wait_transfer_done)
 import subprocess  # noqa: E402
+import time  # noqa: E402
 
 PORT_HUB = "4470"
 PORT_A = "4471"
@@ -70,6 +71,23 @@ def delta(dev, rnd):
     # discard inside an allocated cluster: the blocks then read as zeroes
     sh(f"blkdiscard -o {(c + 2) * CLUSTER_SZ + 512 * 1024} -l {64 * 1024} {dev}", check=False)
     sh("sync")
+
+
+def merge(lvol):
+    """Start the landing volume's merge with its base (a job) and wait for it;
+    starting it again while it runs, or after it is done, must not repeat it."""
+    st = rpc(SOCK_B, "bdev_lvol_merge_base", {"lvol_name": lvol})
+    again = rpc(SOCK_B, "bdev_lvol_merge_base", {"lvol_name": lvol})
+    assert again["state"] in ("running", "done"), again
+    for _ in range(600):
+        st = rpc(SOCK_B, "bdev_lvol_merge_base_stat", {"lvol_name": lvol})
+        if st["state"] != "running":
+            break
+        time.sleep(0.5)
+    assert st["state"] == "done", f"merge of {lvol}: {st}"
+    done_again = rpc(SOCK_B, "bdev_lvol_merge_base", {"lvol_name": lvol})
+    assert done_again == st, f"a finished merge was repeated: {done_again} vs {st}"
+    return st
 
 
 def main():
@@ -143,7 +161,7 @@ def main():
                 print(f"    full retry into {name}: {st_retry}")
                 assert st_retry["partial_reqs"] == 0, st_retry
             if base is not None:
-                merged = rpc(SOCK_B, "bdev_lvol_merge_base", {"lvol_name": f"lvsB/{name}"})
+                merged = merge(f"lvsB/{name}")
                 print(f"    merge {name}: {merged}")
                 st["merged"] = merged
             nqn = nvmf_up(SOCK_B, f"c{name}", f"lvsB/{name}", str(PORT_LANDING0 + rnd))

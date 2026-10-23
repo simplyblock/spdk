@@ -492,6 +492,19 @@ struct spdk_lvol {
 	/* stats of the most recent transfer: how many requests went out as
 	 * bitmap-driven partial ranges vs whole clusters (dirty-bitmap
 	 * replication; reset when a transfer starts) */
+	/* bdev_lvol_merge_base job (destination of a partial transfer): it
+	 * takes longer than an RPC may, so the RPC starts it and
+	 * bdev_lvol_merge_base_stat reports it. */
+	enum spdk_lvol_merge_state {
+		LVOL_MERGE_NONE = 0,
+		LVOL_MERGE_RUNNING,
+		LVOL_MERGE_DONE,
+		LVOL_MERGE_FAILED,
+	} merge_state;
+	int merge_rc;
+	struct spdk_blob_merge_stats merge_stats;
+	uint64_t merge_start_ticks;
+	uint64_t merge_ms;
 	uint64_t xfer_partial_reqs;
 	uint64_t xfer_full_clusters;
 	uint64_t xfer_pages_sent;

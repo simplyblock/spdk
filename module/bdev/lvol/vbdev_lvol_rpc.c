@@ -4448,35 +4448,43 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_merge_base_decoders[]
 	{"lvol_name", offsetof(struct rpc_bdev_lvol_merge_base, lvol_name), spdk_json_decode_string},
 };
 
-static void
-rpc_bdev_lvol_merge_base_cb(void *cb_arg, const struct spdk_blob_merge_stats *stats, int lvolerrno)
+static const char *
+lvol_merge_state_str(enum spdk_lvol_merge_state s)
 {
-	struct spdk_jsonrpc_request *request = cb_arg;
-	struct spdk_json_write_ctx *w;
-
-	if (lvolerrno != 0) {
-		spdk_jsonrpc_send_error_response(request, lvolerrno, spdk_strerror(-lvolerrno));
-		return;
+	switch (s) {
+	case LVOL_MERGE_RUNNING:
+		return "running";
+	case LVOL_MERGE_DONE:
+		return "done";
+	case LVOL_MERGE_FAILED:
+		return "failed";
+	default:
+		return "none";
 	}
-	w = spdk_jsonrpc_begin_result(request);
+}
+
+static void
+rpc_write_merge_state(struct spdk_jsonrpc_request *request, struct spdk_lvol *lvol)
+{
+	struct spdk_json_write_ctx *w = spdk_jsonrpc_begin_result(request);
+
 	spdk_json_write_object_begin(w);
-	spdk_json_write_named_uint64(w, "clusters", stats->clusters);
-	spdk_json_write_named_uint64(w, "ranges", stats->ranges);
-	spdk_json_write_named_uint64(w, "bytes", stats->bytes);
+	spdk_json_write_named_string(w, "state", lvol_merge_state_str(lvol->merge_state));
+	spdk_json_write_named_int32(w, "rc", lvol->merge_rc);
+	spdk_json_write_named_uint64(w, "clusters", lvol->merge_stats.clusters);
+	spdk_json_write_named_uint64(w, "ranges", lvol->merge_stats.ranges);
+	spdk_json_write_named_uint64(w, "bytes", lvol->merge_stats.bytes);
+	spdk_json_write_named_uint64(w, "ms", lvol->merge_ms);
 	spdk_json_write_object_end(w);
 	spdk_jsonrpc_end_result(request, w);
 }
 
-/* Destination side of a partial snapshot replication, after the transfer and
- * before the convert: fill the landing volume from its base wherever the
- * transfer did not write. -ESTALE: the node lost the record of what arrived
- * (restart) -- repeat the transfer into a fresh landing volume. */
-static void
-rpc_bdev_lvol_merge_base(struct spdk_jsonrpc_request *request, const struct spdk_json_val *params)
+static struct spdk_lvol *
+rpc_merge_lvol(struct spdk_jsonrpc_request *request, const struct spdk_json_val *params)
 {
 	struct rpc_bdev_lvol_merge_base req = {};
 	struct spdk_bdev *bdev;
-	struct spdk_lvol *lvol;
+	struct spdk_lvol *lvol = NULL;
 
 	if (spdk_json_decode_object(params, rpc_bdev_lvol_merge_base_decoders,
 				    SPDK_COUNTOF(rpc_bdev_lvol_merge_base_decoders), &req)) {
@@ -4488,14 +4496,45 @@ rpc_bdev_lvol_merge_base(struct spdk_jsonrpc_request *request, const struct spdk
 	lvol = bdev ? vbdev_lvol_get_from_bdev(bdev) : NULL;
 	if (lvol == NULL) {
 		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
-		goto cleanup;
 	}
-	spdk_lvol_merge_base(lvol, rpc_bdev_lvol_merge_base_cb, request);
 cleanup:
 	free(req.lvol_name);
+	return lvol;
+}
+
+/* Destination side of a partial snapshot replication, after the transfer and
+ * before the convert: START filling the landing volume from its base wherever
+ * the transfer did not write, and return at once with the job's state (it
+ * takes longer than an RPC may). Idempotent: a running job is not started
+ * twice, a finished one is not repeated. Poll bdev_lvol_merge_base_stat.
+ * state "failed" with rc -ESTALE: the node lost the record of what arrived
+ * (restart) -- repeat the transfer into a fresh landing volume. */
+static void
+rpc_bdev_lvol_merge_base(struct spdk_jsonrpc_request *request, const struct spdk_json_val *params)
+{
+	struct spdk_lvol *lvol = rpc_merge_lvol(request, params);
+
+	if (lvol == NULL) {
+		return;
+	}
+	spdk_lvol_merge_base_start(lvol);
+	rpc_write_merge_state(request, lvol);
 }
 
 SPDK_RPC_REGISTER("bdev_lvol_merge_base", rpc_bdev_lvol_merge_base, SPDK_RPC_RUNTIME)
+
+static void
+rpc_bdev_lvol_merge_base_stat(struct spdk_jsonrpc_request *request,
+			      const struct spdk_json_val *params)
+{
+	struct spdk_lvol *lvol = rpc_merge_lvol(request, params);
+
+	if (lvol != NULL) {
+		rpc_write_merge_state(request, lvol);
+	}
+}
+
+SPDK_RPC_REGISTER("bdev_lvol_merge_base_stat", rpc_bdev_lvol_merge_base_stat, SPDK_RPC_RUNTIME)
 
 struct rpc_bdev_lvol_set_migration_flag {
 	char *lvol_name;

@@ -385,6 +385,8 @@ typedef void (*spdk_lvol_merge_complete)(void *cb_arg, const struct spdk_blob_me
 		int lvolerrno);
 /* Fill a partially replicated landing lvol from its base (spdk_blob_merge_base). */
 void spdk_lvol_merge_base(struct spdk_lvol *lvol, spdk_lvol_merge_complete cb_fn, void *cb_arg);
+/* The same as a job: the state is in lvol->merge_state (spdk_internal/lvolstore.h). */
+void spdk_lvol_merge_base_start(struct spdk_lvol *lvol);
 int spdk_lvol_batch_transfer(uint32_t cluster_batch, enum xfer_type type, struct spdk_transfer_dev *tdev,
 				struct spdk_lvol **batch_lvols, int num_lvols, char **batch_snapshots, int num_snapshots,
 				uint32_t *batch_lvol_ids, int num_lvol_ids, spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
