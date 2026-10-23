@@ -200,15 +200,52 @@ blob_insert_cluster(struct spdk_blob *blob, uint32_t cluster_num, uint64_t clust
 	return 0;
 }
 
+/* Upper bound of free clusters inspected when looking for one in a given copy domain. */
+#define BS_COPY_DOMAIN_SCAN_MAX 1024
+
+/*
+ * Claim a free cluster in the given copy domain of the underlying device, so that
+ * a cluster copy can be offloaded (e.g. stays on one raid0 leg). Falls back to any
+ * free cluster.
+ */
+static uint32_t
+bs_claim_cluster_in_copy_domain(struct spdk_blob_store *bs, uint32_t copy_domain)
+{
+	uint32_t cluster_num = 0;
+	int i;
+
+	assert(spdk_spin_held(&bs->used_lock));
+
+	for (i = 0; i < BS_COPY_DOMAIN_SCAN_MAX; i++) {
+		cluster_num = spdk_bit_pool_find_free_bit(bs->used_clusters, cluster_num);
+		if (cluster_num == UINT32_MAX) {
+			break;
+		}
+		if (bs->dev->get_copy_domain(bs->dev, bs_cluster_to_lba(bs, cluster_num)) == copy_domain) {
+			spdk_bit_pool_allocate_specific_bit(bs->used_clusters, cluster_num);
+			bs->num_free_clusters--;
+			return cluster_num;
+		}
+		cluster_num++;
+	}
+
+	return bs_claim_cluster(bs);
+}
+
 static int
-bs_allocate_cluster(struct spdk_blob *blob, uint32_t cluster_num,
-		    uint64_t *cluster, uint32_t *lowest_free_md_page, bool update_map)
+bs_allocate_cluster_in_copy_domain(struct spdk_blob *blob, uint32_t cluster_num,
+				   uint64_t *cluster, uint32_t *lowest_free_md_page, bool update_map,
+				   uint32_t copy_domain)
 {
 	uint32_t *extent_page = 0;
 
 	assert(spdk_spin_held(&blob->bs->used_lock));
 
-	*cluster = bs_claim_cluster(blob->bs);
+	if (copy_domain != UINT32_MAX && blob->bs->dev->get_copy_domain != NULL) {
+		*cluster = bs_claim_cluster_in_copy_domain(blob->bs, copy_domain);
+	} else {
+		*cluster = bs_claim_cluster(blob->bs);
+	}
 	if (*cluster == UINT32_MAX) {
 		/* No more free clusters. Cannot satisfy the request */
 		return -ENOSPC;
@@ -244,6 +281,14 @@ bs_allocate_cluster(struct spdk_blob *blob, uint32_t cluster_num,
 	}
 
 	return 0;
+}
+
+static int
+bs_allocate_cluster(struct spdk_blob *blob, uint32_t cluster_num,
+		    uint64_t *cluster, uint32_t *lowest_free_md_page, bool update_map)
+{
+	return bs_allocate_cluster_in_copy_domain(blob, cluster_num, cluster, lowest_free_md_page,
+			update_map, UINT32_MAX);
 }
 
 node_role_t
@@ -4246,6 +4291,33 @@ blob_can_copy(struct spdk_blob *blob, uint64_t cluster_start_page, uint64_t *bas
 }
 
 static void
+blob_copy_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct spdk_blob_copy_cluster_ctx *ctx = cb_arg;
+	struct spdk_blob *blob = ctx->blob;
+
+	if (bserrno == 0) {
+		blob_write_copy_cpl(seq, cb_arg, 0);
+		return;
+	}
+
+	/* The copy could not be offloaded (e.g. source and destination on different
+	 * raid0 legs), fall back to reading and writing the whole cluster. */
+	SPDK_DEBUGLOG(blob, "Cluster copy failed (%d), falling back to read/write\n", bserrno);
+	ctx->buf = spdk_malloc(blob->bs->cluster_sz, blob->back_bs_dev->blocklen,
+			       NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+	if (!ctx->buf) {
+		bs_sequence_finish(seq, -ENOMEM);
+		return;
+	}
+
+	bs_sequence_read_bs_dev(seq, blob->back_bs_dev, ctx->buf,
+				bs_dev_page_to_lba(blob->back_bs_dev, ctx->page),
+				bs_dev_byte_to_lba(blob->back_bs_dev, blob->bs->cluster_sz),
+				blob_write_copy, ctx);
+}
+
+static void
 blob_copy(struct spdk_blob_copy_cluster_ctx *ctx, spdk_bs_user_op_t *op, uint64_t src_lba)
 {
 	struct spdk_blob *blob = ctx->blob;
@@ -4256,7 +4328,7 @@ blob_copy(struct spdk_blob_copy_cluster_ctx *ctx, spdk_bs_user_op_t *op, uint64_
 			     bs_cluster_to_lba(blob->bs, ctx->new_cluster),
 			     src_lba,
 			     lba_count,
-			     blob_write_copy_cpl, ctx);
+			     blob_copy_cpl, ctx);
 }
 
 static void
@@ -4342,8 +4414,10 @@ bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 	}
 
 	spdk_spin_lock(&blob->bs->used_lock);
-	rc = bs_allocate_cluster(blob, cluster_number, &ctx->new_cluster, &ctx->new_extent_page,
-				 false);
+	rc = bs_allocate_cluster_in_copy_domain(blob, cluster_number, &ctx->new_cluster,
+						&ctx->new_extent_page, false,
+						can_copy && blob->bs->dev->get_copy_domain != NULL ?
+						blob->bs->dev->get_copy_domain(blob->bs->dev, copy_src_lba) : UINT32_MAX);
 	spdk_spin_unlock(&blob->bs->used_lock);
 	if (rc != 0) {
 		blob_cow_bufs_free(ctx);
