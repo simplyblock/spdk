@@ -373,6 +373,13 @@ struct spdk_bdev_fn_table {
 
 	/** Check if bdev can handle spdk_accel_sequence to handle I/O of specific type. */
 	bool (*accel_sequence_supported)(void *ctx, enum spdk_bdev_io_type type);
+
+	/**
+	 * Optional. Return the copy domain of the given block. A COPY can only be
+	 * offloaded when source and destination are in the same domain
+	 * (e.g. the same raid0 leg).
+	 */
+	uint32_t (*get_copy_domain)(void *ctx, uint64_t offset_blocks);
 };
 
 /** bdev I/O completion status */

@@ -354,6 +354,9 @@ struct raid_bdev_module {
 	/* Handler for requests without payload (flush, unmap). Optional. */
 	void (*submit_null_payload_request)(struct raid_bdev_io *raid_io);
 
+	/* Handler for COPY requests. Optional. */
+	void (*submit_copy_request)(struct raid_bdev_io *raid_io);
+
 	/*
 	 * Called when the bdev's IO channel is created to get the module's private IO channel.
 	 * Optional.
@@ -514,6 +517,24 @@ raid_bdev_flush_blocks(struct raid_base_bdev_info *base_info, struct spdk_io_cha
 
 	return spdk_bdev_flush_blocks(base_info->desc, ch, priority_lba,
 				      num_blocks, cb, cb_arg);
+}
+
+/*
+ * Raid bdev I/O wrapper for spdk_bdev_copy_blocks function.
+ * The used bits (priority, geometry) apply to the destination address only, as in bdev_blob_copy().
+ */
+static inline int
+raid_bdev_copy_blocks(struct raid_base_bdev_info *base_info, struct spdk_io_channel *ch,
+		      uint64_t dst_offset_blocks, uint64_t src_offset_blocks, uint64_t num_blocks,
+		      spdk_bdev_io_completion_cb cb, void *cb_arg)
+{
+	struct raid_io_used_bits *used_bits = &((struct raid_bdev_io *)cb_arg)->used_bits;
+	const uint64_t priority_dst_lba = ((uint64_t)used_bits->priority_class << PRIORITY_CLASS_BITS_POS) |
+					  ((uint64_t)used_bits->geometry << GEOMETRY_BITS_POS) |
+					  (base_info->data_offset + dst_offset_blocks);
+
+	return spdk_bdev_copy_blocks(base_info->desc, ch, priority_dst_lba,
+				     base_info->data_offset + src_offset_blocks, num_blocks, cb, cb_arg);
 }
 
 /*

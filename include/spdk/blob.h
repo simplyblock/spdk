@@ -352,6 +352,9 @@ struct spdk_bs_dev {
 
 	bool (*is_degraded)(struct spdk_bs_dev *dev);
 
+	/* Optional. Copy domain of an lba; copy can only be offloaded within one domain. */
+	uint32_t (*get_copy_domain)(struct spdk_bs_dev *dev, uint64_t lba);
+
 	uint64_t	blockcnt;
 	uint32_t	blocklen; /* In bytes */
 };
