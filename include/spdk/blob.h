@@ -548,6 +548,23 @@ int spdk_blob_dirty_cluster_ranges(struct blob_dirty_gen *gen, uint64_t cluster_
 bool spdk_blob_dirty_gen_usable(struct spdk_blob *blob, const struct blob_dirty_gen *gen,
 				spdk_blob_id base, const char **why);
 
+/* Destination side of a partial transfer: the landing blob's clusters were
+ * pre-allocated (they read as zeroes) and received only the delta's blocks,
+ * which its own dirty generation recorded. Fill every block of every allocated
+ * cluster that was NOT written from the blob's parent (the copy of the base),
+ * in place, as longest contiguous ranges, many in flight. Run it before the
+ * blob is converted or read. -ESTALE: the blob has no complete generation (the
+ * node restarted since the transfer, or a write could not be tracked), so what
+ * arrived is unknown -- the transfer must be repeated. Runs on the md thread. */
+struct spdk_blob_merge_stats {
+	uint64_t clusters;	/* allocated clusters that needed blocks from the base */
+	uint64_t ranges;	/* contiguous ranges copied */
+	uint64_t bytes;		/* bytes copied from the base */
+};
+typedef void (*spdk_blob_merge_complete)(void *cb_arg, const struct spdk_blob_merge_stats *stats,
+		int bserrno);
+void spdk_blob_merge_base(struct spdk_blob *blob, spdk_blob_merge_complete cb_fn, void *cb_arg);
+
 bool spdk_blob_get_offset_allocate(struct spdk_blob *blob, uint64_t offset);
 bool spdk_blob_check_offset_valid(struct spdk_blob *blob, uint64_t offset, uint64_t length);
 int spdk_read_cluster_data_xfer(struct spdk_blob *blob, void *buf, uint64_t offset,

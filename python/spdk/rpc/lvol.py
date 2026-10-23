@@ -441,6 +441,15 @@ def bdev_lvol_transfer(client, lvol_name=None, lvol_id=0, offset=0, cluster_batc
     return client.call('bdev_lvol_transfer', params)
 
 
+def bdev_lvol_merge_base(client, lvol_name):
+    """Fill a partially replicated landing volume from its base, before convert.
+
+    Args:
+        lvol_name: name of the landing lvol bdev
+    """
+    return client.call('bdev_lvol_merge_base', {'lvol_name': lvol_name})
+
+
 def bdev_lvol_dirty_bitmap_info(client, lvol_name):
     """Show the in-memory dirty generation of a logical volume or snapshot.
 

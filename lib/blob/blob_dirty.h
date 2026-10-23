@@ -58,6 +58,12 @@ struct blob_dirty_gen {
 	/* The blob whose content the generation's writes apply on top of; set
 	 * by the blob layer (see spdk_blob_dirty_gen_base). */
 	spdk_blob_id	base;
+	/* Clusters were allocated without data while this generation tracked
+	 * the blob (the transfer alloc step): until spdk_blob_merge_base fills
+	 * their unwritten blocks from the parent, those read as zeroes, not as
+	 * the base, and the generation is not a valid delta. Kept here, not on
+	 * the blob, so it travels with the generation through a snapshot. */
+	bool		merge_pending;
 	bool		complete;
 	/* One reference for the owning blob plus one per in-flight transfer
 	 * that captured this generation. The family-cap GC in
@@ -93,6 +99,18 @@ void blob_dirty_mark(struct blob_dirty_gen *gen, uint64_t byte_off, uint64_t byt
  * words into transfer ranges (in 8 KiB blocks, relative to cluster start),
  * applying the 64 KiB segment rule and merging contiguous output ranges.
  * Returns the number of ranges written to out (at most max_out). */
+/* Copy cluster cluster_idx's bit words into out (nwords of them). False when
+ * the cluster has no bitmap (nothing of it was written in this generation). */
+bool blob_dirty_cluster_words(struct blob_dirty_gen *gen, uint64_t cluster_idx,
+			      uint64_t *out, uint32_t nwords);
+
+/* PURE: the runs of CLEAR bits in [0, nbits) -- the blocks NOT written -- as
+ * ranges in blocks, each run as long as it goes, in address order. out must hold
+ * nbits / 2 + 1 entries (alternating bits); returns the number of runs, which
+ * exceeds max_out when out was too short (only max_out are written). */
+uint32_t blob_dirty_clean_ranges(const uint64_t *words, uint32_t nbits,
+				 struct blob_dirty_range *out, uint32_t max_out);
+
 uint32_t blob_dirty_coalesce(const uint64_t *words, uint32_t nwords,
 			     struct blob_dirty_range *out, uint32_t max_out);
 

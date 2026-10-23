@@ -4440,6 +4440,63 @@ cleanup:
 
 SPDK_RPC_REGISTER("bdev_lvol_dirty_bitmap_info", rpc_bdev_lvol_dirty_bitmap_info, SPDK_RPC_RUNTIME)
 
+struct rpc_bdev_lvol_merge_base {
+	char *lvol_name;
+};
+
+static const struct spdk_json_object_decoder rpc_bdev_lvol_merge_base_decoders[] = {
+	{"lvol_name", offsetof(struct rpc_bdev_lvol_merge_base, lvol_name), spdk_json_decode_string},
+};
+
+static void
+rpc_bdev_lvol_merge_base_cb(void *cb_arg, const struct spdk_blob_merge_stats *stats, int lvolerrno)
+{
+	struct spdk_jsonrpc_request *request = cb_arg;
+	struct spdk_json_write_ctx *w;
+
+	if (lvolerrno != 0) {
+		spdk_jsonrpc_send_error_response(request, lvolerrno, spdk_strerror(-lvolerrno));
+		return;
+	}
+	w = spdk_jsonrpc_begin_result(request);
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_uint64(w, "clusters", stats->clusters);
+	spdk_json_write_named_uint64(w, "ranges", stats->ranges);
+	spdk_json_write_named_uint64(w, "bytes", stats->bytes);
+	spdk_json_write_object_end(w);
+	spdk_jsonrpc_end_result(request, w);
+}
+
+/* Destination side of a partial snapshot replication, after the transfer and
+ * before the convert: fill the landing volume from its base wherever the
+ * transfer did not write. -ESTALE: the node lost the record of what arrived
+ * (restart) -- repeat the transfer into a fresh landing volume. */
+static void
+rpc_bdev_lvol_merge_base(struct spdk_jsonrpc_request *request, const struct spdk_json_val *params)
+{
+	struct rpc_bdev_lvol_merge_base req = {};
+	struct spdk_bdev *bdev;
+	struct spdk_lvol *lvol;
+
+	if (spdk_json_decode_object(params, rpc_bdev_lvol_merge_base_decoders,
+				    SPDK_COUNTOF(rpc_bdev_lvol_merge_base_decoders), &req)) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "spdk_json_decode_object failed");
+		goto cleanup;
+	}
+	bdev = spdk_bdev_get_by_name(req.lvol_name);
+	lvol = bdev ? vbdev_lvol_get_from_bdev(bdev) : NULL;
+	if (lvol == NULL) {
+		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
+		goto cleanup;
+	}
+	spdk_lvol_merge_base(lvol, rpc_bdev_lvol_merge_base_cb, request);
+cleanup:
+	free(req.lvol_name);
+}
+
+SPDK_RPC_REGISTER("bdev_lvol_merge_base", rpc_bdev_lvol_merge_base, SPDK_RPC_RUNTIME)
+
 struct rpc_bdev_lvol_set_migration_flag {
 	char *lvol_name;
 };

@@ -6022,11 +6022,11 @@ xfer_build_alloc_cmd(struct spdk_lvs_xfer *xfer, void *buf)
 	 * the next command.
 	 */
 	while (xfer->alloc_next < xfer->num_clusters) {
-		/* A partial cluster is not allocated here: a fresh cluster reads as
-		 * zeroes, and the blocks the delta does not carry must read as the
-		 * base's. The landing volume's first write to it does the CoW. */
-		if (xfer->clusters[xfer->alloc_next] != 0 &&
-		    !(xfer->partial != NULL && xfer->partial[xfer->alloc_next])) {
+		/* Partial clusters too: the destination receives only their dirty
+		 * blocks into the fresh cluster, records them in the landing blob's
+		 * own dirty generation, and fills the rest from the base once, at
+		 * the end (spdk_blob_merge_base) -- not by a CoW per request. */
+		if (xfer->clusters[xfer->alloc_next] != 0) {
 			ep = xfer->alloc_next / SPDK_BLOB_CLUSTERS_PER_EXTENT_PAGE;
 			if (n > 0 && ep != last_ep &&
 			    SPDK_LVOL_XFER_CMD_MAX_ENTRIES - n < SPDK_BLOB_CLUSTERS_PER_EXTENT_PAGE) {
@@ -6408,9 +6408,8 @@ xfer_replication(struct spdk_lvs_xfer *xfer) {
 								count++;
 								break;
 							}
-							/* Not pre-allocated: sent whole below, it
-							 * lands on the base's content, so its zero
-							 * blocks must be written too. */
+							/* Sent whole below: every block written,
+							 * zeroes too, so the merge leaves it alone. */
 							req->partial = true;
 						}
 
@@ -8184,6 +8183,71 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
 	task->tmo_poller =  spdk_poller_register(spdk_lvol_transfer_delay, task, 50000);// 50ms
 	// TAILQ_INSERT_TAIL(&g_lvs_xfer_tasks, task, entry);
 	return 0;
+}
+
+struct lvol_merge_req {
+	struct spdk_lvol		*lvol;
+	struct spdk_thread		*thread;
+	struct spdk_blob_merge_stats	stats;
+	int				rc;
+	spdk_lvol_merge_complete	cb_fn;
+	void				*cb_arg;
+};
+
+static void
+lvol_merge_base_reply(void *arg)
+{
+	struct lvol_merge_req *req = arg;
+
+	req->cb_fn(req->cb_arg, &req->stats, req->rc);
+	free(req);
+}
+
+static void
+lvol_merge_base_cpl(void *cb_arg, const struct spdk_blob_merge_stats *stats, int bserrno)
+{
+	struct lvol_merge_req *req = cb_arg;
+
+	req->stats = *stats;
+	req->rc = bserrno;
+	spdk_thread_send_msg(req->thread, lvol_merge_base_reply, req);
+}
+
+static void
+lvol_merge_base_on_md(void *arg)
+{
+	struct lvol_merge_req *req = arg;
+
+	spdk_blob_merge_base(req->lvol->blob, lvol_merge_base_cpl, req);
+}
+
+/*
+ * Destination side of a partial snapshot replication: fill the landing
+ * volume's pre-allocated clusters with the base's content wherever the
+ * transfer did not write (spdk_blob_merge_base). Leader only: a non-leader's
+ * md is not authoritative and its writes are not tracked.
+ */
+void
+spdk_lvol_merge_base(struct spdk_lvol *lvol, spdk_lvol_merge_complete cb_fn, void *cb_arg)
+{
+	struct spdk_blob_merge_stats none = {};
+	struct lvol_merge_req *req;
+
+	if (!lvol->lvol_store->leader) {
+		cb_fn(cb_arg, &none, -EPERM);
+		return;
+	}
+	req = calloc(1, sizeof(*req));
+	if (req == NULL) {
+		cb_fn(cb_arg, &none, -ENOMEM);
+		return;
+	}
+	req->lvol = lvol;
+	req->thread = spdk_get_thread();
+	req->cb_fn = cb_fn;
+	req->cb_arg = cb_arg;
+	spdk_thread_send_msg(spdk_bs_get_md_thread(lvol->lvol_store->blobstore),
+			     lvol_merge_base_on_md, req);
 }
 
 int

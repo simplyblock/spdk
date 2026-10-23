@@ -39,6 +39,8 @@ spdk_blob_dirty_gen_usable(struct spdk_blob *blob, const struct blob_dirty_gen *
 	return gen != NULL && g_ut_dirty_usable;
 }
 DEFINE_STUB_V(spdk_bs_set_dirty_leader, (struct spdk_blob_store *bs, bool leader));
+DEFINE_STUB_V(spdk_blob_merge_base, (struct spdk_blob *blob, spdk_blob_merge_complete cb_fn,
+				     void *cb_arg));
 
 void
 blob_check_io_inflaight(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)

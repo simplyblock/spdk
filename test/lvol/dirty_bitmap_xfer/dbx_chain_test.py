@@ -113,10 +113,14 @@ def main():
         def land(rnd, src_snap, base, parent, retry_full=False):
             """Transfer src_snap into a new landing volume, compare, freeze it as T<rnd>.
 
-            retry_full: then send it again as a FULL transfer into the same
-            landing volume, as a retry after a failed attempt would: the
-            clusters the delta built by CoW hold the base's content, so the
-            full transfer must write its zero blocks too."""
+            With a base, the landing volume is a clone of the base's copy and
+            then merged with it (bdev_lvol_merge_base), as the control plane
+            does: every cluster was pre-allocated, the delta wrote only its
+            blocks, the merge fills the rest from the base.
+
+            retry_full: send it again as a FULL transfer into the same landing
+            volume first, as a retry after a failed attempt would: it must
+            write its zero blocks too, or the merge fills them from the base."""
             name = f"landing{rnd}"
             if parent is None:
                 rpc(SOCK_B, "bdev_lvol_create",
@@ -138,6 +142,10 @@ def main():
                 st_retry = wait_transfer_done(SOCK_A, f"lvsA/{src_snap}")
                 print(f"    full retry into {name}: {st_retry}")
                 assert st_retry["partial_reqs"] == 0, st_retry
+            if base is not None:
+                merged = rpc(SOCK_B, "bdev_lvol_merge_base", {"lvol_name": f"lvsB/{name}"})
+                print(f"    merge {name}: {merged}")
+                st["merged"] = merged
             nqn = nvmf_up(SOCK_B, f"c{name}", f"lvsB/{name}", str(PORT_LANDING0 + rnd))
             dev = host_connect(nqn, str(PORT_LANDING0 + rnd))
             devs.append(nqn)
@@ -171,6 +179,11 @@ def main():
             st = land(rnd, f"S{rnd}", blobid(SOCK_A, f"lvsA/S{rnd - 1}"), f"T{rnd - 1}",
                       retry_full=(rnd == 3))
             assert st["partial_reqs"] > 0, f"round {rnd} did not send ranges: {st}"
+            if rnd == 3:
+                # the full retry wrote every block: nothing left for the merge
+                assert st["merged"]["clusters"] == 0, f"round {rnd} merged after a full retry: {st}"
+            else:
+                assert st["merged"]["clusters"] > 0, f"round {rnd} merged nothing: {st}"
 
         print("=== round 5: wrong base -> full clusters, same content")
         delta(dev_a, 5)

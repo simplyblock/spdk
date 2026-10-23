@@ -262,9 +262,10 @@ struct spdk_lvs_xfer_req {
 	void *payload;
 	int fragments_outstanding;
 	int aggregated_status;
-	/* A dirty range of a cluster (partial transfer): it lands on a
-	 * destination cluster that holds the base's content, so every block of
-	 * it is written, zeroes included. */
+	/* A dirty range of a cluster (partial transfer): every block of it is
+	 * written, zeroes included -- the destination's merge takes every block
+	 * NOT written from the base, so a skipped zero block would read the
+	 * base's old data. */
 	bool partial;
 	struct remote_lvol_info *rmt_lvol;
 	struct spdk_lvs_xfer *xfer;
@@ -349,9 +350,9 @@ struct spdk_lvs_xfer {
 
 	/* Partial (dirty-bitmap) replication, see xfer_setup_partial. dirty_gen
 	 * is the snapshot's generation, pinned for the task's lifetime.
-	 * partial[i] marks the clusters sent as dirty ranges: they are not
-	 * pre-allocated on the destination, whose landing volume builds them by
-	 * CoW from the base it was cloned from. ranges[range_pos..num_ranges) of
+	 * partial[i] marks the clusters sent as dirty ranges; the destination
+	 * pre-allocates them like any other and fills what was not sent from the
+	 * base after the transfer (spdk_blob_merge_base). ranges[range_pos..num_ranges) of
 	 * range_cluster are still to send, range_done blocks of the current one
 	 * already sent, in requests of at most XFER_PARTIAL_MAX_BYTES. */
 	bool allow_partial;

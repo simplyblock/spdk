@@ -681,10 +681,12 @@ xfer_partial_setup_gates(void)
 	blob_dirty_gen_free(gen);
 }
 
-/* Partial clusters are not pre-allocated on the destination: there they are
- * built by CoW from the base, so the blocks the delta skips keep its data. */
+/* Every cluster is pre-allocated on the destination, partial ones too: they
+ * receive only their dirty blocks, and the destination fills the rest from the
+ * base once, after the transfer (spdk_blob_merge_base), not by a CoW per
+ * request. */
 static void
-xfer_partial_alloc_skips_partial_clusters(void)
+xfer_partial_alloc_includes_partial_clusters(void)
 {
 	const int alloc[3] = {1, 1, 1};
 	struct blob_dirty_gen *gen = make_gen_012();
@@ -699,10 +701,11 @@ xfer_partial_alloc_skips_partial_clusters(void)
 	CU_ASSERT(xfer->partial[2] == 0);
 	CU_ASSERT(xfer->partial_clusters == 1);
 
-	CU_ASSERT(xfer_build_alloc_cmd(xfer, buf) == 2);
+	CU_ASSERT(xfer_build_alloc_cmd(xfer, buf) == 3);
 	cmd = buf;
 	CU_ASSERT(cmd->entries[0] == 0);
-	CU_ASSERT(cmd->entries[1] == 2);
+	CU_ASSERT(cmd->entries[1] == 1);
+	CU_ASSERT(cmd->entries[2] == 2);
 
 	free(buf);
 	free_partial_xfer(xfer);
@@ -828,7 +831,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, xfer_replicate_submit_failure_fails_the_request);
 	CU_ADD_TEST(suite, xfer_replicate_write_failure_fails_the_request);
 	CU_ADD_TEST(suite, xfer_partial_setup_gates);
-	CU_ADD_TEST(suite, xfer_partial_alloc_skips_partial_clusters);
+	CU_ADD_TEST(suite, xfer_partial_alloc_includes_partial_clusters);
 	CU_ADD_TEST(suite, xfer_partial_dispatch_splits_ranges);
 	CU_ADD_TEST(suite, xfer_partial_and_resumed_requests_write_zeroes);
 	CU_ADD_TEST(suite, xfer_resume_offset_is_lowest_not_done);

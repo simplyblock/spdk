@@ -185,6 +185,48 @@ blob_dirty_coalesce(const uint64_t *words, uint32_t nwords,
 	return n;
 }
 
+bool
+blob_dirty_cluster_words(struct blob_dirty_gen *gen, uint64_t cluster_idx, uint64_t *out,
+			 uint32_t nwords)
+{
+	struct blob_dirty_cluster *c;
+
+	if (gen == NULL || nwords < gen->words_per_cluster) {
+		return false;
+	}
+	pthread_spin_lock(&gen->lock);
+	c = blob_dirty_cluster_get(gen, cluster_idx, false);
+	if (c != NULL) {
+		memcpy(out, c->bits, gen->words_per_cluster * sizeof(uint64_t));
+	}
+	pthread_spin_unlock(&gen->lock);
+	return c != NULL;
+}
+
+uint32_t
+blob_dirty_clean_ranges(const uint64_t *words, uint32_t nbits, struct blob_dirty_range *out,
+			uint32_t max_out)
+{
+	uint32_t n = 0, b = 0, start;
+
+	while (b < nbits) {
+		if (words != NULL && (words[b / 64] & (1ULL << (b % 64)))) {
+			b++;
+			continue;
+		}
+		start = b;
+		while (b < nbits && !(words != NULL && (words[b / 64] & (1ULL << (b % 64))))) {
+			b++;
+		}
+		if (n < max_out) {
+			out[n].off = start;
+			out[n].len = b - start;
+		}
+		n++;
+	}
+	return n;
+}
+
 /* --- accessors used by the lvol transfer layer and RPCs -------------------- */
 
 bool

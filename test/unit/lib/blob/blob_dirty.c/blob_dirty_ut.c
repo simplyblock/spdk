@@ -484,6 +484,50 @@ test_gen_refcount_outlives_owner(void)
 	CU_ASSERT_TRUE(true);
 }
 
+/* The merge fills exactly the blocks that were not written: the runs of clear
+ * bits, each as long as it goes. */
+static void
+test_clean_ranges_are_the_unwritten_runs(void)
+{
+	struct blob_dirty_gen *gen = blob_dirty_gen_create(CLUSTER_SZ);
+	uint64_t words[4];
+	struct blob_dirty_range r[129];
+	uint32_t n;
+
+	SPDK_CU_ASSERT_FATAL(gen != NULL);
+	/* cluster 1: blocks 0, 2..3 and 255 written */
+	blob_dirty_mark(gen, CLUSTER_SZ, BLK);
+	blob_dirty_mark(gen, CLUSTER_SZ + 2 * BLK, 2 * BLK);
+	blob_dirty_mark(gen, 2ULL * CLUSTER_SZ - BLK, BLK);
+
+	CU_ASSERT(!blob_dirty_cluster_words(gen, 0, words, 4));	/* never written */
+	CU_ASSERT(!blob_dirty_cluster_words(gen, 1, words, 3));	/* short buffer */
+	SPDK_CU_ASSERT_FATAL(blob_dirty_cluster_words(gen, 1, words, 4));
+
+	n = blob_dirty_clean_ranges(words, 256, r, 129);
+	CU_ASSERT(n == 2);
+	CU_ASSERT(r[0].off == 1 && r[0].len == 1);
+	CU_ASSERT(r[1].off == 4 && r[1].len == 251);
+
+	/* no bitmap: the whole cluster comes from the base */
+	n = blob_dirty_clean_ranges(NULL, 256, r, 129);
+	CU_ASSERT(n == 1 && r[0].off == 0 && r[0].len == 256);
+
+	/* fully written: nothing to fill */
+	memset(words, 0xff, sizeof(words));
+	CU_ASSERT(blob_dirty_clean_ranges(words, 256, r, 129) == 0);
+
+	/* alternating: the worst case fits nbits / 2 + 1 */
+	memset(words, 0x55, sizeof(words));
+	n = blob_dirty_clean_ranges(words, 256, r, 129);
+	CU_ASSERT(n == 128);
+	CU_ASSERT(r[0].off == 1 && r[0].len == 1 && r[127].off == 255);
+	/* a short array reports the true count and writes no further */
+	CU_ASSERT(blob_dirty_clean_ranges(words, 256, r, 4) == 128);
+
+	blob_dirty_gen_free(gen);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -513,6 +557,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_coalesce_ranges_are_disjoint_and_in_cluster);
 	CU_ADD_TEST(suite, test_untrackable_write_invalidates);
 	CU_ADD_TEST(suite, test_gen_refcount_outlives_owner);
+	CU_ADD_TEST(suite, test_clean_ranges_are_the_unwritten_runs);
 
 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
 	CU_cleanup_registry();
