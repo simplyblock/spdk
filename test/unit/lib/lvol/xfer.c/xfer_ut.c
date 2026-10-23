@@ -585,6 +585,52 @@ xfer_replicate_write_failure_fails_the_request(void)
 	free_xfer(xfer);
 }
 
+/* Every final step must carry its deadline from creation. A REPLICATE final
+ * step (the cross-cluster cutover) used to keep the calloc'ed 0, so its first
+ * status check found ticks > deadline and failed it ~50 ms in, offset 0
+ * ("Task transfer terminate timeout ... replicate_snapshot") -- no cutover
+ * could complete. The harness's spdk_get_ticks_hz() is 1,000,000. */
+static void
+xfer_final_step_deadline_is_armed_at_creation(void)
+{
+	const int alloc[4] = {1, 1, 1, 1};
+	struct spdk_lvs_xfer *xfer = make_xfer(4, 4, alloc);
+	struct spdk_lvs_xfer_req *req = NULL;
+	const uint64_t hz = spdk_get_ticks_hz();
+
+	MOCK_SET(spdk_get_ticks, 5 * hz);
+	xfer_init_step(xfer, "SNAP_1");
+	CU_ASSERT(xfer->final_step);
+	CU_ASSERT(xfer->terminate_timeout ==
+		  5 * hz + hz * SPDK_LVOL_TRANSFER_TERMINATE_TIMEOUT);
+
+	/* One second in: well inside the deadline, the step keeps running. */
+	MOCK_SET(spdk_get_ticks, 6 * hz);
+	xfer_status_check(xfer, &req, 1, XFER_STATE_DONE, 0);
+	CU_ASSERT(xfer->state != XFER_STATE_FAILED);
+
+	/* Past the deadline it is terminated, which is the guard's purpose. */
+	MOCK_SET(spdk_get_ticks, (5 + SPDK_LVOL_TRANSFER_TERMINATE_TIMEOUT + 1) * hz);
+	xfer_status_check(xfer, &req, 1, XFER_STATE_DONE, 0);
+	CU_ASSERT(xfer->state == XFER_STATE_FAILED);
+
+	MOCK_CLEAR(spdk_get_ticks);
+	free_xfer(xfer);
+}
+
+/* An ordinary (non-final) transfer carries no deadline at all. */
+static void
+xfer_background_step_has_no_deadline(void)
+{
+	const int alloc[2] = {1, 1};
+	struct spdk_lvs_xfer *xfer = make_xfer(2, 2, alloc);
+
+	xfer_init_step(xfer, NULL);
+	CU_ASSERT(!xfer->final_step);
+	CU_ASSERT(xfer->terminate_timeout == 0);
+	free_xfer(xfer);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -609,6 +655,8 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, xfer_replicate_too_many_ranges_sends_whole_cluster);
 	CU_ADD_TEST(suite, xfer_replicate_submit_failure_fails_the_request);
 	CU_ADD_TEST(suite, xfer_replicate_write_failure_fails_the_request);
+	CU_ADD_TEST(suite, xfer_final_step_deadline_is_armed_at_creation);
+	CU_ADD_TEST(suite, xfer_background_step_has_no_deadline);
 
 	allocate_threads(1);
 	set_thread(0);

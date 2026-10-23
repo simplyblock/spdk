@@ -7828,6 +7828,31 @@ spdk_lvol_transfer_delay(void *ctx) {
 	return -1;
 }
 
+/* Mark a new transfer task as the final step of a cutover (snapshot_name set)
+ * or as an ordinary snapshot transfer, and arm the final step's deadline.
+ *
+ * xfer_status_check() fails a final step once spdk_get_ticks() passes
+ * terminate_timeout. The deadline used to be armed only on the migration
+ * path, and only once there were clusters to copy, so a REPLICATE final step
+ * (the cross-cluster cutover) -- and a migration final step with nothing to
+ * copy -- kept the calloc'ed 0 and failed on its first status check, about
+ * 50 ms in, with "Task transfer terminate timeout ... replicate_snapshot",
+ * offset 0. Every final step is created here, so it is armed here. */
+static void
+xfer_init_step(struct spdk_lvs_xfer *task, const char *snapshot_name)
+{
+	if (snapshot_name) {
+		task->len = snprintf(task->snapshot_name, sizeof(task->snapshot_name), "%s", snapshot_name);
+		task->final_step = true;
+		task->signal_sent = false;
+		task->terminate_timeout = spdk_get_ticks() +
+					  spdk_get_ticks_hz() * SPDK_LVOL_TRANSFER_TERMINATE_TIMEOUT;
+	} else {
+		task->len = 0;
+		task->final_step = false;
+	}
+}
+
 int
 spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_batch, enum xfer_type type,
 				struct spdk_transfer_dev *tdev, const char *snapshot_name, uint32_t lvol_id,
@@ -7874,14 +7899,7 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
 	task->page_size = spdk_bs_get_page_size(lvol->lvol_store->blobstore);
 	task->page_per_cluster = spdk_bs_get_cluster_size(lvol->lvol_store->blobstore) / task->page_size;
 
-	if (snapshot_name) {
-		task->len = snprintf(task->snapshot_name, sizeof(task->snapshot_name), "%s", snapshot_name);
-		task->final_step = true;
-		task->signal_sent = false;
-	} else {
-		task->len = 0;
-		task->final_step = false;
-	}
+	xfer_init_step(task, snapshot_name);
 
 	/* The final step runs with the volume's IO FROZEN -- every tick it
 	 * spends queued behind background snapshot transfers is added client
@@ -8013,14 +8031,7 @@ spdk_lvol_batch_transfer(uint32_t cluster_batch, enum xfer_type type, struct spd
 		task->page_size = spdk_bs_get_page_size(lvol->lvol_store->blobstore);
 		task->page_per_cluster = spdk_bs_get_cluster_size(lvol->lvol_store->blobstore) / task->page_size;
 
-		if (snapshot_name) {
-			task->len = snprintf(task->snapshot_name, sizeof(task->snapshot_name), "%s", snapshot_name);
-			task->final_step = true;
-			task->signal_sent = false;
-		} else {
-			task->len = 0;
-			task->final_step = false;
-		}
+		xfer_init_step(task, snapshot_name);
 
 		task->num_clusters = spdk_blob_get_num_clusters(lvol->blob);
 		task->clusters = calloc(task->num_clusters, sizeof(uint64_t));
