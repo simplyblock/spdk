@@ -1044,6 +1044,16 @@ bool spdk_bdev_is_dif_check_enabled(const struct spdk_bdev *bdev,
 uint32_t spdk_bdev_get_max_copy(const struct spdk_bdev *bdev);
 
 /**
+ * Get the copy domain of a block. COPY between blocks of different domains
+ * is not offloaded by the bdev.
+ *
+ * \param bdev Block device to query.
+ * \param offset_blocks Block offset.
+ * \return Copy domain, 0 if the bdev has a single domain.
+ */
+uint32_t spdk_bdev_get_copy_domain(struct spdk_bdev *bdev, uint64_t offset_blocks);
+
+/**
  * Get the most recently measured queue depth from a bdev.
  *
  * The reported queue depth is the aggregate of outstanding I/O

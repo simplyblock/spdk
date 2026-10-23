@@ -161,6 +161,72 @@ raid0_submit_rw_request(struct raid_bdev_io *raid_io)
 	}
 }
 
+static void raid0_submit_copy_request(struct raid_bdev_io *raid_io);
+
+static void
+_raid0_submit_copy_request(void *_raid_io)
+{
+	struct raid_bdev_io *raid_io = _raid_io;
+
+	raid0_submit_copy_request(raid_io);
+}
+
+/*
+ * brief:
+ * raid0_submit_copy_request passes a COPY to the member disk, if source and
+ * destination are each within one strip and on the same member disk.
+ * Otherwise the request fails, and the caller falls back to read and write.
+ * params:
+ * raid_io
+ * returns:
+ * none
+ */
+static void
+raid0_submit_copy_request(struct raid_bdev_io *raid_io)
+{
+	struct spdk_bdev_io		*bdev_io = spdk_bdev_io_from_ctx(raid_io);
+	struct raid_bdev		*raid_bdev = raid_io->raid_bdev;
+	uint64_t			dst = raid_io->offset_blocks;
+	uint64_t			src = bdev_io->u.bdev.copy.src_offset_blocks & MASK_OUT_USED_BITS;
+	uint64_t			num_blocks = raid_io->num_blocks;
+	uint64_t			dst_strip, src_strip;
+	uint64_t			dst_pd_lba, src_pd_lba;
+	uint8_t				pd_idx;
+	struct raid_base_bdev_info	*base_info;
+	struct spdk_io_channel		*base_ch;
+	int				ret;
+
+	dst_strip = dst >> raid_bdev->strip_size_shift;
+	src_strip = src >> raid_bdev->strip_size_shift;
+	if (num_blocks == 0 ||
+	    dst_strip != (dst + num_blocks - 1) >> raid_bdev->strip_size_shift ||
+	    src_strip != (src + num_blocks - 1) >> raid_bdev->strip_size_shift ||
+	    dst_strip % raid_bdev->num_base_bdevs != src_strip % raid_bdev->num_base_bdevs) {
+		SPDK_DEBUGLOG(bdev_raid0, "copy not on a single member disk, dst 0x%" PRIx64 " src 0x%" PRIx64 "\n",
+			      dst, src);
+		raid_bdev_io_complete(raid_io, SPDK_BDEV_IO_STATUS_FAILED);
+		return;
+	}
+
+	pd_idx = dst_strip % raid_bdev->num_base_bdevs;
+	dst_pd_lba = ((dst_strip / raid_bdev->num_base_bdevs) << raid_bdev->strip_size_shift) +
+		     (dst & (raid_bdev->strip_size - 1));
+	src_pd_lba = ((src_strip / raid_bdev->num_base_bdevs) << raid_bdev->strip_size_shift) +
+		     (src & (raid_bdev->strip_size - 1));
+	base_info = &raid_bdev->base_bdev_info[pd_idx];
+	base_ch = raid_bdev_channel_get_base_channel(raid_io->raid_ch, pd_idx);
+
+	ret = raid_bdev_copy_blocks(base_info, base_ch, dst_pd_lba, src_pd_lba, num_blocks,
+				    raid0_bdev_io_completion, raid_io);
+	if (ret == -ENOMEM) {
+		raid_bdev_queue_io_wait(raid_io, spdk_bdev_desc_get_bdev(base_info->desc),
+					base_ch, _raid0_submit_copy_request);
+	} else if (ret != 0) {
+		SPDK_ERRLOG("bdev copy submit error %d\n", ret);
+		raid_bdev_io_complete(raid_io, SPDK_BDEV_IO_STATUS_FAILED);
+	}
+}
+
 /* raid0 IO range */
 struct raid_bdev_io_range {
 	uint64_t	strip_size;
@@ -442,6 +508,7 @@ static struct raid_bdev_module g_raid0_module = {
 	.start = raid0_start,
 	.submit_rw_request = raid0_submit_rw_request,
 	.submit_null_payload_request = raid0_submit_null_payload_request,
+	.submit_copy_request = raid0_submit_copy_request,
 	.resize = raid0_resize,
 };
 RAID_MODULE_REGISTER(&g_raid0_module)
