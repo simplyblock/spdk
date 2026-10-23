@@ -6125,6 +6125,11 @@ xfer_replication(struct spdk_lvs_xfer *xfer) {
 			if (!xfer_page_size_ok(xfer)) {
 				return 0;
 			}
+
+			if (xfer->final_step) {
+				xfer->terminate_timeout = spdk_get_ticks() + (spdk_get_ticks_hz() * SPDK_LVOL_TRANSFER_TERMINATE_TIMEOUT);
+			}
+
 			spdk_blob_scan_used_clusters(lvol->blob, xfer->clusters, xfer->num_clusters, &count);
 			if (count == 0) {
 				xfer->state = xfer->final_step ? XFER_STATE_SIGNAL_TRANSFER : XFER_STATE_DONE;
@@ -6278,6 +6283,11 @@ xfer_migration(struct spdk_lvs_xfer *xfer) {
 			if (!xfer_page_size_ok(xfer)) {
 				return 0;
 			}
+
+			if (xfer->final_step) {
+				xfer->terminate_timeout = spdk_get_ticks() + (spdk_get_ticks_hz() * SPDK_LVOL_TRANSFER_TERMINATE_TIMEOUT);
+			}
+
 			spdk_blob_scan_used_clusters(lvol->blob, xfer->clusters, xfer->num_clusters, &count);
 			SPDK_NOTICELOG("Number clusters %u to migrate and total clusters %" PRIu32 " for lvol %s\n", count, xfer->num_clusters, lvol->name);
 			if (count == 0) {
@@ -6286,9 +6296,6 @@ xfer_migration(struct spdk_lvs_xfer *xfer) {
 				return count;
 			}
 			xfer->state = XFER_STATE_ALLOC_CLUSTERS;
-			if (xfer->final_step) {
-				xfer->terminate_timeout = spdk_get_ticks() + (spdk_get_ticks_hz() * SPDK_LVOL_TRANSFER_TERMINATE_TIMEOUT);
-			}
 			xfer_fill_queue(xfer, xfer->cluster_batch);
 			break;
 
