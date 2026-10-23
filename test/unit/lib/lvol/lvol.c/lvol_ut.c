@@ -94,6 +94,9 @@ DEFINE_STUB_V(spdk_bdev_free_io, (struct spdk_bdev_io *g_bdev_io));
 DEFINE_STUB_V(spdk_blob_io_read, (struct spdk_blob *blob, struct spdk_io_channel *channel,
 		   void *payload, uint64_t offset, uint64_t length,
 		   spdk_blob_op_complete cb_fn, void *cb_arg));
+DEFINE_STUB_V(spdk_blob_io_read_with_priority, (struct spdk_blob *blob, struct spdk_io_channel *channel,
+		   void *payload, uint64_t offset, uint64_t length, int priority_class,
+		   spdk_blob_op_complete cb_fn, void *cb_arg));
 DEFINE_STUB_V(spdk_blob_io_write, (struct spdk_blob *blob, struct spdk_io_channel *channel,
 		   void *payload, uint64_t offset, uint64_t length,
 		   spdk_blob_op_complete cb_fn, void *cb_arg));

@@ -3962,7 +3962,9 @@ rpc_bdev_lvol_transfer_final_step(struct spdk_jsonrpc_request *request,
 	}
 	SPDK_NOTICELOG("Transfering lvol %s in mode %s for final step.\n", req.lvol_name, req.operation);
 
-	rc = spdk_lvol_transfer(lvol, 0, req.cluster_batch, type, tdev, req.snapshot_name, req.lvol_id,
+	/* Class 0: the final step moves the volume that carries client IO next,
+	 * so its reads keep the volume's own class. */
+	rc = spdk_lvol_transfer(lvol, 0, req.cluster_batch, type, tdev, req.snapshot_name, req.lvol_id, 0,
 		 					rpc_bdev_lvol_transfer_final_step_cb, request);
 	if (rc < 0) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
@@ -4164,6 +4166,7 @@ struct rpc_bdev_lvol_transfer {
 	char *operation;
 	bool allow_partial;
 	bool special_io;
+	uint32_t priority_class;
 };
 
 static void 
@@ -4182,6 +4185,7 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_transfer_decoders[] =
 	{"lvol_id", offsetof(struct rpc_bdev_lvol_transfer, lvol_id), spdk_json_decode_uint32, true},
 	{"allow_partial", offsetof(struct rpc_bdev_lvol_transfer, allow_partial), spdk_json_decode_bool, true},
 	{"special_io", offsetof(struct rpc_bdev_lvol_transfer, special_io), spdk_json_decode_bool, true},
+	{"priority_class", offsetof(struct rpc_bdev_lvol_transfer, priority_class), spdk_json_decode_uint32, true},
 };
 
 static void 
@@ -4248,7 +4252,13 @@ rpc_bdev_lvol_transfer(struct spdk_jsonrpc_request *request,
 	}
 	SPDK_NOTICELOG("Transfering lvol %s in %s mode.\n", req.lvol_name, req.operation);
 
-	rc = spdk_lvol_transfer(lvol, req.offset, req.cluster_batch, type, tdev, NULL, req.lvol_id, NULL, NULL);
+	if (req.priority_class > MAX_PRIORITY_CLASS) {
+		SPDK_ERRLOG("priority_class %u out of range\n", req.priority_class);
+		spdk_jsonrpc_send_error_response(request, -EINVAL, spdk_strerror(EINVAL));
+		goto cleanup;
+	}
+	rc = spdk_lvol_transfer(lvol, req.offset, req.cluster_batch, type, tdev, NULL, req.lvol_id,
+				(uint8_t)req.priority_class, NULL, NULL);
 	if (rc < 0) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 spdk_strerror(-rc));

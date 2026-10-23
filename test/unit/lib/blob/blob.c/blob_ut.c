@@ -1566,6 +1566,70 @@ blob_rw_verify(void)
 	poll_threads();
 }
 
+/* A read with its own class carries that class to the device, for each piece
+ * of a split read too, and leaves the blob's class to every other read. */
+static void
+blob_read_with_priority(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob *blob = g_blob;
+	struct spdk_io_channel *channel;
+	uint64_t units_per_cluster = spdk_bs_get_cluster_size(bs) / BLOCKLEN;
+	uint8_t payload[2 * BLOCKLEN];
+	extern int g_dev_last_read_priority;
+
+	channel = spdk_bs_alloc_io_channel(bs);
+	CU_ASSERT(channel != NULL);
+
+	spdk_blob_resize(blob, 4, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	memset(payload, 0xA5, sizeof(payload));
+	spdk_blob_io_write(blob, channel, payload, 0, 2, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	spdk_blob_io_write(blob, channel, payload, units_per_cluster - 1, 2, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	spdk_blob_set_io_priority_class(blob, 2);
+
+	spdk_blob_io_read_with_priority(blob, channel, payload, 0, 2, 7, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(g_dev_last_read_priority == 7);
+
+	/* the blob keeps its own class for every other read */
+	spdk_blob_io_read(blob, channel, payload, 0, 2, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(g_dev_last_read_priority == 2);
+
+	/* negative is the blob's class */
+	spdk_blob_io_read_with_priority(blob, channel, payload, 0, 2, -1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(g_dev_last_read_priority == 2);
+
+	/* a read across a cluster boundary is split; the second piece is the
+	 * last one the device sees */
+	spdk_blob_io_read_with_priority(blob, channel, payload, units_per_cluster - 1, 2, 7,
+					blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(g_dev_last_read_priority == 7);
+
+	/* out of range */
+	spdk_blob_io_read_with_priority(blob, channel, payload, 0, 2, MAX_PRIORITY_CLASS + 1,
+					blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -EINVAL);
+
+	spdk_blob_set_io_priority_class(blob, 0);
+	spdk_bs_free_io_channel(channel);
+	poll_threads();
+}
+
 static void
 blob_rw_verify_iov(void)
 {
@@ -10828,6 +10892,7 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite_blob, blob_write);
 		CU_ADD_TEST(suite_blob, blob_read);
 		CU_ADD_TEST(suite_blob, blob_rw_verify);
+		CU_ADD_TEST(suite_blob, blob_read_with_priority);
 		CU_ADD_TEST(suite_bs, blob_rw_verify_iov);
 		CU_ADD_TEST(suite_blob, blob_rw_verify_iov_nomem);
 		CU_ADD_TEST(suite_blob, blob_rw_iov_read_only);

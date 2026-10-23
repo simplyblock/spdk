@@ -403,7 +403,8 @@ def bdev_lvol_batch_transfer_final_step(client, lvol_names=None, ids=None, snaps
     params = {'lvol_names': lvol_names, 'ids': ids, 'snapshots': snapshots, 'cluster_batch': cluster_batch, 'gateway': gateway, 'operation': operation}
     return client.call('bdev_lvol_batch_transfer_final_step', params)
 
-def bdev_lvol_transfer(client, lvol_name=None, lvol_id=0, offset=0, cluster_batch=16, gateway=None, operation=None):
+def bdev_lvol_transfer(client, lvol_name=None, lvol_id=0, offset=0, cluster_batch=16, gateway=None, operation=None,
+                       priority_class=0):
     """Replicate a logical volume on a logical volume store.
 
     Args:
@@ -413,6 +414,8 @@ def bdev_lvol_transfer(client, lvol_name=None, lvol_id=0, offset=0, cluster_batc
         cluster_batch: elements count in the queue between pollers
         gateway: Name of the gateway to use for transfer (required)
         operation: action type to be useed for transfer (required)
+        priority_class: IO priority class of the transfer's reads (optional,
+            default 0 = the source lvol's own class)
     """
     if not lvol_name:
         raise ValueError("lvol_name must be specified")
@@ -426,6 +429,8 @@ def bdev_lvol_transfer(client, lvol_name=None, lvol_id=0, offset=0, cluster_batc
     if lvol_id > 0:
         params['lvol_id'] = lvol_id
 
+    if priority_class:
+        params['priority_class'] = priority_class
     return client.call('bdev_lvol_transfer', params)
 
 def bdev_lvol_transfer_stat(client, lvol_name=None):

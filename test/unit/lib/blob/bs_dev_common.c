@@ -18,6 +18,8 @@
 uint8_t *g_dev_buffer;
 uint64_t g_dev_write_bytes;
 uint64_t g_dev_read_bytes;
+/* class of the last read the device saw, -1 when it carried no options */
+int g_dev_last_read_priority = -1;
 uint64_t g_dev_copy_bytes;
 bool g_dev_writev_ext_called;
 bool g_dev_readv_ext_called;
@@ -123,6 +125,8 @@ dev_read(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload
 	 struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts)
 {
 	uint64_t offset, length;
+
+	g_dev_last_read_priority = bs_io_opts ? bs_io_opts->priority : -1;
 
 	if (g_power_failure_thresholds.read_threshold != 0) {
 		g_power_failure_counters.read_counter++;

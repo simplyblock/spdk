@@ -1325,6 +1325,22 @@ void spdk_blob_io_read(struct spdk_blob *blob, struct spdk_io_channel *channel,
 		       spdk_blob_op_complete cb_fn, void *cb_arg);
 
 /**
+ * Read data from a blob in a given IO priority class.
+ *
+ * Like spdk_blob_io_read(), but the read carries \p priority_class instead of
+ * the blob's own class (see spdk_blob_set_io_priority_class()). The blob's
+ * class is not changed, so other readers of the blob are unaffected. Clusters
+ * the blob does not own are read from its backing device in that device's own
+ * class, and a read queued while the blob is frozen runs in the blob's class.
+ *
+ * \param priority_class Class for this read, 0..MAX_PRIORITY_CLASS; a negative
+ * value uses the blob's own, exactly as spdk_blob_io_read() does.
+ */
+void spdk_blob_io_read_with_priority(struct spdk_blob *blob, struct spdk_io_channel *channel,
+				     void *payload, uint64_t offset, uint64_t length,
+				     int priority_class, spdk_blob_op_complete cb_fn, void *cb_arg);
+
+/**
  * Write the data described by 'iov' to 'length' io_units beginning at 'offset' io_units
  * into the blob.
  *
