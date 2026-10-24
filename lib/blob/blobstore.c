@@ -4613,8 +4613,13 @@ blob_dirty_gen_start(struct spdk_blob *blob, spdk_blob_id base)
 
 /* The blob's unwritten blocks are about to read a different parent. A blob that
  * owns nothing and has tracked nothing just starts its generation on top of
- * the new parent (a landing volume chained before its transfer); anything else
- * no longer has a delta against a known base. */
+ * the new parent (a landing volume chained before its transfer). So does a
+ * landing volume chained AFTER its transfer, while the previous copy was still
+ * being merged: it had no parent, its clusters were allocated by the transfer
+ * (merge_pending: their unwritten blocks are not data yet) and the generation
+ * marks exactly the blocks that arrived -- spdk_blob_merge_base fills the rest
+ * from the new parent, the same result as chaining first. Anything else no
+ * longer has a delta against a known base. */
 static void
 blob_dirty_gen_reparent(struct spdk_blob *blob, spdk_blob_id new_parent)
 {
@@ -4624,6 +4629,11 @@ blob_dirty_gen_reparent(struct spdk_blob *blob, spdk_blob_id new_parent)
 		return;
 	}
 	if (blob->active.num_allocated_clusters == 0 && spdk_blob_dirty_gen_tracked(gen) == 0) {
+		gen->base = new_parent;
+		return;
+	}
+	if (gen->base == SPDK_BLOBID_INVALID && gen->merge_pending &&
+	    spdk_blob_dirty_gen_complete(gen)) {
 		gen->base = new_parent;
 		return;
 	}

@@ -128,7 +128,7 @@ def main():
         print("=== base pattern: 80 MiB")
         sh(f"dd if=/dev/urandom of={dev_a} bs=1M count=80 oflag=direct status=none")
 
-        def land(rnd, src_snap, base, parent, retry_full=False):
+        def land(rnd, src_snap, base, parent, retry_full=False, chain_after=False):
             """Transfer src_snap into a new landing volume, compare, freeze it as T<rnd>.
 
             With a base, the landing volume is a clone of the base's copy and
@@ -138,9 +138,13 @@ def main():
 
             retry_full: send it again as a FULL transfer into the same landing
             volume first, as a retry after a failed attempt would: it must
-            write its zero blocks too, or the merge fills them from the base."""
+            write its zero blocks too, or the merge fills them from the base.
+
+            chain_after: the landing volume starts with no parent and is chained
+            onto the base's copy only after the transfer, as the control plane
+            does when the transfer overlaps the previous copy's merge."""
             name = f"landing{rnd}"
-            if parent is None:
+            if parent is None or chain_after:
                 rpc(SOCK_B, "bdev_lvol_create",
                     {"lvol_name": name, "size_in_mib": VOL_MIB, "lvs_name": "lvsB",
                      "thin_provision": True})
@@ -160,6 +164,9 @@ def main():
                 st_retry = wait_transfer_done(SOCK_A, f"lvsA/{src_snap}")
                 print(f"    full retry into {name}: {st_retry}")
                 assert st_retry["partial_reqs"] == 0, st_retry
+            if chain_after:
+                rpc(SOCK_B, "bdev_lvol_add_clone", {"lvol_name": f"lvsB/{parent}",
+                                                    "child_name": f"lvsB/{name}"})
             if base is not None:
                 merged = merge(f"lvsB/{name}")
                 print(f"    merge {name}: {merged}")
@@ -209,7 +216,15 @@ def main():
         st = land(5, "S5", blobid(SOCK_A, "lvsA/S3"), "T4")
         assert st["partial_reqs"] == 0 and st["full_clusters"] > 0, st
 
-        print("=== PASS: 3 partial rounds and a refused base, every landing byte-identical")
+        print("=== round 6: delta, S6 on top of S5, landing chained onto T5 after the transfer")
+        delta(dev_a, 6)
+        rpc(SOCK_A, "bdev_lvol_snapshot", {"lvol_name": "lvsA/volA", "snapshot_name": "S6"})
+        st = land(6, "S6", blobid(SOCK_A, "lvsA/S5"), "T5", chain_after=True)
+        assert st["partial_reqs"] > 0, f"round 6 did not send ranges: {st}"
+        assert st["merged"]["clusters"] > 0, f"round 6 merged nothing: {st}"
+
+        print("=== PASS: 4 partial rounds (one chained after its transfer) and a refused "
+              "base, every landing byte-identical")
     except BaseException as e:
         fail = e
     finally:

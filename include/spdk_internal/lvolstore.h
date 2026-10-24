@@ -182,6 +182,9 @@ struct remote_lvol_info {
 	 * whose lifetime ends before this entry's cleanup poller runs): requests
 	 * of a freeze-critical FINAL transfer are dispatched before any other. */
 	bool priority;
+	/* Replication: the most requests of the task's window this poll group
+	 * takes from the ready ring (its share; 0 = no limit). */
+	uint32_t window_share;
 	uint64_t outstanding_io;
 	struct spdk_ring *free_ring;     /* tasks available for this snapshot */
     struct spdk_ring *ready_ring;    /* tasks ready to send to remote lvol */
@@ -271,6 +274,10 @@ struct spdk_lvs_xfer_req {
 	 * The write to the destination ends in fragment_write_cb. */
 	uint64_t t_read;
 	uint64_t t_read_done;
+	/* Ring waits (ticks, 0 = not waiting): entered the ready ring, and
+	 * went back to the free ring. */
+	uint64_t t_ready;
+	uint64_t t_free;
 	struct remote_lvol_info *rmt_lvol;
 	struct spdk_lvs_xfer *xfer;
 	TAILQ_ENTRY(spdk_lvs_xfer_req)	entry;
@@ -369,6 +376,11 @@ struct spdk_lvs_xfer {
 	uint32_t range_done;
 	uint64_t range_cluster;
 	uint64_t partial_clusters;
+	/* Guards the request generator (hold_idx, the ranges, idx, success_cnt,
+	 * outstanding_io, timeout) of a replication task: the app thread's
+	 * dispatcher and the poll group threads that refill a completed request
+	 * in place (xfer_refill_inline) both take the next request from it. */
+	pthread_spinlock_t gen_lock;
 	/* The destination may hold non-zero content in clusters this task did
 	 * not just allocate (a resumed transfer skips the allocation step), so
 	 * zero ranges must be written too. */
@@ -521,6 +533,18 @@ struct spdk_lvol {
 	uint64_t xfer_stat_write_ticks;
 	uint64_t xfer_stat_start_ticks;
 	uint64_t xfer_stat_end_ticks;
+	/* Where a request waits outside its IO: requests refilled in place on
+	 * their poll group; summed waits in the ready ring (until a poll group
+	 * takes it) and in the free ring (until the dispatcher refills it);
+	 * requests between source read and destination write completion now,
+	 * and the most seen. */
+	uint64_t xfer_stat_inline_reqs;
+	uint64_t xfer_stat_ready_wait_ticks;
+	uint64_t xfer_stat_ready_waits;
+	uint64_t xfer_stat_free_wait_ticks;
+	uint64_t xfer_stat_free_waits;
+	uint64_t xfer_stat_inflight;
+	uint64_t xfer_stat_inflight_max;
 	uint64_t xfer_partial_reqs;
 	uint64_t xfer_full_clusters;
 	uint64_t xfer_pages_sent;

@@ -5000,6 +5000,7 @@ set_req_status_and_queued(struct spdk_lvs_xfer_req *req, enum xfer_req_status st
 	}
 
 	req->status = status;
+	req->t_free = spdk_get_ticks();
 	if (spdk_ring_enqueue(rmt->free_ring, (void **)&req, 1, NULL) != 1) {
 		SPDK_ERRLOG("free_ring full while handling write submit failure\n");
 		assert(false);
@@ -5056,6 +5057,48 @@ remote_op_comp(struct spdk_bdev_io *bdev_io, bool success, void *arg)
 
 }
 
+/* Add the time since *since (if set) to a ring wait statistic, and clear it. */
+static inline void
+xfer_stat_wait(uint64_t *since, uint64_t *ticks, uint64_t *waits)
+{
+	uint64_t t = *since;
+
+	if (t == 0) {
+		return;
+	}
+	*since = 0;
+	__atomic_add_fetch(ticks, spdk_get_ticks() - t, __ATOMIC_RELAXED);
+	__atomic_add_fetch(waits, 1, __ATOMIC_RELAXED);
+}
+
+/* The source read of a replication request is submitted. */
+static void
+xfer_stat_inflight_inc(struct spdk_lvol *lvol)
+{
+	uint64_t n;
+
+	if (lvol == NULL) {
+		return;
+	}
+	n = __atomic_add_fetch(&lvol->xfer_stat_inflight, 1, __ATOMIC_RELAXED);
+	if (n > __atomic_load_n(&lvol->xfer_stat_inflight_max, __ATOMIC_RELAXED)) {
+		__atomic_store_n(&lvol->xfer_stat_inflight_max, n, __ATOMIC_RELAXED);
+	}
+}
+
+/* A replication request failed between its source read and its last write. */
+static void
+xfer_stat_drop(struct spdk_lvs_xfer_req *req)
+{
+	struct spdk_lvol *lvol = req->xfer ? req->xfer->lvol : NULL;
+
+	if (lvol == NULL || req->t_read == 0) {
+		return;
+	}
+	__atomic_sub_fetch(&lvol->xfer_stat_inflight, 1, __ATOMIC_RELAXED);
+	req->t_read = 0;
+}
+
 /* A replication request is done: add its source read and destination write
  * times and its bytes to the lvol's transfer statistics (poll group threads,
  * hence atomics). */
@@ -5065,7 +5108,12 @@ xfer_account_req(struct spdk_lvs_xfer_req *req)
 	struct spdk_lvol *lvol = req->xfer ? req->xfer->lvol : NULL;
 	uint64_t now = spdk_get_ticks();
 
-	if (lvol == NULL || req->t_read == 0 || req->t_read_done < req->t_read) {
+	if (lvol == NULL || req->t_read == 0) {
+		return;
+	}
+	__atomic_sub_fetch(&lvol->xfer_stat_inflight, 1, __ATOMIC_RELAXED);
+	if (req->t_read_done < req->t_read) {
+		req->t_read = 0;
 		return;
 	}
 	__atomic_add_fetch(&lvol->xfer_stat_reqs, 1, __ATOMIC_RELAXED);
@@ -5075,6 +5123,8 @@ xfer_account_req(struct spdk_lvs_xfer_req *req)
 	__atomic_store_n(&lvol->xfer_stat_end_ticks, now, __ATOMIC_RELAXED);
 	req->t_read = 0;
 }
+
+static bool xfer_refill_inline(struct spdk_lvs_xfer_req *req);
 
 static void
 fragment_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
@@ -5102,9 +5152,13 @@ fragment_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 		int st = req->aggregated_status;
 		if (st != 0) {
 			req->status = XFER_REQ_STATUS_FAILED;
+			xfer_stat_drop(req);
 		} else {
 			req->status = XFER_REQ_STATUS_DONE;
 			xfer_account_req(req);
+			if (xfer_refill_inline(req)) {
+				return;
+			}
 		}
 
 		set_req_status_and_queued(req,  req->status);
@@ -5253,6 +5307,7 @@ local_op_comp(void *cb_arg, int bserrno)
 	if (bserrno != 0) {		
 		SPDK_ERRLOG("Local I/O failed at offset: %" PRIu64 " len: %" PRIu64 "\n",
 				req->offset, req->len);
+		xfer_stat_drop(req);
 		set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
 		return;
 	}
@@ -5291,6 +5346,7 @@ submit_rw_reqs_local(struct spdk_lvs_xfer_req *req)
 			// read from local and write to remote
 			// in the transfer's own class when it has one, else the blob's (-1)
 			req->t_read = spdk_get_ticks();
+			xfer_stat_inflight_inc(xfer->lvol);
 			spdk_blob_io_read_with_priority(xfer->lvol->blob, md_ch, req->payload, req->offset,
 								req->len, xfer->priority_class ? (int)xfer->priority_class : -1,
 								local_op_comp, req);
@@ -5321,6 +5377,19 @@ submit_rw_reqs_local(struct spdk_lvs_xfer_req *req)
 
 #define XFER_HELPER_MAX_BURST   32
 
+/*
+ * A poll group takes at most its share of a replication window from the ready
+ * ring and leaves the rest to the others. Draining the ring whole put a burst
+ * -- and, since a request is refilled where it completes
+ * (xfer_refill_inline), the whole window -- on one reactor and on its one
+ * qpair to the destination.
+ */
+static bool
+xfer_pg_holds_share(const struct remote_lvol_info *rmt_lvol)
+{
+	return rmt_lvol->window_share != 0 && rmt_lvol->outstanding_io >= rmt_lvol->window_share;
+}
+
 static int
 helper_xfer_poller(void *arg)
 {
@@ -5350,14 +5419,20 @@ helper_xfer_poller(void *arg)
 		/* Drain the ring, do not take ONE request per 200us tick: with the
 		 * dispatcher now filling the whole window per tick, a single-dequeue
 		 * here would re-serialize everything it batched. The ring is bounded
-		 * by cluster_batch, so a full drain is a bounded amount of work. */
-		while (spdk_ring_dequeue(rmt_lvol->ready_ring, (void **)&req, 1) != 0) {
+		 * by cluster_batch, so a full drain is a bounded amount of work --
+		 * up to this poll group's share of a replication window. */
+		while (!xfer_pg_holds_share(rmt_lvol) &&
+		       spdk_ring_dequeue(rmt_lvol->ready_ring, (void **)&req, 1) != 0) {
 		rc = 0;
 
 		count++;
 		rmt_lvol->outstanding_io++;
 		req->rmt_lvol = rmt_lvol;
 		req->status = XFER_REQ_STATUS_IN_FLIGHT;
+		if (req->xfer != NULL && req->xfer->lvol != NULL) {
+			xfer_stat_wait(&req->t_ready, &req->xfer->lvol->xfer_stat_ready_wait_ticks,
+					   &req->xfer->lvol->xfer_stat_ready_waits);
+		}
 
 		if (rmt_lvol->desc == NULL || rmt_lvol->channel == NULL || !rmt_lvol->status) {
 			set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
@@ -6293,10 +6368,10 @@ xfer_classify_partial(struct spdk_lvs_xfer *xfer)
 		       " whole\n", xfer->lvol->name, xfer->partial_clusters, full);
 }
 
-/* Enqueue the next piece of the current dirty range: at most
+/* Make req the next piece of the current dirty range: at most
  * XFER_PARTIAL_MAX_BYTES, so a dense run never becomes one large read. */
 static void
-xfer_enqueue_range_req(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req *req)
+xfer_fill_range_req(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req *req)
 {
 	const struct blob_dirty_range *r = &xfer->ranges[xfer->range_pos];
 	uint64_t pages_per_block = SPDK_BLOB_DIRTY_BLOCK_SZ / xfer->page_size;
@@ -6320,20 +6395,151 @@ xfer_enqueue_range_req(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req *req
 		xfer->range_done = 0;
 	}
 
-	if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
-		SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
-		assert(false);
-	}
 	xfer->lvol->xfer_partial_reqs++;
 	xfer->lvol->xfer_pages_sent += req->len;
 	xfer->outstanding_io++;
 	xfer->idx++;
 }
 
+/*
+ * Make req the replication task's next request: the rest of the current
+ * cluster's dirty ranges, else the next cluster to send (as dirty ranges, as
+ * 64 KiB pieces of a whole cluster in a partial task, or whole). False when
+ * nothing is left. Counts the request (idx, outstanding_io); the caller
+ * clears a whole cluster's payload (xfer_repl_clear, outside the lock: 2 MiB)
+ * and submits it. Under gen_lock.
+ */
+static bool
+xfer_repl_next(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req *req)
+{
+	req->partial = false;
+
+	if (xfer->range_pos < xfer->num_ranges) {
+		/* the rest of the current cluster's dirty ranges */
+		xfer_fill_range_req(xfer, req);
+		return true;
+	}
+
+	for (uint32_t i = xfer->hold_idx; i < xfer->num_clusters; i++) {
+		if (xfer->clusters[i] == 0) {
+			continue;
+		}
+
+		if (xfer->partial != NULL && xfer->partial[i] && xfer_load_ranges(xfer, i)) {
+			/* bitmap-driven: only the dirty ranges travel */
+			xfer->hold_idx = i + 1;
+			xfer_fill_range_req(xfer, req);
+			return true;
+		}
+		if (xfer->allow_partial) {
+			/* a whole cluster of a partial task: one range over all of
+			 * it, in 64 KiB pieces like the others (the payloads are
+			 * that size) */
+			xfer->ranges[0].off = 0;
+			xfer->ranges[0].len = xfer->page_per_cluster * xfer->page_size /
+						  SPDK_BLOB_DIRTY_BLOCK_SZ;
+			xfer->num_ranges = 1;
+			xfer->range_pos = 0;
+			xfer->range_done = 0;
+			xfer->range_cluster = i;
+			xfer->lvol->xfer_full_clusters++;
+			xfer->hold_idx = i + 1;
+			xfer_fill_range_req(xfer, req);
+			return true;
+		}
+
+		xfer->lvol->xfer_full_clusters++;
+		xfer->lvol->xfer_pages_sent += xfer->page_per_cluster;
+		req->dst_offset = i * xfer->page_per_cluster;
+		if (xfer->lvol->redirect_map_id != 0) {
+			req->dst_offset = ((uint64_t)(xfer->lvol->redirect_map_id) << 48) | req->dst_offset;
+		}
+		req->offset = i * xfer->page_per_cluster;
+		req->len = xfer->page_per_cluster; // 2MB
+		req->action = REQ_ACTION_COPY_BACKUP;
+		req->status = XFER_REQ_STATUS_READY;
+		xfer->outstanding_io++;
+		xfer->idx++;
+		xfer->hold_idx = i + 1;
+		return true;
+	}
+	return false;
+}
+
+/* A whole cluster's payload starts zeroed (a partial task's are 64 KiB and
+ * read whole). */
+static void
+xfer_repl_clear(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req *req)
+{
+	if (!xfer->allow_partial) {
+		memset(req->payload, 0, xfer->page_size * xfer->page_per_cluster);
+	}
+}
+
+/*
+ * A replication request is done: make it the task's next request right here,
+ * on the poll group thread it completed on, and submit it. Until now every
+ * completed request went back through the free ring to the dispatcher on the
+ * app thread (a 1 ms poller that shares the thread with every RPC) and then
+ * through the ready ring to a poll group's 200 us helper; only the time in
+ * between was IO. Run 3 (2026-10-24): later deltas had 8-25 of 256 requests
+ * in IO, the rest waiting in the rings.
+ *
+ * Does for the request what xfer_status_check does for one taken back from
+ * the free ring (count it done, refresh the stall clock), then what the
+ * dispatcher does. False: hand it back as before -- not a running replication
+ * window, paused for a freeze-critical transfer, or the destination is gone.
+ * True also when nothing is left to send: the request leaves the window, as
+ * one does at the tail of the dispatcher's scan.
+ */
+static bool
+xfer_refill_inline(struct spdk_lvs_xfer_req *req)
+{
+	struct spdk_lvs_xfer *xfer = req->xfer;
+	struct remote_lvol_info *rmt = req->rmt_lvol;
+	bool next;
+
+	if (xfer == NULL || xfer->type != XFER_REPLICATE_SNAPSHOT ||
+		req->action != REQ_ACTION_COPY_BACKUP || rmt == NULL || !rmt->status) {
+		return false;
+	}
+	if (!xfer->priority && __atomic_load_n(&g_priority_xfer_cnt, __ATOMIC_SEQ_CST) > 0) {
+		return false;
+	}
+
+	pthread_spin_lock(&xfer->gen_lock);
+	if (xfer->state != XFER_STATE_TRANSFER_CLUSTERS) {
+		pthread_spin_unlock(&xfer->gen_lock);
+		return false;
+	}
+	xfer->success_cnt++;
+	if (xfer->outstanding_io > 0) {
+		xfer->outstanding_io--;
+	}
+	xfer->timeout = spdk_get_ticks();
+	next = xfer_repl_next(xfer, req);
+	pthread_spin_unlock(&xfer->gen_lock);
+
+	if (!next) {
+		/* out of the window: this poll group no longer holds it */
+		if (rmt->outstanding_io > 0) {
+			rmt->outstanding_io--;
+		}
+		return true;
+	}
+
+	xfer_repl_clear(xfer, req);
+	__atomic_add_fetch(&xfer->lvol->xfer_stat_inline_reqs, 1, __ATOMIC_RELAXED);
+	req->status = XFER_REQ_STATUS_IN_FLIGHT;
+	if (submit_rw_reqs_local(req) != 0) {
+		set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
+	}
+	return true;
+}
+
 static int
 xfer_replication(struct spdk_lvs_xfer *xfer) {
 	struct spdk_lvs_xfer_req *req;
-	bool is_allocate = false;
 	enum xfer_state  next_state;
 	int count = 0, rc, next_cnt;
 
@@ -6396,100 +6602,39 @@ xfer_replication(struct spdk_lvs_xfer *xfer) {
 			 * The window stays bounded by the free_ring (cluster_batch), so
 			 * looping until it is empty cannot over-submit. */
 			while (true) {
-				is_allocate = false;
+				pthread_spin_lock(&xfer->gen_lock);
 				rc = xfer_status_check(xfer, &req, xfer->idx, next_state, next_cnt);
 				if (rc != 0) {
 					/* no free request, or the state machine moved on */
+					pthread_spin_unlock(&xfer->gen_lock);
 					return count;
 				}
+				xfer_stat_wait(&req->t_free, &xfer->lvol->xfer_stat_free_wait_ticks,
+						   &xfer->lvol->xfer_stat_free_waits);
 
 				xfer->lvol->last_offset = xfer_resume_offset(xfer, req);
-				req->partial = false;
 
-				if (xfer->range_pos < xfer->num_ranges) {
-					/* the rest of the current cluster's dirty ranges */
-					xfer_enqueue_range_req(xfer, req);
-					count++;
-					continue;
-				}
-
-				if (!xfer->allow_partial) {
-					// prepare req (a partial task's payloads are 64 KiB)
-					memset(req->payload, 0, xfer->page_size * xfer->page_per_cluster);
-				}
-
-				if (xfer->hold_idx < xfer->num_clusters) {
-					for (uint32_t i = xfer->hold_idx; i < xfer->num_clusters; i++) {
-						if (xfer->clusters[i] == 0) {
-							continue;
-						}
-
-						if (xfer->partial != NULL && xfer->partial[i]) {
-							if (xfer_load_ranges(xfer, i)) {
-								/* bitmap-driven: only the dirty ranges travel */
-								is_allocate = true;
-								xfer->hold_idx = i + 1;
-								xfer_enqueue_range_req(xfer, req);
-								count++;
-								break;
-							}
-						}
-						if (xfer->allow_partial) {
-							/* a whole cluster of a partial task: one range
-							 * over all of it, in 64 KiB pieces like the
-							 * others (the payloads are that size) */
-							xfer->ranges[0].off = 0;
-							xfer->ranges[0].len = xfer->page_per_cluster * xfer->page_size /
-									      SPDK_BLOB_DIRTY_BLOCK_SZ;
-							xfer->num_ranges = 1;
-							xfer->range_pos = 0;
-							xfer->range_done = 0;
-							xfer->range_cluster = i;
-							xfer->lvol->xfer_full_clusters++;
-							is_allocate = true;
-							xfer->hold_idx = i + 1;
-							xfer_enqueue_range_req(xfer, req);
-							count++;
-							break;
-						}
-
-						is_allocate = true;
-						xfer->lvol->xfer_full_clusters++;
-						xfer->lvol->xfer_pages_sent += xfer->page_per_cluster;
-						req->dst_offset = i * xfer->page_per_cluster;
-						if (xfer->lvol->redirect_map_id != 0) {
-							req->dst_offset = ((uint64_t)(xfer->lvol->redirect_map_id) << 48) | req->dst_offset;
-						}
-
-						req->offset = i * xfer->page_per_cluster;
-						req->len = xfer->page_per_cluster; // 2MB
-						req->action = REQ_ACTION_COPY_BACKUP;
-						req->status = XFER_REQ_STATUS_READY;
-						/* enqueue for transfer; if ready_ring is full, return req to free_ring or retry */
-						if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
-							SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
-							assert(false);
-						}
-
-						xfer->outstanding_io++;
-						xfer->idx++;
-						xfer->hold_idx = i + 1;
-						count++;
-						break;
-					}
-				}
-
-				if (!is_allocate) {
+				if (!xfer_repl_next(xfer, req)) {
 					if (xfer->idx == 0) {
 						// no clusters to send
 						xfer->state = xfer->final_step ?  XFER_STATE_SIGNAL_TRANSFER : XFER_STATE_DONE;
 						xfer_fill_queue(xfer, xfer->cluster_batch);
 					}
+					pthread_spin_unlock(&xfer->gen_lock);
 					/* Tail of the scan: nothing left to enqueue this tick.
 					 * Outstanding IO completes on its own; the success_cnt
 					 * check above transitions the state on a later tick. */
 					return count;
 				}
+				pthread_spin_unlock(&xfer->gen_lock);
+
+				xfer_repl_clear(xfer, req);
+				req->t_ready = spdk_get_ticks();
+				if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
+					SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
+					assert(false);
+				}
+				count++;
 			}
 			break;
 
@@ -7461,6 +7606,39 @@ xfer_s3_recovery(struct spdk_lvs_xfer *xfer) {
 }
 
 
+/* Dispatcher tick lateness (app thread only): the longest gap between ticks in
+ * the current and the previous 10 s window, and the ticks more than 5 ms late. */
+static uint64_t g_md_tick_last, g_md_win_start, g_md_gap_cur, g_md_gap_prev, g_md_late_ticks;
+
+static void
+xfer_md_tick(void)
+{
+	uint64_t now = spdk_get_ticks(), hz = spdk_get_ticks_hz(), gap;
+
+	if (g_md_tick_last != 0) {
+		gap = now - g_md_tick_last;
+		if (gap > g_md_gap_cur) {
+			g_md_gap_cur = gap;
+		}
+		if (gap > hz / 200) {
+			g_md_late_ticks++;
+		}
+	}
+	g_md_tick_last = now;
+	if (now - g_md_win_start > 10 * hz) {
+		g_md_gap_prev = g_md_gap_cur;
+		g_md_gap_cur = 0;
+		g_md_win_start = now;
+	}
+}
+
+void
+spdk_lvol_xfer_md_ticks(uint64_t *gap_max_us, uint64_t *late_ticks)
+{
+	*gap_max_us = spdk_max(g_md_gap_cur, g_md_gap_prev) * 1000000 / spdk_get_ticks_hz();
+	*late_ticks = g_md_late_ticks;
+}
+
 static int
 md_xfer_poller(void *cb_arg)
 {
@@ -7468,6 +7646,8 @@ md_xfer_poller(void *cb_arg)
 	struct spdk_lvs_xfer *sub_xfer;
 	int migration_count = 0;
 	int count = 0;
+
+	xfer_md_tick();
 	TAILQ_FOREACH_SAFE(xfer, &g_lvs_xfer_tasks, entry, tmp) {
 		int sub_count = 0;
 		switch (xfer->type)
@@ -7993,6 +8173,7 @@ spdk_lvol_create_backup_task(struct spdk_lvs_xfer *task, struct spdk_transfer_de
 		s_elements_payload = XFER_PARTIAL_MAX_BYTES;
 	}
 
+	pthread_spin_init(&task->gen_lock, PTHREAD_PROCESS_PRIVATE);
 	task->free_ring  = spdk_ring_create(SPDK_RING_TYPE_MP_MC, task->cluster_batch, SPDK_ENV_SOCKET_ID_ANY);
 	if (!task->free_ring) {
 		SPDK_ERRLOG("Unable to allocate rings on transfer task for lvol %d\n", task->s3_id);
@@ -8043,6 +8224,10 @@ spdk_lvol_create_backup_task(struct spdk_lvs_xfer *task, struct spdk_transfer_de
 		rmt_lvol->ready_ring = task->ready_ring;
 		rmt_lvol->type = task->type;
 		rmt_lvol->xfer_task = task;
+		if (task->type == XFER_REPLICATE_SNAPSHOT) {
+			rmt_lvol->window_share = spdk_divide_round_up(task->cluster_batch,
+						spdk_max(g_lvs_num_pgs, 1));
+		}
 		rmt_lvol->group = lpg;
 		spdk_thread_send_msg(lpg->thread, spdk_lvs_add_rmt_bdev_to_poll_group, rmt_lvol);
 	}
@@ -8196,6 +8381,13 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
 	lvol->xfer_stat_write_ticks = 0;
 	lvol->xfer_stat_start_ticks = spdk_get_ticks();
 	lvol->xfer_stat_end_ticks = 0;
+	lvol->xfer_stat_inline_reqs = 0;
+	lvol->xfer_stat_ready_wait_ticks = 0;
+	lvol->xfer_stat_ready_waits = 0;
+	lvol->xfer_stat_free_wait_ticks = 0;
+	lvol->xfer_stat_free_waits = 0;
+	lvol->xfer_stat_inflight = 0;
+	lvol->xfer_stat_inflight_max = 0;
 
 	// rememeber
 	// if (type == XFER_MIGRATE_SNAPSHOT) {

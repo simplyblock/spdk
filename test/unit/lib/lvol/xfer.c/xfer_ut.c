@@ -45,6 +45,7 @@ make_xfer(int cluster_batch, uint32_t num_clusters, const int *allocated)
 		xfer->clusters[i] = allocated[i] ? 0xABCD0000 + i : 0;
 	}
 
+	pthread_spin_init(&xfer->gen_lock, PTHREAD_PROCESS_PRIVATE);
 	xfer->free_ring = spdk_ring_create(SPDK_RING_TYPE_MP_MC, cluster_batch,
 					   SPDK_ENV_SOCKET_ID_ANY);
 	xfer->ready_ring = spdk_ring_create(SPDK_RING_TYPE_MP_MC, cluster_batch,
@@ -297,6 +298,40 @@ xfer_second_pass_continues_and_completes(void)
 	free_xfer(xfer);
 }
 
+/* A poll group takes only its share of the window from the ready ring,
+ * leaving the rest to the other poll groups. */
+static void
+helper_takes_its_share_of_the_window(void)
+{
+	const int alloc[8] = {1, 1, 1, 1, 1, 1, 1, 1};
+	struct spdk_lvs_xfer *xfer = make_xfer(8, 8, alloc);
+	struct spdk_lvs_poll_group lpg;
+	struct remote_lvol_info rmt;
+
+	CU_ASSERT(xfer_replication(xfer) == 8);
+
+	memset(&lpg, 0, sizeof(lpg));
+	TAILQ_INIT(&lpg.rmt_lvols);
+	memset(&rmt, 0, sizeof(rmt));
+	rmt.status = true;
+	rmt.type = XFER_REPLICATE_SNAPSHOT;
+	rmt.desc = (struct spdk_bdev_desc *)0x1;
+	rmt.channel = (struct spdk_io_channel *)0x1;
+	rmt.md_channel = (struct spdk_io_channel *)0x1;
+	rmt.ready_ring = xfer->ready_ring;
+	rmt.free_ring = xfer->free_ring;
+	rmt.window_share = 3;			/* ceil(8 / 3) of 3 poll groups */
+	TAILQ_INSERT_TAIL(&lpg.rmt_lvols, &rmt, entry);
+
+	helper_xfer_poller(&lpg);
+	CU_ASSERT(rmt.outstanding_io == 3);
+	helper_xfer_poller(&lpg);		/* still holding its share */
+	CU_ASSERT(rmt.outstanding_io == 3);
+	CU_ASSERT(drain_ready(xfer, NULL, 8) == 5);
+
+	free_xfer(xfer);
+}
+
 /* The helper must drain its ready ring, not take one request per tick. */
 static void
 helper_drains_ready_ring(void)
@@ -355,9 +390,13 @@ make_cluster_req(struct spdk_lvs_xfer **xferp, struct remote_lvol_info *rmt)
 	free(xfer->reqs[0].payload);
 	xfer->reqs[0].payload = calloc(1, xfer->page_size * xfer->page_per_cluster);
 	SPDK_CU_ASSERT_FATAL(xfer->reqs[0].payload != NULL);
-	/* the request is in flight: take it off the free ring */
+	/* the request is in flight: take it off the free ring; its cluster was
+	 * the task's only one, so nothing is left to refill it with */
 	while (spdk_ring_dequeue(xfer->free_ring, (void **)&req, 1) == 1) {
 	}
+	xfer->hold_idx = 1;
+	xfer->idx = 1;
+	xfer->outstanding_io = 1;
 
 	memset(rmt, 0, sizeof(*rmt));
 	rmt->status = true;
@@ -790,6 +829,93 @@ xfer_partial_and_resumed_requests_write_zeroes(void)
 	free_xfer(xfer);
 }
 
+/* Complete req's one write (as the remote bdev would). */
+static void
+complete_one_write(struct spdk_lvs_xfer_req *req)
+{
+	req->fragments_outstanding = 1;
+	req->aggregated_status = 0;
+	fragment_write_cb(NULL, true, req);
+}
+
+/* A completed request becomes the task's next request on the spot, on the
+ * poll group it completed on: no trip through the free ring to the
+ * dispatcher and back through the ready ring. With nothing left it leaves
+ * the window, counted done. */
+static void
+xfer_completion_refills_in_place(void)
+{
+	const int alloc[3] = {1, 1, 1};
+	struct spdk_lvs_xfer *xfer = make_xfer(2, 3, alloc);
+	struct remote_lvol_info rmt;
+	struct spdk_lvs_xfer_req *req;
+
+	CU_ASSERT(xfer_replication(xfer) == 2);	/* clusters 0 and 1 */
+	SPDK_CU_ASSERT_FATAL(spdk_ring_dequeue(xfer->ready_ring, (void **)&req, 1) == 1);
+	CU_ASSERT(req->offset == 0);
+
+	memset(&rmt, 0, sizeof(rmt));
+	rmt.status = true;
+	rmt.type = XFER_REPLICATE_SNAPSHOT;
+	rmt.md_channel = (struct spdk_io_channel *)0x1;
+	rmt.free_ring = xfer->free_ring;
+	rmt.outstanding_io = 1;
+	req->rmt_lvol = &rmt;
+	req->status = XFER_REQ_STATUS_IN_FLIGHT;
+
+	complete_one_write(req);			/* -> cluster 2, read submitted */
+	CU_ASSERT(req->status == XFER_REQ_STATUS_IN_FLIGHT);
+	CU_ASSERT(req->offset == 2 * xfer->page_per_cluster);
+	CU_ASSERT(xfer->success_cnt == 1);
+	CU_ASSERT(xfer->idx == 3);
+	CU_ASSERT(xfer->outstanding_io == 2);
+	CU_ASSERT(rmt.outstanding_io == 1);
+	CU_ASSERT(g_xfer_lvol.xfer_stat_inline_reqs == 1);
+	CU_ASSERT(spdk_ring_count(xfer->free_ring) == 0);
+
+	complete_one_write(req);			/* nothing left */
+	CU_ASSERT(req->status == XFER_REQ_STATUS_DONE);
+	CU_ASSERT(xfer->success_cnt == 2);
+	CU_ASSERT(xfer->outstanding_io == 1);
+	CU_ASSERT(rmt.outstanding_io == 0);
+	CU_ASSERT(spdk_ring_count(xfer->free_ring) == 0);
+
+	free_xfer(xfer);
+}
+
+/* While a freeze-critical transfer runs, a background request is not
+ * refilled in place: it goes back to the free ring, where the paused
+ * dispatcher leaves it. */
+static void
+xfer_completion_hands_back_while_paused(void)
+{
+	const int alloc[3] = {1, 1, 1};
+	struct spdk_lvs_xfer *xfer = make_xfer(2, 3, alloc);
+	struct remote_lvol_info rmt;
+	struct spdk_lvs_xfer_req *req;
+
+	CU_ASSERT(xfer_replication(xfer) == 2);
+	SPDK_CU_ASSERT_FATAL(spdk_ring_dequeue(xfer->ready_ring, (void **)&req, 1) == 1);
+	memset(&rmt, 0, sizeof(rmt));
+	rmt.status = true;
+	rmt.type = XFER_REPLICATE_SNAPSHOT;
+	rmt.free_ring = xfer->free_ring;
+	rmt.outstanding_io = 1;
+	req->rmt_lvol = &rmt;
+	req->status = XFER_REQ_STATUS_IN_FLIGHT;
+
+	__atomic_store_n(&g_priority_xfer_cnt, 1, __ATOMIC_SEQ_CST);
+	complete_one_write(req);
+	__atomic_store_n(&g_priority_xfer_cnt, 0, __ATOMIC_SEQ_CST);
+	CU_ASSERT(req->status == XFER_REQ_STATUS_DONE);
+	CU_ASSERT(xfer->idx == 2);
+	CU_ASSERT(xfer->success_cnt == 0);	/* counted by the dispatcher */
+	CU_ASSERT(spdk_ring_count(xfer->free_ring) == 1);
+	CU_ASSERT(rmt.outstanding_io == 0);
+
+	free_xfer(xfer);
+}
+
 /* A resumed attempt starts at the lowest request not yet done: requests
  * complete out of order, and one that completed late must not move the resume
  * point past an earlier one still in flight -- or failed. */
@@ -834,6 +960,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, xfer_skips_unallocated_clusters);
 	CU_ADD_TEST(suite, xfer_second_pass_continues_and_completes);
 	CU_ADD_TEST(suite, helper_drains_ready_ring);
+	CU_ADD_TEST(suite, helper_takes_its_share_of_the_window);
 	CU_ADD_TEST(suite, xfer_read_is_one_cluster_read);
 	CU_ADD_TEST(suite, xfer_replicate_zero_cluster_sends_nothing);
 	CU_ADD_TEST(suite, xfer_replicate_full_cluster_is_one_range);
@@ -846,6 +973,8 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, xfer_partial_dispatch_splits_ranges);
 	CU_ADD_TEST(suite, xfer_partial_and_resumed_requests_write_zeroes);
 	CU_ADD_TEST(suite, xfer_resume_offset_is_lowest_not_done);
+	CU_ADD_TEST(suite, xfer_completion_refills_in_place);
+	CU_ADD_TEST(suite, xfer_completion_hands_back_while_paused);
 
 	allocate_threads(1);
 	set_thread(0);

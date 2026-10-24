@@ -4361,6 +4361,22 @@ rpc_bdev_lvol_transfer_stat(struct spdk_jsonrpc_request *request,
 					     n ? lvol->xfer_stat_write_ticks * 1000000 / hz / n : 0);
 		spdk_json_write_named_uint64(w, "stat_elapsed_ms",
 					     lvol->xfer_stat_start_ticks ? (end - lvol->xfer_stat_start_ticks) * 1000 / hz : 0);
+		/* and where it waits outside its IO */
+		uint64_t rw = lvol->xfer_stat_ready_waits, fw = lvol->xfer_stat_free_waits;
+		uint64_t gap_us, late;
+
+		spdk_json_write_named_uint64(w, "stat_inline_reqs", lvol->xfer_stat_inline_reqs);
+		spdk_json_write_named_uint64(w, "stat_ready_waits", rw);
+		spdk_json_write_named_uint64(w, "stat_ready_wait_us_avg",
+					 rw ? lvol->xfer_stat_ready_wait_ticks * 1000000 / hz / rw : 0);
+		spdk_json_write_named_uint64(w, "stat_free_waits", fw);
+		spdk_json_write_named_uint64(w, "stat_free_wait_us_avg",
+					 fw ? lvol->xfer_stat_free_wait_ticks * 1000000 / hz / fw : 0);
+		spdk_json_write_named_uint64(w, "stat_inflight", lvol->xfer_stat_inflight);
+		spdk_json_write_named_uint64(w, "stat_inflight_max", lvol->xfer_stat_inflight_max);
+		spdk_lvol_xfer_md_ticks(&gap_us, &late);
+		spdk_json_write_named_uint64(w, "md_tick_gap_max_us", gap_us);
+		spdk_json_write_named_uint64(w, "md_late_ticks", late);
 	}
 	spdk_json_write_named_uint64(w, "full_clusters", lvol->xfer_full_clusters);
 	spdk_json_write_named_uint64(w, "pages_sent", lvol->xfer_pages_sent);
