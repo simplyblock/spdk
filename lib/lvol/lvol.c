@@ -5056,6 +5056,26 @@ remote_op_comp(struct spdk_bdev_io *bdev_io, bool success, void *arg)
 
 }
 
+/* A replication request is done: add its source read and destination write
+ * times and its bytes to the lvol's transfer statistics (poll group threads,
+ * hence atomics). */
+static void
+xfer_account_req(struct spdk_lvs_xfer_req *req)
+{
+	struct spdk_lvol *lvol = req->xfer ? req->xfer->lvol : NULL;
+	uint64_t now = spdk_get_ticks();
+
+	if (lvol == NULL || req->t_read == 0 || req->t_read_done < req->t_read) {
+		return;
+	}
+	__atomic_add_fetch(&lvol->xfer_stat_reqs, 1, __ATOMIC_RELAXED);
+	__atomic_add_fetch(&lvol->xfer_stat_bytes, req->len * req->xfer->page_size, __ATOMIC_RELAXED);
+	__atomic_add_fetch(&lvol->xfer_stat_read_ticks, req->t_read_done - req->t_read, __ATOMIC_RELAXED);
+	__atomic_add_fetch(&lvol->xfer_stat_write_ticks, now - req->t_read_done, __ATOMIC_RELAXED);
+	__atomic_store_n(&lvol->xfer_stat_end_ticks, now, __ATOMIC_RELAXED);
+	req->t_read = 0;
+}
+
 static void
 fragment_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
@@ -5084,6 +5104,7 @@ fragment_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 			req->status = XFER_REQ_STATUS_FAILED;
 		} else {
 			req->status = XFER_REQ_STATUS_DONE;
+			xfer_account_req(req);
 		}
 
 		set_req_status_and_queued(req,  req->status);
@@ -5101,6 +5122,9 @@ fragment_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 #define XFER_MAX_DATA_RANGES	64
 /* Largest write to the remote device: 32 blocks of 4 KiB. */
 #define XFER_MAX_WRITE_BYTES	(32 * 0x1000)
+/* Largest request of a partial transfer: one source read and at most two
+ * destination writes (XFER_MAX_WRITE_BYTES) each. */
+#define XFER_PARTIAL_MAX_BYTES	(64 * 1024)
 
 /*
  * Write the request's payload (the cluster, already read whole) to the remote
@@ -5237,6 +5261,7 @@ local_op_comp(void *cb_arg, int bserrno)
 	{
 		case REQ_ACTION_COPY_BACKUP:
 			// read from local and write to remote
+			req->t_read_done = spdk_get_ticks();
 			submit_rw_reqs_remote(req);
 			break;
 		case REQ_ACTION_COPY_RECOVER:
@@ -5265,6 +5290,7 @@ submit_rw_reqs_local(struct spdk_lvs_xfer_req *req)
 		case REQ_ACTION_COPY_BACKUP:
 			// read from local and write to remote
 			// in the transfer's own class when it has one, else the blob's (-1)
+			req->t_read = spdk_get_ticks();
 			spdk_blob_io_read_with_priority(xfer->lvol->blob, md_ch, req->payload, req->offset,
 								req->len, xfer->priority_class ? (int)xfer->priority_class : -1,
 								local_op_comp, req);
@@ -6156,9 +6182,6 @@ xfer_resume_offset(struct spdk_lvs_xfer *xfer, const struct spdk_lvs_xfer_req *d
 	return low;
 }
 
-/* Largest request of a partial transfer: one source read and at most two
- * destination writes (XFER_MAX_WRITE_BYTES) each. */
-#define XFER_PARTIAL_MAX_BYTES	(64 * 1024)
 
 /*
  * Decide whether this task sends dirty ranges instead of whole clusters, and
@@ -6390,8 +6413,10 @@ xfer_replication(struct spdk_lvs_xfer *xfer) {
 					continue;
 				}
 
-				// prepare req
-				memset(req->payload, 0, xfer->page_size * xfer->page_per_cluster);
+				if (!xfer->allow_partial) {
+					// prepare req (a partial task's payloads are 64 KiB)
+					memset(req->payload, 0, xfer->page_size * xfer->page_per_cluster);
+				}
 
 				if (xfer->hold_idx < xfer->num_clusters) {
 					for (uint32_t i = xfer->hold_idx; i < xfer->num_clusters; i++) {
@@ -6408,9 +6433,24 @@ xfer_replication(struct spdk_lvs_xfer *xfer) {
 								count++;
 								break;
 							}
-							/* Sent whole below: every block written,
-							 * zeroes too, so the merge leaves it alone. */
-							req->partial = true;
+						}
+						if (xfer->allow_partial) {
+							/* a whole cluster of a partial task: one range
+							 * over all of it, in 64 KiB pieces like the
+							 * others (the payloads are that size) */
+							xfer->ranges[0].off = 0;
+							xfer->ranges[0].len = xfer->page_per_cluster * xfer->page_size /
+									      SPDK_BLOB_DIRTY_BLOCK_SZ;
+							xfer->num_ranges = 1;
+							xfer->range_pos = 0;
+							xfer->range_done = 0;
+							xfer->range_cluster = i;
+							xfer->lvol->xfer_full_clusters++;
+							is_allocate = true;
+							xfer->hold_idx = i + 1;
+							xfer_enqueue_range_req(xfer, req);
+							count++;
+							break;
 						}
 
 						is_allocate = true;
@@ -7946,6 +7986,12 @@ spdk_lvol_create_backup_task(struct spdk_lvs_xfer *task, struct spdk_transfer_de
 	if (task->type == XFER_MIGRATE_SNAPSHOT) {
 		s_elements_payload = task->page_size * 8; // 8 block per cluster transfer for migration
 	}
+	if (task->allow_partial) {
+		/* every request of a partial task is at most this large, whole
+		 * clusters included: a deep window costs no more memory than a
+		 * shallow one of whole clusters */
+		s_elements_payload = XFER_PARTIAL_MAX_BYTES;
+	}
 
 	task->free_ring  = spdk_ring_create(SPDK_RING_TYPE_MP_MC, task->cluster_batch, SPDK_ENV_SOCKET_ID_ANY);
 	if (!task->free_ring) {
@@ -8030,6 +8076,9 @@ error:
 		free(task->clusters);
 	if (task->chain_s3_ids)
 		free(task->chain_s3_ids);
+	free(task->ranges);
+	free(task->partial);
+	spdk_blob_dirty_gen_unref(task->dirty_gen);
 	free(task);
 	return -ENOMEM;
 }
@@ -8141,6 +8190,12 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
 	lvol->xfer_partial_reqs = 0;
 	lvol->xfer_full_clusters = 0;
 	lvol->xfer_pages_sent = 0;
+	lvol->xfer_stat_reqs = 0;
+	lvol->xfer_stat_bytes = 0;
+	lvol->xfer_stat_read_ticks = 0;
+	lvol->xfer_stat_write_ticks = 0;
+	lvol->xfer_stat_start_ticks = spdk_get_ticks();
+	lvol->xfer_stat_end_ticks = 0;
 
 	// rememeber
 	// if (type == XFER_MIGRATE_SNAPSHOT) {
@@ -8153,17 +8208,19 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
 	lvol->redirect_map_id = lvol_id;
 	lvol->tdev = tdev;
 
-	rc = spdk_lvol_create_backup_task(task, tdev);
-	if (rc != 0) {
-		return rc;
-	}
-
 	/* A resumed transfer skips the allocation step: the destination
 	 * clusters it writes may hold the base's content (CoW of an earlier
 	 * partial attempt) rather than read as zeroes. */
 	task->no_zero_skip = offset != 0 || allow_partial || partial_base != 0;
+	/* Decided before the request buffers are sized: a partial task sends
+	 * every cluster in requests of at most XFER_PARTIAL_MAX_BYTES. */
 	if (allow_partial) {
 		xfer_setup_partial(task, offset, partial_base);
+	}
+
+	rc = spdk_lvol_create_backup_task(task, tdev);
+	if (rc != 0) {
+		return rc;
 	}
 
 	if (task->priority && !task->priority_counted) {

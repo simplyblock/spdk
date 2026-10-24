@@ -712,41 +712,52 @@ xfer_partial_alloc_includes_partial_clusters(void)
 	blob_dirty_gen_free(gen);
 }
 
-/* Whole clusters go as one request; a partial cluster's coalesced ranges go as
- * requests of at most 64 KiB (16 pages), marked partial. */
+/* In a partial task every request is at most 64 KiB (16 pages), marked
+ * partial: a partial cluster's coalesced dirty ranges, and whole clusters as
+ * one range over all of them -- so a deep window costs no more buffer memory
+ * than a shallow one of whole clusters. */
 static void
 xfer_partial_dispatch_splits_ranges(void)
 {
 	const int alloc[3] = {1, 1, 1};
 	struct blob_dirty_gen *gen = make_gen_012();
-	struct spdk_lvs_xfer *xfer = make_partial_xfer(8, 3, alloc, gen);
+	struct spdk_lvs_xfer *xfer = make_partial_xfer(128, 3, alloc, gen);
 	struct spdk_lvs_xfer_req *req;
-	const struct {
+	struct {
 		uint64_t offset, len;
-		bool partial;
-	} want[] = {
-		{0, UT_PPC, false},			/* cluster 0, whole */
-		{UT_PPC + 2, 2, true},			/* 8 KiB at 8 KiB */
-		{UT_PPC + 256, 16, true},		/* 1 MiB: 64 KiB ... */
-		{UT_PPC + 272, 10, true},		/* ... + 40 KiB (13 blocks) */
-		{2 * UT_PPC, UT_PPC, false},		/* cluster 2, whole */
-	};
-	uint32_t n = 0;
+	} want[80];
+	uint32_t nw = 0, n = 0;
+
+	for (uint32_t p = 0; p < UT_PPC; p += 16) {		/* cluster 0, whole */
+		want[nw].offset = p;
+		want[nw++].len = 16;
+	}
+	want[nw].offset = UT_PPC + 2;				/* 8 KiB at 8 KiB */
+	want[nw++].len = 2;
+	want[nw].offset = UT_PPC + 256;				/* 1 MiB: 64 KiB ... */
+	want[nw++].len = 16;
+	want[nw].offset = UT_PPC + 272;				/* ... + 40 KiB */
+	want[nw++].len = 10;
+	for (uint32_t p = 0; p < UT_PPC; p += 16) {		/* cluster 2, whole */
+		want[nw].offset = 2 * UT_PPC + p;
+		want[nw++].len = 16;
+	}
 
 	xfer_classify_partial(xfer);
 	xfer->state = XFER_STATE_TRANSFER_CLUSTERS;
 	xfer_replication(xfer);
 
 	while (spdk_ring_dequeue(xfer->ready_ring, (void **)&req, 1) == 1) {
-		SPDK_CU_ASSERT_FATAL(n < SPDK_COUNTOF(want));
+		SPDK_CU_ASSERT_FATAL(n < nw);
 		CU_ASSERT(req->offset == want[n].offset);
 		CU_ASSERT(req->len == want[n].len);
-		CU_ASSERT(req->partial == want[n].partial);
-		CU_ASSERT(req->len * 4096 <= (want[n].partial ? 64 * 1024 : UT_CLUSTER_SZ));
+		CU_ASSERT(req->partial);
+		CU_ASSERT(req->len * 4096 <= 64 * 1024);
 		n++;
 	}
-	CU_ASSERT(n == SPDK_COUNTOF(want));
-	CU_ASSERT(xfer->idx == SPDK_COUNTOF(want));
+	CU_ASSERT(n == nw);
+	CU_ASSERT(xfer->idx == nw);
+	CU_ASSERT(g_xfer_lvol.xfer_full_clusters == 2);
 
 	free_partial_xfer(xfer);
 	blob_dirty_gen_free(gen);

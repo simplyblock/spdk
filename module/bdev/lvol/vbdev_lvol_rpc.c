@@ -4347,6 +4347,21 @@ rpc_bdev_lvol_transfer_stat(struct spdk_jsonrpc_request *request,
 	}
 	spdk_json_write_named_uint64(w, "offset", lvol->last_offset);
 	spdk_json_write_named_uint64(w, "partial_reqs", lvol->xfer_partial_reqs);
+	{
+		/* where a replication request's time goes: reading the source
+		 * here, and writing to the destination (network + destination) */
+		uint64_t hz = spdk_get_ticks_hz(), n = lvol->xfer_stat_reqs;
+		uint64_t end = lvol->xfer_stat_end_ticks ? lvol->xfer_stat_end_ticks : spdk_get_ticks();
+
+		spdk_json_write_named_uint64(w, "stat_reqs", n);
+		spdk_json_write_named_uint64(w, "stat_bytes", lvol->xfer_stat_bytes);
+		spdk_json_write_named_uint64(w, "stat_read_us_avg",
+					     n ? lvol->xfer_stat_read_ticks * 1000000 / hz / n : 0);
+		spdk_json_write_named_uint64(w, "stat_write_us_avg",
+					     n ? lvol->xfer_stat_write_ticks * 1000000 / hz / n : 0);
+		spdk_json_write_named_uint64(w, "stat_elapsed_ms",
+					     lvol->xfer_stat_start_ticks ? (end - lvol->xfer_stat_start_ticks) * 1000 / hz : 0);
+	}
 	spdk_json_write_named_uint64(w, "full_clusters", lvol->xfer_full_clusters);
 	spdk_json_write_named_uint64(w, "pages_sent", lvol->xfer_pages_sent);
 	spdk_json_write_object_end(w);

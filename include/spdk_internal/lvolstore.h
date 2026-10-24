@@ -267,6 +267,10 @@ struct spdk_lvs_xfer_req {
 	 * NOT written from the base, so a skipped zero block would read the
 	 * base's old data. */
 	bool partial;
+	/* Timing of the request (ticks): source read submitted, read done.
+	 * The write to the destination ends in fragment_write_cb. */
+	uint64_t t_read;
+	uint64_t t_read_done;
 	struct remote_lvol_info *rmt_lvol;
 	struct spdk_lvs_xfer *xfer;
 	TAILQ_ENTRY(spdk_lvs_xfer_req)	entry;
@@ -505,6 +509,18 @@ struct spdk_lvol {
 	struct spdk_blob_merge_stats merge_stats;
 	uint64_t merge_start_ticks;
 	uint64_t merge_ms;
+	/* Transfer timing (dirty-bitmap replication diagnostics; reset when a
+	 * transfer starts, updated from the poll group threads atomically):
+	 * requests completed, bytes written to the destination, summed source
+	 * read and destination write latencies, start and end. The write
+	 * latency is network + destination; the destination's own share is the
+	 * landing bdev's write latency there (bdev_get_iostat). */
+	uint64_t xfer_stat_reqs;
+	uint64_t xfer_stat_bytes;
+	uint64_t xfer_stat_read_ticks;
+	uint64_t xfer_stat_write_ticks;
+	uint64_t xfer_stat_start_ticks;
+	uint64_t xfer_stat_end_ticks;
 	uint64_t xfer_partial_reqs;
 	uint64_t xfer_full_clusters;
 	uint64_t xfer_pages_sent;
