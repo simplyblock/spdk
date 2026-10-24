@@ -1117,6 +1117,7 @@ raid_bdev_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_i
 			raid_bdev_io_complete(raid_io, SPDK_BDEV_IO_STATUS_FAILED);
 			return;
 		}
+		raid_io->copy_src_offset_blocks = bdev_io->u.bdev.copy.src_offset_blocks & MASK_OUT_USED_BITS;
 		raid_io->raid_bdev->module->submit_copy_request(raid_io);
 		break;
 

@@ -52,6 +52,7 @@ DEFINE_STUB(spdk_bdev_copy_blocks, int,
 	    (struct spdk_bdev_desc *desc, struct spdk_io_channel *ch, uint64_t dst_offset_blocks,
 	     uint64_t src_offset_blocks, uint64_t num_blocks, spdk_bdev_io_completion_cb cb,
 	     void *cb_arg), 0);
+DEFINE_STUB(spdk_bdev_get_copy_domain, uint32_t, (struct spdk_bdev *bdev, uint64_t offset_blocks), 0);
 
 struct spdk_bdev {
 	char name[16];
