@@ -184,10 +184,9 @@ _raid0_submit_copy_request(void *_raid_io)
 static void
 raid0_submit_copy_request(struct raid_bdev_io *raid_io)
 {
-	struct spdk_bdev_io		*bdev_io = spdk_bdev_io_from_ctx(raid_io);
 	struct raid_bdev		*raid_bdev = raid_io->raid_bdev;
 	uint64_t			dst = raid_io->offset_blocks;
-	uint64_t			src = bdev_io->u.bdev.copy.src_offset_blocks & MASK_OUT_USED_BITS;
+	uint64_t			src = raid_io->copy_src_offset_blocks;
 	uint64_t			num_blocks = raid_io->num_blocks;
 	uint64_t			dst_strip, src_strip;
 	uint64_t			dst_pd_lba, src_pd_lba;

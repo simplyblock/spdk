@@ -138,6 +138,8 @@ struct raid_bdev_io {
 
 	struct raid_io_used_bits used_bits;
 	uint64_t offset_blocks;
+	/* COPY only: source offset, without the used bits */
+	uint64_t copy_src_offset_blocks;
 	uint64_t num_blocks;
 	struct iovec *iovs;
 	int iovcnt;
