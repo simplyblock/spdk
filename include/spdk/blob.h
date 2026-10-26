@@ -379,8 +379,14 @@ struct spdk_bs_opts {
 	/** Blobstore type */
 	struct spdk_bs_type bstype;
 
-	/* Hole at bytes 36-39. */
-	uint8_t reserved36[4];
+	/**
+	 * Create the metadata journal (torn-write protection) on spdk_bs_init().
+	 * Load and examine take it from the super block, not from this option.
+	 */
+	bool md_journal;
+
+	/* Hole at bytes 37-39. */
+	uint8_t reserved37[3];
 
 	/** Callback function to invoke for each blob. */
 	spdk_blob_op_with_handle_complete iter_cb_fn;

@@ -258,6 +258,15 @@ vbdev_lvs_create(const char *base_bdev_name, const char *name, uint32_t cluster_
 		 enum lvs_clear_method clear_method, uint32_t num_md_pages_per_cluster_ratio,
 		 spdk_lvs_op_with_handle_complete cb_fn, void *cb_arg)
 {
+	return vbdev_lvs_create_ext(base_bdev_name, name, cluster_sz, clear_method,
+				    num_md_pages_per_cluster_ratio, false, cb_fn, cb_arg);
+}
+
+int
+vbdev_lvs_create_ext(const char *base_bdev_name, const char *name, uint32_t cluster_sz,
+		     enum lvs_clear_method clear_method, uint32_t num_md_pages_per_cluster_ratio,
+		     bool md_journal, spdk_lvs_op_with_handle_complete cb_fn, void *cb_arg)
+{
 	struct spdk_bs_dev *bs_dev;
 	struct spdk_lvs_with_handle_req *lvs_req;
 	struct spdk_lvs_opts opts;
@@ -281,6 +290,8 @@ vbdev_lvs_create(const char *base_bdev_name, const char *name, uint32_t cluster_
 	if (num_md_pages_per_cluster_ratio != 0) {
 		opts.num_md_pages_per_cluster_ratio = num_md_pages_per_cluster_ratio;
 	}
+
+	opts.md_journal = md_journal;
 
 	if (name == NULL) {
 		SPDK_ERRLOG("missing name param\n");

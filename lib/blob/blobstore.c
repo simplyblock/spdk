@@ -5384,6 +5384,7 @@ spdk_bs_opts_init(struct spdk_bs_opts *opts, size_t opts_size)
 
 	SET_FIELD(iter_cb_fn, NULL);
 	SET_FIELD(iter_cb_arg, NULL);
+	SET_FIELD(md_journal, false);
 	SET_FIELD(force_recover, false);
 	SET_FIELD(esnap_bs_dev_create, NULL);
 	SET_FIELD(esnap_ctx, NULL);
@@ -6077,8 +6078,11 @@ bs_load_iter_on_examine_cpl(void *cb_arg, int bserrno)
 finish:
 	SPDK_NOTICELOG("Parallel examine blob loading done, rc=%d\n", master->rc);
 
-	bs_md_journal_examine_complete(master->bs->md_journal);
-	bs_md_journal_start(master->bs->md_journal);
+	/* A blobstore created without the md journal has none to start. */
+	if (master->bs->md_journal != NULL) {
+		bs_md_journal_examine_complete(master->bs->md_journal);
+		bs_md_journal_start(master->bs->md_journal);
+	}
 
 	free(master->master_worker);
 	master->master_worker = NULL;
@@ -7080,6 +7084,7 @@ bs_opts_copy(struct spdk_bs_opts *src, struct spdk_bs_opts *dst)
 	if (FIELD_OK(bstype)) {
 		memcpy(&dst->bstype, &src->bstype, sizeof(dst->bstype));
 	}
+	SET_FIELD(md_journal);
 	SET_FIELD(iter_cb_fn);
 	SET_FIELD(iter_cb_arg);
 	SET_FIELD(force_recover);
@@ -7107,6 +7112,7 @@ bs_opts_print(struct spdk_bs_opts *opts)
 	SPDK_NOTICELOG("  max_md_ops: %u\n", opts->max_md_ops);
 	SPDK_NOTICELOG("  max_channel_ops: %u\n", opts->max_channel_ops);
 	SPDK_NOTICELOG("  clear_method: %u\n", opts->clear_method);
+	SPDK_NOTICELOG("  md_journal: %d\n", opts->md_journal);
 	return 0;
 }
 
@@ -8060,7 +8066,7 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	 * up to the nearest page, plus a header.
 	 */
 	/* Torn-write protection: if the user requested a metadata journal, create it now. */
-	if (/*opts.md_journal*/1) {
+	if (opts.md_journal) {
 		ctx->super->used_md_journal = 1;
 		ctx->super->md_journal_mask_start = num_md_pages;
 		ctx->super->md_journal_mask_len = spdk_divide_round_up(ctx->super->md_journal_element_size * ctx->super->md_journal_elements,

@@ -41,6 +41,7 @@ struct rpc_bdev_lvol_create_lvstore {
 	uint32_t cluster_sz;
 	char *clear_method;
 	uint32_t num_md_pages_per_cluster_ratio;
+	bool md_journal;
 };
 
 static int
@@ -87,6 +88,7 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_create_lvstore_decode
 	{"lvs_name", offsetof(struct rpc_bdev_lvol_create_lvstore, lvs_name), spdk_json_decode_string},
 	{"clear_method", offsetof(struct rpc_bdev_lvol_create_lvstore, clear_method), spdk_json_decode_string, true},
 	{"num_md_pages_per_cluster_ratio", offsetof(struct rpc_bdev_lvol_create_lvstore, num_md_pages_per_cluster_ratio), spdk_json_decode_uint32, true},
+	{"md_journal", offsetof(struct rpc_bdev_lvol_create_lvstore, md_journal), spdk_json_decode_bool, true},
 };
 
 static void
@@ -141,8 +143,9 @@ rpc_bdev_lvol_create_lvstore(struct spdk_jsonrpc_request *request,
 		clear_method = LVS_CLEAR_WITH_UNMAP;
 	}
 
-	rc = vbdev_lvs_create(req.bdev_name, req.lvs_name, req.cluster_sz, clear_method,
-			      req.num_md_pages_per_cluster_ratio, rpc_lvol_store_construct_cb, request);
+	rc = vbdev_lvs_create_ext(req.bdev_name, req.lvs_name, req.cluster_sz, clear_method,
+				  req.num_md_pages_per_cluster_ratio, req.md_journal,
+				  rpc_lvol_store_construct_cb, request);
 	if (rc < 0) {
 		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
 		goto cleanup;

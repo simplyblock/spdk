@@ -5,7 +5,7 @@
 
 
 def bdev_lvol_create_lvstore(client, bdev_name, lvs_name, cluster_sz=None,
-                             clear_method=None, num_md_pages_per_cluster_ratio=None):
+                             clear_method=None, num_md_pages_per_cluster_ratio=None, md_journal=False):
     """Construct a logical volume store.
 
     Args:
@@ -14,11 +14,12 @@ def bdev_lvol_create_lvstore(client, bdev_name, lvs_name, cluster_sz=None,
         cluster_sz: cluster size of the logical volume store in bytes (optional)
         clear_method: Change clear method for data region. Available: none, unmap, write_zeroes (optional)
         num_md_pages_per_cluster_ratio: metadata pages per cluster (optional)
+        md_journal: True to create the metadata journal (torn-write protection) (optional)
 
     Returns:
         UUID of created logical volume store.
     """
-    params = {'bdev_name': bdev_name, 'lvs_name': lvs_name}
+    params = {'bdev_name': bdev_name, 'lvs_name': lvs_name, 'md_journal': md_journal}
     if cluster_sz:
         params['cluster_sz'] = cluster_sz
     if clear_method:

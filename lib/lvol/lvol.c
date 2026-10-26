@@ -852,12 +852,13 @@ lvs_opts_copy(const struct spdk_lvs_opts *src, struct spdk_lvs_opts *dst)
 	SET_FIELD(num_md_pages_per_cluster_ratio);
 	SET_FIELD(opts_size);
 	SET_FIELD(esnap_bs_dev_create);
+	SET_FIELD(md_journal);
 
 	dst->opts_size = src->opts_size;
 
 	/* You should not remove this statement, but need to update the assert statement
 	 * if you add a new field, and also add a corresponding SET_FIELD statement */
-	SPDK_STATIC_ASSERT(sizeof(struct spdk_lvs_opts) == 88, "Incorrect size");
+	SPDK_STATIC_ASSERT(sizeof(struct spdk_lvs_opts) == 96, "Incorrect size");
 
 #undef FIELD_OK
 #undef SET_FIELD
@@ -887,6 +888,7 @@ print_lvs_opts(struct spdk_lvs_opts *o)
 	SPDK_NOTICELOG("  cluster_sz: %u\n", o->cluster_sz);
 	SPDK_NOTICELOG("  clear_method: %d\n", o->clear_method);
 	SPDK_NOTICELOG("  num_md_pages_per_cluster_ratio: %u\n", o->num_md_pages_per_cluster_ratio);
+	SPDK_NOTICELOG("  md_journal: %d\n", o->md_journal);
 }
 
 int
@@ -932,6 +934,8 @@ spdk_lvs_init(struct spdk_bs_dev *bs_dev, struct spdk_lvs_opts *o,
 	}
 
 	setup_lvs_opts(&opts, o, total_clusters, lvs);
+	/* From the copy: o may be from a caller built before md_journal existed. */
+	opts.md_journal = lvs_opts.md_journal;
 
 	if (strnlen(lvs_opts.name, SPDK_LVS_NAME_MAX) == SPDK_LVS_NAME_MAX) {
 		SPDK_ERRLOG("Name has no null terminator.\n");

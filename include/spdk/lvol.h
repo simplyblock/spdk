@@ -71,8 +71,16 @@ struct spdk_lvs_opts {
 	 * is being loaded, the lvolstore will not support external snapshots.
 	 */
 	spdk_bs_esnap_dev_create esnap_bs_dev_create;
+
+	/**
+	 * Create the metadata journal (torn-write protection) with the lvolstore.
+	 * Used by spdk_lvs_init() only; load and examine take it from the super block.
+	 */
+	bool			md_journal;
+
+	uint8_t			reserved89[7];
 } __attribute__((packed));
-SPDK_STATIC_ASSERT(sizeof(struct spdk_lvs_opts) == 88, "Incorrect size");
+SPDK_STATIC_ASSERT(sizeof(struct spdk_lvs_opts) == 96, "Incorrect size");
 
 /**
  * Initialize an spdk_lvs_opts structure to the defaults.
