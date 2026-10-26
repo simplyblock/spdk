@@ -794,6 +794,34 @@ md_journal_process_waiting(struct spdk_bs_md_journal *jr)
 	return work;
 }
 
+/*
+ * Fail every request still waiting for a journal slot with -EIO. They were
+ * queued while this node was leader; once leadership is lost they must never
+ * be written, a later leader has changed the same pages since. The callers
+ * undo their in-memory change on the error.
+ */
+static void
+md_journal_fail_waiting(struct spdk_bs_md_journal *jr, const char *why)
+{
+	struct md_journal_wait_req *waiting_req;
+	uint32_t count = 0;
+
+	while ((waiting_req = TAILQ_FIRST(&jr->wait_queue)) != NULL) {
+		TAILQ_REMOVE(&jr->wait_queue, waiting_req, link);
+		if (waiting_req->type == MD_JOURNAL_WAIT_SINGLE) {
+			md_journal_terminate_waiting_single(waiting_req);
+		} else {
+			md_journal_terminate_batch(waiting_req->batch);
+		}
+		free(waiting_req);
+		count++;
+	}
+
+	if (count != 0) {
+		SPDK_ERRLOG("md_journal: %u queued requests failed with -EIO (%s)\n", count, why);
+	}
+}
+
 static void
 md_journal_complete_home_waiters(struct spdk_bs_md_journal *jr, int rc)
 {
@@ -2639,21 +2667,15 @@ bs_md_journal_reset(struct spdk_bs_md_journal *jr)
 
 
 
-	/*
-	 * Requests in wait_queue have no element and no seq yet; they were
-	 * queued while the recovery ran and are admitted by the poller with
-	 * the new generation.
-	 */
 	md_journal_complete_home_waiters(jr, 0);
-	// /*
-	//  * There must not be requests waiting for journal slots.
-	//  * The caller must stop admission before performing the
-	//  * update/failover scan and reset.
-	//  */
-	// if (!TAILQ_EMPTY(&jr->wait_queue)) {
-	// 	SPDK_ERRLOG("Cannot reset MD journal: wait queue is not empty\n");
-	// 	return -EBUSY;
-	// }
+
+	/*
+	 * Requests in wait_queue were queued before this recovery: a paused
+	 * journal rejects new writes, and recovery runs paused. They hold
+	 * page contents from before the last leadership change, so admitting
+	 * them now would write old pages over newer ones. Fail them instead.
+	 */
+	md_journal_fail_waiting(jr, "stale at journal reset");
 
 	/*
 	 * At this point recovery/update must already have processed
@@ -2883,6 +2905,8 @@ md_journal_pause_msg(void *arg)
 	/* 0 -> 0 set-leader call after an examine: the examine result is not needed. */
 	md_journal_examine_drop(jr, "not leader");
 	md_journal_complete_home_waiters(jr, -EIO);
+	/* The drain poller is idle while paused, so fail the queued writes here. */
+	md_journal_fail_waiting(jr, "leadership lost");
 }
 
 /*
