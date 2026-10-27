@@ -6498,6 +6498,11 @@ xfer_refill_inline(struct spdk_lvs_xfer_req *req)
 	struct spdk_lvs_xfer *xfer = req->xfer;
 	struct remote_lvol_info *rmt = req->rmt_lvol;
 	bool next;
+	/* TEST (bisect of the alceml stuck IO): no in-place refill, every
+	 * completion goes back through the dispatcher as before 9dc425e79. */
+	if (1) {
+		return false;
+	}
 
 	if (xfer == NULL || xfer->type != XFER_REPLICATE_SNAPSHOT ||
 		req->action != REQ_ACTION_COPY_BACKUP || rmt == NULL || !rmt->status) {
@@ -8225,8 +8230,7 @@ spdk_lvol_create_backup_task(struct spdk_lvs_xfer *task, struct spdk_transfer_de
 		rmt_lvol->type = task->type;
 		rmt_lvol->xfer_task = task;
 		if (task->type == XFER_REPLICATE_SNAPSHOT) {
-			rmt_lvol->window_share = spdk_divide_round_up(task->cluster_batch,
-						spdk_max(g_lvs_num_pgs, 1));
+			rmt_lvol->window_share = 0;	/* TEST: no per-group share */
 		}
 		rmt_lvol->group = lpg;
 		spdk_thread_send_msg(lpg->thread, spdk_lvs_add_rmt_bdev_to_poll_group, rmt_lvol);
