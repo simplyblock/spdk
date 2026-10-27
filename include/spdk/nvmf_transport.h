@@ -132,7 +132,7 @@ struct spdk_nvmf_request {
 	uint32_t			orig_nsid;
 	STAILQ_ENTRY(spdk_nvmf_request)	reservation_link;
 };
-SPDK_STATIC_ASSERT(sizeof(struct spdk_nvmf_request) == 824, "Incorrect size");
+SPDK_STATIC_ASSERT(sizeof(struct spdk_nvmf_request) == 832, "Incorrect size");
 
 enum spdk_nvmf_qpair_state {
 	SPDK_NVMF_QPAIR_UNINITIALIZED = 0,

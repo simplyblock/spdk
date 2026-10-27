@@ -1257,6 +1257,7 @@ bdev_io_wait_test(void)
 
 	io_wait_entry.entry.bdev = bdev;
 	io_wait_entry.entry.cb_fn = io_wait_cb;
+	io_wait_entry.entry.dep_unblock = false;
 	io_wait_entry.entry.cb_arg = &io_wait_entry;
 	io_wait_entry.io_ch = io_ch;
 	io_wait_entry.desc = desc;
@@ -1281,6 +1282,31 @@ bdev_io_wait_test(void)
 	stub_complete_io(1);
 	CU_ASSERT(g_bdev_ut_channel->outstanding_io_count == 4);
 	CU_ASSERT(io_wait_entry2.submitted == true);
+
+	io_wait_entry.entry.dep_unblock = true;
+	io_wait_entry.submitted = false;
+	io_wait_entry2.entry.dep_unblock = true;
+	io_wait_entry2.submitted = false;
+
+	/*
+	 * Queue two I/O waits, test the order in which the IO requests
+	 * inserted at the head are dequeued.
+	 */
+	rc = spdk_bdev_queue_io_wait(bdev, io_ch, &io_wait_entry.entry);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(io_wait_entry.submitted == false);
+	rc = spdk_bdev_queue_io_wait(bdev, io_ch, &io_wait_entry2.entry);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(io_wait_entry2.submitted == false);
+
+	stub_complete_io(1);
+	CU_ASSERT(g_bdev_ut_channel->outstanding_io_count == 4);
+	CU_ASSERT(io_wait_entry2.submitted == true);
+	CU_ASSERT(io_wait_entry.submitted == false);
+
+	stub_complete_io(1);
+	CU_ASSERT(g_bdev_ut_channel->outstanding_io_count == 4);
+	CU_ASSERT(io_wait_entry.submitted == true);
 
 	stub_complete_io(4);
 	CU_ASSERT(g_bdev_ut_channel->outstanding_io_count == 0);
