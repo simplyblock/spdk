@@ -206,6 +206,8 @@ struct md_journal_wait_req {
 	spdk_bs_sequence_cpl cb_fn;
 	void *cb_arg;
 	struct md_journal_batch *batch;
+	/* When it was queued; for the full-journal prints. */
+	uint64_t queued_tsc;
 	TAILQ_ENTRY(md_journal_wait_req) link;
 };
 
@@ -306,6 +308,32 @@ struct spdk_bs_md_journal {
 	* there are not enough FREE journal elements.
 	*/
 	bool force_home_drain;
+
+	/*
+	* Full-journal prints (ticks, 0 = not set). A full period starts when
+	* the wait_queue head finds too few free slots and ends when the
+	* wait_queue is empty again.
+	*/
+	uint64_t full_start_tsc;
+	uint64_t full_log_tsc;		/* last full print */
+	uint32_t full_admitted;		/* requests admitted during the period */
+	uint64_t full_max_wait_tsc;	/* longest wait of an admitted request */
+	uint32_t full_slots_freed;	/* by ZERO during the period */
+
+	/* HOME/ZERO batches done since the last full print. */
+	uint32_t iv_home_n;
+	uint32_t iv_home_slots;
+	uint64_t iv_home_sum_tsc;
+	uint64_t iv_home_max_tsc;
+	uint32_t iv_zero_n;
+	uint32_t iv_zero_slots;
+	uint64_t iv_zero_sum_tsc;
+	uint64_t iv_zero_max_tsc;
+
+	uint64_t home_start_tsc;	/* active HOME batch */
+	uint64_t zero_start_tsc;	/* active ZERO batch, phase 1 */
+	uint64_t zero_phase2_tsc;	/* active ZERO batch, phase 2 (0 = still phase 1) */
+	uint32_t zero_superseded;	/* active ZERO batch, phase 1 slots */
 
 	uint32_t free_count;
 

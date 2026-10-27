@@ -4,6 +4,7 @@
 #include "spdk/crc32.h"
 #include "spdk/queue.h"
 #include "spdk/log.h"
+#include "spdk/env.h"
 
 #define JM_CRC32C_INITIAL 0xffffffffUL
 
@@ -715,12 +716,95 @@ md_journal_submit_batch(struct md_journal_batch *batch)
 	bs_batch_close(io_batch);
 }
 
+/* A HOME or ZERO batch slower than this is printed, full journal or not. */
+#define MD_JOURNAL_SLOW_BATCH_MS	100
+
+static double
+md_journal_tsc_ms(uint64_t tsc)
+{
+	return (double)tsc * 1000.0 / spdk_get_ticks_hz();
+}
+
+static uint32_t
+md_journal_elem_queue_len(struct md_journal_elem_queue *queue)
+{
+	struct md_journal_elem *elem;
+	uint32_t n = 0;
+
+	TAILQ_FOREACH(elem, queue, link) {
+		n++;
+	}
+	return n;
+}
+
+/*
+ * Where the slots are while the journal is full, and the HOME/ZERO batches
+ * done since the last print. Called once a second at most.
+ */
+static void
+md_journal_full_print(struct spdk_bs_md_journal *jr, const char *what, uint32_t needed, uint64_t now)
+{
+	struct md_journal_wait_req *req;
+	uint32_t wait_reqs = 0, wait_slots = 0;
+
+	TAILQ_FOREACH(req, &jr->wait_queue, link) {
+		wait_reqs++;
+		wait_slots += req->type == MD_JOURNAL_WAIT_BATCH ? req->batch->count : 1;
+	}
+
+	SPDK_NOTICELOG("md_journal: %s for %.1f ms: head needs %u, free=%u, waiting reqs=%u slots=%u "
+		       "head_wait=%.1f ms | journal_inflight=%u reorder=%u home_queue=%u zero_queue=%u | "
+		       "HOME active=%d slots=%u for %.1f ms | ZERO active=%d slots=%u phase=%d for %.1f ms\n",
+		       what, md_journal_tsc_ms(now - jr->full_start_tsc), needed, jr->free_count,
+		       wait_reqs, wait_slots, md_journal_tsc_ms(now - TAILQ_FIRST(&jr->wait_queue)->queued_tsc),
+		       jr->journal_inflight, md_journal_elem_queue_len(&jr->reorder_queue),
+		       md_journal_elem_queue_len(&jr->home_queue), md_journal_elem_queue_len(&jr->zero_queue),
+		       jr->active_drain_batch, jr->active_drain_batch ? jr->drain_batch->elem_count : 0,
+		       jr->active_drain_batch ? md_journal_tsc_ms(now - jr->home_start_tsc) : 0.0,
+		       jr->active_zero_batch, jr->active_zero_batch ? jr->zero_batch->elem_count : 0,
+		       jr->active_zero_batch ? (jr->zero_phase2_tsc ? 2 : 1) : 0,
+		       jr->active_zero_batch ? md_journal_tsc_ms(now - jr->zero_start_tsc) : 0.0);
+
+	SPDK_NOTICELOG("md_journal: %s, batches done in the last %.1f ms: HOME n=%u slots=%u avg=%.1f "
+		       "max=%.1f ms | ZERO n=%u slots=%u avg=%.1f max=%.1f ms\n", what,
+		       md_journal_tsc_ms(now - jr->full_log_tsc), jr->iv_home_n, jr->iv_home_slots,
+		       jr->iv_home_n ? md_journal_tsc_ms(jr->iv_home_sum_tsc / jr->iv_home_n) : 0.0,
+		       md_journal_tsc_ms(jr->iv_home_max_tsc), jr->iv_zero_n, jr->iv_zero_slots,
+		       jr->iv_zero_n ? md_journal_tsc_ms(jr->iv_zero_sum_tsc / jr->iv_zero_n) : 0.0,
+		       md_journal_tsc_ms(jr->iv_zero_max_tsc));
+
+	jr->full_log_tsc = now;
+	jr->iv_home_n = 0;
+	jr->iv_home_slots = 0;
+	jr->iv_home_sum_tsc = 0;
+	jr->iv_home_max_tsc = 0;
+	jr->iv_zero_n = 0;
+	jr->iv_zero_slots = 0;
+	jr->iv_zero_sum_tsc = 0;
+	jr->iv_zero_max_tsc = 0;
+}
+
+static void
+md_journal_full_end(struct spdk_bs_md_journal *jr)
+{
+	if (jr->full_start_tsc == 0 || !TAILQ_EMPTY(&jr->wait_queue)) {
+		return;
+	}
+
+	SPDK_NOTICELOG("md_journal: FULL end after %.1f ms: admitted=%u max_wait=%.1f ms "
+		       "slots_freed=%u free=%u\n", md_journal_tsc_ms(spdk_get_ticks() - jr->full_start_tsc),
+		       jr->full_admitted, md_journal_tsc_ms(jr->full_max_wait_tsc), jr->full_slots_freed,
+		       jr->free_count);
+	jr->full_start_tsc = 0;
+}
+
 static bool
 md_journal_process_waiting(struct spdk_bs_md_journal *jr)
 {
 	struct md_journal_wait_req *waiting_req;
 	uint32_t needed;
 	bool work = false;
+	uint64_t now;
 
 	while ((waiting_req = TAILQ_FIRST(&jr->wait_queue)) != NULL) {
 		switch (waiting_req->type) {
@@ -767,15 +851,27 @@ md_journal_process_waiting(struct spdk_bs_md_journal *jr)
 			 * We need journal elements back as quickly as
 			 * possible.
 			 */
-			if (!jr->force_home_drain) {
-				SPDK_NOTICELOG("md_journal: queue head waits for free slots: needed=%u free=%u "
-					       "- forcing HOME drain\n", needed, jr->free_count);
+			now = spdk_get_ticks();
+			if (jr->full_start_tsc == 0) {
+				jr->full_start_tsc = now;
+				jr->full_admitted = 0;
+				jr->full_max_wait_tsc = 0;
+				jr->full_slots_freed = 0;
+				md_journal_full_print(jr, "FULL start", needed, now);
+			} else if (now - jr->full_log_tsc >= spdk_get_ticks_hz()) {
+				md_journal_full_print(jr, "FULL still", needed, now);
 			}
 			jr->force_home_drain = true;
 			break;
 		}
 
 		TAILQ_REMOVE(&jr->wait_queue, waiting_req, link);
+
+		if (jr->full_start_tsc != 0) {
+			jr->full_admitted++;
+			jr->full_max_wait_tsc = spdk_max(jr->full_max_wait_tsc,
+							 spdk_get_ticks() - waiting_req->queued_tsc);
+		}
 
 		MDJ_IO_NOTICELOG("md_journal: admitting queued %s request: needed=%u free=%u\n",
 				 waiting_req->type == MD_JOURNAL_WAIT_SINGLE ? "single" : "batch",
@@ -790,6 +886,8 @@ md_journal_process_waiting(struct spdk_bs_md_journal *jr)
 		free(waiting_req);
 		work = true;
 	}
+
+	md_journal_full_end(jr);
 
 	return work;
 }
@@ -976,6 +1074,7 @@ bs_md_journal_write(struct spdk_bs_md_journal *jr, spdk_bs_sequence_t *seq, void
 	req->cb_fn = cb_fn;
 	req->cb_arg = cb_arg;
 	req->journal = jr;
+	req->queued_tsc = spdk_get_ticks();
 
 	TAILQ_INSERT_TAIL(&jr->wait_queue, req, link);
 }
@@ -1183,6 +1282,7 @@ bs_md_journal_batch_close(struct md_journal_batch *batch)
 
 		req->type = MD_JOURNAL_WAIT_BATCH;
 		req->batch = batch;
+		req->queued_tsc = spdk_get_ticks();
 		TAILQ_INSERT_TAIL(&jr->wait_queue, req, link);
 
 		/*
@@ -1291,6 +1391,7 @@ spdk_md_journal_batch_drain_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserr
 	struct spdk_bs_md_journal *jr = cb_arg;
 	struct md_journal_drain_batch *drain_batch = jr->drain_batch;
 	struct md_journal_elem *elem;
+	uint64_t home_tsc;
 	uint32_t i;
 
 	jr->active_drain_batch = false;
@@ -1330,6 +1431,17 @@ spdk_md_journal_batch_drain_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserr
 		         jr->home_durable_seq);
 
 	md_journal_process_home_waiters(jr);
+
+	home_tsc = spdk_get_ticks() - jr->home_start_tsc;
+	jr->iv_home_n++;
+	jr->iv_home_slots += drain_batch->elem_count;
+	jr->iv_home_sum_tsc += home_tsc;
+	jr->iv_home_max_tsc = spdk_max(jr->iv_home_max_tsc, home_tsc);
+	if (md_journal_tsc_ms(home_tsc) >= MD_JOURNAL_SLOW_BATCH_MS) {
+		SPDK_NOTICELOG("md_journal: slow HOME batch: slots=%u in %.1f ms, free=%u full=%d\n",
+			       drain_batch->elem_count, md_journal_tsc_ms(home_tsc), jr->free_count,
+			       jr->full_start_tsc != 0);
+	}
 
 	/*
 	 * All HOME writes in this blobstore batch are durable now.
@@ -1486,6 +1598,7 @@ md_journal_start_drain_batch(struct spdk_bs_md_journal *jr, bool force)
 		         batch->items[batch->elem_count - 1]->seq, force, TAILQ_EMPTY(&jr->home_queue));
 
 	jr->active_drain_batch = true;
+	jr->home_start_tsc = spdk_get_ticks();
 
 	/*
 	 * Next step:
@@ -1519,6 +1632,7 @@ spdk_md_journal_submit_zeroes_v2_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int 
 	struct md_journal_drain_batch *zero_batch = cb_arg;
 	struct spdk_bs_md_journal *jr = zero_batch->journal;
 	struct md_journal_elem *elem;
+	uint64_t now, zero_tsc;
 	uint32_t i;
 
 	jr->active_zero_batch = false;
@@ -1565,6 +1679,26 @@ spdk_md_journal_submit_zeroes_v2_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int 
 
 		md_journal_put_free_elem(jr, elem);
 	}
+
+	now = spdk_get_ticks();
+	zero_tsc = now - jr->zero_start_tsc;
+	jr->iv_zero_n++;
+	jr->iv_zero_slots += zero_batch->elem_count;
+	jr->iv_zero_sum_tsc += zero_tsc;
+	jr->iv_zero_max_tsc = spdk_max(jr->iv_zero_max_tsc, zero_tsc);
+	if (jr->full_start_tsc != 0) {
+		jr->full_slots_freed += zero_batch->elem_count;
+	}
+	if (md_journal_tsc_ms(zero_tsc) >= MD_JOURNAL_SLOW_BATCH_MS) {
+		SPDK_NOTICELOG("md_journal: slow ZERO batch: slots=%u in %.1f ms (phase 1: %u slots %.1f ms, "
+			       "phase 2: %u slots %.1f ms), free=%u full=%d\n", zero_batch->elem_count,
+			       md_journal_tsc_ms(zero_tsc), jr->zero_superseded,
+			       md_journal_tsc_ms(jr->zero_phase2_tsc - jr->zero_start_tsc),
+			       zero_batch->elem_count - jr->zero_superseded,
+			       md_journal_tsc_ms(now - jr->zero_phase2_tsc), jr->free_count,
+			       jr->full_start_tsc != 0);
+	}
+
 	memset(zero_batch->items, 0, sizeof(zero_batch->items));
 	zero_batch->elem_count = 0;
 }
@@ -1615,6 +1749,7 @@ spdk_md_journal_submit_zeroes_v1_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int 
 		return;
 	}
 
+	jr->zero_phase2_tsc = spdk_get_ticks();
 	batch = bs_sequence_to_batch(jr->zero_seq, 0, spdk_md_journal_submit_zeroes_v2_cpl, zero_batch);
 	
 	for (uint32_t i = 0; i < zero_batch->elem_count; i++) {
@@ -1694,6 +1829,7 @@ spdk_md_journal_submit_zeroes(struct spdk_bs_md_journal *jr)
 
 	md_journal_mark_latest(zero_batch);
 
+	jr->zero_start_tsc = spdk_get_ticks();
 	batch = bs_sequence_to_batch(jr->zero_seq, 0, spdk_md_journal_submit_zeroes_v1_cpl, zero_batch);
 	for (uint32_t i = 0; i < zero_batch->elem_count; i++) {
 		elem = zero_batch->items[i];
@@ -1714,6 +1850,8 @@ spdk_md_journal_submit_zeroes(struct spdk_bs_md_journal *jr)
 		         zero_batch->elem_count, superseded, zero_batch->elem_count - superseded);
 
 	jr->active_zero_batch = true;
+	jr->zero_superseded = superseded;
+	jr->zero_phase2_tsc = 0;
 
 	bs_batch_close(batch);
 	return 0;
@@ -2738,6 +2876,7 @@ bs_md_journal_reset(struct spdk_bs_md_journal *jr)
 	jr->active_drain_batch = false;
 	jr->active_zero_batch = false;
 	jr->force_home_drain = false;
+	jr->full_start_tsc = 0;
 
 	/*
 	 * Clear the fatal HOME/ZERO error state so metadata journaling
