@@ -340,6 +340,12 @@ bdev_blob_unmap(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, uint64
 	}
 }
 
+static uint32_t
+bdev_blob_get_copy_domain(struct spdk_bs_dev *dev, uint64_t lba)
+{
+	return spdk_bdev_get_copy_domain(__get_bdev(dev), lba);
+}
+
 static void
 bdev_blob_copy(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	       uint64_t dst_lba, uint64_t src_lba, uint64_t lba_count,
@@ -589,6 +595,7 @@ blob_bdev_init(struct blob_bdev *b, struct spdk_bdev_desc *desc)
 	b->bs_dev.unmap = bdev_blob_unmap;
 	if (spdk_bdev_io_type_supported(bdev, SPDK_BDEV_IO_TYPE_COPY)) {
 		b->bs_dev.copy = bdev_blob_copy;
+		b->bs_dev.get_copy_domain = bdev_blob_get_copy_domain;
 	}
 	b->bs_dev.get_base_bdev = bdev_blob_get_base_bdev;
 	b->bs_dev.is_zeroes = bdev_blob_is_zeroes;

@@ -1110,6 +1110,15 @@ raid_bdev_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_i
 		raid_io->raid_bdev->module->submit_null_payload_request(raid_io);
 		break;
 
+	case SPDK_BDEV_IO_TYPE_COPY:
+		if (raid_io->raid_bdev->process != NULL) {
+			raid_bdev_io_complete(raid_io, SPDK_BDEV_IO_STATUS_FAILED);
+			return;
+		}
+		raid_io->copy_src_offset_blocks = bdev_io->u.bdev.copy.src_offset_blocks & MASK_OUT_USED_BITS;
+		raid_io->raid_bdev->module->submit_copy_request(raid_io);
+		break;
+
 	case SPDK_BDEV_IO_TYPE_UNMAP:
 		if (raid_io->raid_bdev->process != NULL) {
 			/* TODO: rebuild support */
@@ -1156,6 +1165,10 @@ _raid_bdev_io_type_supported(struct raid_bdev *raid_bdev, enum spdk_bdev_io_type
 		}
 	}
 
+	if (io_type == SPDK_BDEV_IO_TYPE_COPY && raid_bdev->module->submit_copy_request == NULL) {
+		return false;
+	}
+
 	RAID_FOR_EACH_BASE_BDEV(raid_bdev, base_info) {
 		if (base_info->desc == NULL) {
 			continue;
@@ -1192,6 +1205,7 @@ raid_bdev_io_type_supported(void *ctx, enum spdk_bdev_io_type io_type)
 	case SPDK_BDEV_IO_TYPE_FLUSH:
 	case SPDK_BDEV_IO_TYPE_RESET:
 	case SPDK_BDEV_IO_TYPE_UNMAP:
+	case SPDK_BDEV_IO_TYPE_COPY:
 		return _raid_bdev_io_type_supported(ctx, io_type);
 
 	default:
@@ -1199,6 +1213,23 @@ raid_bdev_io_type_supported(void *ctx, enum spdk_bdev_io_type io_type)
 	}
 
 	return false;
+}
+
+/*
+ * The copy domain of a raid0 block is the index of the base bdev (leg) holding it.
+ * COPY is only passed through when source and destination are on the same leg.
+ */
+static uint32_t
+raid_bdev_get_copy_domain(void *ctx, uint64_t offset_blocks)
+{
+	struct raid_bdev *raid_bdev = ctx;
+
+	if (raid_bdev->level != RAID0 || raid_bdev->num_base_bdevs < 2) {
+		return 0;
+	}
+
+	return ((offset_blocks & MASK_OUT_USED_BITS) >> raid_bdev->strip_size_shift) %
+	       raid_bdev->num_base_bdevs;
 }
 
 /*
@@ -1395,6 +1426,7 @@ static const struct spdk_bdev_fn_table g_raid_bdev_fn_table = {
 	.dump_info_json		= raid_bdev_dump_info_json,
 	.write_config_json	= raid_bdev_write_config_json,
 	.get_memory_domains	= raid_bdev_get_memory_domains,
+	.get_copy_domain	= raid_bdev_get_copy_domain,
 };
 
 struct raid_bdev *
