@@ -268,7 +268,7 @@ struct spdk_blob_store {
 };
 
 /* Number of cluster allocations that can run at the same time on one channel. */
-#define SPDK_BS_CHANNEL_CLUSTER_ALLOCS	512
+#define SPDK_BS_CHANNEL_CLUSTER_ALLOCS	32
 
 /*
  * One cluster allocation in flight on a channel. Only one allocation runs

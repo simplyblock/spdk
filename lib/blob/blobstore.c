@@ -3624,7 +3624,8 @@ blob_persist(spdk_bs_sequence_t *seq, struct spdk_blob *blob, bool md_drain,
 
 struct spdk_blob_copy_cluster_ctx {
 	struct spdk_blob *blob;
-	uint8_t *buf;
+	uint8_t **bufs;		/* one buffer per CoW chunk (see BLOB_COW_CHUNK_SIZE) */
+	uint32_t nchunks;
 	uint64_t page;
 	uint64_t new_cluster;
 	uint32_t new_extent_page;
@@ -3869,6 +3870,55 @@ bs_cow_trace_start(struct spdk_blob_copy_cluster_ctx *ctx, struct spdk_bs_channe
 	set->cpl.u.blob_basic.cb_arg = trace;
 }
 
+#define BLOB_COW_CHUNK_SIZE	(64 * 1024)	/* CoW reads and writes the cluster in chunks of this */
+
+/* Length of chunk i of a cluster; the last one is shorter when the cluster
+ * size is not a multiple of the chunk size. */
+static inline uint64_t
+blob_cow_chunk_len(struct spdk_blob_store *bs, uint32_t i)
+{
+	return spdk_min((uint64_t)BLOB_COW_CHUNK_SIZE, bs->cluster_sz - (uint64_t)i * BLOB_COW_CHUNK_SIZE);
+}
+
+static void
+blob_cow_bufs_free(struct spdk_blob_copy_cluster_ctx *ctx)
+{
+	uint32_t i;
+
+	if (ctx->bufs == NULL) {
+		return;
+	}
+	for (i = 0; i < ctx->nchunks; i++) {
+		spdk_free(ctx->bufs[i]);
+	}
+	free(ctx->bufs);
+	ctx->bufs = NULL;
+}
+
+/* Allocate one DMA buffer per chunk of the cluster, instead of one buffer
+ * of cluster size. */
+static int
+blob_cow_bufs_alloc(struct spdk_blob_copy_cluster_ctx *ctx, uint32_t align)
+{
+	struct spdk_blob_store *bs = ctx->blob->bs;
+	uint32_t i;
+
+	ctx->nchunks = spdk_divide_round_up(bs->cluster_sz, BLOB_COW_CHUNK_SIZE);
+	ctx->bufs = calloc(ctx->nchunks, sizeof(*ctx->bufs));
+	if (ctx->bufs == NULL) {
+		return -ENOMEM;
+	}
+	for (i = 0; i < ctx->nchunks; i++) {
+		ctx->bufs[i] = spdk_malloc(blob_cow_chunk_len(bs, i), align, NULL,
+					   SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+		if (ctx->bufs[i] == NULL) {
+			blob_cow_bufs_free(ctx);
+			return -ENOMEM;
+		}
+	}
+	return 0;
+}
+
 static void
 blob_allocate_and_copy_cluster_cpl(void *cb_arg, int bserrno)
 {
@@ -3904,7 +3954,7 @@ blob_allocate_and_copy_cluster_cpl(void *cb_arg, int bserrno)
 
 	bs_cluster_alloc_resume(ch);
 
-	spdk_free(ctx->buf);
+	blob_cow_bufs_free(ctx);
 	free(ctx);
 }
 
@@ -4034,7 +4084,7 @@ blob_write_copy_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
  * new cluster relies on the same thing.
  */
 #define BLOB_COW_SCAN_UNIT	SPDK_BS_PAGE_SIZE	/* zero check granularity */
-#define BLOB_COW_MAX_WRITES	64		/* more ranges than this: write the whole cluster */
+#define BLOB_COW_MAX_WRITES	64		/* more ranges than this: write the whole chunk */
 
 /* Off for now (testing): CoW writes the whole cluster, zero parts included. */
 static bool g_blob_cow_skip_zero_ranges = false;
@@ -4099,40 +4149,68 @@ blob_write_copy(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	struct spdk_blob_store *bs = ctx->blob->bs;
 	struct spdk_bs_data_range ranges[BLOB_COW_MAX_WRITES];
 	spdk_bs_batch_t *batch;
-	uint64_t cluster_lba;
-	int nranges, i;
+	uint64_t chunk_lba, chunk_len;
+	uint32_t c;
+	int nranges, i, nwrites = 0;
 
 	ctx->read_tsc = spdk_get_ticks();
 
 	if (bserrno != 0) {
-		/* The read failed, so jump to the final completion handler */
+		/* A read failed, so jump to the final completion handler */
 		bs_sequence_finish(seq, bserrno);
 		return;
 	}
 
-	cluster_lba = bs_cluster_to_lba(bs, ctx->new_cluster);
+	/* Write all chunks in one batch. With no data to write the batch
+	 * completes at close and the cluster is inserted without any data write. */
+	batch = bs_sequence_to_batch(seq, 0, blob_write_copy_cpl, ctx);
+	for (c = 0; c < ctx->nchunks; c++) {
+		chunk_lba = bs_cluster_to_lba(bs, ctx->new_cluster) +
+			    bs_byte_to_lba(bs, (uint64_t)c * BLOB_COW_CHUNK_SIZE);
+		chunk_len = blob_cow_chunk_len(bs, c);
 
-	nranges = g_blob_cow_skip_zero_ranges ?
-		  spdk_bs_find_data_ranges(ctx->buf, bs->cluster_sz, BLOB_COW_SCAN_UNIT, 0,
-					   ranges, BLOB_COW_MAX_WRITES) : -1;
-	if (nranges < 0) {
-		/* Data is spread over the cluster, or zero parts are not skipped:
-		 * write whole cluster */
-		bs_sequence_write_dev(seq, ctx->buf, cluster_lba, bs_cluster_to_lba(bs, 1),
-				      blob_write_copy_cpl, ctx);
-		return;
+		nranges = g_blob_cow_skip_zero_ranges ?
+			  spdk_bs_find_data_ranges(ctx->bufs[c], chunk_len, BLOB_COW_SCAN_UNIT, 0,
+						   ranges, BLOB_COW_MAX_WRITES) : -1;
+		if (nranges < 0) {
+			/* Data is spread over the chunk, or zero parts are not skipped:
+			 * write whole chunk */
+			bs_batch_write_dev(batch, ctx->bufs[c], chunk_lba, bs_byte_to_lba(bs, chunk_len));
+			nwrites++;
+			continue;
+		}
+
+		/* Write only the ranges with data. */
+		for (i = 0; i < nranges; i++) {
+			bs_batch_write_dev(batch, ctx->bufs[c] + ranges[i].start,
+					   chunk_lba + bs_byte_to_lba(bs, ranges[i].start),
+					   bs_byte_to_lba(bs, ranges[i].end - ranges[i].start));
+		}
+		nwrites += nranges;
 	}
 
 	SPDK_DEBUGLOG(blob, "CoW blob 0x%" PRIx64 " cluster %" PRIu64 ": %d write(s)\n",
-		      ctx->blob->id, ctx->new_cluster, nranges);
+		      ctx->blob->id, ctx->new_cluster, nwrites);
 
-	/* Write only the ranges with data. With no ranges the batch completes
-	 * at close and the cluster is inserted without any data write. */
-	batch = bs_sequence_to_batch(seq, 0, blob_write_copy_cpl, ctx);
-	for (i = 0; i < nranges; i++) {
-		bs_batch_write_dev(batch, ctx->buf + ranges[i].start,
-				   cluster_lba + bs_byte_to_lba(bs, ranges[i].start),
-				   bs_byte_to_lba(bs, ranges[i].end - ranges[i].start));
+	bs_batch_close(batch);
+}
+
+/* Read all chunks of the cluster from the backing device in one batch. */
+static void
+blob_cow_read(struct spdk_blob_copy_cluster_ctx *ctx)
+{
+	struct spdk_bs_dev *back_bs_dev = ctx->blob->back_bs_dev;
+	struct spdk_blob_store *bs = ctx->blob->bs;
+	spdk_bs_batch_t *batch;
+	uint64_t cluster_lba = bs_dev_page_to_lba(back_bs_dev, ctx->page);
+	uint32_t c;
+
+	batch = bs_sequence_to_batch(ctx->seq, 0, blob_write_copy, ctx);
+	for (c = 0; c < ctx->nchunks; c++) {
+		bs_batch_read_bs_dev(batch, back_bs_dev, ctx->bufs[c],
+				     cluster_lba + bs_dev_byte_to_lba(back_bs_dev,
+						     (uint64_t)c * BLOB_COW_CHUNK_SIZE),
+				     bs_dev_byte_to_lba(back_bs_dev, blob_cow_chunk_len(bs, c)));
 	}
 	bs_batch_close(batch);
 }
@@ -4233,11 +4311,9 @@ bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 			bs_dev_page_to_lba(blob->back_bs_dev, cluster_start_page),
 			bs_dev_byte_to_lba(blob->back_bs_dev, blob->bs->cluster_sz));
 	if (blob->parent_id != SPDK_BLOBID_INVALID && !is_zeroes && !can_copy) {
-		ctx->buf = spdk_malloc(blob->bs->cluster_sz, blob->back_bs_dev->blocklen,
-				       NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
-		if (!ctx->buf) {
-			SPDK_ERRLOG("DMA allocation for cluster of size = %" PRIu32 " failed.\n",
-				    blob->bs->cluster_sz);
+		if (blob_cow_bufs_alloc(ctx, blob->back_bs_dev->blocklen) != 0) {
+			SPDK_ERRLOG("DMA allocation of %" PRIu32 " CoW chunks of size = %d failed.\n",
+				    ctx->nchunks, BLOB_COW_CHUNK_SIZE);
 			free(ctx);
 			bs_user_op_abort(op, -ENOMEM);
 			return;
@@ -4249,7 +4325,7 @@ bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 				 false);
 	spdk_spin_unlock(&blob->bs->used_lock);
 	if (rc != 0) {
-		spdk_free(ctx->buf);
+		blob_cow_bufs_free(ctx);
 		free(ctx);
 		SPDK_NOTICELOG("FAILED allocate cluster op blob: %" PRIu64 " \n", blob->id);
 		bs_user_op_abort(op, rc);
@@ -4265,7 +4341,7 @@ bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 		spdk_spin_lock(&blob->bs->used_lock);
 		bs_release_cluster(blob->bs, ctx->new_cluster);
 		spdk_spin_unlock(&blob->bs->used_lock);
-		spdk_free(ctx->buf);
+		blob_cow_bufs_free(ctx);
 		free(ctx);
 		SPDK_NOTICELOG("FAILED on get seq 2 op blob: %" PRIu64 " \n", blob->id);
 		bs_user_op_abort(op, -ENOMEM);
@@ -4285,11 +4361,8 @@ bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 		if (can_copy) {
 			blob_copy(ctx, op, copy_src_lba);
 		} else {
-			/* Read cluster from backing device */
-			bs_sequence_read_bs_dev(ctx->seq, blob->back_bs_dev, ctx->buf,
-						bs_dev_page_to_lba(blob->back_bs_dev, cluster_start_page),
-						bs_dev_byte_to_lba(blob->back_bs_dev, blob->bs->cluster_sz),
-						blob_write_copy, ctx);
+			/* Read the cluster from the backing device, in chunks */
+			blob_cow_read(ctx);
 		}
 
 	} else {
