@@ -3968,7 +3968,7 @@ rpc_bdev_lvol_transfer_final_step(struct spdk_jsonrpc_request *request,
 	/* Class 0: the final step moves the volume that carries client IO next,
 	 * so its reads keep the volume's own class. */
 	rc = spdk_lvol_transfer(lvol, 0, req.cluster_batch, type, tdev, req.snapshot_name, req.lvol_id, 0,
-		 					rpc_bdev_lvol_transfer_final_step_cb, request);
+				false, 0, rpc_bdev_lvol_transfer_final_step_cb, request);
 	if (rc < 0) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 spdk_strerror(-rc));
@@ -4168,6 +4168,10 @@ struct rpc_bdev_lvol_transfer {
 	char *gateway;
 	char *operation;
 	bool allow_partial;
+	/* blob id of the snapshot whose copy the destination's landing volume
+	 * was cloned from; a partial transfer only runs on a generation that
+	 * started at exactly that snapshot */
+	uint64_t partial_base;
 	bool special_io;
 	uint32_t priority_class;
 };
@@ -4187,6 +4191,7 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_transfer_decoders[] =
 	{"operation", offsetof(struct rpc_bdev_lvol_transfer, operation), spdk_json_decode_string},
 	{"lvol_id", offsetof(struct rpc_bdev_lvol_transfer, lvol_id), spdk_json_decode_uint32, true},
 	{"allow_partial", offsetof(struct rpc_bdev_lvol_transfer, allow_partial), spdk_json_decode_bool, true},
+	{"partial_base", offsetof(struct rpc_bdev_lvol_transfer, partial_base), spdk_json_decode_uint64, true},
 	{"special_io", offsetof(struct rpc_bdev_lvol_transfer, special_io), spdk_json_decode_bool, true},
 	{"priority_class", offsetof(struct rpc_bdev_lvol_transfer, priority_class), spdk_json_decode_uint32, true},
 };
@@ -4260,8 +4265,18 @@ rpc_bdev_lvol_transfer(struct spdk_jsonrpc_request *request,
 		spdk_jsonrpc_send_error_response(request, -EINVAL, spdk_strerror(EINVAL));
 		goto cleanup;
 	}
+	if (req.allow_partial && (req.special_io || req.partial_base == 0 ||
+				  req.partial_base == SPDK_BLOBID_INVALID ||
+				  req.partial_base == SPDK_BLOBID_EXTERNAL_SNAPSHOT)) {
+		/* special IO works on whole blob clusters; without a base there is
+		 * nothing a delta could apply on top of */
+		SPDK_NOTICELOG("Transfer lvol %s: allow_partial ignored (%s)\n", req.lvol_name,
+			       req.special_io ? "special_io" : "no partial_base");
+		req.allow_partial = false;
+	}
 	rc = spdk_lvol_transfer(lvol, req.offset, req.cluster_batch, type, tdev, NULL, req.lvol_id,
-				(uint8_t)req.priority_class, NULL, NULL);
+				(uint8_t)req.priority_class, req.allow_partial, req.partial_base,
+				NULL, NULL);
 	if (rc < 0) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 spdk_strerror(-rc));
@@ -4335,6 +4350,37 @@ rpc_bdev_lvol_transfer_stat(struct spdk_jsonrpc_request *request,
 	}
 	spdk_json_write_named_uint64(w, "offset", lvol->last_offset);
 	spdk_json_write_named_uint64(w, "partial_reqs", lvol->xfer_partial_reqs);
+	{
+		/* where a replication request's time goes: reading the source
+		 * here, and writing to the destination (network + destination) */
+		uint64_t hz = spdk_get_ticks_hz(), n = lvol->xfer_stat_reqs;
+		uint64_t end = lvol->xfer_stat_end_ticks ? lvol->xfer_stat_end_ticks : spdk_get_ticks();
+
+		spdk_json_write_named_uint64(w, "stat_reqs", n);
+		spdk_json_write_named_uint64(w, "stat_bytes", lvol->xfer_stat_bytes);
+		spdk_json_write_named_uint64(w, "stat_read_us_avg",
+					     n ? lvol->xfer_stat_read_ticks * 1000000 / hz / n : 0);
+		spdk_json_write_named_uint64(w, "stat_write_us_avg",
+					     n ? lvol->xfer_stat_write_ticks * 1000000 / hz / n : 0);
+		spdk_json_write_named_uint64(w, "stat_elapsed_ms",
+					     lvol->xfer_stat_start_ticks ? (end - lvol->xfer_stat_start_ticks) * 1000 / hz : 0);
+		/* and where it waits outside its IO */
+		uint64_t rw = lvol->xfer_stat_ready_waits, fw = lvol->xfer_stat_free_waits;
+		uint64_t gap_us, late;
+
+		spdk_json_write_named_uint64(w, "stat_inline_reqs", lvol->xfer_stat_inline_reqs);
+		spdk_json_write_named_uint64(w, "stat_ready_waits", rw);
+		spdk_json_write_named_uint64(w, "stat_ready_wait_us_avg",
+					 rw ? lvol->xfer_stat_ready_wait_ticks * 1000000 / hz / rw : 0);
+		spdk_json_write_named_uint64(w, "stat_free_waits", fw);
+		spdk_json_write_named_uint64(w, "stat_free_wait_us_avg",
+					 fw ? lvol->xfer_stat_free_wait_ticks * 1000000 / hz / fw : 0);
+		spdk_json_write_named_uint64(w, "stat_inflight", lvol->xfer_stat_inflight);
+		spdk_json_write_named_uint64(w, "stat_inflight_max", lvol->xfer_stat_inflight_max);
+		spdk_lvol_xfer_md_ticks(&gap_us, &late);
+		spdk_json_write_named_uint64(w, "md_tick_gap_max_us", gap_us);
+		spdk_json_write_named_uint64(w, "md_late_ticks", late);
+	}
 	spdk_json_write_named_uint64(w, "full_clusters", lvol->xfer_full_clusters);
 	spdk_json_write_named_uint64(w, "pages_sent", lvol->xfer_pages_sent);
 	spdk_json_write_object_end(w);
@@ -4346,6 +4392,183 @@ cleanup:
 }
 
 SPDK_RPC_REGISTER("bdev_lvol_transfer_stat", rpc_bdev_lvol_transfer_stat, SPDK_RPC_RUNTIME)
+
+struct rpc_bdev_lvol_dirty_bitmap_info {
+	char *lvol_name;
+};
+
+static void
+free_rpc_bdev_lvol_dirty_bitmap_info(struct rpc_bdev_lvol_dirty_bitmap_info *req)
+{
+	free(req->lvol_name);
+}
+
+static const struct spdk_json_object_decoder rpc_bdev_lvol_dirty_bitmap_info_decoders[] = {
+	{"lvol_name", offsetof(struct rpc_bdev_lvol_dirty_bitmap_info, lvol_name), spdk_json_decode_string},
+};
+
+/* Inspect the in-memory dirty generation of an lvol/snapshot: whether writes
+ * are tracked, whether the generation is COMPLETE, in which leadership epoch
+ * and on top of which base it started, and how much it marks dirty. Also the
+ * lvstore's count of data writes this node executed, which the control plane
+ * compares across the other members before it allows a partial transfer. */
+static void
+rpc_bdev_lvol_dirty_bitmap_info(struct spdk_jsonrpc_request *request,
+				const struct spdk_json_val *params)
+{
+	struct rpc_bdev_lvol_dirty_bitmap_info req = {};
+	struct spdk_bdev *bdev;
+	struct spdk_lvol *lvol;
+	struct spdk_blob_store *bs;
+	struct blob_dirty_gen *gen;
+	struct spdk_json_write_ctx *w;
+	const char *why = NULL;
+
+	if (spdk_json_decode_object(params, rpc_bdev_lvol_dirty_bitmap_info_decoders,
+				    SPDK_COUNTOF(rpc_bdev_lvol_dirty_bitmap_info_decoders),
+				    &req)) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "spdk_json_decode_object failed");
+		goto cleanup;
+	}
+
+	bdev = spdk_bdev_get_by_name(req.lvol_name);
+	if (bdev == NULL) {
+		SPDK_INFOLOG(lvol_rpc, "bdev '%s' does not exist\n", req.lvol_name);
+		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
+		goto cleanup;
+	}
+
+	lvol = vbdev_lvol_get_from_bdev(bdev);
+	if (lvol == NULL) {
+		SPDK_ERRLOG("lvol does not exist\n");
+		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
+		goto cleanup;
+	}
+
+	bs = lvol->lvol_store->blobstore;
+	gen = spdk_blob_get_dirty_gen(lvol->blob);
+
+	w = spdk_jsonrpc_begin_result(request);
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_bool(w, "tracking", gen != NULL);
+	spdk_json_write_named_bool(w, "complete", spdk_blob_dirty_gen_complete(gen));
+	spdk_json_write_named_uint64(w, "gen_id", spdk_blob_dirty_gen_id(gen));
+	spdk_json_write_named_uint64(w, "base_blob_id", spdk_blob_dirty_gen_base(gen));
+	spdk_json_write_named_uint64(w, "epoch", spdk_blob_dirty_gen_epoch(gen));
+	spdk_json_write_named_uint64(w, "lvs_epoch", spdk_bs_get_dirty_epoch(bs));
+	/* usable against its own base: a partial transfer would still need the
+	 * destination to hold a copy of exactly that base */
+	spdk_json_write_named_bool(w, "usable", spdk_blob_dirty_gen_usable(lvol->blob, gen,
+				   spdk_blob_dirty_gen_base(gen), &why));
+	spdk_json_write_named_string(w, "unusable_reason", why ? why : "");
+	spdk_json_write_named_uint64(w, "clusters_tracked", spdk_blob_dirty_gen_tracked(gen));
+	spdk_json_write_named_uint64(w, "dirty_bytes", spdk_blob_dirty_gen_bytes(gen));
+	spdk_json_write_named_uint64(w, "lvs_local_writes", spdk_bs_get_dirty_local_writes(bs));
+	spdk_json_write_object_end(w);
+	spdk_jsonrpc_end_result(request, w);
+
+cleanup:
+	free_rpc_bdev_lvol_dirty_bitmap_info(&req);
+}
+
+SPDK_RPC_REGISTER("bdev_lvol_dirty_bitmap_info", rpc_bdev_lvol_dirty_bitmap_info, SPDK_RPC_RUNTIME)
+
+struct rpc_bdev_lvol_merge_base {
+	char *lvol_name;
+};
+
+static const struct spdk_json_object_decoder rpc_bdev_lvol_merge_base_decoders[] = {
+	{"lvol_name", offsetof(struct rpc_bdev_lvol_merge_base, lvol_name), spdk_json_decode_string},
+};
+
+static const char *
+lvol_merge_state_str(enum spdk_lvol_merge_state s)
+{
+	switch (s) {
+	case LVOL_MERGE_RUNNING:
+		return "running";
+	case LVOL_MERGE_DONE:
+		return "done";
+	case LVOL_MERGE_FAILED:
+		return "failed";
+	default:
+		return "none";
+	}
+}
+
+static void
+rpc_write_merge_state(struct spdk_jsonrpc_request *request, struct spdk_lvol *lvol)
+{
+	struct spdk_json_write_ctx *w = spdk_jsonrpc_begin_result(request);
+
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_string(w, "state", lvol_merge_state_str(lvol->merge_state));
+	spdk_json_write_named_int32(w, "rc", lvol->merge_rc);
+	spdk_json_write_named_uint64(w, "clusters", lvol->merge_stats.clusters);
+	spdk_json_write_named_uint64(w, "ranges", lvol->merge_stats.ranges);
+	spdk_json_write_named_uint64(w, "bytes", lvol->merge_stats.bytes);
+	spdk_json_write_named_uint64(w, "ms", lvol->merge_ms);
+	spdk_json_write_object_end(w);
+	spdk_jsonrpc_end_result(request, w);
+}
+
+static struct spdk_lvol *
+rpc_merge_lvol(struct spdk_jsonrpc_request *request, const struct spdk_json_val *params)
+{
+	struct rpc_bdev_lvol_merge_base req = {};
+	struct spdk_bdev *bdev;
+	struct spdk_lvol *lvol = NULL;
+
+	if (spdk_json_decode_object(params, rpc_bdev_lvol_merge_base_decoders,
+				    SPDK_COUNTOF(rpc_bdev_lvol_merge_base_decoders), &req)) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "spdk_json_decode_object failed");
+		goto cleanup;
+	}
+	bdev = spdk_bdev_get_by_name(req.lvol_name);
+	lvol = bdev ? vbdev_lvol_get_from_bdev(bdev) : NULL;
+	if (lvol == NULL) {
+		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
+	}
+cleanup:
+	free(req.lvol_name);
+	return lvol;
+}
+
+/* Destination side of a partial snapshot replication, after the transfer and
+ * before the convert: START filling the landing volume from its base wherever
+ * the transfer did not write, and return at once with the job's state (it
+ * takes longer than an RPC may). Idempotent: a running job is not started
+ * twice, a finished one is not repeated. Poll bdev_lvol_merge_base_stat.
+ * state "failed" with rc -ESTALE: the node lost the record of what arrived
+ * (restart) -- repeat the transfer into a fresh landing volume. */
+static void
+rpc_bdev_lvol_merge_base(struct spdk_jsonrpc_request *request, const struct spdk_json_val *params)
+{
+	struct spdk_lvol *lvol = rpc_merge_lvol(request, params);
+
+	if (lvol == NULL) {
+		return;
+	}
+	spdk_lvol_merge_base_start(lvol);
+	rpc_write_merge_state(request, lvol);
+}
+
+SPDK_RPC_REGISTER("bdev_lvol_merge_base", rpc_bdev_lvol_merge_base, SPDK_RPC_RUNTIME)
+
+static void
+rpc_bdev_lvol_merge_base_stat(struct spdk_jsonrpc_request *request,
+			      const struct spdk_json_val *params)
+{
+	struct spdk_lvol *lvol = rpc_merge_lvol(request, params);
+
+	if (lvol != NULL) {
+		rpc_write_merge_state(request, lvol);
+	}
+}
+
+SPDK_RPC_REGISTER("bdev_lvol_merge_base_stat", rpc_bdev_lvol_merge_base_stat, SPDK_RPC_RUNTIME)
 
 struct rpc_bdev_lvol_set_migration_flag {
 	char *lvol_name;

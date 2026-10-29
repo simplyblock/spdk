@@ -24,6 +24,7 @@
 
 #include "blobstore.h"
 #include "blob_md_journal.h"
+#include "blob_dirty.h"
 
 #define BLOB_CRC32C_INITIAL    0xffffffffUL
 #define BLOB_CLEAR_EXTENTS_BATCH_SIZE 500
@@ -428,6 +429,8 @@ blob_free(struct spdk_blob *blob)
 
 	xattrs_free(&blob->xattrs);
 	xattrs_free(&blob->xattrs_internal);
+
+	blob_dirty_gen_free(blob->dirty_gen);
 
 	if (blob->back_bs_dev) {
 		blob_unref_back_bs_dev(blob);
@@ -3199,6 +3202,15 @@ blob_resize_secondary(struct spdk_blob *blob, uint64_t sz)
 	}
 
 
+	/* A SHRINK drops clusters out of the blob's map, and a dirty generation
+	 * cannot express "this cluster is gone": a delta built on it would leave
+	 * the stale pre-shrink content on the destination. Growing is safe (the
+	 * added clusters are unallocated, and the transfer only ever visits
+	 * allocated ones). */
+	if (sz < blob->active.num_clusters) {
+		blob_dirty_gen_invalidate(blob->dirty_gen);
+	}
+
 	blob->active.num_clusters = sz;
 	blob->active.num_extent_pages = new_num_ep;
 	
@@ -3317,6 +3329,15 @@ blob_resize(struct spdk_blob *blob, uint64_t sz)
 		if (blob->active.clusters[i] != 0) {
 			blob->active.num_allocated_clusters--;
 		}
+	}
+
+	/* A SHRINK drops clusters out of the blob's map, and a dirty generation
+	 * cannot express "this cluster is gone": a delta built on it would leave
+	 * the stale pre-shrink content on the destination. Growing is safe (the
+	 * added clusters are unallocated, and the transfer only ever visits
+	 * allocated ones). */
+	if (sz < blob->active.num_clusters) {
+		blob_dirty_gen_invalidate(blob->dirty_gen);
 	}
 
 	blob->active.num_clusters = sz;
@@ -4578,6 +4599,414 @@ blob_zeroes_from_backing(struct spdk_blob *blob)
 	return spdk_blob_is_thin_provisioned(blob) && blob_backed_with_zeroes_dev(blob);
 }
 
+static inline void
+blob_dirty_mark_io_units(struct spdk_blob *blob, uint64_t offset, uint64_t length)
+{
+	struct blob_dirty_gen *gen = blob->dirty_gen;
+
+	__atomic_add_fetch(&blob->bs->dirty_local_writes, 1, __ATOMIC_RELAXED);
+	if (spdk_likely(gen == NULL)) {
+		return;
+	}
+	blob_dirty_mark(gen, offset * blob->bs->io_unit_size, length * blob->bs->io_unit_size);
+}
+
+struct blob_dirty_gen *
+spdk_blob_get_dirty_gen(struct spdk_blob *blob)
+{
+	return blob ? blob->dirty_gen : NULL;
+}
+
+uint64_t
+spdk_bs_get_dirty_local_writes(struct spdk_blob_store *bs)
+{
+	return __atomic_load_n(&bs->dirty_local_writes, __ATOMIC_SEQ_CST);
+}
+
+uint64_t
+spdk_bs_get_dirty_epoch(struct spdk_blob_store *bs)
+{
+	return __atomic_load_n(&bs->dirty_epoch, __ATOMIC_SEQ_CST);
+}
+
+void
+spdk_bs_set_dirty_leader(struct spdk_blob_store *bs, bool leader)
+{
+	if (bs == NULL) {
+		return;
+	}
+	if (__atomic_exchange_n(&bs->dirty_leader, leader, __ATOMIC_SEQ_CST) != leader) {
+		__atomic_add_fetch(&bs->dirty_epoch, 1, __ATOMIC_SEQ_CST);
+	}
+}
+
+bool
+spdk_blob_dirty_gen_usable(struct spdk_blob *blob, const struct blob_dirty_gen *gen,
+			   spdk_blob_id base, const char **why)
+{
+	const char *reason = NULL;
+
+	if (gen == NULL) {
+		reason = "no dirty generation (blob loaded with data, or opened while not leading)";
+	} else if (!spdk_blob_dirty_gen_complete(gen)) {
+		reason = "dirty generation incomplete (a write it cannot represent happened)";
+	} else if (!__atomic_load_n(&blob->bs->dirty_leader, __ATOMIC_SEQ_CST) ||
+		   gen->epoch != spdk_bs_get_dirty_epoch(blob->bs) ||
+		   !__atomic_load_n(&blob->bs->dirty_leader, __ATOMIC_SEQ_CST)) {
+		reason = "leadership changed since the dirty generation started";
+	} else if (gen->base != base) {
+		reason = "dirty generation started at a different base than the destination holds";
+	} else if (gen->merge_pending) {
+		reason = "clusters were allocated without data and not merged with the base";
+	}
+	if (why != NULL) {
+		*why = reason;
+	}
+	return reason == NULL;
+}
+
+/* Start a generation on a blob that owns no data yet: every cluster it will
+ * own gets its first write tracked from here on. Only while the LVS leads --
+ * a non-leader's writes are redirected to the leader, so its bitmap would
+ * stay empty and claim "nothing changed". */
+static void
+blob_dirty_gen_start(struct spdk_blob *blob, spdk_blob_id base)
+{
+	struct spdk_blob_store *bs = blob->bs;
+
+	if (blob->dirty_gen != NULL || !__atomic_load_n(&bs->dirty_leader, __ATOMIC_SEQ_CST)) {
+		return;
+	}
+	blob->dirty_gen = blob_dirty_gen_create(bs->cluster_sz);
+	if (blob->dirty_gen != NULL) {
+		blob->dirty_gen->epoch = spdk_bs_get_dirty_epoch(bs);
+		blob->dirty_gen->base = base;
+	}
+}
+
+/* The blob's unwritten blocks are about to read a different parent. A blob that
+ * owns nothing and has tracked nothing just starts its generation on top of
+ * the new parent (a landing volume chained before its transfer). So does a
+ * landing volume chained AFTER its transfer, while the previous copy was still
+ * being merged: it had no parent, its clusters were allocated by the transfer
+ * (merge_pending: their unwritten blocks are not data yet) and the generation
+ * marks exactly the blocks that arrived -- spdk_blob_merge_base fills the rest
+ * from the new parent, the same result as chaining first. Anything else no
+ * longer has a delta against a known base. */
+static void
+blob_dirty_gen_reparent(struct spdk_blob *blob, spdk_blob_id new_parent)
+{
+	struct blob_dirty_gen *gen = blob->dirty_gen;
+
+	if (gen == NULL) {
+		return;
+	}
+	if (blob->active.num_allocated_clusters == 0 && spdk_blob_dirty_gen_tracked(gen) == 0) {
+		gen->base = new_parent;
+		return;
+	}
+	if (gen->base == SPDK_BLOBID_INVALID && gen->merge_pending &&
+	    spdk_blob_dirty_gen_complete(gen)) {
+		gen->base = new_parent;
+		return;
+	}
+	blob_dirty_gen_invalidate(gen);
+}
+
+/* START spdk_blob_merge_base */
+
+#define BLOB_MERGE_QD		64
+#define BLOB_MERGE_CHUNK	(512 * 1024)
+
+struct blob_merge_ctx;
+
+struct blob_merge_op {
+	struct blob_merge_ctx	*ctx;
+	void			*buf;		/* NULL: the base is zeroes */
+	uint64_t		offset;		/* io units */
+	uint64_t		length;		/* io units */
+	bool			busy;
+};
+
+struct blob_merge_ctx {
+	struct spdk_blob		*blob;
+	struct spdk_blob		*parent;	/* NULL: no parent, the base reads zeroes */
+	struct spdk_io_channel		*ch;
+	struct blob_dirty_gen		*gen;		/* detached from the blob while merging */
+	uint64_t			*words;
+	uint32_t			nwords;
+	uint32_t			nbits;
+	uint64_t			units_per_block;
+	uint64_t			units_per_cluster;
+	struct blob_dirty_range		*ranges;	/* current cluster's unwritten runs */
+	uint32_t			nranges, pos, done;
+	uint64_t			cluster;
+	uint64_t			next_cluster;
+	uint32_t			inflight;
+	int				rc;
+	/* completions can run inside blob_merge_pump (a submit that fails at
+	 * once): they ask for another pass instead of re-entering it */
+	bool				pumping;
+	bool				repump;
+	struct spdk_blob_merge_stats	stats;
+	struct blob_merge_op		ops[BLOB_MERGE_QD];
+	spdk_blob_merge_complete	cb_fn;
+	void				*cb_arg;
+};
+
+/* Next allocated cluster with blocks that were not written. */
+static bool
+blob_merge_load_cluster(struct blob_merge_ctx *ctx)
+{
+	struct spdk_blob *blob = ctx->blob;
+	uint32_t n;
+	bool has;
+
+	while (ctx->next_cluster < blob->active.num_clusters) {
+		uint64_t c = ctx->next_cluster++;
+
+		if (blob->active.clusters[c] == 0) {
+			continue;	/* unallocated: reads through to the parent already */
+		}
+		has = blob_dirty_cluster_words(ctx->gen, c, ctx->words, ctx->nwords);
+		n = blob_dirty_clean_ranges(has ? ctx->words : NULL, ctx->nbits, ctx->ranges,
+					    ctx->nbits / 2 + 1);
+		assert(n <= ctx->nbits / 2 + 1);
+		if (n == 0) {
+			continue;	/* every block arrived */
+		}
+		ctx->cluster = c;
+		ctx->nranges = n;
+		ctx->pos = 0;
+		ctx->done = 0;
+		ctx->stats.clusters++;
+		return true;
+	}
+	return false;
+}
+
+/* The next piece to copy: at most BLOB_MERGE_CHUNK of one unwritten run. */
+static bool
+blob_merge_next_piece(struct blob_merge_ctx *ctx, uint64_t *offset, uint64_t *length)
+{
+	const struct blob_dirty_range *r;
+	uint32_t n, max_blocks = BLOB_MERGE_CHUNK / SPDK_BLOB_DIRTY_BLOCK_SZ;
+
+	if (ctx->pos >= ctx->nranges && !blob_merge_load_cluster(ctx)) {
+		return false;
+	}
+	r = &ctx->ranges[ctx->pos];
+	n = spdk_min(r->len - ctx->done, max_blocks);
+	*offset = ctx->cluster * ctx->units_per_cluster + (uint64_t)(r->off + ctx->done) *
+		  ctx->units_per_block;
+	*length = (uint64_t)n * ctx->units_per_block;
+	ctx->done += n;
+	ctx->stats.bytes += (uint64_t)n * SPDK_BLOB_DIRTY_BLOCK_SZ;
+	if (ctx->done == r->len) {
+		ctx->pos++;
+		ctx->done = 0;
+		ctx->stats.ranges++;
+	}
+	return true;
+}
+
+static void blob_merge_pump(struct blob_merge_ctx *ctx);
+static void blob_merge_issue(struct blob_merge_ctx *ctx);
+
+static void
+blob_merge_finish(struct blob_merge_ctx *ctx)
+{
+	struct spdk_blob *blob = ctx->blob;
+
+	blob->dirty_gen = ctx->gen;
+	blob->dirty_merging = false;
+	if (ctx->rc == 0) {
+		ctx->gen->merge_pending = false;
+	}
+	SPDK_NOTICELOG("blob 0x%" PRIx64 ": merged with the base: %" PRIu64 " cluster(s), %" PRIu64
+		       " range(s), %" PRIu64 " bytes, rc %d\n", blob->id, ctx->stats.clusters,
+		       ctx->stats.ranges, ctx->stats.bytes, ctx->rc);
+	spdk_bs_free_io_channel(ctx->ch);
+	for (int i = 0; i < BLOB_MERGE_QD; i++) {
+		spdk_free(ctx->ops[i].buf);
+	}
+	free(ctx->ranges);
+	free(ctx->words);
+	ctx->cb_fn(ctx->cb_arg, &ctx->stats, ctx->rc);
+	free(ctx);
+}
+
+static void
+blob_merge_op_done(struct blob_merge_op *op, int bserrno)
+{
+	struct blob_merge_ctx *ctx = op->ctx;
+
+	if (bserrno != 0 && ctx->rc == 0) {
+		SPDK_ERRLOG("blob 0x%" PRIx64 ": merge of [%" PRIu64 ", +%" PRIu64 ") failed: %d\n",
+			    ctx->blob->id, op->offset, op->length, bserrno);
+		ctx->rc = bserrno;
+	}
+	op->busy = false;
+	ctx->inflight--;
+	blob_merge_pump(ctx);
+}
+
+static void
+blob_merge_write_cpl(void *cb_arg, int bserrno)
+{
+	blob_merge_op_done(cb_arg, bserrno);
+}
+
+static void
+blob_merge_read_cpl(void *cb_arg, int bserrno)
+{
+	struct blob_merge_op *op = cb_arg;
+	struct blob_merge_ctx *ctx = op->ctx;
+
+	if (bserrno != 0) {
+		blob_merge_op_done(op, bserrno);
+		return;
+	}
+	spdk_blob_io_write(ctx->blob, ctx->ch, op->buf, op->offset, op->length,
+			   blob_merge_write_cpl, op);
+}
+
+static void
+blob_merge_pump(struct blob_merge_ctx *ctx)
+{
+	if (ctx->pumping) {
+		ctx->repump = true;
+		return;
+	}
+	ctx->pumping = true;
+	do {
+		ctx->repump = false;
+		blob_merge_issue(ctx);
+	} while (ctx->repump);
+	ctx->pumping = false;
+	if (ctx->inflight == 0) {
+		blob_merge_finish(ctx);
+	}
+}
+
+static void
+blob_merge_issue(struct blob_merge_ctx *ctx)
+{
+	for (int i = 0; i < BLOB_MERGE_QD && ctx->rc == 0; i++) {
+		struct blob_merge_op *op = &ctx->ops[i];
+
+		if (op->busy) {
+			continue;
+		}
+		if (!blob_merge_next_piece(ctx, &op->offset, &op->length)) {
+			break;
+		}
+		op->busy = true;
+		ctx->inflight++;
+		if (ctx->parent == NULL) {
+			/* no parent: the base reads zeroes, and a fresh cluster need not */
+			spdk_blob_io_write_zeroes(ctx->blob, ctx->ch, op->offset, op->length,
+						  blob_merge_write_cpl, op);
+		} else {
+			spdk_blob_io_read(ctx->parent, ctx->ch, op->buf, op->offset, op->length,
+					  blob_merge_read_cpl, op);
+		}
+	}
+}
+
+void
+spdk_blob_merge_base(struct spdk_blob *blob, spdk_blob_merge_complete cb_fn, void *cb_arg)
+{
+	struct spdk_blob_store *bs = blob->bs;
+	struct blob_merge_ctx *ctx;
+	struct spdk_blob_merge_stats none = {};
+	struct blob_dirty_gen *gen = blob->dirty_gen;
+	struct spdk_blob *parent = NULL;
+
+	if (blob->data_ro) {
+		cb_fn(cb_arg, &none, -EPERM);
+		return;
+	}
+	if (blob->dirty_merging) {
+		/* its generation is detached: it is not lost, a merge holds it */
+		cb_fn(cb_arg, &none, -EBUSY);
+		return;
+	}
+	if (gen == NULL || !spdk_blob_dirty_gen_complete(gen)) {
+		/* what arrived is unknown: the transfer must be repeated */
+		cb_fn(cb_arg, &none, -ESTALE);
+		return;
+	}
+	if (SPDK_BLOB_DIRTY_BLOCK_SZ % bs->io_unit_size != 0) {
+		cb_fn(cb_arg, &none, -EINVAL);
+		return;
+	}
+	if (blob->parent_id == SPDK_BLOBID_EXTERNAL_SNAPSHOT) {
+		cb_fn(cb_arg, &none, -ENOTSUP);
+		return;
+	}
+	if (blob->parent_id != SPDK_BLOBID_INVALID) {
+		parent = blob_lookup(bs, blob->parent_id);
+		if (parent == NULL) {
+			cb_fn(cb_arg, &none, -ENOENT);
+			return;
+		}
+	}
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL) {
+		cb_fn(cb_arg, &none, -ENOMEM);
+		return;
+	}
+	ctx->blob = blob;
+	ctx->parent = parent;
+	ctx->gen = gen;
+	ctx->cb_fn = cb_fn;
+	ctx->cb_arg = cb_arg;
+	ctx->nbits = gen->bits_per_cluster;
+	ctx->nwords = gen->words_per_cluster;
+	ctx->units_per_block = SPDK_BLOB_DIRTY_BLOCK_SZ / bs->io_unit_size;
+	ctx->units_per_cluster = bs_io_units_per_cluster(blob);
+	ctx->words = calloc(ctx->nwords, sizeof(*ctx->words));
+	ctx->ranges = calloc(ctx->nbits / 2 + 1, sizeof(*ctx->ranges));
+	ctx->ch = spdk_bs_alloc_io_channel(bs);
+	for (int i = 0; i < BLOB_MERGE_QD; i++) {
+		ctx->ops[i].ctx = ctx;
+		if (parent != NULL) {
+			ctx->ops[i].buf = spdk_malloc(BLOB_MERGE_CHUNK, 0x1000, NULL,
+						      SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+			if (ctx->ops[i].buf == NULL) {
+				ctx->rc = -ENOMEM;
+			}
+		}
+	}
+	if (ctx->words == NULL || ctx->ranges == NULL || ctx->ch == NULL) {
+		ctx->rc = -ENOMEM;
+	}
+	if (ctx->rc != 0) {
+		for (int i = 0; i < BLOB_MERGE_QD; i++) {
+			spdk_free(ctx->ops[i].buf);
+		}
+		free(ctx->ranges);
+		free(ctx->words);
+		if (ctx->ch != NULL) {
+			spdk_bs_free_io_channel(ctx->ch);
+		}
+		cb_fn(cb_arg, &none, ctx->rc);
+		free(ctx);
+		return;
+	}
+
+	/* The merge's own writes fill in the base; they are not the delta, and
+	 * marking them would make every block of a partial cluster look written.
+	 * Nothing else writes to a landing blob between its transfer and here. */
+	blob->dirty_gen = NULL;
+	blob->dirty_merging = true;
+	blob_merge_pump(ctx);
+}
+
+/* END spdk_blob_merge_base */
+
 /* Whether an I/O of `length` io units at an allocated cluster may release it:
  * the I/O covers the whole cluster, the blob reads unallocated clusters as
  * zeroes, and no snapshot, clone, or migration holds the blob. */
@@ -4604,6 +5033,11 @@ blob_release_cluster(struct spdk_io_channel *_ch, struct spdk_blob *blob, uint64
 	spdk_bs_batch_t *batch;
 
 	assert(offset % bs_io_units_per_cluster(blob) == 0);
+
+	/* The cluster leaves the blob's map entirely; a partial transfer built
+	 * on this generation could no longer express "this cluster is gone". */
+	blob_dirty_gen_invalidate(blob->dirty_gen);
+	__atomic_add_fetch(&blob->bs->dirty_local_writes, 1, __ATOMIC_RELAXED);
 
 	ctx = calloc(1, sizeof(*ctx));
 	if (!ctx) {
@@ -4724,6 +5158,14 @@ blob_request_submit_op_single(struct spdk_io_channel *_ch, struct spdk_blob *blo
 				return;
 			}
 
+			/* Every host mutation of an allocated cluster funnels through
+			 * here (a CoW-triggering write re-executes here after the
+			 * cluster copy, and the copied rest equals the base by
+			 * definition), so this is the tracking point for the dirty
+			 * bitmap. Marked before the IO is issued, so a failed write
+			 * only costs a needless transfer, never a missed one. */
+			blob_dirty_mark_io_units(blob, offset, length);
+
 			uint8_t special_io = (blob->migration_flag & (op_type == SPDK_BLOB_WRITE)) ? 1 : 0;
 			batch = bs_batch_open_s(_ch, &cpl, special_io, blob);
 			if (!batch) {
@@ -4768,6 +5210,9 @@ blob_request_submit_op_single(struct spdk_io_channel *_ch, struct spdk_blob *blo
 		}
 
 		if (is_allocated) {
+			/* The blocks now read as zeroes, which the delta must carry
+			 * like any other modification. */
+			blob_dirty_mark_io_units(blob, offset, length);
 			bs_batch_unmap_dev(batch, lba, lba_count);
 		}
 
@@ -5047,6 +5492,7 @@ blob_request_submit_rw_iov(struct spdk_blob *blob, struct spdk_io_channel *_chan
 
 				seq->ext_io_opts = ext_io_opts;
 
+				blob_dirty_mark_io_units(blob, offset, length);
 				bs_sequence_writev_dev(seq, iov, iovcnt, lba, lba_count, rw_iov_done, NULL);
 			} else {
 				/* Queue this operation and allocate the cluster */
@@ -9509,6 +9955,18 @@ bs_snapshot_swap_cluster_maps(struct spdk_blob *blob1, struct spdk_blob *blob2)
 	extent_page_temp = blob1->active.extent_pages;
 	blob1->active.extent_pages = blob2->active.extent_pages;
 	blob2->active.extent_pages = extent_page_temp;
+
+	/* The dirty generation describes exactly the clusters in the map it
+	 * tracked, so it travels with the map. On the forward swap the new
+	 * snapshot takes the clone's populated generation and the clone takes
+	 * the empty one the snapshot blob received at open -- which IS the
+	 * rotation. The error-path unwind calls swap everything straight back. */
+	{
+		struct blob_dirty_gen *dirty_temp = blob1->dirty_gen;
+
+		blob1->dirty_gen = blob2->dirty_gen;
+		blob2->dirty_gen = dirty_temp;
+	}
 }
 
 /* Copies an internal xattr */
@@ -9556,6 +10014,25 @@ bs_snapshot_origblob_sync_cpl(void *cb_arg, int bserrno)
 	if (bserrno != 0) {
 		bs_clone_snapshot_origblob_cleanup(ctx, bserrno);
 		return;
+	}
+
+	/* Dirty-generation family cap: live (clone) + the two newest snapshots.
+	 * Walk the new snapshot's ancestor chain and drop bitmaps older than its
+	 * immediate predecessor; a transfer still reading one holds a reference.
+	 * Ancestors that are not open lost their generation with blob_free. */
+	{
+		struct spdk_blob *anc = newblob;
+		int depth = 0;
+
+		while (anc != NULL && anc->parent_id != 0 &&
+		       anc->parent_id != SPDK_BLOBID_INVALID && depth < 64) {
+			anc = blob_lookup(newblob->bs, anc->parent_id);
+			depth++;
+			if (anc != NULL && depth >= 2 && anc->dirty_gen != NULL) {
+				blob_dirty_gen_free(anc->dirty_gen);
+				anc->dirty_gen = NULL;
+			}
+		}
 	}
 
 	bs_blob_list_add(ctx->original.blob);
@@ -9693,6 +10170,17 @@ bs_snapshot_freeze_cpl(void *cb_arg, int rc)
 
 	/* swap cluster maps */
 	bs_snapshot_swap_cluster_maps(newblob, origblob);
+
+	/* The clone's new generation tracks writes on top of the new snapshot. */
+	if (origblob->dirty_gen != NULL) {
+		origblob->dirty_gen->base = newblob->id;
+	}
+	if (!ctx->frozen) {
+		/* Without a freeze, a write may have resolved its cluster before
+		 * the swap and marked the clone's generation after it: the data is
+		 * in the snapshot's cluster, the mark is not in its generation. */
+		blob_dirty_gen_invalidate(newblob->dirty_gen);
+	}
 
 	/* Set the clear method on the new blob to match the original. */
 	blob_set_clear_method(newblob, origblob->clear_method);
@@ -10599,6 +11087,8 @@ bs_set_parent_refs(struct spdk_blob *blob, struct blob_parent *parent)
 		SPDK_ERRLOG("error %d setting snapshot xattr\n", rc);
 		return rc;
 	}
+	/* unwritten blocks now read a different base than the generation's */
+	blob_dirty_gen_reparent(blob, parent->u.snapshot.id);
 	blob->parent_id = parent->u.snapshot.id;
 
 	if (blob_is_esnap_clone(blob)) {
@@ -10803,6 +11293,8 @@ bs_set_external_parent_refs(struct spdk_blob *blob, struct blob_parent *parent)
 		return rc;
 	}
 	blob->invalid_flags |= SPDK_BLOB_EXTERNAL_SNAPSHOT;
+	/* an external base is not a blob a delta could name */
+	blob_dirty_gen_invalidate(blob->dirty_gen);
 	blob->parent_id = SPDK_BLOBID_EXTERNAL_SNAPSHOT;
 
 	bs_blob_list_add(blob);
@@ -11486,6 +11978,11 @@ spdk_bs_update_snapshot_clone(struct spdk_blob_store *bs, struct spdk_blob *orig
 	struct spdk_blob tmpblob;
 	struct spdk_blob_list *snapshot_entry = NULL;
 	struct spdk_blob *parentblob = NULL;
+
+	/* The snapshot was taken on another node: this node's generation did
+	 * not rotate with it and describes neither blob. */
+	blob_dirty_gen_invalidate(origblob->dirty_gen);
+	blob_dirty_gen_invalidate(newblob->dirty_gen);
 	if (newblob->parent_id != SPDK_BLOBID_INVALID) {
 		parentblob = blob_lookup(newblob->bs, newblob->parent_id);
 	}
@@ -11543,6 +12040,9 @@ spdk_bs_update_snapshot_clone(struct spdk_blob_store *bs, struct spdk_blob *orig
 void
 spdk_bs_update_snapshot_clone_live(struct spdk_blob *origblob, struct spdk_blob *newblob)
 {
+	/* see spdk_bs_update_snapshot_clone */
+	blob_dirty_gen_invalidate(origblob->dirty_gen);
+	blob_dirty_gen_invalidate(newblob->dirty_gen);
 	//updating the original blob
 
 	/* Set internal xattr for snapshot id */
@@ -11635,6 +12135,8 @@ spdk_bs_chain_snapshot_clone(struct spdk_blob *origblob, struct spdk_blob *clone
 	}
 
 	bs_blob_list_remove(clone);
+	/* unwritten blocks now read a different base than the generation's */
+	blob_dirty_gen_reparent(clone, origblob->id);
 	// check here if we call this twice we will endup with extra open ref
 	clone->parent_id = origblob->id;
 	origblob->open_ref++;
@@ -13569,6 +14071,15 @@ bs_open_blob_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	spdk_bit_array_set(blob->bs->open_blobids, blob->id);
 	RB_INSERT(spdk_blob_tree, &blob->bs->open_blobs, blob);
 
+	/* Dirty tracking epoch: a writable blob that owns NO clusters yet starts
+	 * a COMPLETE generation at open, on top of its parent (a fresh lvol has
+	 * none). Restart-safe by construction: a blob reopened WITH data gets no
+	 * generation and its transfers stay full. A snapshot blob opens empty
+	 * too; its generation becomes the clone's at the swap. */
+	if (!blob->data_ro && blob->active.num_allocated_clusters == 0) {
+		blob_dirty_gen_start(blob, blob->parent_id);
+	}
+
 	bs_sequence_finish(seq, bserrno);
 }
 
@@ -14880,6 +15391,15 @@ spdk_blob_alloc_clusters(struct spdk_blob *blob, const uint32_t *clusters, uint3
 		/* Nothing new: all were allocated already. */
 		blob_alloc_clusters_finish(ctx, 0);
 		return;
+	}
+
+	/* The new clusters read as zeroes, not as the base the generation's
+	 * writes apply on top of, and only the blocks written into them later get
+	 * marked: until spdk_blob_merge_base fills the rest from the parent, the
+	 * generation does not describe the blob's delta. A transfer's landing
+	 * blob is merged before it is converted; anything else stays unusable. */
+	if (blob->dirty_gen != NULL) {
+		blob->dirty_gen->merge_pending = true;
 	}
 
 	/* 2./3. Write the extent pages, then sync the md if needed. */

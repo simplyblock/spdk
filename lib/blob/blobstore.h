@@ -124,6 +124,15 @@ struct spdk_blob {
 	bool  migration_flag;
 	spdk_blob_id	parent_id;
 
+	/* In-memory dirty tracking for partial replication (blob_dirty.c).
+	 * NULL means "not tracked" (e.g. a blob loaded with data, or opened on a
+	 * non-leader): the transfer then falls back to full clusters. Moves to
+	 * the snapshot at rotation (bs_snapshot_swap_cluster_maps), freed in
+	 * blob_free(). */
+	struct blob_dirty_gen *dirty_gen;
+	/* spdk_blob_merge_base is running (dirty_gen is detached meanwhile) */
+	bool dirty_merging;
+
 	enum spdk_blob_state		state;
 
 	/* Two copies of the mutable data. One is a version
@@ -227,6 +236,20 @@ struct spdk_blob_store {
 	 * Only when the distrib internal force state changes, it will be set to false.
 	 */
 	bool				is_leader;
+	/* Dirty tracking (blob_dirty.c) follows the LVS leadership, which the
+	 * lvol layer owns -- not is_leader, which follows the distrib force
+	 * state. dirty_leader mirrors lvs->leader (spdk_bs_set_dirty_leader);
+	 * dirty_epoch is bumped on every change of it, so a generation started
+	 * under one leadership is never used under another. */
+	bool				dirty_leader;
+	uint64_t			dirty_epoch;
+	/* Every data write this node executed into this blobstore's blobs. On
+	 * the node that runs a partial transfer they are in its bitmaps; on any
+	 * other member they are not -- a non-leader with redirection off, or a
+	 * node that took leadership while this one still believed it led -- so
+	 * the control plane allows a delta only if no OTHER member's count grew
+	 * over the snapshot's window. In memory: restarts at 0 with the process. */
+	uint64_t			dirty_local_writes;
 	/* Two-node arbitration: held IO is returned as a path error (-ENOTCONN), not EIO. */
 	bool				ha_fenced;
 	/* Two-node arbitration: desired hold state, written by the lvol layer, applied on

@@ -405,7 +405,7 @@ def bdev_lvol_batch_transfer_final_step(client, lvol_names=None, ids=None, snaps
     return client.call('bdev_lvol_batch_transfer_final_step', params)
 
 def bdev_lvol_transfer(client, lvol_name=None, lvol_id=0, offset=0, cluster_batch=16, gateway=None, operation=None,
-                       priority_class=0):
+                       priority_class=0, allow_partial=False, partial_base=0):
     """Replicate a logical volume on a logical volume store.
 
     Args:
@@ -417,6 +417,10 @@ def bdev_lvol_transfer(client, lvol_name=None, lvol_id=0, offset=0, cluster_batc
         operation: action type to be useed for transfer (required)
         priority_class: IO priority class of the transfer's reads (optional,
             default 0 = the source lvol's own class)
+        allow_partial: send only the dirty ranges of the snapshot's clusters
+            (optional). The destination's landing volume must be a clone of
+            the copy of the snapshot named by partial_base.
+        partial_base: blob id of that snapshot (required with allow_partial)
     """
     if not lvol_name:
         raise ValueError("lvol_name must be specified")
@@ -432,7 +436,38 @@ def bdev_lvol_transfer(client, lvol_name=None, lvol_id=0, offset=0, cluster_batc
 
     if priority_class:
         params['priority_class'] = priority_class
+    if allow_partial:
+        params['allow_partial'] = True
+        params['partial_base'] = partial_base
     return client.call('bdev_lvol_transfer', params)
+
+
+def bdev_lvol_merge_base(client, lvol_name):
+    """Start filling a partially replicated landing volume from its base, before
+    convert. Returns at once with the job's state; idempotent.
+
+    Args:
+        lvol_name: name of the landing lvol bdev
+    """
+    return client.call('bdev_lvol_merge_base', {'lvol_name': lvol_name})
+
+
+def bdev_lvol_merge_base_stat(client, lvol_name):
+    """State of the merge job of a landing volume (none/running/done/failed).
+
+    Args:
+        lvol_name: name of the landing lvol bdev
+    """
+    return client.call('bdev_lvol_merge_base_stat', {'lvol_name': lvol_name})
+
+
+def bdev_lvol_dirty_bitmap_info(client, lvol_name):
+    """Show the in-memory dirty generation of a logical volume or snapshot.
+
+    Args:
+        lvol_name: name of the lvol bdev
+    """
+    return client.call('bdev_lvol_dirty_bitmap_info', {'lvol_name': lvol_name})
 
 def bdev_lvol_transfer_stat(client, lvol_name=None):
     """Capture a snapshot transfer stat.
