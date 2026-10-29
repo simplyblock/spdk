@@ -4304,17 +4304,12 @@ blob_copy_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	/* The copy could not be offloaded (e.g. source and destination on different
 	 * raid0 legs), fall back to reading and writing the whole cluster. */
 	SPDK_DEBUGLOG(blob, "Cluster copy failed (%d), falling back to read/write\n", bserrno);
-	ctx->buf = spdk_malloc(blob->bs->cluster_sz, blob->back_bs_dev->blocklen,
-			       NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
-	if (!ctx->buf) {
+	if (blob_cow_bufs_alloc(ctx, blob->back_bs_dev->blocklen) != 0) {
 		bs_sequence_finish(seq, -ENOMEM);
 		return;
 	}
 
-	bs_sequence_read_bs_dev(seq, blob->back_bs_dev, ctx->buf,
-				bs_dev_page_to_lba(blob->back_bs_dev, ctx->page),
-				bs_dev_byte_to_lba(blob->back_bs_dev, blob->bs->cluster_sz),
-				blob_write_copy, ctx);
+	blob_cow_read(ctx);
 }
 
 static void
