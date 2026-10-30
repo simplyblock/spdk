@@ -9317,7 +9317,26 @@ spdk_bs_get_io_unit_size(struct spdk_blob_store *bs)
 uint64_t
 spdk_bs_free_cluster_count(struct spdk_blob_store *bs)
 {
-	return bs->num_free_clusters;
+	struct spdk_blob *blob;
+	uint64_t used = 0;
+
+	if (bs->is_leader || spdk_get_thread() != bs->md_thread) {
+		return bs->num_free_clusters;
+	}
+
+	/*
+	 * Not the leader: num_free_clusters only shrinks here. Every re-read of a blob's metadata
+	 * claims its clusters, while the leader's deletes and shrinks never release them on this
+	 * node (the bitmap is rebuilt from disk on promotion). Report the clusters of the open
+	 * blobs instead: each cluster belongs to exactly one blob, and a snapshot deleted with a
+	 * clone hands its clusters to the clone. used_clusters itself stays a superset, which the
+	 * free-cluster clear on promotion relies on.
+	 */
+	RB_FOREACH(blob, spdk_blob_tree, &bs->open_blobs) {
+		used += blob->active.num_allocated_clusters;
+	}
+
+	return used < bs->total_data_clusters ? bs->total_data_clusters - used : 0;
 }
 
 uint64_t
