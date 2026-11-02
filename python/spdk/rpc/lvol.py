@@ -442,14 +442,19 @@ def bdev_lvol_transfer(client, lvol_name=None, lvol_id=0, offset=0, cluster_batc
     return client.call('bdev_lvol_transfer', params)
 
 
-def bdev_lvol_merge_base(client, lvol_name):
+def bdev_lvol_merge_base(client, lvol_name, priority_class=None):
     """Start filling a partially replicated landing volume from its base, before
     convert. Returns at once with the job's state; idempotent.
 
     Args:
         lvol_name: name of the landing lvol bdev
+        priority_class: IO class of the merge's reads and writes (the
+            replication's class); omitted: the blobs' own classes
     """
-    return client.call('bdev_lvol_merge_base', {'lvol_name': lvol_name})
+    params = {'lvol_name': lvol_name}
+    if priority_class is not None:
+        params['priority_class'] = priority_class
+    return client.call('bdev_lvol_merge_base', params)
 
 
 def bdev_lvol_merge_base_stat(client, lvol_name):

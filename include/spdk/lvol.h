@@ -393,8 +393,11 @@ typedef void (*spdk_lvol_merge_complete)(void *cb_arg, const struct spdk_blob_me
 		int lvolerrno);
 /* Fill a partially replicated landing lvol from its base (spdk_blob_merge_base). */
 void spdk_lvol_merge_base(struct spdk_lvol *lvol, spdk_lvol_merge_complete cb_fn, void *cb_arg);
+/* The same in IO priority class \p priority_class, or -1 for the blobs' own. */
+void spdk_lvol_merge_base_ext(struct spdk_lvol *lvol, int priority_class,
+			      spdk_lvol_merge_complete cb_fn, void *cb_arg);
 /* The same as a job: the state is in lvol->merge_state (spdk_internal/lvolstore.h). */
-void spdk_lvol_merge_base_start(struct spdk_lvol *lvol);
+void spdk_lvol_merge_base_start(struct spdk_lvol *lvol, int priority_class);
 
 /**
  * How late the transfer dispatcher runs: the longest gap between two of its

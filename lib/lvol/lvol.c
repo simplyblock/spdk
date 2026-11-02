@@ -8442,6 +8442,7 @@ struct lvol_merge_req {
 	struct spdk_lvol		*lvol;
 	struct spdk_thread		*thread;
 	struct spdk_blob_merge_stats	stats;
+	int				priority_class;
 	int				rc;
 	spdk_lvol_merge_complete	cb_fn;
 	void				*cb_arg;
@@ -8471,7 +8472,7 @@ lvol_merge_base_on_md(void *arg)
 {
 	struct lvol_merge_req *req = arg;
 
-	spdk_blob_merge_base(req->lvol->blob, lvol_merge_base_cpl, req);
+	spdk_blob_merge_base_ext(req->lvol->blob, req->priority_class, lvol_merge_base_cpl, req);
 }
 
 /*
@@ -8483,6 +8484,13 @@ lvol_merge_base_on_md(void *arg)
  */
 void
 spdk_lvol_merge_base(struct spdk_lvol *lvol, spdk_lvol_merge_complete cb_fn, void *cb_arg)
+{
+	spdk_lvol_merge_base_ext(lvol, -1, cb_fn, cb_arg);
+}
+
+void
+spdk_lvol_merge_base_ext(struct spdk_lvol *lvol, int priority_class,
+			 spdk_lvol_merge_complete cb_fn, void *cb_arg)
 {
 	struct spdk_blob_merge_stats none = {};
 	struct lvol_merge_req *req;
@@ -8497,6 +8505,7 @@ spdk_lvol_merge_base(struct spdk_lvol *lvol, spdk_lvol_merge_complete cb_fn, voi
 		return;
 	}
 	req->lvol = lvol;
+	req->priority_class = priority_class;
 	req->thread = spdk_get_thread();
 	req->cb_fn = cb_fn;
 	req->cb_arg = cb_arg;
@@ -8521,7 +8530,7 @@ lvol_merge_job_cpl(void *cb_arg, const struct spdk_blob_merge_stats *stats, int 
  * failed one is started again. The state is read from lvol->merge_state.
  */
 void
-spdk_lvol_merge_base_start(struct spdk_lvol *lvol)
+spdk_lvol_merge_base_start(struct spdk_lvol *lvol, int priority_class)
 {
 	if (lvol->merge_state == LVOL_MERGE_RUNNING || lvol->merge_state == LVOL_MERGE_DONE) {
 		return;
@@ -8531,7 +8540,7 @@ spdk_lvol_merge_base_start(struct spdk_lvol *lvol)
 	lvol->merge_ms = 0;
 	lvol->merge_start_ticks = spdk_get_ticks();
 	lvol->merge_state = LVOL_MERGE_RUNNING;
-	spdk_lvol_merge_base(lvol, lvol_merge_job_cpl, lvol);
+	spdk_lvol_merge_base_ext(lvol, priority_class, lvol_merge_job_cpl, lvol);
 }
 
 int

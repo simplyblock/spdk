@@ -20,6 +20,7 @@ uint64_t g_dev_write_bytes;
 uint64_t g_dev_read_bytes;
 /* class of the last read the device saw, -1 when it carried no options */
 int g_dev_last_read_priority = -1;
+int g_dev_last_write_priority = -1;
 uint64_t g_dev_copy_bytes;
 bool g_dev_writev_ext_called;
 bool g_dev_readv_ext_called;
@@ -162,6 +163,7 @@ dev_write(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payloa
 {
 	uint64_t offset, length;
 
+	g_dev_last_write_priority = bs_io_opts ? bs_io_opts->priority : -1;
 	if (g_power_failure_thresholds.write_threshold != 0) {
 		g_power_failure_counters.write_counter++;
 	}
@@ -361,6 +363,7 @@ dev_write_zeroes(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 {
 	uint64_t offset, length;
 
+	g_dev_last_write_priority = bs_io_opts ? bs_io_opts->priority : -1;
 	if (g_power_failure_thresholds.write_zero_threshold != 0) {
 		g_power_failure_counters.write_zero_counter++;
 	}
