@@ -7772,6 +7772,9 @@ bs_dump_finish(spdk_bs_sequence_t *seq, struct spdk_bs_load_ctx *ctx, int bserrn
 	 */
 	if (ctx->dump_type) {
 		bs_dump_itr_opened_blob(ctx);
+		/* Only the dump of a loaded blobstore owns this copy; a load hands it
+		 * to bs->used_clusters. */
+		spdk_bit_array_free(&ctx->used_clusters);
 	}
 
 	if (!ctx->dump_type) {
@@ -8125,6 +8128,10 @@ bs_load_used_blobids_cpl_dump(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno
 	mask = spdk_zmalloc(mask_size, 0x1000, NULL,
 				 SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
 	if (!mask) {
+		SPDK_ERRLOG("lvs dump: cannot allocate the used blobid mask (%" PRIu64 " bytes)\n",
+			    mask_size);
+		spdk_free(ctx->mask);
+		ctx->mask = NULL;
 		bs_load_ctx_fail(ctx, -ENOMEM);
 		return;
 	}
@@ -8223,11 +8230,17 @@ bs_dump_super_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		struct spdk_bs_md_mask *mask;
 		/* Write out the used clusters mask */
 		mask_size = ctx->super->used_cluster_mask_len * SPDK_BS_PAGE_SIZE;
+		rc = spdk_bit_array_resize(&ctx->used_clusters, ctx->bs->total_clusters);
+		if (rc < 0) {
+			bs_load_ctx_fail(ctx, rc);
+			return;
+		}
 		mask = spdk_zmalloc(mask_size, 0x1000, NULL,
 				 SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
-		rc = spdk_bit_array_resize(&ctx->used_clusters, ctx->bs->total_clusters);		
-		if (rc < 0) {			
-			bs_load_ctx_fail(ctx, rc);
+		if (mask == NULL) {
+			SPDK_ERRLOG("lvs dump: cannot allocate the used cluster mask (%" PRIu64 " bytes)\n",
+				    mask_size);
+			bs_load_ctx_fail(ctx, -ENOMEM);
 			return;
 		}
 		spdk_bit_pool_store_mask(ctx->bs->used_clusters, mask->mask);
