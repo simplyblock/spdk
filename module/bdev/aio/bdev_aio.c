@@ -56,6 +56,13 @@ struct bdev_aio_task {
 #endif
 	uint64_t			len;
 	struct bdev_aio_io_channel	*ch;
+#ifdef RWF_NOWAIT
+	/* RWF_NOWAIT -EAGAIN state. Kept across the bdev layer's NOMEM retries
+	 * of the same IO, which keep its submit tsc (see bdev_aio_nowait_init()). */
+	uint64_t			nowait_submit_tsc;
+	uint64_t			nowait_eagain_tsc;	/* first -EAGAIN, 0 = none yet */
+	bool				no_nowait;		/* submit without RWF_NOWAIT */
+#endif
 };
 
 struct file_disk {
@@ -213,7 +220,7 @@ bdev_aio_submit_io(enum spdk_bdev_io_type type, struct file_disk *fdisk,
 	}
 	iocb->data = aio_task;
 #ifdef RWF_NOWAIT
-	if (fdisk->use_nowait) {
+	if (fdisk->use_nowait && !aio_task->no_nowait) {
 		iocb->aio_rw_flags = RWF_NOWAIT;
 	}
 #endif
@@ -224,6 +231,68 @@ bdev_aio_submit_io(enum spdk_bdev_io_type type, struct file_disk *fdisk,
 }
 #endif
 
+#ifdef RWF_NOWAIT
+/*
+ * A NOWAIT read or write fails with -EAGAIN instead of waiting, e.g. when the
+ * block layer has no free tag, or when a write range has pages in the page cache
+ * of the block device (left by a buffered read from another process, like a
+ * blkid probe). The first case clears by itself. The second never does: only
+ * a write that may wait drops those pages. So:
+ *  - on the first -EAGAIN of a write, drop the range from the page cache;
+ *  - if the IO still gets -EAGAIN after BDEV_AIO_NOWAIT_FALLBACK_MS, submit it
+ *    once without RWF_NOWAIT (this may block the thread for a moment).
+ * The retries themselves are the bdev layer's NOMEM retries.
+ */
+#define BDEV_AIO_NOWAIT_FALLBACK_MS	100
+
+/* Reset the -EAGAIN state when the bdev layer submits a new IO, keep it when it
+ * retries the same one. The task memory is not cleared between IOs. */
+static void
+bdev_aio_nowait_init(struct bdev_aio_task *aio_task)
+{
+	uint64_t submit_tsc = spdk_bdev_io_get_submit_tsc(spdk_bdev_io_from_ctx(aio_task));
+
+	if (aio_task->nowait_submit_tsc != submit_tsc) {
+		aio_task->nowait_submit_tsc = submit_tsc;
+		aio_task->nowait_eagain_tsc = 0;
+		aio_task->no_nowait = false;
+	}
+}
+
+static void
+bdev_aio_nowait_eagain(struct bdev_aio_task *aio_task)
+{
+	struct spdk_bdev_io *bdev_io = spdk_bdev_io_from_ctx(aio_task);
+	struct file_disk *fdisk = bdev_io->bdev->ctxt;
+	uint64_t offset = bdev_io->u.bdev.offset_blocks * bdev_io->bdev->blocklen;
+	uint64_t now = spdk_get_ticks();
+	int rc;
+
+	if (aio_task->nowait_eagain_tsc == 0) {
+		aio_task->nowait_eagain_tsc = now;
+		if (bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE) {
+			/* Drops clean pages only; dirty, locked or mapped pages stay. */
+			rc = posix_fadvise(fdisk->fd, offset, aio_task->len, POSIX_FADV_DONTNEED);
+			if (rc != 0) {
+				SPDK_NOTICELOG("%s: posix_fadvise(DONTNEED) offset %" PRIu64 " len %" PRIu64
+					       " failed: %s\n", fdisk->disk.name, offset, aio_task->len,
+					       spdk_strerror(rc));
+			}
+		}
+		return;
+	}
+
+	if (now - aio_task->nowait_eagain_tsc >
+	    spdk_get_ticks_hz() * BDEV_AIO_NOWAIT_FALLBACK_MS / 1000) {
+		SPDK_WARNLOG("%s: %s offset %" PRIu64 " len %" PRIu64 " gets -EAGAIN with RWF_NOWAIT "
+			     "for more than %d ms, submitting it without RWF_NOWAIT\n",
+			     fdisk->disk.name, bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE ? "write" : "read",
+			     offset, aio_task->len, BDEV_AIO_NOWAIT_FALLBACK_MS);
+		aio_task->no_nowait = true;
+	}
+}
+#endif
+
 static void
 bdev_aio_rw(enum spdk_bdev_io_type type, struct file_disk *fdisk,
 	    struct spdk_io_channel *ch, struct bdev_aio_task *aio_task,
@@ -231,6 +300,10 @@ bdev_aio_rw(enum spdk_bdev_io_type type, struct file_disk *fdisk,
 {
 	struct bdev_aio_io_channel *aio_ch = spdk_io_channel_get_ctx(ch);
 	int rc;
+
+#ifdef RWF_NOWAIT
+	bdev_aio_nowait_init(aio_task);
+#endif
 
 	if (type == SPDK_BDEV_IO_TYPE_READ) {
 		SPDK_DEBUGLOG(aio, "read %d iovs size %lu to off: %#lx\n",
@@ -472,6 +545,11 @@ bdev_aio_io_channel_poll(struct bdev_aio_io_channel *io_ch)
 			res = (int)events[i].res;
 			if (res < 0) {
 				if (res == -EAGAIN) {
+#ifdef RWF_NOWAIT
+					if (aio_task->iocb.aio_rw_flags & RWF_NOWAIT) {
+						bdev_aio_nowait_eagain(aio_task);
+					}
+#endif
 					spdk_bdev_io_complete(spdk_bdev_io_from_ctx(aio_task), SPDK_BDEV_IO_STATUS_NOMEM);
 				} else {
 					SPDK_ERRLOG("failed to complete aio: rc %"PRId64"\n", events[i].res);
