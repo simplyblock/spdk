@@ -1484,7 +1484,21 @@ struct vbdev_lvol_xfer_cmd_ctx {
 	uint32_t		count;
 	int			rc;
 	uint8_t			*copy;
+	/* -EBUSY (an extent page of the blob is being written): retried */
+	struct spdk_poller	*busy_poller;
+	uint64_t		busy_deadline;	/* ticks */
+	uint64_t		busy_delay_us;
+	uint32_t		busy_retries;
 };
+
+/* spdk_blob_alloc_clusters answers -EBUSY while the blob is frozen or one of
+ * its extent pages is being written: nothing was done, try again. A landing
+ * volume's extent page is written by the transfer's own previous allocation
+ * and by the merge, both of which finish in milliseconds; the command waits
+ * for them instead of failing the transfer on the source. */
+#define VBDEV_LVOL_XFER_BUSY_FIRST_US	1000
+#define VBDEV_LVOL_XFER_BUSY_MAX_US	50000
+#define VBDEV_LVOL_XFER_BUSY_BUDGET_S	5
 
 /*
  * Complete a failed command. Not through lvol_op_comp: a failed command is not
@@ -1517,11 +1531,44 @@ vbdev_lvol_xfer_cmd_complete(void *arg)
 	free(ctx);
 }
 
+static void vbdev_lvol_xfer_alloc_on_md(void *arg);
+
+static int
+vbdev_lvol_xfer_alloc_retry(void *arg)
+{
+	struct vbdev_lvol_xfer_cmd_ctx *ctx = arg;
+
+	spdk_poller_unregister(&ctx->busy_poller);
+	vbdev_lvol_xfer_alloc_on_md(ctx);
+	return SPDK_POLLER_BUSY;
+}
+
 static void
 vbdev_lvol_xfer_alloc_cpl(void *cb_arg, int bserrno)
 {
 	struct vbdev_lvol_xfer_cmd_ctx *ctx = cb_arg;
 
+	if (bserrno == -EBUSY) {
+		/* on the md thread: retry there, later */
+		if (ctx->busy_retries == 0) {
+			ctx->busy_deadline = spdk_get_ticks() + VBDEV_LVOL_XFER_BUSY_BUDGET_S * spdk_get_ticks_hz();
+			ctx->busy_delay_us = VBDEV_LVOL_XFER_BUSY_FIRST_US;
+		}
+		if (spdk_get_ticks() < ctx->busy_deadline) {
+			ctx->busy_poller = SPDK_POLLER_REGISTER(vbdev_lvol_xfer_alloc_retry, ctx,
+						ctx->busy_delay_us);
+			if (ctx->busy_poller != NULL) {
+				ctx->busy_retries++;
+				ctx->busy_delay_us = spdk_min(ctx->busy_delay_us * 2, VBDEV_LVOL_XFER_BUSY_MAX_US);
+				return;
+			}
+		}
+		SPDK_ERRLOG("lvol %s: transfer command (alloc %u clusters) still busy after %u retries\n",
+				    ctx->lvol->name, ctx->count, ctx->busy_retries);
+	} else if (ctx->busy_retries != 0) {
+		SPDK_NOTICELOG("lvol %s: transfer command (alloc %u clusters) waited out %u busy answer(s): %d\n",
+				       ctx->lvol->name, ctx->count, ctx->busy_retries, bserrno);
+	}
 	ctx->rc = bserrno;
 	spdk_thread_send_msg(ctx->thread, vbdev_lvol_xfer_cmd_complete, ctx);
 }
