@@ -4304,6 +4304,12 @@ blob_copy_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	/* The copy could not be offloaded (e.g. source and destination on different
 	 * raid0 legs), fall back to reading and writing the whole cluster. */
 	SPDK_DEBUGLOG(blob, "Cluster copy failed (%d), falling back to read/write\n", bserrno);
+	/* The fallback reuses this request set. bs_sequence_completion left the
+	 * copy's error in it, and the fallback's batches only ever set an error,
+	 * never clear one: without this the fallback completes with the stale
+	 * error even when all of its reads and writes succeeded, and the client
+	 * IO fails (the lvol layer then drops leadership of the lvstore). */
+	((struct spdk_bs_request_set *)seq)->bserrno = 0;
 	if (blob_cow_bufs_alloc(ctx, blob->back_bs_dev->blocklen) != 0) {
 		bs_sequence_finish(seq, -ENOMEM);
 		return;
