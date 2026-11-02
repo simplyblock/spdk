@@ -4824,6 +4824,7 @@ struct blob_merge_ctx {
 	bool				pumping;
 	bool				repump;
 	struct spdk_blob_merge_stats	stats;
+	int				priority_class;	/* of every read and write, or -1 */
 	struct blob_merge_op		ops[BLOB_MERGE_QD];
 	spdk_blob_merge_complete	cb_fn;
 	void				*cb_arg;
@@ -4942,8 +4943,8 @@ blob_merge_read_cpl(void *cb_arg, int bserrno)
 		blob_merge_op_done(op, bserrno);
 		return;
 	}
-	spdk_blob_io_write(ctx->blob, ctx->ch, op->buf, op->offset, op->length,
-			   blob_merge_write_cpl, op);
+	spdk_blob_io_write_with_priority(ctx->blob, ctx->ch, op->buf, op->offset, op->length,
+				 ctx->priority_class, blob_merge_write_cpl, op);
 }
 
 static void
@@ -4980,11 +4981,12 @@ blob_merge_issue(struct blob_merge_ctx *ctx)
 		ctx->inflight++;
 		if (ctx->parent == NULL) {
 			/* no parent: the base reads zeroes, and a fresh cluster need not */
-			spdk_blob_io_write_zeroes(ctx->blob, ctx->ch, op->offset, op->length,
-						  blob_merge_write_cpl, op);
+			spdk_blob_io_write_zeroes_with_priority(ctx->blob, ctx->ch, op->offset, op->length,
+						ctx->priority_class, blob_merge_write_cpl, op);
 		} else {
-			spdk_blob_io_read(ctx->parent, ctx->ch, op->buf, op->offset, op->length,
-					  blob_merge_read_cpl, op);
+			spdk_blob_io_read_with_priority(ctx->parent, ctx->ch, op->buf, op->offset,
+					op->length, ctx->priority_class,
+					blob_merge_read_cpl, op);
 		}
 	}
 }
@@ -4992,12 +4994,23 @@ blob_merge_issue(struct blob_merge_ctx *ctx)
 void
 spdk_blob_merge_base(struct spdk_blob *blob, spdk_blob_merge_complete cb_fn, void *cb_arg)
 {
+	spdk_blob_merge_base_ext(blob, -1, cb_fn, cb_arg);
+}
+
+void
+spdk_blob_merge_base_ext(struct spdk_blob *blob, int priority_class,
+			 spdk_blob_merge_complete cb_fn, void *cb_arg)
+{
 	struct spdk_blob_store *bs = blob->bs;
 	struct blob_merge_ctx *ctx;
 	struct spdk_blob_merge_stats none = {};
 	struct blob_dirty_gen *gen = blob->dirty_gen;
 	struct spdk_blob *parent = NULL;
 
+	if (priority_class > MAX_PRIORITY_CLASS) {
+		cb_fn(cb_arg, &none, -EINVAL);
+		return;
+	}
 	if (blob->data_ro) {
 		cb_fn(cb_arg, &none, -EPERM);
 		return;
@@ -5038,6 +5051,7 @@ spdk_blob_merge_base(struct spdk_blob *blob, spdk_blob_merge_complete cb_fn, voi
 	ctx->gen = gen;
 	ctx->cb_fn = cb_fn;
 	ctx->cb_arg = cb_arg;
+	ctx->priority_class = priority_class;
 	ctx->nbits = gen->bits_per_cluster;
 	ctx->nwords = gen->words_per_cluster;
 	ctx->units_per_block = SPDK_BLOB_DIRTY_BLOCK_SZ / bs->io_unit_size;
@@ -5246,6 +5260,11 @@ blob_request_submit_op_single(struct spdk_io_channel *_ch, struct spdk_blob *blo
 			if (!batch) {
 				cb_fn(cb_arg, -ENOMEM);
 				return;
+			}
+			if (priority_class >= 0) {
+				/* Only this write, as for a read above. A write that has to
+				 * allocate its cluster first runs in the blob's class. */
+				batch->priority_class = priority_class;
 			}
 
 			if (op_type == SPDK_BLOB_WRITE) {
@@ -15734,6 +15753,32 @@ spdk_blob_io_read_with_priority(struct spdk_blob *blob, struct spdk_io_channel *
 	}
 	blob_request_submit_op(blob, channel, payload, offset, length, cb_fn, cb_arg,
 			       SPDK_BLOB_READ, priority_class);
+}
+
+void
+spdk_blob_io_write_with_priority(struct spdk_blob *blob, struct spdk_io_channel *channel,
+				 void *payload, uint64_t offset, uint64_t length, int priority_class,
+				 spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	if (priority_class > MAX_PRIORITY_CLASS) {
+		cb_fn(cb_arg, -EINVAL);
+		return;
+	}
+	blob_request_submit_op(blob, channel, payload, offset, length, cb_fn, cb_arg,
+			       SPDK_BLOB_WRITE, priority_class);
+}
+
+void
+spdk_blob_io_write_zeroes_with_priority(struct spdk_blob *blob, struct spdk_io_channel *channel,
+					uint64_t offset, uint64_t length, int priority_class,
+					spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	if (priority_class > MAX_PRIORITY_CLASS) {
+		cb_fn(cb_arg, -EINVAL);
+		return;
+	}
+	blob_request_submit_op(blob, channel, NULL, offset, length, cb_fn, cb_arg,
+			       SPDK_BLOB_WRITE_ZEROES, priority_class);
 }
 
 void

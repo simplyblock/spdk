@@ -5346,6 +5346,119 @@ bs_load_iter_test(void)
 	g_bs = NULL;
 }
 
+static int g_merge_rc;
+static struct spdk_blob_merge_stats g_merge_stats;
+
+static void
+merge_complete(void *cb_arg, const struct spdk_blob_merge_stats *stats, int bserrno)
+{
+	g_merge_stats = *stats;
+	g_merge_rc = bserrno;
+}
+
+/* The merge of a landing blob runs in the class it is given (the replication's):
+ * its reads of the base and its writes into the blob both carry it, and the
+ * blob reads the arrived blocks plus the base everywhere else. */
+static void
+blob_merge_base_priority_class(void)
+{
+	extern int g_dev_last_read_priority;
+	extern int g_dev_last_write_priority;
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob *blob, *snapshot, *landing;
+	struct spdk_io_channel *channel;
+	struct spdk_blob_opts opts;
+	spdk_blob_id blobid, snapshotid, landingid;
+	uint64_t pages_per_cluster = spdk_bs_get_cluster_size(bs) / spdk_bs_get_page_size(bs);
+	uint64_t io_units_per_cluster = pages_per_cluster * spdk_bs_get_page_size(bs) / spdk_bs_get_io_unit_size(bs);
+	static uint32_t first_cluster = 0;
+	uint8_t *buf, *expected;
+	uint64_t len = io_units_per_cluster * spdk_bs_get_io_unit_size(bs);
+
+	buf = calloc(1, len);
+	expected = calloc(1, len);
+	SPDK_CU_ASSERT_FATAL(buf != NULL && expected != NULL);
+
+	spdk_bs_set_dirty_leader(bs, true);
+	channel = spdk_bs_alloc_io_channel(bs);
+	CU_ASSERT(channel != NULL);
+
+	/* the base: one cluster of 0x11 */
+	ut_spdk_blob_opts_init(&opts);
+	opts.thin_provision = true;
+	opts.num_clusters = 1;
+	blob = ut_blob_create_and_open(bs, &opts);
+	blobid = spdk_blob_get_id(blob);
+	memset(buf, 0x11, len);
+	spdk_blob_io_write(blob, channel, buf, 0, io_units_per_cluster, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	spdk_bs_create_snapshot(bs, blobid, NULL, blob_op_with_id_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	snapshotid = g_blobid;
+	spdk_bs_open_blob(bs, snapshotid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	snapshot = g_blob;
+
+	/* the landing blob: a clone of the base that owns nothing, so it opens
+	 * with a complete dirty generation on top of it */
+	spdk_bs_create_clone(bs, snapshotid, NULL, blob_op_with_id_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	landingid = g_blobid;
+	spdk_bs_open_blob(bs, landingid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	landing = g_blob;
+	SPDK_CU_ASSERT_FATAL(spdk_blob_get_dirty_gen(landing) != NULL);
+
+	/* the transfer: allocate the cluster without data, write two io units */
+	spdk_blob_alloc_clusters(landing, &first_cluster, 1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	memset(buf, 0x22, 2 * spdk_bs_get_io_unit_size(bs));
+	spdk_blob_io_write(landing, channel, buf, 4, 2, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	g_dev_last_read_priority = -1;
+	g_dev_last_write_priority = -1;
+	g_merge_rc = -1;
+	spdk_blob_merge_base_ext(landing, 5, merge_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_merge_rc == 0);
+	CU_ASSERT(g_merge_stats.clusters == 1);
+	CU_ASSERT(g_dev_last_read_priority == 5);
+	CU_ASSERT(g_dev_last_write_priority == 5);
+
+	memset(buf, 0, len);
+	spdk_blob_io_read(landing, channel, buf, 0, io_units_per_cluster, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	memset(expected, 0x11, len);
+	memset(expected + 4 * spdk_bs_get_io_unit_size(bs), 0x22, 2 * spdk_bs_get_io_unit_size(bs));
+	CU_ASSERT(memcmp(buf, expected, len) == 0);
+
+	/* out of range */
+	g_merge_rc = 0;
+	spdk_blob_merge_base_ext(landing, MAX_PRIORITY_CLASS + 1, merge_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_merge_rc == -EINVAL);
+
+	ut_blob_close_and_delete(bs, landing);
+	ut_blob_close_and_delete(bs, blob);
+	ut_blob_close_and_delete(bs, snapshot);
+	spdk_bs_free_io_channel(channel);
+	poll_threads();
+	spdk_bs_set_dirty_leader(bs, false);
+	free(buf);
+	free(expected);
+	g_blob = NULL;
+	g_blobid = 0;
+}
+
 static void
 blob_snapshot_rw(void)
 {
@@ -11019,6 +11132,7 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite, bs_load_iter_test);
 		CU_ADD_TEST(suite_bs, blob_snapshot_rw);
 		CU_ADD_TEST(suite_bs, blob_snapshot_rw_copy_declined);
+		CU_ADD_TEST(suite_bs, blob_merge_base_priority_class);
 		CU_ADD_TEST(suite_bs, blob_snapshot_rw_iov);
 		CU_ADD_TEST(suite, blob_relations);
 		CU_ADD_TEST(suite, blob_relations2);

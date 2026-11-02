@@ -4476,10 +4476,13 @@ SPDK_RPC_REGISTER("bdev_lvol_dirty_bitmap_info", rpc_bdev_lvol_dirty_bitmap_info
 
 struct rpc_bdev_lvol_merge_base {
 	char *lvol_name;
+	/* IO class of the merge (the replication's), -1: the blobs' own */
+	int32_t priority_class;
 };
 
 static const struct spdk_json_object_decoder rpc_bdev_lvol_merge_base_decoders[] = {
 	{"lvol_name", offsetof(struct rpc_bdev_lvol_merge_base, lvol_name), spdk_json_decode_string},
+	{"priority_class", offsetof(struct rpc_bdev_lvol_merge_base, priority_class), spdk_json_decode_int32, true},
 };
 
 static const char *
@@ -4514,9 +4517,10 @@ rpc_write_merge_state(struct spdk_jsonrpc_request *request, struct spdk_lvol *lv
 }
 
 static struct spdk_lvol *
-rpc_merge_lvol(struct spdk_jsonrpc_request *request, const struct spdk_json_val *params)
+rpc_merge_lvol(struct spdk_jsonrpc_request *request, const struct spdk_json_val *params,
+	       int *priority_class)
 {
-	struct rpc_bdev_lvol_merge_base req = {};
+	struct rpc_bdev_lvol_merge_base req = { .priority_class = -1 };
 	struct spdk_bdev *bdev;
 	struct spdk_lvol *lvol = NULL;
 
@@ -4525,6 +4529,13 @@ rpc_merge_lvol(struct spdk_jsonrpc_request *request, const struct spdk_json_val 
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
 						 "spdk_json_decode_object failed");
 		goto cleanup;
+	}
+	if (req.priority_class < -1 || req.priority_class > MAX_PRIORITY_CLASS) {
+		spdk_jsonrpc_send_error_response(request, -EINVAL, "priority_class out of range");
+		goto cleanup;
+	}
+	if (priority_class != NULL) {
+		*priority_class = req.priority_class;
 	}
 	bdev = spdk_bdev_get_by_name(req.lvol_name);
 	lvol = bdev ? vbdev_lvol_get_from_bdev(bdev) : NULL;
@@ -4546,12 +4557,13 @@ cleanup:
 static void
 rpc_bdev_lvol_merge_base(struct spdk_jsonrpc_request *request, const struct spdk_json_val *params)
 {
-	struct spdk_lvol *lvol = rpc_merge_lvol(request, params);
+	int priority_class = -1;
+	struct spdk_lvol *lvol = rpc_merge_lvol(request, params, &priority_class);
 
 	if (lvol == NULL) {
 		return;
 	}
-	spdk_lvol_merge_base_start(lvol);
+	spdk_lvol_merge_base_start(lvol, priority_class);
 	rpc_write_merge_state(request, lvol);
 }
 
@@ -4561,7 +4573,7 @@ static void
 rpc_bdev_lvol_merge_base_stat(struct spdk_jsonrpc_request *request,
 			      const struct spdk_json_val *params)
 {
-	struct spdk_lvol *lvol = rpc_merge_lvol(request, params);
+	struct spdk_lvol *lvol = rpc_merge_lvol(request, params, NULL);
 
 	if (lvol != NULL) {
 		rpc_write_merge_state(request, lvol);
