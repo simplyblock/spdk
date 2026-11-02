@@ -24,6 +24,7 @@ uint64_t g_dev_copy_bytes;
 bool g_dev_writev_ext_called;
 bool g_dev_readv_ext_called;
 bool g_dev_copy_enabled;
+int g_dev_copy_fail;
 struct spdk_blob_ext_io_opts g_blob_ext_io_opts;
 uint32_t g_phys_blocklen;
 
@@ -400,6 +401,11 @@ dev_copy(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, uint64_t dst_
 	const void *src = &g_dev_buffer[src_lba * dev->blocklen];
 	uint64_t size = lba_count * dev->blocklen;
 
+	if (g_dev_copy_fail != 0) {
+		/* The base bdev declines the copy (e.g. a distrib page copy at max. chain depth). */
+		cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, g_dev_copy_fail);
+		return;
+	}
 	memcpy(dst, src, size);
 	g_dev_copy_bytes += size;
 
