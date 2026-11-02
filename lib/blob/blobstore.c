@@ -15398,7 +15398,8 @@ spdk_blob_alloc_clusters(struct spdk_blob *blob, const uint32_t *clusters, uint3
 			continue;
 		}
 
-		had_ep = *bs_cluster_to_extent_page(blob, idx) != 0;
+		/* without an extent table there are no extent pages to create */
+		had_ep = !blob->use_extent_table || *bs_cluster_to_extent_page(blob, idx) != 0;
 		/* lfmd is not advanced: a claimed md page is no longer clear, so the
 		 * next search skips it (same as blob_resize). */
 		rc = bs_allocate_cluster(blob, idx, &cluster, &lfmd, true);
