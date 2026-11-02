@@ -182,6 +182,9 @@ struct remote_lvol_info {
 	 * whose lifetime ends before this entry's cleanup poller runs): requests
 	 * of a freeze-critical FINAL transfer are dispatched before any other. */
 	bool priority;
+	/* Replication: the most requests of the task's window this poll group
+	 * takes from the ready ring (its share; 0 = no limit). */
+	uint32_t window_share;
 	uint64_t outstanding_io;
 	struct spdk_ring *free_ring;     /* tasks available for this snapshot */
     struct spdk_ring *ready_ring;    /* tasks ready to send to remote lvol */
@@ -262,6 +265,19 @@ struct spdk_lvs_xfer_req {
 	void *payload;
 	int fragments_outstanding;
 	int aggregated_status;
+	/* A dirty range of a cluster (partial transfer): every block of it is
+	 * written, zeroes included -- the destination's merge takes every block
+	 * NOT written from the base, so a skipped zero block would read the
+	 * base's old data. */
+	bool partial;
+	/* Timing of the request (ticks): source read submitted, read done.
+	 * The write to the destination ends in fragment_write_cb. */
+	uint64_t t_read;
+	uint64_t t_read_done;
+	/* Ring waits (ticks, 0 = not waiting): entered the ready ring, and
+	 * went back to the free ring. */
+	uint64_t t_ready;
+	uint64_t t_free;
 	struct remote_lvol_info *rmt_lvol;
 	struct spdk_lvs_xfer *xfer;
 	TAILQ_ENTRY(spdk_lvs_xfer_req)	entry;
@@ -342,6 +358,33 @@ struct spdk_lvs_xfer {
 	 * and the number of commands sent. */
 	uint32_t alloc_next;
 	uint32_t alloc_cmds;
+
+	/* Partial (dirty-bitmap) replication, see xfer_setup_partial. dirty_gen
+	 * is the snapshot's generation, pinned for the task's lifetime.
+	 * partial[i] marks the clusters sent as dirty ranges; the destination
+	 * pre-allocates them like any other and fills what was not sent from the
+	 * base after the transfer (spdk_blob_merge_base). ranges[range_pos..num_ranges) of
+	 * range_cluster are still to send, range_done blocks of the current one
+	 * already sent, in requests of at most XFER_PARTIAL_MAX_BYTES. */
+	bool allow_partial;
+	struct blob_dirty_gen *dirty_gen;
+	uint8_t *partial;
+	struct blob_dirty_range *ranges;
+	uint32_t max_ranges;
+	uint32_t num_ranges;
+	uint32_t range_pos;
+	uint32_t range_done;
+	uint64_t range_cluster;
+	uint64_t partial_clusters;
+	/* Guards the request generator (hold_idx, the ranges, idx, success_cnt,
+	 * outstanding_io, timeout) of a replication task: the app thread's
+	 * dispatcher and the poll group threads that refill a completed request
+	 * in place (xfer_refill_inline) both take the next request from it. */
+	pthread_spinlock_t gen_lock;
+	/* The destination may hold non-zero content in clusters this task did
+	 * not just allocate (a resumed transfer skips the allocation step), so
+	 * zero ranges must be written too. */
+	bool no_zero_skip;
 };
 
 struct spdk_lvol_store {
@@ -465,6 +508,43 @@ struct spdk_lvol {
 	/* stats of the most recent transfer: how many requests went out as
 	 * bitmap-driven partial ranges vs whole clusters (dirty-bitmap
 	 * replication; reset when a transfer starts) */
+	/* bdev_lvol_merge_base job (destination of a partial transfer): it
+	 * takes longer than an RPC may, so the RPC starts it and
+	 * bdev_lvol_merge_base_stat reports it. */
+	enum spdk_lvol_merge_state {
+		LVOL_MERGE_NONE = 0,
+		LVOL_MERGE_RUNNING,
+		LVOL_MERGE_DONE,
+		LVOL_MERGE_FAILED,
+	} merge_state;
+	int merge_rc;
+	struct spdk_blob_merge_stats merge_stats;
+	uint64_t merge_start_ticks;
+	uint64_t merge_ms;
+	/* Transfer timing (dirty-bitmap replication diagnostics; reset when a
+	 * transfer starts, updated from the poll group threads atomically):
+	 * requests completed, bytes written to the destination, summed source
+	 * read and destination write latencies, start and end. The write
+	 * latency is network + destination; the destination's own share is the
+	 * landing bdev's write latency there (bdev_get_iostat). */
+	uint64_t xfer_stat_reqs;
+	uint64_t xfer_stat_bytes;
+	uint64_t xfer_stat_read_ticks;
+	uint64_t xfer_stat_write_ticks;
+	uint64_t xfer_stat_start_ticks;
+	uint64_t xfer_stat_end_ticks;
+	/* Where a request waits outside its IO: requests refilled in place on
+	 * their poll group; summed waits in the ready ring (until a poll group
+	 * takes it) and in the free ring (until the dispatcher refills it);
+	 * requests between source read and destination write completion now,
+	 * and the most seen. */
+	uint64_t xfer_stat_inline_reqs;
+	uint64_t xfer_stat_ready_wait_ticks;
+	uint64_t xfer_stat_ready_waits;
+	uint64_t xfer_stat_free_wait_ticks;
+	uint64_t xfer_stat_free_waits;
+	uint64_t xfer_stat_inflight;
+	uint64_t xfer_stat_inflight_max;
 	uint64_t xfer_partial_reqs;
 	uint64_t xfer_full_clusters;
 	uint64_t xfer_pages_sent;

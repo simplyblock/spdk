@@ -101,6 +101,7 @@ bdev_blob_queue_io(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, voi
 	ctx->bs_io_opts.priority = bs_io_opts->priority;
 	ctx->bs_io_opts.geometry = bs_io_opts->geometry;
 	ctx->bs_io_opts.special_io = bs_io_opts->special_io;
+	ctx->bdev_io_wait.dep_unblock = true;
 
 	rc = spdk_bdev_queue_io_wait(bdev, channel, &ctx->bdev_io_wait);
 	if (rc != 0) {

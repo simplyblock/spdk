@@ -19,6 +19,7 @@
 #include "blob/request.c"
 #include "blob/zeroes.c"
 #include "blob/blob_bs_dev.c"
+#include "blob/blob_dirty.c"
 #include "esnap_dev.c"
 #define BLOCKLEN DEV_BUFFER_BLOCKLEN
 
@@ -5457,6 +5458,84 @@ blob_snapshot_rw(void)
 	ut_blob_close_and_delete(bs, blob);
 	ut_blob_close_and_delete(bs, snapshot);
 
+	spdk_bs_free_io_channel(channel);
+	poll_threads();
+	g_blob = NULL;
+	g_blobid = 0;
+}
+
+/* A declined copy offload falls back to read and write, and the client write
+ * succeeds: the fallback must not report the failed copy's error. */
+static void
+blob_snapshot_rw_copy_declined(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob *blob, *snapshot;
+	struct spdk_io_channel *channel;
+	struct spdk_blob_opts opts;
+	spdk_blob_id blobid, snapshotid;
+	uint64_t cluster_size = spdk_bs_get_cluster_size(bs);
+	uint64_t read_bytes_start, copy_bytes_start;
+	uint8_t payload_read[10 * BLOCKLEN];
+	uint8_t payload_write[10 * BLOCKLEN];
+	uint8_t expected[10 * BLOCKLEN];
+
+	channel = spdk_bs_alloc_io_channel(bs);
+	CU_ASSERT(channel != NULL);
+
+	ut_spdk_blob_opts_init(&opts);
+	opts.thin_provision = true;
+	opts.num_clusters = 5;
+	blob = ut_blob_create_and_open(bs, &opts);
+	blobid = spdk_blob_get_id(blob);
+
+	memset(payload_write, 0xE5, sizeof(payload_write));
+	spdk_blob_io_write(blob, channel, payload_write, 4, 10, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	spdk_bs_create_snapshot(bs, blobid, NULL, blob_op_with_id_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	snapshotid = g_blobid;
+	spdk_bs_open_blob(bs, snapshotid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	snapshot = g_blob;
+
+	read_bytes_start = g_dev_read_bytes;
+	copy_bytes_start = g_dev_copy_bytes;
+	g_dev_copy_fail = -EIO;
+
+	/* Rewrite 2 of the 10 io units: the rest of the cluster comes from the snapshot. */
+	memset(payload_write, 0xAA, 2 * BLOCKLEN);
+	spdk_blob_io_write(blob, channel, payload_write, 6, 2, blob_op_complete, NULL);
+	poll_threads();
+	g_dev_copy_fail = 0;
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(g_dev_copy_bytes == copy_bytes_start);
+	if (g_dev_copy_enabled) {
+		/* the fallback read the whole cluster */
+		CU_ASSERT(g_dev_read_bytes - read_bytes_start == cluster_size);
+	}
+
+	spdk_blob_io_read(blob, channel, payload_read, 4, 10, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	memset(expected, 0xE5, sizeof(expected));
+	memset(expected + 2 * BLOCKLEN, 0xAA, 2 * BLOCKLEN);
+	CU_ASSERT(memcmp(payload_read, expected, 10 * BLOCKLEN) == 0);
+
+	/* The snapshot keeps its data */
+	spdk_blob_io_read(snapshot, channel, payload_read, 4, 10, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	memset(expected, 0xE5, sizeof(expected));
+	CU_ASSERT(memcmp(payload_read, expected, 10 * BLOCKLEN) == 0);
+
+	ut_blob_close_and_delete(bs, blob);
+	ut_blob_close_and_delete(bs, snapshot);
 	spdk_bs_free_io_channel(channel);
 	poll_threads();
 	g_blob = NULL;
@@ -10939,6 +11018,7 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite_bs, blob_thin_prov_rw_iov);
 		CU_ADD_TEST(suite, bs_load_iter_test);
 		CU_ADD_TEST(suite_bs, blob_snapshot_rw);
+		CU_ADD_TEST(suite_bs, blob_snapshot_rw_copy_declined);
 		CU_ADD_TEST(suite_bs, blob_snapshot_rw_iov);
 		CU_ADD_TEST(suite, blob_relations);
 		CU_ADD_TEST(suite, blob_relations2);

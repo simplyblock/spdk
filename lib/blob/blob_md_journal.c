@@ -794,6 +794,34 @@ md_journal_process_waiting(struct spdk_bs_md_journal *jr)
 	return work;
 }
 
+/*
+ * Fail every request still waiting for a journal slot with -EIO. They were
+ * queued while this node was leader; once leadership is lost they must never
+ * be written, a later leader has changed the same pages since. The callers
+ * undo their in-memory change on the error.
+ */
+static void
+md_journal_fail_waiting(struct spdk_bs_md_journal *jr, const char *why)
+{
+	struct md_journal_wait_req *waiting_req;
+	uint32_t count = 0;
+
+	while ((waiting_req = TAILQ_FIRST(&jr->wait_queue)) != NULL) {
+		TAILQ_REMOVE(&jr->wait_queue, waiting_req, link);
+		if (waiting_req->type == MD_JOURNAL_WAIT_SINGLE) {
+			md_journal_terminate_waiting_single(waiting_req);
+		} else {
+			md_journal_terminate_batch(waiting_req->batch);
+		}
+		free(waiting_req);
+		count++;
+	}
+
+	if (count != 0) {
+		SPDK_ERRLOG("md_journal: %u queued requests failed with -EIO (%s)\n", count, why);
+	}
+}
+
 static void
 md_journal_complete_home_waiters(struct spdk_bs_md_journal *jr, int rc)
 {
@@ -1296,10 +1324,10 @@ spdk_md_journal_batch_drain_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserr
 	}
 
 	MDJ_IO_NOTICELOG("md_journal: HOME drain batch done: elements=%u first_seq=%" PRIu64
-		         " last_seq=%" PRIu64 " home_durable_seq=%" PRIu64 " drain_gen=%u\n",
+		         " last_seq=%" PRIu64 " home_durable_seq=%" PRIu64 "\n",
 		         drain_batch->elem_count, drain_batch->items[0]->seq,
 		         drain_batch->items[drain_batch->elem_count - 1]->seq,
-		         jr->home_durable_seq, jr->next_drain_gen);
+		         jr->home_durable_seq);
 
 	md_journal_process_home_waiters(jr);
 
@@ -1313,10 +1341,8 @@ spdk_md_journal_batch_drain_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserr
 		elem = drain_batch->items[i];
 
 		elem->state = MD_JOURNAL_ELEM_ZERO_PENDING;
-		elem->drain_gen = jr->next_drain_gen;
 		TAILQ_INSERT_TAIL(&jr->zero_queue, elem, link);
 	}
-	jr->next_drain_gen++;
 
 	drain_batch = jr->drain_batch;
 	memset(drain_batch->items, 0, sizeof(drain_batch->items));
@@ -1649,15 +1675,28 @@ spdk_md_journal_submit_zeroes(struct spdk_bs_md_journal *jr)
 		return 0;
 	}
 
-	batch = bs_sequence_to_batch(jr->zero_seq, 0, spdk_md_journal_submit_zeroes_v1_cpl, zero_batch);
-	uint32_t gen = TAILQ_FIRST(&jr->zero_queue)->drain_gen;
-	while (zero_batch->elem_count < BS_MD_JOURNAL_DRAIN_BATCH_SIZE) {
+	/*
+	 * Take the whole zero_queue, across HOME batches: ZERO keeps up with
+	 * the backlog. All of them are HOME durable and every
+	 * older element is already zeroed, so it is safe as long as the newest
+	 * one per LBA in this set is zeroed last: phase 1 zeroes the older ones
+	 * (skip_home, set again for this set below), phase 2 the newest.
+	 */
+	while (zero_batch->elem_count < BS_MD_JOURNAL_NUM_ELEMS) {
 		elem = TAILQ_FIRST(&jr->zero_queue);
-		if (elem == NULL || elem->drain_gen != gen) {
+		if (elem == NULL) {
 			break;
 		}
 
 		TAILQ_REMOVE(&jr->zero_queue, elem, link);
+		zero_batch->items[zero_batch->elem_count++] = elem;
+	}
+
+	md_journal_mark_latest(zero_batch);
+
+	batch = bs_sequence_to_batch(jr->zero_seq, 0, spdk_md_journal_submit_zeroes_v1_cpl, zero_batch);
+	for (uint32_t i = 0; i < zero_batch->elem_count; i++) {
+		elem = zero_batch->items[i];
 
 		if (elem->skip_home) {
 			elem->state = MD_JOURNAL_ELEM_ZERO_INFLIGHT;
@@ -1669,13 +1708,10 @@ spdk_md_journal_submit_zeroes(struct spdk_bs_md_journal *jr)
 			superseded++;
 			bs_batch_write_zeroes_dev(batch, journal_lba, lba_count);
 		}
-
-		zero_batch->items[zero_batch->elem_count++] = elem;
 	}
 
-	MDJ_IO_NOTICELOG("md_journal: ZERO batch start (phase 1): drain_gen=%u elements=%u "
-		         "superseded=%u newest=%u\n", gen, zero_batch->elem_count, superseded,
-		         zero_batch->elem_count - superseded);
+	MDJ_IO_NOTICELOG("md_journal: ZERO batch start (phase 1): elements=%u superseded=%u newest=%u\n",
+		         zero_batch->elem_count, superseded, zero_batch->elem_count - superseded);
 
 	jr->active_zero_batch = true;
 
@@ -2639,21 +2675,15 @@ bs_md_journal_reset(struct spdk_bs_md_journal *jr)
 
 
 
-	/*
-	 * Requests in wait_queue have no element and no seq yet; they were
-	 * queued while the recovery ran and are admitted by the poller with
-	 * the new generation.
-	 */
 	md_journal_complete_home_waiters(jr, 0);
-	// /*
-	//  * There must not be requests waiting for journal slots.
-	//  * The caller must stop admission before performing the
-	//  * update/failover scan and reset.
-	//  */
-	// if (!TAILQ_EMPTY(&jr->wait_queue)) {
-	// 	SPDK_ERRLOG("Cannot reset MD journal: wait queue is not empty\n");
-	// 	return -EBUSY;
-	// }
+
+	/*
+	 * Requests in wait_queue were queued before this recovery: a paused
+	 * journal rejects new writes, and recovery runs paused. They hold
+	 * page contents from before the last leadership change, so admitting
+	 * them now would write old pages over newer ones. Fail them instead.
+	 */
+	md_journal_fail_waiting(jr, "stale at journal reset");
 
 	/*
 	 * At this point recovery/update must already have processed
@@ -2801,7 +2831,6 @@ bs_md_journal_create(struct spdk_blob_store *bs, uint64_t md_journal_mask_start,
 	jr->next_seq = 1;
 	jr->next_home_seq = 1;
 	jr->home_durable_seq = 0;
-	jr->next_drain_gen = 0;
 	jr->free_count = 0;
 	jr->journal_inflight = 0;
 
@@ -2883,6 +2912,8 @@ md_journal_pause_msg(void *arg)
 	/* 0 -> 0 set-leader call after an examine: the examine result is not needed. */
 	md_journal_examine_drop(jr, "not leader");
 	md_journal_complete_home_waiters(jr, -EIO);
+	/* The drain poller is idle while paused, so fail the queued writes here. */
+	md_journal_fail_waiting(jr, "leadership lost");
 }
 
 /*

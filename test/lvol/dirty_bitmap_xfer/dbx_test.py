@@ -224,11 +224,13 @@ def main():
                                            "name": "mallocA"})
         rpc(SOCK_A, "bdev_lvol_create_lvstore",
             {"bdev_name": "mallocA", "lvs_name": "lvsA", "cluster_sz": CLUSTER_SZ})
+        # leadership first: a volume starts dirty tracking only when it is
+        # opened on a leading lvstore
+        rpc(SOCK_A, "bdev_lvol_set_leader_all",
+            {"lvs_name": "lvsA", "lvs_leadership": True, "bs_nonleadership": False})
         rpc(SOCK_A, "bdev_lvol_create",
             {"lvol_name": "volA", "size_in_mib": VOL_MIB, "lvs_name": "lvsA",
              "thin_provision": True})
-        rpc(SOCK_A, "bdev_lvol_set_leader_all",
-            {"lvs_name": "lvsA", "lvs_leadership": True, "bs_nonleadership": False})
         # the transfer helper pollers run on lvs POLL GROUPS; without them the
         # ready_ring is never drained and every request times out
         rpc(SOCK_A, "bdev_lvol_create_poller_group", {"cpu_mask": "0x0C"})
@@ -295,7 +297,10 @@ def main():
         rpc(SOCK_A, "bdev_lvol_transfer",
             {"lvol_name": "lvsA/S2", "offset": 0, "cluster_batch": 8,
              "gateway": "hubrn1", "operation": "replicate", "lvol_id": map_id,
-             "allow_partial": True})
+             "allow_partial": True,
+             # the delta applies on top of S1, which the landing volume holds
+             "partial_base": rpc(SOCK_A, "bdev_get_bdevs", {"name": "lvsA/S1"})[0]
+             ["driver_specific"]["lvol"]["blobid"]})
         st2 = wait_transfer_done(SOCK_A, "lvsA/S2")
         print(f"    partial transfer stat: {st2}")
         assert st2["partial_reqs"] > 0, f"partial transfer did not use the bitmap: {st2}"

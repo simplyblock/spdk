@@ -121,7 +121,6 @@ typedef void (*bs_md_journal_batch_cb)(spdk_bs_sequence_t *seq, void *cb_arg, in
 struct md_journal_elem {
 
 	uint32_t slot;
-	uint32_t drain_gen;
 	/*
 	 * Logical ordering number.
 	 *
@@ -256,7 +255,6 @@ struct spdk_bs_md_journal {
 	uint64_t journal_mask_len;
 	uint32_t blocks_per_page;
 	uint32_t blocks_per_entry;
-	uint32_t next_drain_gen;
 	/*
 	 * Sequence assigned to the next admitted metadata write.
 	 */
