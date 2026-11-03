@@ -6130,8 +6130,12 @@ xfer_build_alloc_cmd(struct spdk_lvs_xfer *xfer, void *buf)
 		/* Partial clusters too: the destination receives only their dirty
 		 * blocks into the fresh cluster, records them in the landing blob's
 		 * own dirty generation, and fills the rest from the base once, at
-		 * the end (spdk_blob_merge_base) -- not by a CoW per request. */
-		if (xfer->clusters[xfer->alloc_next] != 0) {
+		 * the end (spdk_blob_merge_base) -- not by a CoW per request.
+		 * With cow_landing a partial cluster is NOT allocated here: its first
+		 * range write CoWs it from the base the landing blob is chained to
+		 * (a page copy with copy offload), and no merge follows. */
+		if (xfer->clusters[xfer->alloc_next] != 0 &&
+		    !(xfer->cow_landing && xfer->partial != NULL && xfer->partial[xfer->alloc_next])) {
 			ep = xfer->alloc_next / SPDK_BLOB_CLUSTERS_PER_EXTENT_PAGE;
 			if (n > 0 && ep != last_ep &&
 			    SPDK_LVOL_XFER_CMD_MAX_ENTRIES - n < SPDK_BLOB_CLUSTERS_PER_EXTENT_PAGE) {
@@ -8308,7 +8312,7 @@ spdk_lvol_transfer_delay(void *ctx) {
 int
 spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_batch, enum xfer_type type,
 				struct spdk_transfer_dev *tdev, const char *snapshot_name, uint32_t lvol_id,
-				uint8_t priority_class, bool allow_partial, uint64_t partial_base,
+				uint8_t priority_class, bool allow_partial, uint64_t partial_base, bool cow_landing,
 				spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg) {
 	struct spdk_lvs_xfer *xfer, *task;	
 	struct spdk_lvol_store *lvs = lvol->lvol_store;	
@@ -8411,6 +8415,7 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
 	/* Decided before the request buffers are sized: a partial task sends
 	 * every cluster in requests of at most XFER_PARTIAL_MAX_BYTES. */
 	if (allow_partial) {
+		task->cow_landing = cow_landing;
 		xfer_setup_partial(task, offset, partial_base);
 	}
 

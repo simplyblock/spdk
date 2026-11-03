@@ -751,6 +751,94 @@ xfer_partial_alloc_includes_partial_clusters(void)
 	blob_dirty_gen_free(gen);
 }
 
+/* cow_landing: a partial cluster is NOT pre-allocated on the destination (its
+ * first range write CoWs it from the base the landing blob is chained to, no
+ * merge after); whole clusters still are. */
+static void
+xfer_cow_landing_alloc_skips_partial_clusters(void)
+{
+	const int alloc[3] = {1, 1, 1};
+	struct blob_dirty_gen *gen = make_gen_012();
+	struct spdk_lvs_xfer *xfer = make_partial_xfer(1, 3, alloc, gen);
+	struct spdk_lvol_xfer_cmd_hdr *cmd;
+	void *buf = calloc(1, SPDK_LVOL_XFER_CMD_SIZE);
+
+	SPDK_CU_ASSERT_FATAL(buf != NULL && xfer->allow_partial);
+	xfer->cow_landing = true;
+	xfer_classify_partial(xfer);
+	CU_ASSERT(xfer->partial[1] == 1);
+
+	CU_ASSERT(xfer_build_alloc_cmd(xfer, buf) == 2);
+	cmd = buf;
+	CU_ASSERT(cmd->count == 2);
+	CU_ASSERT(cmd->entries[0] == 0);
+	CU_ASSERT(cmd->entries[1] == 2);
+	CU_ASSERT(xfer_build_alloc_cmd(xfer, buf) == 0);	/* nothing left */
+
+	free(buf);
+	free_partial_xfer(xfer);
+	blob_dirty_gen_free(gen);
+}
+
+/* cow_landing with only partial clusters: no alloc command at all. */
+static void
+xfer_cow_landing_all_partial_allocates_nothing(void)
+{
+	const int alloc[1] = {1};
+	struct blob_dirty_gen *gen = blob_dirty_gen_create(UT_CLUSTER_SZ);
+	struct spdk_lvs_xfer *xfer;
+	void *buf = calloc(1, SPDK_LVOL_XFER_CMD_SIZE);
+
+	SPDK_CU_ASSERT_FATAL(gen != NULL && buf != NULL);
+	blob_dirty_mark(gen, 8192, 8192);
+	xfer = make_partial_xfer(1, 1, alloc, gen);
+	SPDK_CU_ASSERT_FATAL(xfer->allow_partial);
+	xfer->cow_landing = true;
+	xfer_classify_partial(xfer);
+	CU_ASSERT(xfer->partial[0] == 1);
+	CU_ASSERT(xfer_build_alloc_cmd(xfer, buf) == 0);
+
+	/* Without cow_landing the same cluster is pre-allocated. */
+	xfer->cow_landing = false;
+	xfer->alloc_next = 0;
+	CU_ASSERT(xfer_build_alloc_cmd(xfer, buf) == 1);
+
+	free(buf);
+	free_partial_xfer(xfer);
+	blob_dirty_gen_free(gen);
+}
+
+/* cow_landing changes only the alloc commands: the partial cluster's dirty
+ * ranges are still sent, exactly as without it. */
+static void
+xfer_cow_landing_still_sends_partial_ranges(void)
+{
+	const int alloc[3] = {1, 1, 1};
+	struct blob_dirty_gen *gen = make_gen_012();
+	struct spdk_lvs_xfer *xfer = make_partial_xfer(128, 3, alloc, gen);
+	struct spdk_lvs_xfer_req *req;
+	uint32_t n = 0, in_c1 = 0;
+
+	xfer->cow_landing = true;
+	xfer_classify_partial(xfer);
+	xfer->state = XFER_STATE_TRANSFER_CLUSTERS;
+	xfer_replication(xfer);
+
+	while (spdk_ring_dequeue(xfer->ready_ring, (void **)&req, 1) == 1) {
+		if (req->offset >= UT_PPC && req->offset < 2 * UT_PPC) {
+			in_c1++;
+			CU_ASSERT(req->offset == UT_PPC + 2 || req->offset == UT_PPC + 256 ||
+				  req->offset == UT_PPC + 272);
+		}
+		n++;
+	}
+	CU_ASSERT(in_c1 == 3);
+	CU_ASSERT(n == 2 * (UT_PPC / 16) + 3);
+
+	free_partial_xfer(xfer);
+	blob_dirty_gen_free(gen);
+}
+
 /* In a partial task every request is at most 64 KiB (16 pages), marked
  * partial: a partial cluster's coalesced dirty ranges, and whole clusters as
  * one range over all of them -- so a deep window costs no more buffer memory
@@ -970,6 +1058,9 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, xfer_replicate_write_failure_fails_the_request);
 	CU_ADD_TEST(suite, xfer_partial_setup_gates);
 	CU_ADD_TEST(suite, xfer_partial_alloc_includes_partial_clusters);
+	CU_ADD_TEST(suite, xfer_cow_landing_alloc_skips_partial_clusters);
+	CU_ADD_TEST(suite, xfer_cow_landing_all_partial_allocates_nothing);
+	CU_ADD_TEST(suite, xfer_cow_landing_still_sends_partial_ranges);
 	CU_ADD_TEST(suite, xfer_partial_dispatch_splits_ranges);
 	CU_ADD_TEST(suite, xfer_partial_and_resumed_requests_write_zeroes);
 	CU_ADD_TEST(suite, xfer_resume_offset_is_lowest_not_done);

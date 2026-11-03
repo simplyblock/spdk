@@ -387,7 +387,7 @@ struct spdk_transfer_dev *spdk_open_rmt_bdev(const char *name, struct spdk_lvol_
 int spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_batch,
 				enum xfer_type type, struct spdk_transfer_dev *tdev, const char *snapshot_name,
 				uint32_t lvol_id, uint8_t priority_class,
-				bool allow_partial, uint64_t partial_base,
+				bool allow_partial, uint64_t partial_base, bool cow_landing,
 				spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
 typedef void (*spdk_lvol_merge_complete)(void *cb_arg, const struct spdk_blob_merge_stats *stats,
 		int lvolerrno);

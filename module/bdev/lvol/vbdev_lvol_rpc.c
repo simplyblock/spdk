@@ -3968,7 +3968,7 @@ rpc_bdev_lvol_transfer_final_step(struct spdk_jsonrpc_request *request,
 	/* Class 0: the final step moves the volume that carries client IO next,
 	 * so its reads keep the volume's own class. */
 	rc = spdk_lvol_transfer(lvol, 0, req.cluster_batch, type, tdev, req.snapshot_name, req.lvol_id, 0,
-				false, 0, rpc_bdev_lvol_transfer_final_step_cb, request);
+				false, 0, false, rpc_bdev_lvol_transfer_final_step_cb, request);
 	if (rc < 0) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 spdk_strerror(-rc));
@@ -4168,6 +4168,7 @@ struct rpc_bdev_lvol_transfer {
 	char *gateway;
 	char *operation;
 	bool allow_partial;
+	bool cow_landing;
 	/* blob id of the snapshot whose copy the destination's landing volume
 	 * was cloned from; a partial transfer only runs on a generation that
 	 * started at exactly that snapshot */
@@ -4191,6 +4192,7 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_transfer_decoders[] =
 	{"operation", offsetof(struct rpc_bdev_lvol_transfer, operation), spdk_json_decode_string},
 	{"lvol_id", offsetof(struct rpc_bdev_lvol_transfer, lvol_id), spdk_json_decode_uint32, true},
 	{"allow_partial", offsetof(struct rpc_bdev_lvol_transfer, allow_partial), spdk_json_decode_bool, true},
+	{"cow_landing", offsetof(struct rpc_bdev_lvol_transfer, cow_landing), spdk_json_decode_bool, true},
 	{"partial_base", offsetof(struct rpc_bdev_lvol_transfer, partial_base), spdk_json_decode_uint64, true},
 	{"special_io", offsetof(struct rpc_bdev_lvol_transfer, special_io), spdk_json_decode_bool, true},
 	{"priority_class", offsetof(struct rpc_bdev_lvol_transfer, priority_class), spdk_json_decode_uint32, true},
@@ -4274,8 +4276,11 @@ rpc_bdev_lvol_transfer(struct spdk_jsonrpc_request *request,
 			       req.special_io ? "special_io" : "no partial_base");
 		req.allow_partial = false;
 	}
+	if (!req.allow_partial) {
+		req.cow_landing = false;
+	}
 	rc = spdk_lvol_transfer(lvol, req.offset, req.cluster_batch, type, tdev, NULL, req.lvol_id,
-				(uint8_t)req.priority_class, req.allow_partial, req.partial_base,
+				(uint8_t)req.priority_class, req.allow_partial, req.partial_base, req.cow_landing,
 				NULL, NULL);
 	if (rc < 0) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,

@@ -405,7 +405,7 @@ def bdev_lvol_batch_transfer_final_step(client, lvol_names=None, ids=None, snaps
     return client.call('bdev_lvol_batch_transfer_final_step', params)
 
 def bdev_lvol_transfer(client, lvol_name=None, lvol_id=0, offset=0, cluster_batch=16, gateway=None, operation=None,
-                       priority_class=0, allow_partial=False, partial_base=0):
+                       priority_class=0, allow_partial=False, partial_base=0, cow_landing=False):
     """Replicate a logical volume on a logical volume store.
 
     Args:
@@ -421,6 +421,8 @@ def bdev_lvol_transfer(client, lvol_name=None, lvol_id=0, offset=0, cluster_batc
             (optional). The destination's landing volume must be a clone of
             the copy of the snapshot named by partial_base.
         partial_base: blob id of that snapshot (required with allow_partial)
+        cow_landing: with allow_partial, do not pre-allocate partial clusters on the
+            destination: their first write CoWs from the base (copy offload), no merge
     """
     if not lvol_name:
         raise ValueError("lvol_name must be specified")
@@ -438,6 +440,8 @@ def bdev_lvol_transfer(client, lvol_name=None, lvol_id=0, offset=0, cluster_batc
         params['priority_class'] = priority_class
     if allow_partial:
         params['allow_partial'] = True
+        if cow_landing:
+            params['cow_landing'] = True
         params['partial_base'] = partial_base
     return client.call('bdev_lvol_transfer', params)
 
