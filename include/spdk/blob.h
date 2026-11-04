@@ -352,6 +352,9 @@ struct spdk_bs_dev {
 
 	bool (*is_degraded)(struct spdk_bs_dev *dev);
 
+	/* Optional. Copy domain of an lba; copy can only be offloaded within one domain. */
+	uint32_t (*get_copy_domain)(struct spdk_bs_dev *dev, uint64_t lba);
+
 	uint64_t	blockcnt;
 	uint32_t	blocklen; /* In bytes */
 };
@@ -570,6 +573,12 @@ struct spdk_blob_merge_stats {
 typedef void (*spdk_blob_merge_complete)(void *cb_arg, const struct spdk_blob_merge_stats *stats,
 		int bserrno);
 void spdk_blob_merge_base(struct spdk_blob *blob, spdk_blob_merge_complete cb_fn, void *cb_arg);
+/* The same, with every read of the base and write of the blob in IO priority
+ * class \p priority_class (0..MAX_PRIORITY_CLASS), or the blobs' own classes
+ * for -1. The merge is part of a replication: it runs in the replication's
+ * class, like the transfer it completes. */
+void spdk_blob_merge_base_ext(struct spdk_blob *blob, int priority_class,
+			      spdk_blob_merge_complete cb_fn, void *cb_arg);
 
 bool spdk_blob_get_offset_allocate(struct spdk_blob *blob, uint64_t offset);
 bool spdk_blob_check_offset_valid(struct spdk_blob *blob, uint64_t offset, uint64_t length);
@@ -1412,6 +1421,20 @@ void spdk_blob_io_read(struct spdk_blob *blob, struct spdk_io_channel *channel,
 void spdk_blob_io_read_with_priority(struct spdk_blob *blob, struct spdk_io_channel *channel,
 				     void *payload, uint64_t offset, uint64_t length,
 				     int priority_class, spdk_blob_op_complete cb_fn, void *cb_arg);
+
+/**
+ * Write to a blob in a given IO priority class; see
+ * spdk_blob_io_read_with_priority(). A write that has to allocate its cluster
+ * first runs in the blob's own class.
+ */
+void spdk_blob_io_write_with_priority(struct spdk_blob *blob, struct spdk_io_channel *channel,
+					      void *payload, uint64_t offset, uint64_t length, int priority_class,
+					      spdk_blob_op_complete cb_fn, void *cb_arg);
+
+/** Write zeroes to a blob in a given IO priority class; see spdk_blob_io_write_with_priority(). */
+void spdk_blob_io_write_zeroes_with_priority(struct spdk_blob *blob, struct spdk_io_channel *channel,
+						     uint64_t offset, uint64_t length, int priority_class,
+						     spdk_blob_op_complete cb_fn, void *cb_arg);
 
 /**
  * Write the data described by 'iov' to 'length' io_units beginning at 'offset' io_units

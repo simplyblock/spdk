@@ -200,15 +200,52 @@ blob_insert_cluster(struct spdk_blob *blob, uint32_t cluster_num, uint64_t clust
 	return 0;
 }
 
+/* Upper bound of free clusters inspected when looking for one in a given copy domain. */
+#define BS_COPY_DOMAIN_SCAN_MAX 1024
+
+/*
+ * Claim a free cluster in the given copy domain of the underlying device, so that
+ * a cluster copy can be offloaded (e.g. stays on one raid0 leg). Falls back to any
+ * free cluster.
+ */
+static uint32_t
+bs_claim_cluster_in_copy_domain(struct spdk_blob_store *bs, uint32_t copy_domain)
+{
+	uint32_t cluster_num = 0;
+	int i;
+
+	assert(spdk_spin_held(&bs->used_lock));
+
+	for (i = 0; i < BS_COPY_DOMAIN_SCAN_MAX; i++) {
+		cluster_num = spdk_bit_pool_find_free_bit(bs->used_clusters, cluster_num);
+		if (cluster_num == UINT32_MAX) {
+			break;
+		}
+		if (bs->dev->get_copy_domain(bs->dev, bs_cluster_to_lba(bs, cluster_num)) == copy_domain) {
+			spdk_bit_pool_allocate_specific_bit(bs->used_clusters, cluster_num);
+			bs->num_free_clusters--;
+			return cluster_num;
+		}
+		cluster_num++;
+	}
+
+	return bs_claim_cluster(bs);
+}
+
 static int
-bs_allocate_cluster(struct spdk_blob *blob, uint32_t cluster_num,
-		    uint64_t *cluster, uint32_t *lowest_free_md_page, bool update_map)
+bs_allocate_cluster_in_copy_domain(struct spdk_blob *blob, uint32_t cluster_num,
+				   uint64_t *cluster, uint32_t *lowest_free_md_page, bool update_map,
+				   uint32_t copy_domain)
 {
 	uint32_t *extent_page = 0;
 
 	assert(spdk_spin_held(&blob->bs->used_lock));
 
-	*cluster = bs_claim_cluster(blob->bs);
+	if (copy_domain != UINT32_MAX && blob->bs->dev->get_copy_domain != NULL) {
+		*cluster = bs_claim_cluster_in_copy_domain(blob->bs, copy_domain);
+	} else {
+		*cluster = bs_claim_cluster(blob->bs);
+	}
 	if (*cluster == UINT32_MAX) {
 		/* No more free clusters. Cannot satisfy the request */
 		return -ENOSPC;
@@ -244,6 +281,14 @@ bs_allocate_cluster(struct spdk_blob *blob, uint32_t cluster_num,
 	}
 
 	return 0;
+}
+
+static int
+bs_allocate_cluster(struct spdk_blob *blob, uint32_t cluster_num,
+		    uint64_t *cluster, uint32_t *lowest_free_md_page, bool update_map)
+{
+	return bs_allocate_cluster_in_copy_domain(blob, cluster_num, cluster, lowest_free_md_page,
+			update_map, UINT32_MAX);
 }
 
 node_role_t
@@ -4246,6 +4291,34 @@ blob_can_copy(struct spdk_blob *blob, uint64_t cluster_start_page, uint64_t *bas
 }
 
 static void
+blob_copy_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct spdk_blob_copy_cluster_ctx *ctx = cb_arg;
+	struct spdk_blob *blob = ctx->blob;
+
+	if (bserrno == 0) {
+		blob_write_copy_cpl(seq, cb_arg, 0);
+		return;
+	}
+
+	/* The copy could not be offloaded (e.g. source and destination on different
+	 * raid0 legs), fall back to reading and writing the whole cluster. */
+	SPDK_DEBUGLOG(blob, "Cluster copy failed (%d), falling back to read/write\n", bserrno);
+	/* The fallback reuses this request set. bs_sequence_completion left the
+	 * copy's error in it, and the fallback's batches only ever set an error,
+	 * never clear one: without this the fallback completes with the stale
+	 * error even when all of its reads and writes succeeded, and the client
+	 * IO fails (the lvol layer then drops leadership of the lvstore). */
+	((struct spdk_bs_request_set *)seq)->bserrno = 0;
+	if (blob_cow_bufs_alloc(ctx, blob->back_bs_dev->blocklen) != 0) {
+		bs_sequence_finish(seq, -ENOMEM);
+		return;
+	}
+
+	blob_cow_read(ctx);
+}
+
+static void
 blob_copy(struct spdk_blob_copy_cluster_ctx *ctx, spdk_bs_user_op_t *op, uint64_t src_lba)
 {
 	struct spdk_blob *blob = ctx->blob;
@@ -4256,7 +4329,7 @@ blob_copy(struct spdk_blob_copy_cluster_ctx *ctx, spdk_bs_user_op_t *op, uint64_
 			     bs_cluster_to_lba(blob->bs, ctx->new_cluster),
 			     src_lba,
 			     lba_count,
-			     blob_write_copy_cpl, ctx);
+			     blob_copy_cpl, ctx);
 }
 
 static void
@@ -4342,8 +4415,10 @@ bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 	}
 
 	spdk_spin_lock(&blob->bs->used_lock);
-	rc = bs_allocate_cluster(blob, cluster_number, &ctx->new_cluster, &ctx->new_extent_page,
-				 false);
+	rc = bs_allocate_cluster_in_copy_domain(blob, cluster_number, &ctx->new_cluster,
+						&ctx->new_extent_page, false,
+						can_copy && blob->bs->dev->get_copy_domain != NULL ?
+						blob->bs->dev->get_copy_domain(blob->bs->dev, copy_src_lba) : UINT32_MAX);
 	spdk_spin_unlock(&blob->bs->used_lock);
 	if (rc != 0) {
 		blob_cow_bufs_free(ctx);
@@ -4749,6 +4824,7 @@ struct blob_merge_ctx {
 	bool				pumping;
 	bool				repump;
 	struct spdk_blob_merge_stats	stats;
+	int				priority_class;	/* of every read and write, or -1 */
 	struct blob_merge_op		ops[BLOB_MERGE_QD];
 	spdk_blob_merge_complete	cb_fn;
 	void				*cb_arg;
@@ -4867,8 +4943,8 @@ blob_merge_read_cpl(void *cb_arg, int bserrno)
 		blob_merge_op_done(op, bserrno);
 		return;
 	}
-	spdk_blob_io_write(ctx->blob, ctx->ch, op->buf, op->offset, op->length,
-			   blob_merge_write_cpl, op);
+	spdk_blob_io_write_with_priority(ctx->blob, ctx->ch, op->buf, op->offset, op->length,
+				 ctx->priority_class, blob_merge_write_cpl, op);
 }
 
 static void
@@ -4905,11 +4981,12 @@ blob_merge_issue(struct blob_merge_ctx *ctx)
 		ctx->inflight++;
 		if (ctx->parent == NULL) {
 			/* no parent: the base reads zeroes, and a fresh cluster need not */
-			spdk_blob_io_write_zeroes(ctx->blob, ctx->ch, op->offset, op->length,
-						  blob_merge_write_cpl, op);
+			spdk_blob_io_write_zeroes_with_priority(ctx->blob, ctx->ch, op->offset, op->length,
+						ctx->priority_class, blob_merge_write_cpl, op);
 		} else {
-			spdk_blob_io_read(ctx->parent, ctx->ch, op->buf, op->offset, op->length,
-					  blob_merge_read_cpl, op);
+			spdk_blob_io_read_with_priority(ctx->parent, ctx->ch, op->buf, op->offset,
+					op->length, ctx->priority_class,
+					blob_merge_read_cpl, op);
 		}
 	}
 }
@@ -4917,12 +4994,23 @@ blob_merge_issue(struct blob_merge_ctx *ctx)
 void
 spdk_blob_merge_base(struct spdk_blob *blob, spdk_blob_merge_complete cb_fn, void *cb_arg)
 {
+	spdk_blob_merge_base_ext(blob, -1, cb_fn, cb_arg);
+}
+
+void
+spdk_blob_merge_base_ext(struct spdk_blob *blob, int priority_class,
+			 spdk_blob_merge_complete cb_fn, void *cb_arg)
+{
 	struct spdk_blob_store *bs = blob->bs;
 	struct blob_merge_ctx *ctx;
 	struct spdk_blob_merge_stats none = {};
 	struct blob_dirty_gen *gen = blob->dirty_gen;
 	struct spdk_blob *parent = NULL;
 
+	if (priority_class > MAX_PRIORITY_CLASS) {
+		cb_fn(cb_arg, &none, -EINVAL);
+		return;
+	}
 	if (blob->data_ro) {
 		cb_fn(cb_arg, &none, -EPERM);
 		return;
@@ -4963,6 +5051,7 @@ spdk_blob_merge_base(struct spdk_blob *blob, spdk_blob_merge_complete cb_fn, voi
 	ctx->gen = gen;
 	ctx->cb_fn = cb_fn;
 	ctx->cb_arg = cb_arg;
+	ctx->priority_class = priority_class;
 	ctx->nbits = gen->bits_per_cluster;
 	ctx->nwords = gen->words_per_cluster;
 	ctx->units_per_block = SPDK_BLOB_DIRTY_BLOCK_SZ / bs->io_unit_size;
@@ -5171,6 +5260,11 @@ blob_request_submit_op_single(struct spdk_io_channel *_ch, struct spdk_blob *blo
 			if (!batch) {
 				cb_fn(cb_arg, -ENOMEM);
 				return;
+			}
+			if (priority_class >= 0) {
+				/* Only this write, as for a read above. A write that has to
+				 * allocate its cluster first runs in the blob's class. */
+				batch->priority_class = priority_class;
 			}
 
 			if (op_type == SPDK_BLOB_WRITE) {
@@ -15379,7 +15473,8 @@ spdk_blob_alloc_clusters(struct spdk_blob *blob, const uint32_t *clusters, uint3
 			continue;
 		}
 
-		had_ep = *bs_cluster_to_extent_page(blob, idx) != 0;
+		/* without an extent table there are no extent pages to create */
+		had_ep = !blob->use_extent_table || *bs_cluster_to_extent_page(blob, idx) != 0;
 		/* lfmd is not advanced: a claimed md page is no longer clear, so the
 		 * next search skips it (same as blob_resize). */
 		rc = bs_allocate_cluster(blob, idx, &cluster, &lfmd, true);
@@ -15659,6 +15754,32 @@ spdk_blob_io_read_with_priority(struct spdk_blob *blob, struct spdk_io_channel *
 	}
 	blob_request_submit_op(blob, channel, payload, offset, length, cb_fn, cb_arg,
 			       SPDK_BLOB_READ, priority_class);
+}
+
+void
+spdk_blob_io_write_with_priority(struct spdk_blob *blob, struct spdk_io_channel *channel,
+				 void *payload, uint64_t offset, uint64_t length, int priority_class,
+				 spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	if (priority_class > MAX_PRIORITY_CLASS) {
+		cb_fn(cb_arg, -EINVAL);
+		return;
+	}
+	blob_request_submit_op(blob, channel, payload, offset, length, cb_fn, cb_arg,
+			       SPDK_BLOB_WRITE, priority_class);
+}
+
+void
+spdk_blob_io_write_zeroes_with_priority(struct spdk_blob *blob, struct spdk_io_channel *channel,
+					uint64_t offset, uint64_t length, int priority_class,
+					spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	if (priority_class > MAX_PRIORITY_CLASS) {
+		cb_fn(cb_arg, -EINVAL);
+		return;
+	}
+	blob_request_submit_op(blob, channel, NULL, offset, length, cb_fn, cb_arg,
+			       SPDK_BLOB_WRITE_ZEROES, priority_class);
 }
 
 void

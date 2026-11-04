@@ -20,10 +20,12 @@ uint64_t g_dev_write_bytes;
 uint64_t g_dev_read_bytes;
 /* class of the last read the device saw, -1 when it carried no options */
 int g_dev_last_read_priority = -1;
+int g_dev_last_write_priority = -1;
 uint64_t g_dev_copy_bytes;
 bool g_dev_writev_ext_called;
 bool g_dev_readv_ext_called;
 bool g_dev_copy_enabled;
+int g_dev_copy_fail;
 struct spdk_blob_ext_io_opts g_blob_ext_io_opts;
 uint32_t g_phys_blocklen;
 
@@ -162,6 +164,7 @@ dev_write(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payloa
 {
 	uint64_t offset, length;
 
+	g_dev_last_write_priority = bs_io_opts ? bs_io_opts->priority : -1;
 	if (g_power_failure_thresholds.write_threshold != 0) {
 		g_power_failure_counters.write_counter++;
 	}
@@ -361,6 +364,7 @@ dev_write_zeroes(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 {
 	uint64_t offset, length;
 
+	g_dev_last_write_priority = bs_io_opts ? bs_io_opts->priority : -1;
 	if (g_power_failure_thresholds.write_zero_threshold != 0) {
 		g_power_failure_counters.write_zero_counter++;
 	}
@@ -400,6 +404,11 @@ dev_copy(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, uint64_t dst_
 	const void *src = &g_dev_buffer[src_lba * dev->blocklen];
 	uint64_t size = lba_count * dev->blocklen;
 
+	if (g_dev_copy_fail != 0) {
+		/* The base bdev declines the copy (e.g. a distrib page copy at max. chain depth). */
+		cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, g_dev_copy_fail);
+		return;
+	}
 	memcpy(dst, src, size);
 	g_dev_copy_bytes += size;
 

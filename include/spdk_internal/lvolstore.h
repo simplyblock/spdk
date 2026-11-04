@@ -367,6 +367,10 @@ struct spdk_lvs_xfer {
 	 * range_cluster are still to send, range_done blocks of the current one
 	 * already sent, in requests of at most XFER_PARTIAL_MAX_BYTES. */
 	bool allow_partial;
+	/* With allow_partial: partial clusters are not pre-allocated on the
+	 * destination; its first range write CoWs the cluster from the base the
+	 * landing blob is chained to (cheap with copy offload), so no merge. */
+	bool cow_landing;
 	struct blob_dirty_gen *dirty_gen;
 	uint8_t *partial;
 	struct blob_dirty_range *ranges;

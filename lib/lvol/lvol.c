@@ -6130,8 +6130,12 @@ xfer_build_alloc_cmd(struct spdk_lvs_xfer *xfer, void *buf)
 		/* Partial clusters too: the destination receives only their dirty
 		 * blocks into the fresh cluster, records them in the landing blob's
 		 * own dirty generation, and fills the rest from the base once, at
-		 * the end (spdk_blob_merge_base) -- not by a CoW per request. */
-		if (xfer->clusters[xfer->alloc_next] != 0) {
+		 * the end (spdk_blob_merge_base) -- not by a CoW per request.
+		 * With cow_landing a partial cluster is NOT allocated here: its first
+		 * range write CoWs it from the base the landing blob is chained to
+		 * (a page copy with copy offload), and no merge follows. */
+		if (xfer->clusters[xfer->alloc_next] != 0 &&
+		    !(xfer->cow_landing && xfer->partial != NULL && xfer->partial[xfer->alloc_next])) {
 			ep = xfer->alloc_next / SPDK_BLOB_CLUSTERS_PER_EXTENT_PAGE;
 			if (n > 0 && ep != last_ep &&
 			    SPDK_LVOL_XFER_CMD_MAX_ENTRIES - n < SPDK_BLOB_CLUSTERS_PER_EXTENT_PAGE) {
@@ -8308,7 +8312,7 @@ spdk_lvol_transfer_delay(void *ctx) {
 int
 spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_batch, enum xfer_type type,
 				struct spdk_transfer_dev *tdev, const char *snapshot_name, uint32_t lvol_id,
-				uint8_t priority_class, bool allow_partial, uint64_t partial_base,
+				uint8_t priority_class, bool allow_partial, uint64_t partial_base, bool cow_landing,
 				spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg) {
 	struct spdk_lvs_xfer *xfer, *task;	
 	struct spdk_lvol_store *lvs = lvol->lvol_store;	
@@ -8411,6 +8415,7 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
 	/* Decided before the request buffers are sized: a partial task sends
 	 * every cluster in requests of at most XFER_PARTIAL_MAX_BYTES. */
 	if (allow_partial) {
+		task->cow_landing = cow_landing;
 		xfer_setup_partial(task, offset, partial_base);
 	}
 
@@ -8442,6 +8447,7 @@ struct lvol_merge_req {
 	struct spdk_lvol		*lvol;
 	struct spdk_thread		*thread;
 	struct spdk_blob_merge_stats	stats;
+	int				priority_class;
 	int				rc;
 	spdk_lvol_merge_complete	cb_fn;
 	void				*cb_arg;
@@ -8471,7 +8477,7 @@ lvol_merge_base_on_md(void *arg)
 {
 	struct lvol_merge_req *req = arg;
 
-	spdk_blob_merge_base(req->lvol->blob, lvol_merge_base_cpl, req);
+	spdk_blob_merge_base_ext(req->lvol->blob, req->priority_class, lvol_merge_base_cpl, req);
 }
 
 /*
@@ -8483,6 +8489,13 @@ lvol_merge_base_on_md(void *arg)
  */
 void
 spdk_lvol_merge_base(struct spdk_lvol *lvol, spdk_lvol_merge_complete cb_fn, void *cb_arg)
+{
+	spdk_lvol_merge_base_ext(lvol, -1, cb_fn, cb_arg);
+}
+
+void
+spdk_lvol_merge_base_ext(struct spdk_lvol *lvol, int priority_class,
+			 spdk_lvol_merge_complete cb_fn, void *cb_arg)
 {
 	struct spdk_blob_merge_stats none = {};
 	struct lvol_merge_req *req;
@@ -8497,6 +8510,7 @@ spdk_lvol_merge_base(struct spdk_lvol *lvol, spdk_lvol_merge_complete cb_fn, voi
 		return;
 	}
 	req->lvol = lvol;
+	req->priority_class = priority_class;
 	req->thread = spdk_get_thread();
 	req->cb_fn = cb_fn;
 	req->cb_arg = cb_arg;
@@ -8521,7 +8535,7 @@ lvol_merge_job_cpl(void *cb_arg, const struct spdk_blob_merge_stats *stats, int 
  * failed one is started again. The state is read from lvol->merge_state.
  */
 void
-spdk_lvol_merge_base_start(struct spdk_lvol *lvol)
+spdk_lvol_merge_base_start(struct spdk_lvol *lvol, int priority_class)
 {
 	if (lvol->merge_state == LVOL_MERGE_RUNNING || lvol->merge_state == LVOL_MERGE_DONE) {
 		return;
@@ -8531,7 +8545,7 @@ spdk_lvol_merge_base_start(struct spdk_lvol *lvol)
 	lvol->merge_ms = 0;
 	lvol->merge_start_ticks = spdk_get_ticks();
 	lvol->merge_state = LVOL_MERGE_RUNNING;
-	spdk_lvol_merge_base(lvol, lvol_merge_job_cpl, lvol);
+	spdk_lvol_merge_base_ext(lvol, priority_class, lvol_merge_job_cpl, lvol);
 }
 
 int

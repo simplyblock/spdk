@@ -28,6 +28,7 @@ struct io_output {
 	struct iovec                *iovs;
 	int                         iovcnt;
 	void                        *md_buf;
+	uint64_t                    src_offset_blocks; /* COPY only */
 };
 
 struct raid_io_ranges {
@@ -369,6 +370,25 @@ spdk_bdev_unmap_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 
 	set_io_output(output, desc, ch, offset_blocks, num_blocks, cb, cb_arg,
 		      SPDK_BDEV_IO_TYPE_UNMAP, NULL, 0, NULL);
+	g_io_output_index++;
+
+	child_io = get_child_io(output);
+	child_io_complete(child_io, cb, cb_arg);
+
+	return 0;
+}
+
+int
+spdk_bdev_copy_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
+		      uint64_t dst_offset_blocks, uint64_t src_offset_blocks, uint64_t num_blocks,
+		      spdk_bdev_io_completion_cb cb, void *cb_arg)
+{
+	struct io_output *output = &g_io_output[g_io_output_index];
+	struct spdk_bdev_io *child_io;
+
+	set_io_output(output, desc, ch, dst_offset_blocks, num_blocks, cb, cb_arg,
+		      SPDK_BDEV_IO_TYPE_COPY, NULL, 0, NULL);
+	output->src_offset_blocks = src_offset_blocks;
 	g_io_output_index++;
 
 	child_io = get_child_io(output);
@@ -838,6 +858,77 @@ test_unmap_io(void)
 	reset_globals();
 }
 
+/* COPY: passed to the member disk if source and destination are on the same one, each within a strip */
+static void
+test_copy_io(void)
+{
+	struct raid_bdev *raid_bdev;
+	struct raid_bdev_io *raid_io;
+	struct raid_bdev_io_channel *raid_ch;
+	uint8_t n;
+	uint64_t dst_strip, src_strip, nblk;
+	struct {
+		uint64_t dst_strip, src_strip;
+		uint64_t dst_off, src_off, nblk;
+		bool b_ok;
+	} cases[6];
+	int i;
+
+	set_globals();
+
+	raid_bdev = create_raid0();
+	raid_ch = raid_test_create_io_channel(raid_bdev);
+	n = raid_bdev->num_base_bdevs;
+	SPDK_CU_ASSERT_FATAL(n >= 2);
+
+	/* same leg, whole strip */
+	cases[0].dst_strip = 3 * n + 1; cases[0].src_strip = 7 * n + 1; cases[0].dst_off = 0; cases[0].src_off = 0; cases[0].nblk = g_strip_size; cases[0].b_ok = true;
+	/* same leg, part of the strip, different in-strip offsets */
+	cases[1].dst_strip = 2 * n; cases[1].src_strip = 5 * n; cases[1].dst_off = 4; cases[1].src_off = 8; cases[1].nblk = g_strip_size / 2; cases[1].b_ok = true;
+	/* different legs */
+	cases[2].dst_strip = 3 * n; cases[2].src_strip = 3 * n + 1; cases[2].dst_off = 0; cases[2].src_off = 0; cases[2].nblk = g_strip_size; cases[2].b_ok = false;
+	/* destination spans two strips */
+	cases[3].dst_strip = 4 * n; cases[3].src_strip = 6 * n; cases[3].dst_off = 1; cases[3].src_off = 0; cases[3].nblk = g_strip_size; cases[3].b_ok = false;
+	/* source spans two strips */
+	cases[4].dst_strip = 4 * n; cases[4].src_strip = 6 * n; cases[4].dst_off = 0; cases[4].src_off = 1; cases[4].nblk = g_strip_size; cases[4].b_ok = false;
+	/* same strip index on the same leg (different rows of the leg) */
+	cases[5].dst_strip = n - 1; cases[5].src_strip = 9 * n + n - 1; cases[5].dst_off = 0; cases[5].src_off = 0; cases[5].nblk = 1; cases[5].b_ok = true;
+
+	for (i = 0; i < 6; i++) {
+		raid_io = calloc(1, sizeof(*raid_io));
+		SPDK_CU_ASSERT_FATAL(raid_io != NULL);
+		dst_strip = cases[i].dst_strip;
+		src_strip = cases[i].src_strip;
+		nblk = cases[i].nblk;
+		raid_io_initialize(raid_io, raid_ch, raid_bdev, dst_strip * g_strip_size + cases[i].dst_off, nblk,
+				   SPDK_BDEV_IO_TYPE_COPY);
+		raid_io->copy_src_offset_blocks = src_strip * g_strip_size + cases[i].src_off;
+		memset(g_io_output, 0, g_max_base_drives * sizeof(struct io_output));
+		g_io_output_index = 0;
+		g_io_comp_status = 0;
+		raid0_submit_copy_request(raid_io);
+		if (cases[i].b_ok) {
+			CU_ASSERT(g_io_output_index == 1);
+			CU_ASSERT(g_io_output[0].iotype == SPDK_BDEV_IO_TYPE_COPY);
+			CU_ASSERT(g_io_output[0].desc == raid_bdev->base_bdev_info[dst_strip % n].desc);
+			CU_ASSERT(g_io_output[0].ch == raid_bdev_channel_get_base_channel(raid_ch, dst_strip % n));
+			CU_ASSERT(g_io_output[0].offset_blocks == (dst_strip / n) * g_strip_size + cases[i].dst_off);
+			CU_ASSERT(g_io_output[0].src_offset_blocks == (src_strip / n) * g_strip_size + cases[i].src_off);
+			CU_ASSERT(g_io_output[0].num_blocks == nblk);
+			CU_ASSERT(g_io_comp_status == true);
+		} else {
+			CU_ASSERT(g_io_output_index == 0);
+			CU_ASSERT(g_io_comp_status == false);
+		}
+		raid_io_cleanup(raid_io);
+	}
+
+	raid_test_destroy_io_channel(raid_ch);
+	delete_raid0(raid_bdev);
+
+	reset_globals();
+}
+
 /* Test IO failures */
 static void
 test_io_failure(void)
@@ -886,6 +977,7 @@ main(int argc, char **argv)
 		{ "test_write_io", test_write_io },
 		{ "test_read_io", test_read_io },
 		{ "test_unmap_io", test_unmap_io },
+		{ "test_copy_io", test_copy_io },
 		{ "test_io_failure", test_io_failure },
 		CU_TEST_INFO_NULL,
 	};

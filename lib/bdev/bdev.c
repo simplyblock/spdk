@@ -5335,6 +5335,16 @@ spdk_bdev_get_max_copy(const struct spdk_bdev *bdev)
 	return bdev->max_copy;
 }
 
+uint32_t
+spdk_bdev_get_copy_domain(struct spdk_bdev *bdev, uint64_t offset_blocks)
+{
+	if (bdev->fn_table->get_copy_domain == NULL) {
+		return 0;
+	}
+
+	return bdev->fn_table->get_copy_domain(bdev->ctxt, offset_blocks);
+}
+
 uint64_t
 spdk_bdev_get_qd(const struct spdk_bdev *bdev)
 {
