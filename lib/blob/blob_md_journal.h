@@ -380,4 +380,19 @@ int md_journal_confirm_home_drain(struct spdk_bs_md_journal *jr, uint64_t target
 
 uint64_t bs_md_journal_next_seq_num(struct spdk_bs_md_journal *jr);
 
+/*
+ * Direct HOME write-through of a journaled page (see blob_persist_start()).
+ *
+ * bs_md_journal_home_direct_ok(): the journal is in a state where such a
+ * write-through is meaningful (not examine / paused / failed / stopping).
+ *
+ * bs_md_journal_home_pending(): some entry already admitted (or queued for
+ * admission) targets lba and has not reached HOME yet. A write issued now
+ * gets a newer sequence than all of them, so its direct HOME copy would be
+ * overwritten with older content when the ordered drain homes them; the
+ * caller must then not write through but wait for the HOME barrier.
+ */
+bool bs_md_journal_home_direct_ok(struct spdk_bs_md_journal *jr);
+bool bs_md_journal_home_pending(struct spdk_bs_md_journal *jr, uint64_t lba);
+
 #endif /* SPDK_BLOB_MD_JOURNAL_H */

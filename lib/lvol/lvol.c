@@ -5184,6 +5184,32 @@ fragment_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
  * destination writes (XFER_MAX_WRITE_BYTES) each. */
 #define XFER_PARTIAL_MAX_BYTES	(64 * 1024)
 
+/* A cluster of a partial transfer whose dirty share is at least this many
+ * percent is sent as one whole-cluster request instead of its dirty ranges
+ * (each range is a request of at most XFER_PARTIAL_MAX_BYTES through a
+ * window of cluster_batch requests; a mostly-dirty cluster costs more that
+ * way than its 2 MiB in one request). 100: only fully dirty clusters;
+ * 0: every cluster whole. Set with spdk_lvol_set_xfer_whole_cluster_pct()
+ * (RPC bdev_lvol_set_xfer_whole_cluster_pct). */
+#define XFER_WHOLE_CLUSTER_PCT_DEFAULT	50
+static uint32_t g_lvs_xfer_whole_cluster_pct = XFER_WHOLE_CLUSTER_PCT_DEFAULT;
+
+int
+spdk_lvol_set_xfer_whole_cluster_pct(uint32_t pct)
+{
+	if (pct > 100) {
+		return -EINVAL;
+	}
+	g_lvs_xfer_whole_cluster_pct = pct;
+	return 0;
+}
+
+uint32_t
+spdk_lvol_get_xfer_whole_cluster_pct(void)
+{
+	return g_lvs_xfer_whole_cluster_pct;
+}
+
 /*
  * Write the request's payload (the cluster, already read whole) to the remote
  * device:
@@ -5842,6 +5868,7 @@ destroy_xfer_task_tmo(void *arg) {
 		free(xfer->old_clusters);
 	free(xfer->ranges);
 	free(xfer->partial);
+	free(xfer->bridged);
 	/* release the pinned dirty generation (no-op when NULL) */
 	spdk_blob_dirty_gen_unref(xfer->dirty_gen);
 	xfer->dirty_gen = NULL;
@@ -6281,12 +6308,107 @@ xfer_resume_offset(struct spdk_lvs_xfer *xfer, const struct spdk_lvs_xfer_req *d
  * that the landing volume really is a clone of the base's copy -- the caller
  * (the control plane) must guarantee before passing allow_partial.
  */
+/* Snapshots between the destination's base and the generation's base that a
+ * bridged delta tolerates (each adds its owned clusters, sent whole). */
+#define XFER_BRIDGE_MAX_HOPS	16
+
+/*
+ * The generation started on gen_base, a LATER snapshot of the same lvol than
+ * partial_base, the one the destination holds a copy of: snapshots were taken
+ * between the two (a snapshot RPC that timed out at the control plane and was
+ * retried, a predecessor the control plane did not replicate, ...). The
+ * generation's base is always the snapshot directly below it in the chain
+ * at the time it rotated (bs_snapshot_swap_cluster_maps), so the chain walk
+ * gen_base -> parent -> ... reaches partial_base iff it is still present.
+ *
+ * Then a delta against partial_base is still exact: the snapshot's content
+ * differs from partial_base's exactly in (a) the blocks this generation
+ * marked dirty, and (b) every cluster one of the in-between snapshots owns
+ * (gen_base included, partial_base excluded); (b) is sent whole, read through
+ * the snapshot, since those snapshots' own generations may be gone (family
+ * cap). Fills xfer->bridged with (b). Every in-between snapshot must be open
+ * on this node (an lvol of the lvolstore); false otherwise, and the caller
+ * sends full clusters as before.
+ */
+static bool
+xfer_bridge_partial_base(struct spdk_lvs_xfer *xfer, spdk_blob_id gen_base, uint64_t partial_base)
+{
+	struct spdk_lvol_store *lvs = xfer->lvol->lvol_store;
+	struct spdk_lvol *lvol;
+	uint64_t *owned;
+	spdk_blob_id id = gen_base;
+	uint32_t hops = 0, i;
+	uint64_t whole = 0;
+	int count = 0;
+
+	owned = calloc(xfer->num_clusters, sizeof(*owned));
+	xfer->bridged = calloc(xfer->num_clusters, sizeof(*xfer->bridged));
+	if (owned == NULL || xfer->bridged == NULL) {
+		goto fail;
+	}
+
+	while (id != (spdk_blob_id)partial_base) {
+		if (id == SPDK_BLOBID_INVALID || id == SPDK_BLOBID_EXTERNAL_SNAPSHOT ||
+		    hops >= XFER_BRIDGE_MAX_HOPS) {
+			goto fail;
+		}
+		TAILQ_FOREACH(lvol, &lvs->lvols, link) {
+			if (lvol->blob_id == id) {
+				break;
+			}
+		}
+		if (lvol == NULL || lvol->blob == NULL) {
+			goto fail;
+		}
+		/* fills only entries still 0: the union of what the chain owns */
+		spdk_blob_scan_used_clusters(lvol->blob, owned, xfer->num_clusters, &count);
+		id = spdk_blob_get_parent_snapshot(lvs->blobstore, id);
+		hops++;
+	}
+
+	for (i = 0; i < xfer->num_clusters; i++) {
+		if (owned[i] != 0) {
+			xfer->bridged[i] = 1;
+			whole++;
+		}
+	}
+	free(owned);
+	xfer->bridge_hops = hops;
+	xfer->bridge_clusters = whole;
+	return true;
+
+fail:
+	free(owned);
+	free(xfer->bridged);
+	xfer->bridged = NULL;
+	return false;
+}
+
+/* Bridged clusters the snapshot does not own itself still have to travel:
+ * add them to clusters[] (any non-zero value: replication only tests for
+ * zero and reads through the snapshot). Returns how many were added. */
+static int
+xfer_add_bridged_clusters(struct spdk_lvs_xfer *xfer)
+{
+	uint32_t i;
+	int added = 0;
+
+	for (i = 0; i < xfer->num_clusters; i++) {
+		if (xfer->bridged[i] && xfer->clusters[i] == 0) {
+			xfer->clusters[i] = 1;
+			added++;
+		}
+	}
+	return added;
+}
+
 static void
 xfer_setup_partial(struct spdk_lvs_xfer *xfer, uint64_t offset, uint64_t partial_base)
 {
 	struct spdk_lvol *lvol = xfer->lvol;
 	struct blob_dirty_gen *gen = spdk_blob_get_dirty_gen(lvol->blob);
 	const char *why = NULL;
+	bool usable = false;
 
 	if (xfer->type != XFER_REPLICATE_SNAPSHOT || xfer->final_step) {
 		why = "only snapshot replication sends dirty ranges";
@@ -6297,15 +6419,27 @@ xfer_setup_partial(struct spdk_lvs_xfer *xfer, uint64_t offset, uint64_t partial
 		why = "a resumed transfer sends full clusters";
 	} else if (xfer->page_size == 0 || SPDK_BLOB_DIRTY_BLOCK_SZ % xfer->page_size != 0) {
 		why = "dirty block is not a whole number of pages";
-	} else if (spdk_blob_dirty_gen_usable(lvol->blob, gen, (spdk_blob_id)partial_base, &why)) {
+	} else {
+		usable = spdk_blob_dirty_gen_usable(lvol->blob, gen, (spdk_blob_id)partial_base, &why);
+		if (!usable && gen != NULL && spdk_blob_dirty_gen_base(gen) != (spdk_blob_id)partial_base &&
+		    spdk_blob_dirty_gen_usable(lvol->blob, gen, spdk_blob_dirty_gen_base(gen), NULL)) {
+			/* usable, just not against that base: bridge the gap if
+			 * the destination's base is still an ancestor */
+			usable = xfer_bridge_partial_base(xfer, spdk_blob_dirty_gen_base(gen), partial_base);
+		}
+	}
+
+	if (usable) {
 		xfer->max_ranges = spdk_blob_dirty_max_ranges(gen);
 		xfer->ranges = calloc(xfer->max_ranges, sizeof(*xfer->ranges));
 		xfer->partial = calloc(xfer->num_clusters, sizeof(*xfer->partial));
 		if (xfer->ranges == NULL || xfer->partial == NULL) {
 			free(xfer->ranges);
 			free(xfer->partial);
+			free(xfer->bridged);
 			xfer->ranges = NULL;
 			xfer->partial = NULL;
+			xfer->bridged = NULL;
 			why = "out of memory";
 		} else {
 			/* Pin it: the family cap in the blob layer frees generations
@@ -6319,6 +6453,13 @@ xfer_setup_partial(struct spdk_lvs_xfer *xfer, uint64_t offset, uint64_t partial
 				       " dirty bytes)\n", lvol->name, spdk_blob_dirty_gen_id(gen),
 				       partial_base, spdk_blob_dirty_gen_tracked(gen),
 				       spdk_blob_dirty_gen_bytes(gen));
+			if (xfer->bridged != NULL) {
+				SPDK_NOTICELOG("Transfer lvol %s: generation started at base 0x%" PRIx64
+					       ", bridged over %" PRIu32 " snapshot(s) to base 0x%" PRIx64
+					       ": %" PRIu64 " cluster(s) they own are sent whole\n",
+					       lvol->name, spdk_blob_dirty_gen_base(gen), xfer->bridge_hops,
+					       partial_base, xfer->bridge_clusters);
+			}
 			return;
 		}
 	}
@@ -6353,10 +6494,16 @@ static void
 xfer_classify_partial(struct spdk_lvs_xfer *xfer)
 {
 	uint64_t blocks = (uint64_t)xfer->page_per_cluster * xfer->page_size / SPDK_BLOB_DIRTY_BLOCK_SZ;
-	uint64_t i, full = 0;
+	uint64_t pct = g_lvs_xfer_whole_cluster_pct;
+	uint64_t i, k, dirty, full = 0, promoted = 0;
 
 	for (i = 0; i < xfer->num_clusters; i++) {
 		if (xfer->clusters[i] == 0) {
+			continue;
+		}
+		if (xfer->bridged != NULL && xfer->bridged[i]) {
+			/* owned by a snapshot between the two bases: whole */
+			full++;
 			continue;
 		}
 		if (!xfer_load_ranges(xfer, i)) {
@@ -6367,13 +6514,24 @@ xfer_classify_partial(struct spdk_lvs_xfer *xfer)
 			full++;
 			continue;
 		}
+		/* mostly dirty: one whole-cluster request beats many range requests */
+		dirty = 0;
+		for (k = 0; k < xfer->num_ranges; k++) {
+			dirty += xfer->ranges[k].len;
+		}
+		if (dirty * 100 >= pct * blocks) {
+			full++;
+			promoted++;
+			continue;
+		}
 		xfer->partial[i] = 1;
 		xfer->partial_clusters++;
 	}
 	xfer->num_ranges = 0;
 	xfer->range_pos = 0;
 	SPDK_NOTICELOG("Transfer lvol %s: %" PRIu64 " cluster(s) as dirty ranges, %" PRIu64
-		       " whole\n", xfer->lvol->name, xfer->partial_clusters, full);
+		       " whole (%" PRIu64 " of them >= %" PRIu64 "%% dirty)\n", xfer->lvol->name,
+		       xfer->partial_clusters, full, promoted, pct);
 }
 
 /* Make req the next piece of the current dirty range: at most
@@ -6575,6 +6733,10 @@ xfer_replication(struct spdk_lvs_xfer *xfer) {
 			}
 
 			spdk_blob_scan_used_clusters(lvol->blob, xfer->clusters, xfer->num_clusters, &count);
+			if (xfer->bridged != NULL) {
+				/* clusters of the snapshots bridged over (xfer_setup_partial) */
+				count += xfer_add_bridged_clusters(xfer);
+			}
 			if (count == 0) {
 				xfer->state = xfer->final_step ? XFER_STATE_SIGNAL_TRANSFER : XFER_STATE_DONE;
 				xfer_fill_queue(xfer, xfer->final_step ? 1 : 0);
@@ -8271,6 +8433,7 @@ error:
 		free(task->chain_s3_ids);
 	free(task->ranges);
 	free(task->partial);
+	free(task->bridged);
 	spdk_blob_dirty_gen_unref(task->dirty_gen);
 	free(task);
 	return -ENOMEM;

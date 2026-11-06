@@ -2414,6 +2414,10 @@ struct spdk_blob_persist_ctx {
 	spdk_bs_sequence_cpl	bit_cb_fn_persist;
 
 	bool			home_barrier;
+	/* home_barrier satisfied by writing this persist's pages straight to
+	 * their HOME LBAs as well (first persist of a new blob); cleared as soon
+	 * as one page cannot be written through, see blob_persist_start(). */
+	bool			home_direct;
 
 	spdk_bs_sequence_t		*seq;
 	spdk_bs_sequence_cpl		cb_fn;
@@ -2520,7 +2524,9 @@ blob_persist_complete_cb(void *arg)
 	uint64_t target_seq;
 	int rc;
 
-	if (ctx->rc == 0 && ctx->home_barrier && jr != NULL) {
+	/* home_direct: every page of this persist already reached HOME through
+	 * the write-through in the persist itself; no global barrier needed. */
+	if (ctx->rc == 0 && ctx->home_barrier && !ctx->home_direct && jr != NULL) {
 		target_seq = bs_md_journal_next_seq_num(ctx->blob->bs->md_journal);
 		if (target_seq == 0) {
 			blob_persist_barrier_cpl(ctx->seq, ctx, ctx->rc);
@@ -3075,6 +3081,26 @@ persist_bs_write_used_blobids(spdk_bs_sequence_t *seq, void *arg, int bserrno)
 	bs_sequence_write_dev(seq, ctx->bit_page, lba, bs_byte_to_lba(bs, SPDK_BS_PAGE_SIZE), cb_fn, arg);
 }
 
+/* Journal write of the root page done: write the same buffer to its HOME LBA
+ * when this persist writes through (see blob_persist_start()). */
+static void
+blob_persist_page_root_home(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct spdk_blob_persist_ctx	*ctx = cb_arg;
+	struct spdk_blob		*blob = ctx->blob;
+	struct spdk_blob_store		*bs = blob->bs;
+
+	if (bserrno != 0 || !ctx->home_direct) {
+		persist_bs_write_used_blobids(seq, ctx, bserrno);
+		return;
+	}
+
+	bs->w_io++;
+	bs_sequence_write_dev(seq, &ctx->pages[0], bs_md_page_to_lba(bs, bs_blobid_to_page(blob->id)),
+			      bs_byte_to_lba(bs, sizeof(ctx->pages[0])),
+			      persist_bs_write_used_blobids, ctx);
+}
+
 static void
 blob_persist_write_page_root(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
@@ -3106,13 +3132,43 @@ blob_persist_write_page_root(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	bs->w_io++;
 
 	if (bs->md_journal) {
+		if (ctx->home_direct && bs_md_journal_home_pending(bs->md_journal, lba)) {
+			/* an older entry for this LBA is still to be homed: barrier instead */
+			ctx->home_direct = false;
+		}
 		bs_md_journal_write(bs->md_journal, seq, page, lba, lba_count,
-			      persist_bs_write_used_blobids, ctx, MD_JOURNAL_WRITE);
+			      blob_persist_page_root_home, ctx, MD_JOURNAL_WRITE);
 		return;
 	}
 
 	bs_sequence_write_dev(seq, page, lba, lba_count,
 			      persist_bs_write_used_blobids, ctx);
+}
+
+/* Journal batch of the chain pages (pages[1..]) done: write the same buffers
+ * to their HOME LBAs when this persist writes through (blob_persist_start()),
+ * then continue with the root page. */
+static void
+blob_persist_page_chain_home(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct spdk_blob_persist_ctx	*ctx = cb_arg;
+	struct spdk_blob		*blob = ctx->blob;
+	struct spdk_blob_store		*bs = blob->bs;
+	spdk_bs_batch_t			*batch;
+	size_t				i;
+
+	if (bserrno != 0 || !ctx->home_direct) {
+		blob_persist_write_page_root(seq, ctx, bserrno);
+		return;
+	}
+
+	batch = bs_sequence_to_batch(seq, 0, blob_persist_write_page_root, ctx);
+	for (i = 1; i < blob->active.num_pages; i++) {
+		bs->w_io++;
+		bs_batch_write_dev(batch, &ctx->pages[i], bs_md_page_to_lba(bs, blob->active.pages[i]),
+				   bs_byte_to_lba(bs, sizeof(ctx->pages[i])));
+	}
+	bs_batch_close(batch);
 }
 
 static void
@@ -3139,7 +3195,16 @@ blob_persist_write_page_chain(spdk_bs_sequence_t *seq, struct spdk_blob_persist_
 			return;
 		}
 
-		jr_batch = bs_md_journal_sequence_to_batch(bs->md_journal, seq, blob->active.num_pages - 1, blob_persist_write_page_root, ctx);
+		/* Write-through (blob_persist_start()): every chain page must be
+		 * free of older un-homed entries, else the barrier is kept. */
+		for (i = 1; ctx->home_direct && i < blob->active.num_pages; i++) {
+			if (bs_md_journal_home_pending(bs->md_journal,
+						       bs_md_page_to_lba(bs, blob->active.pages[i]))) {
+				ctx->home_direct = false;
+			}
+		}
+
+		jr_batch = bs_md_journal_sequence_to_batch(bs->md_journal, seq, blob->active.num_pages - 1, blob_persist_page_chain_home, ctx);
 		if (jr_batch == NULL) {
 			blob_persist_write_page_root(seq, ctx, -ENOMEM);
 			return;
@@ -3465,6 +3530,30 @@ blob_persist_generate_new_md(struct spdk_blob_persist_ctx *ctx)
 	blob_persist_write_page_chain(seq, ctx);
 }
 
+static void blob_persist_write_extent_pages(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno);
+
+/* Journal write of an extent page done: write the same buffer to its HOME
+ * LBA when this persist writes through (see blob_persist_start()). */
+static void
+blob_persist_extent_page_home(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct spdk_blob_persist_ctx	*ctx = cb_arg;
+	struct spdk_blob		*blob = ctx->blob;
+	uint32_t			extent_page_id;
+
+	if (bserrno != 0 || !ctx->home_direct) {
+		blob_persist_write_extent_pages(seq, ctx, bserrno);
+		return;
+	}
+
+	assert(ctx->next_extent_page > 0);
+	extent_page_id = blob->active.extent_pages[ctx->next_extent_page - 1];
+	blob->bs->w_io++;
+	bs_sequence_write_dev(seq, ctx->extent_page, bs_md_page_to_lba(blob->bs, extent_page_id),
+			      bs_byte_to_lba(blob->bs, SPDK_BS_PAGE_SIZE),
+			      blob_persist_write_extent_pages, ctx);
+}
+
 static void
 blob_persist_write_extent_pages(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
@@ -3510,9 +3599,15 @@ blob_persist_write_extent_pages(spdk_bs_sequence_t *seq, void *cb_arg, int bserr
 		}
 		blob->bs->w_io++;
 		if (blob->bs->md_journal) {
+			if (ctx->home_direct &&
+			    bs_md_journal_home_pending(blob->bs->md_journal,
+						       bs_md_page_to_lba(blob->bs, extent_page_id))) {
+				/* an older entry for this LBA is still to be homed: barrier instead */
+				ctx->home_direct = false;
+			}
 			bs_md_journal_write(blob->bs->md_journal, seq, ctx->extent_page, bs_md_page_to_lba(blob->bs, extent_page_id),
 				      bs_byte_to_lba(blob->bs, SPDK_BS_PAGE_SIZE),
-				      blob_persist_write_extent_pages, ctx, MD_JOURNAL_WRITE);
+				      blob_persist_extent_page_home, ctx, MD_JOURNAL_WRITE);
 			return;
 		}
 
@@ -3545,6 +3640,35 @@ blob_persist_start(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		return;
 
 	}
+
+	/*
+	 * HOME write-through for the first persist of a blob (clean.num_pages
+	 * == 0: nothing of it was ever on disk). Such a persist writes only
+	 * pages it claims itself: the root page at the blobid's slot, fresh
+	 * chain pages and this blob's extent pages. After each page's journal
+	 * write, the same buffer is written to the page's HOME LBA in the same
+	 * sequence, and the persist completes without the global barrier
+	 * (md_journal_confirm_home_drain) that otherwise waits for every
+	 * blob's pending entries. Readers of HOME that must see the new blob
+	 * -- the leader reopening it (blob_load) and a secondary's
+	 * bdev_lvol_register (spdk_lvs_update_live -> bs_update_replay_blobid:
+	 * the page chain and extent pages; the super block it reads only for
+	 * layout, and the used_blobids mask page is written straight to HOME
+	 * by persist_bs_write_used_blobids already) -- are satisfied.
+	 *
+	 * Safe against the ordered drain: when it later homes the same entry
+	 * it rewrites identical content, and no entry newer than ours for
+	 * these LBAs exists until this persist completes (persists of one blob
+	 * are serialized). The hazard is an OLDER entry for the same LBA still
+	 * waiting to be homed (the page was freed by a deleted blob whose zero
+	 * entry has not drained yet): the drain would overwrite our copy with
+	 * it. bs_md_journal_home_pending() is checked per page before the
+	 * journal write; on a hit the write-through is dropped for this
+	 * persist and the barrier is kept. Re-persists (clean.num_pages > 0)
+	 * always use the barrier.
+	 */
+	ctx->home_direct = ctx->home_barrier && blob->clean.num_pages == 0 &&
+			   bs_md_journal_home_direct_ok(blob->bs->md_journal);
 
 	if (blob->clean.num_clusters < blob->active.num_clusters) {
 		/* Blob was resized up */
@@ -12256,8 +12380,13 @@ spdk_bs_chain_snapshot_clone(struct spdk_blob *origblob, struct spdk_blob *clone
 		cb_fn(cb_arg, 0);
 		return;
 	} else {
-		/* sync clone metadata */
-		spdk_blob_sync_md(clone, true, spdk_bs_convert_blob_cb, ctx);
+		/* Sync the clone's metadata journal-durable only (no HOME barrier).
+		 * Nothing reads this blob's pages from their HOME LBAs after the
+		 * chain RPC returns: the non-leader members apply the chain
+		 * in-memory (the !leader branch above), a failover replays the
+		 * journal before any page is read, and set_parent / delete already
+		 * persist the same kind of change with md_drain=false. */
+		spdk_blob_sync_md(clone, false, spdk_bs_convert_blob_cb, ctx);
 		return;
 	}
 }
