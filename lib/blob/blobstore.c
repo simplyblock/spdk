@@ -12256,8 +12256,13 @@ spdk_bs_chain_snapshot_clone(struct spdk_blob *origblob, struct spdk_blob *clone
 		cb_fn(cb_arg, 0);
 		return;
 	} else {
-		/* sync clone metadata */
-		spdk_blob_sync_md(clone, true, spdk_bs_convert_blob_cb, ctx);
+		/* Sync the clone's metadata journal-durable only (no HOME barrier).
+		 * Nothing reads this blob's pages from their HOME LBAs after the
+		 * chain RPC returns: the non-leader members apply the chain
+		 * in-memory (the !leader branch above), a failover replays the
+		 * journal before any page is read, and set_parent / delete already
+		 * persist the same kind of change with md_drain=false. */
+		spdk_blob_sync_md(clone, false, spdk_bs_convert_blob_cb, ctx);
 		return;
 	}
 }
