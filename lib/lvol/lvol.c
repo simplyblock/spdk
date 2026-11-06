@@ -5184,6 +5184,32 @@ fragment_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
  * destination writes (XFER_MAX_WRITE_BYTES) each. */
 #define XFER_PARTIAL_MAX_BYTES	(64 * 1024)
 
+/* A cluster of a partial transfer whose dirty share is at least this many
+ * percent is sent as one whole-cluster request instead of its dirty ranges
+ * (each range is a request of at most XFER_PARTIAL_MAX_BYTES through a
+ * window of cluster_batch requests; a mostly-dirty cluster costs more that
+ * way than its 2 MiB in one request). 100: only fully dirty clusters;
+ * 0: every cluster whole. Set with spdk_lvol_set_xfer_whole_cluster_pct()
+ * (RPC bdev_lvol_set_xfer_whole_cluster_pct). */
+#define XFER_WHOLE_CLUSTER_PCT_DEFAULT	50
+static uint32_t g_lvs_xfer_whole_cluster_pct = XFER_WHOLE_CLUSTER_PCT_DEFAULT;
+
+int
+spdk_lvol_set_xfer_whole_cluster_pct(uint32_t pct)
+{
+	if (pct > 100) {
+		return -EINVAL;
+	}
+	g_lvs_xfer_whole_cluster_pct = pct;
+	return 0;
+}
+
+uint32_t
+spdk_lvol_get_xfer_whole_cluster_pct(void)
+{
+	return g_lvs_xfer_whole_cluster_pct;
+}
+
 /*
  * Write the request's payload (the cluster, already read whole) to the remote
  * device:
@@ -6468,7 +6494,8 @@ static void
 xfer_classify_partial(struct spdk_lvs_xfer *xfer)
 {
 	uint64_t blocks = (uint64_t)xfer->page_per_cluster * xfer->page_size / SPDK_BLOB_DIRTY_BLOCK_SZ;
-	uint64_t i, full = 0;
+	uint64_t pct = g_lvs_xfer_whole_cluster_pct;
+	uint64_t i, k, dirty, full = 0, promoted = 0;
 
 	for (i = 0; i < xfer->num_clusters; i++) {
 		if (xfer->clusters[i] == 0) {
@@ -6487,13 +6514,24 @@ xfer_classify_partial(struct spdk_lvs_xfer *xfer)
 			full++;
 			continue;
 		}
+		/* mostly dirty: one whole-cluster request beats many range requests */
+		dirty = 0;
+		for (k = 0; k < xfer->num_ranges; k++) {
+			dirty += xfer->ranges[k].len;
+		}
+		if (dirty * 100 >= pct * blocks) {
+			full++;
+			promoted++;
+			continue;
+		}
 		xfer->partial[i] = 1;
 		xfer->partial_clusters++;
 	}
 	xfer->num_ranges = 0;
 	xfer->range_pos = 0;
 	SPDK_NOTICELOG("Transfer lvol %s: %" PRIu64 " cluster(s) as dirty ranges, %" PRIu64
-		       " whole\n", xfer->lvol->name, xfer->partial_clusters, full);
+		       " whole (%" PRIu64 " of them >= %" PRIu64 "%% dirty)\n", xfer->lvol->name,
+		       xfer->partial_clusters, full, promoted, pct);
 }
 
 /* Make req the next piece of the current dirty range: at most

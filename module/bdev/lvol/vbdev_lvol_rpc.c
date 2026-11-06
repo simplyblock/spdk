@@ -4398,6 +4398,50 @@ cleanup:
 
 SPDK_RPC_REGISTER("bdev_lvol_transfer_stat", rpc_bdev_lvol_transfer_stat, SPDK_RPC_RUNTIME)
 
+struct rpc_bdev_lvol_set_xfer_whole_cluster_pct {
+	uint32_t pct;
+};
+
+static const struct spdk_json_object_decoder rpc_bdev_lvol_set_xfer_whole_cluster_pct_decoders[] = {
+	{"pct", offsetof(struct rpc_bdev_lvol_set_xfer_whole_cluster_pct, pct), spdk_json_decode_uint32},
+};
+
+/* Node-wide tunable of partial transfers: a cluster at least pct % dirty is
+ * sent whole rather than as dirty ranges (see spdk_lvol_set_xfer_whole_cluster_pct). */
+static void
+rpc_bdev_lvol_set_xfer_whole_cluster_pct(struct spdk_jsonrpc_request *request,
+					 const struct spdk_json_val *params)
+{
+	struct rpc_bdev_lvol_set_xfer_whole_cluster_pct req = {};
+	struct spdk_json_write_ctx *w;
+	int rc;
+
+	if (spdk_json_decode_object(params, rpc_bdev_lvol_set_xfer_whole_cluster_pct_decoders,
+				    SPDK_COUNTOF(rpc_bdev_lvol_set_xfer_whole_cluster_pct_decoders),
+				    &req)) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "spdk_json_decode_object failed");
+		return;
+	}
+
+	rc = spdk_lvol_set_xfer_whole_cluster_pct(req.pct);
+	if (rc != 0) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "pct must be 0..100");
+		return;
+	}
+	SPDK_NOTICELOG("Partial transfer whole-cluster threshold set to %u%%\n", req.pct);
+
+	w = spdk_jsonrpc_begin_result(request);
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_uint32(w, "whole_cluster_pct", spdk_lvol_get_xfer_whole_cluster_pct());
+	spdk_json_write_object_end(w);
+	spdk_jsonrpc_end_result(request, w);
+}
+
+SPDK_RPC_REGISTER("bdev_lvol_set_xfer_whole_cluster_pct", rpc_bdev_lvol_set_xfer_whole_cluster_pct,
+		  SPDK_RPC_RUNTIME)
+
 struct rpc_bdev_lvol_dirty_bitmap_info {
 	char *lvol_name;
 };

@@ -890,6 +890,51 @@ xfer_partial_dispatch_splits_ranges(void)
 	blob_dirty_gen_free(gen);
 }
 
+/* A cluster whose dirty share reaches the whole-cluster threshold (default
+ * 50 %) is classified whole, not as ranges; at 100 % only a fully dirty
+ * cluster is; at 0 % every cluster is. */
+static void
+xfer_partial_mostly_dirty_cluster_goes_whole(void)
+{
+	const int alloc[2] = {1, 1};
+	struct blob_dirty_gen *gen = blob_dirty_gen_create(UT_CLUSTER_SZ);
+	struct spdk_lvs_xfer *xfer;
+
+	SPDK_CU_ASSERT_FATAL(gen != NULL);
+	/* cluster 0: 8 KiB dirty; cluster 1: 1 MiB + 64 KiB of 2 MiB dirty (> 50 %) */
+	blob_dirty_mark(gen, 0, 8192);
+	blob_dirty_mark(gen, (uint64_t)UT_CLUSTER_SZ + 256 * 1024, 1024 * 1024 + 64 * 1024);
+
+	CU_ASSERT(spdk_lvol_get_xfer_whole_cluster_pct() == 50);
+	xfer = make_partial_xfer(1, 2, alloc, gen);
+	SPDK_CU_ASSERT_FATAL(xfer->allow_partial);
+	xfer_classify_partial(xfer);
+	CU_ASSERT(xfer->partial[0] == 1);
+	CU_ASSERT(xfer->partial[1] == 0);
+	CU_ASSERT(xfer->partial_clusters == 1);
+	free_partial_xfer(xfer);
+
+	CU_ASSERT(spdk_lvol_set_xfer_whole_cluster_pct(101) == -EINVAL);
+	CU_ASSERT(spdk_lvol_set_xfer_whole_cluster_pct(100) == 0);
+	xfer = make_partial_xfer(1, 2, alloc, gen);
+	xfer_classify_partial(xfer);
+	CU_ASSERT(xfer->partial[0] == 1);
+	CU_ASSERT(xfer->partial[1] == 1);
+	CU_ASSERT(xfer->partial_clusters == 2);
+	free_partial_xfer(xfer);
+
+	CU_ASSERT(spdk_lvol_set_xfer_whole_cluster_pct(0) == 0);
+	xfer = make_partial_xfer(1, 2, alloc, gen);
+	xfer_classify_partial(xfer);
+	CU_ASSERT(xfer->partial[0] == 0);
+	CU_ASSERT(xfer->partial[1] == 0);
+	CU_ASSERT(xfer->partial_clusters == 0);
+	free_partial_xfer(xfer);
+
+	CU_ASSERT(spdk_lvol_set_xfer_whole_cluster_pct(50) == 0);
+	blob_dirty_gen_free(gen);
+}
+
 /* A partial request lands on blocks that hold the base's content: its zero
  * blocks are written like any other; so are a resumed task's. */
 static void
@@ -1062,6 +1107,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, xfer_cow_landing_all_partial_allocates_nothing);
 	CU_ADD_TEST(suite, xfer_cow_landing_still_sends_partial_ranges);
 	CU_ADD_TEST(suite, xfer_partial_dispatch_splits_ranges);
+	CU_ADD_TEST(suite, xfer_partial_mostly_dirty_cluster_goes_whole);
 	CU_ADD_TEST(suite, xfer_partial_and_resumed_requests_write_zeroes);
 	CU_ADD_TEST(suite, xfer_resume_offset_is_lowest_not_done);
 	CU_ADD_TEST(suite, xfer_completion_refills_in_place);
