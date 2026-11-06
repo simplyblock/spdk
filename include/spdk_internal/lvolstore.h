@@ -373,6 +373,13 @@ struct spdk_lvs_xfer {
 	bool cow_landing;
 	struct blob_dirty_gen *dirty_gen;
 	uint8_t *partial;
+	/* Delta bridged over snapshots between the destination's base and the
+	 * generation's base (xfer_bridge_partial_base): bridged[i] marks the
+	 * clusters one of those in-between snapshots owns; they are added to
+	 * clusters[] and sent whole. NULL when the bases match. */
+	uint8_t *bridged;
+	uint32_t bridge_hops;
+	uint64_t bridge_clusters;
 	struct blob_dirty_range *ranges;
 	uint32_t max_ranges;
 	uint32_t num_ranges;
