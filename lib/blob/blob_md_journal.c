@@ -1285,6 +1285,8 @@ bs_md_journal_next_seq_num(struct spdk_bs_md_journal *jr) {
 	return jr->next_seq;
 }
 
+static void md_journal_start_drain_batch(struct spdk_bs_md_journal *jr, bool force);
+
 static void
 spdk_md_journal_batch_drain_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
@@ -1349,6 +1351,20 @@ spdk_md_journal_batch_drain_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserr
 	drain_batch->elem_count = 0;
 	drain_batch->rc = 0;
 	// bs_sequence_finish(seq, 0);
+
+	/*
+	 * Keep HOME draining back-to-back. The poller runs every 1 ms, and
+	 * under copy-on-write load the queue refills faster than one batch
+	 * per tick, so waiting for the next tick left the device idle between
+	 * batches and let HOME barriers (md_drain persists) queue up for
+	 * seconds. Still exactly one batch in flight: it is started here only
+	 * after this one completed. The stopping / sequence-reset / failed /
+	 * paused cases stay with the poller, which owns their ordering.
+	 */
+	if (!jr->stopping && !jr->seq_resetting && !jr->failed && !jr->paused &&
+	    !TAILQ_EMPTY(&jr->home_queue)) {
+		md_journal_start_drain_batch(jr, jr->force_home_drain);
+	}
 }
 
 static int
@@ -1451,11 +1467,20 @@ md_journal_start_drain_batch(struct spdk_bs_md_journal *jr, bool force)
 	/*
 	 * Consume the next consecutive elements from the ordered
 	 * HOME queue.
+	 *
+	 * The small batch bounds the work of an idle-ish journal. When more
+	 * than that is already pending, the queue is behind: take everything
+	 * (the large size) so one batch, not several back-to-back ones, drains
+	 * the backlog. Per-LBA ordering is unaffected: elements stay in
+	 * sequence order and md_journal_mark_latest() still homes only the
+	 * newest entry of an LBA within the batch.
 	 */
-	while (batch->elem_count < max_drain) {
-		elem = TAILQ_FIRST(&jr->home_queue);
-		if (elem == NULL) {
-			break;
+	while ((elem = TAILQ_FIRST(&jr->home_queue)) != NULL) {
+		if (batch->elem_count >= max_drain) {
+			if (max_drain >= BS_MD_JOURNAL_NUM_ELEMS) {
+				break;
+			}
+			max_drain = BS_MD_JOURNAL_NUM_ELEMS;
 		}
 
 		TAILQ_REMOVE(&jr->home_queue, elem, link);
@@ -2810,6 +2835,16 @@ bs_md_journal_create(struct spdk_blob_store *bs, uint64_t md_journal_mask_start,
 		md_journal_free(jr);
 		return NULL;
 	}
+	/*
+	 * HOME (and ZERO) writes carry the metadata priority class, not the
+	 * blobstore's default: bs_sequence_start_bs() copies bs->priority_class,
+	 * which is 0 until some blob gets a class (spdk_blob_set_io_priority_class
+	 * then raises it to PREMIUM for "metadata I/O"). The class rides in the
+	 * top LBA bits (blob_bdev.c) and the distrib schedules by it; at class 0
+	 * the drain queued behind client IO and every md_drain persist waited on
+	 * it. bs_sequence_to_batch() keeps the sequence's class for the batch.
+	 */
+	jr->home_seq->priority_class = PREMIUM_PRIORITY_CLASS;
 
 	struct spdk_bs_cpl zero_cpl;
 	zero_cpl.type = SPDK_BS_CPL_TYPE_BLOB_BASIC;
@@ -2822,6 +2857,8 @@ bs_md_journal_create(struct spdk_blob_store *bs, uint64_t md_journal_mask_start,
 		md_journal_free(jr);
 		return NULL;
 	}
+	/* ZERO batches return journal slots; a starved ZERO path stalls admission too. */
+	jr->zero_seq->priority_class = PREMIUM_PRIORITY_CLASS;
 	/*
 	 * For a fresh journal.
 	 *
