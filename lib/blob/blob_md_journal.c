@@ -1285,6 +1285,66 @@ bs_md_journal_next_seq_num(struct spdk_bs_md_journal *jr) {
 	return jr->next_seq;
 }
 
+bool
+bs_md_journal_home_direct_ok(struct spdk_bs_md_journal *jr)
+{
+	/* In examine mode every write already goes straight to HOME; a paused,
+	 * failed or stopping journal rejects the write itself. */
+	return jr != NULL && !jr->examine && !jr->paused && !jr->failed && !jr->stopping;
+}
+
+bool
+bs_md_journal_home_pending(struct spdk_bs_md_journal *jr, uint64_t lba)
+{
+	struct md_journal_elem *elem;
+	struct md_journal_wait_req *req;
+	uint32_t i;
+
+	if (jr == NULL || jr->elems == NULL) {
+		return false;
+	}
+
+	/*
+	 * Admitted entries that have not reached HOME: journal write in
+	 * flight, waiting for sequence order, HOME pending, or in the active
+	 * HOME batch (a skipped element's newer twin is in that batch too).
+	 * ZERO_* elements are already home-durable; a failed journal write is
+	 * never homed.
+	 */
+	for (i = 0; i < BS_MD_JOURNAL_NUM_ELEMS; i++) {
+		elem = &jr->elems[i];
+		switch (elem->state) {
+		case MD_JOURNAL_ELEM_JOURNAL_INFLIGHT:
+		case MD_JOURNAL_ELEM_JOURNAL_DONE:
+		case MD_JOURNAL_ELEM_HOME_PENDING:
+		case MD_JOURNAL_ELEM_HOME_INFLIGHT:
+			if (elem->hdr->target_lba == lba) {
+				return true;
+			}
+			break;
+		default:
+			break;
+		}
+	}
+
+	/* Writes queued for a slot are admitted FIFO, ahead of a write issued now. */
+	TAILQ_FOREACH(req, &jr->wait_queue, link) {
+		if (req->type == MD_JOURNAL_WAIT_SINGLE) {
+			if (req->entry.lba == lba) {
+				return true;
+			}
+		} else if (req->batch != NULL) {
+			for (i = 0; i < req->batch->count; i++) {
+				if (req->batch->entry[i].lba == lba) {
+					return true;
+				}
+			}
+		}
+	}
+
+	return false;
+}
+
 static void md_journal_start_drain_batch(struct spdk_bs_md_journal *jr, bool force);
 
 static void
