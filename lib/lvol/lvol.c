@@ -5244,9 +5244,6 @@ fragment_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 /* Largest request of a partial transfer: one source read and at most two
  * destination writes (XFER_MAX_WRITE_BYTES) each. */
 #define XFER_PARTIAL_MAX_BYTES	(64 * 1024)
-/* In-flight requests of a whole-cluster task at most (16 x 2 MiB = 32 MiB, the
- * control plane's full-transfer batch). */
-#define XFER_FULL_MAX_BATCH	16
 /* In-flight requests of a partial final step (snapshot replication's window;
  * the control plane passes 2 for a whole-cluster final step). */
 #define XFER_FINAL_PARTIAL_WINDOW	256
@@ -6344,6 +6341,12 @@ xfer_resume_offset(struct spdk_lvs_xfer *xfer, const struct spdk_lvs_xfer_req *d
 {
 	uint64_t low = (uint64_t)xfer->hold_idx * xfer->page_per_cluster;
 
+	/* pieces of the current cluster not dispatched yet: hold_idx is
+	 * already past it */
+	if (xfer->ranges != NULL && xfer->range_pos < xfer->num_ranges) {
+		low = spdk_min(low, (uint64_t)xfer->range_cluster * xfer->page_per_cluster);
+	}
+
 	for (int i = 0; i < xfer->cluster_batch; i++) {
 		const struct spdk_lvs_xfer_req *r = &xfer->reqs[i];
 		enum xfer_req_status st = __atomic_load_n(&r->status, __ATOMIC_ACQUIRE);
@@ -6664,8 +6667,7 @@ xfer_fill_range_req(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req *req)
  * cluster's dirty ranges, else the next cluster to send (as dirty ranges, as
  * 64 KiB pieces of a whole cluster in a partial task, or whole). False when
  * nothing is left. Counts the request (idx, outstanding_io); the caller
- * clears a whole cluster's payload (xfer_repl_clear, outside the lock: 2 MiB)
- * and submits it. Under gen_lock.
+ * submits it. Under gen_lock.
  */
 static bool
 xfer_repl_next(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req *req)
@@ -6689,10 +6691,10 @@ xfer_repl_next(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req *req)
 			xfer_fill_range_req(xfer, req);
 			return true;
 		}
-		if (xfer->allow_partial) {
-			/* a whole cluster of a partial task: one range over all of
-			 * it, in 64 KiB pieces like the others (the payloads are
-			 * that size) */
+		{
+			/* a whole cluster: one range over all of it, in 64 KiB
+			 * pieces like the dirty ranges (the payloads are that
+			 * size; there is no 2 MiB request) */
 			xfer->ranges[0].off = 0;
 			xfer->ranges[0].len = xfer->page_per_cluster * xfer->page_size /
 						  SPDK_BLOB_DIRTY_BLOCK_SZ;
@@ -6705,33 +6707,8 @@ xfer_repl_next(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req *req)
 			xfer_fill_range_req(xfer, req);
 			return true;
 		}
-
-		xfer->lvol->xfer_full_clusters++;
-		xfer->lvol->xfer_pages_sent += xfer->page_per_cluster;
-		req->dst_offset = i * xfer->page_per_cluster;
-		if (xfer->lvol->redirect_map_id != 0) {
-			req->dst_offset = ((uint64_t)(xfer->lvol->redirect_map_id) << 48) | req->dst_offset;
-		}
-		req->offset = i * xfer->page_per_cluster;
-		req->len = xfer->page_per_cluster; // 2MB
-		req->action = REQ_ACTION_COPY_BACKUP;
-		req->status = XFER_REQ_STATUS_READY;
-		xfer->outstanding_io++;
-		xfer->idx++;
-		xfer->hold_idx = i + 1;
-		return true;
 	}
 	return false;
-}
-
-/* A whole cluster's payload starts zeroed (a partial task's are 64 KiB and
- * read whole). */
-static void
-xfer_repl_clear(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req *req)
-{
-	if (!xfer->allow_partial) {
-		memset(req->payload, 0, xfer->page_size * xfer->page_per_cluster);
-	}
 }
 
 /*
@@ -6786,7 +6763,6 @@ xfer_refill_inline(struct spdk_lvs_xfer_req *req)
 		return true;
 	}
 
-	xfer_repl_clear(xfer, req);
 	__atomic_add_fetch(&xfer->lvol->xfer_stat_inline_reqs, 1, __ATOMIC_RELAXED);
 	req->status = XFER_REQ_STATUS_IN_FLIGHT;
 	if (submit_rw_reqs_local(req) != 0) {
@@ -6918,7 +6894,6 @@ xfer_replication(struct spdk_lvs_xfer *xfer) {
 				}
 				pthread_spin_unlock(&xfer->gen_lock);
 
-				xfer_repl_clear(xfer, req);
 				req->t_ready = spdk_get_ticks();
 				if (spdk_ring_enqueue(xfer->ready_ring, (void **)&req, 1, NULL) != 1) {
 					SPDK_WARNLOG("ready_ring full; returning req to free_ring\n");
@@ -8467,21 +8442,22 @@ spdk_lvol_create_backup_task(struct spdk_lvs_xfer *task, struct spdk_transfer_de
 	if (task->type == XFER_MIGRATE_SNAPSHOT) {
 		s_elements_payload = task->page_size * 8; // 8 block per cluster transfer for migration
 	}
-	if (task->allow_partial) {
-		/* every request of a partial task is at most this large, whole
-		 * clusters included: a deep window costs no more memory than a
-		 * shallow one of whole clusters */
+	if (task->allow_partial || task->type == XFER_REPLICATE_SNAPSHOT) {
+		/* Every replication request is at most this large, whole clusters
+		 * included (in pieces): 64 KiB reaches the NVMe's and the
+		 * network's throughput, and a deep window costs 16 MiB instead of
+		 * 256 x 2 MiB. There is no whole-cluster request any more. */
 		s_elements_payload = XFER_PARTIAL_MAX_BYTES;
-	} else if (task->cluster_batch > XFER_FULL_MAX_BATCH &&
-		   (uint64_t)s_elements_payload > XFER_PARTIAL_MAX_BYTES) {
-		/* A window sized for 64 KiB delta requests, but the task sends
-		 * whole clusters (the delta was refused: a resumed transfer, no
-		 * usable generation, ...): 256 x 2 MiB is a 512 MiB DMA pool, which
-		 * failed every retry with ENOMEM on bed bf15. Keep the full
-		 * transfer's usual window instead. */
-		SPDK_NOTICELOG("Transfer lvol %s: whole clusters, window %u -> %u\n",
-			       task->lvol->name, task->cluster_batch, XFER_FULL_MAX_BATCH);
-		task->cluster_batch = XFER_FULL_MAX_BATCH;
+	}
+	if (task->type == XFER_REPLICATE_SNAPSHOT && task->ranges == NULL) {
+		/* a task without a dirty generation still sends its clusters as
+		 * one range each (xfer_repl_next) */
+		task->ranges = calloc(1, sizeof(*task->ranges));
+		if (!task->ranges) {
+			SPDK_ERRLOG("Unable to allocate ranges on transfer task for lvol %d\n", task->s3_id);
+			goto error;
+		}
+		task->max_ranges = 1;
 	}
 
 	pthread_spin_init(&task->gen_lock, PTHREAD_PROCESS_PRIVATE);
@@ -8738,8 +8714,9 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
 	 * clusters) would leave the dirty ranges latency-bound inside the 12 s
 	 * terminate timeout. Use snapshot replication's window; the payload
 	 * pool is cluster_batch * 64 KiB = 16 MiB, as for a replication task. */
-	if (task->final_step && task->allow_partial && task->cluster_batch < XFER_FINAL_PARTIAL_WINDOW) {
-		SPDK_NOTICELOG("Transfer lvol %s final step: window %u -> %u requests (dirty ranges)\n",
+	if (task->final_step && type == XFER_REPLICATE_SNAPSHOT &&
+	    task->cluster_batch < XFER_FINAL_PARTIAL_WINDOW) {
+		SPDK_NOTICELOG("Transfer lvol %s final step: window %u -> %u requests (64 KiB)\n",
 			       lvol->name, task->cluster_batch, XFER_FINAL_PARTIAL_WINDOW);
 		task->cluster_batch = XFER_FINAL_PARTIAL_WINDOW;
 	}
