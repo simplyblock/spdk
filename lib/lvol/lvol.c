@@ -5244,6 +5244,9 @@ fragment_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 /* Largest request of a partial transfer: one source read and at most two
  * destination writes (XFER_MAX_WRITE_BYTES) each. */
 #define XFER_PARTIAL_MAX_BYTES	(64 * 1024)
+/* In-flight requests of a whole-cluster task at most (16 x 2 MiB = 32 MiB, the
+ * control plane's full-transfer batch). */
+#define XFER_FULL_MAX_BATCH	16
 /* In-flight requests of a partial final step (snapshot replication's window;
  * the control plane passes 2 for a whole-cluster final step). */
 #define XFER_FINAL_PARTIAL_WINDOW	256
@@ -8469,6 +8472,16 @@ spdk_lvol_create_backup_task(struct spdk_lvs_xfer *task, struct spdk_transfer_de
 		 * clusters included: a deep window costs no more memory than a
 		 * shallow one of whole clusters */
 		s_elements_payload = XFER_PARTIAL_MAX_BYTES;
+	} else if (task->cluster_batch > XFER_FULL_MAX_BATCH &&
+		   (uint64_t)s_elements_payload > XFER_PARTIAL_MAX_BYTES) {
+		/* A window sized for 64 KiB delta requests, but the task sends
+		 * whole clusters (the delta was refused: a resumed transfer, no
+		 * usable generation, ...): 256 x 2 MiB is a 512 MiB DMA pool, which
+		 * failed every retry with ENOMEM on bed bf15. Keep the full
+		 * transfer's usual window instead. */
+		SPDK_NOTICELOG("Transfer lvol %s: whole clusters, window %u -> %u\n",
+			       task->lvol->name, task->cluster_batch, XFER_FULL_MAX_BATCH);
+		task->cluster_batch = XFER_FULL_MAX_BATCH;
 	}
 
 	pthread_spin_init(&task->gen_lock, PTHREAD_PROCESS_PRIVATE);
