@@ -371,7 +371,16 @@ struct spdk_lvs_xfer {
 	 * destination; its first range write CoWs the cluster from the base the
 	 * landing blob is chained to (cheap with copy offload), so no merge. */
 	bool cow_landing;
+	/* Final replication step whose destination is a real clone of the
+	 * snapshot named in snapshot_name (the control plane's cutover clone,
+	 * requested with cow_landing): the destination is already chained, so
+	 * no "transfer_task_completed" signal is written. Without the
+	 * destination's migration_flag that page is not intercepted and would
+	 * land as data on page 0 of the volume. */
+	bool dest_is_clone;
 	struct blob_dirty_gen *dirty_gen;
+	/* dirty_gen's base when it was pinned (final step re-validation) */
+	uint64_t dirty_gen_base;
 	uint8_t *partial;
 	/* Delta bridged over snapshots between the destination's base and the
 	 * generation's base (xfer_bridge_partial_base): bridged[i] marks the

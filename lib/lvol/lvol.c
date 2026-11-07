@@ -5183,6 +5183,9 @@ fragment_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 /* Largest request of a partial transfer: one source read and at most two
  * destination writes (XFER_MAX_WRITE_BYTES) each. */
 #define XFER_PARTIAL_MAX_BYTES	(64 * 1024)
+/* In-flight requests of a partial final step (snapshot replication's window;
+ * the control plane passes 2 for a whole-cluster final step). */
+#define XFER_FINAL_PARTIAL_WINDOW	256
 
 /* A cluster of a partial transfer whose dirty share is at least this many
  * percent is sent as one whole-cluster request instead of its dirty ranges
@@ -6297,9 +6300,22 @@ xfer_resume_offset(struct spdk_lvs_xfer *xfer, const struct spdk_lvs_xfer_req *d
  * Decide whether this task sends dirty ranges instead of whole clusters, and
  * pin the generation that drives it. Everything that could make the delta
  * incomplete falls back to full clusters, which is always correct:
- *  - only snapshot replication of a fresh (not resumed) task: a resumed task
+ *  - only replication of a fresh (not resumed) task: a resumed task
  *    may find destination clusters an earlier full attempt allocated fresh,
  *    where a range write would leave zeroes instead of the base's content;
+ *  - a snapshot, or the FINAL step of the live volume. The live volume's
+ *    generation tracks the writes since its last snapshot (the rotation in
+ *    bs_snapshot_swap_cluster_maps sets its base to that snapshot). It is
+ *    stable only because the control plane fenced the source and the final
+ *    step froze it (lvol->freezed, set before this call). Nothing allocated
+ *    here depends on the dirty content -- max_ranges is per-cluster
+ *    geometry, partial[] one byte per cluster -- and the scan and the
+ *    classification run in XFER_STATE_NONE, after the in-flight drain
+ *    (spdk_lvol_transfer_delay), so writes in flight at setup are in the
+ *    bitmaps by then. XFER_STATE_NONE re-validates the generation
+ *    (xfer_final_gen_valid) and sends every cluster whole if it changed.
+ *    The final step needs cow_landing: its destination goes live without a
+ *    merge that could fill the unsent blocks of a pre-allocated cluster;
  *  - the generation must be usable against partial_base, the blob the
  *    destination's landing volume holds a copy of (spdk_blob_dirty_gen_usable:
  *    complete, same leadership epoch, started at that base);
@@ -6410,9 +6426,18 @@ xfer_setup_partial(struct spdk_lvs_xfer *xfer, uint64_t offset, uint64_t partial
 	const char *why = NULL;
 	bool usable = false;
 
-	if (xfer->type != XFER_REPLICATE_SNAPSHOT || xfer->final_step) {
-		why = "only snapshot replication sends dirty ranges";
-	} else if (!spdk_blob_is_read_only(lvol->blob)) {
+	if (xfer->type != XFER_REPLICATE_SNAPSHOT) {
+		why = "only replication sends dirty ranges";
+	} else if (xfer->final_step && !xfer->cow_landing) {
+		/* The cutover destination goes live right after the final step:
+		 * no spdk_blob_merge_base follows that could fill the unsent
+		 * blocks of a pre-allocated cluster. Only a destination that is a
+		 * clone of the base (CoW on the first range write) is exact. */
+		why = "a final step sends dirty ranges only into a clone of the base (cow_landing)";
+	} else if (xfer->final_step && !lvol->freezed) {
+		/* the live volume's generation is stable only while it is frozen */
+		why = "the final step's source is not frozen";
+	} else if (!xfer->final_step && !spdk_blob_is_read_only(lvol->blob)) {
 		/* a writable blob's generation keeps growing after the scan */
 		why = "the source is not a read-only snapshot";
 	} else if (offset != 0) {
@@ -6447,10 +6472,12 @@ xfer_setup_partial(struct spdk_lvs_xfer *xfer, uint64_t offset, uint64_t partial
 			 * bitmaps across many poller ticks. */
 			spdk_blob_dirty_gen_ref(gen);
 			xfer->dirty_gen = gen;
+			xfer->dirty_gen_base = spdk_blob_dirty_gen_base(gen);
 			xfer->allow_partial = true;
-			SPDK_NOTICELOG("Transfer lvol %s: dirty-bitmap partial transfer (gen %" PRIu64
+			SPDK_NOTICELOG("Transfer lvol %s%s: dirty-bitmap partial transfer (gen %" PRIu64
 				       ", base 0x%" PRIx64 ", %" PRIu64 " tracked clusters, %" PRIu64
-				       " dirty bytes)\n", lvol->name, spdk_blob_dirty_gen_id(gen),
+				       " dirty bytes)\n", lvol->name,
+				       xfer->final_step ? " final step" : "", spdk_blob_dirty_gen_id(gen),
 				       partial_base, spdk_blob_dirty_gen_tracked(gen),
 				       spdk_blob_dirty_gen_bytes(gen));
 			if (xfer->bridged != NULL) {
@@ -6463,8 +6490,9 @@ xfer_setup_partial(struct spdk_lvs_xfer *xfer, uint64_t offset, uint64_t partial
 			return;
 		}
 	}
-	SPDK_NOTICELOG("Transfer lvol %s: partial requested (base 0x%" PRIx64 "), sending full "
-		       "clusters: %s\n", lvol->name, partial_base, why);
+	SPDK_NOTICELOG("Transfer lvol %s%s: partial requested (base 0x%" PRIx64 "), sending full "
+		       "clusters: %s\n", lvol->name, xfer->final_step ? " final step" : "",
+		       partial_base, why);
 }
 
 /* Fill ranges with cluster idx's dirty ranges. False: no usable bitmap for it
@@ -6703,6 +6731,34 @@ xfer_refill_inline(struct spdk_lvs_xfer_req *req)
 	return true;
 }
 
+/*
+ * The final step pinned the live volume's generation at setup, before the
+ * in-flight drain. Classify against it only if it is still the volume's
+ * current generation, on the same base, and still usable (nothing rotated or
+ * invalidated it meanwhile: a snapshot, a leadership change, a write it could
+ * not represent). Otherwise every cluster goes whole -- always exact.
+ */
+static bool
+xfer_final_gen_valid(struct spdk_lvs_xfer *xfer)
+{
+	struct spdk_blob *blob = xfer->lvol->blob;
+	const char *why = NULL;
+
+	if (spdk_blob_get_dirty_gen(blob) != xfer->dirty_gen) {
+		why = "the volume's dirty generation changed since the setup";
+	} else if (spdk_blob_dirty_gen_base(xfer->dirty_gen) != xfer->dirty_gen_base) {
+		why = "the dirty generation's base changed since the setup";
+	} else if (!spdk_blob_dirty_gen_usable(blob, xfer->dirty_gen, xfer->dirty_gen_base, &why)) {
+		/* why set */
+	}
+	if (why != NULL) {
+		SPDK_NOTICELOG("Transfer lvol %s final step: sending every cluster whole: %s\n",
+			       xfer->lvol->name, why);
+		return false;
+	}
+	return true;
+}
+
 static int
 xfer_replication(struct spdk_lvs_xfer *xfer) {
 	struct spdk_lvs_xfer_req *req;
@@ -6742,7 +6798,7 @@ xfer_replication(struct spdk_lvs_xfer *xfer) {
 				xfer_fill_queue(xfer, xfer->final_step ? 1 : 0);
 				return count;
 			}
-			if (xfer->allow_partial) {
+			if (xfer->allow_partial && (!xfer->final_step || xfer_final_gen_valid(xfer))) {
 				xfer_classify_partial(xfer);
 			}
 			xfer->state = XFER_STATE_ALLOC_CLUSTERS;
@@ -6809,14 +6865,25 @@ xfer_replication(struct spdk_lvs_xfer *xfer) {
 			break;
 
 		case XFER_STATE_SIGNAL_TRANSFER:
+			if (xfer->dest_is_clone) {
+				/* every data request is done (that is how this state
+				 * was reached); the destination is already a clone of
+				 * the snapshot: nothing to chain */
+				SPDK_NOTICELOG("Transfer lvol %s final step: destination is a clone of %s, "
+					       "no completion signal\n", xfer->lvol->name, xfer->snapshot_name);
+				xfer->state = XFER_STATE_DONE;
+				return 0;
+			}
 			rc = xfer_status_check(xfer, &req, xfer->idx, XFER_STATE_DONE, 0);
 			if (rc != 0) {
 				return 0;
 			}
 
 			if (!xfer->signal_sent) {
-				memset(req->payload, 0, xfer->page_size * xfer->page_per_cluster);
-				count++;	
+				/* one page: a partial task's payloads are only
+				 * XFER_PARTIAL_MAX_BYTES, a whole cluster would overrun */
+				memset(req->payload, 0, xfer->page_size);
+				count++;
 				req->len = 1;
 				req->offset = 0;
 				req->action = REQ_ACTION_WRITE;
@@ -8480,6 +8547,7 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
 	struct spdk_lvs_xfer *xfer, *task;	
 	struct spdk_lvol_store *lvs = lvol->lvol_store;	
 	int rc;
+	bool final_step;
 	// if (!lvs->leader) {
 	// 	SPDK_ERRLOG("Lvolstore %s: is not leader.\n", lvs->name);
 	// 	return -EINVAL;
@@ -8575,15 +8643,40 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
 	 * clusters it writes may hold the base's content (CoW of an earlier
 	 * partial attempt) rather than read as zeroes. */
 	task->no_zero_skip = offset != 0 || allow_partial || partial_base != 0;
+	/* The final step of a replication whose destination the control plane
+	 * built as a clone of the snapshot it names (cow_landing): no chaining
+	 * signal (see dest_is_clone). */
+	task->dest_is_clone = task->final_step && type == XFER_REPLICATE_SNAPSHOT && cow_landing;
+	/* Freeze the final step's volume before the partial decision: its
+	 * generation must not move under the setup (xfer_setup_partial). The
+	 * drain of IO already in flight follows (spdk_lvol_transfer_delay). */
+	if (task->final_step) {
+		lvol->freezed = true;
+	}
 	/* Decided before the request buffers are sized: a partial task sends
 	 * every cluster in requests of at most XFER_PARTIAL_MAX_BYTES. */
 	if (allow_partial) {
 		task->cow_landing = cow_landing;
 		xfer_setup_partial(task, offset, partial_base);
 	}
+	/* A partial final step sends 64 KiB requests, not 2 MiB clusters: a
+	 * window of 2 (the control plane's final-step batch, sized for whole
+	 * clusters) would leave the dirty ranges latency-bound inside the 12 s
+	 * terminate timeout. Use snapshot replication's window; the payload
+	 * pool is cluster_batch * 64 KiB = 16 MiB, as for a replication task. */
+	if (task->final_step && task->allow_partial && task->cluster_batch < XFER_FINAL_PARTIAL_WINDOW) {
+		SPDK_NOTICELOG("Transfer lvol %s final step: window %u -> %u requests (dirty ranges)\n",
+			       lvol->name, task->cluster_batch, XFER_FINAL_PARTIAL_WINDOW);
+		task->cluster_batch = XFER_FINAL_PARTIAL_WINDOW;
+	}
 
+	final_step = task->final_step;
 	rc = spdk_lvol_create_backup_task(task, tdev);
 	if (rc != 0) {
+		/* the task is freed; the freeze set above is ours to undo */
+		if (final_step) {
+			lvol->freezed = false;
+		}
 		return rc;
 	}
 
@@ -8592,12 +8685,9 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
 		__atomic_add_fetch(&g_priority_xfer_cnt, 1, __ATOMIC_SEQ_CST);
 	}
 
-	//freezing the lvol for incoming io here
-	//TODO: put some delay for stating the migration bcs may we have inflight IO
-	if (task->final_step) {
-		lvol->freezed = true;
-	}
-	
+	/* the final step's freeze was set before the partial decision above;
+	 * spdk_lvol_transfer_delay waits for IO already in flight */
+
 	SPDK_NOTICELOG("Transfer lvol %s %s task: last offset %" PRIu64 " status %s start.\n", task->lvol->name,
 		 			xfer_type_to_string(task->type), task->lvol->last_offset,
 					xfer_result_type_to_string(task->lvol->transfer_status));

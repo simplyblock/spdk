@@ -3850,6 +3850,14 @@ struct rpc_bdev_lvol_transfer_final_step {
 	char *snapshot_name;
 	char *operation;
 	bool special_io;
+	/* Optional, as for bdev_lvol_transfer: send the live volume's dirty
+	 * ranges since partial_base (the SOURCE blob id of the snapshot the
+	 * destination is a clone of) instead of whole clusters. cow_landing:
+	 * the destination is a clone of that snapshot -- required for
+	 * allow_partial, and it also drops the chaining signal. */
+	bool allow_partial;
+	bool cow_landing;
+	uint64_t partial_base;
 };
 
 static void 
@@ -3868,6 +3876,9 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_transfer_final_step_d
 	{"snapshot_name", offsetof(struct rpc_bdev_lvol_transfer_final_step, snapshot_name), spdk_json_decode_string},
 	{"special_io", offsetof(struct rpc_bdev_lvol_transfer_final_step, special_io), spdk_json_decode_bool, true},
 	{"operation", offsetof(struct rpc_bdev_lvol_transfer_final_step, operation), spdk_json_decode_string},
+	{"allow_partial", offsetof(struct rpc_bdev_lvol_transfer_final_step, allow_partial), spdk_json_decode_bool, true},
+	{"cow_landing", offsetof(struct rpc_bdev_lvol_transfer_final_step, cow_landing), spdk_json_decode_bool, true},
+	{"partial_base", offsetof(struct rpc_bdev_lvol_transfer_final_step, partial_base), spdk_json_decode_uint64, true},
 };
 
 static void
@@ -3965,10 +3976,31 @@ rpc_bdev_lvol_transfer_final_step(struct spdk_jsonrpc_request *request,
 	}
 	SPDK_NOTICELOG("Transfering lvol %s in mode %s for final step.\n", req.lvol_name, req.operation);
 
+	if (type != XFER_REPLICATE_SNAPSHOT && (req.allow_partial || req.cow_landing)) {
+		/* migration's final step moves metadata, not a delta */
+		SPDK_NOTICELOG("Transfer lvol %s final step: allow_partial/cow_landing ignored for %s\n",
+			       req.lvol_name, req.operation);
+		req.allow_partial = false;
+		req.cow_landing = false;
+	}
+	if (req.allow_partial && (req.special_io || !req.cow_landing || req.partial_base == 0 ||
+				  req.partial_base == SPDK_BLOBID_INVALID ||
+				  req.partial_base == SPDK_BLOBID_EXTERNAL_SNAPSHOT)) {
+		/* the destination goes live right after this step: no merge can
+		 * fill the unsent blocks of a cluster that is not a CoW of the base */
+		SPDK_NOTICELOG("Transfer lvol %s final step: allow_partial ignored (%s)\n", req.lvol_name,
+			       req.special_io ? "special_io" : !req.cow_landing ? "no cow_landing" :
+			       "no partial_base");
+		req.allow_partial = false;
+	}
+
 	/* Class 0: the final step moves the volume that carries client IO next,
-	 * so its reads keep the volume's own class. */
+	 * so its reads keep the volume's own class. cow_landing goes on without
+	 * allow_partial too: the destination is already a clone of the snapshot,
+	 * so no chaining signal is written. */
 	rc = spdk_lvol_transfer(lvol, 0, req.cluster_batch, type, tdev, req.snapshot_name, req.lvol_id, 0,
-				false, 0, false, rpc_bdev_lvol_transfer_final_step_cb, request);
+				req.allow_partial, req.partial_base, req.cow_landing,
+				rpc_bdev_lvol_transfer_final_step_cb, request);
 	if (rc < 0) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 spdk_strerror(-rc));

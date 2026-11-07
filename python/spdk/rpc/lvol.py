@@ -357,7 +357,8 @@ def bdev_lvol_s3_bdev(client, bdev=None, uuid=None, lvs_name=None):
         params['lvs_name'] = lvs_name
     return client.call('bdev_lvol_s3_bdev', params)
 
-def bdev_lvol_transfer_final_step(client, lvol_name=None, lvol_id=0, snapshot_name=None, cluster_batch=16, gateway=None, operation=None):
+def bdev_lvol_transfer_final_step(client, lvol_name=None, lvol_id=0, snapshot_name=None, cluster_batch=16, gateway=None, operation=None,
+                                  allow_partial=False, partial_base=0, cow_landing=False):
     """Replicate a logical volume on a logical volume store.
 
     Args:
@@ -366,6 +367,11 @@ def bdev_lvol_transfer_final_step(client, lvol_name=None, lvol_id=0, snapshot_na
         cluster_batch: elements count in the queue between pollers
         gateway: Name of the gateway to use for transfer (required)
         operation: action type to be useed for transfer (required)
+        allow_partial: send the live volume's dirty ranges since partial_base
+            instead of whole clusters (replicate only; needs cow_landing)
+        partial_base: source blob id of the snapshot the destination is a clone of
+        cow_landing: the destination is a clone of that snapshot (no
+            pre-allocation of partial clusters, no chaining signal)
     """
     if not lvol_name:
         raise ValueError("lvol_name must be specified")
@@ -377,6 +383,11 @@ def bdev_lvol_transfer_final_step(client, lvol_name=None, lvol_id=0, snapshot_na
         raise ValueError("lvol_id must be specified")
 
     params = {'lvol_name': lvol_name, 'lvol_id': lvol_id, 'snapshot_name': snapshot_name, 'cluster_batch': cluster_batch, 'gateway': gateway, 'operation': operation}
+    if cow_landing:
+        params['cow_landing'] = True
+    if allow_partial:
+        params['allow_partial'] = True
+        params['partial_base'] = partial_base
     return client.call('bdev_lvol_transfer_final_step', params)
 
 def bdev_lvol_batch_transfer_final_step(client, lvol_names=None, ids=None, snapshots=None, cluster_batch=16, gateway=None, operation=None):

@@ -720,6 +720,103 @@ xfer_partial_setup_gates(void)
 	blob_dirty_gen_free(gen);
 }
 
+/* The final step of the live volume sends dirty ranges only into a clone of
+ * the base (cow_landing) and only while the volume is frozen; its writable
+ * blob is fine then. */
+static void
+xfer_partial_setup_final_step(void)
+{
+	const int alloc[1] = {1};
+	struct blob_dirty_gen *gen = make_gen_012();
+	struct spdk_lvs_xfer *xfer;
+
+	xfer = make_xfer(1, 1, alloc);
+	xfer->page_size = 4096;
+	xfer->final_step = true;
+	g_ut_dirty_gen = gen;
+	g_ut_dirty_usable = true;
+	g_blob_read_only = false;	/* the live volume */
+
+	/* no cow_landing: the destination would need a merge */
+	g_xfer_lvol.freezed = true;
+	xfer_setup_partial(xfer, 0, 0x42);
+	CU_ASSERT(!xfer->allow_partial && xfer->dirty_gen == NULL);
+
+	/* cow_landing, but not frozen: the generation still moves */
+	xfer->cow_landing = true;
+	g_xfer_lvol.freezed = false;
+	xfer_setup_partial(xfer, 0, 0x42);
+	CU_ASSERT(!xfer->allow_partial && xfer->dirty_gen == NULL);
+
+	/* migration's final step never */
+	g_xfer_lvol.freezed = true;
+	xfer->type = XFER_MIGRATE_SNAPSHOT;
+	xfer_setup_partial(xfer, 0, 0x42);
+	CU_ASSERT(!xfer->allow_partial && xfer->dirty_gen == NULL);
+	CU_ASSERT(gen->refcnt == 1);
+
+	/* replicate, cow_landing, frozen: partial on the writable blob */
+	xfer->type = XFER_REPLICATE_SNAPSHOT;
+	xfer_setup_partial(xfer, 0, 0x42);
+	CU_ASSERT(xfer->allow_partial && xfer->dirty_gen == gen);
+	CU_ASSERT(gen->refcnt == 2);
+	free_partial_xfer(xfer);
+	CU_ASSERT(gen->refcnt == 1);
+	g_xfer_lvol.freezed = false;
+
+	blob_dirty_gen_free(gen);
+}
+
+/* A final step into a clone of the snapshot ends without the chaining
+ * signal (it would be written as data to page 0 of the destination); one
+ * into a plain lvol still sends it, one page long. */
+static void
+xfer_final_step_signal(void)
+{
+	const int alloc[1] = {1};
+	struct spdk_lvs_xfer *xfer;
+	struct spdk_lvs_xfer_req *req = NULL;
+
+	xfer = make_xfer(2, 1, alloc);
+	xfer->final_step = true;
+	xfer->priority = true;
+	xfer->dest_is_clone = true;
+	snprintf(xfer->snapshot_name, sizeof(xfer->snapshot_name), "lvs/snap");
+	xfer->len = 8;
+	xfer->state = XFER_STATE_SIGNAL_TRANSFER;
+	xfer_fill_queue(xfer, 1);
+	xfer_replication(xfer);
+	CU_ASSERT(xfer->state == XFER_STATE_DONE);
+	CU_ASSERT(spdk_ring_count(xfer->ready_ring) == 0);
+	free_xfer(xfer);
+
+	xfer = make_xfer(2, 1, alloc);
+	xfer->page_size = 4096;
+	for (int i = 0; i < 2; i++) {
+		free(xfer->reqs[i].payload);
+		xfer->reqs[i].payload = calloc(1, xfer->page_size * xfer->page_per_cluster);
+		SPDK_CU_ASSERT_FATAL(xfer->reqs[i].payload != NULL);
+	}
+	xfer->terminate_timeout = UINT64_MAX;
+	xfer->final_step = true;
+	xfer->priority = true;
+	snprintf(xfer->snapshot_name, sizeof(xfer->snapshot_name), "lvs/snap");
+	xfer->len = 8;
+	xfer->state = XFER_STATE_SIGNAL_TRANSFER;
+	xfer_fill_queue(xfer, 1);
+	memset(xfer->reqs[0].payload, 0xff, xfer->page_size * xfer->page_per_cluster);
+	xfer_replication(xfer);
+	CU_ASSERT(xfer->signal_sent);
+	CU_ASSERT(spdk_ring_dequeue(xfer->ready_ring, (void **)&req, 1) == 1);
+	CU_ASSERT(req != NULL && req->len == 1 && req->action == REQ_ACTION_WRITE);
+	if (req != NULL) {
+		CU_ASSERT(strncmp(req->payload, "transfer_task_completed:lvs/snap", 32) == 0);
+		/* only the signal page is cleared */
+		CU_ASSERT(((uint8_t *)req->payload)[xfer->page_size] == 0xff);
+	}
+	free_xfer(xfer);
+}
+
 /* Every cluster is pre-allocated on the destination, partial ones too: they
  * receive only their dirty blocks, and the destination fills the rest from the
  * base once, after the transfer (spdk_blob_merge_base), not by a CoW per
@@ -1102,6 +1199,8 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, xfer_replicate_submit_failure_fails_the_request);
 	CU_ADD_TEST(suite, xfer_replicate_write_failure_fails_the_request);
 	CU_ADD_TEST(suite, xfer_partial_setup_gates);
+	CU_ADD_TEST(suite, xfer_partial_setup_final_step);
+	CU_ADD_TEST(suite, xfer_final_step_signal);
 	CU_ADD_TEST(suite, xfer_partial_alloc_includes_partial_clusters);
 	CU_ADD_TEST(suite, xfer_cow_landing_alloc_skips_partial_clusters);
 	CU_ADD_TEST(suite, xfer_cow_landing_all_partial_allocates_nothing);
