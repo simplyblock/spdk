@@ -4810,6 +4810,12 @@ blob_dirty_mark_io_units(struct spdk_blob *blob, uint64_t offset, uint64_t lengt
 	blob_dirty_mark(gen, offset * blob->bs->io_unit_size, length * blob->bs->io_unit_size);
 }
 
+bool
+spdk_blob_locked_operation_in_progress(const struct spdk_blob *blob)
+{
+	return blob != NULL && blob->locked_operation_in_progress;
+}
+
 struct blob_dirty_gen *
 spdk_blob_get_dirty_gen(struct spdk_blob *blob)
 {
@@ -13393,6 +13399,8 @@ clone_update_delete_sync_cpl(void *cb_arg, int lvolerrno)
 	clone->state = SPDK_BLOB_STATE_CLEAN;
 	if (lvolerrno < 0) {
 		SPDK_ERRLOG("Could not update clone blob for sync lvol delete blobid 0x%" PRIx64 " \n", clone->id);
+		/* ctx was leaked here */
+		free(ctx);
 		return;
 	}
 	SPDK_NOTICELOG("update clone blob for async lvol delete blobid 0x%" PRIx64 " done.\n", clone->id);
@@ -13453,7 +13461,12 @@ clone_update_delete_sync_cpl(void *cb_arg, int lvolerrno)
 		new_parent_entry->clone_count++;
 
 		parentblob = blob_lookup(clone->bs, new_parent_entry->id);
-		if (parentblob && parentblob->open_ref != snapshot_entry->clone_count + 1 ) {
+		/* snapshot_entry (the OLD parent's) is NULL when the clone had no
+		 * parent before (ctx->parent_id invalid): do not dereference it.
+		 * Whether the old parent's count is the right one here at all is
+		 * left to the owner (the branch above uses the new parent's). */
+		if (parentblob && snapshot_entry &&
+		    parentblob->open_ref != snapshot_entry->clone_count + 1) {
 			parentblob->open_ref = snapshot_entry->clone_count + 1;
 		}
 

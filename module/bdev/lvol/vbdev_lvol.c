@@ -894,6 +894,87 @@ _vbdev_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *c
 	cb_fn(cb_arg, 0);
 }
 
+/*
+ * A secondary-mode delete of a blob whose failover update is still in flight.
+ * Deleting a snapshot in secondary mode re-parents its clone and starts an
+ * async spdk_blob_update_on_failover of that clone
+ * (spdk_bs_delete_blob_non_leader); the control plane's next sync delete is
+ * often that very clone (a chain torn down top to bottom). Copying and
+ * freeing the blob then (spdk_lvol_copy_blob, delete_blob_manually) left the
+ * update's completion chain -- bs_update_blob_cpl, blob_unfreeze_io,
+ * clone_update_delete_sync_cpl -- writing into freed memory: heap corruption,
+ * SIGSEGV in the bdev name tree seconds later (bf14, 2026-11-06). Wait for
+ * the update instead, bounded; the RPC answers when the delete is done.
+ */
+#define VBDEV_LVOL_DESTROY_DEFER_US		(10 * 1000)
+#define VBDEV_LVOL_DESTROY_DEFER_MAX_US		(30 * 1000 * 1000)
+
+struct vbdev_lvol_destroy_defer {
+	struct spdk_lvol	*lvol;
+	spdk_lvol_op_complete	cb_fn;
+	void			*cb_arg;
+	bool			is_sync;
+	uint64_t		deadline;
+	struct spdk_poller	*poller;
+};
+
+static int
+vbdev_lvol_destroy_defer_poll(void *arg)
+{
+	struct vbdev_lvol_destroy_defer *d = arg;
+	struct spdk_lvol *lvol = d->lvol;
+
+	if (spdk_blob_locked_operation_in_progress(lvol->blob)) {
+		if (spdk_get_ticks() < d->deadline) {
+			return SPDK_POLLER_IDLE;
+		}
+		SPDK_ERRLOG("Deleting blob 0x%" PRIx64 " in secondary mode: its metadata update "
+			    "is still in flight after %u s, giving up (-EBUSY)\n", lvol->blob_id,
+			    VBDEV_LVOL_DESTROY_DEFER_MAX_US / (1000 * 1000));
+		spdk_poller_unregister(&d->poller);
+		lvol->action_in_progress = false;
+		d->cb_fn(d->cb_arg, -EBUSY);
+		free(d);
+		return SPDK_POLLER_BUSY;
+	}
+	spdk_poller_unregister(&d->poller);
+	lvol->action_in_progress = false;
+	SPDK_NOTICELOG("Deleting blob 0x%" PRIx64 " in secondary mode: metadata update done, "
+		       "deleting now\n", lvol->blob_id);
+	vbdev_lvol_destroy(lvol, d->cb_fn, d->cb_arg, d->is_sync);
+	free(d);
+	return SPDK_POLLER_BUSY;
+}
+
+static bool
+vbdev_lvol_destroy_defer(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg,
+			 bool is_sync)
+{
+	struct vbdev_lvol_destroy_defer *d = calloc(1, sizeof(*d));
+
+	if (d == NULL) {
+		return false;
+	}
+	d->lvol = lvol;
+	d->cb_fn = cb_fn;
+	d->cb_arg = cb_arg;
+	d->is_sync = is_sync;
+	d->deadline = spdk_get_ticks() +
+		      spdk_get_ticks_hz() / (1000 * 1000) * VBDEV_LVOL_DESTROY_DEFER_MAX_US;
+	d->poller = SPDK_POLLER_REGISTER(vbdev_lvol_destroy_defer_poll, d,
+					 VBDEV_LVOL_DESTROY_DEFER_US);
+	if (d->poller == NULL) {
+		free(d);
+		return false;
+	}
+	/* a repeated delete RPC (the control plane retries on its timeout)
+	 * answers -EBUSY instead of deferring a second delete of this lvol */
+	lvol->action_in_progress = true;
+	SPDK_NOTICELOG("Deleting blob 0x%" PRIx64 " in secondary mode: deferred, its metadata "
+		       "update is in flight\n", lvol->blob_id);
+	return true;
+}
+
 void
 vbdev_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg, bool is_sync)
 {
@@ -936,6 +1017,15 @@ vbdev_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb
 
 		if (lvol->hublvol) {
 			_vbdev_lvol_destroy(lvol, cb_fn, cb_arg, true);
+			return;
+		}
+
+		if (spdk_blob_locked_operation_in_progress(lvol->blob)) {
+			/* a failover update holds the blob: copying or freeing
+			 * it now corrupts the heap (vbdev_lvol_destroy_defer) */
+			if (!vbdev_lvol_destroy_defer(lvol, cb_fn, cb_arg, is_sync)) {
+				cb_fn(cb_arg, -EBUSY);
+			}
 			return;
 		}
 

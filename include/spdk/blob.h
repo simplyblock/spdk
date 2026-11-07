@@ -522,6 +522,11 @@ struct blob_dirty_range {
 	uint32_t len;	/* in 8 KiB blocks */
 };
 
+/* True while a metadata operation that holds the blob (a failover update on a
+ * non-leader, a snapshot/clone/resize) is in flight: the blob must not be
+ * freed until it completes. */
+bool spdk_blob_locked_operation_in_progress(const struct spdk_blob *blob);
+
 struct blob_dirty_gen *spdk_blob_get_dirty_gen(struct spdk_blob *blob);
 /* Pin a generation for the lifetime of a transfer task. The snapshot family
  * cap frees generations older than the two newest snapshots, so a task that

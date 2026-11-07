@@ -2390,6 +2390,72 @@ spdk_lvol_rename(struct spdk_lvol *lvol, const char *new_name,
 	}
 }
 
+/* Waiting for a failover update of the blob, at most 3000 polls of 10 ms
+ * (see lvol_destroy_non_leader). */
+#define LVOL_DESTROY_NON_LEADER_WAIT_US		(10 * 1000)
+#define LVOL_DESTROY_NON_LEADER_WAIT_MAX	3000
+
+static int lvol_destroy_non_leader_poll(void *arg);
+
+/*
+ * Non-leader delete of the lvol's blob. delete_blob_manually frees the open
+ * blob (blob_lookup of the id); if a failover update of it is in flight --
+ * started when the snapshot below it was deleted in secondary mode -- its
+ * completion chain then writes into freed memory. vbdev_lvol_destroy already
+ * waits for that before it copies the blob; this covers an update that began
+ * between that check and here (the bdev unregister in between is async).
+ */
+static void
+lvol_destroy_non_leader(struct spdk_lvol_req *req)
+{
+	struct spdk_lvol *lvol = req->lvol;
+	struct spdk_blob_store *bs = lvol->lvol_store->blobstore;
+
+	if (spdk_blob_locked_operation_in_progress(lvol->blob) &&
+	    req->rc < LVOL_DESTROY_NON_LEADER_WAIT_MAX) {
+		if (req->poller == NULL) {
+			SPDK_NOTICELOG("Deleting tmpblob 0x%" PRIx64 " on failover: waiting for its "
+				       "metadata update\n", lvol->blob_id);
+			req->poller = SPDK_POLLER_REGISTER(lvol_destroy_non_leader_poll, req,
+							   LVOL_DESTROY_NON_LEADER_WAIT_US);
+		}
+		if (req->poller != NULL) {
+			return;
+		}
+		/* no poller: go on, as before this check */
+	}
+	if (req->poller != NULL) {
+		spdk_poller_unregister(&req->poller);
+	}
+	if (spdk_blob_locked_operation_in_progress(lvol->blob)) {
+		SPDK_ERRLOG("Deleting tmpblob 0x%" PRIx64 " on failover while its metadata update "
+			    "is still in flight\n", lvol->blob_id);
+	}
+
+	SPDK_NOTICELOG("Deleting tmpblob 0x%" PRIx64 " on failover.\n", lvol->blob_id);
+	// TODO add check for snapshots and clons
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+	spdk_bs_delete_blob_non_leader(bs, lvol->tmp_blob);
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+	req->rc = 0;
+	lvol_delete_blob_cb(req, 0);
+}
+
+static int
+lvol_destroy_non_leader_poll(void *arg)
+{
+	struct spdk_lvol_req *req = arg;
+
+	/* rc counts the polls while the delete waits */
+	req->rc++;
+	if (spdk_blob_locked_operation_in_progress(req->lvol->blob) &&
+	    req->rc < LVOL_DESTROY_NON_LEADER_WAIT_MAX) {
+		return SPDK_POLLER_IDLE;
+	}
+	lvol_destroy_non_leader(req);
+	return SPDK_POLLER_BUSY;
+}
+
 void
 spdk_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg)
 {
@@ -2452,12 +2518,7 @@ spdk_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_
 	if (lvol->lvol_store->leader) {
 		spdk_bs_delete_blob(bs, lvol->blob_id, lvol_delete_blob_cb, req);
 	} else {
-		SPDK_NOTICELOG("Deleting tmpblob 0x%" PRIx64 " on failover.\n", lvol->blob_id);
-		// TODO add check for snapshots and clons
-		pthread_mutex_lock(&g_lvol_stores_mutex);
-		spdk_bs_delete_blob_non_leader(bs, lvol->tmp_blob);
-		pthread_mutex_unlock(&g_lvol_stores_mutex);
-		lvol_delete_blob_cb(req , 0);
+		lvol_destroy_non_leader(req);
 	}
 }
 
