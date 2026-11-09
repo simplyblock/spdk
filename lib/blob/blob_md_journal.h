@@ -10,6 +10,17 @@
 #define BS_MD_JOURNAL_PAGE_SIZE           4096u
 #define BS_MD_JOURNAL_ENTRY_SIZE          8192u
 #define BS_MD_JOURNAL_NUM_ELEMS           8192u
+/*
+ * The elements' DMA buffers (header page + metadata page, 8 KiB each) are
+ * carved from chunks of this many elements (2 MiB per chunk), not allocated
+ * one 4 KiB page at a time: 16384 single 4 KiB-aligned allocations per journal
+ * left a 3968 B hole after every page -- 186 MiB of unusable holes on a node
+ * with three lvstores, and no free block above ~0.5 MiB (bed bf19 2026-11-09).
+ * Chunks, not one 64 MiB block: a journal can be created on a heap that is
+ * already fragmented (lvstore load, takeover).
+ */
+#define BS_MD_JOURNAL_ELEMS_PER_CHUNK     256u
+#define BS_MD_JOURNAL_NUM_CHUNKS          (BS_MD_JOURNAL_NUM_ELEMS / BS_MD_JOURNAL_ELEMS_PER_CHUNK)
 
 /*
  * Maximum number of ordered journal elements handled by one home drain batch.
@@ -42,6 +53,11 @@ SPDK_STATIC_ASSERT(
 	(BS_MD_JOURNAL_EXAMINE_HASH_SIZE &
 	 (BS_MD_JOURNAL_EXAMINE_HASH_SIZE - 1)) == 0,
 	"MD journal examine hash size must be power of two");
+
+SPDK_STATIC_ASSERT(BS_MD_JOURNAL_NUM_ELEMS % BS_MD_JOURNAL_ELEMS_PER_CHUNK == 0,
+		   "MD journal elements must fill whole DMA chunks");
+SPDK_STATIC_ASSERT(BS_MD_JOURNAL_ENTRY_SIZE == 2 * BS_MD_JOURNAL_PAGE_SIZE,
+		   "an MD journal element is a header page plus a metadata page");
 
 struct md_journal_hash_entry {
 	struct md_journal_elem *elem;
@@ -246,6 +262,8 @@ TAILQ_HEAD(md_journal_home_wait_queue, md_journal_home_waiter);
 
 struct spdk_bs_md_journal {
 	struct spdk_blob_store *bs;
+	/* DMA chunks the elements' hdr/page buffers point into */
+	void *elem_dma_chunks[BS_MD_JOURNAL_NUM_CHUNKS];
 	spdk_bs_sequence_t *home_seq;
 	spdk_bs_sequence_t *zero_seq;
 	/*

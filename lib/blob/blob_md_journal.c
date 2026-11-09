@@ -70,6 +70,17 @@ md_journal_can_destroy(struct spdk_bs_md_journal *jr)
 }
 
 static void
+md_journal_free_elem_chunks(struct spdk_bs_md_journal *jr)
+{
+	uint32_t c;
+
+	for (c = 0; c < BS_MD_JOURNAL_NUM_CHUNKS; c++) {
+		spdk_free(jr->elem_dma_chunks[c]);
+		jr->elem_dma_chunks[c] = NULL;
+	}
+}
+
+static void
 md_journal_free(struct spdk_bs_md_journal *jr)
 {
 	struct md_journal_elem *elem;
@@ -103,21 +114,14 @@ md_journal_free(struct spdk_bs_md_journal *jr)
 	if (jr->elems != NULL) {
 		for (i = 0; i < BS_MD_JOURNAL_NUM_ELEMS; i++) {
 			elem = &jr->elems[i];
-
-			if (elem->hdr != NULL) {
-				spdk_free(elem->hdr);
-				elem->hdr = NULL;
-			}
-
-			if (elem->page != NULL) {
-				spdk_free(elem->page);
-				elem->page = NULL;
-			}
+			elem->hdr = NULL;	/* points into elem_dma_chunks */
+			elem->page = NULL;
 		}
 
 		free(jr->elems);
 		jr->elems = NULL;
 	}
+	md_journal_free_elem_chunks(jr);
 
 	free(jr->drain_batch);
 	jr->drain_batch = NULL;
@@ -2105,24 +2109,28 @@ md_journal_init_elements(struct spdk_bs_md_journal *jr)
 	}
 
 	for (i = 0; i < BS_MD_JOURNAL_NUM_ELEMS; i++) {
+		uint32_t c = i / BS_MD_JOURNAL_ELEMS_PER_CHUNK;
+		uint8_t *slot_buf;
+
 		elem = &jr->elems[i];
-		
+
 		elem->journal = jr;
 		elem->slot = i;
 
-		elem->hdr = spdk_zmalloc(BS_MD_JOURNAL_PAGE_SIZE, BS_MD_JOURNAL_PAGE_SIZE,
-            NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
-
-		if (elem->hdr == NULL) {
-			goto error;
+		if (jr->elem_dma_chunks[c] == NULL) {
+			jr->elem_dma_chunks[c] = spdk_zmalloc((size_t)BS_MD_JOURNAL_ELEMS_PER_CHUNK *
+							      BS_MD_JOURNAL_ENTRY_SIZE,
+							      BS_MD_JOURNAL_PAGE_SIZE, NULL,
+							      SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+			if (jr->elem_dma_chunks[c] == NULL) {
+				goto error;
+			}
 		}
-
-		elem->page = spdk_zmalloc(BS_MD_JOURNAL_PAGE_SIZE, BS_MD_JOURNAL_PAGE_SIZE,
-			NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
-
-		if (elem->page == NULL) {
-			goto error;
-		}
+		/* header page then metadata page, adjacent (8 KiB per element) */
+		slot_buf = (uint8_t *)jr->elem_dma_chunks[c] +
+			   (size_t)(i % BS_MD_JOURNAL_ELEMS_PER_CHUNK) * BS_MD_JOURNAL_ENTRY_SIZE;
+		elem->hdr = (struct md_journal_entry_hdr *)slot_buf;
+		elem->page = slot_buf + BS_MD_JOURNAL_PAGE_SIZE;
 
 		elem->journal_iov[0].iov_base = elem->hdr;
 		elem->journal_iov[0].iov_len = BS_MD_JOURNAL_PAGE_SIZE;
@@ -2143,23 +2151,14 @@ md_journal_init_elements(struct spdk_bs_md_journal *jr)
 	return 0;
 
 error:
-	SPDK_ERRLOG("md_journal: cannot allocate DMA buffers for element %u\n", i);
-	for (i = 0; i < BS_MD_JOURNAL_NUM_ELEMS; i++) {
-		elem = &jr->elems[i];
-
-		if (elem->hdr != NULL) {
-			spdk_free(elem->hdr);
-			elem->hdr = NULL;
-		}
-
-		if (elem->page != NULL) {
-			spdk_free(elem->page);
-			elem->page = NULL;
-		}
-	}
-
+	SPDK_ERRLOG("md_journal: cannot allocate a %u KiB DMA chunk for element %u\n",
+		    BS_MD_JOURNAL_ELEMS_PER_CHUNK * BS_MD_JOURNAL_ENTRY_SIZE / 1024, i);
+	/* elements already queued point into the chunks being freed */
+	TAILQ_INIT(&jr->free_queue);
+	jr->free_count = 0;
 	free(jr->elems);
 	jr->elems = NULL;
+	md_journal_free_elem_chunks(jr);
 
 	return -ENOMEM;
 }
