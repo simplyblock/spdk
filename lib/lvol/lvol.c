@@ -6908,8 +6908,9 @@ xfer_replication(struct spdk_lvs_xfer *xfer) {
 				/* every data request is done (that is how this state
 				 * was reached); the destination is already a clone of
 				 * the snapshot: nothing to chain */
-				SPDK_NOTICELOG("Transfer lvol %s final step: destination is a clone of %s, "
-					       "no completion signal\n", xfer->lvol->name, xfer->snapshot_name);
+				SPDK_NOTICELOG("Transfer lvol %s%s: destination is a clone of %s, "
+					       "no completion signal\n", xfer->lvol->name,
+					       xfer->final_step ? " final step" : "", xfer->snapshot_name);
 				xfer->state = XFER_STATE_DONE;
 				return 0;
 			}
@@ -8693,10 +8694,13 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
 	 * clusters it writes may hold the base's content (CoW of an earlier
 	 * partial attempt) rather than read as zeroes. */
 	task->no_zero_skip = offset != 0 || allow_partial || partial_base != 0;
-	/* The final step of a replication whose destination the control plane
-	 * built as a clone of the snapshot it names (cow_landing): no chaining
-	 * signal (see dest_is_clone). */
-	task->dest_is_clone = task->final_step && type == XFER_REPLICATE_SNAPSHOT && cow_landing;
+	/* A replication whose destination the control plane built as a clone
+	 * of the snapshot it names (cow_landing): the cutover's final step, and
+	 * its endgame rounds, which send each round snapshot's delta straight
+	 * into the cutover clone instead of a landing volume. No chaining
+	 * signal: its page would land as data at offset 0 of the clone (see
+	 * dest_is_clone). */
+	task->dest_is_clone = type == XFER_REPLICATE_SNAPSHOT && cow_landing;
 	/* Freeze the final step's volume before the partial decision: its
 	 * generation must not move under the setup (xfer_setup_partial). The
 	 * drain of IO already in flight follows (spdk_lvol_transfer_delay). */

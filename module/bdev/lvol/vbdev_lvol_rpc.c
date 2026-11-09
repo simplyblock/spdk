@@ -4207,9 +4207,15 @@ struct rpc_bdev_lvol_transfer {
 	uint64_t partial_base;
 	bool special_io;
 	uint32_t priority_class;
+	/* the destination is a clone of the snapshot the delta applies on (a
+	 * cutover's endgame round sent into the cutover clone): cow_landing and
+	 * no completion signal. A separate parameter so that a control plane
+	 * asking for it from an SPDK without it gets a decode error, not a
+	 * signal page written into the clone. */
+	bool dest_clone;
 };
 
-static void 
+static void
 free_rpc_bdev_lvol_transfer(struct rpc_bdev_lvol_transfer *req) {
 	free(req->lvol_name);
 	free(req->gateway);
@@ -4227,6 +4233,7 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_transfer_decoders[] =
 	{"cow_landing", offsetof(struct rpc_bdev_lvol_transfer, cow_landing), spdk_json_decode_bool, true},
 	{"partial_base", offsetof(struct rpc_bdev_lvol_transfer, partial_base), spdk_json_decode_uint64, true},
 	{"special_io", offsetof(struct rpc_bdev_lvol_transfer, special_io), spdk_json_decode_bool, true},
+	{"dest_clone", offsetof(struct rpc_bdev_lvol_transfer, dest_clone), spdk_json_decode_bool, true},
 	{"priority_class", offsetof(struct rpc_bdev_lvol_transfer, priority_class), spdk_json_decode_uint32, true},
 };
 
@@ -4308,9 +4315,11 @@ rpc_bdev_lvol_transfer(struct spdk_jsonrpc_request *request,
 			       req.special_io ? "special_io" : "no partial_base");
 		req.allow_partial = false;
 	}
-	if (!req.allow_partial) {
-		req.cow_landing = false;
-	}
+	/* A snapshot transfer lands in a clone only when asked by dest_clone;
+	 * cow_landing then also holds without a delta (no completion signal into
+	 * the clone; whole clusters sent into a clone are exact). Without it a
+	 * landing volume receives, chained by the completion signal. */
+	req.cow_landing = req.dest_clone;
 	rc = spdk_lvol_transfer(lvol, req.offset, req.cluster_batch, type, tdev, NULL, req.lvol_id,
 				(uint8_t)req.priority_class, req.allow_partial, req.partial_base, req.cow_landing,
 				NULL, NULL);
