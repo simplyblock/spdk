@@ -5213,20 +5213,17 @@ spdk_blob_merge_base_ext(struct spdk_blob *blob, int priority_class,
 			ctx->nops++;
 		}
 		if (ctx->nops == 0) {
-			SPDK_ERRLOG("blob 0x%" PRIx64 ": merge with the base: no DMA buffer of %u bytes
-",
+			SPDK_ERRLOG("blob 0x%" PRIx64 ": merge with the base: no DMA buffer of %u bytes\n",
 				    blob->id, BLOB_MERGE_CHUNK);
 			ctx->rc = -ENOMEM;
 		} else if (ctx->nops < BLOB_MERGE_QD) {
 			SPDK_WARNLOG("blob 0x%" PRIx64 ": merge with the base at queue depth %u of %u: "
-				     "the DMA heap is short
-", blob->id, ctx->nops, BLOB_MERGE_QD);
+				     "the DMA heap is short\n", blob->id, ctx->nops, BLOB_MERGE_QD);
 		}
 	}
 	if (ctx->words == NULL || ctx->ranges == NULL || ctx->ch == NULL) {
 		if (ctx->ch == NULL) {
-			SPDK_ERRLOG("blob 0x%" PRIx64 ": merge with the base: no I/O channel
-", blob->id);
+			SPDK_ERRLOG("blob 0x%" PRIx64 ": merge with the base: no I/O channel\n", blob->id);
 		}
 		ctx->rc = -ENOMEM;
 	}
