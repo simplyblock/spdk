@@ -60,6 +60,11 @@ make_xfer(int cluster_batch, uint32_t num_clusters, const int *allocated)
 		xfer->reqs[i].xfer = xfer;
 		xfer->reqs[i].type = xfer->type;
 	}
+	/* as spdk_lvol_create_backup_task: a task without a dirty generation
+	 * sends each cluster as one range */
+	xfer->ranges = calloc(1, sizeof(*xfer->ranges));
+	SPDK_CU_ASSERT_FATAL(xfer->ranges != NULL);
+	xfer->max_ranges = 1;
 	xfer_fill_queue(xfer, cluster_batch);
 	xfer->timeout = spdk_get_ticks();
 	return xfer;
@@ -75,6 +80,7 @@ free_xfer(struct spdk_lvs_xfer *xfer)
 	spdk_ring_free(xfer->free_ring);
 	spdk_ring_free(xfer->ready_ring);
 	free(xfer->clusters);
+	free(xfer->ranges);
 	free(xfer);
 }
 
@@ -646,15 +652,23 @@ make_partial_xfer(int batch, uint32_t num_clusters, const int *alloc, struct blo
 	g_ut_dirty_gen = gen;
 	g_ut_dirty_usable = true;
 	g_blob_read_only = true;	/* a snapshot */
+	free(xfer->ranges);
+	xfer->ranges = NULL;
+	xfer->max_ranges = 0;
 	xfer_setup_partial(xfer, 0, 0x42);
 	g_blob_read_only = false;
+	if (xfer->ranges == NULL) {
+		/* not pinned: spdk_lvol_create_backup_task's one-range array */
+		xfer->ranges = calloc(1, sizeof(*xfer->ranges));
+		SPDK_CU_ASSERT_FATAL(xfer->ranges != NULL);
+		xfer->max_ranges = 1;
+	}
 	return xfer;
 }
 
 static void
 free_partial_xfer(struct spdk_lvs_xfer *xfer)
 {
-	free(xfer->ranges);
 	free(xfer->partial);
 	spdk_blob_dirty_gen_unref(xfer->dirty_gen);
 	free_xfer(xfer);
