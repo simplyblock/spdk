@@ -134,6 +134,7 @@ DEFINE_STUB_V(spdk_blob_scan_used_clusters, (struct spdk_blob* blob, uint64_t *c
 DEFINE_STUB(spdk_blob_get_parent_snapshot, spdk_blob_id, (struct spdk_blob_store *bs, spdk_blob_id blobid),
 	    SPDK_BLOBID_INVALID);
 
+DEFINE_STUB(spdk_blob_locked_operation_in_progress, bool, (const struct spdk_blob *blob), false);
 DEFINE_STUB(spdk_bs_for_each_loaded_blob, int,(struct spdk_blob_store *bs,
 			     spdk_bs_loaded_blob_fn fn, void *cb_arg), 0);
 
@@ -141,14 +142,61 @@ DEFINE_STUB(spdk_bs_for_each_loaded_blob, int,(struct spdk_blob_store *bs,
  * g_ut_bdev_write_rc from write number g_ut_bdev_write_fail_at on (0: never). */
 #define UT_BDEV_WRITES_MAX 64
 struct ut_bdev_write {
-	void		*buf;
+	void		*buf;		/* the first iovec's, for a vectored write */
 	uint64_t	offset_blocks;
 	uint64_t	num_blocks;
+	int		iovcnt;		/* 0: not vectored */
+	uint64_t	bytes;		/* what the iovecs describe */
 };
 static struct ut_bdev_write g_ut_bdev_writes[UT_BDEV_WRITES_MAX];
 static uint32_t g_ut_bdev_write_cnt;
 static uint32_t g_ut_bdev_write_fail_at;
 static int g_ut_bdev_write_rc;
+
+int
+spdk_bdev_writev_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
+			struct iovec *iov, int iovcnt, uint64_t offset_blocks, uint64_t num_blocks,
+			spdk_bdev_io_completion_cb cb, void *cb_arg)
+{
+	uint64_t bytes = 0;
+
+	if (g_ut_bdev_write_fail_at != 0 && g_ut_bdev_write_cnt + 1 >= g_ut_bdev_write_fail_at) {
+		return g_ut_bdev_write_rc;
+	}
+	for (int i = 0; i < iovcnt; i++) {
+		bytes += iov[i].iov_len;
+	}
+	if (g_ut_bdev_write_cnt < UT_BDEV_WRITES_MAX) {
+		g_ut_bdev_writes[g_ut_bdev_write_cnt].buf = iov[0].iov_base;
+		g_ut_bdev_writes[g_ut_bdev_write_cnt].offset_blocks = offset_blocks;
+		g_ut_bdev_writes[g_ut_bdev_write_cnt].num_blocks = num_blocks;
+		g_ut_bdev_writes[g_ut_bdev_write_cnt].iovcnt = iovcnt;
+		g_ut_bdev_writes[g_ut_bdev_write_cnt].bytes = bytes;
+	}
+	g_ut_bdev_write_cnt++;
+	return 0;
+}
+
+/* The last vectored read of a blob (the replication's source reads). */
+static uint32_t g_ut_blob_readv_cnt;
+static struct iovec *g_ut_blob_readv_iov;
+static int g_ut_blob_readv_iovcnt;
+static uint64_t g_ut_blob_readv_offset;
+static uint64_t g_ut_blob_readv_length;
+static void *g_ut_blob_readv_arg;
+
+void
+spdk_blob_io_readv_with_priority(struct spdk_blob *blob, struct spdk_io_channel *channel,
+				 struct iovec *iov, int iovcnt, uint64_t offset, uint64_t length,
+				 int priority_class, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	g_ut_blob_readv_cnt++;
+	g_ut_blob_readv_iov = iov;
+	g_ut_blob_readv_iovcnt = iovcnt;
+	g_ut_blob_readv_offset = offset;
+	g_ut_blob_readv_length = length;
+	g_ut_blob_readv_arg = cb_arg;
+}
 
 int
 spdk_bdev_write_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch, void *buf,

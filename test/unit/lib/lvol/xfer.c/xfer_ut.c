@@ -19,6 +19,8 @@
 
 static struct spdk_lvol g_xfer_lvol;
 static struct spdk_lvol_store g_xfer_lvs;
+/* the poll group the requests run on: its iobuf channel is set up in main() */
+static struct spdk_lvs_poll_group g_ut_lpg;
 
 static struct spdk_lvs_xfer *
 make_xfer(int cluster_batch, uint32_t num_clusters, const int *allocated)
@@ -36,7 +38,8 @@ make_xfer(int cluster_batch, uint32_t num_clusters, const int *allocated)
 	xfer->state = XFER_STATE_TRANSFER_CLUSTERS;
 	xfer->final_step = false;
 	xfer->cluster_batch = cluster_batch;
-	xfer->page_size = 16;
+	/* 4 KiB pages, 16 KiB clusters: one request per cluster */
+	xfer->page_size = 4096;
 	xfer->page_per_cluster = 4;
 	xfer->num_clusters = num_clusters;
 	xfer->clusters = calloc(num_clusters, sizeof(uint64_t));
@@ -74,8 +77,12 @@ static void
 free_xfer(struct spdk_lvs_xfer *xfer)
 {
 	for (int i = 0; i < xfer->cluster_batch; i++) {
+		/* a request left in flight (its read never completes here)
+		 * still holds its buffers */
+		xfer_req_put_bufs(&xfer->reqs[i]);
 		free(xfer->reqs[i].payload);
 	}
+	poll_threads();		/* a ready message that may still be pending */
 	free(xfer->reqs);
 	spdk_ring_free(xfer->free_ring);
 	spdk_ring_free(xfer->ready_ring);
@@ -161,6 +168,7 @@ helper_serves_priority_first_and_exclusively(void)
 	memset(&lpg, 0, sizeof(lpg));
 	TAILQ_INIT(&lpg.rmt_lvols);
 	memset(&rmt_bg, 0, sizeof(rmt_bg));
+	rmt_bg.group = &g_ut_lpg;
 	rmt_bg.status = true;
 	rmt_bg.type = XFER_REPLICATE_SNAPSHOT;
 	rmt_bg.desc = (struct spdk_bdev_desc *)0x1;
@@ -319,6 +327,7 @@ helper_takes_its_share_of_the_window(void)
 	memset(&lpg, 0, sizeof(lpg));
 	TAILQ_INIT(&lpg.rmt_lvols);
 	memset(&rmt, 0, sizeof(rmt));
+	rmt.group = &g_ut_lpg;
 	rmt.status = true;
 	rmt.type = XFER_REPLICATE_SNAPSHOT;
 	rmt.desc = (struct spdk_bdev_desc *)0x1;
@@ -352,6 +361,7 @@ helper_drains_ready_ring(void)
 	memset(&lpg, 0, sizeof(lpg));
 	TAILQ_INIT(&lpg.rmt_lvols);
 	memset(&rmt, 0, sizeof(rmt));
+	rmt.group = &g_ut_lpg;
 	rmt.status = true;
 	rmt.type = XFER_REPLICATE_SNAPSHOT;
 	rmt.desc = (struct spdk_bdev_desc *)0x1;      /* only null-checked */
@@ -370,40 +380,62 @@ helper_drains_ready_ring(void)
 }
 
 /*
- * Replication write path (submit_req_fragments): the cluster is read whole
- * (one spdk_blob_io_read), then written to the remote in writes of at most
- * 32 blocks of 4 KiB. Only the data ranges are written (the destination
- * clusters were allocated by the alloc step); an all-zero cluster sends
- * nothing; more than 64 ranges send the whole cluster.
+ * Replication write path (submit_req_fragments). A request is at most 64 KiB
+ * (16 blocks of 4 KiB), read into a chain of iobuf small-pool buffers (8 KiB
+ * here: 8 buffers) taken on the poll group thread, then written to the remote
+ * in writes of at most 32 blocks -- so a whole request is one write -- each
+ * write describing its part of the chain. Only the data ranges are written
+ * (the destination clusters were allocated by the alloc step); an all-zero
+ * request sends nothing. Every buffer goes back when the request leaves.
  */
 #define UT_CLUSTER_BLOCKS	512
-#define UT_MAX_WRITE_BLOCKS	32
+#define UT_REQ_BLOCKS		16
 #define UT_DST_OFFSET		0x10000
+#define UT_XFER_SMALL_COUNT	256
+#define UT_XFER_SMALL_SIZE	8192
 
 static struct spdk_bdev g_ut_rmt_bdev;
 static struct spdk_bdev_desc g_ut_rmt_desc;
 
-static struct spdk_lvs_xfer_req *
-make_cluster_req(struct spdk_lvs_xfer **xferp, struct remote_lvol_info *rmt)
+/* Small-pool buffers not held by anybody: the global pool plus the poll
+ * group channel's cache. */
+static uint32_t
+ut_xfer_bufs_free(void)
 {
-	const int alloc[1] = {1};
-	struct spdk_lvs_xfer *xfer;
-	struct spdk_lvs_xfer_req *req;
+	struct spdk_iobuf_channel ch;
+	void **bufs = calloc(UT_XFER_SMALL_COUNT, sizeof(void *));
+	uint32_t n = 0;
 
-	xfer = make_xfer(1, 1, alloc);
-	xfer->page_size = 4096;
-	xfer->page_per_cluster = UT_CLUSTER_BLOCKS;
-	free(xfer->reqs[0].payload);
-	xfer->reqs[0].payload = calloc(1, xfer->page_size * xfer->page_per_cluster);
-	SPDK_CU_ASSERT_FATAL(xfer->reqs[0].payload != NULL);
-	/* the request is in flight: take it off the free ring; its cluster was
-	 * the task's only one, so nothing is left to refill it with */
-	while (spdk_ring_dequeue(xfer->free_ring, (void **)&req, 1) == 1) {
+	SPDK_CU_ASSERT_FATAL(bufs != NULL);
+	SPDK_CU_ASSERT_FATAL(spdk_iobuf_channel_init(&ch, "ut_xfer", 0, 0) == 0);
+	while (n < UT_XFER_SMALL_COUNT &&
+	       (bufs[n] = spdk_iobuf_get(&ch, UT_XFER_SMALL_SIZE, NULL, NULL)) != NULL) {
+		n++;
 	}
-	xfer->hold_idx = 1;
-	xfer->idx = 1;
-	xfer->outstanding_io = 1;
+	for (uint32_t i = 0; i < n; i++) {
+		spdk_iobuf_put(&ch, bufs[i], UT_XFER_SMALL_SIZE);
+	}
+	spdk_iobuf_channel_fini(&ch);
+	free(bufs);
+	return n + g_ut_lpg.iobuf.cache[0].small.cache_count;
+}
 
+/* Take all but `leave` small buffers through the poll group's channel. */
+static uint32_t
+ut_xfer_drain(void **bufs, uint32_t leave)
+{
+	uint32_t n = 0;
+
+	while (n < UT_XFER_SMALL_COUNT - leave &&
+	       (bufs[n] = spdk_iobuf_get(&g_ut_lpg.iobuf, UT_XFER_SMALL_SIZE, NULL, NULL)) != NULL) {
+		n++;
+	}
+	return n;
+}
+
+static void
+ut_rmt_init(struct remote_lvol_info *rmt, struct spdk_lvs_xfer *xfer)
+{
 	memset(rmt, 0, sizeof(*rmt));
 	rmt->status = true;
 	rmt->type = XFER_REPLICATE_SNAPSHOT;
@@ -412,50 +444,112 @@ make_cluster_req(struct spdk_lvs_xfer **xferp, struct remote_lvol_info *rmt)
 	g_ut_rmt_desc.bdev = &g_ut_rmt_bdev;
 	rmt->desc = &g_ut_rmt_desc;
 	rmt->channel = (struct spdk_io_channel *)0x1;
-	rmt->outstanding_io = 1;
 	rmt->free_ring = xfer->free_ring;
+	rmt->group = &g_ut_lpg;
+}
 
-	req = &xfer->reqs[0];
+/* reqs[i] in flight on rmt: 16 blocks at block i * 16 of the only cluster. */
+static struct spdk_lvs_xfer_req *
+ut_prep_req(struct spdk_lvs_xfer *xfer, int i, struct remote_lvol_info *rmt)
+{
+	struct spdk_lvs_xfer_req *req = &xfer->reqs[i];
+
 	req->rmt_lvol = rmt;
 	req->action = REQ_ACTION_COPY_BACKUP;
 	req->status = XFER_REQ_STATUS_IN_FLIGHT;
-	req->offset = 0;
-	req->dst_offset = UT_DST_OFFSET;
-	req->len = UT_CLUSTER_BLOCKS;
+	req->offset = (uint64_t)i * UT_REQ_BLOCKS;
+	req->dst_offset = UT_DST_OFFSET + req->offset;
+	req->len = UT_REQ_BLOCKS;
+	rmt->outstanding_io++;
+	return req;
+}
+
+static struct spdk_lvs_xfer *
+make_cluster_xfer(int batch, struct remote_lvol_info *rmt)
+{
+	const int alloc[1] = {1};
+	struct spdk_lvs_xfer *xfer;
+	struct spdk_lvs_xfer_req *req;
+
+	xfer = make_xfer(batch, 1, alloc);
+	xfer->page_size = 4096;
+	xfer->page_per_cluster = UT_CLUSTER_BLOCKS;
+	for (int i = 0; i < batch; i++) {
+		/* as in the task setup: no payload until a command needs one */
+		free(xfer->reqs[i].payload);
+		xfer->reqs[i].payload = NULL;
+	}
+	/* the requests are in flight: take them off the free ring; the task's
+	 * only cluster is sent, so nothing is left to refill them with */
+	while (spdk_ring_dequeue(xfer->free_ring, (void **)&req, 1) == 1) {
+	}
+	xfer->hold_idx = 1;
+	xfer->idx = batch;
+	xfer->outstanding_io = batch;
+	ut_rmt_init(rmt, xfer);
 
 	g_ut_bdev_write_cnt = 0;
 	g_ut_bdev_write_fail_at = 0;
 	g_ut_bdev_write_rc = 0;
+	g_ut_blob_readv_cnt = 0;
+	return xfer;
+}
 
+/* As if the source read zeroes into the request's buffers. */
+static void
+ut_zero_chain(struct spdk_lvs_xfer_req *req)
+{
+	for (uint32_t i = 0; i < req->chain.needed; i++) {
+		memset(req->chain.iovs[i].iov_base, 0, req->chain.iovs[i].iov_len);
+	}
+}
+
+/* One request, submitted: it holds its chain (zeroed: the source read zeroes)
+ * and its read is out. */
+static struct spdk_lvs_xfer_req *
+make_cluster_req(struct spdk_lvs_xfer **xferp, struct remote_lvol_info *rmt)
+{
+	struct spdk_lvs_xfer *xfer = make_cluster_xfer(1, rmt);
+	struct spdk_lvs_xfer_req *req = ut_prep_req(xfer, 0, rmt);
+
+	CU_ASSERT(submit_rw_reqs_local(req) == 0);
+	SPDK_CU_ASSERT_FATAL(req->chain.nbufs == UT_REQ_BLOCKS * 4096 / UT_XFER_SMALL_SIZE);
+	ut_zero_chain(req);
 	*xferp = xfer;
 	return req;
+}
+
+/* Where block b of the request lives in its chain. */
+static uint8_t *
+chain_block(struct spdk_lvs_xfer_req *req, uint64_t b)
+{
+	struct iovec iov[2];
+
+	SPDK_CU_ASSERT_FATAL(xfer_iov_slice(req->chain.iovs, (int)req->chain.needed, b * 4096, 4096,
+					    iov, 2) == 1);
+	return iov[0].iov_base;
 }
 
 static void
 fill_blocks(struct spdk_lvs_xfer_req *req, uint32_t first, uint32_t count)
 {
-	memset((uint8_t *)req->payload + (uint64_t)first * 4096, 0xA5, (uint64_t)count * 4096);
+	for (uint32_t b = first; b < first + count; b++) {
+		memset(chain_block(req, b), 0xA5, 4096);
+	}
 }
 
-/* Check write i: blocks [start, start + n) of the cluster. */
+/* Check write i: blocks [start, start + n) of the request, from its chain. */
 static void
 check_write(struct spdk_lvs_xfer_req *req, uint32_t i, uint64_t start, uint64_t n)
 {
 	SPDK_CU_ASSERT_FATAL(i < g_ut_bdev_write_cnt);
-	CU_ASSERT(g_ut_bdev_writes[i].offset_blocks == UT_DST_OFFSET + start);
+	CU_ASSERT(g_ut_bdev_writes[i].offset_blocks == UT_DST_OFFSET + req->offset + start);
 	CU_ASSERT(g_ut_bdev_writes[i].num_blocks == n);
-	CU_ASSERT(g_ut_bdev_writes[i].buf == (uint8_t *)req->payload + start * 4096);
-}
-
-/* The whole cluster as 16 writes of 32 blocks, in order. */
-static void
-check_whole_cluster(struct spdk_lvs_xfer_req *req)
-{
-	CU_ASSERT(g_ut_bdev_write_cnt == UT_CLUSTER_BLOCKS / UT_MAX_WRITE_BLOCKS);
-	CU_ASSERT(req->fragments_outstanding == UT_CLUSTER_BLOCKS / UT_MAX_WRITE_BLOCKS);
-	for (uint32_t i = 0; i < UT_CLUSTER_BLOCKS / UT_MAX_WRITE_BLOCKS; i++) {
-		check_write(req, i, (uint64_t)i * UT_MAX_WRITE_BLOCKS, UT_MAX_WRITE_BLOCKS);
-	}
+	CU_ASSERT(g_ut_bdev_writes[i].buf == chain_block(req, start));
+	CU_ASSERT(g_ut_bdev_writes[i].bytes == n * 4096);
+	/* 4 KiB blocks in 8 KiB buffers: one iovec per buffer touched */
+	CU_ASSERT(g_ut_bdev_writes[i].iovcnt ==
+		  (int)((start + n + 1) / 2 - start / 2));
 }
 
 /* Complete every write in flight; the last one finishes the request. */
@@ -469,7 +563,7 @@ complete_writes(struct spdk_lvs_xfer_req *req, bool success)
 	}
 }
 
-/* The read phase is one whole-cluster read: no fragments armed. */
+/* The read is one read of the whole request into its 8-buffer chain. */
 static void
 xfer_read_is_one_cluster_read(void)
 {
@@ -477,14 +571,27 @@ xfer_read_is_one_cluster_read(void)
 	struct remote_lvol_info rmt;
 	struct spdk_lvs_xfer_req *req = make_cluster_req(&xfer, &rmt);
 
-	CU_ASSERT(submit_rw_reqs_local(req) == 0);
+	CU_ASSERT(g_ut_blob_readv_cnt == 1);
+	CU_ASSERT(g_ut_blob_readv_arg == req);
+	CU_ASSERT(g_ut_blob_readv_iov == req->chain.iovs);
+	CU_ASSERT(g_ut_blob_readv_iovcnt == 8);
+	CU_ASSERT(g_ut_blob_readv_offset == 0);
+	CU_ASSERT(g_ut_blob_readv_length == UT_REQ_BLOCKS);
+	for (int i = 0; i < 8; i++) {
+		CU_ASSERT(req->chain.iovs[i].iov_len == UT_XFER_SMALL_SIZE);
+	}
 	CU_ASSERT(req->fragments_outstanding == 0);
 	CU_ASSERT(g_ut_bdev_write_cnt == 0);
 
+	local_op_comp(req, -EIO);		/* a failed read gives them back */
+	CU_ASSERT(req->status == XFER_REQ_STATUS_FAILED);
+	CU_ASSERT(req->chain.nbufs == 0);
+	CU_ASSERT(ut_xfer_bufs_free() == UT_XFER_SMALL_COUNT);
 	free_xfer(xfer);
 }
 
-/* Preallocated, all zero: nothing is sent and the request is done at once. */
+/* Preallocated, all zero: nothing is sent and the request is done at once,
+ * its buffers returned. */
 static void
 xfer_replicate_zero_cluster_sends_nothing(void)
 {
@@ -497,11 +604,13 @@ xfer_replicate_zero_cluster_sends_nothing(void)
 	CU_ASSERT(req->fragments_outstanding == 0);
 	CU_ASSERT(req->status == XFER_REQ_STATUS_DONE);
 	CU_ASSERT(rmt.outstanding_io == 0);
+	CU_ASSERT(req->chain.nbufs == 0);
+	CU_ASSERT(ut_xfer_bufs_free() == UT_XFER_SMALL_COUNT);
 
 	free_xfer(xfer);
 }
 
-/* One range covering the whole cluster: the same writes as today. */
+/* All data: one write of the whole request, over all 8 buffers. */
 static void
 xfer_replicate_full_cluster_is_one_range(void)
 {
@@ -509,17 +618,23 @@ xfer_replicate_full_cluster_is_one_range(void)
 	struct remote_lvol_info rmt;
 	struct spdk_lvs_xfer_req *req = make_cluster_req(&xfer, &rmt);
 
-	fill_blocks(req, 0, UT_CLUSTER_BLOCKS);
+	fill_blocks(req, 0, UT_REQ_BLOCKS);
 	local_op_comp(req, 0);
-	check_whole_cluster(req);
+	CU_ASSERT(g_ut_bdev_write_cnt == 1);
+	CU_ASSERT(req->fragments_outstanding == 1);
+	check_write(req, 0, 0, UT_REQ_BLOCKS);
+	CU_ASSERT(g_ut_bdev_writes[0].iovcnt == 8);
+	CU_ASSERT(req->chain.nbufs == 8);	/* held until the write is done */
 
 	complete_writes(req, true);
 	CU_ASSERT(req->status == XFER_REQ_STATUS_DONE);
+	CU_ASSERT(req->chain.nbufs == 0);
+	CU_ASSERT(ut_xfer_bufs_free() == UT_XFER_SMALL_COUNT);
 
 	free_xfer(xfer);
 }
 
-/* Only the data ranges are written, each split at 32 blocks. */
+/* Only the data ranges are written, across buffer boundaries. */
 static void
 xfer_replicate_sends_only_data_ranges(void)
 {
@@ -527,33 +642,29 @@ xfer_replicate_sends_only_data_ranges(void)
 	struct remote_lvol_info rmt;
 	struct spdk_lvs_xfer_req *req = make_cluster_req(&xfer, &rmt);
 
-	fill_blocks(req, 0, 3);		/* 1 write */
-	fill_blocks(req, 100, 1);	/* 1 write */
-	fill_blocks(req, 200, 100);	/* 32 + 32 + 32 + 4 */
-	fill_blocks(req, 511, 1);	/* last block: 1 write */
+	fill_blocks(req, 0, 3);		/* buffers 0-1 */
+	fill_blocks(req, 5, 1);		/* second half of buffer 2 */
+	fill_blocks(req, 7, 6);		/* buffers 3-6 */
+	fill_blocks(req, 15, 1);	/* last block */
 	local_op_comp(req, 0);
 
-	CU_ASSERT(g_ut_bdev_write_cnt == 7);
-	CU_ASSERT(req->fragments_outstanding == 7);
+	CU_ASSERT(g_ut_bdev_write_cnt == 4);
+	CU_ASSERT(req->fragments_outstanding == 4);
 	check_write(req, 0, 0, 3);
-	check_write(req, 1, 100, 1);
-	check_write(req, 2, 200, 32);
-	check_write(req, 3, 232, 32);
-	check_write(req, 4, 264, 32);
-	check_write(req, 5, 296, 4);
-	check_write(req, 6, 511, 1);
-	for (uint32_t i = 0; i < g_ut_bdev_write_cnt; i++) {
-		CU_ASSERT(g_ut_bdev_writes[i].num_blocks <= UT_MAX_WRITE_BLOCKS);
-	}
+	check_write(req, 1, 5, 1);
+	check_write(req, 2, 7, 6);
+	check_write(req, 3, 15, 1);
+	CU_ASSERT(g_ut_bdev_writes[2].iovcnt == 4);
 
 	complete_writes(req, true);
 	CU_ASSERT(req->status == XFER_REQ_STATUS_DONE);
 	CU_ASSERT(rmt.outstanding_io == 0);
+	CU_ASSERT(ut_xfer_bufs_free() == UT_XFER_SMALL_COUNT);
 
 	free_xfer(xfer);
 }
 
-/* More than 64 ranges (every other block): the whole cluster is sent. */
+/* Every other block: eight one-block writes. */
 static void
 xfer_replicate_too_many_ranges_sends_whole_cluster(void)
 {
@@ -561,11 +672,14 @@ xfer_replicate_too_many_ranges_sends_whole_cluster(void)
 	struct remote_lvol_info rmt;
 	struct spdk_lvs_xfer_req *req = make_cluster_req(&xfer, &rmt);
 
-	for (uint32_t b = 0; b < UT_CLUSTER_BLOCKS; b += 2) {
+	for (uint32_t b = 0; b < UT_REQ_BLOCKS; b += 2) {
 		fill_blocks(req, b, 1);
 	}
 	local_op_comp(req, 0);
-	check_whole_cluster(req);
+	CU_ASSERT(g_ut_bdev_write_cnt == 8);
+	for (uint32_t i = 0; i < 8; i++) {
+		check_write(req, i, 2 * i, 1);
+	}
 
 	complete_writes(req, true);
 	CU_ASSERT(req->status == XFER_REQ_STATUS_DONE);
@@ -574,7 +688,8 @@ xfer_replicate_too_many_ranges_sends_whole_cluster(void)
 }
 
 /* A submit failure after some writes: the request fails once the writes in
- * flight return. On the first write: it fails at once. */
+ * flight return. On the first write: it fails at once. Either way its
+ * buffers go back. */
 static void
 xfer_replicate_submit_failure_fails_the_request(void)
 {
@@ -582,17 +697,21 @@ xfer_replicate_submit_failure_fails_the_request(void)
 	struct remote_lvol_info rmt;
 	struct spdk_lvs_xfer_req *req = make_cluster_req(&xfer, &rmt);
 
-	fill_blocks(req, 0, UT_CLUSTER_BLOCKS);
+	fill_blocks(req, 0, 1);
+	fill_blocks(req, 4, 1);
+	fill_blocks(req, 8, 1);
 	g_ut_bdev_write_fail_at = 3;
 	g_ut_bdev_write_rc = -ENOMEM;
 	local_op_comp(req, 0);
 	CU_ASSERT(g_ut_bdev_write_cnt == 2);
 	CU_ASSERT(req->fragments_outstanding == 2);
 	CU_ASSERT(req->status == XFER_REQ_STATUS_IN_FLIGHT);
+	CU_ASSERT(req->chain.nbufs == 8);
 
 	complete_writes(req, true);
 	CU_ASSERT(req->status == XFER_REQ_STATUS_FAILED);
 	CU_ASSERT(rmt.outstanding_io == 0);
+	CU_ASSERT(req->chain.nbufs == 0);
 	free_xfer(xfer);
 
 	req = make_cluster_req(&xfer, &rmt);
@@ -604,6 +723,8 @@ xfer_replicate_submit_failure_fails_the_request(void)
 	CU_ASSERT(req->fragments_outstanding == 0);
 	CU_ASSERT(req->status == XFER_REQ_STATUS_FAILED);
 	CU_ASSERT(rmt.outstanding_io == 0);
+	CU_ASSERT(req->chain.nbufs == 0);
+	CU_ASSERT(ut_xfer_bufs_free() == UT_XFER_SMALL_COUNT);
 	free_xfer(xfer);
 
 	g_ut_bdev_write_fail_at = 0;
@@ -617,16 +738,210 @@ xfer_replicate_write_failure_fails_the_request(void)
 	struct remote_lvol_info rmt;
 	struct spdk_lvs_xfer_req *req = make_cluster_req(&xfer, &rmt);
 
-	fill_blocks(req, 0, 64);
+	fill_blocks(req, 0, 1);
+	fill_blocks(req, 10, 1);
 	local_op_comp(req, 0);
 	CU_ASSERT(req->fragments_outstanding == 2);
 
 	fragment_write_cb(NULL, false, req);
 	CU_ASSERT(req->status == XFER_REQ_STATUS_IN_FLIGHT);	/* one still out */
+	CU_ASSERT(req->chain.nbufs == 8);
 	fragment_write_cb(NULL, true, req);
 	CU_ASSERT(req->status == XFER_REQ_STATUS_FAILED);
 	CU_ASSERT(rmt.outstanding_io == 0);
+	CU_ASSERT(ut_xfer_bufs_free() == UT_XFER_SMALL_COUNT);
 
+	free_xfer(xfer);
+}
+
+/* With the pool empty a request waits -- in flight for the window, no read
+ * yet -- and does not fail. The first waiting one keeps the 3 buffers it got,
+ * the second holds none; buffers returned on the thread complete them in
+ * order and a message submits their reads. */
+static void
+xfer_replicate_waits_for_buffers(void)
+{
+	struct spdk_lvs_xfer *xfer;
+	struct remote_lvol_info rmt;
+	struct spdk_lvs_xfer_req *a, *b;
+	void **bufs = calloc(UT_XFER_SMALL_COUNT, sizeof(void *));
+	uint32_t n, i;
+
+	SPDK_CU_ASSERT_FATAL(bufs != NULL);
+	xfer = make_cluster_xfer(2, &rmt);
+	a = ut_prep_req(xfer, 0, &rmt);
+	b = ut_prep_req(xfer, 1, &rmt);
+
+	n = ut_xfer_drain(bufs, 3);
+	CU_ASSERT(n == UT_XFER_SMALL_COUNT - 3);
+	CU_ASSERT(submit_rw_reqs_local(a) == 0);
+	CU_ASSERT(submit_rw_reqs_local(b) == 0);
+	CU_ASSERT(g_ut_blob_readv_cnt == 0);
+	CU_ASSERT(a->chain.waiting && a->chain.nbufs == 3);
+	CU_ASSERT(b->chain.waiting && b->chain.nbufs == 0);
+	CU_ASSERT(TAILQ_FIRST(&g_ut_lpg.bufq.waitq) == &a->chain);
+	CU_ASSERT(rmt.outstanding_io == 2);
+	CU_ASSERT(a->status == XFER_REQ_STATUS_IN_FLIGHT);
+
+	/* the poller finds nothing in the pool */
+	helper_xfer_poller(&g_ut_lpg);
+	poll_threads();
+	CU_ASSERT(g_ut_blob_readv_cnt == 0);
+
+	/* 5 more complete the first; it is submitted from a message */
+	for (i = 0; i < 5; i++) {
+		spdk_iobuf_put(&g_ut_lpg.iobuf, bufs[--n], UT_XFER_SMALL_SIZE);
+	}
+	CU_ASSERT(!a->chain.waiting && a->chain.nbufs == 8);
+	CU_ASSERT(a->buf_ready);
+	CU_ASSERT(g_ut_blob_readv_cnt == 0);
+	poll_threads();
+	CU_ASSERT(g_ut_blob_readv_cnt == 1 && g_ut_blob_readv_arg == a);
+	CU_ASSERT(!a->buf_ready);
+	CU_ASSERT(b->chain.waiting);
+
+	for (i = 0; i < 8; i++) {
+		spdk_iobuf_put(&g_ut_lpg.iobuf, bufs[--n], UT_XFER_SMALL_SIZE);
+	}
+	poll_threads();
+	CU_ASSERT(g_ut_blob_readv_cnt == 2 && g_ut_blob_readv_arg == b);
+
+	while (n > 0) {
+		spdk_iobuf_put(&g_ut_lpg.iobuf, bufs[--n], UT_XFER_SMALL_SIZE);
+	}
+	ut_zero_chain(a);
+	ut_zero_chain(b);
+	local_op_comp(a, 0);			/* all zero: done */
+	local_op_comp(b, 0);
+	CU_ASSERT(a->status == XFER_REQ_STATUS_DONE && b->status == XFER_REQ_STATUS_DONE);
+	CU_ASSERT(rmt.outstanding_io == 0);
+	CU_ASSERT(ut_xfer_bufs_free() == UT_XFER_SMALL_COUNT);
+
+	free(bufs);
+	free_xfer(xfer);
+}
+
+/* Buffers returned on another thread go to the global pool, and the iobuf
+ * wait queue is per thread: the helper poller hands them to the waiting
+ * request. */
+static void
+xfer_replicate_kick_takes_other_threads_buffers(void)
+{
+	struct spdk_lvs_xfer *xfer;
+	struct remote_lvol_info rmt;
+	struct spdk_lvs_xfer_req *a;
+	struct spdk_iobuf_channel ch1;
+	void **bufs = calloc(UT_XFER_SMALL_COUNT, sizeof(void *));
+	uint32_t n;
+
+	SPDK_CU_ASSERT_FATAL(bufs != NULL);
+	xfer = make_cluster_xfer(1, &rmt);
+	a = ut_prep_req(xfer, 0, &rmt);
+	n = ut_xfer_drain(bufs, 0);
+	CU_ASSERT(submit_rw_reqs_local(a) == 0);
+	CU_ASSERT(a->chain.waiting);
+
+	set_thread(1);
+	SPDK_CU_ASSERT_FATAL(spdk_iobuf_channel_init(&ch1, "ut_xfer", 0, 0) == 0);
+	while (n > 0) {
+		spdk_iobuf_put(&ch1, bufs[--n], UT_XFER_SMALL_SIZE);
+	}
+	spdk_iobuf_channel_fini(&ch1);
+	set_thread(0);
+	poll_threads();
+	CU_ASSERT(a->chain.waiting);		/* nobody put one on thread 0 */
+
+	helper_xfer_poller(&g_ut_lpg);		/* the kick */
+	CU_ASSERT(!a->chain.waiting && a->chain.nbufs == 8);
+	poll_threads();
+	CU_ASSERT(g_ut_blob_readv_cnt == 1 && g_ut_blob_readv_arg == a);
+
+	ut_zero_chain(a);
+	local_op_comp(a, 0);
+	CU_ASSERT(a->status == XFER_REQ_STATUS_DONE);
+	CU_ASSERT(ut_xfer_bufs_free() == UT_XFER_SMALL_COUNT);
+	free(bufs);
+	free_xfer(xfer);
+}
+
+/* Teardown fails the requests that wait for buffers (they have no IO to
+ * abort), so the poll group's outstanding_io drains; a request that got its
+ * buffers but was not submitted yet is failed the same way. */
+static void
+xfer_replicate_teardown_fails_waiting_requests(void)
+{
+	struct spdk_lvs_xfer *xfer;
+	struct remote_lvol_info rmt;
+	struct spdk_lvs_xfer_req *a, *b;
+	void **bufs = calloc(UT_XFER_SMALL_COUNT, sizeof(void *));
+	uint32_t n, i;
+
+	SPDK_CU_ASSERT_FATAL(bufs != NULL);
+	xfer = make_cluster_xfer(2, &rmt);
+	a = ut_prep_req(xfer, 0, &rmt);
+	b = ut_prep_req(xfer, 1, &rmt);
+	n = ut_xfer_drain(bufs, 0);
+	CU_ASSERT(submit_rw_reqs_local(a) == 0);
+	CU_ASSERT(submit_rw_reqs_local(b) == 0);
+	for (i = 0; i < 8; i++) {
+		spdk_iobuf_put(&g_ut_lpg.iobuf, bufs[--n], UT_XFER_SMALL_SIZE);
+	}
+	CU_ASSERT(a->buf_ready);		/* ready, its message not run yet */
+	CU_ASSERT(b->chain.waiting);
+
+	rmt.status = false;
+	xfer_bufq_abort_rmt(&g_ut_lpg, &rmt);
+	CU_ASSERT(a->status == XFER_REQ_STATUS_FAILED && b->status == XFER_REQ_STATUS_FAILED);
+	CU_ASSERT(!a->buf_ready && !b->chain.waiting);
+	CU_ASSERT(a->chain.nbufs == 0 && b->chain.nbufs == 0);
+	CU_ASSERT(rmt.outstanding_io == 0);
+	CU_ASSERT(spdk_ring_count(xfer->free_ring) == 2);
+	CU_ASSERT(TAILQ_EMPTY(&g_ut_lpg.bufq.waitq) && TAILQ_EMPTY(&g_ut_lpg.buf_readyq));
+	poll_threads();				/* the pending message finds nothing */
+	CU_ASSERT(g_ut_blob_readv_cnt == 0);
+
+	while (n > 0) {
+		spdk_iobuf_put(&g_ut_lpg.iobuf, bufs[--n], UT_XFER_SMALL_SIZE);
+	}
+	CU_ASSERT(ut_xfer_bufs_free() == UT_XFER_SMALL_COUNT);
+	free(bufs);
+	free_xfer(xfer);
+}
+
+/* An alloc command travels in a buffer chain too: copied from the request's
+ * command buffer, one vectored write of SPDK_LVOL_XFER_CMD_BLOCKS blocks. */
+static void
+xfer_replicate_command_is_copied_into_a_chain(void)
+{
+	struct spdk_lvs_xfer *xfer;
+	struct remote_lvol_info rmt;
+	struct spdk_lvs_xfer_req *a;
+	uint8_t *cmd;
+
+	xfer = make_cluster_xfer(1, &rmt);
+	a = ut_prep_req(xfer, 0, &rmt);
+	cmd = xfer_req_ctrl_payload(xfer, a);
+	SPDK_CU_ASSERT_FATAL(cmd != NULL);
+	for (uint32_t i = 0; i < SPDK_LVOL_XFER_CMD_SIZE; i++) {
+		cmd[i] = (uint8_t)(i * 7 + 1);
+	}
+	a->action = REQ_ACTION_WRITE;
+	a->len = SPDK_LVOL_XFER_CMD_BLOCKS;
+	a->dst_offset = 0x77;
+	CU_ASSERT(submit_rw_reqs_local(a) == 0);
+	CU_ASSERT(g_ut_bdev_write_cnt == 1);
+	CU_ASSERT(g_ut_bdev_writes[0].offset_blocks == 0x77);
+	CU_ASSERT(g_ut_bdev_writes[0].num_blocks == SPDK_LVOL_XFER_CMD_BLOCKS);
+	CU_ASSERT(g_ut_bdev_writes[0].iovcnt == SPDK_LVOL_XFER_CMD_SIZE / UT_XFER_SMALL_SIZE);
+	CU_ASSERT(g_ut_bdev_writes[0].bytes == SPDK_LVOL_XFER_CMD_SIZE);
+	for (uint32_t i = 0; i < a->chain.needed; i++) {
+		CU_ASSERT(memcmp(a->chain.iovs[i].iov_base, cmd + i * UT_XFER_SMALL_SIZE,
+				 UT_XFER_SMALL_SIZE) == 0);
+	}
+	complete_op_cb(NULL, true, a);
+	CU_ASSERT(a->status == XFER_REQ_STATUS_DONE);
+	CU_ASSERT(a->chain.nbufs == 0);
+	CU_ASSERT(ut_xfer_bufs_free() == UT_XFER_SMALL_COUNT);
 	free_xfer(xfer);
 }
 
@@ -1055,7 +1370,7 @@ xfer_partial_and_resumed_requests_write_zeroes(void)
 	struct remote_lvol_info rmt;
 	struct spdk_lvs_xfer_req *req = make_cluster_req(&xfer, &rmt);
 
-	req->len = 16;			/* 64 KiB, all zero */
+	/* 64 KiB, all zero */
 	req->partial = true;
 	local_op_comp(req, 0);
 	CU_ASSERT(g_ut_bdev_write_cnt == 1);
@@ -1065,9 +1380,10 @@ xfer_partial_and_resumed_requests_write_zeroes(void)
 	free_xfer(xfer);
 
 	req = make_cluster_req(&xfer, &rmt);
-	xfer->no_zero_skip = true;	/* whole, all-zero cluster of a resumed task */
+	xfer->no_zero_skip = true;	/* whole, all-zero request of a resumed task */
 	local_op_comp(req, 0);
-	check_whole_cluster(req);
+	CU_ASSERT(g_ut_bdev_write_cnt == 1);
+	check_write(req, 0, 0, UT_REQ_BLOCKS);
 	complete_writes(req, true);
 	CU_ASSERT(req->status == XFER_REQ_STATUS_DONE);
 	free_xfer(xfer);
@@ -1099,6 +1415,7 @@ xfer_completion_refills_in_place(void)
 	CU_ASSERT(req->offset == 0);
 
 	memset(&rmt, 0, sizeof(rmt));
+	rmt.group = &g_ut_lpg;
 	rmt.status = true;
 	rmt.type = XFER_REPLICATE_SNAPSHOT;
 	rmt.md_channel = (struct spdk_io_channel *)0x1;
@@ -1141,6 +1458,7 @@ xfer_completion_hands_back_while_paused(void)
 	CU_ASSERT(xfer_replication(xfer) == 2);
 	SPDK_CU_ASSERT_FATAL(spdk_ring_dequeue(xfer->ready_ring, (void **)&req, 1) == 1);
 	memset(&rmt, 0, sizeof(rmt));
+	rmt.group = &g_ut_lpg;
 	rmt.status = true;
 	rmt.type = XFER_REPLICATE_SNAPSHOT;
 	rmt.free_ring = xfer->free_ring;
@@ -1187,10 +1505,16 @@ xfer_resume_offset_is_lowest_not_done(void)
 	free_xfer(xfer);
 }
 
+static void
+ut_xfer_iobuf_finish_cb(void *ctx)
+{
+}
+
 int
 main(int argc, char **argv)
 {
 	CU_pSuite suite = NULL;
+	struct spdk_iobuf_opts iobuf_opts;
 	unsigned int num_failures;
 
 	CU_initialize_registry();
@@ -1212,6 +1536,10 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, xfer_replicate_too_many_ranges_sends_whole_cluster);
 	CU_ADD_TEST(suite, xfer_replicate_submit_failure_fails_the_request);
 	CU_ADD_TEST(suite, xfer_replicate_write_failure_fails_the_request);
+	CU_ADD_TEST(suite, xfer_replicate_waits_for_buffers);
+	CU_ADD_TEST(suite, xfer_replicate_kick_takes_other_threads_buffers);
+	CU_ADD_TEST(suite, xfer_replicate_teardown_fails_waiting_requests);
+	CU_ADD_TEST(suite, xfer_replicate_command_is_copied_into_a_chain);
 	CU_ADD_TEST(suite, xfer_partial_setup_gates);
 	CU_ADD_TEST(suite, xfer_partial_setup_final_step);
 	CU_ADD_TEST(suite, xfer_final_step_signal);
@@ -1226,11 +1554,34 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, xfer_completion_refills_in_place);
 	CU_ADD_TEST(suite, xfer_completion_hands_back_while_paused);
 
-	allocate_threads(1);
+	allocate_threads(2);
 	set_thread(0);
+
+	spdk_iobuf_get_opts(&iobuf_opts, sizeof(iobuf_opts));
+	iobuf_opts.small_pool_count = UT_XFER_SMALL_COUNT;
+	iobuf_opts.small_bufsize = UT_XFER_SMALL_SIZE;
+	iobuf_opts.large_pool_count = 8;
+	if (spdk_iobuf_set_opts(&iobuf_opts) != 0 || spdk_iobuf_initialize() != 0 ||
+	    spdk_iobuf_register_module(LVS_XFER_IOBUF_MODULE) != 0 ||
+	    spdk_iobuf_register_module("ut_xfer") != 0) {
+		fprintf(stderr, "iobuf setup failed\n");
+		return 1;
+	}
+	TAILQ_INIT(&g_ut_lpg.rmt_lvols);
+	TAILQ_INIT(&g_ut_lpg.ch_tdev);
+	g_ut_lpg.thread = spdk_get_thread();
+	g_ut_lpg.thread_name = "ut_lpg";
+	lvs_poll_group_iobuf_init(&g_ut_lpg);
+	if (!g_ut_lpg.iobuf_ok) {
+		fprintf(stderr, "poll group iobuf channel failed\n");
+		return 1;
+	}
 
 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
 
+	spdk_iobuf_channel_fini(&g_ut_lpg.iobuf);
+	spdk_iobuf_finish(ut_xfer_iobuf_finish_cb, NULL);
+	poll_threads();
 	free_threads();
 	CU_cleanup_registry();
 	return num_failures;

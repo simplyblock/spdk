@@ -4883,6 +4883,9 @@ spdk_wait_for_pg_io_cleanup_poller(void *arg) {
 	return -1;
 }
 
+static void xfer_bufq_abort_rmt(struct spdk_lvs_poll_group *lpg,
+				struct remote_lvol_info *rmt_lvol);
+
 static void
 spdk_wait_for_pg_io_cleanup(void *arg) {
 	struct remote_lvol_info *rmt_lvol, *tmp;
@@ -4929,6 +4932,8 @@ spdk_wait_for_pg_io_cleanup(void *arg) {
 		}
 
 		rmt_lvol->status = false;
+		/* requests waiting for buffers have no IO to finish */
+		xfer_bufq_abort_rmt(lpg, rmt_lvol);
 		if (rmt_lvol->outstanding_io > 0) {
 			SPDK_NOTICELOG("Waiting for %lu I/Os to finish for pg %s.\n", rmt_lvol->outstanding_io, lpg->thread_name);
 			TAILQ_REMOVE(&lpg->rmt_lvols, rmt_lvol, entry);
@@ -5052,10 +5057,67 @@ spdk_change_rmt_lvol_state(struct spdk_lvol_store *lvs, struct spdk_transfer_dev
 	}
 }
 
+/*
+ * Replication requests take their data buffers from the iobuf small pool, as
+ * a chain per request, on the poll group thread that runs them (lpg->bufq).
+ * Every request leaves its thread through set_req_status_and_queued (or, in
+ * xfer_refill_inline, out of the window): that is where the buffers go back,
+ * so a request on the free ring never holds any.
+ */
+#define LVS_XFER_IOBUF_MODULE	"lvol_xfer"
+/* small buffers each poll group thread keeps in its channel cache */
+#define LVS_XFER_IOBUF_CACHE	32
+
+static void
+xfer_req_put_bufs(struct spdk_lvs_xfer_req *req)
+{
+	if (req->buf_ready) {
+		/* got them after waiting, not submitted yet */
+		struct spdk_lvs_poll_group *lpg = SPDK_CONTAINEROF(req->chain.q,
+						  struct spdk_lvs_poll_group, bufq);
+
+		TAILQ_REMOVE(&lpg->buf_readyq, req, buf_link);
+		req->buf_ready = false;
+	}
+	spdk_iobuf_chain_put(&req->chain);
+}
+
+/*
+ * A replication task has no per-request DMA payload: its data travels in
+ * buffer chains. Only an alloc command or the completion signal is built in
+ * req->payload, a plain-heap SPDK_LVOL_XFER_CMD_SIZE buffer allocated the first
+ * time the request carries one and copied into the request's chain on send.
+ */
+static void *
+xfer_req_ctrl_payload(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req *req)
+{
+	if (xfer->type == XFER_REPLICATE_SNAPSHOT && req->payload == NULL) {
+		req->payload = calloc(1, SPDK_LVOL_XFER_CMD_SIZE);
+		if (req->payload == NULL) {
+			SPDK_ERRLOG("lvol %s: no memory for a transfer command\n", xfer->lvol->name);
+		}
+	}
+	return req->payload;
+}
+
+static void
+xfer_free_ctrl_payloads(struct spdk_lvs_xfer *xfer)
+{
+	if (xfer->type != XFER_REPLICATE_SNAPSHOT || xfer->reqs == NULL) {
+		return;
+	}
+	for (int i = 0; i < xfer->cluster_batch; i++) {
+		free(xfer->reqs[i].payload);
+		xfer->reqs[i].payload = NULL;
+	}
+}
+
 static void
 set_req_status_and_queued(struct spdk_lvs_xfer_req *req, enum xfer_req_status status)
 {
 	struct remote_lvol_info *rmt = req->rmt_lvol;
+
+	xfer_req_put_bufs(req);
 
 	if (rmt->outstanding_io == 0) {
 		SPDK_ERRLOG("outstanding_io underflow\n");
@@ -5274,12 +5336,96 @@ spdk_lvol_get_xfer_whole_cluster_pct(void)
 	return g_lvs_xfer_whole_cluster_pct;
 }
 
+SPDK_STATIC_ASSERT(SPDK_LVS_XFER_FRAG_IOVS >= SPDK_IOBUF_CHAIN_MAX_IOVS + XFER_MAX_DATA_RANGES,
+		   "frag_iovs too small for a request's writes");
+
+static bool
+xfer_unit_is_zero(const uint8_t *p, uint32_t len)
+{
+	const uint64_t *w = (const uint64_t *)p;
+	uint64_t acc = 0;
+	uint32_t i;
+
+	for (i = 0; i < len / sizeof(uint64_t); i++) {
+		acc |= w[i];
+	}
+	return acc == 0;
+}
+
 /*
- * Write the request's payload (the cluster, already read whole) to the remote
+ * spdk_bs_find_data_ranges() over a buffer chain: the first len bytes of iovs,
+ * in units of unit bytes (each buffer holds whole units). A range runs on
+ * across buffer boundaries. -1: more than max_ranges ranges.
+ */
+static int
+xfer_find_data_ranges_iov(const struct iovec *iovs, int iovcnt, uint64_t len, uint32_t unit,
+			  uint64_t max_range_len, struct spdk_bs_data_range *ranges, int max_ranges)
+{
+	uint64_t off = 0, o, n;
+	int nranges = 0, i;
+
+	for (i = 0; i < iovcnt && off < len; i++) {
+		const uint8_t *p = iovs[i].iov_base;
+
+		n = spdk_min((uint64_t)iovs[i].iov_len, len - off);
+		if (n % unit != 0) {
+			return -1;	/* cannot happen with 4 KiB multiples: send it whole */
+		}
+		for (o = 0; o < n; o += unit, off += unit) {
+			if (xfer_unit_is_zero(p + o, unit)) {
+				continue;
+			}
+			if (nranges > 0 && ranges[nranges - 1].end == off &&
+			    (max_range_len == 0 || off - ranges[nranges - 1].start < max_range_len)) {
+				ranges[nranges - 1].end = off + unit;
+				continue;
+			}
+			if (nranges == max_ranges) {
+				return -1;
+			}
+			ranges[nranges].start = off;
+			ranges[nranges].end = off + unit;
+			nranges++;
+		}
+	}
+	return nranges;
+}
+
+/* Describe bytes [off, off + len) of a buffer chain in dst; the number of
+ * entries, or -1 when dst is too short or the chain ends first. */
+static int
+xfer_iov_slice(const struct iovec *src, int srccnt, uint64_t off, uint64_t len,
+	       struct iovec *dst, int dstmax)
+{
+	int i = 0, cnt = 0;
+	uint64_t n;
+
+	while (i < srccnt && off >= src[i].iov_len) {
+		off -= src[i].iov_len;
+		i++;
+	}
+	while (len > 0) {
+		if (i >= srccnt || cnt >= dstmax) {
+			return -1;
+		}
+		n = spdk_min((uint64_t)src[i].iov_len - off, len);
+		dst[cnt].iov_base = (uint8_t *)src[i].iov_base + off;
+		dst[cnt].iov_len = n;
+		cnt++;
+		len -= n;
+		off = 0;
+		i++;
+	}
+	return cnt;
+}
+
+/*
+ * Write the request's data (read whole into its buffer chain) to the remote
  * device:
  *  - no data range: nothing to send, the request is done;
  *  - up to XFER_MAX_DATA_RANGES ranges: one write per range;
- *  - more ranges: the whole payload, in writes of XFER_MAX_WRITE_BYTES.
+ *  - more ranges: all of it, in writes of XFER_MAX_WRITE_BYTES.
+ * A write's pieces of the chain are in req->frag_iovs until it completes.
  */
 static int
 submit_req_fragments(struct spdk_lvs_xfer_req *req, struct remote_lvol_info *rmt)
@@ -5289,21 +5435,27 @@ submit_req_fragments(struct spdk_lvs_xfer_req *req, struct remote_lvol_info *rmt
 	uint32_t blocklen = spdk_bdev_get_block_size(spdk_bdev_desc_get_bdev(desc));
 	uint32_t max_blocks = spdk_max(XFER_MAX_WRITE_BYTES / blocklen, 1u);
 	struct spdk_bs_data_range ranges[XFER_MAX_DATA_RANGES];
-	uint8_t *payload = (uint8_t *)req->payload;
-	uint64_t start, end, n;
-	int nranges, i, rc;
+	struct spdk_iobuf_chain *chain = &req->chain;
+	uint64_t start, end, n, len = (uint64_t)req->len * blocklen;
+	int nranges, i, rc, cnt, used = 0;
 
 	req->fragments_outstanding = 0;
 	req->aggregated_status = 0;
+
+	if (len > chain->len || chain->nbufs < chain->needed) {
+		SPDK_ERRLOG("replicate offset %" PRIu64 ": %" PRIu64 " bytes, buffers for %" PRIu64 "\n",
+			    req->offset, len, chain->len);
+		return -EINVAL;
+	}
 
 	if (req->partial || req->xfer->no_zero_skip) {
 		/* The destination block holds the base's content (or may), not
 		 * zeroes: a zero block must be written like any other. */
 		nranges = -1;
 	} else {
-		nranges = spdk_bs_find_data_ranges(payload, (uint64_t)req->len * blocklen, blocklen,
-						   (uint64_t)max_blocks * blocklen,
-						   ranges, XFER_MAX_DATA_RANGES);
+		nranges = xfer_find_data_ranges_iov(chain->iovs, (int)chain->needed, len, blocklen,
+						    (uint64_t)max_blocks * blocklen,
+						    ranges, XFER_MAX_DATA_RANGES);
 	}
 
 	if (nranges == 0) {
@@ -5315,9 +5467,9 @@ submit_req_fragments(struct spdk_lvs_xfer_req *req, struct remote_lvol_info *rmt
 	}
 
 	if (nranges < 0) {
-		/* Too many ranges: the whole payload is one range. */
+		/* Too many ranges: all of it is one range. */
 		ranges[0].start = 0;
-		ranges[0].end = (uint64_t)req->len * blocklen;
+		ranges[0].end = len;
 		nranges = 1;
 	}
 
@@ -5329,11 +5481,16 @@ submit_req_fragments(struct spdk_lvs_xfer_req *req, struct remote_lvol_info *rmt
 		/* A found range is one write; only the whole payload is split. */
 		while (start < end) {
 			n = spdk_min(end - start, (uint64_t)max_blocks);
+			cnt = xfer_iov_slice(chain->iovs, (int)chain->needed, start * blocklen,
+					     n * blocklen, &req->frag_iovs[used],
+					     SPDK_LVS_XFER_FRAG_IOVS - used);
 
 			/* increment fragments counter before submit */
 			req->fragments_outstanding++;
-			rc = spdk_bdev_write_blocks(desc, ch, payload + start * blocklen,
-						    req->dst_offset + start, n, fragment_write_cb, req);
+			rc = cnt > 0 ? spdk_bdev_writev_blocks(desc, ch, &req->frag_iovs[used], cnt,
+							       req->dst_offset + start, n,
+							       fragment_write_cb, req) : -EINVAL;
+			used += spdk_max(cnt, 0);
 			if (rc != 0) {
 				/* synchronous failure: the fragments in flight finish the
 				 * request with the error; none in flight, the caller does. */
@@ -5427,13 +5584,196 @@ local_op_comp(void *cb_arg, int bserrno)
 }
 
 
+/* Bytes of a replication request's buffer chain. */
+static uint64_t
+xfer_req_bytes(const struct spdk_lvs_xfer_req *req)
+{
+	return (uint64_t)req->len * req->xfer->page_size;
+}
+
+/* A replication request has its buffers: read the source into them, or send
+ * the command / completion signal staged in payload. */
+static int
+xfer_req_submit_chain(struct spdk_lvs_xfer_req *req)
+{
+	struct remote_lvol_info *rmt = req->rmt_lvol;
+	struct spdk_lvs_xfer *xfer = req->xfer;
+	struct spdk_iobuf_chain *chain = &req->chain;
+
+	switch (req->action) {
+	case REQ_ACTION_COPY_BACKUP:
+		/* in the transfer's own class when it has one, else the blob's (-1) */
+		req->t_read = spdk_get_ticks();
+		xfer_stat_inflight_inc(xfer->lvol);
+		spdk_blob_io_readv_with_priority(xfer->lvol->blob, rmt->md_channel, chain->iovs,
+						 (int)chain->needed, req->offset, req->len,
+						 xfer->priority_class ? (int)xfer->priority_class : -1,
+						 local_op_comp, req);
+		return 0;
+	case REQ_ACTION_WRITE:
+		if (req->payload == NULL) {
+			return -EINVAL;
+		}
+		spdk_copy_buf_to_iovs(chain->iovs, (int)chain->needed, req->payload, chain->len);
+		return spdk_bdev_writev_blocks(rmt->desc, rmt->channel, chain->iovs, (int)chain->needed,
+					       req->dst_offset, req->len, complete_op_cb, req);
+	default:
+		SPDK_ERRLOG("Replication request at offset %" PRIu64 ": invalid action %d\n",
+			    req->offset, req->action);
+		return -EINVAL;
+	}
+}
+
+/*
+ * Start a replication request on its poll group thread: take its buffer chain
+ * from the iobuf small pool and submit it, or -- the pool is empty -- leave it
+ * waiting (still in flight for the window, which therefore does not refill:
+ * nothing spins). xfer_req_bufs_ready submits it once it has the buffers.
+ */
+static int
+xfer_req_start(struct spdk_lvs_xfer_req *req)
+{
+	struct spdk_lvs_poll_group *lpg = req->rmt_lvol ? req->rmt_lvol->group : NULL;
+	int rc;
+
+	if (lpg == NULL || !lpg->iobuf_ok) {
+		SPDK_ERRLOG("Replication request at offset %" PRIu64 ": no iobuf channel on this "
+			    "poll group\n", req->offset);
+		return -ENOMEM;
+	}
+	rc = spdk_iobuf_chain_get(&lpg->bufq, &req->chain, xfer_req_bytes(req));
+	if (rc < 0) {
+		SPDK_ERRLOG("Replication request at offset %" PRIu64 ": %" PRIu64 " bytes do not fit "
+			    "a buffer chain\n", req->offset, xfer_req_bytes(req));
+		return rc;
+	}
+	if (rc > 0) {
+		return 0;
+	}
+	return xfer_req_submit_chain(req);
+}
+
+/* Submit the requests that got their buffers after waiting. */
+static void
+xfer_bufq_run(void *arg)
+{
+	struct spdk_lvs_poll_group *lpg = arg;
+	struct spdk_lvs_xfer_req *req;
+	struct remote_lvol_info *rmt;
+
+	lpg->buf_run_pending = false;
+	while ((req = TAILQ_FIRST(&lpg->buf_readyq)) != NULL) {
+		TAILQ_REMOVE(&lpg->buf_readyq, req, buf_link);
+		req->buf_ready = false;
+		rmt = req->rmt_lvol;
+		if (rmt->desc == NULL || rmt->channel == NULL || !rmt->status ||
+		    xfer_req_submit_chain(req) != 0) {
+			set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
+		}
+	}
+}
+
+/* ready_fn of a poll group's buffer queue: runs inside another request's
+ * buffer return, so the request is only queued here. */
+static void
+xfer_req_bufs_ready(struct spdk_iobuf_chain *chain)
+{
+	struct spdk_lvs_xfer_req *req = SPDK_CONTAINEROF(chain, struct spdk_lvs_xfer_req, chain);
+	struct spdk_lvs_poll_group *lpg = SPDK_CONTAINEROF(chain->q, struct spdk_lvs_poll_group, bufq);
+
+	TAILQ_INSERT_TAIL(&lpg->buf_readyq, req, buf_link);
+	req->buf_ready = true;
+	if (!lpg->buf_run_pending &&
+	    spdk_thread_send_msg(spdk_get_thread(), xfer_bufq_run, lpg) == 0) {
+		lpg->buf_run_pending = true;
+	}
+	/* else helper_xfer_poller runs it */
+}
+
+/* From helper_xfer_poller: requests left ready (no message), and buffers
+ * other threads returned to the pool for the request waiting here. */
+static void
+xfer_bufq_poll(struct spdk_lvs_poll_group *lpg)
+{
+	if (!lpg->iobuf_ok) {
+		return;
+	}
+	if (!lpg->buf_run_pending && !TAILQ_EMPTY(&lpg->buf_readyq)) {
+		xfer_bufq_run(lpg);
+	}
+	spdk_iobuf_chain_kick(&lpg->bufq);
+}
+
+/*
+ * Teardown of rmt_lvol on its poll group thread: fail its requests that wait
+ * for buffers or for submission (no bdev_io to abort), so outstanding_io
+ * drains. Rescans after each one: a request leaving can complete others.
+ */
+static void
+xfer_bufq_abort_rmt(struct spdk_lvs_poll_group *lpg, struct remote_lvol_info *rmt_lvol)
+{
+	struct spdk_iobuf_chain *chain;
+	struct spdk_lvs_xfer_req *req;
+	bool found = true;
+
+	if (!lpg->iobuf_ok) {
+		return;
+	}
+	while (found) {
+		found = false;
+		TAILQ_FOREACH(chain, &lpg->bufq.waitq, link) {
+			req = SPDK_CONTAINEROF(chain, struct spdk_lvs_xfer_req, chain);
+			if (req->rmt_lvol == rmt_lvol) {
+				set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
+				found = true;
+				break;
+			}
+		}
+		if (found) {
+			continue;
+		}
+		TAILQ_FOREACH(req, &lpg->buf_readyq, buf_link) {
+			if (req->rmt_lvol == rmt_lvol) {
+				set_req_status_and_queued(req, XFER_REQ_STATUS_FAILED);
+				found = true;
+				break;
+			}
+		}
+	}
+}
+
+static void
+lvs_poll_group_iobuf_init(struct spdk_lvs_poll_group *lpg)
+{
+	int rc;
+
+	TAILQ_INIT(&lpg->buf_readyq);
+	rc = spdk_iobuf_channel_init(&lpg->iobuf, LVS_XFER_IOBUF_MODULE, LVS_XFER_IOBUF_CACHE, 0);
+	if (rc != 0) {
+		/* the pool cannot fill the cache now: take buffers as needed */
+		rc = spdk_iobuf_channel_init(&lpg->iobuf, LVS_XFER_IOBUF_MODULE, 0, 0);
+	}
+	if (rc != 0) {
+		SPDK_ERRLOG("lvs poll group %s: no iobuf channel (%d): replication on it fails\n",
+			    lpg->thread_name, rc);
+		return;
+	}
+	spdk_iobuf_chain_queue_init(&lpg->bufq, &lpg->iobuf, xfer_req_bufs_ready);
+	lpg->iobuf_ok = true;
+}
+
 static int
 submit_rw_reqs_local(struct spdk_lvs_xfer_req *req)
 {
-	struct remote_lvol_info *rmt = req->rmt_lvol;
-	struct spdk_io_channel *md_ch = rmt->md_channel;
+	struct spdk_io_channel *md_ch = req->rmt_lvol->md_channel;
 	struct spdk_lvs_xfer *xfer = req->xfer;
 	int rc = 0;
+
+	if (xfer->type == XFER_REPLICATE_SNAPSHOT &&
+	    (req->action == REQ_ACTION_COPY_BACKUP || req->action == REQ_ACTION_WRITE)) {
+		/* iobuf small-pool chains, not the task's payloads */
+		return xfer_req_start(req);
+	}
 	switch (req->action)
 	{
 		case REQ_ACTION_COPY_BACKUP:
@@ -5449,16 +5789,6 @@ submit_rw_reqs_local(struct spdk_lvs_xfer_req *req)
 			// read from remote and write to local
 			spdk_blob_io_write(xfer->lvol->blob, md_ch, req->payload, req->offset,
 								req->len, local_op_comp, req);
-			break;
-		case REQ_ACTION_WRITE:
-			if (req->xfer->type == XFER_REPLICATE_SNAPSHOT) {
-				rc = spdk_bdev_write_blocks(rmt->desc, rmt->channel,
-					req->payload, req->dst_offset, req->len, complete_op_cb, req);
-			} else {
-				SPDK_ERRLOG("Local I/O failed at offset: %" PRIu64 " len: %" PRIu64 " due to invalid action\n",
-				req->offset, req->len);
-				rc = -EINVAL;
-			}
 			break;
 		default:
 			SPDK_ERRLOG("Local I/O failed at offset: %" PRIu64 " len: %" PRIu64 " due to invalid action\n",
@@ -5494,6 +5824,8 @@ helper_xfer_poller(void *arg)
 	uint32_t burst = 0;
 	bool priority_active =
 		__atomic_load_n(&g_priority_xfer_cnt, __ATOMIC_SEQ_CST) > 0;
+
+	xfer_bufq_poll(lpg);
 	/* Two passes: freeze-critical transfers first, and while any is active
 	 * the non-priority rings are not touched at all -- the frozen client is
 	 * waiting on every one of these ticks. */
@@ -5873,6 +6205,8 @@ spdk_delete_rmt_lvol_pg(void *arg) {
 
 		TAILQ_REMOVE(&lpg->rmt_lvols, rmt_lvol, entry);
 		rmt_lvol->status = false;
+		/* requests waiting for buffers have no bdev_io to abort */
+		xfer_bufq_abort_rmt(lpg, rmt_lvol);
 
 		if (rmt_lvol->outstanding_io > 0) {
 			SPDK_NOTICELOG("Waiting for %lu I/Os to finish for pg %s (xfer teardown).\n",
@@ -5919,6 +6253,7 @@ destroy_xfer_task_tmo(void *arg) {
 	spdk_poller_unregister(&xfer->tmo_poller);
 	xfer->tmo_poller = NULL;
 	spdk_dma_free(xfer->pdus);
+	xfer_free_ctrl_payloads(xfer);
 	free(xfer->reqs);
 	spdk_ring_free(xfer->free_ring);
 	spdk_ring_free(xfer->ready_ring);
@@ -6301,6 +6636,13 @@ xfer_alloc_clusters_step(struct spdk_lvs_xfer *xfer)
 			return count;
 		}
 
+		if (xfer_req_ctrl_payload(xfer, req) == NULL) {
+			if (xfer->lvol) {
+				xfer->lvol->transfer_status = XFER_FAILED;
+			}
+			xfer->state = XFER_STATE_FAILED;
+			return count;
+		}
 		if (xfer_build_alloc_cmd(xfer, req->payload) == 0) {
 			/* Every command is sent; this req is not needed. */
 			if (xfer->idx == 0) {
@@ -6756,7 +7098,9 @@ xfer_refill_inline(struct spdk_lvs_xfer_req *req)
 	pthread_spin_unlock(&xfer->gen_lock);
 
 	if (!next) {
-		/* out of the window: this poll group no longer holds it */
+		/* out of the window: this poll group no longer holds it,
+		 * nor its buffers */
+		xfer_req_put_bufs(req);
 		if (rmt->outstanding_io > 0) {
 			rmt->outstanding_io--;
 		}
@@ -6920,8 +7264,12 @@ xfer_replication(struct spdk_lvs_xfer *xfer) {
 			}
 
 			if (!xfer->signal_sent) {
-				/* one page: a partial task's payloads are only
-				 * XFER_PARTIAL_MAX_BYTES, a whole cluster would overrun */
+				/* one page, built in the request's command buffer */
+				if (xfer_req_ctrl_payload(xfer, req) == NULL) {
+					xfer->lvol->transfer_status = XFER_FAILED;
+					xfer->state = XFER_STATE_FAILED;
+					return 0;
+				}
 				memset(req->payload, 0, xfer->page_size);
 				count++;
 				req->len = 1;
@@ -8106,6 +8454,9 @@ spdk_lvs_create_poll_group(void *ctx)
 	lpg->thread_name = spdk_thread_get_name(lpg->thread);
 	TAILQ_INIT(&lpg->rmt_lvols);
 	TAILQ_INIT(&lpg->ch_tdev);
+	/* replication buffers: an iobuf channel of this thread (never released:
+	 * the poll group lives as long as the app) */
+	lvs_poll_group_iobuf_init(lpg);
 	// lpg->md_thread = g_lvs_md_thread;
 	const char *suffix = strrchr(lpg->thread_name, '_'); // find last '_'
 	lpg->id =  atoi(suffix + 1);
@@ -8214,6 +8565,14 @@ spdk_lvs_poll_group_options(char *mask)
 		SPDK_ERRLOG("No helper core is set.\n");
 		return -EINVAL;
 	}
+
+	/* the poll groups' replication buffers come from the iobuf small pool */
+	ret = spdk_iobuf_register_module(LVS_XFER_IOBUF_MODULE);
+	if (ret != 0 && ret != -EEXIST) {
+		SPDK_ERRLOG("Cannot register iobuf module %s: %d\n", LVS_XFER_IOBUF_MODULE, ret);
+		return ret;
+	}
+	ret = 0;
 
 	spdk_lvs_create_poll_groups(NULL);
 	return 0;
@@ -8480,14 +8839,21 @@ spdk_lvol_create_backup_task(struct spdk_lvs_xfer *task, struct spdk_transfer_de
 		goto error;
 	}
 
-	task->pdus = spdk_dma_zmalloc(task->cluster_batch * s_elements_payload, 0x1000, NULL);
-	if (!task->pdus) {
-		SPDK_ERRLOG("Unable to allocate pdu pool on transfer task for lvol %d.\n", task->s3_id);
-		goto error;
+	if (task->type != XFER_REPLICATE_SNAPSHOT) {
+		task->pdus = spdk_dma_zmalloc(task->cluster_batch * s_elements_payload, 0x1000, NULL);
+		if (!task->pdus) {
+			SPDK_ERRLOG("Unable to allocate pdu pool on transfer task for lvol %d.\n", task->s3_id);
+			goto error;
+		}
 	}
+	/* else no DMA payloads: every request's data is a chain of iobuf
+	 * small-pool buffers, taken per request on the poll group thread
+	 * (xfer_req_start) -- at most cluster_batch x 64 KiB in flight -- and a
+	 * command or the completion signal a small heap buffer
+	 * (xfer_req_ctrl_payload) */
 
 	for (int i = 0; i < task->cluster_batch; i++) {
-        task->reqs[i].payload =  task->pdus + (i * s_elements_payload);
+        task->reqs[i].payload = task->pdus ? (uint8_t *)task->pdus + (i * s_elements_payload) : NULL;
         task->reqs[i].len = s_elements_payload / task->page_size; // in page unit
 		task->reqs[i].xfer = task;
 		task->reqs[i].type = task->type;
