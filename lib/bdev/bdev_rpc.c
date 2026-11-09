@@ -461,6 +461,61 @@ rpc_bdev_get_iostat(struct spdk_jsonrpc_request *request,
 }
 SPDK_RPC_REGISTER("bdev_get_iostat", rpc_bdev_get_iostat, SPDK_RPC_RUNTIME)
 
+struct rpc_bdev_get_io_pool_stats {
+	bool reset_max;
+};
+
+static const struct spdk_json_object_decoder rpc_bdev_get_io_pool_stats_decoders[] = {
+	{"reset_max", offsetof(struct rpc_bdev_get_io_pool_stats, reset_max), spdk_json_decode_bool, true},
+};
+
+static void
+rpc_bdev_get_io_pool_stats_done(const struct bdev_io_pool_stats *s, void *cb_arg)
+{
+	struct spdk_jsonrpc_request *request = cb_arg;
+	struct spdk_json_write_ctx *w;
+
+	if (s == NULL) {
+		spdk_jsonrpc_send_error_response(request, -ENOMEM, spdk_strerror(ENOMEM));
+		return;
+	}
+	w = spdk_jsonrpc_begin_result(request);
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_uint64(w, "pool_size", s->pool_size);
+	spdk_json_write_named_uint64(w, "pool_free", s->pool_free);
+	spdk_json_write_named_uint64(w, "thread_cache", s->thread_cache);
+	spdk_json_write_named_uint64(w, "outstanding", s->outstanding);
+	spdk_json_write_named_uint64(w, "outstanding_max_sum", s->outstanding_max_sum);
+	spdk_json_write_named_uint64(w, "outstanding_max_thread", s->outstanding_max_thread);
+	spdk_json_write_named_uint64(w, "get_nomem", s->get_nomem);
+	spdk_json_write_named_uint32(w, "threads", s->threads);
+	spdk_json_write_named_uint32(w, "bdev_io_size", s->bdev_io_size);
+	spdk_json_write_object_end(w);
+	spdk_jsonrpc_end_result(request, w);
+}
+
+/*
+ * bdev_io pool use, for sizing bdev_io_pool_size: the pool's size and free
+ * count, the per-thread caches, bdev_ios outstanding now and their per-thread
+ * high-water marks (reset_max restarts them), and gets that found none.
+ */
+static void
+rpc_bdev_get_io_pool_stats(struct spdk_jsonrpc_request *request,
+			   const struct spdk_json_val *params)
+{
+	struct rpc_bdev_get_io_pool_stats req = {};
+
+	if (params != NULL &&
+	    spdk_json_decode_object(params, rpc_bdev_get_io_pool_stats_decoders,
+				    SPDK_COUNTOF(rpc_bdev_get_io_pool_stats_decoders), &req)) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "Invalid parameters");
+		return;
+	}
+	bdev_get_io_pool_stats(req.reset_max, rpc_bdev_get_io_pool_stats_done, request);
+}
+SPDK_RPC_REGISTER("bdev_get_io_pool_stats", rpc_bdev_get_io_pool_stats, SPDK_RPC_RUNTIME)
+
 struct rpc_reset_iostat_ctx {
 	int bdev_count;
 	int rc;
