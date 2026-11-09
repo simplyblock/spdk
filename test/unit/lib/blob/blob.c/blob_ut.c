@@ -1631,6 +1631,105 @@ blob_read_with_priority(void)
 	poll_threads();
 }
 
+/* The vectored reads and writes with their own class: the class reaches the
+ * device (each piece of a split IO too), the data is right, and the blob's
+ * class stays that of every other IO. */
+static void
+blob_rw_iov_with_priority(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob *blob = g_blob;
+	struct spdk_io_channel *channel;
+	uint64_t units_per_cluster = spdk_bs_get_cluster_size(bs) / BLOCKLEN;
+	uint8_t wbuf[4 * BLOCKLEN], rbuf[4 * BLOCKLEN];
+	struct iovec wiov[2], riov[3];
+	extern int g_dev_last_read_priority;
+	extern int g_dev_last_write_priority;
+
+	channel = spdk_bs_alloc_io_channel(bs);
+	CU_ASSERT(channel != NULL);
+
+	spdk_blob_resize(blob, 4, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	/* allocate both clusters: a write that allocates runs in the blob's class */
+	memset(wbuf, 0, sizeof(wbuf));
+	spdk_blob_io_write(blob, channel, wbuf, 0, 1, blob_op_complete, NULL);
+	poll_threads();
+	spdk_blob_io_write(blob, channel, wbuf, units_per_cluster, 1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	spdk_blob_set_io_priority_class(blob, 2);
+	for (uint32_t i = 0; i < sizeof(wbuf); i++) {
+		wbuf[i] = (uint8_t)(i / BLOCKLEN + 1);
+	}
+	wiov[0].iov_base = wbuf;
+	wiov[0].iov_len = BLOCKLEN;
+	wiov[1].iov_base = wbuf + BLOCKLEN;
+	wiov[1].iov_len = 3 * BLOCKLEN;
+
+	g_dev_last_write_priority = -1;
+	spdk_blob_io_writev_with_priority(blob, channel, wiov, 2, 0, 4, 6, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(g_dev_last_write_priority == 6);
+
+	memset(rbuf, 0, sizeof(rbuf));
+	riov[0].iov_base = rbuf;
+	riov[0].iov_len = 2 * BLOCKLEN;
+	riov[1].iov_base = rbuf + 2 * BLOCKLEN;
+	riov[1].iov_len = BLOCKLEN;
+	riov[2].iov_base = rbuf + 3 * BLOCKLEN;
+	riov[2].iov_len = BLOCKLEN;
+	g_dev_last_read_priority = -1;
+	spdk_blob_io_readv_with_priority(blob, channel, riov, 3, 0, 4, 7, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(g_dev_last_read_priority == 7);
+	CU_ASSERT(memcmp(wbuf, rbuf, sizeof(wbuf)) == 0);
+
+	/* the blob keeps its own class for every other IO */
+	spdk_blob_io_readv(blob, channel, riov, 3, 0, 4, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(g_dev_last_read_priority == 2);
+
+	/* negative is the blob's class */
+	spdk_blob_io_writev_with_priority(blob, channel, wiov, 2, 0, 4, -1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(g_dev_last_write_priority == 2);
+
+	/* across the cluster boundary: split, every piece in the class */
+	spdk_blob_io_writev_with_priority(blob, channel, wiov, 2, units_per_cluster - 2, 4, 5,
+					  blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(g_dev_last_write_priority == 5);
+	memset(rbuf, 0, sizeof(rbuf));
+	spdk_blob_io_readv_with_priority(blob, channel, riov, 3, units_per_cluster - 2, 4, 4,
+					 blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(g_dev_last_read_priority == 4);
+	CU_ASSERT(memcmp(wbuf, rbuf, sizeof(wbuf)) == 0);
+
+	/* out of range */
+	spdk_blob_io_readv_with_priority(blob, channel, riov, 3, 0, 4, MAX_PRIORITY_CLASS + 1,
+					 blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -EINVAL);
+	spdk_blob_io_writev_with_priority(blob, channel, wiov, 2, 0, 4, MAX_PRIORITY_CLASS + 1,
+					  blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -EINVAL);
+
+	spdk_blob_set_io_priority_class(blob, 0);
+	spdk_bs_free_io_channel(channel);
+	poll_threads();
+}
+
 static void
 blob_rw_verify_iov(void)
 {
@@ -5458,6 +5557,7 @@ blob_merge_base_priority_class(void)
 	g_blob = NULL;
 	g_blobid = 0;
 }
+
 
 static void
 blob_snapshot_rw(void)

@@ -227,6 +227,7 @@ dev_readv(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		length = lba_count * dev->blocklen;
 		SPDK_CU_ASSERT_FATAL(offset + length <= DEV_BUFFER_SIZE);
 		__check_iov(iov, iovcnt, length);
+		g_dev_last_read_priority = bs_io_opts ? bs_io_opts->priority : -1;
 
 		for (i = 0; i < iovcnt; i++) {
 			memcpy(iov[i].iov_base, &g_dev_buffer[offset], iov[i].iov_len);
@@ -279,6 +280,7 @@ dev_writev(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		length = lba_count * dev->blocklen;
 		SPDK_CU_ASSERT_FATAL(offset + length <= DEV_BUFFER_SIZE);
 		__check_iov(iov, iovcnt, length);
+		g_dev_last_write_priority = bs_io_opts ? bs_io_opts->priority : -1;
 
 		for (i = 0; i < iovcnt; i++) {
 			memcpy(&g_dev_buffer[offset], iov[i].iov_base, iov[i].iov_len);
