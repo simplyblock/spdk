@@ -4955,6 +4955,8 @@ struct blob_merge_ctx {
 	bool				repump;
 	struct spdk_blob_merge_stats	stats;
 	int				priority_class;	/* of every read and write, or -1 */
+	/* ops in use: as many as got a buffer, at most BLOB_MERGE_QD */
+	uint32_t			nops;
 	struct blob_merge_op		ops[BLOB_MERGE_QD];
 	spdk_blob_merge_complete	cb_fn;
 	void				*cb_arg;
@@ -5098,7 +5100,7 @@ blob_merge_pump(struct blob_merge_ctx *ctx)
 static void
 blob_merge_issue(struct blob_merge_ctx *ctx)
 {
-	for (int i = 0; i < BLOB_MERGE_QD && ctx->rc == 0; i++) {
+	for (uint32_t i = 0; i < ctx->nops && ctx->rc == 0; i++) {
 		struct blob_merge_op *op = &ctx->ops[i];
 
 		if (op->busy) {
@@ -5189,17 +5191,43 @@ spdk_blob_merge_base_ext(struct spdk_blob *blob, int priority_class,
 	ctx->words = calloc(ctx->nwords, sizeof(*ctx->words));
 	ctx->ranges = calloc(ctx->nbits / 2 + 1, sizeof(*ctx->ranges));
 	ctx->ch = spdk_bs_alloc_io_channel(bs);
+	/*
+	 * As many buffers as the DMA heap gives, up to BLOB_MERGE_QD: the merge
+	 * runs at a lower queue depth rather than not at all. It used to need all
+	 * 64 x 512 KiB at once and failed with -ENOMEM on a target whose heap the
+	 * I/O path had nearly used up -- relaunched for 37 min, never starting
+	 * (bed bf18 2026-11-09). It fails only when it gets no buffer at all.
+	 */
 	for (int i = 0; i < BLOB_MERGE_QD; i++) {
 		ctx->ops[i].ctx = ctx;
-		if (parent != NULL) {
-			ctx->ops[i].buf = spdk_malloc(BLOB_MERGE_CHUNK, 0x1000, NULL,
-						      SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
-			if (ctx->ops[i].buf == NULL) {
-				ctx->rc = -ENOMEM;
+	}
+	if (parent == NULL) {
+		ctx->nops = BLOB_MERGE_QD;	/* write_zeroes needs no buffer */
+	} else {
+		while (ctx->nops < BLOB_MERGE_QD) {
+			ctx->ops[ctx->nops].buf = spdk_malloc(BLOB_MERGE_CHUNK, 0x1000, NULL,
+							      SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+			if (ctx->ops[ctx->nops].buf == NULL) {
+				break;
 			}
+			ctx->nops++;
+		}
+		if (ctx->nops == 0) {
+			SPDK_ERRLOG("blob 0x%" PRIx64 ": merge with the base: no DMA buffer of %u bytes
+",
+				    blob->id, BLOB_MERGE_CHUNK);
+			ctx->rc = -ENOMEM;
+		} else if (ctx->nops < BLOB_MERGE_QD) {
+			SPDK_WARNLOG("blob 0x%" PRIx64 ": merge with the base at queue depth %u of %u: "
+				     "the DMA heap is short
+", blob->id, ctx->nops, BLOB_MERGE_QD);
 		}
 	}
 	if (ctx->words == NULL || ctx->ranges == NULL || ctx->ch == NULL) {
+		if (ctx->ch == NULL) {
+			SPDK_ERRLOG("blob 0x%" PRIx64 ": merge with the base: no I/O channel
+", blob->id);
+		}
 		ctx->rc = -ENOMEM;
 	}
 	if (ctx->rc != 0) {
