@@ -20,6 +20,7 @@
 #include "spdk/uuid.h"
 
 #include "spdk_internal/assert.h"
+#include "spdk_internal/iobuf_chain.h"
 #include "spdk/log.h"
 
 #include "blobstore.h"
@@ -4921,16 +4922,28 @@ blob_dirty_gen_reparent(struct spdk_blob *blob, spdk_blob_id new_parent)
 /* START spdk_blob_merge_base */
 
 #define BLOB_MERGE_QD		64
-#define BLOB_MERGE_CHUNK	(512 * 1024)
+/*
+ * One piece: one read of the base and one write of the blob, in a chain of
+ * iobuf small-pool buffers (8 x 8 KiB by default). At most BLOB_MERGE_QD
+ * pieces are in flight: 64 x 64 KiB = 4 MiB of buffers per merge, from the
+ * preallocated small pool -- never from the DMA heap, which the I/O path
+ * fragments (bed bf18 2026-11-09: 64 x 512 KiB spdk_malloc failed there).
+ */
+#define BLOB_MERGE_CHUNK	(64 * 1024)
+#define BLOB_MERGE_IOBUF_MODULE	"blob_merge"
+/* While a piece waits for buffers: look this often for buffers that other
+ * threads returned to the pool (they wake only waiters of their own thread). */
+#define BLOB_MERGE_KICK_US	1000
 
 struct blob_merge_ctx;
 
 struct blob_merge_op {
-	struct blob_merge_ctx	*ctx;
-	void			*buf;		/* NULL: the base is zeroes */
-	uint64_t		offset;		/* io units */
-	uint64_t		length;		/* io units */
-	bool			busy;
+	struct blob_merge_ctx		*ctx;
+	struct spdk_iobuf_chain		chain;		/* the piece's data (not with no parent) */
+	uint64_t			offset;		/* io units */
+	uint64_t			length;		/* io units */
+	bool				busy;
+	TAILQ_ENTRY(blob_merge_op)	ready_link;
 };
 
 struct blob_merge_ctx {
@@ -4955,12 +4968,61 @@ struct blob_merge_ctx {
 	bool				repump;
 	struct spdk_blob_merge_stats	stats;
 	int				priority_class;	/* of every read and write, or -1 */
-	/* ops in use: as many as got a buffer, at most BLOB_MERGE_QD */
-	uint32_t			nops;
+	/* buffers: the blobstore's merge iobuf channel (iobuf_ref), and the
+	 * pieces that got theirs after waiting, to be submitted by
+	 * blob_merge_run_ready (run_pending: it is scheduled or running) */
+	bool				iobuf_ref;
+	struct spdk_iobuf_chain_queue	bufq;
+	TAILQ_HEAD(, blob_merge_op)	readyq;
+	bool				run_pending;
+	struct spdk_poller		*kick_poller;
 	struct blob_merge_op		ops[BLOB_MERGE_QD];
 	spdk_blob_merge_complete	cb_fn;
 	void				*cb_arg;
 };
+
+/*
+ * The merges of a blobstore share one iobuf channel on the md thread (a thread
+ * has at most IOBUF_MAX_CHANNELS). No cache: a merge takes the pool's buffers
+ * as it goes and returns each piece's at once.
+ */
+static int
+bs_merge_iobuf_get(struct spdk_blob_store *bs)
+{
+	int rc;
+
+	if (bs->merge_iobuf_refs > 0) {
+		bs->merge_iobuf_refs++;
+		return 0;
+	}
+	rc = spdk_iobuf_register_module(BLOB_MERGE_IOBUF_MODULE);
+	if (rc != 0 && rc != -EEXIST) {
+		return rc;
+	}
+	bs->merge_iobuf = calloc(1, sizeof(*bs->merge_iobuf));
+	if (bs->merge_iobuf == NULL) {
+		return -ENOMEM;
+	}
+	rc = spdk_iobuf_channel_init(bs->merge_iobuf, BLOB_MERGE_IOBUF_MODULE, 0, 0);
+	if (rc != 0) {
+		free(bs->merge_iobuf);
+		bs->merge_iobuf = NULL;
+		return rc;
+	}
+	bs->merge_iobuf_refs = 1;
+	return 0;
+}
+
+static void
+bs_merge_iobuf_put(struct spdk_blob_store *bs)
+{
+	assert(bs->merge_iobuf_refs > 0);
+	if (--bs->merge_iobuf_refs == 0) {
+		spdk_iobuf_channel_fini(bs->merge_iobuf);
+		free(bs->merge_iobuf);
+		bs->merge_iobuf = NULL;
+	}
+}
 
 /* Next allocated cluster with blocks that were not written. */
 static bool
@@ -5026,6 +5088,7 @@ blob_merge_finish(struct blob_merge_ctx *ctx)
 {
 	struct spdk_blob *blob = ctx->blob;
 
+	assert(TAILQ_EMPTY(&ctx->readyq));
 	blob->dirty_gen = ctx->gen;
 	blob->dirty_merging = false;
 	if (ctx->rc == 0) {
@@ -5034,10 +5097,18 @@ blob_merge_finish(struct blob_merge_ctx *ctx)
 	SPDK_NOTICELOG("blob 0x%" PRIx64 ": merged with the base: %" PRIu64 " cluster(s), %" PRIu64
 		       " range(s), %" PRIu64 " bytes, rc %d\n", blob->id, ctx->stats.clusters,
 		       ctx->stats.ranges, ctx->stats.bytes, ctx->rc);
-	spdk_bs_free_io_channel(ctx->ch);
-	for (int i = 0; i < BLOB_MERGE_QD; i++) {
-		spdk_free(ctx->ops[i].buf);
+	if (ctx->bufq.waits != 0) {
+		SPDK_NOTICELOG("blob 0x%" PRIx64 ": merge waited for iobuf small-pool buffers %" PRIu64
+			       " time(s)\n", blob->id, ctx->bufq.waits);
 	}
+	spdk_poller_unregister(&ctx->kick_poller);
+	for (int i = 0; i < BLOB_MERGE_QD; i++) {
+		spdk_iobuf_chain_put(&ctx->ops[i].chain);
+	}
+	if (ctx->iobuf_ref) {
+		bs_merge_iobuf_put(blob->bs);
+	}
+	spdk_bs_free_io_channel(ctx->ch);
 	free(ctx->ranges);
 	free(ctx->words);
 	ctx->cb_fn(ctx->cb_arg, &ctx->stats, ctx->rc);
@@ -5054,6 +5125,9 @@ blob_merge_op_done(struct blob_merge_op *op, int bserrno)
 			    ctx->blob->id, op->offset, op->length, bserrno);
 		ctx->rc = bserrno;
 	}
+	/* the buffers go back at once: to a piece waiting for them, of this
+	 * merge or another user of the md thread, else to the pool */
+	spdk_iobuf_chain_put(&op->chain);
 	op->busy = false;
 	ctx->inflight--;
 	blob_merge_pump(ctx);
@@ -5075,8 +5149,80 @@ blob_merge_read_cpl(void *cb_arg, int bserrno)
 		blob_merge_op_done(op, bserrno);
 		return;
 	}
-	spdk_blob_io_write_with_priority(ctx->blob, ctx->ch, op->buf, op->offset, op->length,
-				 ctx->priority_class, blob_merge_write_cpl, op);
+	spdk_blob_io_writev_with_priority(ctx->blob, ctx->ch, op->chain.iovs, (int)op->chain.needed,
+					  op->offset, op->length, ctx->priority_class,
+					  blob_merge_write_cpl, op);
+}
+
+/* A piece has its buffers: read it from the base. */
+static void
+blob_merge_submit(struct blob_merge_op *op)
+{
+	struct blob_merge_ctx *ctx = op->ctx;
+
+	if (ctx->rc != 0) {
+		/* the merge failed while it waited */
+		blob_merge_op_done(op, 0);
+		return;
+	}
+	spdk_blob_io_readv_with_priority(ctx->parent, ctx->ch, op->chain.iovs, (int)op->chain.needed,
+					 op->offset, op->length, ctx->priority_class,
+					 blob_merge_read_cpl, op);
+}
+
+/* Submit the pieces that got their buffers after waiting. */
+static void
+blob_merge_run_ready(void *arg)
+{
+	struct blob_merge_ctx *ctx = arg;
+	struct blob_merge_op *op;
+
+	/* run_pending stays set while the loop runs: a piece that completes
+	 * inside it must not finish the merge under the loop */
+	ctx->run_pending = true;
+	while ((op = TAILQ_FIRST(&ctx->readyq)) != NULL) {
+		TAILQ_REMOVE(&ctx->readyq, op, ready_link);
+		blob_merge_submit(op);
+	}
+	ctx->run_pending = false;
+	if (ctx->inflight == 0) {
+		blob_merge_pump(ctx);
+	}
+}
+
+/* ready_fn of the merge's buffer queue: runs inside another piece's buffer
+ * return (or a kick), so the piece is only noted here and submitted from a
+ * message. */
+static void
+blob_merge_bufs_ready(struct spdk_iobuf_chain *chain)
+{
+	struct blob_merge_op *op = SPDK_CONTAINEROF(chain, struct blob_merge_op, chain);
+	struct blob_merge_ctx *ctx = op->ctx;
+
+	TAILQ_INSERT_TAIL(&ctx->readyq, op, ready_link);
+	if (!ctx->run_pending) {
+		if (spdk_thread_send_msg(spdk_get_thread(), blob_merge_run_ready, ctx) == 0) {
+			ctx->run_pending = true;
+		}
+		/* else blob_merge_kick runs it */
+	}
+}
+
+static int
+blob_merge_kick(void *arg)
+{
+	struct blob_merge_ctx *ctx = arg;
+
+	if (!ctx->run_pending && !TAILQ_EMPTY(&ctx->readyq)) {
+		/* may finish the merge, and unregister this poller */
+		blob_merge_run_ready(ctx);
+		return SPDK_POLLER_BUSY;
+	}
+	if (spdk_iobuf_chain_queue_idle(&ctx->bufq)) {
+		return SPDK_POLLER_IDLE;
+	}
+	spdk_iobuf_chain_kick(&ctx->bufq);
+	return SPDK_POLLER_BUSY;
 }
 
 static void
@@ -5092,7 +5238,7 @@ blob_merge_pump(struct blob_merge_ctx *ctx)
 		blob_merge_issue(ctx);
 	} while (ctx->repump);
 	ctx->pumping = false;
-	if (ctx->inflight == 0) {
+	if (ctx->inflight == 0 && !ctx->run_pending) {
 		blob_merge_finish(ctx);
 	}
 }
@@ -5100,7 +5246,9 @@ blob_merge_pump(struct blob_merge_ctx *ctx)
 static void
 blob_merge_issue(struct blob_merge_ctx *ctx)
 {
-	for (uint32_t i = 0; i < ctx->nops && ctx->rc == 0; i++) {
+	int rc;
+
+	for (uint32_t i = 0; i < BLOB_MERGE_QD && ctx->rc == 0; i++) {
 		struct blob_merge_op *op = &ctx->ops[i];
 
 		if (op->busy) {
@@ -5114,12 +5262,17 @@ blob_merge_issue(struct blob_merge_ctx *ctx)
 		if (ctx->parent == NULL) {
 			/* no parent: the base reads zeroes, and a fresh cluster need not */
 			spdk_blob_io_write_zeroes_with_priority(ctx->blob, ctx->ch, op->offset, op->length,
-						ctx->priority_class, blob_merge_write_cpl, op);
-		} else {
-			spdk_blob_io_read_with_priority(ctx->parent, ctx->ch, op->buf, op->offset,
-					op->length, ctx->priority_class,
-					blob_merge_read_cpl, op);
+								ctx->priority_class, blob_merge_write_cpl, op);
+			continue;
 		}
+		rc = spdk_iobuf_chain_get(&ctx->bufq, &op->chain,
+					  op->length * ctx->blob->bs->io_unit_size);
+		if (rc == 0) {
+			blob_merge_submit(op);
+		} else if (rc < 0) {
+			blob_merge_op_done(op, rc);
+		}
+		/* else it waits for buffers: blob_merge_bufs_ready */
 	}
 }
 
@@ -5138,6 +5291,7 @@ spdk_blob_merge_base_ext(struct spdk_blob *blob, int priority_class,
 	struct spdk_blob_merge_stats none = {};
 	struct blob_dirty_gen *gen = blob->dirty_gen;
 	struct spdk_blob *parent = NULL;
+	int rc;
 
 	if (priority_class > MAX_PRIORITY_CLASS) {
 		cb_fn(cb_arg, &none, -EINVAL);
@@ -5191,35 +5345,9 @@ spdk_blob_merge_base_ext(struct spdk_blob *blob, int priority_class,
 	ctx->words = calloc(ctx->nwords, sizeof(*ctx->words));
 	ctx->ranges = calloc(ctx->nbits / 2 + 1, sizeof(*ctx->ranges));
 	ctx->ch = spdk_bs_alloc_io_channel(bs);
-	/*
-	 * As many buffers as the DMA heap gives, up to BLOB_MERGE_QD: the merge
-	 * runs at a lower queue depth rather than not at all. It used to need all
-	 * 64 x 512 KiB at once and failed with -ENOMEM on a target whose heap the
-	 * I/O path had nearly used up -- relaunched for 37 min, never starting
-	 * (bed bf18 2026-11-09). It fails only when it gets no buffer at all.
-	 */
+	TAILQ_INIT(&ctx->readyq);
 	for (int i = 0; i < BLOB_MERGE_QD; i++) {
 		ctx->ops[i].ctx = ctx;
-	}
-	if (parent == NULL) {
-		ctx->nops = BLOB_MERGE_QD;	/* write_zeroes needs no buffer */
-	} else {
-		while (ctx->nops < BLOB_MERGE_QD) {
-			ctx->ops[ctx->nops].buf = spdk_malloc(BLOB_MERGE_CHUNK, 0x1000, NULL,
-							      SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
-			if (ctx->ops[ctx->nops].buf == NULL) {
-				break;
-			}
-			ctx->nops++;
-		}
-		if (ctx->nops == 0) {
-			SPDK_ERRLOG("blob 0x%" PRIx64 ": merge with the base: no DMA buffer of %u bytes\n",
-				    blob->id, BLOB_MERGE_CHUNK);
-			ctx->rc = -ENOMEM;
-		} else if (ctx->nops < BLOB_MERGE_QD) {
-			SPDK_WARNLOG("blob 0x%" PRIx64 ": merge with the base at queue depth %u of %u: "
-				     "the DMA heap is short\n", blob->id, ctx->nops, BLOB_MERGE_QD);
-		}
 	}
 	if (ctx->words == NULL || ctx->ranges == NULL || ctx->ch == NULL) {
 		if (ctx->ch == NULL) {
@@ -5227,17 +5355,40 @@ spdk_blob_merge_base_ext(struct spdk_blob *blob, int priority_class,
 		}
 		ctx->rc = -ENOMEM;
 	}
+	if (ctx->rc == 0 && parent != NULL) {
+		/*
+		 * The pieces' buffers come from the iobuf small pool, as chains.
+		 * A piece that finds the pool empty waits for buffers (the merge
+		 * slows down); the merge no longer fails or shrinks for want of
+		 * memory, which a fragmented DMA heap made it do.
+		 */
+		rc = bs_merge_iobuf_get(bs);
+		if (rc != 0) {
+			SPDK_ERRLOG("blob 0x%" PRIx64 ": merge with the base: no iobuf channel: %d\n",
+				    blob->id, rc);
+			ctx->rc = rc;
+		} else {
+			ctx->iobuf_ref = true;
+			spdk_iobuf_chain_queue_init(&ctx->bufq, bs->merge_iobuf, blob_merge_bufs_ready);
+			ctx->kick_poller = SPDK_POLLER_REGISTER(blob_merge_kick, ctx, BLOB_MERGE_KICK_US);
+			if (ctx->kick_poller == NULL) {
+				SPDK_ERRLOG("blob 0x%" PRIx64 ": merge with the base: no poller\n", blob->id);
+				ctx->rc = -ENOMEM;
+			}
+		}
+	}
 	if (ctx->rc != 0) {
-		for (int i = 0; i < BLOB_MERGE_QD; i++) {
-			spdk_free(ctx->ops[i].buf);
+		rc = ctx->rc;
+		if (ctx->iobuf_ref) {
+			bs_merge_iobuf_put(bs);
 		}
 		free(ctx->ranges);
 		free(ctx->words);
 		if (ctx->ch != NULL) {
 			spdk_bs_free_io_channel(ctx->ch);
 		}
-		cb_fn(cb_arg, &none, ctx->rc);
 		free(ctx);
+		cb_fn(cb_arg, &none, rc);
 		return;
 	}
 

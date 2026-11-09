@@ -250,6 +250,10 @@ struct spdk_blob_store {
 	 * the control plane allows a delta only if no OTHER member's count grew
 	 * over the snapshot's window. In memory: restarts at 0 with the process. */
 	uint64_t			dirty_local_writes;
+	/* spdk_blob_merge_base: one iobuf channel on the md thread, shared by
+	 * the merges in progress (merge_iobuf_refs) */
+	struct spdk_iobuf_channel	*merge_iobuf;
+	uint32_t			merge_iobuf_refs;
 	/* Two-node arbitration: held IO is returned as a path error (-ENOTCONN), not EIO. */
 	bool				ha_fenced;
 	/* Two-node arbitration: desired hold state, written by the lvol layer, applied on

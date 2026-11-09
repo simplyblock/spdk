@@ -18,6 +18,8 @@
 uint8_t *g_dev_buffer;
 uint64_t g_dev_write_bytes;
 uint64_t g_dev_read_bytes;
+/* largest single read the device saw (reset by the tests that check it) */
+uint64_t g_dev_max_read_bytes;
 /* class of the last read the device saw, -1 when it carried no options */
 int g_dev_last_read_priority = -1;
 int g_dev_last_write_priority = -1;
@@ -149,6 +151,7 @@ dev_read(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload
 		if (length > 0) {
 			memcpy(payload, &g_dev_buffer[offset], length);
 			g_dev_read_bytes += length;
+			g_dev_max_read_bytes = spdk_max(g_dev_max_read_bytes, length);
 		}
 	} else {
 		g_power_failure_rc = -EIO;
@@ -235,6 +238,7 @@ dev_readv(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		}
 
 		g_dev_read_bytes += length;
+		g_dev_max_read_bytes = spdk_max(g_dev_max_read_bytes, length);
 	} else {
 		g_power_failure_rc = -EIO;
 	}

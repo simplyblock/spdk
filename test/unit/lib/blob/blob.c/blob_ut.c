@@ -5448,6 +5448,10 @@ bs_load_iter_test(void)
 static int g_merge_rc;
 static struct spdk_blob_merge_stats g_merge_stats;
 
+/* the iobuf pools main() sets up: the merge takes its buffers from the small one */
+#define UT_IOBUF_SMALL_COUNT	128
+#define UT_IOBUF_SMALL_SIZE	8192
+
 static void
 merge_complete(void *cb_arg, const struct spdk_blob_merge_stats *stats, int bserrno)
 {
@@ -5558,6 +5562,275 @@ blob_merge_base_priority_class(void)
 	g_blobid = 0;
 }
 
+/*
+ * The merge takes its buffers from the iobuf small pool (main() sets it up
+ * with UT_IOBUF_SMALL_COUNT buffers of UT_IOBUF_SMALL_SIZE), as chains of
+ * 64 KiB pieces, and waits when the pool is empty.
+ */
+struct ut_merge_env {
+	struct spdk_blob	*blob;
+	struct spdk_blob	*snapshot;
+	struct spdk_blob	*landing;
+	struct spdk_io_channel	*channel;
+	uint64_t		io_unit;
+	uint64_t		cluster_units;
+	uint64_t		len;
+	uint8_t			*buf;
+	uint8_t			*expected;
+};
+
+/* Small-pool buffers free right now (taken on the current thread, given back). */
+static uint32_t
+ut_iobuf_small_free(void)
+{
+	struct spdk_iobuf_channel ch;
+	void **bufs = calloc(UT_IOBUF_SMALL_COUNT, sizeof(void *));
+	uint32_t n = 0;
+
+	SPDK_CU_ASSERT_FATAL(bufs != NULL);
+	SPDK_CU_ASSERT_FATAL(spdk_iobuf_channel_init(&ch, "ut_blob", 0, 0) == 0);
+	while (n < UT_IOBUF_SMALL_COUNT &&
+	       (bufs[n] = spdk_iobuf_get(&ch, UT_IOBUF_SMALL_SIZE, NULL, NULL)) != NULL) {
+		n++;
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		spdk_iobuf_put(&ch, bufs[i], UT_IOBUF_SMALL_SIZE);
+	}
+	spdk_iobuf_channel_fini(&ch);
+	free(bufs);
+	return n;
+}
+
+/* Take all but `leave` small buffers on the current thread. */
+static uint32_t
+ut_iobuf_drain(struct spdk_iobuf_channel *ch, void **bufs, uint32_t leave)
+{
+	uint32_t n = 0;
+
+	SPDK_CU_ASSERT_FATAL(spdk_iobuf_channel_init(ch, "ut_blob", 0, 0) == 0);
+	while (n < UT_IOBUF_SMALL_COUNT - leave &&
+	       (bufs[n] = spdk_iobuf_get(ch, UT_IOBUF_SMALL_SIZE, NULL, NULL)) != NULL) {
+		n++;
+	}
+	return n;
+}
+
+static void
+ut_iobuf_refill(struct spdk_iobuf_channel *ch, void **bufs, uint32_t n)
+{
+	for (uint32_t i = 0; i < n; i++) {
+		spdk_iobuf_put(ch, bufs[i], UT_IOBUF_SMALL_SIZE);
+	}
+	spdk_iobuf_channel_fini(ch);
+}
+
+/* A base cluster with a distinct byte per io unit, its snapshot, and a landing
+ * clone whose transfer wrote io units 4 and 5 (8 KiB dirty block 2 with 4 KiB
+ * units): the merge copies every other block of the cluster from the base. */
+static void
+ut_merge_env_setup(struct ut_merge_env *env)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob_opts opts;
+	static uint32_t first_cluster = 0;
+	spdk_blob_id blobid, snapshotid;
+
+	memset(env, 0, sizeof(*env));
+	env->io_unit = spdk_bs_get_io_unit_size(bs);
+	env->cluster_units = spdk_bs_get_cluster_size(bs) / env->io_unit;
+	env->len = env->cluster_units * env->io_unit;
+	env->buf = calloc(1, env->len);
+	env->expected = calloc(1, env->len);
+	SPDK_CU_ASSERT_FATAL(env->buf != NULL && env->expected != NULL);
+
+	spdk_bs_set_dirty_leader(bs, true);
+	env->channel = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(env->channel != NULL);
+
+	ut_spdk_blob_opts_init(&opts);
+	opts.thin_provision = true;
+	opts.num_clusters = 1;
+	env->blob = ut_blob_create_and_open(bs, &opts);
+	blobid = spdk_blob_get_id(env->blob);
+	for (uint64_t i = 0; i < env->len; i++) {
+		env->buf[i] = (uint8_t)(i / env->io_unit + 1);
+	}
+	memcpy(env->expected, env->buf, env->len);
+	spdk_blob_io_write(env->blob, env->channel, env->buf, 0, env->cluster_units, blob_op_complete,
+			   NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	spdk_bs_create_snapshot(bs, blobid, NULL, blob_op_with_id_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	snapshotid = g_blobid;
+	spdk_bs_open_blob(bs, snapshotid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	env->snapshot = g_blob;
+
+	spdk_bs_create_clone(bs, snapshotid, NULL, blob_op_with_id_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	spdk_bs_open_blob(bs, g_blobid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	env->landing = g_blob;
+	SPDK_CU_ASSERT_FATAL(spdk_blob_get_dirty_gen(env->landing) != NULL);
+
+	spdk_blob_alloc_clusters(env->landing, &first_cluster, 1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	memset(env->buf, 0x22, 2 * env->io_unit);
+	spdk_blob_io_write(env->landing, env->channel, env->buf, 4, 2, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	memset(env->expected + 4 * env->io_unit, 0x22, 2 * env->io_unit);
+}
+
+static void
+ut_merge_env_check(struct ut_merge_env *env)
+{
+	memset(env->buf, 0, env->len);
+	spdk_blob_io_read(env->landing, env->channel, env->buf, 0, env->cluster_units,
+			  blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(memcmp(env->buf, env->expected, env->len) == 0);
+}
+
+static void
+ut_merge_env_teardown(struct ut_merge_env *env)
+{
+	struct spdk_blob_store *bs = g_bs;
+
+	ut_blob_close_and_delete(bs, env->landing);
+	ut_blob_close_and_delete(bs, env->blob);
+	ut_blob_close_and_delete(bs, env->snapshot);
+	spdk_bs_free_io_channel(env->channel);
+	poll_threads();
+	spdk_bs_set_dirty_leader(bs, false);
+	free(env->buf);
+	free(env->expected);
+	g_blob = NULL;
+	g_blobid = 0;
+}
+
+/* The base is copied in pieces of at most 64 KiB, one read each, and every
+ * buffer goes back to the pool. */
+static void
+blob_merge_base_64k_pieces(void)
+{
+	extern uint64_t g_dev_max_read_bytes;
+	struct ut_merge_env env;
+
+	ut_merge_env_setup(&env);
+	CU_ASSERT(ut_iobuf_small_free() == UT_IOBUF_SMALL_COUNT);
+
+	g_dev_max_read_bytes = 0;
+	g_merge_rc = 1;
+	spdk_blob_merge_base_ext(env.landing, 3, merge_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_merge_rc == 0);
+	CU_ASSERT(g_merge_stats.clusters == 1);
+	/* the runs before and after the written block */
+	CU_ASSERT(g_merge_stats.ranges == 2);
+	CU_ASSERT(g_merge_stats.bytes == env.len - SPDK_BLOB_DIRTY_BLOCK_SZ);
+	if (env.len - 3 * SPDK_BLOB_DIRTY_BLOCK_SZ >= 64 * 1024) {
+		CU_ASSERT(g_dev_max_read_bytes == 64 * 1024);
+	}
+	CU_ASSERT(g_dev_max_read_bytes <= 64 * 1024);
+	CU_ASSERT(ut_iobuf_small_free() == UT_IOBUF_SMALL_COUNT);
+	ut_merge_env_check(&env);
+
+	ut_merge_env_teardown(&env);
+}
+
+/* With the pool empty the merge waits -- it does not fail -- and goes on as
+ * buffers come back on its thread; the first piece keeps the few it got
+ * while it waits for the rest. */
+static void
+blob_merge_base_waits_for_buffers(void)
+{
+	struct ut_merge_env env;
+	struct spdk_iobuf_channel ch;
+	void **bufs = calloc(UT_IOBUF_SMALL_COUNT, sizeof(void *));
+	uint32_t n;
+
+	SPDK_CU_ASSERT_FATAL(bufs != NULL);
+	ut_merge_env_setup(&env);
+
+	/* all but 3: the first piece takes them and waits for 5 more */
+	n = ut_iobuf_drain(&ch, bufs, 3);
+	CU_ASSERT(n == UT_IOBUF_SMALL_COUNT - 3);
+	g_merge_rc = 1;
+	spdk_blob_merge_base_ext(env.landing, -1, merge_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_merge_rc == 1);		/* waiting, not failed */
+	spdk_delay_us(10 * 1000);
+	poll_threads();
+	CU_ASSERT(g_merge_rc == 1);		/* the kick finds nothing either */
+
+	/* one at a time: each goes to the waiting piece */
+	for (uint32_t i = 0; i < n && g_merge_rc == 1; i++) {
+		spdk_iobuf_put(&ch, bufs[i], UT_IOBUF_SMALL_SIZE);
+		bufs[i] = NULL;
+		poll_threads();
+	}
+	CU_ASSERT(g_merge_rc == 0);
+	for (uint32_t i = 0; i < n; i++) {
+		if (bufs[i] != NULL) {
+			spdk_iobuf_put(&ch, bufs[i], UT_IOBUF_SMALL_SIZE);
+		}
+	}
+	spdk_iobuf_channel_fini(&ch);
+	CU_ASSERT(ut_iobuf_small_free() == UT_IOBUF_SMALL_COUNT);
+	ut_merge_env_check(&env);
+
+	ut_merge_env_teardown(&env);
+	free(bufs);
+}
+
+/* Buffers returned on another thread go to the global pool, and the iobuf
+ * wait queue is per thread: the merge's poller takes them from the pool. */
+static void
+blob_merge_base_kick_takes_other_threads_buffers(void)
+{
+	struct ut_merge_env env;
+	struct spdk_iobuf_channel ch;
+	void **bufs = calloc(UT_IOBUF_SMALL_COUNT, sizeof(void *));
+	uint32_t n, rounds = 0;
+
+	SPDK_CU_ASSERT_FATAL(bufs != NULL);
+	ut_merge_env_setup(&env);
+
+	set_thread(1);
+	n = ut_iobuf_drain(&ch, bufs, 0);
+	set_thread(0);
+	CU_ASSERT(n == UT_IOBUF_SMALL_COUNT);
+
+	g_merge_rc = 1;
+	spdk_blob_merge_base_ext(env.landing, -1, merge_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_merge_rc == 1);
+
+	set_thread(1);
+	ut_iobuf_refill(&ch, bufs, n);
+	set_thread(0);
+	poll_threads();
+	CU_ASSERT(g_merge_rc == 1);		/* nobody on thread 0 put one */
+
+	while (g_merge_rc == 1 && rounds++ < 1000) {
+		spdk_delay_us(1000);
+		poll_threads();
+	}
+	CU_ASSERT(g_merge_rc == 0);
+	CU_ASSERT(ut_iobuf_small_free() == UT_IOBUF_SMALL_COUNT);
+	ut_merge_env_check(&env);
+
+	ut_merge_env_teardown(&env);
+	free(bufs);
+}
 
 static void
 blob_snapshot_rw(void)
@@ -11115,10 +11388,16 @@ blob_ha_backstop_cancelled_by_release(void)
 /* END two-node arbitration */
 
 
+static void
+ut_iobuf_finish_cb(void *ctx)
+{
+}
+
 int
 main(int argc, char **argv)
 {
 	CU_pSuite		suite, suite_bs, suite_blob, suite_esnap_bs;
+	struct spdk_iobuf_opts	iobuf_opts;
 	unsigned int		i, num_failures;
 	char			suite_name[4096];
 	struct ut_config	*config;
@@ -11185,6 +11464,7 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite_blob, blob_read);
 		CU_ADD_TEST(suite_blob, blob_rw_verify);
 		CU_ADD_TEST(suite_blob, blob_read_with_priority);
+		CU_ADD_TEST(suite_blob, blob_rw_iov_with_priority);
 		CU_ADD_TEST(suite_bs, blob_rw_verify_iov);
 		CU_ADD_TEST(suite_blob, blob_rw_verify_iov_nomem);
 		CU_ADD_TEST(suite_blob, blob_rw_iov_read_only);
@@ -11233,6 +11513,9 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite_bs, blob_snapshot_rw);
 		CU_ADD_TEST(suite_bs, blob_snapshot_rw_copy_declined);
 		CU_ADD_TEST(suite_bs, blob_merge_base_priority_class);
+		CU_ADD_TEST(suite_bs, blob_merge_base_64k_pieces);
+		CU_ADD_TEST(suite_bs, blob_merge_base_waits_for_buffers);
+		CU_ADD_TEST(suite_bs, blob_merge_base_kick_takes_other_threads_buffers);
 		CU_ADD_TEST(suite_bs, blob_snapshot_rw_iov);
 		CU_ADD_TEST(suite, blob_relations);
 		CU_ADD_TEST(suite, blob_relations2);
@@ -11274,12 +11557,24 @@ main(int argc, char **argv)
 	allocate_threads(2);
 	set_thread(0);
 
+	spdk_iobuf_get_opts(&iobuf_opts, sizeof(iobuf_opts));
+	iobuf_opts.small_pool_count = UT_IOBUF_SMALL_COUNT;
+	iobuf_opts.small_bufsize = UT_IOBUF_SMALL_SIZE;
+	iobuf_opts.large_pool_count = 8;
+	if (spdk_iobuf_set_opts(&iobuf_opts) != 0 || spdk_iobuf_initialize() != 0 ||
+	    spdk_iobuf_register_module("ut_blob") != 0) {
+		fprintf(stderr, "iobuf setup failed\n");
+		return 1;
+	}
+
 	g_dev_buffer = calloc(1, DEV_BUFFER_SIZE);
 
 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
 
 	free(g_dev_buffer);
 
+	spdk_iobuf_finish(ut_iobuf_finish_cb, NULL);
+	poll_threads();
 	free_threads();
 
 	return num_failures;
