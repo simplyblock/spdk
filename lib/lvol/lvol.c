@@ -8594,7 +8594,7 @@ int
 spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_batch, enum xfer_type type,
 				struct spdk_transfer_dev *tdev, const char *snapshot_name, uint32_t lvol_id,
 				uint8_t priority_class, bool allow_partial, uint64_t partial_base, bool cow_landing,
-				spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg) {
+				bool dest_clone, spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg) {
 	struct spdk_lvs_xfer *xfer, *task;	
 	struct spdk_lvol_store *lvs = lvol->lvol_store;	
 	int rc;
@@ -8696,11 +8696,13 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
 	task->no_zero_skip = offset != 0 || allow_partial || partial_base != 0;
 	/* A replication whose destination the control plane built as a clone
 	 * of the snapshot it names (cow_landing): the cutover's final step, and
-	 * its endgame rounds, which send each round snapshot's delta straight
-	 * into the cutover clone instead of a landing volume. No chaining
-	 * signal: its page would land as data at offset 0 of the clone (see
-	 * dest_is_clone). */
-	task->dest_is_clone = type == XFER_REPLICATE_SNAPSHOT && cow_landing;
+	 * its endgame rounds (dest_clone), which send each round snapshot's
+	 * delta straight into the cutover clone instead of a landing volume. No
+	 * chaining signal: its page would land as data at offset 0 of the clone
+	 * (see dest_is_clone). A landing volume with cow_landing (merge-free
+	 * landing) is not a clone: it is chained by the signal as before. */
+	task->dest_is_clone = type == XFER_REPLICATE_SNAPSHOT && cow_landing &&
+			      (task->final_step || dest_clone);
 	/* Freeze the final step's volume before the partial decision: its
 	 * generation must not move under the setup (xfer_setup_partial). The
 	 * drain of IO already in flight follows (spdk_lvol_transfer_delay). */

@@ -3999,7 +3999,7 @@ rpc_bdev_lvol_transfer_final_step(struct spdk_jsonrpc_request *request,
 	 * allow_partial too: the destination is already a clone of the snapshot,
 	 * so no chaining signal is written. */
 	rc = spdk_lvol_transfer(lvol, 0, req.cluster_batch, type, tdev, req.snapshot_name, req.lvol_id, 0,
-				req.allow_partial, req.partial_base, req.cow_landing,
+				req.allow_partial, req.partial_base, req.cow_landing, false,
 				rpc_bdev_lvol_transfer_final_step_cb, request);
 	if (rc < 0) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
@@ -4315,13 +4315,20 @@ rpc_bdev_lvol_transfer(struct spdk_jsonrpc_request *request,
 			       req.special_io ? "special_io" : "no partial_base");
 		req.allow_partial = false;
 	}
+	if (!req.allow_partial) {
+		req.cow_landing = false;
+	}
 	/* A snapshot transfer lands in a clone only when asked by dest_clone;
 	 * cow_landing then also holds without a delta (no completion signal into
 	 * the clone; whole clusters sent into a clone are exact). Without it a
-	 * landing volume receives, chained by the completion signal. */
-	req.cow_landing = req.dest_clone;
+	 * landing volume receives -- with the caller's cow_landing on a delta --
+	 * and is chained by the completion signal. */
+	if (req.dest_clone) {
+		req.cow_landing = true;
+	}
 	rc = spdk_lvol_transfer(lvol, req.offset, req.cluster_batch, type, tdev, NULL, req.lvol_id,
 				(uint8_t)req.priority_class, req.allow_partial, req.partial_base, req.cow_landing,
+				req.dest_clone,
 				NULL, NULL);
 	if (rc < 0) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
