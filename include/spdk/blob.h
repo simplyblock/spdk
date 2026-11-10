@@ -522,6 +522,11 @@ struct blob_dirty_range {
 	uint32_t len;	/* in 8 KiB blocks */
 };
 
+/* True while a metadata operation that holds the blob (a failover update on a
+ * non-leader, a snapshot/clone/resize) is in flight: the blob must not be
+ * freed until it completes. */
+bool spdk_blob_locked_operation_in_progress(const struct spdk_blob *blob);
+
 struct blob_dirty_gen *spdk_blob_get_dirty_gen(struct spdk_blob *blob);
 /* Pin a generation for the lifetime of a transfer task. The snapshot family
  * cap frees generations older than the two newest snapshots, so a task that
@@ -1430,6 +1435,25 @@ void spdk_blob_io_read_with_priority(struct spdk_blob *blob, struct spdk_io_chan
 void spdk_blob_io_write_with_priority(struct spdk_blob *blob, struct spdk_io_channel *channel,
 					      void *payload, uint64_t offset, uint64_t length, int priority_class,
 					      spdk_blob_op_complete cb_fn, void *cb_arg);
+
+/**
+ * Read into the memory described by \p iov in a given IO priority class: the
+ * vectored spdk_blob_io_read_with_priority(), with the same rules for the
+ * class (a frozen blob's queued read runs in the blob's class).
+ */
+void spdk_blob_io_readv_with_priority(struct spdk_blob *blob, struct spdk_io_channel *channel,
+				      struct iovec *iov, int iovcnt, uint64_t offset, uint64_t length,
+				      int priority_class, spdk_blob_op_complete cb_fn, void *cb_arg);
+
+/**
+ * Write the memory described by \p iov in a given IO priority class: the
+ * vectored spdk_blob_io_write_with_priority(). A write that has to allocate
+ * its cluster first, or is queued while the blob is frozen, runs in the
+ * blob's own class.
+ */
+void spdk_blob_io_writev_with_priority(struct spdk_blob *blob, struct spdk_io_channel *channel,
+				       struct iovec *iov, int iovcnt, uint64_t offset, uint64_t length,
+				       int priority_class, spdk_blob_op_complete cb_fn, void *cb_arg);
 
 /** Write zeroes to a blob in a given IO priority class; see spdk_blob_io_write_with_priority(). */
 void spdk_blob_io_write_zeroes_with_priority(struct spdk_blob *blob, struct spdk_io_channel *channel,

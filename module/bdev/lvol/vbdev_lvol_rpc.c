@@ -3850,6 +3850,14 @@ struct rpc_bdev_lvol_transfer_final_step {
 	char *snapshot_name;
 	char *operation;
 	bool special_io;
+	/* Optional, as for bdev_lvol_transfer: send the live volume's dirty
+	 * ranges since partial_base (the SOURCE blob id of the snapshot the
+	 * destination is a clone of) instead of whole clusters. cow_landing:
+	 * the destination is a clone of that snapshot -- required for
+	 * allow_partial, and it also drops the chaining signal. */
+	bool allow_partial;
+	bool cow_landing;
+	uint64_t partial_base;
 };
 
 static void 
@@ -3868,6 +3876,9 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_transfer_final_step_d
 	{"snapshot_name", offsetof(struct rpc_bdev_lvol_transfer_final_step, snapshot_name), spdk_json_decode_string},
 	{"special_io", offsetof(struct rpc_bdev_lvol_transfer_final_step, special_io), spdk_json_decode_bool, true},
 	{"operation", offsetof(struct rpc_bdev_lvol_transfer_final_step, operation), spdk_json_decode_string},
+	{"allow_partial", offsetof(struct rpc_bdev_lvol_transfer_final_step, allow_partial), spdk_json_decode_bool, true},
+	{"cow_landing", offsetof(struct rpc_bdev_lvol_transfer_final_step, cow_landing), spdk_json_decode_bool, true},
+	{"partial_base", offsetof(struct rpc_bdev_lvol_transfer_final_step, partial_base), spdk_json_decode_uint64, true},
 };
 
 static void
@@ -3965,10 +3976,31 @@ rpc_bdev_lvol_transfer_final_step(struct spdk_jsonrpc_request *request,
 	}
 	SPDK_NOTICELOG("Transfering lvol %s in mode %s for final step.\n", req.lvol_name, req.operation);
 
+	if (type != XFER_REPLICATE_SNAPSHOT && (req.allow_partial || req.cow_landing)) {
+		/* migration's final step moves metadata, not a delta */
+		SPDK_NOTICELOG("Transfer lvol %s final step: allow_partial/cow_landing ignored for %s\n",
+			       req.lvol_name, req.operation);
+		req.allow_partial = false;
+		req.cow_landing = false;
+	}
+	if (req.allow_partial && (req.special_io || !req.cow_landing || req.partial_base == 0 ||
+				  req.partial_base == SPDK_BLOBID_INVALID ||
+				  req.partial_base == SPDK_BLOBID_EXTERNAL_SNAPSHOT)) {
+		/* the destination goes live right after this step: no merge can
+		 * fill the unsent blocks of a cluster that is not a CoW of the base */
+		SPDK_NOTICELOG("Transfer lvol %s final step: allow_partial ignored (%s)\n", req.lvol_name,
+			       req.special_io ? "special_io" : !req.cow_landing ? "no cow_landing" :
+			       "no partial_base");
+		req.allow_partial = false;
+	}
+
 	/* Class 0: the final step moves the volume that carries client IO next,
-	 * so its reads keep the volume's own class. */
+	 * so its reads keep the volume's own class. cow_landing goes on without
+	 * allow_partial too: the destination is already a clone of the snapshot,
+	 * so no chaining signal is written. */
 	rc = spdk_lvol_transfer(lvol, 0, req.cluster_batch, type, tdev, req.snapshot_name, req.lvol_id, 0,
-				false, 0, false, rpc_bdev_lvol_transfer_final_step_cb, request);
+				req.allow_partial, req.partial_base, req.cow_landing, false,
+				rpc_bdev_lvol_transfer_final_step_cb, request);
 	if (rc < 0) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 spdk_strerror(-rc));
@@ -4175,9 +4207,15 @@ struct rpc_bdev_lvol_transfer {
 	uint64_t partial_base;
 	bool special_io;
 	uint32_t priority_class;
+	/* the destination is a clone of the snapshot the delta applies on (a
+	 * cutover's endgame round sent into the cutover clone): cow_landing and
+	 * no completion signal. A separate parameter so that a control plane
+	 * asking for it from an SPDK without it gets a decode error, not a
+	 * signal page written into the clone. */
+	bool dest_clone;
 };
 
-static void 
+static void
 free_rpc_bdev_lvol_transfer(struct rpc_bdev_lvol_transfer *req) {
 	free(req->lvol_name);
 	free(req->gateway);
@@ -4195,6 +4233,7 @@ static const struct spdk_json_object_decoder rpc_bdev_lvol_transfer_decoders[] =
 	{"cow_landing", offsetof(struct rpc_bdev_lvol_transfer, cow_landing), spdk_json_decode_bool, true},
 	{"partial_base", offsetof(struct rpc_bdev_lvol_transfer, partial_base), spdk_json_decode_uint64, true},
 	{"special_io", offsetof(struct rpc_bdev_lvol_transfer, special_io), spdk_json_decode_bool, true},
+	{"dest_clone", offsetof(struct rpc_bdev_lvol_transfer, dest_clone), spdk_json_decode_bool, true},
 	{"priority_class", offsetof(struct rpc_bdev_lvol_transfer, priority_class), spdk_json_decode_uint32, true},
 };
 
@@ -4279,8 +4318,17 @@ rpc_bdev_lvol_transfer(struct spdk_jsonrpc_request *request,
 	if (!req.allow_partial) {
 		req.cow_landing = false;
 	}
+	/* A snapshot transfer lands in a clone only when asked by dest_clone;
+	 * cow_landing then also holds without a delta (no completion signal into
+	 * the clone; whole clusters sent into a clone are exact). Without it a
+	 * landing volume receives -- with the caller's cow_landing on a delta --
+	 * and is chained by the completion signal. */
+	if (req.dest_clone) {
+		req.cow_landing = true;
+	}
 	rc = spdk_lvol_transfer(lvol, req.offset, req.cluster_batch, type, tdev, NULL, req.lvol_id,
 				(uint8_t)req.priority_class, req.allow_partial, req.partial_base, req.cow_landing,
+				req.dest_clone,
 				NULL, NULL);
 	if (rc < 0) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
@@ -4397,6 +4445,50 @@ cleanup:
 }
 
 SPDK_RPC_REGISTER("bdev_lvol_transfer_stat", rpc_bdev_lvol_transfer_stat, SPDK_RPC_RUNTIME)
+
+struct rpc_bdev_lvol_set_xfer_whole_cluster_pct {
+	uint32_t pct;
+};
+
+static const struct spdk_json_object_decoder rpc_bdev_lvol_set_xfer_whole_cluster_pct_decoders[] = {
+	{"pct", offsetof(struct rpc_bdev_lvol_set_xfer_whole_cluster_pct, pct), spdk_json_decode_uint32},
+};
+
+/* Node-wide tunable of partial transfers: a cluster at least pct % dirty is
+ * sent whole rather than as dirty ranges (see spdk_lvol_set_xfer_whole_cluster_pct). */
+static void
+rpc_bdev_lvol_set_xfer_whole_cluster_pct(struct spdk_jsonrpc_request *request,
+					 const struct spdk_json_val *params)
+{
+	struct rpc_bdev_lvol_set_xfer_whole_cluster_pct req = {};
+	struct spdk_json_write_ctx *w;
+	int rc;
+
+	if (spdk_json_decode_object(params, rpc_bdev_lvol_set_xfer_whole_cluster_pct_decoders,
+				    SPDK_COUNTOF(rpc_bdev_lvol_set_xfer_whole_cluster_pct_decoders),
+				    &req)) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "spdk_json_decode_object failed");
+		return;
+	}
+
+	rc = spdk_lvol_set_xfer_whole_cluster_pct(req.pct);
+	if (rc != 0) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "pct must be 0..100");
+		return;
+	}
+	SPDK_NOTICELOG("Partial transfer whole-cluster threshold set to %u%%\n", req.pct);
+
+	w = spdk_jsonrpc_begin_result(request);
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_uint32(w, "whole_cluster_pct", spdk_lvol_get_xfer_whole_cluster_pct());
+	spdk_json_write_object_end(w);
+	spdk_jsonrpc_end_result(request, w);
+}
+
+SPDK_RPC_REGISTER("bdev_lvol_set_xfer_whole_cluster_pct", rpc_bdev_lvol_set_xfer_whole_cluster_pct,
+		  SPDK_RPC_RUNTIME)
 
 struct rpc_bdev_lvol_dirty_bitmap_info {
 	char *lvol_name;

@@ -722,7 +722,11 @@ spdk_iobuf_get(struct spdk_iobuf_channel *ch, uint64_t len,
 				       spdk_max(pool->cache_size, 1)));
 		if (sz == 0) {
 			if (entry) {
-				SPDK_NOTICELOG("set entry for get buf and wait, cache_count %d\n", pool->cache_count);
+				/* DEBUG, not NOTICE: replication and the landing merge now wait
+				 * for small buffers by design and re-arm on every kick -- under
+				 * pool exhaustion this fired thousands of times per second */
+				SPDK_DEBUGLOG(thread, "set entry for get buf and wait, cache_count %d\n",
+					      pool->cache_count);
 				STAILQ_INSERT_TAIL(pool->queue, entry, stailq);
 				entry->module = ch->module;
 				entry->cb_fn = cb_fn;

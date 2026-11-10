@@ -2268,7 +2268,10 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
                                              snapshot_name=args.snapshot_name,
                                              cluster_batch=args.cluster_batch,
                                              gateway=args.gateway,
-                                             operation=args.operation))
+                                             operation=args.operation,
+                                             allow_partial=args.allow_partial,
+                                             partial_base=args.partial_base,
+                                             cow_landing=args.cow_landing))
 
     p = subparsers.add_parser('bdev_lvol_transfer_final_step', help='Transfer an lvol between lvol stores via hublvol as gateway')
     p.add_argument('--lvol-name', help='Name of the source lvol')
@@ -2277,6 +2280,12 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('-b', '--cluster-batch', help='Transfering lvol with batch reqs: default 16 clusters', type=int)
     p.add_argument('-g', '--gateway', help='Target hubLvol name as gateway', required=True)
     p.add_argument('-O', '--operation', help=("Operation to perform. Valid values: 'migrate' (metadata only), 'replicate' (metadata + data)"), choices=['migrate', 'replicate'], required=True)
+    p.add_argument('--allow-partial', help='Send the dirty ranges since --partial-base (replicate, needs --cow-landing)',
+                   action='store_true', default=False)
+    p.add_argument('--partial-base', help='Source blob id of the snapshot the destination is a clone of',
+                   type=int, default=0)
+    p.add_argument('--cow-landing', help='The destination is a clone of that snapshot (no chaining signal)',
+                   action='store_true', default=False)
     p.set_defaults(func=bdev_lvol_transfer_final_step)
     
     def bdev_lvol_batch_transfer_final_step(args):

@@ -243,6 +243,16 @@ struct spdk_bdev_mgmt_channel {
 	uint32_t	per_thread_cache_count;
 	uint32_t	bdev_io_cache_size;
 
+	/*
+	 * bdev_io accounting of this thread, for sizing bdev_io_pool_size
+	 * (bdev_get_io_pool_stats): bdev_ios handed out and not yet freed, the
+	 * highest that reached, and gets that found none (the caller waits via
+	 * spdk_bdev_queue_io_wait). Thread-local: no atomics on the IO path.
+	 */
+	uint64_t	io_outstanding;
+	uint64_t	io_outstanding_max;
+	uint64_t	io_get_nomem;
+
 	struct spdk_iobuf_channel iobuf;
 
 	TAILQ_HEAD(, spdk_bdev_shared_resource)	shared_resources;
@@ -2710,6 +2720,14 @@ bdev_channel_get_io(struct spdk_bdev_channel *channel)
 		bdev_io = spdk_mempool_get(g_bdev_mgr.bdev_io_pool);
 	}
 
+	if (spdk_likely(bdev_io != NULL)) {
+		if (++ch->io_outstanding > ch->io_outstanding_max) {
+			ch->io_outstanding_max = ch->io_outstanding;
+		}
+	} else {
+		ch->io_get_nomem++;
+	}
+
 	return bdev_io;
 }
 
@@ -2727,6 +2745,10 @@ spdk_bdev_free_io(struct spdk_bdev_io *bdev_io)
 		bdev_io_put_buf(bdev_io);
 	}
 
+	if (spdk_likely(ch->io_outstanding > 0)) {
+		ch->io_outstanding--;
+	}
+
 	if (ch->per_thread_cache_count < ch->bdev_io_cache_size) {
 		ch->per_thread_cache_count++;
 		STAILQ_INSERT_HEAD(&ch->per_thread_cache, bdev_io, internal.buf_link);
@@ -2742,6 +2764,61 @@ spdk_bdev_free_io(struct spdk_bdev_io *bdev_io)
 		assert(TAILQ_EMPTY(&ch->io_wait_queue));
 		spdk_mempool_put(g_bdev_mgr.bdev_io_pool, (void *)bdev_io);
 	}
+}
+
+struct bdev_io_pool_stats_ctx {
+	struct bdev_io_pool_stats	stats;
+	bool				reset_max;
+	bdev_io_pool_stats_cb		cb;
+	void				*cb_arg;
+};
+
+static void
+bdev_io_pool_stats_channel(struct spdk_io_channel_iter *i)
+{
+	struct bdev_io_pool_stats_ctx *ctx = spdk_io_channel_iter_get_ctx(i);
+	struct spdk_bdev_mgmt_channel *ch = spdk_io_channel_get_ctx(
+			spdk_io_channel_iter_get_channel(i));
+
+	ctx->stats.threads++;
+	ctx->stats.thread_cache += ch->per_thread_cache_count;
+	ctx->stats.outstanding += ch->io_outstanding;
+	ctx->stats.outstanding_max_sum += ch->io_outstanding_max;
+	ctx->stats.outstanding_max_thread = spdk_max(ctx->stats.outstanding_max_thread,
+					    ch->io_outstanding_max);
+	ctx->stats.get_nomem += ch->io_get_nomem;
+	if (ctx->reset_max) {
+		ch->io_outstanding_max = ch->io_outstanding;
+	}
+	spdk_for_each_channel_continue(i, 0);
+}
+
+static void
+bdev_io_pool_stats_done(struct spdk_io_channel_iter *i, int status)
+{
+	struct bdev_io_pool_stats_ctx *ctx = spdk_io_channel_iter_get_ctx(i);
+
+	ctx->stats.pool_size = g_bdev_opts.bdev_io_pool_size;
+	ctx->stats.pool_free = spdk_mempool_count(g_bdev_mgr.bdev_io_pool);
+	ctx->stats.bdev_io_size = sizeof(struct spdk_bdev_io) + bdev_module_get_max_ctx_size();
+	ctx->cb(&ctx->stats, ctx->cb_arg);
+	free(ctx);
+}
+
+void
+bdev_get_io_pool_stats(bool reset_max, bdev_io_pool_stats_cb cb, void *cb_arg)
+{
+	struct bdev_io_pool_stats_ctx *ctx = calloc(1, sizeof(*ctx));
+
+	if (ctx == NULL) {
+		cb(NULL, cb_arg);
+		return;
+	}
+	ctx->reset_max = reset_max;
+	ctx->cb = cb;
+	ctx->cb_arg = cb_arg;
+	spdk_for_each_channel(&g_bdev_mgr, bdev_io_pool_stats_channel, ctx,
+			      bdev_io_pool_stats_done);
 }
 
 static bool

@@ -20,6 +20,7 @@
 #include "spdk/uuid.h"
 
 #include "spdk_internal/assert.h"
+#include "spdk_internal/iobuf_chain.h"
 #include "spdk/log.h"
 
 #include "blobstore.h"
@@ -2414,6 +2415,10 @@ struct spdk_blob_persist_ctx {
 	spdk_bs_sequence_cpl	bit_cb_fn_persist;
 
 	bool			home_barrier;
+	/* home_barrier satisfied by writing this persist's pages straight to
+	 * their HOME LBAs as well (first persist of a new blob); cleared as soon
+	 * as one page cannot be written through, see blob_persist_start(). */
+	bool			home_direct;
 
 	spdk_bs_sequence_t		*seq;
 	spdk_bs_sequence_cpl		cb_fn;
@@ -2520,7 +2525,9 @@ blob_persist_complete_cb(void *arg)
 	uint64_t target_seq;
 	int rc;
 
-	if (ctx->rc == 0 && ctx->home_barrier && jr != NULL) {
+	/* home_direct: every page of this persist already reached HOME through
+	 * the write-through in the persist itself; no global barrier needed. */
+	if (ctx->rc == 0 && ctx->home_barrier && !ctx->home_direct && jr != NULL) {
 		target_seq = bs_md_journal_next_seq_num(ctx->blob->bs->md_journal);
 		if (target_seq == 0) {
 			blob_persist_barrier_cpl(ctx->seq, ctx, ctx->rc);
@@ -3075,6 +3082,26 @@ persist_bs_write_used_blobids(spdk_bs_sequence_t *seq, void *arg, int bserrno)
 	bs_sequence_write_dev(seq, ctx->bit_page, lba, bs_byte_to_lba(bs, SPDK_BS_PAGE_SIZE), cb_fn, arg);
 }
 
+/* Journal write of the root page done: write the same buffer to its HOME LBA
+ * when this persist writes through (see blob_persist_start()). */
+static void
+blob_persist_page_root_home(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct spdk_blob_persist_ctx	*ctx = cb_arg;
+	struct spdk_blob		*blob = ctx->blob;
+	struct spdk_blob_store		*bs = blob->bs;
+
+	if (bserrno != 0 || !ctx->home_direct) {
+		persist_bs_write_used_blobids(seq, ctx, bserrno);
+		return;
+	}
+
+	bs->w_io++;
+	bs_sequence_write_dev(seq, &ctx->pages[0], bs_md_page_to_lba(bs, bs_blobid_to_page(blob->id)),
+			      bs_byte_to_lba(bs, sizeof(ctx->pages[0])),
+			      persist_bs_write_used_blobids, ctx);
+}
+
 static void
 blob_persist_write_page_root(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
@@ -3106,13 +3133,43 @@ blob_persist_write_page_root(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	bs->w_io++;
 
 	if (bs->md_journal) {
+		if (ctx->home_direct && bs_md_journal_home_pending(bs->md_journal, lba)) {
+			/* an older entry for this LBA is still to be homed: barrier instead */
+			ctx->home_direct = false;
+		}
 		bs_md_journal_write(bs->md_journal, seq, page, lba, lba_count,
-			      persist_bs_write_used_blobids, ctx, MD_JOURNAL_WRITE);
+			      blob_persist_page_root_home, ctx, MD_JOURNAL_WRITE);
 		return;
 	}
 
 	bs_sequence_write_dev(seq, page, lba, lba_count,
 			      persist_bs_write_used_blobids, ctx);
+}
+
+/* Journal batch of the chain pages (pages[1..]) done: write the same buffers
+ * to their HOME LBAs when this persist writes through (blob_persist_start()),
+ * then continue with the root page. */
+static void
+blob_persist_page_chain_home(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct spdk_blob_persist_ctx	*ctx = cb_arg;
+	struct spdk_blob		*blob = ctx->blob;
+	struct spdk_blob_store		*bs = blob->bs;
+	spdk_bs_batch_t			*batch;
+	size_t				i;
+
+	if (bserrno != 0 || !ctx->home_direct) {
+		blob_persist_write_page_root(seq, ctx, bserrno);
+		return;
+	}
+
+	batch = bs_sequence_to_batch(seq, 0, blob_persist_write_page_root, ctx);
+	for (i = 1; i < blob->active.num_pages; i++) {
+		bs->w_io++;
+		bs_batch_write_dev(batch, &ctx->pages[i], bs_md_page_to_lba(bs, blob->active.pages[i]),
+				   bs_byte_to_lba(bs, sizeof(ctx->pages[i])));
+	}
+	bs_batch_close(batch);
 }
 
 static void
@@ -3139,7 +3196,16 @@ blob_persist_write_page_chain(spdk_bs_sequence_t *seq, struct spdk_blob_persist_
 			return;
 		}
 
-		jr_batch = bs_md_journal_sequence_to_batch(bs->md_journal, seq, blob->active.num_pages - 1, blob_persist_write_page_root, ctx);
+		/* Write-through (blob_persist_start()): every chain page must be
+		 * free of older un-homed entries, else the barrier is kept. */
+		for (i = 1; ctx->home_direct && i < blob->active.num_pages; i++) {
+			if (bs_md_journal_home_pending(bs->md_journal,
+						       bs_md_page_to_lba(bs, blob->active.pages[i]))) {
+				ctx->home_direct = false;
+			}
+		}
+
+		jr_batch = bs_md_journal_sequence_to_batch(bs->md_journal, seq, blob->active.num_pages - 1, blob_persist_page_chain_home, ctx);
 		if (jr_batch == NULL) {
 			blob_persist_write_page_root(seq, ctx, -ENOMEM);
 			return;
@@ -3465,6 +3531,30 @@ blob_persist_generate_new_md(struct spdk_blob_persist_ctx *ctx)
 	blob_persist_write_page_chain(seq, ctx);
 }
 
+static void blob_persist_write_extent_pages(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno);
+
+/* Journal write of an extent page done: write the same buffer to its HOME
+ * LBA when this persist writes through (see blob_persist_start()). */
+static void
+blob_persist_extent_page_home(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct spdk_blob_persist_ctx	*ctx = cb_arg;
+	struct spdk_blob		*blob = ctx->blob;
+	uint32_t			extent_page_id;
+
+	if (bserrno != 0 || !ctx->home_direct) {
+		blob_persist_write_extent_pages(seq, ctx, bserrno);
+		return;
+	}
+
+	assert(ctx->next_extent_page > 0);
+	extent_page_id = blob->active.extent_pages[ctx->next_extent_page - 1];
+	blob->bs->w_io++;
+	bs_sequence_write_dev(seq, ctx->extent_page, bs_md_page_to_lba(blob->bs, extent_page_id),
+			      bs_byte_to_lba(blob->bs, SPDK_BS_PAGE_SIZE),
+			      blob_persist_write_extent_pages, ctx);
+}
+
 static void
 blob_persist_write_extent_pages(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
@@ -3510,9 +3600,15 @@ blob_persist_write_extent_pages(spdk_bs_sequence_t *seq, void *cb_arg, int bserr
 		}
 		blob->bs->w_io++;
 		if (blob->bs->md_journal) {
+			if (ctx->home_direct &&
+			    bs_md_journal_home_pending(blob->bs->md_journal,
+						       bs_md_page_to_lba(blob->bs, extent_page_id))) {
+				/* an older entry for this LBA is still to be homed: barrier instead */
+				ctx->home_direct = false;
+			}
 			bs_md_journal_write(blob->bs->md_journal, seq, ctx->extent_page, bs_md_page_to_lba(blob->bs, extent_page_id),
 				      bs_byte_to_lba(blob->bs, SPDK_BS_PAGE_SIZE),
-				      blob_persist_write_extent_pages, ctx, MD_JOURNAL_WRITE);
+				      blob_persist_extent_page_home, ctx, MD_JOURNAL_WRITE);
 			return;
 		}
 
@@ -3545,6 +3641,35 @@ blob_persist_start(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		return;
 
 	}
+
+	/*
+	 * HOME write-through for the first persist of a blob (clean.num_pages
+	 * == 0: nothing of it was ever on disk). Such a persist writes only
+	 * pages it claims itself: the root page at the blobid's slot, fresh
+	 * chain pages and this blob's extent pages. After each page's journal
+	 * write, the same buffer is written to the page's HOME LBA in the same
+	 * sequence, and the persist completes without the global barrier
+	 * (md_journal_confirm_home_drain) that otherwise waits for every
+	 * blob's pending entries. Readers of HOME that must see the new blob
+	 * -- the leader reopening it (blob_load) and a secondary's
+	 * bdev_lvol_register (spdk_lvs_update_live -> bs_update_replay_blobid:
+	 * the page chain and extent pages; the super block it reads only for
+	 * layout, and the used_blobids mask page is written straight to HOME
+	 * by persist_bs_write_used_blobids already) -- are satisfied.
+	 *
+	 * Safe against the ordered drain: when it later homes the same entry
+	 * it rewrites identical content, and no entry newer than ours for
+	 * these LBAs exists until this persist completes (persists of one blob
+	 * are serialized). The hazard is an OLDER entry for the same LBA still
+	 * waiting to be homed (the page was freed by a deleted blob whose zero
+	 * entry has not drained yet): the drain would overwrite our copy with
+	 * it. bs_md_journal_home_pending() is checked per page before the
+	 * journal write; on a hit the write-through is dropped for this
+	 * persist and the barrier is kept. Re-persists (clean.num_pages > 0)
+	 * always use the barrier.
+	 */
+	ctx->home_direct = ctx->home_barrier && blob->clean.num_pages == 0 &&
+			   bs_md_journal_home_direct_ok(blob->bs->md_journal);
 
 	if (blob->clean.num_clusters < blob->active.num_clusters) {
 		/* Blob was resized up */
@@ -4686,6 +4811,12 @@ blob_dirty_mark_io_units(struct spdk_blob *blob, uint64_t offset, uint64_t lengt
 	blob_dirty_mark(gen, offset * blob->bs->io_unit_size, length * blob->bs->io_unit_size);
 }
 
+bool
+spdk_blob_locked_operation_in_progress(const struct spdk_blob *blob)
+{
+	return blob != NULL && blob->locked_operation_in_progress;
+}
+
 struct blob_dirty_gen *
 spdk_blob_get_dirty_gen(struct spdk_blob *blob)
 {
@@ -4791,16 +4922,28 @@ blob_dirty_gen_reparent(struct spdk_blob *blob, spdk_blob_id new_parent)
 /* START spdk_blob_merge_base */
 
 #define BLOB_MERGE_QD		64
-#define BLOB_MERGE_CHUNK	(512 * 1024)
+/*
+ * One piece: one read of the base and one write of the blob, in a chain of
+ * iobuf small-pool buffers (8 x 8 KiB by default). At most BLOB_MERGE_QD
+ * pieces are in flight: 64 x 64 KiB = 4 MiB of buffers per merge, from the
+ * preallocated small pool -- never from the DMA heap, which the I/O path
+ * fragments (bed bf18 2026-11-09: 64 x 512 KiB spdk_malloc failed there).
+ */
+#define BLOB_MERGE_CHUNK	(64 * 1024)
+#define BLOB_MERGE_IOBUF_MODULE	"blob_merge"
+/* While a piece waits for buffers: look this often for buffers that other
+ * threads returned to the pool (they wake only waiters of their own thread). */
+#define BLOB_MERGE_KICK_US	1000
 
 struct blob_merge_ctx;
 
 struct blob_merge_op {
-	struct blob_merge_ctx	*ctx;
-	void			*buf;		/* NULL: the base is zeroes */
-	uint64_t		offset;		/* io units */
-	uint64_t		length;		/* io units */
-	bool			busy;
+	struct blob_merge_ctx		*ctx;
+	struct spdk_iobuf_chain		chain;		/* the piece's data (not with no parent) */
+	uint64_t			offset;		/* io units */
+	uint64_t			length;		/* io units */
+	bool				busy;
+	TAILQ_ENTRY(blob_merge_op)	ready_link;
 };
 
 struct blob_merge_ctx {
@@ -4825,10 +4968,61 @@ struct blob_merge_ctx {
 	bool				repump;
 	struct spdk_blob_merge_stats	stats;
 	int				priority_class;	/* of every read and write, or -1 */
+	/* buffers: the blobstore's merge iobuf channel (iobuf_ref), and the
+	 * pieces that got theirs after waiting, to be submitted by
+	 * blob_merge_run_ready (run_pending: it is scheduled or running) */
+	bool				iobuf_ref;
+	struct spdk_iobuf_chain_queue	bufq;
+	TAILQ_HEAD(, blob_merge_op)	readyq;
+	bool				run_pending;
+	struct spdk_poller		*kick_poller;
 	struct blob_merge_op		ops[BLOB_MERGE_QD];
 	spdk_blob_merge_complete	cb_fn;
 	void				*cb_arg;
 };
+
+/*
+ * The merges of a blobstore share one iobuf channel on the md thread (a thread
+ * has at most IOBUF_MAX_CHANNELS). No cache: a merge takes the pool's buffers
+ * as it goes and returns each piece's at once.
+ */
+static int
+bs_merge_iobuf_get(struct spdk_blob_store *bs)
+{
+	int rc;
+
+	if (bs->merge_iobuf_refs > 0) {
+		bs->merge_iobuf_refs++;
+		return 0;
+	}
+	rc = spdk_iobuf_register_module(BLOB_MERGE_IOBUF_MODULE);
+	if (rc != 0 && rc != -EEXIST) {
+		return rc;
+	}
+	bs->merge_iobuf = calloc(1, sizeof(*bs->merge_iobuf));
+	if (bs->merge_iobuf == NULL) {
+		return -ENOMEM;
+	}
+	rc = spdk_iobuf_channel_init(bs->merge_iobuf, BLOB_MERGE_IOBUF_MODULE, 0, 0);
+	if (rc != 0) {
+		free(bs->merge_iobuf);
+		bs->merge_iobuf = NULL;
+		return rc;
+	}
+	bs->merge_iobuf_refs = 1;
+	return 0;
+}
+
+static void
+bs_merge_iobuf_put(struct spdk_blob_store *bs)
+{
+	assert(bs->merge_iobuf_refs > 0);
+	if (--bs->merge_iobuf_refs == 0) {
+		spdk_iobuf_channel_fini(bs->merge_iobuf);
+		free(bs->merge_iobuf);
+		bs->merge_iobuf = NULL;
+	}
+}
 
 /* Next allocated cluster with blocks that were not written. */
 static bool
@@ -4894,6 +5088,7 @@ blob_merge_finish(struct blob_merge_ctx *ctx)
 {
 	struct spdk_blob *blob = ctx->blob;
 
+	assert(TAILQ_EMPTY(&ctx->readyq));
 	blob->dirty_gen = ctx->gen;
 	blob->dirty_merging = false;
 	if (ctx->rc == 0) {
@@ -4902,10 +5097,18 @@ blob_merge_finish(struct blob_merge_ctx *ctx)
 	SPDK_NOTICELOG("blob 0x%" PRIx64 ": merged with the base: %" PRIu64 " cluster(s), %" PRIu64
 		       " range(s), %" PRIu64 " bytes, rc %d\n", blob->id, ctx->stats.clusters,
 		       ctx->stats.ranges, ctx->stats.bytes, ctx->rc);
-	spdk_bs_free_io_channel(ctx->ch);
-	for (int i = 0; i < BLOB_MERGE_QD; i++) {
-		spdk_free(ctx->ops[i].buf);
+	if (ctx->bufq.waits != 0) {
+		SPDK_NOTICELOG("blob 0x%" PRIx64 ": merge waited for iobuf small-pool buffers %" PRIu64
+			       " time(s)\n", blob->id, ctx->bufq.waits);
 	}
+	spdk_poller_unregister(&ctx->kick_poller);
+	for (int i = 0; i < BLOB_MERGE_QD; i++) {
+		spdk_iobuf_chain_put(&ctx->ops[i].chain);
+	}
+	if (ctx->iobuf_ref) {
+		bs_merge_iobuf_put(blob->bs);
+	}
+	spdk_bs_free_io_channel(ctx->ch);
 	free(ctx->ranges);
 	free(ctx->words);
 	ctx->cb_fn(ctx->cb_arg, &ctx->stats, ctx->rc);
@@ -4922,6 +5125,9 @@ blob_merge_op_done(struct blob_merge_op *op, int bserrno)
 			    ctx->blob->id, op->offset, op->length, bserrno);
 		ctx->rc = bserrno;
 	}
+	/* the buffers go back at once: to a piece waiting for them, of this
+	 * merge or another user of the md thread, else to the pool */
+	spdk_iobuf_chain_put(&op->chain);
 	op->busy = false;
 	ctx->inflight--;
 	blob_merge_pump(ctx);
@@ -4943,8 +5149,80 @@ blob_merge_read_cpl(void *cb_arg, int bserrno)
 		blob_merge_op_done(op, bserrno);
 		return;
 	}
-	spdk_blob_io_write_with_priority(ctx->blob, ctx->ch, op->buf, op->offset, op->length,
-				 ctx->priority_class, blob_merge_write_cpl, op);
+	spdk_blob_io_writev_with_priority(ctx->blob, ctx->ch, op->chain.iovs, (int)op->chain.needed,
+					  op->offset, op->length, ctx->priority_class,
+					  blob_merge_write_cpl, op);
+}
+
+/* A piece has its buffers: read it from the base. */
+static void
+blob_merge_submit(struct blob_merge_op *op)
+{
+	struct blob_merge_ctx *ctx = op->ctx;
+
+	if (ctx->rc != 0) {
+		/* the merge failed while it waited */
+		blob_merge_op_done(op, 0);
+		return;
+	}
+	spdk_blob_io_readv_with_priority(ctx->parent, ctx->ch, op->chain.iovs, (int)op->chain.needed,
+					 op->offset, op->length, ctx->priority_class,
+					 blob_merge_read_cpl, op);
+}
+
+/* Submit the pieces that got their buffers after waiting. */
+static void
+blob_merge_run_ready(void *arg)
+{
+	struct blob_merge_ctx *ctx = arg;
+	struct blob_merge_op *op;
+
+	/* run_pending stays set while the loop runs: a piece that completes
+	 * inside it must not finish the merge under the loop */
+	ctx->run_pending = true;
+	while ((op = TAILQ_FIRST(&ctx->readyq)) != NULL) {
+		TAILQ_REMOVE(&ctx->readyq, op, ready_link);
+		blob_merge_submit(op);
+	}
+	ctx->run_pending = false;
+	if (ctx->inflight == 0) {
+		blob_merge_pump(ctx);
+	}
+}
+
+/* ready_fn of the merge's buffer queue: runs inside another piece's buffer
+ * return (or a kick), so the piece is only noted here and submitted from a
+ * message. */
+static void
+blob_merge_bufs_ready(struct spdk_iobuf_chain *chain)
+{
+	struct blob_merge_op *op = SPDK_CONTAINEROF(chain, struct blob_merge_op, chain);
+	struct blob_merge_ctx *ctx = op->ctx;
+
+	TAILQ_INSERT_TAIL(&ctx->readyq, op, ready_link);
+	if (!ctx->run_pending) {
+		if (spdk_thread_send_msg(spdk_get_thread(), blob_merge_run_ready, ctx) == 0) {
+			ctx->run_pending = true;
+		}
+		/* else blob_merge_kick runs it */
+	}
+}
+
+static int
+blob_merge_kick(void *arg)
+{
+	struct blob_merge_ctx *ctx = arg;
+
+	if (!ctx->run_pending && !TAILQ_EMPTY(&ctx->readyq)) {
+		/* may finish the merge, and unregister this poller */
+		blob_merge_run_ready(ctx);
+		return SPDK_POLLER_BUSY;
+	}
+	if (spdk_iobuf_chain_queue_idle(&ctx->bufq)) {
+		return SPDK_POLLER_IDLE;
+	}
+	spdk_iobuf_chain_kick(&ctx->bufq);
+	return SPDK_POLLER_BUSY;
 }
 
 static void
@@ -4960,7 +5238,7 @@ blob_merge_pump(struct blob_merge_ctx *ctx)
 		blob_merge_issue(ctx);
 	} while (ctx->repump);
 	ctx->pumping = false;
-	if (ctx->inflight == 0) {
+	if (ctx->inflight == 0 && !ctx->run_pending) {
 		blob_merge_finish(ctx);
 	}
 }
@@ -4968,7 +5246,9 @@ blob_merge_pump(struct blob_merge_ctx *ctx)
 static void
 blob_merge_issue(struct blob_merge_ctx *ctx)
 {
-	for (int i = 0; i < BLOB_MERGE_QD && ctx->rc == 0; i++) {
+	int rc;
+
+	for (uint32_t i = 0; i < BLOB_MERGE_QD && ctx->rc == 0; i++) {
 		struct blob_merge_op *op = &ctx->ops[i];
 
 		if (op->busy) {
@@ -4982,12 +5262,17 @@ blob_merge_issue(struct blob_merge_ctx *ctx)
 		if (ctx->parent == NULL) {
 			/* no parent: the base reads zeroes, and a fresh cluster need not */
 			spdk_blob_io_write_zeroes_with_priority(ctx->blob, ctx->ch, op->offset, op->length,
-						ctx->priority_class, blob_merge_write_cpl, op);
-		} else {
-			spdk_blob_io_read_with_priority(ctx->parent, ctx->ch, op->buf, op->offset,
-					op->length, ctx->priority_class,
-					blob_merge_read_cpl, op);
+								ctx->priority_class, blob_merge_write_cpl, op);
+			continue;
 		}
+		rc = spdk_iobuf_chain_get(&ctx->bufq, &op->chain,
+					  op->length * ctx->blob->bs->io_unit_size);
+		if (rc == 0) {
+			blob_merge_submit(op);
+		} else if (rc < 0) {
+			blob_merge_op_done(op, rc);
+		}
+		/* else it waits for buffers: blob_merge_bufs_ready */
 	}
 }
 
@@ -5006,6 +5291,7 @@ spdk_blob_merge_base_ext(struct spdk_blob *blob, int priority_class,
 	struct spdk_blob_merge_stats none = {};
 	struct blob_dirty_gen *gen = blob->dirty_gen;
 	struct spdk_blob *parent = NULL;
+	int rc;
 
 	if (priority_class > MAX_PRIORITY_CLASS) {
 		cb_fn(cb_arg, &none, -EINVAL);
@@ -5059,30 +5345,50 @@ spdk_blob_merge_base_ext(struct spdk_blob *blob, int priority_class,
 	ctx->words = calloc(ctx->nwords, sizeof(*ctx->words));
 	ctx->ranges = calloc(ctx->nbits / 2 + 1, sizeof(*ctx->ranges));
 	ctx->ch = spdk_bs_alloc_io_channel(bs);
+	TAILQ_INIT(&ctx->readyq);
 	for (int i = 0; i < BLOB_MERGE_QD; i++) {
 		ctx->ops[i].ctx = ctx;
-		if (parent != NULL) {
-			ctx->ops[i].buf = spdk_malloc(BLOB_MERGE_CHUNK, 0x1000, NULL,
-						      SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
-			if (ctx->ops[i].buf == NULL) {
+	}
+	if (ctx->words == NULL || ctx->ranges == NULL || ctx->ch == NULL) {
+		if (ctx->ch == NULL) {
+			SPDK_ERRLOG("blob 0x%" PRIx64 ": merge with the base: no I/O channel\n", blob->id);
+		}
+		ctx->rc = -ENOMEM;
+	}
+	if (ctx->rc == 0 && parent != NULL) {
+		/*
+		 * The pieces' buffers come from the iobuf small pool, as chains.
+		 * A piece that finds the pool empty waits for buffers (the merge
+		 * slows down); the merge no longer fails or shrinks for want of
+		 * memory, which a fragmented DMA heap made it do.
+		 */
+		rc = bs_merge_iobuf_get(bs);
+		if (rc != 0) {
+			SPDK_ERRLOG("blob 0x%" PRIx64 ": merge with the base: no iobuf channel: %d\n",
+				    blob->id, rc);
+			ctx->rc = rc;
+		} else {
+			ctx->iobuf_ref = true;
+			spdk_iobuf_chain_queue_init(&ctx->bufq, bs->merge_iobuf, blob_merge_bufs_ready);
+			ctx->kick_poller = SPDK_POLLER_REGISTER(blob_merge_kick, ctx, BLOB_MERGE_KICK_US);
+			if (ctx->kick_poller == NULL) {
+				SPDK_ERRLOG("blob 0x%" PRIx64 ": merge with the base: no poller\n", blob->id);
 				ctx->rc = -ENOMEM;
 			}
 		}
 	}
-	if (ctx->words == NULL || ctx->ranges == NULL || ctx->ch == NULL) {
-		ctx->rc = -ENOMEM;
-	}
 	if (ctx->rc != 0) {
-		for (int i = 0; i < BLOB_MERGE_QD; i++) {
-			spdk_free(ctx->ops[i].buf);
+		rc = ctx->rc;
+		if (ctx->iobuf_ref) {
+			bs_merge_iobuf_put(bs);
 		}
 		free(ctx->ranges);
 		free(ctx->words);
 		if (ctx->ch != NULL) {
 			spdk_bs_free_io_channel(ctx->ch);
 		}
-		cb_fn(cb_arg, &none, ctx->rc);
 		free(ctx);
+		cb_fn(cb_arg, &none, rc);
 		return;
 	}
 
@@ -5386,8 +5692,14 @@ struct rw_iov_ctx {
 	uint64_t io_units_remaining;
 	uint64_t io_units_done;
 	struct spdk_blob_ext_io_opts *ext_io_opts;
+	int priority_class;
 	struct iovec iov[0];
 };
+
+static void blob_request_submit_rw_iov(struct spdk_blob *blob, struct spdk_io_channel *_channel,
+				       struct iovec *iov, int iovcnt, uint64_t offset, uint64_t length,
+				       spdk_blob_op_complete cb_fn, void *cb_arg, bool read,
+				       struct spdk_blob_ext_io_opts *ext_io_opts, int priority_class);
 
 static void
 rw_iov_done(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
@@ -5458,20 +5770,16 @@ rw_iov_split_next(void *cb_arg, int bserrno)
 	ctx->io_units_done += io_units_count;
 	iov = &ctx->iov[0];
 
-	if (ctx->read) {
-		spdk_blob_io_readv_ext(ctx->blob, ctx->channel, iov, iovcnt, io_unit_offset,
-				       io_units_count, rw_iov_split_next, ctx, ctx->ext_io_opts);
-	} else {
-		spdk_blob_io_writev_ext(ctx->blob, ctx->channel, iov, iovcnt, io_unit_offset,
-					io_units_count, rw_iov_split_next, ctx, ctx->ext_io_opts);
-	}
+	blob_request_submit_rw_iov(ctx->blob, ctx->channel, iov, iovcnt, io_unit_offset,
+				   io_units_count, rw_iov_split_next, ctx, ctx->read, ctx->ext_io_opts,
+				   ctx->priority_class);
 }
 
 static void
 blob_request_submit_rw_iov(struct spdk_blob *blob, struct spdk_io_channel *_channel,
 			   struct iovec *iov, int iovcnt,
 			   uint64_t offset, uint64_t length, spdk_blob_op_complete cb_fn, void *cb_arg, bool read,
-			   struct spdk_blob_ext_io_opts *ext_io_opts)
+			   struct spdk_blob_ext_io_opts *ext_io_opts, int priority_class)
 {
 	struct spdk_bs_cpl	cpl;
 
@@ -5566,6 +5874,10 @@ blob_request_submit_rw_iov(struct spdk_blob *blob, struct spdk_io_channel *_chan
 			}
 
 			seq->ext_io_opts = ext_io_opts;
+			if (priority_class >= 0) {
+				/* only this read, as in blob_request_submit_op_single */
+				seq->priority_class = priority_class;
+			}
 
 			if (is_allocated) {
 				bs_sequence_readv_dev(seq, iov, iovcnt, lba, lba_count, rw_iov_done, NULL);
@@ -5585,6 +5897,11 @@ blob_request_submit_rw_iov(struct spdk_blob *blob, struct spdk_io_channel *_chan
 				}
 
 				seq->ext_io_opts = ext_io_opts;
+				if (priority_class >= 0) {
+					/* only this write; one that allocates its
+					 * cluster first runs in the blob's class */
+					seq->priority_class = priority_class;
+				}
 
 				blob_dirty_mark_io_units(blob, offset, length);
 				bs_sequence_writev_dev(seq, iov, iovcnt, lba, lba_count, rw_iov_done, NULL);
@@ -5626,6 +5943,7 @@ blob_request_submit_rw_iov(struct spdk_blob *blob, struct spdk_io_channel *_chan
 		ctx->io_units_remaining = length;
 		ctx->io_units_done = 0;
 		ctx->ext_io_opts = ext_io_opts;
+		ctx->priority_class = priority_class;
 
 		rw_iov_split_next(ctx, 0);
 	}
@@ -12275,8 +12593,13 @@ spdk_bs_chain_snapshot_clone(struct spdk_blob *origblob, struct spdk_blob *clone
 		cb_fn(cb_arg, 0);
 		return;
 	} else {
-		/* sync clone metadata */
-		spdk_blob_sync_md(clone, true, spdk_bs_convert_blob_cb, ctx);
+		/* Sync the clone's metadata journal-durable only (no HOME barrier).
+		 * Nothing reads this blob's pages from their HOME LBAs after the
+		 * chain RPC returns: the non-leader members apply the chain
+		 * in-memory (the !leader branch above), a failover replays the
+		 * journal before any page is read, and set_parent / delete already
+		 * persist the same kind of change with md_drain=false. */
+		spdk_blob_sync_md(clone, false, spdk_bs_convert_blob_cb, ctx);
 		return;
 	}
 }
@@ -13283,6 +13606,8 @@ clone_update_delete_sync_cpl(void *cb_arg, int lvolerrno)
 	clone->state = SPDK_BLOB_STATE_CLEAN;
 	if (lvolerrno < 0) {
 		SPDK_ERRLOG("Could not update clone blob for sync lvol delete blobid 0x%" PRIx64 " \n", clone->id);
+		/* ctx was leaked here */
+		free(ctx);
 		return;
 	}
 	SPDK_NOTICELOG("update clone blob for async lvol delete blobid 0x%" PRIx64 " done.\n", clone->id);
@@ -13343,7 +13668,12 @@ clone_update_delete_sync_cpl(void *cb_arg, int lvolerrno)
 		new_parent_entry->clone_count++;
 
 		parentblob = blob_lookup(clone->bs, new_parent_entry->id);
-		if (parentblob && parentblob->open_ref != snapshot_entry->clone_count + 1 ) {
+		/* snapshot_entry (the OLD parent's) is NULL when the clone had no
+		 * parent before (ctx->parent_id invalid): do not dereference it.
+		 * Whether the old parent's count is the right one here at all is
+		 * left to the owner (the branch above uses the new parent's). */
+		if (parentblob && snapshot_entry &&
+		    parentblob->open_ref != snapshot_entry->clone_count + 1) {
 			parentblob->open_ref = snapshot_entry->clone_count + 1;
 		}
 
@@ -15806,7 +16136,8 @@ spdk_blob_io_writev(struct spdk_blob *blob, struct spdk_io_channel *channel,
 		    struct iovec *iov, int iovcnt, uint64_t offset, uint64_t length,
 		    spdk_blob_op_complete cb_fn, void *cb_arg)
 {
-	blob_request_submit_rw_iov(blob, channel, iov, iovcnt, offset, length, cb_fn, cb_arg, false, NULL);
+	blob_request_submit_rw_iov(blob, channel, iov, iovcnt, offset, length, cb_fn, cb_arg, false, NULL,
+				   -1);
 }
 
 void
@@ -15814,7 +16145,34 @@ spdk_blob_io_readv(struct spdk_blob *blob, struct spdk_io_channel *channel,
 		   struct iovec *iov, int iovcnt, uint64_t offset, uint64_t length,
 		   spdk_blob_op_complete cb_fn, void *cb_arg)
 {
-	blob_request_submit_rw_iov(blob, channel, iov, iovcnt, offset, length, cb_fn, cb_arg, true, NULL);
+	blob_request_submit_rw_iov(blob, channel, iov, iovcnt, offset, length, cb_fn, cb_arg, true, NULL,
+				   -1);
+}
+
+void
+spdk_blob_io_readv_with_priority(struct spdk_blob *blob, struct spdk_io_channel *channel,
+				 struct iovec *iov, int iovcnt, uint64_t offset, uint64_t length,
+				 int priority_class, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	if (priority_class > MAX_PRIORITY_CLASS) {
+		cb_fn(cb_arg, -EINVAL);
+		return;
+	}
+	blob_request_submit_rw_iov(blob, channel, iov, iovcnt, offset, length, cb_fn, cb_arg, true, NULL,
+				   priority_class);
+}
+
+void
+spdk_blob_io_writev_with_priority(struct spdk_blob *blob, struct spdk_io_channel *channel,
+				  struct iovec *iov, int iovcnt, uint64_t offset, uint64_t length,
+				  int priority_class, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	if (priority_class > MAX_PRIORITY_CLASS) {
+		cb_fn(cb_arg, -EINVAL);
+		return;
+	}
+	blob_request_submit_rw_iov(blob, channel, iov, iovcnt, offset, length, cb_fn, cb_arg, false, NULL,
+				   priority_class);
 }
 
 void
@@ -15823,7 +16181,7 @@ spdk_blob_io_writev_ext(struct spdk_blob *blob, struct spdk_io_channel *channel,
 			spdk_blob_op_complete cb_fn, void *cb_arg, struct spdk_blob_ext_io_opts *io_opts)
 {
 	blob_request_submit_rw_iov(blob, channel, iov, iovcnt, offset, length, cb_fn, cb_arg, false,
-				   io_opts);
+				   io_opts, -1);
 }
 
 void
@@ -15847,7 +16205,7 @@ spdk_blob_io_readv_ext(struct spdk_blob *blob, struct spdk_io_channel *channel,
 		       spdk_blob_op_complete cb_fn, void *cb_arg, struct spdk_blob_ext_io_opts *io_opts)
 {
 	blob_request_submit_rw_iov(blob, channel, iov, iovcnt, offset, length, cb_fn, cb_arg, true,
-				   io_opts);
+				   io_opts, -1);
 }
 
 struct spdk_bs_iter_ctx {

@@ -12,6 +12,7 @@
 #include "spdk/queue.h"
 #include "spdk/tree.h"
 #include "spdk/uuid.h"
+#include "spdk_internal/iobuf_chain.h"
 
 /* Default size of blobstore cluster */
 #define SPDK_LVS_OPTS_CLUSTER_SZ (4 * 1024 * 1024)
@@ -215,6 +216,15 @@ struct spdk_lvs_poll_group {
 	int id;
 	TAILQ_ENTRY(spdk_lvs_poll_group) entry;
 	TAILQ_HEAD(, remote_dev_info)	ch_tdev;	
+	/* Replication request buffers: iobuf small-pool chains taken on this
+	 * thread (lib/lvol/lvol.c, xfer_req_start). buf_readyq: requests that
+	 * got their buffers after waiting, submitted by a message
+	 * (buf_run_pending). */
+	bool				iobuf_ok;
+	struct spdk_iobuf_channel	iobuf;
+	struct spdk_iobuf_chain_queue	bufq;
+	TAILQ_HEAD(, spdk_lvs_xfer_req)	buf_readyq;
+	bool				buf_run_pending;
 };
 
 
@@ -255,6 +265,10 @@ SPDK_STATIC_ASSERT(sizeof(struct spdk_lvol_xfer_cmd_hdr) == 64, "Incorrect size"
 #define SPDK_LVOL_XFER_CMD_MAX_ENTRIES \
 	((SPDK_LVOL_XFER_CMD_SIZE - sizeof(struct spdk_lvol_xfer_cmd_hdr)) / sizeof(uint32_t))
 
+/* iovecs for the remote writes of one replication request: the chain's
+ * buffers plus one per write (XFER_MAX_DATA_RANGES writes at most) */
+#define SPDK_LVS_XFER_FRAG_IOVS	(SPDK_IOBUF_CHAIN_MAX_IOVS + 64)
+
 struct spdk_lvs_xfer_req {
 	enum xfer_req_status status;
 	enum xfer_type   type;
@@ -281,6 +295,15 @@ struct spdk_lvs_xfer_req {
 	struct remote_lvol_info *rmt_lvol;
 	struct spdk_lvs_xfer *xfer;
 	TAILQ_ENTRY(spdk_lvs_xfer_req)	entry;
+	/* Replication: the request's data, a chain of iobuf small-pool buffers
+	 * of the poll group thread that runs it (payload holds only a command
+	 * or the completion signal, copied into the chain). buf_ready: on the
+	 * poll group's buf_readyq. frag_iovs: the remote writes' pieces of the
+	 * chain (at most one more per write than the chain has buffers). */
+	struct spdk_iobuf_chain chain;
+	bool buf_ready;
+	TAILQ_ENTRY(spdk_lvs_xfer_req)	buf_link;
+	struct iovec frag_iovs[SPDK_LVS_XFER_FRAG_IOVS];
 };
 
 struct spdk_lvs_xfer {
@@ -371,8 +394,24 @@ struct spdk_lvs_xfer {
 	 * destination; its first range write CoWs the cluster from the base the
 	 * landing blob is chained to (cheap with copy offload), so no merge. */
 	bool cow_landing;
+	/* Final replication step whose destination is a real clone of the
+	 * snapshot named in snapshot_name (the control plane's cutover clone,
+	 * requested with cow_landing): the destination is already chained, so
+	 * no "transfer_task_completed" signal is written. Without the
+	 * destination's migration_flag that page is not intercepted and would
+	 * land as data on page 0 of the volume. */
+	bool dest_is_clone;
 	struct blob_dirty_gen *dirty_gen;
+	/* dirty_gen's base when it was pinned (final step re-validation) */
+	uint64_t dirty_gen_base;
 	uint8_t *partial;
+	/* Delta bridged over snapshots between the destination's base and the
+	 * generation's base (xfer_bridge_partial_base): bridged[i] marks the
+	 * clusters one of those in-between snapshots owns; they are added to
+	 * clusters[] and sent whole. NULL when the bases match. */
+	uint8_t *bridged;
+	uint32_t bridge_hops;
+	uint64_t bridge_clusters;
 	struct blob_dirty_range *ranges;
 	uint32_t max_ranges;
 	uint32_t num_ranges;

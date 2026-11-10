@@ -18,6 +18,8 @@
 uint8_t *g_dev_buffer;
 uint64_t g_dev_write_bytes;
 uint64_t g_dev_read_bytes;
+/* largest single read the device saw (reset by the tests that check it) */
+uint64_t g_dev_max_read_bytes;
 /* class of the last read the device saw, -1 when it carried no options */
 int g_dev_last_read_priority = -1;
 int g_dev_last_write_priority = -1;
@@ -149,6 +151,7 @@ dev_read(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload
 		if (length > 0) {
 			memcpy(payload, &g_dev_buffer[offset], length);
 			g_dev_read_bytes += length;
+			g_dev_max_read_bytes = spdk_max(g_dev_max_read_bytes, length);
 		}
 	} else {
 		g_power_failure_rc = -EIO;
@@ -227,6 +230,7 @@ dev_readv(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		length = lba_count * dev->blocklen;
 		SPDK_CU_ASSERT_FATAL(offset + length <= DEV_BUFFER_SIZE);
 		__check_iov(iov, iovcnt, length);
+		g_dev_last_read_priority = bs_io_opts ? bs_io_opts->priority : -1;
 
 		for (i = 0; i < iovcnt; i++) {
 			memcpy(iov[i].iov_base, &g_dev_buffer[offset], iov[i].iov_len);
@@ -234,6 +238,7 @@ dev_readv(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		}
 
 		g_dev_read_bytes += length;
+		g_dev_max_read_bytes = spdk_max(g_dev_max_read_bytes, length);
 	} else {
 		g_power_failure_rc = -EIO;
 	}
@@ -279,6 +284,7 @@ dev_writev(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		length = lba_count * dev->blocklen;
 		SPDK_CU_ASSERT_FATAL(offset + length <= DEV_BUFFER_SIZE);
 		__check_iov(iov, iovcnt, length);
+		g_dev_last_write_priority = bs_io_opts ? bs_io_opts->priority : -1;
 
 		for (i = 0; i < iovcnt; i++) {
 			memcpy(&g_dev_buffer[offset], iov[i].iov_base, iov[i].iov_len);

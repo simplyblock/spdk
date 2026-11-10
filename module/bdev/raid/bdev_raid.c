@@ -789,8 +789,12 @@ raid_bdev_io_complete(struct raid_bdev_io *raid_io, enum spdk_bdev_io_status sta
 			}
 		}
 
-		if (status == SPDK_BDEV_IO_STATUS_FAILED) {
-			SPDK_NOTICELOG("FAILED in proccess IO RAID.\n");	
+		/* A failed COPY is the base bdev declining the offload (the distrib
+		 * answers FAILED by design when it cannot copy the range); the
+		 * blobstore then falls back to read + write. Not worth a line per
+		 * IO: 10,900 of them in 10 minutes under CoW load. */
+		if (status == SPDK_BDEV_IO_STATUS_FAILED && bdev_io->type != SPDK_BDEV_IO_TYPE_COPY) {
+			SPDK_NOTICELOG("FAILED in proccess IO RAID.\n");
 		}
 		spdk_bdev_io_complete(bdev_io, status);
 	}

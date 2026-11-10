@@ -387,8 +387,16 @@ struct spdk_transfer_dev *spdk_open_rmt_bdev(const char *name, struct spdk_lvol_
 int spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_batch,
 				enum xfer_type type, struct spdk_transfer_dev *tdev, const char *snapshot_name,
 				uint32_t lvol_id, uint8_t priority_class,
-				bool allow_partial, uint64_t partial_base, bool cow_landing,
+				bool allow_partial, uint64_t partial_base, bool cow_landing, bool dest_clone,
 				spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg);
+
+/**
+ * Dirty share (percent, 0..100) from which a cluster of a partial (dirty-bitmap)
+ * transfer is sent as one whole-cluster request instead of its dirty ranges.
+ * Default 50. Applies to transfers started after the call. -EINVAL above 100.
+ */
+int spdk_lvol_set_xfer_whole_cluster_pct(uint32_t pct);
+uint32_t spdk_lvol_get_xfer_whole_cluster_pct(void);
 typedef void (*spdk_lvol_merge_complete)(void *cb_arg, const struct spdk_blob_merge_stats *stats,
 		int lvolerrno);
 /* Fill a partially replicated landing lvol from its base (spdk_blob_merge_base). */

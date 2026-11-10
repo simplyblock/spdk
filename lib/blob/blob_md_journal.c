@@ -70,6 +70,17 @@ md_journal_can_destroy(struct spdk_bs_md_journal *jr)
 }
 
 static void
+md_journal_free_elem_chunks(struct spdk_bs_md_journal *jr)
+{
+	uint32_t c;
+
+	for (c = 0; c < BS_MD_JOURNAL_NUM_CHUNKS; c++) {
+		spdk_free(jr->elem_dma_chunks[c]);
+		jr->elem_dma_chunks[c] = NULL;
+	}
+}
+
+static void
 md_journal_free(struct spdk_bs_md_journal *jr)
 {
 	struct md_journal_elem *elem;
@@ -103,21 +114,14 @@ md_journal_free(struct spdk_bs_md_journal *jr)
 	if (jr->elems != NULL) {
 		for (i = 0; i < BS_MD_JOURNAL_NUM_ELEMS; i++) {
 			elem = &jr->elems[i];
-
-			if (elem->hdr != NULL) {
-				spdk_free(elem->hdr);
-				elem->hdr = NULL;
-			}
-
-			if (elem->page != NULL) {
-				spdk_free(elem->page);
-				elem->page = NULL;
-			}
+			elem->hdr = NULL;	/* points into elem_dma_chunks */
+			elem->page = NULL;
 		}
 
 		free(jr->elems);
 		jr->elems = NULL;
 	}
+	md_journal_free_elem_chunks(jr);
 
 	free(jr->drain_batch);
 	jr->drain_batch = NULL;
@@ -1285,6 +1289,68 @@ bs_md_journal_next_seq_num(struct spdk_bs_md_journal *jr) {
 	return jr->next_seq;
 }
 
+bool
+bs_md_journal_home_direct_ok(struct spdk_bs_md_journal *jr)
+{
+	/* In examine mode every write already goes straight to HOME; a paused,
+	 * failed or stopping journal rejects the write itself. */
+	return jr != NULL && !jr->examine && !jr->paused && !jr->failed && !jr->stopping;
+}
+
+bool
+bs_md_journal_home_pending(struct spdk_bs_md_journal *jr, uint64_t lba)
+{
+	struct md_journal_elem *elem;
+	struct md_journal_wait_req *req;
+	uint32_t i;
+
+	if (jr == NULL || jr->elems == NULL) {
+		return false;
+	}
+
+	/*
+	 * Admitted entries that have not reached HOME: journal write in
+	 * flight, waiting for sequence order, HOME pending, or in the active
+	 * HOME batch (a skipped element's newer twin is in that batch too).
+	 * ZERO_* elements are already home-durable; a failed journal write is
+	 * never homed.
+	 */
+	for (i = 0; i < BS_MD_JOURNAL_NUM_ELEMS; i++) {
+		elem = &jr->elems[i];
+		switch (elem->state) {
+		case MD_JOURNAL_ELEM_JOURNAL_INFLIGHT:
+		case MD_JOURNAL_ELEM_JOURNAL_DONE:
+		case MD_JOURNAL_ELEM_HOME_PENDING:
+		case MD_JOURNAL_ELEM_HOME_INFLIGHT:
+			if (elem->hdr->target_lba == lba) {
+				return true;
+			}
+			break;
+		default:
+			break;
+		}
+	}
+
+	/* Writes queued for a slot are admitted FIFO, ahead of a write issued now. */
+	TAILQ_FOREACH(req, &jr->wait_queue, link) {
+		if (req->type == MD_JOURNAL_WAIT_SINGLE) {
+			if (req->entry.lba == lba) {
+				return true;
+			}
+		} else if (req->batch != NULL) {
+			for (i = 0; i < req->batch->count; i++) {
+				if (req->batch->entry[i].lba == lba) {
+					return true;
+				}
+			}
+		}
+	}
+
+	return false;
+}
+
+static void md_journal_start_drain_batch(struct spdk_bs_md_journal *jr, bool force);
+
 static void
 spdk_md_journal_batch_drain_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
@@ -1349,6 +1415,20 @@ spdk_md_journal_batch_drain_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserr
 	drain_batch->elem_count = 0;
 	drain_batch->rc = 0;
 	// bs_sequence_finish(seq, 0);
+
+	/*
+	 * Keep HOME draining back-to-back. The poller runs every 1 ms, and
+	 * under copy-on-write load the queue refills faster than one batch
+	 * per tick, so waiting for the next tick left the device idle between
+	 * batches and let HOME barriers (md_drain persists) queue up for
+	 * seconds. Still exactly one batch in flight: it is started here only
+	 * after this one completed. The stopping / sequence-reset / failed /
+	 * paused cases stay with the poller, which owns their ordering.
+	 */
+	if (!jr->stopping && !jr->seq_resetting && !jr->failed && !jr->paused &&
+	    !TAILQ_EMPTY(&jr->home_queue)) {
+		md_journal_start_drain_batch(jr, jr->force_home_drain);
+	}
 }
 
 static int
@@ -1451,11 +1531,20 @@ md_journal_start_drain_batch(struct spdk_bs_md_journal *jr, bool force)
 	/*
 	 * Consume the next consecutive elements from the ordered
 	 * HOME queue.
+	 *
+	 * The small batch bounds the work of an idle-ish journal. When more
+	 * than that is already pending, the queue is behind: take everything
+	 * (the large size) so one batch, not several back-to-back ones, drains
+	 * the backlog. Per-LBA ordering is unaffected: elements stay in
+	 * sequence order and md_journal_mark_latest() still homes only the
+	 * newest entry of an LBA within the batch.
 	 */
-	while (batch->elem_count < max_drain) {
-		elem = TAILQ_FIRST(&jr->home_queue);
-		if (elem == NULL) {
-			break;
+	while ((elem = TAILQ_FIRST(&jr->home_queue)) != NULL) {
+		if (batch->elem_count >= max_drain) {
+			if (max_drain >= BS_MD_JOURNAL_NUM_ELEMS) {
+				break;
+			}
+			max_drain = BS_MD_JOURNAL_NUM_ELEMS;
 		}
 
 		TAILQ_REMOVE(&jr->home_queue, elem, link);
@@ -2020,24 +2109,28 @@ md_journal_init_elements(struct spdk_bs_md_journal *jr)
 	}
 
 	for (i = 0; i < BS_MD_JOURNAL_NUM_ELEMS; i++) {
+		uint32_t c = i / BS_MD_JOURNAL_ELEMS_PER_CHUNK;
+		uint8_t *slot_buf;
+
 		elem = &jr->elems[i];
-		
+
 		elem->journal = jr;
 		elem->slot = i;
 
-		elem->hdr = spdk_zmalloc(BS_MD_JOURNAL_PAGE_SIZE, BS_MD_JOURNAL_PAGE_SIZE,
-            NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
-
-		if (elem->hdr == NULL) {
-			goto error;
+		if (jr->elem_dma_chunks[c] == NULL) {
+			jr->elem_dma_chunks[c] = spdk_zmalloc((size_t)BS_MD_JOURNAL_ELEMS_PER_CHUNK *
+							      BS_MD_JOURNAL_ENTRY_SIZE,
+							      BS_MD_JOURNAL_PAGE_SIZE, NULL,
+							      SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+			if (jr->elem_dma_chunks[c] == NULL) {
+				goto error;
+			}
 		}
-
-		elem->page = spdk_zmalloc(BS_MD_JOURNAL_PAGE_SIZE, BS_MD_JOURNAL_PAGE_SIZE,
-			NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
-
-		if (elem->page == NULL) {
-			goto error;
-		}
+		/* header page then metadata page, adjacent (8 KiB per element) */
+		slot_buf = (uint8_t *)jr->elem_dma_chunks[c] +
+			   (size_t)(i % BS_MD_JOURNAL_ELEMS_PER_CHUNK) * BS_MD_JOURNAL_ENTRY_SIZE;
+		elem->hdr = (struct md_journal_entry_hdr *)slot_buf;
+		elem->page = slot_buf + BS_MD_JOURNAL_PAGE_SIZE;
 
 		elem->journal_iov[0].iov_base = elem->hdr;
 		elem->journal_iov[0].iov_len = BS_MD_JOURNAL_PAGE_SIZE;
@@ -2058,23 +2151,14 @@ md_journal_init_elements(struct spdk_bs_md_journal *jr)
 	return 0;
 
 error:
-	SPDK_ERRLOG("md_journal: cannot allocate DMA buffers for element %u\n", i);
-	for (i = 0; i < BS_MD_JOURNAL_NUM_ELEMS; i++) {
-		elem = &jr->elems[i];
-
-		if (elem->hdr != NULL) {
-			spdk_free(elem->hdr);
-			elem->hdr = NULL;
-		}
-
-		if (elem->page != NULL) {
-			spdk_free(elem->page);
-			elem->page = NULL;
-		}
-	}
-
+	SPDK_ERRLOG("md_journal: cannot allocate a %u KiB DMA chunk for element %u\n",
+		    BS_MD_JOURNAL_ELEMS_PER_CHUNK * BS_MD_JOURNAL_ENTRY_SIZE / 1024, i);
+	/* elements already queued point into the chunks being freed */
+	TAILQ_INIT(&jr->free_queue);
+	jr->free_count = 0;
 	free(jr->elems);
 	jr->elems = NULL;
+	md_journal_free_elem_chunks(jr);
 
 	return -ENOMEM;
 }
@@ -2810,6 +2894,16 @@ bs_md_journal_create(struct spdk_blob_store *bs, uint64_t md_journal_mask_start,
 		md_journal_free(jr);
 		return NULL;
 	}
+	/*
+	 * HOME (and ZERO) writes carry the metadata priority class, not the
+	 * blobstore's default: bs_sequence_start_bs() copies bs->priority_class,
+	 * which is 0 until some blob gets a class (spdk_blob_set_io_priority_class
+	 * then raises it to PREMIUM for "metadata I/O"). The class rides in the
+	 * top LBA bits (blob_bdev.c) and the distrib schedules by it; at class 0
+	 * the drain queued behind client IO and every md_drain persist waited on
+	 * it. bs_sequence_to_batch() keeps the sequence's class for the batch.
+	 */
+	jr->home_seq->priority_class = PREMIUM_PRIORITY_CLASS;
 
 	struct spdk_bs_cpl zero_cpl;
 	zero_cpl.type = SPDK_BS_CPL_TYPE_BLOB_BASIC;
@@ -2822,6 +2916,8 @@ bs_md_journal_create(struct spdk_blob_store *bs, uint64_t md_journal_mask_start,
 		md_journal_free(jr);
 		return NULL;
 	}
+	/* ZERO batches return journal slots; a starved ZERO path stalls admission too. */
+	jr->zero_seq->priority_class = PREMIUM_PRIORITY_CLASS;
 	/*
 	 * For a fresh journal.
 	 *
