@@ -2338,6 +2338,7 @@ struct nvme_active_ns_ctx {
 	uint32_t next_nsid;
 	uint32_t *new_ns_list;
 	nvme_active_ns_ctx_deleter deleter;
+	void *cb_arg;
 
 	enum nvme_active_ns_state state;
 };
@@ -3228,104 +3229,547 @@ nvme_ctrlr_update_namespaces(struct spdk_nvme_ctrlr *ctrlr)
 	}
 }
 
-static int
-nvme_ctrlr_clear_changed_ns_log(struct spdk_nvme_ctrlr *ctrlr)
+/*
+ * Asynchronous event (AEN) processing.
+ *
+ * Namespace Attribute Changed and ANA Change notices need admin commands (Get Log
+ * Page, Identify) before the event is delivered to the user's AER callback. These
+ * used to be issued synchronously, busy-waiting on the admin queue for up to
+ * admin_timeout_ms (or without any timeout for Identify Namespace). A target that
+ * stops responding right after emitting the notice (e.g. a node that is shutting
+ * down) then stalls the polling thread until the transport fails. All of these
+ * commands are therefore issued asynchronously here:
+ *
+ * - At most one event is processed at a time per process (proc->aen_ctx). Further
+ *   events stay queued in proc->async_events until it finished, so that event
+ *   handlers never race on the active namespace list or the ANA log page.
+ * - Every command reads into a buffer owned by the context, and the context is
+ *   released only after its last command completed. Commands aborted by a reset,
+ *   failure or destruct of the controller still complete (with an error status)
+ *   and still copy their payload back, so this never writes into freed memory.
+ * - The user callback is delivered from nvme_ctrlr_complete_queued_async_events(),
+ *   i.e. from the same context as before and never from inside a command
+ *   completion. It is delivered even if the admin commands failed (the user,
+ *   e.g. bdev_nvme, re-reads what it needs), deferred while the controller is
+ *   resetting, and dropped once the controller is being destructed.
+ */
+#define NVME_AEN_BUF_SIZE	4096
+
+SPDK_STATIC_ASSERT(SPDK_NVME_MAX_CHANGED_NAMESPACES * sizeof(uint32_t) <= NVME_AEN_BUF_SIZE,
+		   "AEN buffer too small for changed NS list");
+SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_ns_data) <= NVME_AEN_BUF_SIZE,
+		   "AEN buffer too small for NS data");
+SPDK_STATIC_ASSERT(sizeof(((struct spdk_nvme_ns *)0)->id_desc_list) <= NVME_AEN_BUF_SIZE,
+		   "AEN buffer too small for NS ID descriptor list");
+SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_zns_ns_data) <= NVME_AEN_BUF_SIZE,
+		   "AEN buffer too small for ZNS NS data");
+SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_nvm_ns_data) <= NVME_AEN_BUF_SIZE,
+		   "AEN buffer too small for NVM NS data");
+
+struct nvme_aen_ctx {
+	struct spdk_nvme_ctrlr	*ctrlr;
+	/* The async event completion to deliver to the user. */
+	struct spdk_nvme_cpl	cpl;
+	/* Payload buffer for the changed NS list log page and Identify commands. */
+	void			*buf;
+	/* Private copy of the ANA log page while it is being read. */
+	void			*ana_buf;
+	uint32_t		ana_buf_size;
+	/* Namespace currently being refreshed and its command set. */
+	uint32_t		nsid;
+	uint8_t			csi;
+	int			rc;
+	/* All commands completed, waiting to be delivered. */
+	bool			done;
+	/* The owning process detached, free the context once all commands completed. */
+	bool			orphaned;
+};
+
+static void nvme_ctrlr_aen_refresh_ns(struct nvme_aen_ctx *ctx, uint32_t nsid);
+
+static void
+nvme_aen_ctx_free(struct nvme_aen_ctx *ctx)
 {
-	struct nvme_completion_poll_status	*status;
-	int		rc = -ENOMEM;
-	char		*buffer = NULL;
-	uint32_t	nsid;
-	size_t		buf_size = (SPDK_NVME_MAX_CHANGED_NAMESPACES * sizeof(uint32_t));
+	spdk_free(ctx->buf);
+	free(ctx->ana_buf);
+	free(ctx);
+}
+
+static void
+nvme_ctrlr_aen_done(struct nvme_aen_ctx *ctx, int rc)
+{
+	if (ctx->orphaned) {
+		nvme_aen_ctx_free(ctx);
+		return;
+	}
+
+	ctx->rc = rc;
+	ctx->done = true;
+}
+
+/*
+ * Stop processing if the owning process detached, or if the controller is going
+ * away or being reinitialized; the reset path re-reads namespaces and ANA state.
+ * Must not dereference ctx->ctrlr if the context was orphaned.
+ */
+static bool
+nvme_ctrlr_aen_abandon(struct nvme_aen_ctx *ctx)
+{
+	struct spdk_nvme_ctrlr *ctrlr;
+
+	if (ctx->orphaned) {
+		return true;
+	}
+
+	ctrlr = ctx->ctrlr;
+	return ctrlr->is_destructed || ctrlr->is_resetting || ctrlr->is_failed || ctrlr->is_removed;
+}
+
+static void
+nvme_ctrlr_proc_release_aen_ctx(struct spdk_nvme_ctrlr_process *proc)
+{
+	struct nvme_aen_ctx *ctx = proc->aen_ctx;
+
+	/* The context lives in the heap of the process that owns proc. */
+	if (ctx == NULL || proc->pid != getpid()) {
+		return;
+	}
+
+	proc->aen_ctx = NULL;
+	if (ctx->done) {
+		nvme_aen_ctx_free(ctx);
+	} else {
+		/* Commands still outstanding, the last completion frees the context. */
+		ctx->orphaned = true;
+	}
+}
+
+static void
+nvme_ctrlr_aen_refresh_ns_finish(struct nvme_aen_ctx *ctx, int rc)
+{
+	/* The active namespace list was updated, let I/O message producers know. */
+	nvme_io_msg_ctrlr_update(ctx->ctrlr);
+	nvme_ctrlr_aen_done(ctx, rc);
+}
+
+static void
+nvme_ctrlr_aen_refresh_next_ns(struct nvme_aen_ctx *ctx)
+{
+	nvme_ctrlr_aen_refresh_ns(ctx, spdk_nvme_ctrlr_get_next_active_ns(ctx->ctrlr, ctx->nsid));
+}
+
+/* Returns the namespace being refreshed, or NULL if it is no longer active. */
+static struct spdk_nvme_ns *
+nvme_ctrlr_aen_get_ns(struct nvme_aen_ctx *ctx)
+{
+	if (!spdk_nvme_ctrlr_is_active_ns(ctx->ctrlr, ctx->nsid)) {
+		return NULL;
+	}
+
+	return spdk_nvme_ctrlr_get_ns(ctx->ctrlr, ctx->nsid);
+}
+
+static void
+nvme_ctrlr_aen_identify_iocs_specific_done(void *arg, const struct spdk_nvme_cpl *cpl)
+{
+	struct nvme_aen_ctx *ctx = arg;
+	struct spdk_nvme_ns *ns;
+	void *nsdata;
+
+	if (nvme_ctrlr_aen_abandon(ctx)) {
+		nvme_ctrlr_aen_done(ctx, -ENXIO);
+		return;
+	}
+
+	ns = nvme_ctrlr_aen_get_ns(ctx);
+	if (ns == NULL) {
+		nvme_ctrlr_aen_refresh_next_ns(ctx);
+		return;
+	}
+
+	nsdata = NULL;
+	if (spdk_nvme_cpl_is_error(cpl)) {
+		NVME_CTRLR_ERRLOG(ctx->ctrlr, "Failed to retrieve Identify IOCS Specific "
+				  "Namespace Data Structure for NSID %u\n", ctx->nsid);
+	} else {
+		nsdata = spdk_zmalloc(NVME_AEN_BUF_SIZE, 64, NULL, SPDK_ENV_NUMA_ID_ANY,
+				      SPDK_MALLOC_SHARE);
+		if (nsdata != NULL) {
+			memcpy(nsdata, ctx->buf, NVME_AEN_BUF_SIZE);
+		}
+	}
+
+	if (ctx->csi == SPDK_NVME_CSI_ZNS) {
+		nvme_ns_free_zns_specific_data(ns);
+		ns->nsdata_zns = nsdata;
+	} else {
+		nvme_ns_free_nvm_specific_data(ns);
+		ns->nsdata_nvm = nsdata;
+	}
+
+	nvme_ctrlr_aen_refresh_next_ns(ctx);
+}
+
+static void
+nvme_ctrlr_aen_identify_iocs_specific(struct nvme_aen_ctx *ctx, struct spdk_nvme_ns *ns)
+{
+	struct spdk_nvme_ctrlr *ctrlr = ctx->ctrlr;
+	int rc;
+
+	if (!nvme_ctrlr_multi_iocs_enabled(ctrlr) ||
+	    !nvme_ns_has_supported_iocs_specific_data(ns)) {
+		nvme_ctrlr_aen_refresh_next_ns(ctx);
+		return;
+	}
+
+	ctx->csi = ns->csi;
+	rc = nvme_ctrlr_cmd_identify(ctrlr, SPDK_NVME_IDENTIFY_NS_IOCS, 0, ns->id, ns->csi,
+				     ctx->buf, NVME_AEN_BUF_SIZE,
+				     nvme_ctrlr_aen_identify_iocs_specific_done, ctx);
+	if (rc != 0) {
+		NVME_CTRLR_ERRLOG(ctrlr, "Identify IOCS Specific Namespace failed: rc=%d\n", rc);
+		nvme_ctrlr_aen_refresh_ns_finish(ctx, rc);
+	}
+}
+
+static void
+nvme_ctrlr_aen_identify_id_desc_done(void *arg, const struct spdk_nvme_cpl *cpl)
+{
+	struct nvme_aen_ctx *ctx = arg;
+	struct spdk_nvme_ns *ns;
+
+	if (nvme_ctrlr_aen_abandon(ctx)) {
+		nvme_ctrlr_aen_done(ctx, -ENXIO);
+		return;
+	}
+
+	ns = nvme_ctrlr_aen_get_ns(ctx);
+	if (ns == NULL) {
+		nvme_ctrlr_aen_refresh_next_ns(ctx);
+		return;
+	}
+
+	if (spdk_nvme_cpl_is_error(cpl)) {
+		NVME_CTRLR_WARNLOG(ctx->ctrlr, "Failed to retrieve NS ID Descriptor List "
+				   "for NSID %u\n", ctx->nsid);
+		memset(ns->id_desc_list, 0, sizeof(ns->id_desc_list));
+		nvme_ns_set_id_desc_list_data(ns);
+		nvme_ctrlr_aen_refresh_next_ns(ctx);
+		return;
+	}
+
+	memcpy(ns->id_desc_list, ctx->buf, sizeof(ns->id_desc_list));
+	nvme_ns_set_id_desc_list_data(ns);
+	nvme_ctrlr_aen_identify_iocs_specific(ctx, ns);
+}
+
+static void
+nvme_ctrlr_aen_identify_id_desc(struct nvme_aen_ctx *ctx, struct spdk_nvme_ns *ns)
+{
+	struct spdk_nvme_ctrlr *ctrlr = ctx->ctrlr;
+	int rc;
+
+	if ((ctrlr->vs.raw < SPDK_NVME_VERSION(1, 3, 0) &&
+	     !(ctrlr->cap.bits.css & SPDK_NVME_CAP_CSS_IOCS)) ||
+	    (ctrlr->quirks & NVME_QUIRK_IDENTIFY_CNS)) {
+		memset(ns->id_desc_list, 0, sizeof(ns->id_desc_list));
+		nvme_ctrlr_aen_identify_iocs_specific(ctx, ns);
+		return;
+	}
+
+	rc = nvme_ctrlr_cmd_identify(ctrlr, SPDK_NVME_IDENTIFY_NS_ID_DESCRIPTOR_LIST, 0, ns->id, 0,
+				     ctx->buf, sizeof(ns->id_desc_list),
+				     nvme_ctrlr_aen_identify_id_desc_done, ctx);
+	if (rc != 0) {
+		NVME_CTRLR_ERRLOG(ctrlr, "Identify NS ID Descriptor List failed: rc=%d\n", rc);
+		nvme_ctrlr_aen_refresh_ns_finish(ctx, rc);
+	}
+}
+
+static void
+nvme_ctrlr_aen_identify_ns_done(void *arg, const struct spdk_nvme_cpl *cpl)
+{
+	struct nvme_aen_ctx *ctx = arg;
+	struct spdk_nvme_ns *ns;
+
+	if (nvme_ctrlr_aen_abandon(ctx)) {
+		nvme_ctrlr_aen_done(ctx, -ENXIO);
+		return;
+	}
+
+	ns = nvme_ctrlr_aen_get_ns(ctx);
+	if (ns == NULL) {
+		nvme_ctrlr_aen_refresh_next_ns(ctx);
+		return;
+	}
+
+	if (spdk_nvme_cpl_is_error(cpl)) {
+		/* Same as nvme_ns_construct(): this can occur if the namespace is not active. */
+		nvme_ns_destruct(ns);
+		nvme_ctrlr_aen_refresh_next_ns(ctx);
+		return;
+	}
+
+	memcpy(&ns->nsdata, ctx->buf, sizeof(ns->nsdata));
+	nvme_ns_set_identify_data(ns);
+
+	/* skip Identify NS ID Descriptor List for inactive NS */
+	if (!spdk_nvme_ns_is_active(ns)) {
+		nvme_ctrlr_aen_refresh_next_ns(ctx);
+		return;
+	}
+
+	nvme_ctrlr_aen_identify_id_desc(ctx, ns);
+}
+
+/*
+ * Asynchronous equivalent of nvme_ctrlr_update_namespaces(): reconstruct each
+ * active namespace starting at nsid, one Identify command at a time.
+ */
+static void
+nvme_ctrlr_aen_refresh_ns(struct nvme_aen_ctx *ctx, uint32_t nsid)
+{
+	struct spdk_nvme_ctrlr *ctrlr = ctx->ctrlr;
+	struct spdk_nvme_ns *ns;
+	int rc;
+
+	if (nsid == 0) {
+		nvme_ctrlr_aen_refresh_ns_finish(ctx, 0);
+		return;
+	}
+
+	ns = spdk_nvme_ctrlr_get_ns(ctrlr, nsid);
+	if (ns == NULL) {
+		nvme_ctrlr_aen_refresh_ns_finish(ctx, -ENOMEM);
+		return;
+	}
+
+	ns->ctrlr = ctrlr;
+	ns->id = nsid;
+	/* This will be overwritten when reading ANA log page. */
+	ns->ana_state = SPDK_NVME_ANA_OPTIMIZED_STATE;
+
+	ctx->nsid = nsid;
+	rc = nvme_ctrlr_cmd_identify(ctrlr, SPDK_NVME_IDENTIFY_NS, 0, nsid, 0,
+				     ctx->buf, sizeof(struct spdk_nvme_ns_data),
+				     nvme_ctrlr_aen_identify_ns_done, ctx);
+	if (rc != 0) {
+		NVME_CTRLR_ERRLOG(ctrlr, "Identify Namespace failed: rc=%d\n", rc);
+		nvme_ctrlr_aen_refresh_ns_finish(ctx, rc);
+	}
+}
+
+static void
+nvme_ctrlr_aen_identify_active_ns_done(struct nvme_active_ns_ctx *actx)
+{
+	struct nvme_aen_ctx *ctx = actx->cb_arg;
+	struct spdk_nvme_ctrlr *ctrlr;
+
+	if (nvme_ctrlr_aen_abandon(ctx) || actx->state != NVME_ACTIVE_NS_STATE_DONE) {
+		if (!ctx->orphaned && actx->state == NVME_ACTIVE_NS_STATE_ERROR) {
+			NVME_CTRLR_ERRLOG(ctx->ctrlr, "Failed to identify active NS list\n");
+		}
+		nvme_active_ns_ctx_destroy(actx);
+		nvme_ctrlr_aen_done(ctx, -ENXIO);
+		return;
+	}
+
+	ctrlr = ctx->ctrlr;
+	nvme_ctrlr_identify_active_ns_swap(ctrlr, actx->new_ns_list, actx->page_count * 1024);
+	nvme_active_ns_ctx_destroy(actx);
+
+	nvme_ctrlr_aen_refresh_ns(ctx, spdk_nvme_ctrlr_get_first_active_ns(ctrlr));
+}
+
+static void
+nvme_ctrlr_aen_identify_active_ns(struct nvme_aen_ctx *ctx)
+{
+	struct nvme_active_ns_ctx *actx;
+
+	actx = nvme_active_ns_ctx_create(ctx->ctrlr, nvme_ctrlr_aen_identify_active_ns_done);
+	if (actx == NULL) {
+		nvme_ctrlr_aen_done(ctx, -ENOMEM);
+		return;
+	}
+
+	actx->cb_arg = ctx;
+	/* Calls nvme_ctrlr_aen_identify_active_ns_done() when finished, possibly inline. */
+	nvme_ctrlr_identify_active_ns_async(actx);
+}
+
+static void
+nvme_ctrlr_aen_changed_ns_log_done(void *arg, const struct spdk_nvme_cpl *cpl)
+{
+	struct nvme_aen_ctx *ctx = arg;
+	uint32_t nsid;
+
+	if (nvme_ctrlr_aen_abandon(ctx)) {
+		nvme_ctrlr_aen_done(ctx, -ENXIO);
+		return;
+	}
+
+	if (spdk_nvme_cpl_is_error(cpl)) {
+		/* Not fatal, the active NS list is what matters. */
+		NVME_CTRLR_ERRLOG(ctx->ctrlr, "Get changed NS list log page failed: sct=%u sc=%u\n",
+				  cpl->status.sct, cpl->status.sc);
+	} else {
+		/* only check the case of overflow. */
+		nsid = from_le32(ctx->buf);
+		if (nsid == 0xffffffffu) {
+			NVME_CTRLR_WARNLOG(ctx->ctrlr, "changed ns log overflowed.\n");
+		}
+	}
+
+	nvme_ctrlr_aen_identify_active_ns(ctx);
+}
+
+static void
+nvme_ctrlr_aen_clear_changed_ns_log(struct nvme_aen_ctx *ctx)
+{
+	struct spdk_nvme_ctrlr *ctrlr = ctx->ctrlr;
+	int rc;
 
 	if (ctrlr->opts.disable_read_changed_ns_list_log_page) {
-		return 0;
+		nvme_ctrlr_aen_identify_active_ns(ctx);
+		return;
 	}
 
-	buffer = spdk_dma_zmalloc(buf_size, 4096, NULL);
-	if (!buffer) {
-		NVME_CTRLR_ERRLOG(ctrlr, "Failed to allocate buffer for getting "
-				  "changed ns log.\n");
-		return rc;
-	}
-
-	status = calloc(1, sizeof(*status));
-	if (!status) {
-		NVME_CTRLR_ERRLOG(ctrlr, "Failed to allocate status tracker\n");
-		goto free_buffer;
-	}
-
-	rc = spdk_nvme_ctrlr_cmd_get_log_page(ctrlr,
-					      SPDK_NVME_LOG_CHANGED_NS_LIST,
-					      SPDK_NVME_GLOBAL_NS_TAG,
-					      buffer, buf_size, 0,
-					      nvme_completion_poll_cb, status);
-
-	if (rc) {
+	rc = spdk_nvme_ctrlr_cmd_get_log_page(ctrlr, SPDK_NVME_LOG_CHANGED_NS_LIST,
+					      SPDK_NVME_GLOBAL_NS_TAG, ctx->buf,
+					      SPDK_NVME_MAX_CHANGED_NAMESPACES * sizeof(uint32_t),
+					      0, nvme_ctrlr_aen_changed_ns_log_done, ctx);
+	if (rc != 0) {
 		NVME_CTRLR_ERRLOG(ctrlr, "spdk_nvme_ctrlr_cmd_get_log_page() failed: rc=%d\n", rc);
-		free(status);
-		goto free_buffer;
+		nvme_ctrlr_aen_identify_active_ns(ctx);
+	}
+}
+
+static void
+nvme_ctrlr_aen_ana_log_page_done(void *arg, const struct spdk_nvme_cpl *cpl)
+{
+	struct nvme_aen_ctx *ctx = arg;
+	struct spdk_nvme_ctrlr *ctrlr;
+	uint32_t copy_len;
+
+	if (nvme_ctrlr_aen_abandon(ctx)) {
+		nvme_ctrlr_aen_done(ctx, -ENXIO);
+		return;
 	}
 
-	rc = nvme_wait_for_completion_timeout(ctrlr->adminq, status,
-					      ctrlr->opts.admin_timeout_ms * 1000);
-	if (!status->timed_out) {
-		free(status);
+	ctrlr = ctx->ctrlr;
+	if (spdk_nvme_cpl_is_error(cpl)) {
+		NVME_CTRLR_ERRLOG(ctrlr, "Get ANA log page failed: sct=%u sc=%u\n",
+				  cpl->status.sct, cpl->status.sc);
+		nvme_ctrlr_aen_done(ctx, -EIO);
+		return;
 	}
 
-	if (rc) {
-		NVME_CTRLR_ERRLOG(ctrlr, "wait for spdk_nvme_ctrlr_cmd_get_log_page failed: rc=%d\n", rc);
-		goto free_buffer;
+	/* ctrlr->ana_log_page never shrinks, but it may have grown meanwhile. */
+	assert(ctrlr->ana_log_page != NULL);
+	copy_len = spdk_min(ctx->ana_buf_size, ctrlr->ana_log_page_size);
+	memcpy(ctrlr->ana_log_page, ctx->ana_buf, copy_len);
+	memset((uint8_t *)ctrlr->ana_log_page + copy_len, 0, ctrlr->ana_log_page_size - copy_len);
+
+	nvme_ctrlr_parse_ana_log_page(ctrlr, nvme_ctrlr_update_ns_ana_states, ctrlr);
+	nvme_ctrlr_aen_done(ctx, 0);
+}
+
+static void
+nvme_ctrlr_aen_read_ana_log_page(struct nvme_aen_ctx *ctx)
+{
+	struct spdk_nvme_ctrlr *ctrlr = ctx->ctrlr;
+	int rc;
+
+	/* Size the buffer for the current number of active namespaces, in memory only. */
+	rc = nvme_ctrlr_alloc_ana_log_page(ctrlr);
+	if (rc != 0) {
+		goto err;
 	}
 
-	/* only check the case of overflow. */
-	nsid = from_le32(buffer);
-	if (nsid == 0xffffffffu) {
-		NVME_CTRLR_WARNLOG(ctrlr, "changed ns log overflowed.\n");
+	/*
+	 * Read into a private buffer: ctrlr->ana_log_page may be reallocated while the
+	 * command is outstanding, and is only updated if the command succeeded.
+	 */
+	ctx->ana_buf_size = ctrlr->ana_log_page_size;
+	ctx->ana_buf = calloc(1, ctx->ana_buf_size);
+	if (ctx->ana_buf == NULL) {
+		rc = -ENOMEM;
+		goto err;
 	}
 
-free_buffer:
-	spdk_dma_free(buffer);
-	return rc;
+	rc = spdk_nvme_ctrlr_cmd_get_log_page(ctrlr, SPDK_NVME_LOG_ASYMMETRIC_NAMESPACE_ACCESS,
+					      SPDK_NVME_GLOBAL_NS_TAG, ctx->ana_buf,
+					      ctx->ana_buf_size, 0,
+					      nvme_ctrlr_aen_ana_log_page_done, ctx);
+	if (rc != 0) {
+		NVME_CTRLR_ERRLOG(ctrlr, "Get ANA log page failed: rc=%d\n", rc);
+		goto err;
+	}
+
+	return;
+
+err:
+	nvme_ctrlr_aen_done(ctx, rc);
+}
+
+static void
+nvme_ctrlr_deliver_async_event(struct spdk_nvme_ctrlr_process *active_proc,
+			       const struct spdk_nvme_cpl *cpl)
+{
+	if (active_proc->aer_cb_fn) {
+		active_proc->aer_cb_fn(active_proc->aer_cb_arg, cpl);
+	}
 }
 
 static void
 nvme_ctrlr_process_async_event(struct spdk_nvme_ctrlr *ctrlr,
+			       struct spdk_nvme_ctrlr_process *active_proc,
 			       const struct spdk_nvme_cpl *cpl)
 {
 	union spdk_nvme_async_event_completion event;
-	struct spdk_nvme_ctrlr_process *active_proc;
-	int rc;
+	struct nvme_aen_ctx *ctx;
+	bool ns_changed, ana_changed;
+
+	assert(active_proc->aen_ctx == NULL);
 
 	event.raw = cpl->cdw0;
 
-	if ((event.bits.async_event_type == SPDK_NVME_ASYNC_EVENT_TYPE_NOTICE) &&
-	    (event.bits.async_event_info == SPDK_NVME_ASYNC_EVENT_NS_ATTR_CHANGED)) {
-		nvme_ctrlr_clear_changed_ns_log(ctrlr);
+	ns_changed = (event.bits.async_event_type == SPDK_NVME_ASYNC_EVENT_TYPE_NOTICE) &&
+		     (event.bits.async_event_info == SPDK_NVME_ASYNC_EVENT_NS_ATTR_CHANGED);
+	ana_changed = (event.bits.async_event_type == SPDK_NVME_ASYNC_EVENT_TYPE_NOTICE) &&
+		      (event.bits.async_event_info == SPDK_NVME_ASYNC_EVENT_ANA_CHANGE) &&
+		      !ctrlr->opts.disable_read_ana_log_page;
 
-		rc = nvme_ctrlr_identify_active_ns(ctrlr);
-		if (rc) {
-			return;
-		}
-		nvme_ctrlr_update_namespaces(ctrlr);
-		nvme_io_msg_ctrlr_update(ctrlr);
+	if (!ns_changed && !ana_changed) {
+		nvme_ctrlr_deliver_async_event(active_proc, cpl);
+		return;
 	}
 
-	if ((event.bits.async_event_type == SPDK_NVME_ASYNC_EVENT_TYPE_NOTICE) &&
-	    (event.bits.async_event_info == SPDK_NVME_ASYNC_EVENT_ANA_CHANGE)) {
-		if (!ctrlr->opts.disable_read_ana_log_page) {
-			rc = nvme_ctrlr_update_ana_log_page(ctrlr);
-			if (rc) {
-				return;
-			}
-			nvme_ctrlr_parse_ana_log_page(ctrlr, nvme_ctrlr_update_ns_ana_states,
-						      ctrlr);
-		}
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL) {
+		NVME_CTRLR_ERRLOG(ctrlr, "Failed to allocate async event context\n");
+		nvme_ctrlr_deliver_async_event(active_proc, cpl);
+		return;
 	}
 
-	active_proc = nvme_ctrlr_get_current_process(ctrlr);
-	if (active_proc && active_proc->aer_cb_fn) {
-		active_proc->aer_cb_fn(active_proc->aer_cb_arg, cpl);
+	ctx->ctrlr = ctrlr;
+	ctx->cpl = *cpl;
+	active_proc->aen_ctx = ctx;
+
+	if (ana_changed) {
+		nvme_ctrlr_aen_read_ana_log_page(ctx);
+		return;
 	}
+
+	ctx->buf = spdk_zmalloc(NVME_AEN_BUF_SIZE, 4096, NULL, SPDK_ENV_NUMA_ID_ANY,
+				SPDK_MALLOC_DMA);
+	if (ctx->buf == NULL) {
+		NVME_CTRLR_ERRLOG(ctrlr, "Failed to allocate async event buffer\n");
+		nvme_ctrlr_aen_done(ctx, -ENOMEM);
+		return;
+	}
+
+	nvme_ctrlr_aen_clear_changed_ns_log(ctx);
 }
 
 static void
@@ -3352,17 +3796,38 @@ nvme_ctrlr_queue_async_event(struct spdk_nvme_ctrlr *ctrlr,
 static void
 nvme_ctrlr_complete_queued_async_events(struct spdk_nvme_ctrlr *ctrlr)
 {
-	struct  spdk_nvme_ctrlr_aer_completion  *nvme_event, *nvme_event_tmp;
+	struct  spdk_nvme_ctrlr_aer_completion  *nvme_event;
 	struct spdk_nvme_ctrlr_process	*active_proc;
+	struct nvme_aen_ctx		*ctx;
 
 	active_proc = nvme_ctrlr_get_current_process(ctrlr);
 
-	STAILQ_FOREACH_SAFE(nvme_event, &active_proc->async_events, link, nvme_event_tmp) {
-		STAILQ_REMOVE(&active_proc->async_events, nvme_event,
-			      spdk_nvme_ctrlr_aer_completion, link);
-		nvme_ctrlr_process_async_event(ctrlr, &nvme_event->cpl);
-		spdk_free(nvme_event);
+	/*
+	 * Events are left queued while the controller is resetting and processed once
+	 * it is back. After destruct started they are freed with the process object.
+	 */
+	while (!ctrlr->is_resetting && !ctrlr->is_destructed) {
+		ctx = active_proc->aen_ctx;
+		if (ctx != NULL) {
+			if (!ctx->done) {
+				/* Admin commands still outstanding. */
+				break;
+			}
 
+			active_proc->aen_ctx = NULL;
+			nvme_ctrlr_deliver_async_event(active_proc, &ctx->cpl);
+			nvme_aen_ctx_free(ctx);
+			continue;
+		}
+
+		nvme_event = STAILQ_FIRST(&active_proc->async_events);
+		if (nvme_event == NULL) {
+			break;
+		}
+
+		STAILQ_REMOVE_HEAD(&active_proc->async_events, link);
+		nvme_ctrlr_process_async_event(ctrlr, active_proc, &nvme_event->cpl);
+		spdk_free(nvme_event);
 	}
 }
 
@@ -3579,6 +4044,8 @@ nvme_ctrlr_remove_process(struct spdk_nvme_ctrlr *ctrlr,
 
 	assert(STAILQ_EMPTY(&proc->active_reqs));
 
+	nvme_ctrlr_proc_release_aen_ctx(proc);
+
 	TAILQ_FOREACH_SAFE(qpair, &proc->allocated_io_qpairs, per_process_tailq, tmp_qpair) {
 		spdk_nvme_ctrlr_free_io_qpair(qpair);
 	}
@@ -3654,6 +4121,7 @@ nvme_ctrlr_free_processes(struct spdk_nvme_ctrlr *ctrlr)
 
 		assert(STAILQ_EMPTY(&active_proc->active_reqs));
 
+		nvme_ctrlr_proc_release_aen_ctx(active_proc);
 		spdk_free(active_proc);
 	}
 }
