@@ -28,6 +28,9 @@ struct lvol_store_bdev {
 	 * a command still in flight when the lvolstore goes away does not reach it. */
 	uint32_t		resv_epoch;
 	struct vbdev_lvol_resv_hub	*resv_hub;
+	/* The lvolstore is being unloaded or destroyed and its lvs may already be freed:
+	 * the reservation sync and forward paths no longer touch it, nor make a new hub */
+	bool			resv_detached;
 
 	TAILQ_ENTRY(lvol_store_bdev)	lvol_stores;
 };

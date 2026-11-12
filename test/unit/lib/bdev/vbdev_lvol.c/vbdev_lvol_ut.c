@@ -69,6 +69,7 @@ DEFINE_STUB(spdk_bdev_get_memory_domains, int, (struct spdk_bdev *bdev,
 DEFINE_STUB(spdk_blob_get_esnap_id, int,
 	    (struct spdk_blob *blob, const void **id, size_t *len), -ENOTSUP);
 DEFINE_STUB(spdk_blob_is_esnap_clone, bool, (const struct spdk_blob *blob), false);
+DEFINE_STUB(spdk_blob_locked_operation_in_progress, bool, (const struct spdk_blob *blob), false);
 DEFINE_STUB(spdk_lvs_queued_rsp, bool, (struct spdk_lvol_store *lvs, struct spdk_bdev_io *bdev_io), false);
 DEFINE_STUB(spdk_lvol_iter_immediate_clones, int,
 	    (struct spdk_lvol *lvol, spdk_lvol_iter_cb cb_fn, void *cb_arg), -ENOTSUP);
@@ -3515,6 +3516,49 @@ ut_lvol_resv_hub_detached_before_unload(void)
 	ut_resv_node_fini(&n);
 }
 
+/* lib/lvol frees the lvolstore when it starts the blobstore unload or destroy, and
+ * lvs_bdev stays on g_spdk_lvol_pairs until that completes. In between, neither the
+ * sync poller nor a sync it queued just before may follow lvs_bdev->lvs, nor make a
+ * new hub (test_replication exec_sync_lvs_mga_source_degraded: ASan
+ * heap-use-after-free in vbdev_lvol_resv_sync_poll during bdev_lvol_delete_lvstore). */
+static void
+ut_lvol_resv_sync_skips_detached_lvs(void)
+{
+	struct ut_resv_node *n;
+	struct lvol_store_bdev *lb;
+
+	n = calloc(1, sizeof(*n));
+	SPDK_CU_ASSERT_FATAL(n != NULL);
+	ut_resv_node_init(n, false);
+	n->lvs.hub_dev.state = HUBLVOL_CONNECTED;
+	n->lvs.hub_dev.desc = UT_HUB_DESC;
+	TAILQ_REMOVE(&g_spdk_lvol_pairs, &n->lvs_bdev, lvol_stores);
+	lb = calloc(1, sizeof(*lb));
+	SPDK_CU_ASSERT_FATAL(lb != NULL);
+	lb->lvs = &n->lvs;
+	TAILQ_INSERT_TAIL(&g_spdk_lvol_pairs, lb, lvol_stores);
+
+	/* The poller queues a sync, then the removal starts: the hub lets go of the
+	 * lvolstore and lib/lvol frees it while lb is still registered */
+	vbdev_lvol_resv_sync_poll(NULL);
+	vbdev_lvol_resv_hub_detach(lb);
+	free(n);
+
+	poll_threads();		/* the sync queued before the removal */
+	vbdev_lvol_resv_sync_poll(NULL);
+	poll_threads();
+	CU_ASSERT(g_hub_ncmds == 0);
+	CU_ASSERT(lb->resv_hub == NULL);
+	CU_ASSERT(g_ut_hub_channels == 0);
+
+	/* What _vbdev_lvs_remove_cb does once the blobstore is gone */
+	TAILQ_REMOVE(&g_spdk_lvol_pairs, lb, lvol_stores);
+	free(lb);
+	CU_ASSERT(ut_hub_unregister());
+	vbdev_lvol_set_resv_changed_cb(NULL, NULL);
+	g_hub_ncmds = 0;
+}
+
 /* The lvol library closes the hub descriptor and opens a new one, which can come back
  * at the same address: the channel got on the closed one goes back at the close and
  * is not used for the new hub */
@@ -3722,6 +3766,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, ut_lvol_hub_resv_as_nvmf_submits);
 	CU_ADD_TEST(suite, ut_lvol_hub_resv_plain_io_ignores_stale_iovs);
 	CU_ADD_TEST(suite, ut_lvol_resv_hub_detached_before_unload);
+	CU_ADD_TEST(suite, ut_lvol_resv_sync_skips_detached_lvs);
 	CU_ADD_TEST(suite, ut_lvol_resv_follower_keeps_fetched_state);
 	CU_ADD_TEST(suite, ut_lvol_resv_store_failure_restores_xattr);
 	CU_ADD_TEST(suite, ut_lvol_resv_sync_backoff);

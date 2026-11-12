@@ -4116,6 +4116,9 @@ vbdev_lvol_resv_sync_round_done(struct vbdev_lvol_resv_hub *hub, bool ok)
 static struct vbdev_lvol_resv_hub *
 vbdev_lvol_resv_hub_of(struct lvol_store_bdev *lvs_bdev)
 {
+	if (lvs_bdev->resv_detached) {
+		return NULL;
+	}
 	if (lvs_bdev->resv_hub == NULL) {
 		lvs_bdev->resv_hub = calloc(1, sizeof(*lvs_bdev->resv_hub));
 		if (lvs_bdev->resv_hub != NULL) {
@@ -4221,6 +4224,10 @@ vbdev_lvol_resv_hub_detach(struct lvol_store_bdev *lvs_bdev)
 {
 	struct vbdev_lvol_resv_hub *hub = lvs_bdev->resv_hub;
 
+	/* lib/lvol frees the lvs when it starts the blobstore unload or destroy, while
+	 * lvs_bdev stays on g_spdk_lvol_pairs until that completes: from here on the
+	 * poller and the queued messages must not follow lvs_bdev->lvs */
+	lvs_bdev->resv_detached = true;
 	if (hub == NULL) {
 		return;
 	}
@@ -4303,6 +4310,8 @@ vbdev_lvol_resv_hub_status(struct spdk_bdev_io *bdev_io, uint32_t *cdw0, uint8_t
 	return isct == SPDK_NVME_SCT_GENERIC && isc == SPDK_NVME_SC_SUCCESS;
 }
 
+/* lvs_bdev is still registered and its lvolstore is not going away, so a message
+ * queued earlier may use lvs_bdev->lvs */
 static bool
 vbdev_lvol_resv_lvs_known(struct lvol_store_bdev *lvs_bdev)
 {
@@ -4310,7 +4319,7 @@ vbdev_lvol_resv_lvs_known(struct lvol_store_bdev *lvs_bdev)
 
 	TAILQ_FOREACH(it, &g_spdk_lvol_pairs, lvol_stores) {
 		if (it == lvs_bdev) {
-			return true;
+			return !lvs_bdev->resv_detached;
 		}
 	}
 	return false;
@@ -4554,7 +4563,8 @@ vbdev_lvol_resv_sync_poll(void *arg)
 	TAILQ_FOREACH(lvs_bdev, &g_spdk_lvol_pairs, lvol_stores) {
 		struct vbdev_lvol_resv_hub *hub = lvs_bdev->resv_hub;
 
-		if (lvs_bdev->lvs == NULL) {
+		/* An lvolstore being removed may have its lvs freed already */
+		if (lvs_bdev->lvs == NULL || lvs_bdev->resv_detached) {
 			continue;
 		}
 		/* A channel on a hub that is gone or replaced goes back, as does one this
