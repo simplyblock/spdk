@@ -2612,6 +2612,176 @@ origlvol_update_delete_async_cpl(void *cb_arg, int lvolerrno)
 	free(req);
 }
 
+/*
+ * Leader-side delete of a read-only blob (a snapshot) right after a takeover
+ * by IO: the lvols of this lvstore are refreshed lazily (lvol->leader false
+ * until their metadata is re-read), and a clone records its parent only in its
+ * own metadata. A clone the previous leader attached to the snapshot while this
+ * node did not refresh it is then missing from the snapshot tree: the snapshot
+ * looks clone-less, its clusters are unmapped and its metadata deleted while
+ * the clone still names it as parent (bf23 LVS_16, 2026-11-12). Refresh every
+ * stale lvol first, then run the delete again on the refreshed tree.
+ */
+#define LVOL_DESTROY_REFRESH_WAIT_US	(10 * 1000)
+#define LVOL_DESTROY_REFRESH_WAIT_MAX	3000
+
+struct lvol_destroy_refresh_ctx {
+	struct spdk_lvol	*lvol;
+	struct spdk_lvol	*stale;
+	spdk_lvol_op_complete	cb_fn;
+	void			*cb_arg;
+	struct spdk_poller	*poller;
+	uint32_t		polls;
+};
+
+/* Called with g_lvol_stores_mutex held. *busy: a stale lvol is being
+ * refreshed by another path (IO-triggered update) right now. */
+static struct spdk_lvol *
+lvs_find_stale_lvol(struct spdk_lvol_store *lvs, struct spdk_lvol *self, bool *busy)
+{
+	struct spdk_lvol *l;
+
+	*busy = false;
+	TAILQ_FOREACH(l, &lvs->lvols, link) {
+		if (l == self || l->leader || l->blob == NULL || l->hublvol ||
+		    strcmp(l->name, "hublvol") == 0) {
+			continue;
+		}
+		if (l->update_in_progress || spdk_blob_locked_operation_in_progress(l->blob)) {
+			/* a refresh would fail -EBUSY and mark the blob failed */
+			*busy = true;
+			continue;
+		}
+		return l;
+	}
+	return NULL;
+}
+
+static bool
+lvs_has_stale_lvol(struct spdk_lvol_store *lvs, struct spdk_lvol *self)
+{
+	struct spdk_lvol *stale;
+	bool busy;
+
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+	stale = lvs_find_stale_lvol(lvs, self, &busy);
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+	return stale != NULL || busy;
+}
+
+static void lvol_destroy_refresh_next(struct lvol_destroy_refresh_ctx *ctx);
+
+static void
+lvol_destroy_refresh_finish(struct lvol_destroy_refresh_ctx *ctx, int rc)
+{
+	spdk_lvol_op_complete cb_fn = ctx->cb_fn;
+	void *cb_arg = ctx->cb_arg;
+
+	free(ctx);
+	cb_fn(cb_arg, rc);
+}
+
+static void
+lvol_destroy_refresh_cpl(void *cb_arg, int lvolerrno)
+{
+	struct lvol_destroy_refresh_ctx *ctx = cb_arg;
+	struct spdk_lvol *stale = ctx->stale;
+
+	ctx->stale = NULL;
+	if (lvolerrno < 0) {
+		SPDK_ERRLOG("lvol %s: cannot delete it: refreshing lvol %s (blob 0x%" PRIx64 ") "
+			    "failed (%d), the snapshot tree is not known\n",
+			    ctx->lvol->unique_id, stale->unique_id, stale->blob_id, lvolerrno);
+		spdk_lvol_set_leader_failed_on_update(stale);
+		lvol_destroy_refresh_finish(ctx, ERR_UPDATE_FAILED);
+		return;
+	}
+	spdk_lvol_set_leader(stale);
+	lvol_destroy_refresh_next(ctx);
+}
+
+static int
+lvol_destroy_refresh_poll(void *arg)
+{
+	struct lvol_destroy_refresh_ctx *ctx = arg;
+
+	spdk_poller_unregister(&ctx->poller);
+	lvol_destroy_refresh_next(ctx);
+	return SPDK_POLLER_BUSY;
+}
+
+static void
+lvol_destroy_refresh_next(struct lvol_destroy_refresh_ctx *ctx)
+{
+	struct spdk_lvol_store *lvs = ctx->lvol->lvol_store;
+	struct spdk_lvol *lvol = ctx->lvol;
+	spdk_lvol_op_complete cb_fn = ctx->cb_fn;
+	void *cb_arg = ctx->cb_arg;
+	struct spdk_lvol *stale;
+	bool busy;
+
+	if (!lvs->leader) {
+		SPDK_ERRLOG("lvol %s: cannot destroy: due to leadership change\n", lvol->unique_id);
+		lvol_destroy_refresh_finish(ctx, ERR_LEADERSHIP_CHANGED);
+		return;
+	}
+
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+	stale = lvs_find_stale_lvol(lvs, lvol, &busy);
+	if (stale != NULL) {
+		/* as lvol_update_async_delete() */
+		stale->update_in_progress = true;
+		stale->failed_on_update = false;
+		blob_freeze_on_failover(stale->blob);
+	}
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
+
+	if (stale != NULL) {
+		ctx->stale = stale;
+		SPDK_NOTICELOG("lvol %s: refreshing lvol %s (blob 0x%" PRIx64 ") before deleting "
+			       "the snapshot\n", lvol->unique_id, stale->unique_id, stale->blob_id);
+		spdk_blob_update_on_failover(stale->blob, lvol_destroy_refresh_cpl, ctx);
+		return;
+	}
+
+	if (busy) {
+		if (++ctx->polls >= LVOL_DESTROY_REFRESH_WAIT_MAX) {
+			SPDK_ERRLOG("lvol %s: cannot delete it: lvols of the lvstore are still being "
+				    "refreshed\n", lvol->unique_id);
+			lvol_destroy_refresh_finish(ctx, -EBUSY);
+			return;
+		}
+		ctx->poller = SPDK_POLLER_REGISTER(lvol_destroy_refresh_poll, ctx,
+						   LVOL_DESTROY_REFRESH_WAIT_US);
+		if (ctx->poller == NULL) {
+			lvol_destroy_refresh_finish(ctx, -ENOMEM);
+		}
+		return;
+	}
+
+	/* The tree is current now: delete again, with the clone if there is one. */
+	free(ctx);
+	spdk_lvol_destroy_async(lvol, cb_fn, cb_arg);
+}
+
+static void
+lvol_destroy_refresh_start(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg)
+{
+	struct lvol_destroy_refresh_ctx *ctx;
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL) {
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+	ctx->lvol = lvol;
+	ctx->cb_fn = cb_fn;
+	ctx->cb_arg = cb_arg;
+	SPDK_NOTICELOG("lvol %s: snapshot delete on a leader with lvols not refreshed since the "
+		       "takeover: refreshing them first\n", lvol->unique_id);
+	lvol_destroy_refresh_next(ctx);
+}
+
 void
 spdk_lvol_destroy_async(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg)
 {
@@ -2664,6 +2834,11 @@ spdk_lvol_destroy_async(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, voi
 	}
 
 	if (lvol->leader) {
+		if (spdk_blob_is_read_only(lvol->blob) && lvs_has_stale_lvol(lvs, lvol)) {
+			free(req);
+			lvol_destroy_refresh_start(lvol, cb_fn, cb_arg);
+			return;
+		}
 		lvol->action_in_progress = true;
 		spdk_bs_delete_blob_async(bs, lvol->blob, lvol_delete_async_cb, req);
 		return;
