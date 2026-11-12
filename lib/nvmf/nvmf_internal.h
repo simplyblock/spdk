@@ -211,6 +211,9 @@ struct spdk_nvmf_ns {
 	struct spdk_nvmf_reservation_preempt_abort_info *preempt_abort;
 	/* Reloads waiting for the reservation commands queued on this namespace */
 	struct nvmf_ns_reservation_reload *reservation_reloads;
+	/* A reload replaced the registrants and the poll groups are still reading them:
+	 * commands and other reloads wait until that update is done */
+	bool reservation_reload_inflight;
 	/* Persist Through Power Loss file which contains the persistent reservation */
 	char *ptpl_file;
 	/* Persist Through Power Loss feature is enabled */

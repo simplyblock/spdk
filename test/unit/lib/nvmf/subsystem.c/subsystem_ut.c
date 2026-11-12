@@ -4182,6 +4182,92 @@ test_reservation_reload_live_namespace(void)
 	ut_resv_env_fini(&env);
 }
 
+/* Poll group updates done when each load (the start of a reload) ran */
+static size_t g_load_pg_updates[2];
+static int g_loads;
+
+static int
+ut_load_reservation_recorded(const struct spdk_nvmf_ns *ns, struct spdk_nvmf_reservation_info *info)
+{
+	if (g_loads < (int)SPDK_COUNTOF(g_load_pg_updates)) {
+		g_load_pg_updates[g_loads] = g_ns_pg_update;
+	}
+	g_loads++;
+	return ut_load_reservation(ns, info);
+}
+
+/*
+ * A reload frees the registrants and the poll groups then read the new ones on their
+ * own threads. Nothing may change the registrants again until they are done: neither
+ * a second reload (an lvol failover sends them back to back) nor a command.
+ */
+static void
+test_reservation_reload_serialized(void)
+{
+	struct spdk_nvmf_ns_reservation_ops ops = {
+		.is_ptpl_capable = ut_is_ptpl_capable,
+		.update = ut_update_reservation,
+		.load = ut_load_reservation_recorded,
+		.update_async = ut_update_async,
+		.is_shared = ut_is_shared,
+	};
+	struct ut_resv_env env;
+	struct spdk_nvmf_request *req;
+	struct spdk_nvmf_reservation_info info = {};
+	int async_calls;
+
+	ut_resv_env_init(&env, &ops);
+	g_shared = true;
+	req = ut_resv_env_req(&env, &g_ctrlr1_A);
+
+	/* The store says B is registered */
+	spdk_uuid_fmt_lower(info.bdev_uuid, sizeof(info.bdev_uuid), spdk_bdev_get_uuid(g_ns.bdev));
+	info.num_regs = 1;
+	info.registrants[0].rkey = 0xb1;
+	spdk_uuid_fmt_lower(info.registrants[0].host_uuid, sizeof(info.registrants[0].host_uuid),
+			    &g_ctrlr_B.hostid);
+	g_resv_info = info;
+
+	/* Two reloads back to back: the second replaces the registrants only after the
+	 * poll groups are done with the ones the first put there */
+	g_reload_calls = 0;
+	g_reload_rc = -1;
+	g_loads = 0;
+	CU_ASSERT(spdk_nvmf_ns_reload_reservation(&g_subsystem, g_ns.nsid, ut_reload_done, NULL) == 0);
+	CU_ASSERT(spdk_nvmf_ns_reload_reservation(&g_subsystem, g_ns.nsid, ut_reload_done, NULL) == 0);
+	poll_threads();
+	CU_ASSERT(g_loads == 2);
+	CU_ASSERT(g_load_pg_updates[1] > g_load_pg_updates[0]);
+	CU_ASSERT(g_reload_calls == 2);
+	CU_ASSERT(g_reload_rc == 0);
+	CU_ASSERT(g_ns.reservation_reload_inflight == false);
+	CU_ASSERT(g_ns.reservation_reloads == NULL);
+	CU_ASSERT(nvmf_ns_reservation_get_registrant(&g_ns, &g_ctrlr_B.hostid) != NULL);
+
+	/* A command that comes during a reload's poll group update waits for it */
+	CU_ASSERT(spdk_nvmf_ns_reload_reservation(&g_subsystem, g_ns.nsid, ut_reload_done, NULL) == 0);
+	poll_thread_times(0, 1);	/* the reload message, not yet its poll group update */
+	CU_ASSERT(g_ns.reservation_reload_inflight == true);
+	async_calls = g_async_calls;
+	ut_reservation_build_register_request(req, SPDK_NVME_RESERVE_REGISTER_KEY, 0, 0, 0, 0xa1);
+	nvmf_ns_reservation_request(req);
+	CU_ASSERT(g_async_calls == async_calls);
+	CU_ASSERT(nvmf_ns_reservation_get_registrant(&g_ns, &g_ctrlr1_A.hostid) == NULL);
+	poll_threads();
+	CU_ASSERT(g_reload_calls == 3);
+	CU_ASSERT(g_ns.reservation_reload_inflight == false);
+	/* Then the command runs */
+	CU_ASSERT(g_async_calls == async_calls + 1);
+	ut_async_complete(0);
+	poll_threads();
+	CU_ASSERT(req->rsp->nvme_cpl.status.sc == SPDK_NVME_SC_SUCCESS);
+	CU_ASSERT(nvmf_ns_reservation_get_registrant(&g_ns, &g_ctrlr1_A.hostid) != NULL);
+	CU_ASSERT(nvmf_ns_reservation_get_registrant(&g_ns, &g_ctrlr_B.hostid) != NULL);
+
+	ut_reservation_free_req(req);
+	ut_resv_env_fini(&env);
+}
+
 /*
  * Without pnfs-os 0006 a Linux pNFS client can hold two device nodes for one
  * namespace, and each registers the same key: the second Register is a no-op
@@ -4687,6 +4773,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_reservation_async_update_failure_rolls_back);
 	CU_ADD_TEST(suite, test_reservation_shared_persists_every_change);
 	CU_ADD_TEST(suite, test_reservation_reload_live_namespace);
+	CU_ADD_TEST(suite, test_reservation_reload_serialized);
 	CU_ADD_TEST(suite, test_reservation_forwarded_on_nonleader);
 	CU_ADD_TEST(suite, test_reservation_forward_declined_runs_locally);
 	CU_ADD_TEST(suite, test_reservation_execute_as_host);

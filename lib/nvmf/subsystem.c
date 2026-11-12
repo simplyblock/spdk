@@ -4539,8 +4539,9 @@ nvmf_ns_reservation_update_state(struct spdk_nvmf_ns *ns,
 		STAILQ_INSERT_TAIL(&ns->reservations, req, reservation_link);
 		req->reservation_queued = true;
 	}
-	/* The head is in-progress, others must wait */
-	if (req != STAILQ_FIRST(&ns->reservations)) {
+	/* The head is in-progress, others must wait. The head also waits for a reload
+	 * whose poll group update still reads the registrants it replaced */
+	if (req != STAILQ_FIRST(&ns->reservations) || ns->reservation_reload_inflight) {
 		return;
 	}
 
@@ -4636,6 +4637,8 @@ struct nvmf_ns_reservation_reload {
 	struct spdk_thread			*thread;
 	int					rc;
 	struct nvmf_ns_reservation_reload	*next;
+	/* The namespace this reload marked in flight, while its poll group update runs */
+	struct spdk_nvmf_ns			*inflight_ns;
 };
 
 static void
@@ -4656,10 +4659,30 @@ nvmf_ns_reservation_reload_finish(struct nvmf_ns_reservation_reload *ctx, int rc
 	spdk_thread_send_msg(ctx->thread, nvmf_ns_reservation_reload_complete, ctx);
 }
 
+/* A reload is done with the namespace: run what waited for it, commands first */
+static void
+nvmf_ns_reservation_reload_release(struct spdk_nvmf_ns *ns)
+{
+	ns->reservation_reload_inflight = false;
+	if (!STAILQ_EMPTY(&ns->reservations)) {
+		spdk_thread_send_msg(ns->subsystem->thread, nvmf_ns_reservation_request,
+				     STAILQ_FIRST(&ns->reservations));
+	} else {
+		nvmf_ns_reservation_reloads_kick(ns);
+	}
+}
+
 static void
 nvmf_ns_reservation_reload_pg_done(struct spdk_nvmf_subsystem *subsystem, void *cb_arg, int status)
 {
-	nvmf_ns_reservation_reload_finish(cb_arg, status);
+	struct nvmf_ns_reservation_reload *ctx = cb_arg;
+	struct spdk_nvmf_ns *ns = _nvmf_subsystem_get_ns(subsystem, ctx->nsid);
+
+	/* The namespace may have been removed meanwhile, or replaced by another one */
+	if (ns != NULL && ns == ctx->inflight_ns && ns->reservation_reload_inflight) {
+		nvmf_ns_reservation_reload_release(ns);
+	}
+	nvmf_ns_reservation_reload_finish(ctx, status);
 }
 
 static void
@@ -4675,8 +4698,10 @@ nvmf_ns_reservation_reload_msg(void *arg)
 		nvmf_ns_reservation_reload_finish(ctx, -ENOENT);
 		return;
 	}
-	if (!STAILQ_EMPTY(&ns->reservations)) {
-		/* Run when the queue drains, in the order the reloads came */
+	if (!STAILQ_EMPTY(&ns->reservations) || ns->reservation_reload_inflight) {
+		/* Run when the queue drains and the reload before it is done, in the order
+		 * the reloads came. A reload frees the registrants, so it must never run
+		 * while the poll groups still read the ones the previous reload put there */
 		struct nvmf_ns_reservation_reload **tail = &ns->reservation_reloads;
 
 		while (*tail) {
@@ -4692,6 +4717,8 @@ nvmf_ns_reservation_reload_msg(void *arg)
 		nvmf_ns_reservation_reload_finish(ctx, -ENOMEM);
 		return;
 	}
+	ns->reservation_reload_inflight = true;
+	ctx->inflight_ns = ns;
 	rc = nvmf_ns_reservation_load(ns, info);
 	if (rc == 0) {
 		rc = nvmf_ns_reservation_apply(ns, info);
@@ -4699,12 +4726,14 @@ nvmf_ns_reservation_reload_msg(void *arg)
 	free(info);
 	if (rc != 0) {
 		SPDK_ERRLOG("Reloading the reservation state of nsid %u failed (%d)\n", ns->nsid, rc);
+		nvmf_ns_reservation_reload_release(ns);
 		nvmf_ns_reservation_reload_finish(ctx, rc);
 		return;
 	}
 
 	rc = nvmf_subsystem_update_ns(ctx->subsystem, nvmf_ns_reservation_reload_pg_done, ctx);
 	if (rc != 0) {
+		nvmf_ns_reservation_reload_release(ns);
 		nvmf_ns_reservation_reload_finish(ctx, rc);
 	}
 }
