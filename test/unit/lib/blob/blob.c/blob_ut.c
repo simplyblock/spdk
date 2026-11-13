@@ -3033,7 +3033,7 @@ bs_load_after_failed_grow(void)
 	/* new_md_journal: the super block is never marked clean (unload does not write it); was: CU_ASSERT(super_block->clean == 1); */
 
 	mask = (struct spdk_bs_md_mask *)(g_dev_buffer + super_block->used_cluster_mask_start *
-					  g_phys_blocklen);
+					  SPDK_BS_PAGE_SIZE);
 	/* new_md_journal: the used cluster mask is not written by unload/grow; was: CU_ASSERT(mask->type == SPDK_MD_MASK_TYPE_USED_CLUSTERS); */
 	/* new_md_journal: the used cluster mask is not written by unload/grow; was: CU_ASSERT(mask->length == super_block->size / super_block->cluster_size); */
 
@@ -3350,8 +3350,10 @@ bs_test_recover_cluster_count(void)
 	CU_ASSERT(g_bserrno == 0);
 	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
 	bs = g_bs;
-	CU_ASSERT(bs->num_free_clusters == bs->total_clusters - (super_block.md_start +
-			super_block.md_len));
+	/* new_md_journal: md pages are SPDK_BS_PAGE_SIZE (4 KiB), several per cluster of 16 KiB */
+	CU_ASSERT(bs->num_free_clusters == bs->total_clusters -
+		  spdk_divide_round_up(super_block.md_start + super_block.md_len,
+				       super_block.cluster_size / SPDK_BS_PAGE_SIZE));
 
 	spdk_bs_unload(bs, bs_op_complete, NULL);
 	poll_threads();
@@ -3400,7 +3402,7 @@ bs_grow_live_size(uint64_t new_blockcnt)
 	CU_ASSERT(super_block.size == bdev_size);
 	CU_ASSERT(super_block.clean == 0);
 	/* The used_cluster mask is not written out until first spdk_bs_unload. */
-	memcpy(&mask, g_dev_buffer + super_block.used_cluster_mask_start * g_phys_blocklen,
+	memcpy(&mask, g_dev_buffer + super_block.used_cluster_mask_start * SPDK_BS_PAGE_SIZE,
 	       sizeof(struct spdk_bs_md_mask));
 	CU_ASSERT(mask.type == 0);
 	CU_ASSERT(mask.length == 0);
@@ -3414,7 +3416,7 @@ bs_grow_live_size(uint64_t new_blockcnt)
 	memcpy(&super_block, g_dev_buffer, sizeof(struct spdk_bs_super_block));
 	CU_ASSERT(super_block.size == bdev_size);
 	/* new_md_journal: the super block is never marked clean (unload does not write it); was: CU_ASSERT(super_block.clean == 1); */
-	memcpy(&mask, g_dev_buffer + super_block.used_cluster_mask_start * g_phys_blocklen,
+	memcpy(&mask, g_dev_buffer + super_block.used_cluster_mask_start * SPDK_BS_PAGE_SIZE,
 	       sizeof(struct spdk_bs_md_mask));
 	/* new_md_journal: the used cluster mask is not written by unload/grow; was: CU_ASSERT(mask.type == SPDK_MD_MASK_TYPE_USED_CLUSTERS); */
 	/* new_md_journal: the used cluster mask is not written by unload/grow; was: CU_ASSERT(mask.length == bdev_size / (1 * 1024 * 1024)); */
@@ -3531,7 +3533,7 @@ bs_grow_live_no_space(void)
 	memcpy(&super_block, g_dev_buffer, sizeof(struct spdk_bs_super_block));
 	CU_ASSERT(super_block.size == bdev_size_init);
 	/* new_md_journal: the super block is never marked clean (unload does not write it); was: CU_ASSERT(super_block.clean == 1); */
-	memcpy(&mask, g_dev_buffer + super_block.used_cluster_mask_start * g_phys_blocklen,
+	memcpy(&mask, g_dev_buffer + super_block.used_cluster_mask_start * SPDK_BS_PAGE_SIZE,
 	       sizeof(struct spdk_bs_md_mask));
 	/* new_md_journal: the used cluster mask is not written by unload/grow; was: CU_ASSERT(mask.type == SPDK_MD_MASK_TYPE_USED_CLUSTERS); */
 	/* new_md_journal: the used cluster mask is not written by unload/grow; was: CU_ASSERT(mask.length == bdev_size_init / (1 * 1024 * 1024)); */
@@ -3588,7 +3590,7 @@ bs_test_grow(void)
 	/*
 	 * Make sure the used_cluster mask is correct.
 	 */
-	memcpy(&mask, g_dev_buffer + super_block.used_cluster_mask_start * g_phys_blocklen,
+	memcpy(&mask, g_dev_buffer + super_block.used_cluster_mask_start * SPDK_BS_PAGE_SIZE,
 	       sizeof(struct spdk_bs_md_mask));
 	/* new_md_journal: the used cluster mask is not written by unload/grow; was: CU_ASSERT(mask.type == SPDK_MD_MASK_TYPE_USED_CLUSTERS); */
 	/* new_md_journal: the used cluster mask is not written by unload/grow; was: CU_ASSERT(mask.length == bdev_size / (1 * 1024 * 1024)); */
@@ -3699,15 +3701,21 @@ bs_cluster_sz(void)
 	 * Set cluster size to blobstore page size,
 	 * to work it is required to be at least twice the blobstore page size.
 	 */
-	dev = init_dev();
-	spdk_bs_opts_init(&opts, sizeof(opts));
-	opts.cluster_sz = g_phys_blocklen;
+	/*
+	 * new_md_journal: the md page is SPDK_BS_PAGE_SIZE (4 KiB) whatever the phys block size, so a
+	 * cluster of one phys block is one md page only when the phys block is 4 KiB.
+	 */
+	if (g_phys_blocklen == SPDK_BS_PAGE_SIZE) {
+		dev = init_dev();
+		spdk_bs_opts_init(&opts, sizeof(opts));
+		opts.cluster_sz = g_phys_blocklen;
 
-	/* Initialize a new blob store */
-	spdk_bs_init(dev, &opts, bs_op_with_handle_complete, NULL);
-	poll_threads();
-	CU_ASSERT(g_bserrno == -ENOMEM);
-	SPDK_CU_ASSERT_FATAL(g_bs == NULL);
+		/* Initialize a new blob store */
+		spdk_bs_init(dev, &opts, bs_op_with_handle_complete, NULL);
+		poll_threads();
+		CU_ASSERT(g_bserrno == -ENOMEM);
+		SPDK_CU_ASSERT_FATAL(g_bs == NULL);
+	}
 
 	/*
 	 * Set cluster size to lower than page size,
@@ -4023,7 +4031,7 @@ blob_crc(void)
 	CU_ASSERT(g_bserrno == 0);
 
 	page_num = bs_blobid_to_page(blobid);
-	index = g_phys_blocklen * (bs->md_start + page_num);
+	index = SPDK_BS_PAGE_SIZE * (bs->md_start + page_num); /* md pages are 4 KiB on new_md_journal, whatever the phys block size */
 	page = (struct spdk_blob_md_page *)&g_dev_buffer[index];
 	page->crc = 0;
 
@@ -4335,7 +4343,7 @@ blob_dirty_shutdown(void)
 	/* Mark second blob as invalid */
 	page_num = bs_blobid_to_page(blobid2);
 
-	index = g_phys_blocklen * (bs->md_start + page_num);
+	index = SPDK_BS_PAGE_SIZE * (bs->md_start + page_num); /* md pages are 4 KiB on new_md_journal, whatever the phys block size */
 	page = (struct spdk_blob_md_page *)&g_dev_buffer[index];
 	page->sequence_num = 1;
 	page->crc = blob_md_page_calc_crc(page);
