@@ -7207,6 +7207,15 @@ bs_examine_clone_without_close(void *cb_arg, struct spdk_blob *blob, int bserrno
 }
 
 static void
+bs_load_iter_release_cpl(void *cb_arg, int bserrno)
+{
+	if (bserrno != 0) {
+		SPDK_ERRLOG("Failed to release a blob after iter_cb_fn on examine: %d\n", bserrno);
+	}
+	bs_load_iter_on_examine_cpl(cb_arg, 0);
+}
+
+static void
 bs_load_iter_on_examine(void *arg, struct spdk_blob *blob, int bserrno)
 {
 	struct spdk_bs_load_ctx *ctx = arg;
@@ -7223,11 +7232,18 @@ bs_load_iter_on_examine(void *arg, struct spdk_blob *blob, int bserrno)
 		if (rc != 0) {
 			rc = blob_get_xattr_value(blob, SNAPSHOT_IN_PROGRESS, &value, &len, true);
 			if (rc != 0) {
-				// /* Not corrupted - process it and continue with iterating through blobs */
-				// if (ctx->iter_cb_fn) {
-				// 	ctx->iter_cb_fn(ctx->iter_cb_arg, blob, 0);
-				// }
+				/* Not corrupted - process it and continue with iterating through blobs */
 				bs_blob_list_add(blob);
+				if (ctx->iter_cb_fn) {
+					/*
+					 * A bs_opts.iter_cb_fn user (e.g. blobfs) only inspects the blob, as with
+					 * the iterating load: drop the load-time reference afterwards instead of
+					 * keeping the blob open for an owner (the lvol layer adopts it instead).
+					 */
+					ctx->iter_cb_fn(ctx->iter_cb_arg, blob, 0);
+					spdk_blob_close(blob, bs_load_iter_release_cpl, ctx);
+					return;
+				}
 				bs_load_iter_on_examine_cpl(ctx, 0);
 				return;
 			}
@@ -7491,6 +7507,9 @@ bs_load_used_blobids_cpl_clean_mode(spdk_bs_sequence_t *seq, void *cb_arg, int b
 		worker->bs = ctx->bs;
 		worker->seq = ctx->seq;
 		worker->master_worker = ctx;
+		/* bs_opts.iter_cb_fn (e.g. blobfs) is called for every loaded blob */
+		worker->iter_cb_fn = ctx->iter_cb_fn;
+		worker->iter_cb_arg = ctx->iter_cb_arg;
 
 		if (!bs_load_examine_assign_next(worker)) {
 			break;
@@ -7771,6 +7790,9 @@ bs_load_journal_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		worker->bs = ctx->bs;
 		worker->seq = ctx->seq;
 		worker->master_worker = ctx;
+		/* bs_opts.iter_cb_fn (e.g. blobfs) is called for every loaded blob */
+		worker->iter_cb_fn = ctx->iter_cb_fn;
+		worker->iter_cb_arg = ctx->iter_cb_arg;
 
 		if (!bs_load_examine_assign_next(worker)) {
 			break;
@@ -7876,6 +7898,9 @@ bs_recover(struct spdk_bs_load_ctx *ctx)
 		worker->bs = ctx->bs;
 		worker->seq = ctx->seq;
 		worker->master_worker = ctx;
+		/* bs_opts.iter_cb_fn (e.g. blobfs) is called for every loaded blob */
+		worker->iter_cb_fn = ctx->iter_cb_fn;
+		worker->iter_cb_arg = ctx->iter_cb_arg;
 
 		if (!bs_load_examine_assign_next(worker)) {
 			break;
