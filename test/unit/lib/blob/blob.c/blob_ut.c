@@ -10504,6 +10504,179 @@ blob_shallow_copy(void)
 	poll_threads();
 }
 
+/*
+ * Chain base <- mid <- clone, as LVS_16 on bf23 (2026-11-12): base 0x38
+ * (LVOL_350), mid 0x16 (itself a snapshot), clone the volume below it.
+ * Returns the three open blobs (base opened by the test, mid and clone as well).
+ */
+static void
+ut_secondary_delete_chain(struct spdk_blob_store *bs, struct spdk_blob **base,
+			  struct spdk_blob **mid, struct spdk_blob **clone)
+{
+	struct spdk_blob_opts opts;
+	spdk_blob_id cloneid;
+
+	ut_spdk_blob_opts_init(&opts);
+	opts.num_clusters = 10;
+	*clone = ut_blob_create_and_open(bs, &opts);
+	cloneid = spdk_blob_get_id(*clone);
+
+	spdk_bs_create_snapshot(bs, cloneid, NULL, blob_op_with_id_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blobid != SPDK_BLOBID_INVALID);
+	spdk_bs_open_blob(bs, g_blobid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	*base = g_blob;
+
+	spdk_bs_create_snapshot(bs, cloneid, NULL, blob_op_with_id_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blobid != SPDK_BLOBID_INVALID);
+	spdk_bs_open_blob(bs, g_blobid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	*mid = g_blob;
+
+	CU_ASSERT((*mid)->parent_id == spdk_blob_get_id(*base));
+	CU_ASSERT((*clone)->parent_id == spdk_blob_get_id(*mid));
+}
+
+static bool
+ut_snapshot_has_clone(struct spdk_blob_store *bs, spdk_blob_id snapshotid, spdk_blob_id cloneid)
+{
+	spdk_blob_id ids[4];
+	size_t count = SPDK_COUNTOF(ids);
+	size_t i;
+
+	if (spdk_blob_get_clones(bs, snapshotid, ids, &count) != 0) {
+		return false;
+	}
+	for (i = 0; i < count; i++) {
+		if (ids[i] == cloneid) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * Secondary replay (spdk_bs_delete_blob_non_leader) of the delete of base,
+ * after a leader that did its job: mid was re-parented on disk before base
+ * was deleted. The replay re-reads mid and ends with the tree the leader has
+ * on disk.
+ */
+static void
+blob_secondary_delete_snapshot_reparented(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob *base, *mid, *clone, *tmp;
+	spdk_blob_id baseid, midid, cloneid;
+	const void *value;
+	size_t len;
+	int rc;
+
+	ut_secondary_delete_chain(bs, &base, &mid, &clone);
+	baseid = spdk_blob_get_id(base);
+	midid = spdk_blob_get_id(mid);
+	cloneid = spdk_blob_get_id(clone);
+
+	/* What the leader writes for mid when it deletes base (base has no parent) */
+	mid->md_ro = false;
+	rc = blob_remove_xattr(mid, BLOB_SNAPSHOT, true);
+	CU_ASSERT(rc == 0);
+	spdk_blob_sync_md(mid, false, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	/* ... while this node, a secondary, still has the old view in memory
+	 * (the sync made the read-only blob md_ro again) */
+	mid->md_ro = false;
+	rc = blob_set_xattr(mid, BLOB_SNAPSHOT, &baseid, sizeof(baseid), true);
+	CU_ASSERT(rc == 0);
+	mid->state = SPDK_BLOB_STATE_CLEAN;
+	mid->md_ro = true;
+
+	tmp = spdk_bs_copy_blob(bs, base);
+	SPDK_CU_ASSERT_FATAL(tmp != NULL);
+	/* frees base: do not use it after this */
+	rc = spdk_bs_delete_blob_non_leader(bs, tmp);
+	CU_ASSERT(rc == 0);
+	poll_threads();
+
+	CU_ASSERT(mid->failed_on_update == false);
+	CU_ASSERT(mid->parent_id == SPDK_BLOBID_INVALID);
+	rc = blob_get_xattr_value(mid, BLOB_SNAPSHOT, &value, &len, true);
+	CU_ASSERT(rc != 0);
+	CU_ASSERT(ut_snapshot_has_clone(bs, midid, cloneid));
+	CU_ASSERT(clone->parent_id == midid);
+
+	spdk_blob_close(clone, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	spdk_blob_close(mid, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+}
+
+/*
+ * The incident: the leader deleted base from a stale tree in which base had
+ * no clone, so mid still names base as parent on disk. The secondary replay
+ * re-parents mid in memory and re-reads it; the re-read finds a parent that
+ * no longer exists. It used to drop the parent silently and report success
+ * ("Snapshot fail" only), leaving mid and its clone backed by zeroes. Now the
+ * refresh fails and mid is marked failed_on_update (its IO fails, loudly).
+ */
+static void
+blob_secondary_delete_snapshot_dangling_parent(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob *base, *mid, *clone, *tmp;
+	spdk_blob_id baseid, midid, cloneid;
+	int rc;
+
+	ut_secondary_delete_chain(bs, &base, &mid, &clone);
+	baseid = spdk_blob_get_id(base);
+	midid = spdk_blob_get_id(mid);
+	cloneid = spdk_blob_get_id(clone);
+
+	tmp = spdk_bs_copy_blob(bs, base);
+	SPDK_CU_ASSERT_FATAL(tmp != NULL);
+	/* frees base: do not use it after this */
+	rc = spdk_bs_delete_blob_non_leader(bs, tmp);
+	CU_ASSERT(rc == 0);
+	poll_threads();
+
+	/* base is gone on this node */
+	CU_ASSERT(spdk_bit_array_get(bs->used_blobids, bs_blobid_to_page(baseid)) == false);
+	/* the re-read of mid found base on disk and failed instead of cutting the chain */
+	CU_ASSERT(mid->failed_on_update == true);
+	/* the tree is the replayed one, not one rebuilt from mid's broken md */
+	CU_ASSERT(mid->parent_id == SPDK_BLOBID_INVALID);
+	CU_ASSERT(ut_snapshot_has_clone(bs, midid, cloneid));
+	CU_ASSERT(clone->parent_id == midid);
+
+	/* A later refresh of mid keeps failing while its md names a deleted parent */
+	mid->md_ro = false;
+	blob_freeze_on_failover(mid);
+	spdk_blob_update_on_failover(mid, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -ENOENT);
+	CU_ASSERT(mid->failed_on_update == true);
+	CU_ASSERT(mid->parent_id == SPDK_BLOBID_INVALID);
+	mid->md_ro = true;
+
+	mid->failed_on_update = false;
+	spdk_blob_close(clone, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	spdk_blob_close(mid, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+}
+
 static void
 blob_set_parent(void)
 {
@@ -11719,6 +11892,8 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite_bs, blob_clone_resize);
 		CU_ADD_TEST(suite, blob_esnap_clone_resize);
 		CU_ADD_TEST(suite_bs, blob_shallow_copy);
+		CU_ADD_TEST(suite_bs, blob_secondary_delete_snapshot_reparented);
+		CU_ADD_TEST(suite_bs, blob_secondary_delete_snapshot_dangling_parent);
 		CU_ADD_TEST(suite_esnap_bs, blob_set_parent);
 		CU_ADD_TEST(suite_esnap_bs, blob_set_external_parent);
 	}

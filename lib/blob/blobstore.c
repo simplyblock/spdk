@@ -1843,6 +1843,22 @@ blob_load_snapshot_cpl(void *cb_arg, struct spdk_blob *snapshot, int bserrno)
 			bserrno = -ENOMEM;
 		}
 	}
+	if (bserrno != 0 && ctx->status == SPDK_BLOB_UPDATE_REFRESH) {
+		/*
+		 * The metadata on disk names a parent that cannot be opened (it
+		 * was deleted, typically by a leader that deleted the snapshot
+		 * without re-parenting this blob). Cutting the chain below would
+		 * turn every unallocated cluster of this blob, and of its clones,
+		 * into zeroes. Fail the refresh instead: the caller keeps the open
+		 * blob as it was and marks it failed_on_update.
+		 */
+		SPDK_ERRLOG("Snapshot fail: blob 0x%" PRIx64 " names parent 0x%" PRIx64 " on disk, "
+			    "which cannot be opened (%d): not refreshing it with a broken chain\n",
+			    blob->id, blob->parent_id, bserrno);
+		blob->back_bs_dev = NULL;
+		blob_load_final(ctx, bserrno);
+		return;
+	}
 	if (bserrno != 0) {
 		// spdk_bit_array_clear(blob->bs->open_blobids, blob->parent_id);
 		// this line onlt for failover case
@@ -1959,7 +1975,8 @@ blob_load_backing_dev(spdk_bs_sequence_t *seq, void *cb_arg)
 			/* open snapshot blob and continue in the callback function */
 			blob->parent_id = *(spdk_blob_id *)value;
 
-			if (ctx->status == SPDK_BLOB_UPDATE_FAILOVER) {
+			if (ctx->status == SPDK_BLOB_UPDATE_FAILOVER ||
+			    ctx->status == SPDK_BLOB_UPDATE_REFRESH) {
 				exist = blob_lookup(blob->bs, blob->parent_id);
 				if (exist) {
 					blob_load_snapshot_cpl(ctx, exist, 0);
@@ -12250,11 +12267,30 @@ bs_swap_blobs_repair_chains(struct spdk_blob *destblob, struct spdk_blob *srcblo
 		return;
 	}
 
+	if (srcblob->parent_id == SPDK_BLOBID_EXTERNAL_SNAPSHOT) {
+		return;
+	}
+
 	new_parent_entry = bs_get_snapshot_entry(srcblob->bs, srcblob->parent_id);
 	if (!new_parent_entry) {
-		SPDK_ERRLOG("CRITICAL: parent snapshot 0x%" PRIx64" not found for source blob 0x%" PRIx64 "\n",
-		    srcblob->parent_id, srcblob->id);
-		return;
+		/*
+		 * This node never saw the parent with a clone (its tree is stale:
+		 * the blob was re-parented by the leader while this node did not
+		 * refresh it). Create the entry, as bs_blob_list_add() does, so
+		 * the refreshed blob is in the tree and the parent is not taken
+		 * for a snapshot without clones.
+		 */
+		new_parent_entry = calloc(1, sizeof(*new_parent_entry));
+		if (!new_parent_entry) {
+			SPDK_ERRLOG("CRITICAL: parent snapshot 0x%" PRIx64" not found for source blob 0x%" PRIx64
+				    " and no memory to add it\n", srcblob->parent_id, srcblob->id);
+			return;
+		}
+		new_parent_entry->id = srcblob->parent_id;
+		TAILQ_INIT(&new_parent_entry->clones);
+		TAILQ_INSERT_TAIL(&srcblob->bs->snapshots, new_parent_entry, link);
+		SPDK_NOTICELOG("Added snapshot entry 0x%" PRIx64 " for refreshed blob 0x%" PRIx64 "\n",
+			       srcblob->parent_id, srcblob->id);
 	}
 
 	TAILQ_FOREACH(new_clone_entry, &new_parent_entry->clones, link) {
@@ -12461,7 +12497,7 @@ bs_update_blob_on_failover(struct spdk_blob_store *bs,
 		return;
 	}
 
-	blob_load(seq, newblob, bs_update_blob_cpl, ctx, SPDK_BLOB_UPDATE_FAILOVER);
+	blob_load(seq, newblob, bs_update_blob_cpl, ctx, SPDK_BLOB_UPDATE_REFRESH);
 }
 
 static int
@@ -13683,7 +13719,10 @@ clone_update_delete_sync_cpl(void *cb_arg, int lvolerrno)
 	clone->md_ro = true;
 	clone->state = SPDK_BLOB_STATE_CLEAN;
 	if (lvolerrno < 0) {
-		SPDK_ERRLOG("Could not update clone blob for sync lvol delete blobid 0x%" PRIx64 " \n", clone->id);
+		SPDK_ERRLOG("Could not update clone blob for sync lvol delete blobid 0x%" PRIx64
+			    " (rc %d): its metadata on disk does not match the delete replayed here "
+			    "(expected parent 0x%" PRIx64 "); clone IO fails until it is refreshed\n",
+			    clone->id, lvolerrno, ctx->parent_id);
 		/* ctx was leaked here */
 		free(ctx);
 		return;

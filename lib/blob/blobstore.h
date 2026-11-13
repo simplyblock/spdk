@@ -97,6 +97,11 @@ enum spdk_blob_load_status {
 	SPDK_BLOB_UPDATE_LIVE,
 	SPDK_BLOB_UPDATE_FAILOVER,
 	SPDK_BLOB_LOAD_EXAMINE,
+	/* Like SPDK_BLOB_UPDATE_FAILOVER, but the load re-reads the metadata
+	 * of a blob that is already open (spdk_blob_update_on_failover): a
+	 * parent that cannot be opened fails the load instead of being cut
+	 * from the chain, the open blob keeps its state. */
+	SPDK_BLOB_UPDATE_REFRESH,
 };
 
 TAILQ_HEAD(spdk_xattr_tailq, spdk_xattr);
