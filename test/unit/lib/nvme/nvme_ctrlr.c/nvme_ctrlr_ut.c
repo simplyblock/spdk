@@ -351,6 +351,11 @@ spdk_nvme_ctrlr_cmd_get_feature(struct spdk_nvme_ctrlr *ctrlr, uint8_t feature,
 struct spdk_nvme_ana_page *g_ana_hdr;
 struct spdk_nvme_ana_group_descriptor **g_ana_descs;
 
+/* When set, Get Log Page is submitted but its completion is held back. */
+static bool g_defer_get_log_page;
+static spdk_nvme_cmd_cb g_deferred_cb_fn;
+static void *g_deferred_cb_arg;
+
 int
 spdk_nvme_ctrlr_cmd_get_log_page(struct spdk_nvme_ctrlr *ctrlr, uint8_t log_page,
 				 uint32_t nsid, void *payload, uint32_t payload_size,
@@ -378,8 +383,28 @@ spdk_nvme_ctrlr_cmd_get_log_page(struct spdk_nvme_ctrlr *ctrlr, uint8_t log_page
 		log_page_directory->marketing_description_log_len =  true;
 	}
 
+	if (g_defer_get_log_page) {
+		CU_ASSERT(g_deferred_cb_fn == NULL);
+		g_deferred_cb_fn = cb_fn;
+		g_deferred_cb_arg = cb_arg;
+		return 0;
+	}
+
 	fake_cpl_sc(cb_fn, cb_arg);
 	return 0;
+}
+
+static void
+complete_deferred_get_log_page(uint16_t sct, uint16_t sc)
+{
+	struct spdk_nvme_cpl cpl = {};
+	spdk_nvme_cmd_cb cb_fn = g_deferred_cb_fn;
+
+	SPDK_CU_ASSERT_FATAL(cb_fn != NULL);
+	g_deferred_cb_fn = NULL;
+	cpl.status.sct = sct;
+	cpl.status.sc = sc;
+	cb_fn(g_deferred_cb_arg, &cpl);
 }
 
 int
@@ -688,6 +713,12 @@ nvme_ns_free_nvm_specific_data(struct spdk_nvme_ns *ns)
 void
 nvme_ns_destruct(struct spdk_nvme_ns *ns)
 {
+}
+
+bool
+spdk_nvme_ns_is_active(struct spdk_nvme_ns *ns)
+{
+	return ns->id != 0 && ns->nsdata.ncap != 0;
 }
 
 int
@@ -3051,6 +3082,139 @@ test_nvme_ctrlr_ns_attr_changed(void)
 }
 
 static void
+test_nvme_ctrlr_aer_async(void)
+{
+	DECLARE_AND_CONSTRUCT_CTRLR();
+	uint32_t active_ns_list[] = { 1, 2 };
+	uint32_t active_ns_list2[] = { 1, 2, 3 };
+	struct spdk_nvme_ctrlr_process *proc;
+	struct nvme_aen_ctx *ctx;
+	union spdk_nvme_async_event_completion ana_event = {
+		.bits.async_event_type = SPDK_NVME_ASYNC_EVENT_TYPE_NOTICE,
+		.bits.async_event_info = SPDK_NVME_ASYNC_EVENT_ANA_CHANGE
+	};
+	union spdk_nvme_async_event_completion ns_event = {
+		.bits.async_event_type = SPDK_NVME_ASYNC_EVENT_TYPE_NOTICE,
+		.bits.async_event_info = SPDK_NVME_ASYNC_EVENT_NS_ATTR_CHANGED
+	};
+	struct spdk_nvme_cpl ana_cpl = {
+		.status.sct = SPDK_NVME_SCT_GENERIC,
+		.status.sc = SPDK_NVME_SC_SUCCESS,
+		.cdw0 = ana_event.raw
+	};
+	struct spdk_nvme_cpl ns_cpl = {
+		.status.sct = SPDK_NVME_SCT_GENERIC,
+		.status.sc = SPDK_NVME_SC_SUCCESS,
+		.cdw0 = ns_event.raw
+	};
+
+	SPDK_CU_ASSERT_FATAL(nvme_ctrlr_construct(&ctrlr) == 0);
+
+	ctrlr.vs.bits.mjr = 1;
+	ctrlr.vs.bits.mnr = 2;
+	ctrlr.vs.bits.ter = 0;
+	ctrlr.cdata.nn = 4096;
+
+	ctrlr.state = NVME_CTRLR_STATE_CONFIGURE_AER;
+	g_active_ns_list = active_ns_list;
+	g_active_ns_list_length = SPDK_COUNTOF(active_ns_list);
+	while (ctrlr.state != NVME_CTRLR_STATE_READY) {
+		SPDK_CU_ASSERT_FATAL(nvme_ctrlr_process_init(&ctrlr) == 0);
+	}
+
+	CU_ASSERT(nvme_ctrlr_add_process(&ctrlr, NULL) == 0);
+	proc = nvme_ctrlr_get_current_process(&ctrlr);
+	SPDK_CU_ASSERT_FATAL(proc != NULL);
+	spdk_nvme_ctrlr_register_aer_callback(&ctrlr, aer_cb, NULL);
+	g_aer_cb_counter = 0;
+	g_defer_get_log_page = true;
+
+	/* The ANA log page read is outstanding: nothing is delivered, nothing blocks. */
+	nvme_ctrlr_async_event_cb(&ctrlr.aer[0], &ana_cpl);
+	nvme_ctrlr_complete_queued_async_events(&ctrlr);
+	CU_ASSERT(g_aer_cb_counter == 0);
+	CU_ASSERT(proc->aen_ctx != NULL);
+	CU_ASSERT(g_deferred_cb_fn != NULL);
+
+	/* A second event waits until the first one is finished. */
+	g_active_ns_list = active_ns_list2;
+	g_active_ns_list_length = SPDK_COUNTOF(active_ns_list2);
+	nvme_ctrlr_async_event_cb(&ctrlr.aer[0], &ns_cpl);
+	nvme_ctrlr_complete_queued_async_events(&ctrlr);
+	CU_ASSERT(g_aer_cb_counter == 0);
+	CU_ASSERT(!STAILQ_EMPTY(&proc->async_events));
+	CU_ASSERT(!spdk_nvme_ctrlr_is_active_ns(&ctrlr, 3));
+
+	/* Complete the ANA read: both events are processed and delivered, in order. */
+	g_defer_get_log_page = false;
+	complete_deferred_get_log_page(SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_SUCCESS);
+	nvme_ctrlr_complete_queued_async_events(&ctrlr);
+	CU_ASSERT(g_aer_cb_counter == 2);
+	CU_ASSERT(proc->aen_ctx == NULL);
+	CU_ASSERT(STAILQ_EMPTY(&proc->async_events));
+	CU_ASSERT(spdk_nvme_ctrlr_is_active_ns(&ctrlr, 3));
+
+	/* A failed (e.g. timed out) changed NS log read does not stop the event. */
+	g_aer_cb_counter = 0;
+	g_defer_get_log_page = true;
+	nvme_ctrlr_async_event_cb(&ctrlr.aer[0], &ns_cpl);
+	nvme_ctrlr_complete_queued_async_events(&ctrlr);
+	CU_ASSERT(g_aer_cb_counter == 0);
+	g_defer_get_log_page = false;
+	complete_deferred_get_log_page(SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_INTERNAL_DEVICE_ERROR);
+	nvme_ctrlr_complete_queued_async_events(&ctrlr);
+	CU_ASSERT(g_aer_cb_counter == 1);
+	CU_ASSERT(proc->aen_ctx == NULL);
+
+	/* Failed ANA read: the event is still delivered. */
+	g_aer_cb_counter = 0;
+	g_defer_get_log_page = true;
+	nvme_ctrlr_async_event_cb(&ctrlr.aer[0], &ana_cpl);
+	nvme_ctrlr_complete_queued_async_events(&ctrlr);
+	complete_deferred_get_log_page(SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_INTERNAL_DEVICE_ERROR);
+	nvme_ctrlr_complete_queued_async_events(&ctrlr);
+	CU_ASSERT(g_aer_cb_counter == 1);
+	CU_ASSERT(proc->aen_ctx == NULL);
+
+	/* Command aborted by a reset: delivery is deferred until the reset is done. */
+	g_aer_cb_counter = 0;
+	nvme_ctrlr_async_event_cb(&ctrlr.aer[0], &ana_cpl);
+	nvme_ctrlr_complete_queued_async_events(&ctrlr);
+	ctrlr.is_resetting = true;
+	complete_deferred_get_log_page(SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_ABORTED_SQ_DELETION);
+	ctx = proc->aen_ctx;
+	SPDK_CU_ASSERT_FATAL(ctx != NULL);
+	CU_ASSERT(ctx->done);
+	nvme_ctrlr_complete_queued_async_events(&ctrlr);
+	CU_ASSERT(g_aer_cb_counter == 0);
+	ctrlr.is_resetting = false;
+	nvme_ctrlr_complete_queued_async_events(&ctrlr);
+	CU_ASSERT(g_aer_cb_counter == 1);
+	CU_ASSERT(proc->aen_ctx == NULL);
+
+	/* The process detaches while a command is outstanding: its completion frees the context. */
+	g_aer_cb_counter = 0;
+	nvme_ctrlr_async_event_cb(&ctrlr.aer[0], &ana_cpl);
+	nvme_ctrlr_complete_queued_async_events(&ctrlr);
+	ctx = proc->aen_ctx;
+	SPDK_CU_ASSERT_FATAL(ctx != NULL);
+	nvme_ctrlr_proc_release_aen_ctx(proc);
+	CU_ASSERT(proc->aen_ctx == NULL);
+	CU_ASSERT(ctx->orphaned);
+	ctrlr.is_destructed = true;
+	complete_deferred_get_log_page(SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_ABORTED_SQ_DELETION);
+	nvme_ctrlr_complete_queued_async_events(&ctrlr);
+	CU_ASSERT(g_aer_cb_counter == 0);
+	ctrlr.is_destructed = false;
+
+	g_defer_get_log_page = false;
+	g_active_ns_list = NULL;
+	g_active_ns_list_length = 0;
+	nvme_ctrlr_free_processes(&ctrlr);
+	nvme_ctrlr_destruct(&ctrlr);
+}
+
+static void
 test_nvme_ctrlr_identify_namespaces_iocs_specific_next(void)
 {
 	struct spdk_nvme_ctrlr ctrlr = {};
@@ -3338,8 +3502,12 @@ test_nvme_ctrlr_ana_resize(void)
 	nvme_ctrlr_async_event_cb(&ctrlr.aer[0], &aer_cpl);
 	nvme_ctrlr_complete_queued_async_events(&ctrlr);
 
+	for (i = 0; i < 4; ++i) {
+		CU_ASSERT(spdk_nvme_ctrlr_is_active_ns(&ctrlr, i + 1));
+	}
+
 	/* Update ANA log with new namespaces */
-	ana_desc->ana_state = SPDK_NVME_ANA_OPTIMIZED_STATE;
+	ana_desc->ana_state = SPDK_NVME_ANA_INACCESSIBLE_STATE;
 	ana_desc->num_of_nsid = 4;
 	for (i = 0; i < ana_desc->num_of_nsid; ++i) {
 		ana_desc->nsid[i] = i + 1;
@@ -3351,7 +3519,7 @@ test_nvme_ctrlr_ana_resize(void)
 
 	for (i = 0; i < ana_desc->num_of_nsid; ++i) {
 		ns = spdk_nvme_ctrlr_get_ns(&ctrlr, i + 1);
-		CU_ASSERT(ns->ana_state == SPDK_NVME_ANA_OPTIMIZED_STATE);
+		CU_ASSERT(ns->ana_state == SPDK_NVME_ANA_INACCESSIBLE_STATE);
 	}
 
 	g_active_ns_list = NULL;
@@ -3491,6 +3659,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_nvme_ctrlr_reset);
 	CU_ADD_TEST(suite, test_nvme_ctrlr_aer_callback);
 	CU_ADD_TEST(suite, test_nvme_ctrlr_ns_attr_changed);
+	CU_ADD_TEST(suite, test_nvme_ctrlr_aer_async);
 	CU_ADD_TEST(suite, test_nvme_ctrlr_identify_namespaces_iocs_specific_next);
 	CU_ADD_TEST(suite, test_nvme_ctrlr_set_supported_log_pages);
 	CU_ADD_TEST(suite, test_nvme_ctrlr_set_intel_supported_log_pages);
