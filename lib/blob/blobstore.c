@@ -6997,6 +6997,17 @@ bs_load_iter_on_examine_cpl(void *cb_arg, int bserrno)
 
 	master->active_workers--;
 
+	if (bserrno == -EINVAL || bserrno == -ENOTSUP) {
+		/*
+		 * The blob cannot be used (unsupported flags, unparsable metadata, external snapshot
+		 * device not available): skip it, as the blob iteration of a regular load does,
+		 * instead of failing the load of the whole blobstore. Its owner sees it as present
+		 * in used_blobids but not loaded (spdk_bs_for_each_loaded_blob).
+		 */
+		SPDK_ERRLOG("Skipping blob that failed to load on examine: %d\n", bserrno);
+		bserrno = 0;
+	}
+
 	if (bserrno != 0 && bserrno != -ENOENT) {
 		SPDK_ERRLOG("Error loading blob on examine: %d\n", bserrno);
 
