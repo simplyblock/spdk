@@ -1028,14 +1028,15 @@ io_valid_test(void)
 	/* Last valid block */
 	CU_ASSERT(bdev_io_valid_blocks(&bdev, 99, 1) == true);
 
-	/* Offset past end of bdev */
-	CU_ASSERT(bdev_io_valid_blocks(&bdev, 100, 1) == false);
-
-	/* Offset + length past end of bdev */
-	CU_ASSERT(bdev_io_valid_blocks(&bdev, 99, 2) == false);
-
-	/* Offset near end of uint64_t range (2^64 - 1) */
-	CU_ASSERT(bdev_io_valid_blocks(&bdev, 18446744073709551615ULL, 1) == false);
+	/*
+	 * new_md_journal: bdev_io_valid_blocks() accepts every range ("need this to support
+	 * priority I/O": the offset carries priority / confirmation bits in its high bits, see
+	 * the distrib lba_with_priority), so out-of-range offsets are not rejected here anymore.
+	 * Upstream expected false for the three cases below.
+	 */
+	CU_ASSERT(bdev_io_valid_blocks(&bdev, 100, 1) == true);
+	CU_ASSERT(bdev_io_valid_blocks(&bdev, 99, 2) == true);
+	CU_ASSERT(bdev_io_valid_blocks(&bdev, 18446744073709551615ULL, 1) == true);
 
 	spdk_spin_destroy(&bdev.internal.spinlock);
 }

@@ -1006,6 +1006,10 @@ basic_qos(void)
 	bdev = &g_bdev.bdev;
 	bdev->internal.qos = calloc(1, sizeof(*bdev->internal.qos));
 	SPDK_CU_ASSERT_FATAL(bdev->internal.qos != NULL);
+	/* new_md_journal (pool QoS): rate_limits is allocated separately */
+	bdev->internal.qos->rate_limits = calloc(SPDK_BDEV_QOS_NUM_RATE_LIMIT_TYPES,
+							sizeof(*bdev->internal.qos->rate_limits));
+	SPDK_CU_ASSERT_FATAL(bdev->internal.qos->rate_limits != NULL);
 	/*
 	 * Enable read/write IOPS, read only byte per second and
 	 * read/write byte per second rate limits.
@@ -1180,6 +1184,10 @@ io_during_qos_queue(void)
 	bdev = &g_bdev.bdev;
 	bdev->internal.qos = calloc(1, sizeof(*bdev->internal.qos));
 	SPDK_CU_ASSERT_FATAL(bdev->internal.qos != NULL);
+	/* new_md_journal (pool QoS): rate_limits is allocated separately */
+	bdev->internal.qos->rate_limits = calloc(SPDK_BDEV_QOS_NUM_RATE_LIMIT_TYPES,
+							sizeof(*bdev->internal.qos->rate_limits));
+	SPDK_CU_ASSERT_FATAL(bdev->internal.qos->rate_limits != NULL);
 
 	/*
 	 * Enable read/write IOPS, read only byte per sec, write only
@@ -1283,6 +1291,10 @@ io_during_qos_reset(void)
 	bdev = &g_bdev.bdev;
 	bdev->internal.qos = calloc(1, sizeof(*bdev->internal.qos));
 	SPDK_CU_ASSERT_FATAL(bdev->internal.qos != NULL);
+	/* new_md_journal (pool QoS): rate_limits is allocated separately */
+	bdev->internal.qos->rate_limits = calloc(SPDK_BDEV_QOS_NUM_RATE_LIMIT_TYPES,
+							sizeof(*bdev->internal.qos->rate_limits));
+	SPDK_CU_ASSERT_FATAL(bdev->internal.qos->rate_limits != NULL);
 
 	/*
 	 * Enable read/write IOPS, write only byte per sec and
