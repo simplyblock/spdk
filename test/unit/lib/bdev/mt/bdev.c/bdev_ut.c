@@ -1195,14 +1195,17 @@ io_during_qos_queue(void)
 	 * In this case, both read only and write only byte per sec
 	 * rate limit will take effect.
 	 */
-	/* 4000 read/write I/O per second, or 4 per millisecond */
-	bdev->internal.qos->rate_limits[SPDK_BDEV_QOS_RW_IOPS_RATE_LIMIT].limit = 4000;
-	/* 8K byte per millisecond with 4K block size */
-	bdev->internal.qos->rate_limits[SPDK_BDEV_QOS_RW_BPS_RATE_LIMIT].limit = 8192000;
-	/* 4K byte per millisecond with 4K block size */
-	bdev->internal.qos->rate_limits[SPDK_BDEV_QOS_R_BPS_RATE_LIMIT].limit = 4096000;
-	/* 4K byte per millisecond with 4K block size */
-	bdev->internal.qos->rate_limits[SPDK_BDEV_QOS_W_BPS_RATE_LIMIT].limit = 4096000;
+	/*
+	 * The fork's QoS timeslice is SPDK_BDEV_QOS_TIMESLICE_IN_USEC (5 ms, not 1 ms):
+	 * scale the limits so that one timeslice still allows 4 I/Os, 8K read/write,
+	 * 4K read and 4K write bytes with 4K block size.
+	 */
+#define UT_QOS_PER_TIMESLICE(per_ms) ((per_ms) * 1000ULL * 1000 / SPDK_BDEV_QOS_TIMESLICE_IN_USEC)
+	bdev->internal.qos->rate_limits[SPDK_BDEV_QOS_RW_IOPS_RATE_LIMIT].limit = UT_QOS_PER_TIMESLICE(4);
+	bdev->internal.qos->rate_limits[SPDK_BDEV_QOS_RW_BPS_RATE_LIMIT].limit = UT_QOS_PER_TIMESLICE(8192);
+	bdev->internal.qos->rate_limits[SPDK_BDEV_QOS_R_BPS_RATE_LIMIT].limit = UT_QOS_PER_TIMESLICE(4096);
+	bdev->internal.qos->rate_limits[SPDK_BDEV_QOS_W_BPS_RATE_LIMIT].limit = UT_QOS_PER_TIMESLICE(4096);
+#undef UT_QOS_PER_TIMESLICE
 
 	g_get_io_channel = true;
 
@@ -1250,8 +1253,8 @@ io_during_qos_queue(void)
 	/* The write I/O should complete. */
 	CU_ASSERT(status2 == SPDK_BDEV_IO_STATUS_SUCCESS);
 
-	/* Advance in time by a millisecond */
-	spdk_delay_us(1000);
+	/* Advance in time by one QoS timeslice */
+	spdk_delay_us(SPDK_BDEV_QOS_TIMESLICE_IN_USEC);
 
 	/* Complete more I/O */
 	poll_threads();
