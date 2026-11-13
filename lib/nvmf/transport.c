@@ -916,6 +916,18 @@ nvmf_request_set_stripped_buffer(struct spdk_nvmf_request *req, void *buf, uint3
 
 static void nvmf_request_iobuf_get_cb(struct spdk_iobuf_entry *entry, void *buf);
 
+/*
+ * Subsystem NQN for log messages. A qpair has no controller yet while its CONNECT
+ * command (which carries data, so it needs a buffer) is being processed.
+ */
+static inline const char *
+nvmf_request_log_subnqn(struct spdk_nvmf_request *req)
+{
+	struct spdk_nvmf_ctrlr *ctrlr = req->qpair->ctrlr;
+
+	return (ctrlr != NULL && ctrlr->subsys != NULL) ? ctrlr->subsys->subnqn : "<no ctrlr>";
+}
+
 static int
 nvmf_request_get_buffers(struct spdk_nvmf_request *req,
 			 struct spdk_nvmf_transport_poll_group *group,
@@ -934,7 +946,7 @@ nvmf_request_get_buffers(struct spdk_nvmf_request *req,
 	num_buffers = SPDK_CEIL_DIV(length, io_unit_size);
 	if (spdk_unlikely(num_buffers > NVMF_REQ_MAX_BUFFERS)) {
 		SPDK_ERRLOG("qpair id:%d nqn:%s Request requires %u buffers, which is more than the maximum allowed (%u)\n", req->qpair->qid,
-			    req->qpair->ctrlr->subsys->subnqn, num_buffers, NVMF_REQ_MAX_BUFFERS);
+			    nvmf_request_log_subnqn(req), num_buffers, NVMF_REQ_MAX_BUFFERS);
 		return -EINVAL;
 	}
 
@@ -947,7 +959,8 @@ nvmf_request_get_buffers(struct spdk_nvmf_request *req,
 		buffer = spdk_iobuf_get(group->buf_cache, spdk_min(io_unit_size, length), entry,
 					nvmf_request_iobuf_get_cb);
 		if (spdk_unlikely(buffer == NULL)) {
-			spdk_iobuf_get_stats_per_channel(group->buf_cache, req->qpair->ctrlr->subsys->subnqn, req->qpair->qid);
+			spdk_iobuf_get_stats_per_channel(group->buf_cache, nvmf_request_log_subnqn(req),
+							 req->qpair->qid);
 			req->iobuf.remaining_length = length;
 			return -ENOMEM;
 		}
@@ -999,7 +1012,8 @@ spdk_nvmf_request_get_buffers(struct spdk_nvmf_request *req,
 	// SPDK_NOTICELOG("get buf group %p \n", group);
 	rc = nvmf_request_get_buffers(req, group, transport, length, transport->opts.io_unit_size, false);
 	if (spdk_unlikely(rc == -ENOMEM && transport->ops->req_get_buffers_done == NULL)) {
-		SPDK_NOTICELOG("waiting for release buf,qid:%d nqn:%s \n", req->qpair->qid, req->qpair->ctrlr->subsys->subnqn);
+		SPDK_NOTICELOG("waiting for release buf,qid:%d nqn:%s \n", req->qpair->qid,
+			       nvmf_request_log_subnqn(req));
 		spdk_nvmf_request_free_buffers(req, group, transport);
 	}
 

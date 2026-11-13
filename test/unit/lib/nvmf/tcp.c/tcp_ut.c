@@ -269,7 +269,8 @@ DEFINE_STUB(nvmf_auth_request_exec, int, (struct spdk_nvmf_request *r),
 DEFINE_STUB(nvmf_request_get_buffers_abort, bool, (struct spdk_nvmf_request *r), false);
 DEFINE_STUB(spdk_bdev_io_type_supported, bool,
 	    (struct spdk_bdev *bdev, enum spdk_bdev_io_type io_type), false);
-DEFINE_STUB(spdk_nvmf_check_port_permission, bool, (uint16_t port, bool *is_reject), false);
+/* no port is blocked (fenced): the real function returns true then */
+DEFINE_STUB(spdk_nvmf_check_port_permission, bool, (uint16_t port, bool *is_reject), true);
 DEFINE_STUB(spdk_nvmf_check_port_timeout, int, (uint64_t ack_timeout), 0);
 struct spdk_io_channel *
 spdk_accel_get_io_channel(void)
@@ -1563,6 +1564,19 @@ test_nvmf_tcp_tls_generate_tls_psk(void)
 	uint8_t psk_key1[SPDK_TLS_PSK_MAX_LEN] = {}, psk_key2[SPDK_TLS_PSK_MAX_LEN] = {};
 	uint8_t too_small_psk_tls[5] = {};
 	int retained_size, tls_size;
+	const uint8_t kat_retained[] = {
+		0xb7, 0x99, 0x8b, 0x35, 0x1f, 0xe9, 0xd0, 0x65, 0x9b, 0x39, 0x2f, 0x3a, 0xad, 0x42, 0x6e, 0xab,
+		0x72, 0x85, 0xab, 0x9b, 0xab, 0x94, 0xe3, 0xd6, 0xe8, 0xce, 0x50, 0x61, 0xfa, 0xd8, 0x0b, 0x36
+	};
+	const uint8_t kat_tls_sha256[] = {
+		0x96, 0xe4, 0x72, 0x5a, 0x6e, 0x73, 0x5e, 0x32, 0x24, 0xd5, 0xb4, 0x91, 0xbe, 0x4d, 0x67, 0x30,
+		0xa1, 0xed, 0x88, 0x6c, 0xc8, 0x7f, 0x90, 0xad, 0x62, 0x5b, 0x08, 0xca, 0x9e, 0xeb, 0xc5, 0x0c
+	};
+	const uint8_t kat_tls_sha384[] = {
+		0xd4, 0x88, 0xb7, 0x71, 0xb9, 0xcd, 0x86, 0xf0, 0xc2, 0xe1, 0x2f, 0xaf, 0x21, 0x3b, 0x11, 0x71,
+		0x42, 0xd9, 0x9f, 0xf5, 0x55, 0xa0, 0x0a, 0xad, 0x0b, 0x62, 0xb6, 0x7b, 0xa1, 0x3b, 0x78, 0x9c,
+		0x03, 0x0b, 0x40, 0x7a, 0x6c, 0xca, 0x58, 0x0d, 0x6d, 0xb2, 0x5d, 0x4c, 0x50, 0x02, 0xba, 0xfe
+	};
 
 	unhexlified = spdk_unhexlify(psk_reference);
 	CU_ASSERT(unhexlified != NULL);
@@ -1581,6 +1595,13 @@ test_nvmf_tcp_tls_generate_tls_psk(void)
 	CU_ASSERT(nvme_tcp_derive_tls_psk(psk_retained, retained_size, psk_id_reference, psk_key2,
 					  SPDK_TLS_PSK_MAX_LEN, NVME_TCP_CIPHER_AES_256_GCM_SHA384) > 0);
 	CU_ASSERT(memcmp(psk_key1, psk_key2, tls_size) != 0);
+
+	/* Known answers (RFC 5869 HKDF without salt, computed independently in Python). */
+	CU_ASSERT(retained_size == sizeof(kat_retained));
+	CU_ASSERT(memcmp(psk_retained, kat_retained, sizeof(kat_retained)) == 0);
+	CU_ASSERT(tls_size == sizeof(kat_tls_sha256));
+	CU_ASSERT(memcmp(psk_key1, kat_tls_sha256, sizeof(kat_tls_sha256)) == 0);
+	CU_ASSERT(memcmp(psk_key2, kat_tls_sha384, sizeof(kat_tls_sha384)) == 0);
 
 	/* Make sure that passing unknown value as hash errors out the function. */
 	CU_ASSERT(nvme_tcp_derive_tls_psk(psk_retained, retained_size, psk_id_reference,

@@ -111,13 +111,30 @@ DEFINE_STUB(spdk_blob_is_esnap_clone, bool, (const struct spdk_blob *blob), fals
 DEFINE_STUB(spdk_blob_is_degraded, bool, (const struct spdk_blob *blob), false);
 DEFINE_STUB_V(spdk_bs_grow_live,
 	      (struct spdk_blob_store *bs, spdk_bs_op_complete cb_fn, void *cb_arg));
-DEFINE_STUB_V(spdk_blob_unfreeze_cleanup,
-	      (struct spdk_blob *blob, spdk_blob_op_with_id_complete cb_fn, void *cb_arg));
+/* new_md_journal: snapshot creation freezes the origin blob, waits SNAPSHOT_FREEZE_DELAY in a timed
+ * poller and unfreezes on failure; the fakes complete immediately (see ut_lvol_snapshot_settle). */
+void
+spdk_blob_unfreeze_cleanup(struct spdk_blob *blob, spdk_blob_op_with_id_complete cb_fn, void *cb_arg)
+{
+	cb_fn(cb_arg, SPDK_BLOBID_INVALID, 0);
+}
 DEFINE_STUB_V(blob_freeze_on_failover, (struct spdk_blob *blob));
 DEFINE_STUB(spdk_blob_get_md_ro, bool, (struct spdk_blob *blob), false);
 DEFINE_STUB_V(spdk_blob_set_md_ro, (struct spdk_blob *blob, bool md_ro));
 DEFINE_STUB_V(spdk_blob_set_clean, (struct spdk_blob *blob));
-DEFINE_STUB_V(spdk_snapshot_freeze_blob, (struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg));
+void
+spdk_snapshot_freeze_blob(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	cb_fn(cb_arg, 0);
+}
+
+/* Let the delayed (50 ms timed poller) snapshot creation of spdk_lvol_create_snapshot run. */
+static void
+ut_lvol_snapshot_settle(void)
+{
+	spdk_delay_us(50 * 1000);
+	poll_threads();
+}
 DEFINE_STUB_V(spdk_blob_update_on_failover, (struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg));
 DEFINE_STUB(spdk_bs_delete_blob_non_leader, int ,(struct spdk_blob_store *bs, struct spdk_blob *blob), 0);
 DEFINE_STUB_V(spdk_bdev_free_io, (struct spdk_bdev_io *g_bdev_io));
@@ -135,8 +152,6 @@ DEFINE_STUB(spdk_blob_get_parent_snapshot, spdk_blob_id, (struct spdk_blob_store
 	    SPDK_BLOBID_INVALID);
 
 DEFINE_STUB(spdk_blob_locked_operation_in_progress, bool, (const struct spdk_blob *blob), false);
-DEFINE_STUB(spdk_bs_for_each_loaded_blob, int,(struct spdk_blob_store *bs,
-			     spdk_bs_loaded_blob_fn fn, void *cb_arg), 0);
 
 /* Records the remote writes (the transfer tests check them); returns
  * g_ut_bdev_write_rc from write number g_ut_bdev_write_fail_at on (0: never). */
@@ -345,6 +360,27 @@ spdk_bs_iter_next(struct spdk_blob_store *bs, struct spdk_blob *b,
 	}
 
 	cb_fn(cb_arg, next, _errno);
+}
+
+/* spdk_lvs_load_ext loads the lvols from the blobs the blobstore load already opened
+ * (examine path): visit every blob but the super blob, then end with -ENOENT. */
+int
+spdk_bs_for_each_loaded_blob(struct spdk_blob_store *bs, spdk_bs_loaded_blob_fn fn, void *cb_arg)
+{
+	struct spdk_blob *blob;
+
+	TAILQ_FOREACH(blob, &bs->blobs, link) {
+		if (blob->id == bs->super_blobid) {
+			continue;
+		}
+		if (blob->load_status != 0) {
+			fn(cb_arg, NULL, blob->load_status);
+			continue;
+		}
+		fn(cb_arg, blob, 0);
+	}
+	fn(cb_arg, NULL, -ENOENT);
+	return 0;
 }
 
 void
@@ -826,6 +862,14 @@ spdk_blob_get_clones(struct spdk_blob_store *bs, spdk_blob_id blob_id, spdk_blob
 static void
 lvol_store_op_with_handle_complete(void *cb_arg, struct spdk_lvol_store *lvol_store, int lvserrno)
 {
+	/*
+	 * new_md_journal: an lvstore is created / loaded as non-leader, and snapshot, clone,
+	 * delete etc. require leadership, which the control plane grants afterwards
+	 * (spdk_lvs_set_leader). These single-node tests act as that control plane.
+	 */
+	if (lvserrno == 0 && lvol_store != NULL) {
+		spdk_lvs_set_leader(lvol_store, true);
+	}
 	g_lvol_store = lvol_store;
 	g_lvserrno = lvserrno;
 	if (cb_arg != NULL) {
@@ -1776,6 +1820,7 @@ lvol_snapshot(void)
 	lvol = g_lvol;
 
 	spdk_lvol_create_snapshot(lvol, "snap", lvol_op_with_handle_complete, NULL);
+	ut_lvol_snapshot_settle();
 	CU_ASSERT(g_lvserrno == 0);
 	SPDK_CU_ASSERT_FATAL(g_lvol != NULL);
 	CU_ASSERT_STRING_EQUAL(g_lvol->name, "snap");
@@ -1824,18 +1869,22 @@ lvol_snapshot_fail(void)
 	lvol = g_lvol;
 
 	spdk_lvol_create_snapshot(NULL, "snap", lvol_op_with_handle_complete, NULL);
+	ut_lvol_snapshot_settle();
 	CU_ASSERT(g_lvserrno < 0);
 	SPDK_CU_ASSERT_FATAL(g_lvol == NULL);
 
 	spdk_lvol_create_snapshot(lvol, "", lvol_op_with_handle_complete, NULL);
+	ut_lvol_snapshot_settle();
 	CU_ASSERT(g_lvserrno < 0);
 	SPDK_CU_ASSERT_FATAL(g_lvol == NULL);
 
 	spdk_lvol_create_snapshot(lvol, NULL, lvol_op_with_handle_complete, NULL);
+	ut_lvol_snapshot_settle();
 	CU_ASSERT(g_lvserrno < 0);
 	SPDK_CU_ASSERT_FATAL(g_lvol == NULL);
 
 	spdk_lvol_create_snapshot(lvol, "snap", lvol_op_with_handle_complete, NULL);
+	ut_lvol_snapshot_settle();
 	CU_ASSERT(g_lvserrno == 0);
 	SPDK_CU_ASSERT_FATAL(g_lvol != NULL);
 	CU_ASSERT_STRING_EQUAL(g_lvol->name, "snap");
@@ -1843,6 +1892,7 @@ lvol_snapshot_fail(void)
 	snap = g_lvol;
 
 	spdk_lvol_create_snapshot(lvol, "snap", lvol_op_with_handle_complete, NULL);
+	ut_lvol_snapshot_settle();
 	CU_ASSERT(g_lvserrno < 0);
 
 	spdk_lvol_close(lvol, op_complete, NULL);
@@ -1889,6 +1939,7 @@ lvol_clone(void)
 	lvol = g_lvol;
 
 	spdk_lvol_create_snapshot(lvol, "snap", lvol_op_with_handle_complete, NULL);
+	ut_lvol_snapshot_settle();
 	CU_ASSERT(g_lvserrno == 0);
 	SPDK_CU_ASSERT_FATAL(g_lvol != NULL);
 	CU_ASSERT_STRING_EQUAL(g_lvol->name, "snap");
@@ -1950,6 +2001,7 @@ lvol_clone_fail(void)
 	lvol = g_lvol;
 
 	spdk_lvol_create_snapshot(lvol, "snap", lvol_op_with_handle_complete, NULL);
+	ut_lvol_snapshot_settle();
 	CU_ASSERT(g_lvserrno == 0);
 	SPDK_CU_ASSERT_FATAL(g_lvol != NULL);
 	CU_ASSERT_STRING_EQUAL(g_lvol->name, "snap");
@@ -2028,6 +2080,7 @@ lvol_iter_clones(void)
 
 	/* Create a snapshot of the volume */
 	spdk_lvol_create_snapshot(lvol, "snap", lvol_op_with_handle_complete, NULL);
+	ut_lvol_snapshot_settle();
 	CU_ASSERT(g_lvserrno == 0);
 	SPDK_CU_ASSERT_FATAL(g_lvol != NULL);
 	CU_ASSERT_STRING_EQUAL(g_lvol->name, "snap");
@@ -3023,6 +3076,7 @@ lvol_esnap_missing(void)
 	CU_ASSERT(degraded_set != NULL);
 	spdk_lvol_create_snapshot(lvol1, name2, lvol_op_with_handle_complete,
 				  ut_cb_res_clear(&cb_res));
+	ut_lvol_snapshot_settle();
 	CU_ASSERT(cb_res.err == 0);
 	SPDK_CU_ASSERT_FATAL(cb_res.data != NULL);
 	lvol2 = cb_res.data;
@@ -3682,6 +3736,7 @@ lvol_set_parent(void)
 
 	/* Create a snapshot of lvol2 */
 	spdk_lvol_create_snapshot(lvol2, "snap1", lvol_op_with_handle_complete, NULL);
+	ut_lvol_snapshot_settle();
 	CU_ASSERT(g_lvserrno == 0);
 	SPDK_CU_ASSERT_FATAL(g_lvol != NULL);
 	CU_ASSERT_STRING_EQUAL(g_lvol->name, "snap1");

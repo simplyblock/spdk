@@ -750,7 +750,7 @@ spdk_iobuf_get(struct spdk_iobuf_channel *ch, uint64_t len,
 }
 
 void
-spdk_iobuf_get_stats_per_channel(struct spdk_iobuf_channel *ch, char *nqn, int qid)
+spdk_iobuf_get_stats_per_channel(struct spdk_iobuf_channel *ch, const char *nqn, int qid)
 {
 	struct spdk_iobuf_node_cache *cache;
 	struct spdk_iobuf_pool_cache *small, *large;

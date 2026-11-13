@@ -2528,7 +2528,8 @@ spdk_put_io_channel(struct spdk_io_channel *ch)
 		      "Putting io_channel %p for io_device %s (%p) on thread %s refcnt %u\n",
 		      ch, ch->dev->name, ch->dev->io_device, thread->name, ch->ref);
 	SPDK_NOTICELOG("Putting io_channel %p for io_device %s (%p) on thread %s refcnt %u\n",
-		      ch, ch->dev->name, ch->dev->io_device, thread->name, ch->ref);
+		      ch, ch->dev ? ch->dev->name : "(none)", ch->dev ? ch->dev->io_device : NULL,
+		      thread->name, ch->ref);
 
 	ch->ref--;
 

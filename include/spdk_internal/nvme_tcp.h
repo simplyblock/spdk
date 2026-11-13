@@ -726,11 +726,11 @@ nvme_tcp_derive_retained_psk(const uint8_t *psk_in, uint64_t psk_in_size, const 
 		rc = -ENOBUFS;
 		goto end;
 	}
-	if (EVP_PKEY_CTX_set1_hkdf_salt(ctx, NULL, 0) != 1) {
-		SPDK_ERRLOG("Unable to set salt for HKDF!\n");
-		rc = -EINVAL;
-		goto end;
-	}
+	/*
+	 * No salt: RFC 5869 then uses HashLen zero bytes, which gives the same PRK as an
+	 * empty salt. Do not pass a NULL/0 salt explicitly - newer OpenSSL 3 providers
+	 * reject an empty octet-string parameter, which made every TLS PSK derivation fail.
+	 */
 	if (EVP_PKEY_derive(ctx, psk_out, &digest_len) != 1) {
 		SPDK_ERRLOG("Unable to derive the PSK key!\n");
 		rc = -EINVAL;
@@ -817,11 +817,11 @@ nvme_tcp_derive_tls_psk(const uint8_t *psk_in, uint64_t psk_in_size, const char 
 		rc = -ENOBUFS;
 		goto end;
 	}
-	if (EVP_PKEY_CTX_set1_hkdf_salt(ctx, NULL, 0) != 1) {
-		SPDK_ERRLOG("Unable to set salt for HKDF!\n");
-		rc = -EINVAL;
-		goto end;
-	}
+	/*
+	 * No salt: RFC 5869 then uses HashLen zero bytes, which gives the same PRK as an
+	 * empty salt. Do not pass a NULL/0 salt explicitly - newer OpenSSL 3 providers
+	 * reject an empty octet-string parameter, which made every TLS PSK derivation fail.
+	 */
 	if (EVP_PKEY_derive(ctx, psk_out, &digest_len) != 1) {
 		SPDK_ERRLOG("Unable to derive the PSK key!\n");
 		rc = -EINVAL;

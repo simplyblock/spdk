@@ -6503,6 +6503,13 @@ bs_alloc(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts, struct spdk_blob_st
 			    opts->cluster_sz, SPDK_BS_PAGE_SIZE);
 		return -EINVAL;
 	}
+	if (opts->cluster_sz % SPDK_BS_PAGE_SIZE != 0 || opts->cluster_sz % dev->blocklen != 0) {
+		/* A cluster is a whole number of md pages and of device blocks */
+		SPDK_ERRLOG("Cluster size %" PRIu32 " is not a multiple of the page size %d and the "
+			    "device block length %" PRIu32 "\n", opts->cluster_sz, SPDK_BS_PAGE_SIZE,
+			    dev->blocklen);
+		return -EINVAL;
+	}
 	bs = calloc(1, sizeof(struct spdk_blob_store));
 	if (!bs) {
 		return -ENOMEM;
@@ -6958,6 +6965,36 @@ static void
 bs_load_blob_iter_on_examine(struct spdk_bs_load_ctx *ctx);
 
 static void
+bs_load_examine_finish(struct spdk_bs_load_ctx *master)
+{
+	SPDK_NOTICELOG("Parallel examine blob loading done, rc=%d\n", master->rc);
+
+	/* A blobstore created without the md journal has none to start. */
+	if (master->bs->md_journal != NULL) {
+		bs_md_journal_examine_complete(master->bs->md_journal);
+		bs_md_journal_start(master->bs->md_journal);
+	}
+
+	free(master->master_worker);
+	master->master_worker = NULL;
+
+	master->iter_cb_fn = NULL;
+
+	if (master->super) {
+		spdk_free(master->super);
+		master->super = NULL;
+	}
+
+	if (master->mask) {
+		spdk_free(master->mask);
+		master->mask = NULL;
+	}
+
+	bs_sequence_finish(master->seq, master->rc);
+	free(master);
+}
+
+static void
 bs_load_iter_on_examine_cpl(void *cb_arg, int bserrno)
 {
 	struct spdk_bs_load_ctx *worker = cb_arg;
@@ -6966,6 +7003,17 @@ bs_load_iter_on_examine_cpl(void *cb_arg, int bserrno)
 	assert(master->active_workers > 0);
 
 	master->active_workers--;
+
+	if (bserrno == -EINVAL || bserrno == -ENOTSUP) {
+		/*
+		 * The blob cannot be used (unsupported flags, unparsable metadata, external snapshot
+		 * device not available): skip it, as the blob iteration of a regular load does,
+		 * instead of failing the load of the whole blobstore. Its owner sees it as present
+		 * in used_blobids but not loaded (spdk_bs_for_each_loaded_blob).
+		 */
+		SPDK_ERRLOG("Skipping blob that failed to load on examine: %d\n", bserrno);
+		bserrno = 0;
+	}
 
 	if (bserrno != 0 && bserrno != -ENOENT) {
 		SPDK_ERRLOG("Error loading blob on examine: %d\n", bserrno);
@@ -7007,31 +7055,7 @@ bs_load_iter_on_examine_cpl(void *cb_arg, int bserrno)
 	}
 
 finish:
-	SPDK_NOTICELOG("Parallel examine blob loading done, rc=%d\n", master->rc);
-
-	/* A blobstore created without the md journal has none to start. */
-	if (master->bs->md_journal != NULL) {
-		bs_md_journal_examine_complete(master->bs->md_journal);
-		bs_md_journal_start(master->bs->md_journal);
-	}
-
-	free(master->master_worker);
-	master->master_worker = NULL;
-
-	master->iter_cb_fn = NULL;
-
-	if (master->super) {
-		spdk_free(master->super);
-		master->super = NULL;
-	}
-
-	if (master->mask) {
-		spdk_free(master->mask);
-		master->mask = NULL;
-	}
-
-	bs_sequence_finish(master->seq, master->rc);
-	free(master);
+	bs_load_examine_finish(master);
 }
 
 static void
@@ -7183,6 +7207,15 @@ bs_examine_clone_without_close(void *cb_arg, struct spdk_blob *blob, int bserrno
 }
 
 static void
+bs_load_iter_release_cpl(void *cb_arg, int bserrno)
+{
+	if (bserrno != 0) {
+		SPDK_ERRLOG("Failed to release a blob after iter_cb_fn on examine: %d\n", bserrno);
+	}
+	bs_load_iter_on_examine_cpl(cb_arg, 0);
+}
+
+static void
 bs_load_iter_on_examine(void *arg, struct spdk_blob *blob, int bserrno)
 {
 	struct spdk_bs_load_ctx *ctx = arg;
@@ -7199,11 +7232,18 @@ bs_load_iter_on_examine(void *arg, struct spdk_blob *blob, int bserrno)
 		if (rc != 0) {
 			rc = blob_get_xattr_value(blob, SNAPSHOT_IN_PROGRESS, &value, &len, true);
 			if (rc != 0) {
-				// /* Not corrupted - process it and continue with iterating through blobs */
-				// if (ctx->iter_cb_fn) {
-				// 	ctx->iter_cb_fn(ctx->iter_cb_arg, blob, 0);
-				// }
+				/* Not corrupted - process it and continue with iterating through blobs */
 				bs_blob_list_add(blob);
+				if (ctx->iter_cb_fn) {
+					/*
+					 * A bs_opts.iter_cb_fn user (e.g. blobfs) only inspects the blob, as with
+					 * the iterating load: drop the load-time reference afterwards instead of
+					 * keeping the blob open for an owner (the lvol layer adopts it instead).
+					 */
+					ctx->iter_cb_fn(ctx->iter_cb_arg, blob, 0);
+					spdk_blob_close(blob, bs_load_iter_release_cpl, ctx);
+					return;
+				}
 				bs_load_iter_on_examine_cpl(ctx, 0);
 				return;
 			}
@@ -7467,6 +7507,9 @@ bs_load_used_blobids_cpl_clean_mode(spdk_bs_sequence_t *seq, void *cb_arg, int b
 		worker->bs = ctx->bs;
 		worker->seq = ctx->seq;
 		worker->master_worker = ctx;
+		/* bs_opts.iter_cb_fn (e.g. blobfs) is called for every loaded blob */
+		worker->iter_cb_fn = ctx->iter_cb_fn;
+		worker->iter_cb_arg = ctx->iter_cb_arg;
 
 		if (!bs_load_examine_assign_next(worker)) {
 			break;
@@ -7474,6 +7517,12 @@ bs_load_used_blobids_cpl_clean_mode(spdk_bs_sequence_t *seq, void *cb_arg, int b
 
 		ctx->active_workers++;
 		bs_load_blob_iter_on_examine(worker);
+	}
+
+	/* No blob to load (empty blobstore): nothing would ever complete the load. */
+	if (ctx->active_workers == 0) {
+		ctx->scan_done = true;
+		bs_load_examine_finish(ctx);
 	}
 }
 
@@ -7741,6 +7790,9 @@ bs_load_journal_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		worker->bs = ctx->bs;
 		worker->seq = ctx->seq;
 		worker->master_worker = ctx;
+		/* bs_opts.iter_cb_fn (e.g. blobfs) is called for every loaded blob */
+		worker->iter_cb_fn = ctx->iter_cb_fn;
+		worker->iter_cb_arg = ctx->iter_cb_arg;
 
 		if (!bs_load_examine_assign_next(worker)) {
 			break;
@@ -7748,6 +7800,12 @@ bs_load_journal_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 
 		ctx->active_workers++;
 		bs_load_blob_iter_on_examine(worker);
+	}
+
+	/* No blob to load (empty blobstore): nothing would ever complete the load. */
+	if (ctx->active_workers == 0) {
+		ctx->scan_done = true;
+		bs_load_examine_finish(ctx);
 	}
 }
 
@@ -7840,6 +7898,9 @@ bs_recover(struct spdk_bs_load_ctx *ctx)
 		worker->bs = ctx->bs;
 		worker->seq = ctx->seq;
 		worker->master_worker = ctx;
+		/* bs_opts.iter_cb_fn (e.g. blobfs) is called for every loaded blob */
+		worker->iter_cb_fn = ctx->iter_cb_fn;
+		worker->iter_cb_arg = ctx->iter_cb_arg;
 
 		if (!bs_load_examine_assign_next(worker)) {
 			break;
@@ -7847,6 +7908,12 @@ bs_recover(struct spdk_bs_load_ctx *ctx)
 
 		ctx->active_workers++;
 		bs_load_blob_iter_on_examine(worker);
+	}
+
+	/* No blob to load (empty blobstore): nothing would ever complete the load. */
+	if (ctx->active_workers == 0) {
+		ctx->scan_done = true;
+		bs_load_examine_finish(ctx);
 	}
 }
 
@@ -7859,6 +7926,17 @@ bs_load_only_used_blobid_pages_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bs
 	if (bserrno != 0) {
 		bs_load_ctx_fail(ctx, bserrno);
 		return;
+	}
+
+	/*
+	 * The used blobid mask is persisted page by page together with blob metadata
+	 * (persist_bs_write_used_blobids), and unload no longer writes it. A blobstore that
+	 * never persisted a blob has a never-written (all zero) mask: no blobid is in use.
+	 */
+	if (ctx->mask->type == 0 && ctx->mask->length == 0) {
+		SPDK_INFOLOG(blob, "Used blobid mask never written: no blobs\n");
+		ctx->mask->type = SPDK_MD_MASK_TYPE_USED_BLOBIDS;
+		ctx->mask->length = ctx->super->md_len;
 	}
 
 	/* The type must be correct */

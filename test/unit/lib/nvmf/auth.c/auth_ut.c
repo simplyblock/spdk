@@ -49,6 +49,18 @@ spdk_nvmf_qpair_disconnect(struct spdk_nvmf_qpair *qpair)
 
 static bool g_req_completed;
 
+/*
+ * 55b7c1dcf (nvmf/auth: add small delay after sending failure1 message) disconnects
+ * the qpair from a poller NVMF_AUTH_FAILURE1_DELAY_US after the failure1 message.
+ */
+static void
+ut_auth_failure1_settle(void)
+{
+	spdk_delay_us(NVMF_AUTH_FAILURE1_DELAY_US);
+	poll_threads();
+}
+
+
 int
 spdk_nvmf_request_complete(struct spdk_nvmf_request *req)
 {
@@ -645,6 +657,7 @@ test_auth_failure1(void)
 	auth->tid = 8;
 
 	nvmf_auth_recv_exec(&req);
+	ut_auth_failure1_settle();
 	CU_ASSERT(g_req_completed);
 	CU_ASSERT_EQUAL(cpl->status.sct, 0);
 	CU_ASSERT_EQUAL(cpl->status.sc, 0);
@@ -664,6 +677,7 @@ test_auth_failure1(void)
 	auth->fail_reason = 0;
 
 	nvmf_auth_recv_exec(&req);
+	ut_auth_failure1_settle();
 	CU_ASSERT(g_req_completed);
 	CU_ASSERT_EQUAL(cpl->status.sct, 0);
 	CU_ASSERT_EQUAL(cpl->status.sc, 0);
@@ -781,6 +795,7 @@ test_auth_challenge(void)
 	MOCK_SET(RAND_bytes, -1);
 
 	nvmf_auth_recv_exec(&req);
+	ut_auth_failure1_settle();
 	CU_ASSERT(g_req_completed);
 	CU_ASSERT_EQUAL(qpair.state, SPDK_NVMF_QPAIR_ERROR);
 	CU_ASSERT_EQUAL(fail->auth_type, SPDK_NVMF_AUTH_TYPE_COMMON_MESSAGE);
@@ -799,6 +814,7 @@ test_auth_challenge(void)
 	auth->tid = 8;
 
 	nvmf_auth_recv_exec(&req);
+	ut_auth_failure1_settle();
 	CU_ASSERT(g_req_completed);
 	CU_ASSERT_EQUAL(qpair.state, SPDK_NVMF_QPAIR_ERROR);
 	CU_ASSERT_EQUAL(fail->auth_type, SPDK_NVMF_AUTH_TYPE_COMMON_MESSAGE);
@@ -817,6 +833,7 @@ test_auth_challenge(void)
 	auth->tid = 8;
 
 	nvmf_auth_recv_exec(&req);
+	ut_auth_failure1_settle();
 	CU_ASSERT(g_req_completed);
 	CU_ASSERT_EQUAL(qpair.state, SPDK_NVMF_QPAIR_ERROR);
 	CU_ASSERT_EQUAL(fail->auth_type, SPDK_NVMF_AUTH_TYPE_COMMON_MESSAGE);
@@ -836,6 +853,7 @@ test_auth_challenge(void)
 	cmd.al = req.length = req.iov[0].iov_len = sizeof(msg) + 47;
 
 	nvmf_auth_recv_exec(&req);
+	ut_auth_failure1_settle();
 	CU_ASSERT(g_req_completed);
 	CU_ASSERT_EQUAL(qpair.state, SPDK_NVMF_QPAIR_ERROR);
 	CU_ASSERT_EQUAL(fail->auth_type, SPDK_NVMF_AUTH_TYPE_COMMON_MESSAGE);
@@ -1138,6 +1156,7 @@ test_auth_success1(void)
 	cmd.al = req.iov[0].iov_len = req.length = sizeof(*msg) - 1;
 
 	nvmf_auth_recv_exec(&req);
+	ut_auth_failure1_settle();
 	CU_ASSERT(g_req_completed);
 	CU_ASSERT_EQUAL(auth->state, NVMF_QPAIR_AUTH_ERROR);
 	CU_ASSERT_EQUAL(qpair.state, SPDK_NVMF_QPAIR_ERROR);
@@ -1157,6 +1176,7 @@ test_auth_success1(void)
 	cmd.al = req.iov[0].iov_len = req.length = sizeof(*msg) + 47;
 
 	nvmf_auth_recv_exec(&req);
+	ut_auth_failure1_settle();
 	CU_ASSERT(g_req_completed);
 	CU_ASSERT_EQUAL(auth->state, NVMF_QPAIR_AUTH_ERROR);
 	CU_ASSERT_EQUAL(qpair.state, SPDK_NVMF_QPAIR_ERROR);
