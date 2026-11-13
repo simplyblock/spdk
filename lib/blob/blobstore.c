@@ -6503,6 +6503,13 @@ bs_alloc(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts, struct spdk_blob_st
 			    opts->cluster_sz, SPDK_BS_PAGE_SIZE);
 		return -EINVAL;
 	}
+	if (opts->cluster_sz % SPDK_BS_PAGE_SIZE != 0 || opts->cluster_sz % dev->blocklen != 0) {
+		/* A cluster is a whole number of md pages and of device blocks */
+		SPDK_ERRLOG("Cluster size %" PRIu32 " is not a multiple of the page size %d and the "
+			    "device block length %" PRIu32 "\n", opts->cluster_sz, SPDK_BS_PAGE_SIZE,
+			    dev->blocklen);
+		return -EINVAL;
+	}
 	bs = calloc(1, sizeof(struct spdk_blob_store));
 	if (!bs) {
 		return -ENOMEM;
