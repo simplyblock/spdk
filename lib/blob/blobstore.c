@@ -6958,6 +6958,36 @@ static void
 bs_load_blob_iter_on_examine(struct spdk_bs_load_ctx *ctx);
 
 static void
+bs_load_examine_finish(struct spdk_bs_load_ctx *master)
+{
+	SPDK_NOTICELOG("Parallel examine blob loading done, rc=%d\n", master->rc);
+
+	/* A blobstore created without the md journal has none to start. */
+	if (master->bs->md_journal != NULL) {
+		bs_md_journal_examine_complete(master->bs->md_journal);
+		bs_md_journal_start(master->bs->md_journal);
+	}
+
+	free(master->master_worker);
+	master->master_worker = NULL;
+
+	master->iter_cb_fn = NULL;
+
+	if (master->super) {
+		spdk_free(master->super);
+		master->super = NULL;
+	}
+
+	if (master->mask) {
+		spdk_free(master->mask);
+		master->mask = NULL;
+	}
+
+	bs_sequence_finish(master->seq, master->rc);
+	free(master);
+}
+
+static void
 bs_load_iter_on_examine_cpl(void *cb_arg, int bserrno)
 {
 	struct spdk_bs_load_ctx *worker = cb_arg;
@@ -7007,31 +7037,7 @@ bs_load_iter_on_examine_cpl(void *cb_arg, int bserrno)
 	}
 
 finish:
-	SPDK_NOTICELOG("Parallel examine blob loading done, rc=%d\n", master->rc);
-
-	/* A blobstore created without the md journal has none to start. */
-	if (master->bs->md_journal != NULL) {
-		bs_md_journal_examine_complete(master->bs->md_journal);
-		bs_md_journal_start(master->bs->md_journal);
-	}
-
-	free(master->master_worker);
-	master->master_worker = NULL;
-
-	master->iter_cb_fn = NULL;
-
-	if (master->super) {
-		spdk_free(master->super);
-		master->super = NULL;
-	}
-
-	if (master->mask) {
-		spdk_free(master->mask);
-		master->mask = NULL;
-	}
-
-	bs_sequence_finish(master->seq, master->rc);
-	free(master);
+	bs_load_examine_finish(master);
 }
 
 static void
@@ -7475,6 +7481,12 @@ bs_load_used_blobids_cpl_clean_mode(spdk_bs_sequence_t *seq, void *cb_arg, int b
 		ctx->active_workers++;
 		bs_load_blob_iter_on_examine(worker);
 	}
+
+	/* No blob to load (empty blobstore): nothing would ever complete the load. */
+	if (ctx->active_workers == 0) {
+		ctx->scan_done = true;
+		bs_load_examine_finish(ctx);
+	}
 }
 
 static void
@@ -7749,6 +7761,12 @@ bs_load_journal_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		ctx->active_workers++;
 		bs_load_blob_iter_on_examine(worker);
 	}
+
+	/* No blob to load (empty blobstore): nothing would ever complete the load. */
+	if (ctx->active_workers == 0) {
+		ctx->scan_done = true;
+		bs_load_examine_finish(ctx);
+	}
 }
 
 static void
@@ -7847,6 +7865,12 @@ bs_recover(struct spdk_bs_load_ctx *ctx)
 
 		ctx->active_workers++;
 		bs_load_blob_iter_on_examine(worker);
+	}
+
+	/* No blob to load (empty blobstore): nothing would ever complete the load. */
+	if (ctx->active_workers == 0) {
+		ctx->scan_done = true;
+		bs_load_examine_finish(ctx);
 	}
 }
 
