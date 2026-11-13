@@ -7861,6 +7861,17 @@ bs_load_only_used_blobid_pages_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bs
 		return;
 	}
 
+	/*
+	 * The used blobid mask is persisted page by page together with blob metadata
+	 * (persist_bs_write_used_blobids), and unload no longer writes it. A blobstore that
+	 * never persisted a blob has a never-written (all zero) mask: no blobid is in use.
+	 */
+	if (ctx->mask->type == 0 && ctx->mask->length == 0) {
+		SPDK_INFOLOG(blob, "Used blobid mask never written: no blobs\n");
+		ctx->mask->type = SPDK_MD_MASK_TYPE_USED_BLOBIDS;
+		ctx->mask->length = ctx->super->md_len;
+	}
+
 	/* The type must be correct */
 	assert(ctx->mask->type == SPDK_MD_MASK_TYPE_USED_BLOBIDS);
 	/* The length of the mask (in bits) must not be greater than the length of the buffer (converted to bits) */
