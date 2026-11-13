@@ -160,6 +160,15 @@ ut_hub_ch_create(void *io_device, void *ctx_buf)
 	return 0;
 }
 
+/* new_md_journal: vbdev_lvs_unload / vbdev_lvs_destruct remove the lvstore from a 100 ms poller,
+ * once its transfer devices are gone (vbdev_lvs_destroy_tdevs_poller). */
+static void
+ut_vbdev_lvs_settle(void)
+{
+	spdk_delay_us(100 * 1000);
+	poll_threads();
+}
+
 static void
 ut_hub_ch_destroy(void *io_device, void *ctx_buf)
 {
@@ -473,7 +482,11 @@ lvs_load(struct spdk_bs_dev *dev, const struct spdk_lvs_opts *lvs_opts,
 	spdk_uuid_generate(&lvs->uuid);
 	lvs->bs_dev = dev;
 	for (i = 0; i < g_num_lvols; i++) {
-		_lvol_create(lvs);
+		/* Like the lvol library's load: loaded from the blobs, not opened yet
+		 * (examine takes the reference). */
+		struct spdk_lvol *lvol = _lvol_create(lvs);
+
+		lvol->ref_count = 0;
 		lvs->lvol_count++;
 	}
 
@@ -762,6 +775,7 @@ spdk_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_
 	grp_record_destroy();
 	if (lvol->ref_count != 0) {
 		cb_fn(cb_arg, -ENODEV);
+		return;
 	}
 
 	TAILQ_REMOVE(&lvol->lvol_store->lvols, lvol, link);
@@ -783,6 +797,7 @@ spdk_lvol_destroy_async(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, voi
 	}
 	if (lvol->ref_count != 0) {
 		cb_fn(cb_arg, -ENODEV);
+		return;
 	}
 
 	TAILQ_REMOVE(&lvol->lvol_store->lvols, lvol, link);
@@ -1246,6 +1261,7 @@ ut_lvs_destroy(void)
 
 	/* Unload lvol store */
 	vbdev_lvs_destruct(lvs, lvol_store_op_complete, NULL);
+	ut_vbdev_lvs_settle();
 	CU_ASSERT(g_lvserrno == 0);
 	CU_ASSERT(g_lvol_store == NULL);
 }
@@ -1291,6 +1307,7 @@ ut_lvol_init(void)
 
 	/* Destroy lvol store */
 	vbdev_lvs_destruct(lvs, lvol_store_op_complete, NULL);
+	ut_vbdev_lvs_settle();
 	CU_ASSERT(g_lvserrno == 0);
 	CU_ASSERT(g_lvol_store == NULL);
 }
@@ -1375,16 +1392,16 @@ ut_lvol_group_snapshot_ordering(void)
 	CU_ASSERT(g_grp_entries[0].snap != NULL);
 	CU_ASSERT(g_grp_entries[1].snap != NULL);
 	CU_ASSERT(g_grp_entries[2].snap != NULL);
-	/* Every freeze precedes every snapshot; every snapshot precedes every
-	 * unfreeze -- the whole group shares one frozen window. */
-	CU_ASSERT(strcmp(grp_events_joined(),
-			 "F0 F1 F2 S0 S1 S2 U0 U1 U2 ") == 0);
-	/* Each snapshot was taken while ITS blob was frozen: the fork's
-	 * bs_create_snapshot path has no freeze interlock (freeze is
-	 * externalized), and the group machine depends on that. */
-	CU_ASSERT(g_grp_snap_taken_while_frozen == 3);
+	/*
+	 * new_md_journal (95ac0d3b5, "fix snapshot group creation"): the group no longer has its own
+	 * freeze / unfreeze phase. It submits vbdev_lvol_create_snapshot for every member at once;
+	 * each member freezes itself inside spdk_lvol_create_snapshot. The members therefore no
+	 * longer share one frozen window (the original consistency-group guarantee).
+	 */
+	CU_ASSERT(strcmp(grp_events_joined(), "S0 S1 S2 ") == 0);
 
 	vbdev_lvs_destruct(lvs, lvol_store_op_complete, NULL);
+	ut_vbdev_lvs_settle();
 	grp_reset();
 }
 
@@ -1412,13 +1429,17 @@ ut_lvol_group_snapshot_midfail_unfreezes_then_gcs(void)
 	CU_ASSERT(g_grp_entries[1].snap == NULL);
 	CU_ASSERT(g_grp_entries[2].snap == NULL);
 	ev = grp_events_joined();
-	/* All three members freeze, snapshots stop at the failure, then ALL
-	 * THREE unfreeze BEFORE the GC delete runs: host IO is never held
-	 * hostage to cleanup. */
-	CU_ASSERT(strncmp(ev, "F0 F1 F2 S0 S1 U0 U1 U2 D", strlen("F0 F1 F2 S0 S1 U0 U1 U2 D")) == 0);
+	/*
+	 * new_md_journal (95ac0d3b5, "fix snapshot group creation"): the group no longer has its own
+	 * freeze / unfreeze phase. It submits vbdev_lvol_create_snapshot for every member at once;
+	 * each member freezes itself inside spdk_lvol_create_snapshot. The members therefore no
+	 * longer share one frozen window (the original consistency-group guarantee).
+	 */
+	/* All members are submitted, then the created snapshots are garbage-collected. */
+	CU_ASSERT(strncmp(ev, "S0 S1 S2 D", strlen("S0 S1 S2 D")) == 0);
 	first_d = strchr(ev, 'D');
 	SPDK_CU_ASSERT_FATAL(first_d != NULL);
-	CU_ASSERT(strstr(first_d, "U") == NULL);   /* no unfreeze after any delete */
+	CU_ASSERT(strchr(first_d, 'S') == NULL);   /* no snapshot after any delete */
 	/* The GC must be the SYNC destroy: the fork's async delete leaves the
 	 * blob metadata and the bdev registered, waiting for a control-plane
 	 * sync follow-up that never comes for a partial group snapshot
@@ -1426,6 +1447,7 @@ ut_lvol_group_snapshot_midfail_unfreezes_then_gcs(void)
 	CU_ASSERT(strchr(ev, 'd') == NULL);
 
 	vbdev_lvs_destruct(lvs, lvol_store_op_complete, NULL);
+	ut_vbdev_lvs_settle();
 	grp_reset();
 }
 
@@ -1445,16 +1467,23 @@ ut_lvol_group_snapshot_freeze_fail_unwinds(void)
 	g_grp_done_called = 0;
 	vbdev_lvol_create_snapshot_group(g_grp_entries, 3, grp_snapshot_done, NULL);
 
+	/*
+	 * new_md_journal (95ac0d3b5): the group no longer freezes its members itself (each member
+	 * freezes inside spdk_lvol_create_snapshot), so a group-level freeze failure cannot happen
+	 * anymore: no group freeze / unfreeze is issued and every member is snapshotted. Upstream of
+	 * that change this test checked the unwind of a failed group freeze ("F0 f1 U0").
+	 */
 	CU_ASSERT(g_grp_done_called == 1);
-	CU_ASSERT(g_grp_done_rc == -EBUSY);
-	CU_ASSERT(g_grp_entries[0].snap == NULL);
+	CU_ASSERT(g_grp_done_rc == 0);
+	CU_ASSERT(g_grp_entries[0].snap != NULL);
 	ev = grp_events_joined();
-	/* Only the successfully frozen member is unfrozen; no snapshot, no GC. */
-	CU_ASSERT(strcmp(ev, "F0 f1 U0 ") == 0);
-	CU_ASSERT(strchr(ev, 'S') == NULL);
+	CU_ASSERT(strchr(ev, 'F') == NULL);
+	CU_ASSERT(strchr(ev, 'U') == NULL);
+	CU_ASSERT(strcmp(ev, "S0 S1 S2 ") == 0);
 	CU_ASSERT(strchr(ev, 'D') == NULL);
 
 	vbdev_lvs_destruct(lvs, lvol_store_op_complete, NULL);
+	ut_vbdev_lvs_settle();
 	grp_reset();
 }
 
@@ -1473,6 +1502,7 @@ ut_lvol_group_snapshot_rejects_empty_and_null(void)
 	CU_ASSERT(g_grp_event_count == 0);
 
 	vbdev_lvs_destruct(lvs, lvol_store_op_complete, NULL);
+	ut_vbdev_lvs_settle();
 	grp_reset();
 }
 
@@ -1522,6 +1552,7 @@ ut_lvol_snapshot(void)
 
 	/* Destroy lvol store */
 	vbdev_lvs_destruct(lvs, lvol_store_op_complete, NULL);
+	ut_vbdev_lvs_settle();
 	CU_ASSERT(g_lvserrno == 0);
 	CU_ASSERT(g_lvol_store == NULL);
 }
@@ -1591,6 +1622,7 @@ ut_lvol_clone(void)
 
 	/* Destroy lvol store */
 	vbdev_lvs_destruct(lvs, lvol_store_op_complete, NULL);
+	ut_vbdev_lvs_settle();
 	CU_ASSERT(g_lvserrno == 0);
 	CU_ASSERT(g_lvol_store == NULL);
 }
@@ -1619,6 +1651,7 @@ ut_lvol_hotremove(void)
 
 	/* Hot remove lvs on bdev removal */
 	vbdev_lvs_hotremove_cb(&g_bdev);
+	ut_vbdev_lvs_settle();
 
 	CU_ASSERT(g_lvol_store == NULL);
 	CU_ASSERT(TAILQ_EMPTY(&g_spdk_lvol_pairs));
@@ -1686,21 +1719,14 @@ ut_lvol_examine_disk(void)
 	vbdev_lvs_examine_disk(&g_bdev);
 	ut_lvs_examine_check(false);
 
-	/* Examine successfully
-	 * - one lvol fails to load
-	 * - lvs is loaded with no lvols present */
-	g_lvserrno = 0;
-	g_lvolerrno = -1;
+	/*
+	 * new_md_journal: examine no longer opens the lvols (spdk_lvol_open): the lvstore load
+	 * already loaded them from the blobs the blobstore load opened, and examine only takes a
+	 * reference and creates the bdevs. A failing / -ENOMEM lvol open during examine (upstream's
+	 * "one lvol fails to load" and "retry on -ENOMEM" cases) cannot happen here anymore; lvol
+	 * load failures are handled in the lvol library (lvol_ut).
+	 */
 	g_num_lvols = 1;
-	lvol_already_opened = false;
-	g_registered_bdevs = 0;
-	vbdev_lvs_examine_disk(&g_bdev);
-	ut_lvs_examine_check(true);
-	CU_ASSERT(g_registered_bdevs == 0);
-	CU_ASSERT(TAILQ_EMPTY(&g_lvol_store->lvols));
-	vbdev_lvs_destruct(g_lvol_store, lvol_store_op_complete, NULL);
-	CU_ASSERT(g_lvserrno == 0);
-	CU_ASSERT(g_lvol_store == NULL);
 
 	/* Examine successfully */
 	g_lvserrno = 0;
@@ -1712,6 +1738,7 @@ ut_lvol_examine_disk(void)
 	CU_ASSERT(g_registered_bdevs != 0);
 	SPDK_CU_ASSERT_FATAL(!TAILQ_EMPTY(&g_lvol_store->lvols));
 	vbdev_lvs_destruct(g_lvol_store, lvol_store_op_complete, NULL);
+	ut_vbdev_lvs_settle();
 	CU_ASSERT(g_lvserrno == 0);
 
 	/* Examine multiple lvols successfully */
@@ -1723,18 +1750,7 @@ ut_lvol_examine_disk(void)
 	CU_ASSERT(g_registered_bdevs == g_num_lvols);
 	SPDK_CU_ASSERT_FATAL(!TAILQ_EMPTY(&g_lvol_store->lvols));
 	vbdev_lvs_destruct(g_lvol_store, lvol_store_op_complete, NULL);
-	CU_ASSERT(g_lvserrno == 0);
-
-	/* Examine multiple lvols successfully - fail one with -ENOMEM on lvol open */
-	g_num_lvols = 4;
-	g_lvol_open_enomem = 2;
-	g_registered_bdevs = 0;
-	lvol_already_opened = false;
-	vbdev_lvs_examine_disk(&g_bdev);
-	ut_lvs_examine_check(true);
-	CU_ASSERT(g_registered_bdevs == g_num_lvols);
-	SPDK_CU_ASSERT_FATAL(!TAILQ_EMPTY(&g_lvol_store->lvols));
-	vbdev_lvs_destruct(g_lvol_store, lvol_store_op_complete, NULL);
+	ut_vbdev_lvs_settle();
 	CU_ASSERT(g_lvserrno == 0);
 }
 
@@ -1801,6 +1817,7 @@ ut_lvol_rename(void)
 
 	/* Destroy lvol store */
 	vbdev_lvs_destruct(lvs, lvol_store_op_complete, NULL);
+	ut_vbdev_lvs_settle();
 	CU_ASSERT(g_lvserrno == 0);
 	CU_ASSERT(g_lvol_store == NULL);
 }
@@ -1928,6 +1945,7 @@ ut_lvol_resize(void)
 
 	/* Destroy lvol store */
 	vbdev_lvs_destruct(lvs, lvol_store_op_complete, NULL);
+	ut_vbdev_lvs_settle();
 	CU_ASSERT(g_lvserrno == 0);
 	CU_ASSERT(g_lvol_store == NULL);
 }
@@ -1971,6 +1989,7 @@ ut_lvol_set_read_only(void)
 
 	/* Destroy lvol store */
 	vbdev_lvs_destruct(lvs, lvol_store_op_complete, NULL);
+	ut_vbdev_lvs_settle();
 	CU_ASSERT(g_lvserrno == 0);
 	CU_ASSERT(g_lvol_store == NULL);
 }
@@ -2007,6 +2026,7 @@ ut_lvs_unload(void)
 
 	/* Unload lvol store */
 	vbdev_lvs_unload(lvs, lvol_store_op_complete, NULL);
+	ut_vbdev_lvs_settle();
 	CU_ASSERT(g_lvserrno == 0);
 	CU_ASSERT(g_lvol_store == NULL);
 	CU_ASSERT(g_lvol != NULL);
@@ -2062,6 +2082,7 @@ ut_lvs_init(void)
 
 	/* Destruct lvol store */
 	vbdev_lvs_destruct(lvs, lvol_store_op_complete, NULL);
+	ut_vbdev_lvs_settle();
 	CU_ASSERT(g_lvserrno == 0);
 	CU_ASSERT(g_lvol_store == NULL);
 }
@@ -2259,6 +2280,7 @@ ut_lvs_rename(void)
 	/* Unload lvol store */
 	g_lvol_store = lvs;
 	vbdev_lvs_destruct(g_lvol_store, lvol_store_op_complete, NULL);
+	ut_vbdev_lvs_settle();
 	CU_ASSERT(g_lvserrno == 0);
 	CU_ASSERT(g_lvol_store == NULL);
 }
@@ -2270,6 +2292,9 @@ ut_lvol_seek(void)
 	SPDK_CU_ASSERT_FATAL(g_io != NULL);
 	g_lvol = calloc(1, sizeof(struct spdk_lvol));
 	SPDK_CU_ASSERT_FATAL(g_lvol != NULL);
+	/* new_md_journal: seek completes the lvstore's in-flight IO accounting (current_io_t) */
+	g_lvol->lvol_store = calloc(1, sizeof(struct spdk_lvol_store));
+	SPDK_CU_ASSERT_FATAL(g_lvol->lvol_store != NULL);
 
 	g_io->bdev = &g_bdev;
 	g_io->bdev->ctxt = g_lvol;
@@ -2299,6 +2324,7 @@ ut_lvol_seek(void)
 	CU_ASSERT(g_io->u.bdev.seek.offset == UINT64_MAX);
 
 	free(g_io);
+	free(g_lvol->lvol_store);
 	free(g_lvol);
 }
 
@@ -2420,6 +2446,7 @@ ut_lvol_esnap_clone_bad_args(void)
 
 	g_lvol_store = lvs;
 	vbdev_lvs_destruct(g_lvol_store, lvol_store_op_complete, NULL);
+	ut_vbdev_lvs_settle();
 	CU_ASSERT(g_lvserrno == 0);
 	CU_ASSERT(g_lvol_store == NULL);
 }
@@ -2473,6 +2500,7 @@ ut_lvol_shallow_copy(void)
 
 	/* Destroy lvol store */
 	vbdev_lvs_destruct(lvs, lvol_store_op_complete, NULL);
+	ut_vbdev_lvs_settle();
 	CU_ASSERT(g_lvserrno == 0);
 	CU_ASSERT(g_lvol_store == NULL);
 }
