@@ -1311,7 +1311,6 @@ blob_parse(const struct spdk_blob_md_page *pages, uint32_t page_count,
 	void *tmp;
 
 	assert(page_count > 0);
-	assert(pages[0].sequence_num == 0);
 	assert(blob != NULL);
 	assert(blob->state == SPDK_BLOB_STATE_LOADING);
 	assert(blob->active.clusters == NULL);
@@ -1323,6 +1322,23 @@ blob_parse(const struct spdk_blob_md_page *pages, uint32_t page_count,
 		SPDK_ERRLOG("Blobid (0x%" PRIx64 ") doesn't match what's in metadata "
 			    "(0x%" PRIx64 ")\n", blob->id, pages[0].id);
 		return -ENOENT;
+	}
+
+	/*
+	 * Every page of the chain must belong to this blob and carry its position in the chain.
+	 * Upstream's load found the blobs by scanning the md region for pages with sequence_num 0,
+	 * so a first page with a corrupted sequence number was never opened. The examine load
+	 * takes the blobids from the persisted used blobid mask instead and opens every one of
+	 * them: check here (it was only an assert), so that a corrupted chain fails the open
+	 * (-EINVAL: the examine load skips the blob) instead of being parsed.
+	 */
+	for (i = 0; i < page_count; i++) {
+		if (pages[i].id != blob->id || pages[i].sequence_num != i) {
+			SPDK_ERRLOG("Blob 0x%" PRIx64 ": md page %" PRIu32 " of the chain is corrupted "
+				    "(id 0x%" PRIx64 ", sequence_num %" PRIu32 ")\n", blob->id, i,
+				    pages[i].id, pages[i].sequence_num);
+			return -EINVAL;
+		}
 	}
 
 	tmp = realloc(blob->active.pages, page_count * sizeof(*blob->active.pages));

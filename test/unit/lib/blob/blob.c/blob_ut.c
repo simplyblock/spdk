@@ -4359,17 +4359,15 @@ blob_dirty_shutdown(void)
 	ut_bs_dirty_load(&bs, NULL);
 
 	/*
-	 * new_md_journal: the recovery load takes the blobids from the persisted used blobid mask
-	 * instead of scanning all md pages, and does not reject a first md page whose sequence
-	 * number is corrupted (upstream's scan skipped it, so the open failed). Blob 2 loads.
+	 * The recovery load takes the blobids from the persisted used blobid mask instead of
+	 * scanning all md pages for first pages, so blob 2 is opened: blob_parse() rejects its
+	 * first md page with the corrupted sequence number (-EINVAL), and the open still fails.
 	 */
+	g_bserrno = 0;
 	spdk_bs_open_blob(bs, blobid2, blob_op_with_handle_complete, NULL);
 	poll_threads();
-	if (g_blob != NULL) {
-		spdk_blob_close(g_blob, blob_op_complete, NULL);
-		poll_threads();
-	}
-	g_blob = NULL;
+	CU_ASSERT(g_bserrno == -EINVAL);
+	CU_ASSERT(g_blob == NULL);
 
 	spdk_bs_open_blob(bs, blobid3, blob_op_with_handle_complete, NULL);
 	poll_threads();
@@ -4378,6 +4376,86 @@ blob_dirty_shutdown(void)
 	blob = g_blob;
 
 	CU_ASSERT(free_clusters == spdk_bs_free_cluster_count(bs));
+}
+
+/*
+ * A blob whose md page chain carries a wrong sequence number (on the first page or on a later
+ * page of the chain) must fail to open after a load instead of being parsed.
+ */
+static void
+blob_md_chain_corrupted_sequence_num(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob_opts opts;
+	struct spdk_blob *blob;
+	struct spdk_blob_md_page *page;
+	spdk_blob_id blobid, blobid2;
+	char xattr[2048];
+	char name[16];
+	uint32_t page_num;
+	uint64_t index;
+	int i, rc;
+
+	/* A blob whose xattrs need a chain of several md pages, and a small one. */
+	ut_spdk_blob_opts_init(&opts);
+	blob = ut_blob_create_and_open(bs, &opts);
+	blobid = spdk_blob_get_id(blob);
+	memset(xattr, 'x', sizeof(xattr));
+	for (i = 0; i < 4; i++) {
+		snprintf(name, sizeof(name), "big%d", i);
+		rc = spdk_blob_set_xattr(blob, name, xattr, sizeof(xattr));
+		CU_ASSERT(rc == 0);
+	}
+	spdk_blob_sync_md(blob, false, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	blob = ut_blob_create_and_open(bs, &opts);
+	blobid2 = spdk_blob_get_id(blob);
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	g_blob = NULL;
+
+	ut_bs_reload(&bs, NULL);
+
+	/* Second page of the chain of the first blob: wrong sequence number, valid crc. */
+	page_num = bs_blobid_to_page(blobid);
+	index = SPDK_BS_PAGE_SIZE * (bs->md_start + page_num);
+	page = (struct spdk_blob_md_page *)&g_dev_buffer[index];
+	SPDK_CU_ASSERT_FATAL(page->id == blobid && page->sequence_num == 0);
+	SPDK_CU_ASSERT_FATAL(page->next != SPDK_INVALID_MD_PAGE);
+	index = SPDK_BS_PAGE_SIZE * (bs->md_start + page->next);
+	page = (struct spdk_blob_md_page *)&g_dev_buffer[index];
+	SPDK_CU_ASSERT_FATAL(page->id == blobid && page->sequence_num == 1);
+	page->sequence_num = 7;
+	page->crc = blob_md_page_calc_crc(page);
+
+	/* First (only) page of the second blob: wrong sequence number, valid crc. */
+	page_num = bs_blobid_to_page(blobid2);
+	index = SPDK_BS_PAGE_SIZE * (bs->md_start + page_num);
+	page = (struct spdk_blob_md_page *)&g_dev_buffer[index];
+	SPDK_CU_ASSERT_FATAL(page->id == blobid2 && page->sequence_num == 0);
+	page->sequence_num = 1;
+	page->crc = blob_md_page_calc_crc(page);
+
+	/* The load skips both blobs; opening them fails. */
+	ut_bs_dirty_load(&bs, NULL);
+
+	g_bserrno = 0;
+	spdk_bs_open_blob(bs, blobid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -EINVAL);
+	CU_ASSERT(g_blob == NULL);
+
+	g_bserrno = 0;
+	spdk_bs_open_blob(bs, blobid2, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -EINVAL);
+	CU_ASSERT(g_blob == NULL);
 }
 
 static void
@@ -11843,6 +11921,7 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite_bs, blob_parse_md);
 		CU_ADD_TEST(suite, bs_load);
 		CU_ADD_TEST(suite_bs, bs_load_pending_removal);
+		CU_ADD_TEST(suite_bs, blob_md_chain_corrupted_sequence_num);
 		CU_ADD_TEST(suite, bs_load_custom_cluster_size);
 		CU_ADD_TEST(suite, bs_load_after_failed_grow);
 		CU_ADD_TEST(suite, bs_load_error);
