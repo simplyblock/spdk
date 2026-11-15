@@ -6401,6 +6401,7 @@ struct spdk_bs_load_ctx {
 	bool					dumping;
 	bool              		snapshot_create_mode;
 	bool              		snapshot_md_flag;
+	bool				orphan_released;
 	uint32_t				page_counter;
 	bool 					dump_type;
 	FILE					*fp;
@@ -7190,6 +7191,72 @@ bs_update_corrupted_blob_without_close(void *cb_arg, int bserrno)
 	spdk_blob_sync_md(ctx->blob, false, blob_op_update_corrupted_cb, ctx);
 }
 
+/*
+ * Snapshot deletion interrupted after the clone was updated ("deletion mode"): the clone already
+ * took over the snapshot's clusters (and extent pages), while the snapshot's metadata still
+ * maps them. The examine load leaves such a snapshot (still marked SNAPSHOT_PENDING_REMOVAL) for
+ * its owner to delete, but it must not keep those mappings: whichever way it is deleted later
+ * (spdk_bs_delete_blob has no clone to update, it just releases every cluster the snapshot
+ * maps), it would release clusters the clone is using - and a cluster the clone releases in
+ * the meantime would still be mapped by the snapshot. Drop the shared entries from the
+ * snapshot, as delete_snapshot_sync_clone_cpl() does before the snapshot is deleted. Returns
+ * whether anything was dropped.
+ */
+static bool
+bs_examine_release_orphan_snapshot(struct spdk_blob *snapshot, struct spdk_blob *clone)
+{
+	bool changed = false;
+	uint64_t i;
+
+	for (i = 0; i < snapshot->active.num_clusters && i < clone->active.num_clusters; i++) {
+		if (snapshot->active.clusters[i] != 0 &&
+		    snapshot->active.clusters[i] == clone->active.clusters[i]) {
+			snapshot->active.clusters[i] = 0;
+			snapshot->active.num_allocated_clusters--;
+			changed = true;
+		}
+	}
+	for (i = 0; i < snapshot->active.num_extent_pages && i < clone->active.num_extent_pages; i++) {
+		if (snapshot->active.extent_pages[i] != 0 &&
+		    snapshot->active.extent_pages[i] == clone->active.extent_pages[i]) {
+			snapshot->active.extent_pages[i] = 0;
+			changed = true;
+		}
+	}
+
+	return changed;
+}
+
+static void
+bs_examine_release_orphan_snapshot_close_cpl(void *cb_arg, int bserrno)
+{
+	struct spdk_bs_load_ctx *ctx = cb_arg;
+	struct spdk_blob *snapshot = ctx->blob;
+
+	if (bserrno != 0) {
+		SPDK_ERRLOG("Failed to close clone of a corrupted blob\n");
+	}
+
+	if (!ctx->orphan_released) {
+		bs_load_iter_on_examine_cpl(ctx, 0);
+		return;
+	}
+	ctx->orphan_released = false;
+
+	SPDK_NOTICELOG("Snapshot 0x%" PRIx64 " pending removal: its clusters belong to the clone, "
+		       "dropping them from the snapshot\n", snapshot->id);
+
+	/* The snapshot now has unallocated clusters: thin provisioned, reading zeroes there
+	 * unless it has a parent of its own. */
+	ctx->snapshot_md_flag = snapshot->md_ro;
+	snapshot->md_ro = false;
+	blob_set_thin_provision(snapshot);
+	if (snapshot->back_bs_dev == NULL) {
+		snapshot->back_bs_dev = bs_create_zeroes_dev();
+	}
+	spdk_blob_sync_md(snapshot, false, blob_op_update_corrupted_cb, ctx);
+}
+
 static void
 bs_examine_clone_without_close(void *cb_arg, struct spdk_blob *blob, int bserrno)
 {
@@ -7214,9 +7281,12 @@ bs_examine_clone_without_close(void *cb_arg, struct spdk_blob *blob, int bserrno
 		}
 		ctx->blobid = ctx->blob->id;
 		SPDK_INFOLOG(blob, "Cannot examine corrupted snapblob in deletion mode 0x%" PRIx64 ".\n", blob->id);
-		/* Power failure occurred after updating clone (snapshot delete case) - remove snapshot */
+		/* Power failure occurred after updating clone (snapshot delete case). The snapshot is
+		 * left for its owner to delete, but its clusters already belong to the clone: release
+		 * them from the snapshot now (bs_examine_release_orphan_snapshot) */
 		// bs_swap_corrupted_blob_start(ctx->blob, blob, bs_examine_swap_corrupted_blob_cleanup, ctx);
-		spdk_blob_close(blob, bs_delete_corrupted_blob_examine_cpl, ctx);
+		ctx->orphan_released = bs_examine_release_orphan_snapshot(ctx->blob, blob);
+		spdk_blob_close(blob, bs_examine_release_orphan_snapshot_close_cpl, ctx);
 		// only for failover recovery case, we just delete the corrupted snapblob
 		// spdk_blob_close(blob, bs_delete_corrupted_blob_without_close, ctx);
 		return;
