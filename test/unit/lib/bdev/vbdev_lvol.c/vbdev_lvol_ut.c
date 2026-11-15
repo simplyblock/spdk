@@ -1094,6 +1094,32 @@ grp_blob_index(struct spdk_blob *blob)
 }
 
 void
+spdk_blob_group_freeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	g_grp_freeze_calls++;
+	if (g_grp_freeze_fail_at && g_grp_freeze_calls == g_grp_freeze_fail_at) {
+		grp_event('f', grp_blob_index(blob) >= 0 ? grp_blob_index(blob) : g_grp_freeze_calls - 1);
+		cb_fn(cb_arg, -EBUSY);
+		return;
+	}
+	(*grp_freeze_slot(blob))++;
+	grp_event('F', grp_blob_index(blob));
+	cb_fn(cb_arg, 0);
+}
+
+void
+spdk_blob_group_unfreeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	int *slot = grp_freeze_slot(blob);
+
+	if (*slot > 0) {
+		(*slot)--;
+	}
+	grp_event('U', grp_blob_index(blob));
+	cb_fn(cb_arg, 0);
+}
+
+void
 spdk_lvol_create_snapshot(struct spdk_lvol *lvol, const char *snapshot_name,
 			  spdk_lvol_op_with_handle_complete cb_fn, void *cb_arg)
 {
@@ -1393,12 +1419,13 @@ ut_lvol_group_snapshot_ordering(void)
 	CU_ASSERT(g_grp_entries[1].snap != NULL);
 	CU_ASSERT(g_grp_entries[2].snap != NULL);
 	/*
-	 * new_md_journal (95ac0d3b5, "fix snapshot group creation"): the group no longer has its own
-	 * freeze / unfreeze phase. It submits vbdev_lvol_create_snapshot for every member at once;
-	 * each member freezes itself inside spdk_lvol_create_snapshot. The members therefore no
-	 * longer share one frozen window (the original consistency-group guarantee).
+	 * Every member is group-frozen before the first snapshot and unfrozen after the last one:
+	 * the members share one frozen window. The snapshots themselves are submitted together
+	 * (95ac0d3b5), inside that window.
 	 */
-	CU_ASSERT(strcmp(grp_events_joined(), "S0 S1 S2 ") == 0);
+	CU_ASSERT(strcmp(grp_events_joined(), "F0 F1 F2 S0 S1 S2 U0 U1 U2 ") == 0);
+	CU_ASSERT(g_grp_snap_taken_while_frozen == 3);
+	CU_ASSERT(g_grp_freeze_cnt[0] == 0 && g_grp_freeze_cnt[1] == 0 && g_grp_freeze_cnt[2] == 0);
 
 	vbdev_lvs_destruct(lvs, lvol_store_op_complete, NULL);
 	ut_vbdev_lvs_settle();
@@ -1430,16 +1457,16 @@ ut_lvol_group_snapshot_midfail_unfreezes_then_gcs(void)
 	CU_ASSERT(g_grp_entries[2].snap == NULL);
 	ev = grp_events_joined();
 	/*
-	 * new_md_journal (95ac0d3b5, "fix snapshot group creation"): the group no longer has its own
-	 * freeze / unfreeze phase. It submits vbdev_lvol_create_snapshot for every member at once;
-	 * each member freezes itself inside spdk_lvol_create_snapshot. The members therefore no
-	 * longer share one frozen window (the original consistency-group guarantee).
+	 * All members frozen, every snapshot submitted inside the window (95ac0d3b5), then every
+	 * member unfrozen BEFORE the snapshots already taken are garbage-collected.
 	 */
-	/* All members are submitted, then the created snapshots are garbage-collected. */
-	CU_ASSERT(strncmp(ev, "S0 S1 S2 D", strlen("S0 S1 S2 D")) == 0);
+	CU_ASSERT(strncmp(ev, "F0 F1 F2 S0 S1 S2 U0 U1 U2 D",
+			  strlen("F0 F1 F2 S0 S1 S2 U0 U1 U2 D")) == 0);
+	CU_ASSERT(g_grp_snap_taken_while_frozen == 3);
 	first_d = strchr(ev, 'D');
 	SPDK_CU_ASSERT_FATAL(first_d != NULL);
 	CU_ASSERT(strchr(first_d, 'S') == NULL);   /* no snapshot after any delete */
+	CU_ASSERT(strchr(first_d, 'U') == NULL);   /* no unfreeze after any delete */
 	/* The GC must be the SYNC destroy: the fork's async delete leaves the
 	 * blob metadata and the bdev registered, waiting for a control-plane
 	 * sync follow-up that never comes for a partial group snapshot
@@ -1467,20 +1494,17 @@ ut_lvol_group_snapshot_freeze_fail_unwinds(void)
 	g_grp_done_called = 0;
 	vbdev_lvol_create_snapshot_group(g_grp_entries, 3, grp_snapshot_done, NULL);
 
-	/*
-	 * new_md_journal (95ac0d3b5): the group no longer freezes its members itself (each member
-	 * freezes inside spdk_lvol_create_snapshot), so a group-level freeze failure cannot happen
-	 * anymore: no group freeze / unfreeze is issued and every member is snapshotted. Upstream of
-	 * that change this test checked the unwind of a failed group freeze ("F0 f1 U0").
-	 */
+	/* The freeze taken so far is unwound and nothing is created. */
 	CU_ASSERT(g_grp_done_called == 1);
-	CU_ASSERT(g_grp_done_rc == 0);
-	CU_ASSERT(g_grp_entries[0].snap != NULL);
+	CU_ASSERT(g_grp_done_rc == -EBUSY);
+	CU_ASSERT(g_grp_entries[0].snap == NULL);
+	CU_ASSERT(g_grp_entries[1].snap == NULL);
+	CU_ASSERT(g_grp_entries[2].snap == NULL);
 	ev = grp_events_joined();
-	CU_ASSERT(strchr(ev, 'F') == NULL);
-	CU_ASSERT(strchr(ev, 'U') == NULL);
-	CU_ASSERT(strcmp(ev, "S0 S1 S2 ") == 0);
+	CU_ASSERT(strcmp(ev, "F0 f1 U0 ") == 0);
+	CU_ASSERT(strchr(ev, 'S') == NULL);
 	CU_ASSERT(strchr(ev, 'D') == NULL);
+	CU_ASSERT(g_grp_freeze_cnt[0] == 0);
 
 	vbdev_lvs_destruct(lvs, lvol_store_op_complete, NULL);
 	ut_vbdev_lvs_settle();

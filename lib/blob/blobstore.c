@@ -11003,6 +11003,28 @@ spdk_blob_get_freeze_cnt(struct spdk_blob *blob)
 	/* get Freeze count on blob */
 	return blob->frozen_refcnt;
 }
+
+void
+spdk_blob_group_freeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	/* Consistency-group freeze: refcount only. Deliberately NOT taking
+	 * locked_operation_in_progress - the group holds its freeze across the per-member
+	 * snapshot creations, and each of those takes its own spdk_snapshot_freeze_blob, which
+	 * refuses when that flag is set. The group window relies on frozen_refcnt staying >= 1
+	 * from before the first member snapshot until after the last. */
+	blob_verify_md_op(blob);
+	blob->group_frozen_refcnt++;
+	blob_freeze_io(blob, cb_fn, cb_arg);
+}
+
+void
+spdk_blob_group_unfreeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	blob_verify_md_op(blob);
+	assert(blob->group_frozen_refcnt > 0);
+	blob->group_frozen_refcnt--;
+	blob_unfreeze_io(blob, cb_fn, cb_arg);
+}
 /* END spdk_bs_create_snapshot */
 
 /* START spdk_bs_create_clone */
@@ -13183,8 +13205,9 @@ spdk_bs_set_ha_fenced(struct spdk_blob_store *bs, bool fenced)
 void
 blob_freeze_on_failover(struct spdk_blob *blob)
 {
-	/* Freeze I/O on blob */
-	assert(blob->frozen_refcnt == 0);
+	/* Freeze I/O on blob. A consistency-group freeze may already hold IO
+	 * (spdk_blob_group_freeze_io, snapshot of a non-leader group member). */
+	assert(blob->frozen_refcnt == blob->group_frozen_refcnt);
 	blob->failed_on_update = false;
 	blob->frozen_refcnt++;
 }
