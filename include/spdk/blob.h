@@ -719,6 +719,12 @@ void spdk_bs_dumpv2(struct spdk_blob_store *bs, FILE *fp, spdk_bs_op_complete cb
  *
  * It will destroy the blobstore by zeroing the super block.
  *
+ * The blobstore is freed once the destroy has started, whatever its result: only when the
+ * request is rejected up front (open blobs: -EBUSY, out of memory: -ENOMEM) is it still
+ * valid when cb_fn is called. Callers (the lvol layer) tear their own state down right
+ * after this call and cannot retry; a device that failed (e.g. hot remove) must still be
+ * released.
+ *
  * \param bs blobstore to destroy.
  * \param cb_fn Called when the destruction is complete.
  * \param cb_arg Argument passed to function cb_fn.
@@ -729,7 +735,16 @@ void spdk_bs_destroy(struct spdk_blob_store *bs, spdk_bs_op_complete cb_fn,
 /**
  * Unload the blobstore.
  *
- * It will flush all volatile data to disk.
+ * Metadata is persisted as it changes (md journal): the unload does not write the super block
+ * or the used masks (abbe829d2), it reads and validates the super block and releases the
+ * blobstore.
+ *
+ * The blobstore is freed once the unload has started, whatever its result (an I/O error or
+ * an invalid super block is reported through cb_fn): only when the request is rejected up
+ * front (open blobs or unload already in progress: -EBUSY, out of memory: -ENOMEM) is it
+ * still valid when cb_fn is called. Callers (the lvol layer, blobfs) tear their own state
+ * down right after this call and cannot retry; a device that failed (e.g. hot remove) must
+ * still be released. This is the behaviour of upstream SPDK before a2f5e1c2d.
  *
  * \param bs blobstore to unload.
  * \param cb_fn Called when the unloading is complete.
