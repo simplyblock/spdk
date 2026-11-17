@@ -481,6 +481,22 @@ void spdk_blob_failover_unfreaze(struct spdk_blob *blob,
 
 void spdk_snapshot_freeze_blob(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
 
+/**
+ * Group-freeze IO on a blob: a refcounted freeze WITHOUT the locked_operation_in_progress gate,
+ * so the per-blob snapshot taken inside the group window (spdk_lvol_create_snapshot ->
+ * spdk_snapshot_freeze_blob) still proceeds; its freeze / unfreeze only moves the refcount
+ * between 1 and 2. Consistency-group snapshots freeze EVERY member blob before the first member
+ * snapshot is taken and unfreeze them after the last one, so the set of snapshots represents
+ * one point in time. Must be called from the blobstore md thread.
+ */
+void spdk_blob_group_freeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
+
+/**
+ * Counterpart of spdk_blob_group_freeze_io: refcounted unfreeze; queued IO resumes when the
+ * count reaches zero. Must be called from the blobstore md thread.
+ */
+void spdk_blob_group_unfreeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg);
+
 int spdk_blob_get_freeze_cnt(struct spdk_blob *blob);
 
 void spdk_blob_unfreeze_cleanup(struct spdk_blob *blob,
@@ -719,6 +735,12 @@ void spdk_bs_dumpv2(struct spdk_blob_store *bs, FILE *fp, spdk_bs_op_complete cb
  *
  * It will destroy the blobstore by zeroing the super block.
  *
+ * The blobstore is freed once the destroy has started, whatever its result: only when the
+ * request is rejected up front (open blobs: -EBUSY, out of memory: -ENOMEM) is it still
+ * valid when cb_fn is called. Callers (the lvol layer) tear their own state down right
+ * after this call and cannot retry; a device that failed (e.g. hot remove) must still be
+ * released.
+ *
  * \param bs blobstore to destroy.
  * \param cb_fn Called when the destruction is complete.
  * \param cb_arg Argument passed to function cb_fn.
@@ -729,7 +751,16 @@ void spdk_bs_destroy(struct spdk_blob_store *bs, spdk_bs_op_complete cb_fn,
 /**
  * Unload the blobstore.
  *
- * It will flush all volatile data to disk.
+ * Metadata is persisted as it changes (md journal): the unload does not write the super block
+ * or the used masks (abbe829d2), it reads and validates the super block and releases the
+ * blobstore.
+ *
+ * The blobstore is freed once the unload has started, whatever its result (an I/O error or
+ * an invalid super block is reported through cb_fn): only when the request is rejected up
+ * front (open blobs or unload already in progress: -EBUSY, out of memory: -ENOMEM) is it
+ * still valid when cb_fn is called. Callers (the lvol layer, blobfs) tear their own state
+ * down right after this call and cannot retry; a device that failed (e.g. hot remove) must
+ * still be released. This is the behaviour of upstream SPDK before a2f5e1c2d.
  *
  * \param bs blobstore to unload.
  * \param cb_fn Called when the unloading is complete.

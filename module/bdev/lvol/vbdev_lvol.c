@@ -2926,8 +2926,8 @@ vbdev_lvol_create_snapshot(struct spdk_lvol *lvol, const char *snapshot_name,
 
 /* --- consistency-group snapshots ------------------------------------------
  *
- * Sequence: group-freeze member 0..n-1  ->  snapshot member 0..n-1
- *           ->  group-unfreeze member 0..n-1  ->  complete.
+ * Sequence: group-freeze member 0..n-1  ->  snapshot every member (submitted
+ *           in parallel, 95ac0d3b5)  ->  group-unfreeze member 0..n-1  ->  complete.
  *
  * The group freeze is a pure refcount (spdk_blob_group_freeze_io): each
  * per-member vbdev_lvol_create_snapshot still takes its own
@@ -2943,8 +2943,10 @@ vbdev_lvol_create_snapshot(struct spdk_lvol *lvol, const char *snapshot_name,
  * the snapshots already taken, newest first.
  */
 enum group_snap_phase {
-	GRP_SNAP_CREATE = 0,
+	GRP_SNAP_FREEZE = 0,
+	GRP_SNAP_CREATE,
 	GRP_SNAP_INPROCESS,
+	GRP_SNAP_UNFREEZE,
 	GRP_SNAP_GC,
 	GRP_SNAP_GC_INPROCESS
 };
@@ -2956,7 +2958,8 @@ struct vbdev_lvol_group_snap_ctx {
 	struct vbdev_lvol_group_snap_entry	*entries;
 	uint32_t		count;
 	uint32_t		completed;	/* async completions plus submission reference */
-	uint32_t		idx;
+	uint32_t		idx;		/* cursor of the freeze / unfreeze phases; GC: destroys submitted */
+	uint32_t		frozen;		/* members group-frozen so far */
 	enum group_snap_phase			phase;
 	int				rc;		/* first error, sticky */
 	vbdev_lvol_group_snapshot_complete	cb_fn;
@@ -2979,6 +2982,26 @@ group_snap_complete(struct vbdev_lvol_group_snap_ctx *ctx)
 }
 
 static void
+group_snap_freeze_cb(void *cb_arg, int lvolerrno)
+{
+	struct vbdev_lvol_group_snap_ctx *ctx = cb_arg;
+
+	if (lvolerrno != 0) {
+		SPDK_ERRLOG("group snapshot: freeze of member %u (%s) failed: %d\n",
+			    ctx->idx, ctx->entries[ctx->idx].lvol->name, lvolerrno);
+		ctx->rc = lvolerrno;
+		/* Nothing created yet; unwind the freezes taken so far. */
+		ctx->phase = GRP_SNAP_UNFREEZE;
+		ctx->idx = 0;
+		group_snap_advance(ctx);
+		return;
+	}
+	ctx->frozen++;
+	ctx->idx++;
+	group_snap_advance(ctx);
+}
+
+static void
 group_snap_create_cb(void *cb_arg, struct spdk_lvol *snap, int lvolerrno)
 {
 	struct spdk_lvol_group_snap_entry *entries = cb_arg;
@@ -2996,7 +3019,24 @@ group_snap_create_cb(void *cb_arg, struct spdk_lvol *snap, int lvolerrno)
 		group_snap_advance(ctx);
 		return;
 	}
-	ctx->entries[entries->idx].snap = snap;	
+	ctx->entries[entries->idx].snap = snap;
+	group_snap_advance(ctx);
+}
+
+static void
+group_snap_unfreeze_cb(void *cb_arg, int lvolerrno)
+{
+	struct vbdev_lvol_group_snap_ctx *ctx = cb_arg;
+
+	if (lvolerrno != 0) {
+		/* Keep going: the remaining members must still be unfrozen. */
+		SPDK_ERRLOG("group snapshot: unfreeze of member %u (%s) failed: %d\n",
+			    ctx->idx, ctx->entries[ctx->idx].lvol->name, lvolerrno);
+		if (ctx->rc == 0) {
+			ctx->rc = lvolerrno;
+		}
+	}
+	ctx->idx++;
 	group_snap_advance(ctx);
 }
 
@@ -3021,20 +3061,22 @@ group_snap_advance(struct vbdev_lvol_group_snap_ctx *ctx)
 	uint32_t i = 0;
 	switch (ctx->phase) {
 
-	case GRP_SNAP_CREATE:
-		ctx->entry = calloc(ctx->count, sizeof(*ctx->entry));
-		if (ctx->entry == NULL) {
-			SPDK_NOTICELOG("Snapshotting blob failed\n");
-			ctx->rc = -ENOMEM;
-			group_snap_complete(ctx);
+	case GRP_SNAP_FREEZE:
+		/* Park IO on EVERY member before the first snapshot is taken. */
+		if (ctx->idx < ctx->count) {
+			spdk_blob_group_freeze_io(ctx->entries[ctx->idx].lvol->blob,
+						  group_snap_freeze_cb, ctx);
 			return;
 		}
-
+		ctx->phase = GRP_SNAP_CREATE;
+		ctx->idx = 0;
+		group_snap_advance(ctx);
+		return;
+	case GRP_SNAP_CREATE:
 		ctx->phase = GRP_SNAP_INPROCESS;
 
+		/* All members are frozen: the snapshots are taken in parallel (95ac0d3b5). */
 		for (i = 0; i < ctx->count; i++) {
-			ctx->entry[i].ctx = ctx;
-			ctx->entry[i].idx = i;
 			vbdev_lvol_create_snapshot(ctx->entries[i].lvol,
 						   ctx->entries[i].snapshot_name,
 						   group_snap_create_cb, &ctx->entry[i]);
@@ -3060,11 +3102,24 @@ group_snap_advance(struct vbdev_lvol_group_snap_ctx *ctx)
 
 		if (ctx->rc != 0) {
 			SPDK_ERRLOG("group snapshot creation failed: rc=%d\n", ctx->rc);
+		}
+		/* Unfreeze FIRST (host IO is never held hostage to cleanup), then GC. */
+		ctx->phase = GRP_SNAP_UNFREEZE;
+		ctx->idx = 0;
+		group_snap_advance(ctx);
+		return;
+	case GRP_SNAP_UNFREEZE:
+		/* Unfreeze exactly the members that were frozen. */
+		if (ctx->idx < ctx->frozen) {
+			spdk_blob_group_unfreeze_io(ctx->entries[ctx->idx].lvol->blob,
+						    group_snap_unfreeze_cb, ctx);
+			return;
+		}
+		if (ctx->rc != 0) {
 			ctx->phase = GRP_SNAP_GC;
 			group_snap_advance(ctx);
 			return;
 		}
-
 		group_snap_complete(ctx);
 		return;
 	case GRP_SNAP_GC:
@@ -3145,12 +3200,22 @@ vbdev_lvol_create_snapshot_group(struct vbdev_lvol_group_snap_entry *entries,
 		cb_fn(cb_arg, entries, count, -ENOMEM);
 		return;
 	}
-	ctx->entry = NULL;
+	ctx->entry = calloc(count, sizeof(*ctx->entry));
+	if (ctx->entry == NULL) {
+		SPDK_NOTICELOG("Snapshotting blob failed\n");
+		free(ctx);
+		cb_fn(cb_arg, entries, count, -ENOMEM);
+		return;
+	}
+	for (i = 0; i < count; i++) {
+		ctx->entry[i].ctx = ctx;
+		ctx->entry[i].idx = i;
+	}
 	ctx->entries = entries;
 	ctx->count = count;
 	ctx->cb_fn = cb_fn;
 	ctx->cb_arg = cb_arg;
-	ctx->phase = GRP_SNAP_CREATE;
+	ctx->phase = GRP_SNAP_FREEZE;
 	group_snap_advance(ctx);
 }
 

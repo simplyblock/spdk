@@ -1311,7 +1311,6 @@ blob_parse(const struct spdk_blob_md_page *pages, uint32_t page_count,
 	void *tmp;
 
 	assert(page_count > 0);
-	assert(pages[0].sequence_num == 0);
 	assert(blob != NULL);
 	assert(blob->state == SPDK_BLOB_STATE_LOADING);
 	assert(blob->active.clusters == NULL);
@@ -1323,6 +1322,23 @@ blob_parse(const struct spdk_blob_md_page *pages, uint32_t page_count,
 		SPDK_ERRLOG("Blobid (0x%" PRIx64 ") doesn't match what's in metadata "
 			    "(0x%" PRIx64 ")\n", blob->id, pages[0].id);
 		return -ENOENT;
+	}
+
+	/*
+	 * Every page of the chain must belong to this blob and carry its position in the chain.
+	 * Upstream's load found the blobs by scanning the md region for pages with sequence_num 0,
+	 * so a first page with a corrupted sequence number was never opened. The examine load
+	 * takes the blobids from the persisted used blobid mask instead and opens every one of
+	 * them: check here (it was only an assert), so that a corrupted chain fails the open
+	 * (-EINVAL: the examine load skips the blob) instead of being parsed.
+	 */
+	for (i = 0; i < page_count; i++) {
+		if (pages[i].id != blob->id || pages[i].sequence_num != i) {
+			SPDK_ERRLOG("Blob 0x%" PRIx64 ": md page %" PRIu32 " of the chain is corrupted "
+				    "(id 0x%" PRIx64 ", sequence_num %" PRIu32 ")\n", blob->id, i,
+				    pages[i].id, pages[i].sequence_num);
+			return -EINVAL;
+		}
 	}
 
 	tmp = realloc(blob->active.pages, page_count * sizeof(*blob->active.pages));
@@ -6401,6 +6417,7 @@ struct spdk_bs_load_ctx {
 	bool					dumping;
 	bool              		snapshot_create_mode;
 	bool              		snapshot_md_flag;
+	bool				orphan_released;
 	uint32_t				page_counter;
 	bool 					dump_type;
 	FILE					*fp;
@@ -7190,6 +7207,72 @@ bs_update_corrupted_blob_without_close(void *cb_arg, int bserrno)
 	spdk_blob_sync_md(ctx->blob, false, blob_op_update_corrupted_cb, ctx);
 }
 
+/*
+ * Snapshot deletion interrupted after the clone was updated ("deletion mode"): the clone already
+ * took over the snapshot's clusters (and extent pages), while the snapshot's metadata still
+ * maps them. The examine load leaves such a snapshot (still marked SNAPSHOT_PENDING_REMOVAL) for
+ * its owner to delete, but it must not keep those mappings: whichever way it is deleted later
+ * (spdk_bs_delete_blob has no clone to update, it just releases every cluster the snapshot
+ * maps), it would release clusters the clone is using - and a cluster the clone releases in
+ * the meantime would still be mapped by the snapshot. Drop the shared entries from the
+ * snapshot, as delete_snapshot_sync_clone_cpl() does before the snapshot is deleted. Returns
+ * whether anything was dropped.
+ */
+static bool
+bs_examine_release_orphan_snapshot(struct spdk_blob *snapshot, struct spdk_blob *clone)
+{
+	bool changed = false;
+	uint64_t i;
+
+	for (i = 0; i < snapshot->active.num_clusters && i < clone->active.num_clusters; i++) {
+		if (snapshot->active.clusters[i] != 0 &&
+		    snapshot->active.clusters[i] == clone->active.clusters[i]) {
+			snapshot->active.clusters[i] = 0;
+			snapshot->active.num_allocated_clusters--;
+			changed = true;
+		}
+	}
+	for (i = 0; i < snapshot->active.num_extent_pages && i < clone->active.num_extent_pages; i++) {
+		if (snapshot->active.extent_pages[i] != 0 &&
+		    snapshot->active.extent_pages[i] == clone->active.extent_pages[i]) {
+			snapshot->active.extent_pages[i] = 0;
+			changed = true;
+		}
+	}
+
+	return changed;
+}
+
+static void
+bs_examine_release_orphan_snapshot_close_cpl(void *cb_arg, int bserrno)
+{
+	struct spdk_bs_load_ctx *ctx = cb_arg;
+	struct spdk_blob *snapshot = ctx->blob;
+
+	if (bserrno != 0) {
+		SPDK_ERRLOG("Failed to close clone of a corrupted blob\n");
+	}
+
+	if (!ctx->orphan_released) {
+		bs_load_iter_on_examine_cpl(ctx, 0);
+		return;
+	}
+	ctx->orphan_released = false;
+
+	SPDK_NOTICELOG("Snapshot 0x%" PRIx64 " pending removal: its clusters belong to the clone, "
+		       "dropping them from the snapshot\n", snapshot->id);
+
+	/* The snapshot now has unallocated clusters: thin provisioned, reading zeroes there
+	 * unless it has a parent of its own. */
+	ctx->snapshot_md_flag = snapshot->md_ro;
+	snapshot->md_ro = false;
+	blob_set_thin_provision(snapshot);
+	if (snapshot->back_bs_dev == NULL) {
+		snapshot->back_bs_dev = bs_create_zeroes_dev();
+	}
+	spdk_blob_sync_md(snapshot, false, blob_op_update_corrupted_cb, ctx);
+}
+
 static void
 bs_examine_clone_without_close(void *cb_arg, struct spdk_blob *blob, int bserrno)
 {
@@ -7214,9 +7297,12 @@ bs_examine_clone_without_close(void *cb_arg, struct spdk_blob *blob, int bserrno
 		}
 		ctx->blobid = ctx->blob->id;
 		SPDK_INFOLOG(blob, "Cannot examine corrupted snapblob in deletion mode 0x%" PRIx64 ".\n", blob->id);
-		/* Power failure occurred after updating clone (snapshot delete case) - remove snapshot */
+		/* Power failure occurred after updating clone (snapshot delete case). The snapshot is
+		 * left for its owner to delete, but its clusters already belong to the clone: release
+		 * them from the snapshot now (bs_examine_release_orphan_snapshot) */
 		// bs_swap_corrupted_blob_start(ctx->blob, blob, bs_examine_swap_corrupted_blob_cleanup, ctx);
-		spdk_blob_close(blob, bs_delete_corrupted_blob_examine_cpl, ctx);
+		ctx->orphan_released = bs_examine_release_orphan_snapshot(ctx->blob, blob);
+		spdk_blob_close(blob, bs_examine_release_orphan_snapshot_close_cpl, ctx);
 		// only for failover recovery case, we just delete the corrupted snapblob
 		// spdk_blob_close(blob, bs_delete_corrupted_blob_without_close, ctx);
 		return;
@@ -10917,6 +11003,28 @@ spdk_blob_get_freeze_cnt(struct spdk_blob *blob)
 	/* get Freeze count on blob */
 	return blob->frozen_refcnt;
 }
+
+void
+spdk_blob_group_freeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	/* Consistency-group freeze: refcount only. Deliberately NOT taking
+	 * locked_operation_in_progress - the group holds its freeze across the per-member
+	 * snapshot creations, and each of those takes its own spdk_snapshot_freeze_blob, which
+	 * refuses when that flag is set. The group window relies on frozen_refcnt staying >= 1
+	 * from before the first member snapshot until after the last. */
+	blob_verify_md_op(blob);
+	blob->group_frozen_refcnt++;
+	blob_freeze_io(blob, cb_fn, cb_arg);
+}
+
+void
+spdk_blob_group_unfreeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	blob_verify_md_op(blob);
+	assert(blob->group_frozen_refcnt > 0);
+	blob->group_frozen_refcnt--;
+	blob_unfreeze_io(blob, cb_fn, cb_arg);
+}
 /* END spdk_bs_create_snapshot */
 
 /* START spdk_bs_create_clone */
@@ -13097,8 +13205,9 @@ spdk_bs_set_ha_fenced(struct spdk_blob_store *bs, bool fenced)
 void
 blob_freeze_on_failover(struct spdk_blob *blob)
 {
-	/* Freeze I/O on blob */
-	assert(blob->frozen_refcnt == 0);
+	/* Freeze I/O on blob. A consistency-group freeze may already hold IO
+	 * (spdk_blob_group_freeze_io, snapshot of a non-leader group member). */
+	assert(blob->frozen_refcnt == blob->group_frozen_refcnt);
 	blob->failed_on_update = false;
 	blob->frozen_refcnt++;
 }

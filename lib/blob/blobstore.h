@@ -167,6 +167,8 @@ struct spdk_blob {
 	RB_ENTRY(spdk_blob) link;
 
 	uint32_t frozen_refcnt;
+	/* Part of frozen_refcnt held by consistency-group freezes (spdk_blob_group_freeze_io). */
+	uint32_t group_frozen_refcnt;
 	bool locked_operation_in_progress;
 	enum blob_clear_method clear_method;
 	bool extent_rle_found;

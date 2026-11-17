@@ -20,6 +20,7 @@
 #include "spdk/util.h"
 #include "spdk/trace.h"
 #include "spdk/dma.h"
+#include "spdk/priority_class.h"
 
 #include "spdk/bdev_module.h"
 #include "spdk/log.h"
@@ -5771,7 +5772,15 @@ bdev_bytes_to_blocks(struct spdk_bdev_desc *desc, uint64_t offset_bytes,
 static bool
 bdev_io_valid_blocks(struct spdk_bdev *bdev, uint64_t offset_blocks, uint64_t num_blocks)
 {
-	if (1) { return true; } // need this to support priority I/O
+	/*
+	 * The top NBITS_USED bits of an offset carry IO attributes, not address bits (priority
+	 * class, geometry, storage tiering, special IO; see spdk/priority_class.h): a blobstore
+	 * on a raid bdev sends them to a bdev of real size. Check only the address part. Bdevs
+	 * that decode further address bits of their own (distrib / alceml addressing, the
+	 * hublvol's lvol map id) report blockcnt = UINT64_MAX and accept any such address.
+	 */
+	offset_blocks &= MASK_OUT_USED_BITS;
+
 	/* Return failure if offset_blocks + num_blocks is less than offset_blocks; indicates there
 	 * has been an overflow and hence the offset has been wrapped around */
 	if (offset_blocks + num_blocks < offset_blocks) {
