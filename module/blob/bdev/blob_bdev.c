@@ -61,7 +61,16 @@ bdev_blob_io_complete(struct spdk_bdev_io *bdev_io, bool success, void *arg)
 	if (success) {
 		bserrno = 0;
 	} else {
-		bserrno = -EIO;
+		uint32_t cdw0;
+		int sct, sc;
+
+		/* The base bdev (distrib) reports a write it could not place for lack of
+		 * space as NVMe "Capacity Exceeded": carried up as -ENOSPC, so the lvol
+		 * layer fails the IO to the host and keeps its leadership (a full device
+		 * is not a lost leader). Anything else stays -EIO. */
+		spdk_bdev_io_get_nvme_status(bdev_io, &cdw0, &sct, &sc);
+		bserrno = (sct == SPDK_NVME_SCT_GENERIC && sc == SPDK_NVME_SC_CAPACITY_EXCEEDED) ?
+			  -ENOSPC : -EIO;
 	}
 	cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, bserrno);
 	spdk_bdev_free_io(bdev_io);

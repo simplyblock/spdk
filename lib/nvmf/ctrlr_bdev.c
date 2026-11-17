@@ -97,6 +97,10 @@ nvmf_bdev_ctrlr_complete_cmd(struct spdk_bdev_io *bdev_io, bool success,
 	response->cdw0 = cdw0;
 	response->status.sc = sc;
 	response->status.sct = sct;
+	/* Out of space: retrying the same write on this or another path cannot help. */
+	if (sct == SPDK_NVME_SCT_GENERIC && sc == SPDK_NVME_SC_CAPACITY_EXCEEDED) {
+		response->status.dnr = 1;
+	}
 
 	spdk_nvmf_request_complete(req);
 	spdk_bdev_free_io(bdev_io);

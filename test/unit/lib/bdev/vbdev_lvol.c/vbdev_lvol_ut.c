@@ -2234,6 +2234,47 @@ ut_lvol_read_write(void)
 	free(g_lvol);
 }
 
+static int g_done_sct_ns = -1, g_done_sc_ns = -1;
+static void ut_capture_nvme_status(void);
+
+/* A full device is a write error for the host, never a lost leader (bed bf26
+ * 2026-11-17): -ENOSPC completes with NVMe Capacity Exceeded and leaves the
+ * lvstore's failed-IO queue (freeze, port block, leadership drop) untouched. */
+static void
+ut_lvol_nospace_is_a_write_error_not_a_failover(void)
+{
+	static struct spdk_lvol_store ns_lvs;
+
+	g_io = calloc(1, sizeof(struct spdk_bdev_io) + vbdev_lvs_get_ctx_size());
+	SPDK_CU_ASSERT_FATAL(g_io != NULL);
+	g_lvol = calloc(1, sizeof(struct spdk_lvol));
+	SPDK_CU_ASSERT_FATAL(g_lvol != NULL);
+	memset(&ns_lvs, 0, sizeof(ns_lvs));
+	ns_lvs.leader = true;
+	g_lvol->lvol_store = &ns_lvs;
+	g_io->bdev = &g_bdev;
+	g_io->bdev->ctxt = g_lvol;
+	g_io->type = SPDK_BDEV_IO_TYPE_WRITE;
+	g_io->u.bdev.offset_blocks = 20;
+	g_io->u.bdev.num_blocks = 8;
+	g_io->internal.status = SPDK_BDEV_IO_STATUS_PENDING;
+
+	lvol_op_comp(g_io, -ENOSPC);
+	ut_capture_nvme_status();
+	CU_ASSERT(g_done_sct_ns == SPDK_NVME_SCT_GENERIC);
+	CU_ASSERT(g_done_sc_ns == SPDK_NVME_SC_CAPACITY_EXCEEDED);
+	CU_ASSERT(g_io->internal.status == SPDK_BDEV_IO_STATUS_PENDING);
+	CU_ASSERT(ns_lvs.queue_failed_rsp == false);
+	CU_ASSERT(ns_lvs.leader == true);
+
+	/* Any other error keeps today's behaviour: a generic failure. */
+	lvol_op_comp(g_io, -EIO);
+	CU_ASSERT(g_io->internal.status == SPDK_BDEV_IO_STATUS_FAILED);
+
+	free(g_io);
+	free(g_lvol);
+}
+
 static void
 ut_vbdev_lvol_submit_request(void)
 {
@@ -2787,6 +2828,59 @@ spdk_bdev_io_complete_nvme_status(struct spdk_bdev_io *bdev_io, uint32_t cdw0, i
 	g_done_sct = sct;
 	g_done_sc = sc;
 	g_done_calls++;
+}
+
+static void
+ut_capture_nvme_status(void)
+{
+	g_done_sct_ns = g_done_sct;
+	g_done_sc_ns = g_done_sc;
+}
+
+/* A secondary whose redirected IO comes back from the leader with Capacity
+ * Exceeded passes that to its host as-is: no failover, no resend. */
+static void
+ut_lvol_redirected_nospace_completes_without_failover(void)
+{
+	static struct spdk_lvol_store rd_lvs;
+	struct spdk_bdev_io *orig;
+	struct spdk_lvol *lvol;
+	struct vbdev_lvol_io *io_ctx;
+	struct ctx_redirect_req *ctx;
+	int calls_before;
+
+	orig = calloc(1, sizeof(struct spdk_bdev_io) + vbdev_lvs_get_ctx_size());
+	SPDK_CU_ASSERT_FATAL(orig != NULL);
+	lvol = calloc(1, sizeof(struct spdk_lvol));
+	SPDK_CU_ASSERT_FATAL(lvol != NULL);
+	memset(&rd_lvs, 0, sizeof(rd_lvs));
+	lvol->lvol_store = &rd_lvs;
+	rd_lvs.hub_dev.redirected_io_count = 1;
+	orig->bdev = &g_bdev;
+	orig->bdev->ctxt = lvol;
+	orig->internal.status = SPDK_BDEV_IO_STATUS_PENDING;
+	io_ctx = (struct vbdev_lvol_io *)orig->driver_ctx;
+	io_ctx->redirect_in_progress = true;
+	ctx = calloc(1, sizeof(*ctx));
+	SPDK_CU_ASSERT_FATAL(ctx != NULL);
+	ctx->bdev_io = orig;
+	ctx->ch = g_ch;
+
+	g_hub_io_sct = SPDK_NVME_SCT_GENERIC;
+	g_hub_io_sc = SPDK_NVME_SC_CAPACITY_EXCEEDED;
+	calls_before = g_done_calls;
+	_pt_complete_io(&g_hub_io, false, ctx);
+	CU_ASSERT(g_done_calls == calls_before + 1);
+	CU_ASSERT(g_done_sct == SPDK_NVME_SCT_GENERIC);
+	CU_ASSERT(g_done_sc == SPDK_NVME_SC_CAPACITY_EXCEEDED);
+	CU_ASSERT(io_ctx->redirect_in_progress == false);
+	CU_ASSERT(rd_lvs.hub_dev.redirected_io_count == 0);
+	CU_ASSERT(orig->internal.status == SPDK_BDEV_IO_STATUS_PENDING); /* not resubmitted */
+
+	g_hub_io_sct = 0;
+	g_hub_io_sc = 0;
+	free(orig);
+	free(lvol);
 }
 
 /* Answer the oldest outstanding hub command, copying data into its buffer */
@@ -3846,6 +3940,8 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, ut_vbdev_lvol_io_type_supported);
 	CU_ADD_TEST(suite, ut_lvol_read_write);
 	CU_ADD_TEST(suite, ut_vbdev_lvol_submit_request);
+	CU_ADD_TEST(suite, ut_lvol_nospace_is_a_write_error_not_a_failover);
+	CU_ADD_TEST(suite, ut_lvol_redirected_nospace_completes_without_failover);
 	CU_ADD_TEST(suite, ut_lvol_examine_config);
 	CU_ADD_TEST(suite, ut_lvol_examine_disk);
 	CU_ADD_TEST(suite, ut_lvol_rename);

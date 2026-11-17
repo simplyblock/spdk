@@ -1279,6 +1279,26 @@ lvol_op_comp(void *cb_arg, int bserrno)
 		return;
 	}
 
+	if (bserrno == -ENOSPC) {
+		/* The devices under the lvstore are out of space. That is a write error for
+		 * the host, never a sign of a lost leader: no freeze, no port block, no
+		 * leadership change (bed bf26 2026-11-17: on a full cluster every leader
+		 * failed this way in turn, blocked its ports, and the hosts lost their
+		 * paths after ctrl-loss-tmo). */
+		uint64_t offset = bdev_io->u.bdev.offset_blocks;
+		struct spdk_lvol *target = lvol;
+
+		if (lvol->hublvol) {
+			target = lvs->lvol_map.lvol[offset >> 48];
+		}
+		SPDK_NOTICELOG("FAILED IO blob: %" PRIu64 " LBA: %" PRIu64 " CNT %" PRIu64
+			       " type %d: out of space\n", target ? target->blob_id : 0,
+			       bdev_io->u.bdev.offset_blocks, bdev_io->u.bdev.num_blocks, bdev_io->type);
+		spdk_bdev_io_complete_nvme_status(bdev_io, 0, SPDK_NVME_SCT_GENERIC,
+						  SPDK_NVME_SC_CAPACITY_EXCEEDED);
+		return;
+	}
+
 	if (bserrno != 0) {
 
 		uint64_t offset = bdev_io->u.bdev.offset_blocks;
@@ -1843,6 +1863,18 @@ blob_ext_io_opts_to_bdev_opts(struct spdk_bdev_ext_io_opts *dst, struct spdk_blo
 	dst->memory_domain_ctx = src->memory_domain_ctx;
 }
 
+/* True when a redirected IO came back from the leader with NVMe "Capacity
+ * Exceeded" (lvol_op_comp on the leader, -ENOSPC from its devices). */
+static bool
+vbdev_lvol_io_is_nospace(struct spdk_bdev_io *bdev_io)
+{
+	uint32_t cdw0;
+	int sct, sc;
+
+	spdk_bdev_io_get_nvme_status(bdev_io, &cdw0, &sct, &sc);
+	return sct == SPDK_NVME_SCT_GENERIC && sc == SPDK_NVME_SC_CAPACITY_EXCEEDED;
+}
+
 static void
 _pt_complete_io(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
@@ -1870,6 +1902,15 @@ _pt_complete_io(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 		return;
 	}
 
+	if (vbdev_lvol_io_is_nospace(bdev_io)) {
+		/* The leader answered: its devices are out of space. A write error for the
+		 * host, not a failed leader -- no failover, no resend. */
+		spdk_bdev_free_io(bdev_io);
+		free(ctx);
+		spdk_bdev_io_complete_nvme_status(orig_io, 0, SPDK_NVME_SCT_GENERIC,
+						  SPDK_NVME_SC_CAPACITY_EXCEEDED);
+		return;
+	}
 
 	// Failure path: trigger failover and resend original IO
 	if (!lvs->skip_redirecting) {
@@ -2074,6 +2115,15 @@ _pt_complete_io_after_migrate(struct spdk_bdev_io *bdev_io, bool success, void *
 		spdk_bdev_io_complete(orig_io, status);
 		spdk_bdev_free_io(bdev_io);
 		free(ctx);
+		return;
+	}
+
+	if (vbdev_lvol_io_is_nospace(bdev_io)) {
+		/* The target's devices are out of space: a write error, not a broken redirect. */
+		spdk_bdev_free_io(bdev_io);
+		free(ctx);
+		spdk_bdev_io_complete_nvme_status(orig_io, 0, SPDK_NVME_SCT_GENERIC,
+						  SPDK_NVME_SC_CAPACITY_EXCEEDED);
 		return;
 	}
 
