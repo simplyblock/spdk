@@ -54,6 +54,49 @@ DEFINE_STUB(spdk_bdev_copy_blocks, int,
 	     void *cb_arg), 0);
 DEFINE_STUB(spdk_bdev_get_copy_domain, uint32_t, (struct spdk_bdev *bdev, uint64_t offset_blocks), 0);
 
+static int g_io_sct, g_io_sc;
+
+void
+spdk_bdev_io_get_nvme_status(const struct spdk_bdev_io *bdev_io, uint32_t *cdw0, int *sct, int *sc)
+{
+	*cdw0 = 0;
+	*sct = g_io_sct;
+	*sc = g_io_sc;
+}
+
+static int g_cb_bserrno;
+
+static void
+ut_bs_dev_cb(struct spdk_io_channel *channel, void *cb_arg, int bserrno)
+{
+	g_cb_bserrno = bserrno;
+}
+
+/* A base-bdev write that failed with NVMe Capacity Exceeded (distrib: no
+ * device can take the allocation) reaches the blobstore as -ENOSPC, so the
+ * lvol layer can fail the IO without dropping leadership; any other failure
+ * stays -EIO (bed bf26 2026-11-17). */
+static void
+io_complete_maps_capacity_exceeded_to_enospc(void)
+{
+	struct spdk_bs_dev_cb_args cb_args = { .cb_fn = ut_bs_dev_cb };
+
+	g_io_sct = SPDK_NVME_SCT_GENERIC;
+	g_io_sc = SPDK_NVME_SC_CAPACITY_EXCEEDED;
+	g_cb_bserrno = 1;
+	bdev_blob_io_complete(NULL, false, &cb_args);
+	CU_ASSERT(g_cb_bserrno == -ENOSPC);
+
+	g_io_sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+	bdev_blob_io_complete(NULL, false, &cb_args);
+	CU_ASSERT(g_cb_bserrno == -EIO);
+
+	g_io_sct = 0;
+	g_io_sc = 0;
+	bdev_blob_io_complete(NULL, true, &cb_args);
+	CU_ASSERT(g_cb_bserrno == 0);
+}
+
 struct spdk_bdev {
 	char name[16];
 	uint64_t blockcnt;
@@ -561,6 +604,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, deferred_destroy_refs);
 	CU_ADD_TEST(suite, deferred_destroy_channels);
 	CU_ADD_TEST(suite, deferred_destroy_threads);
+	CU_ADD_TEST(suite, io_complete_maps_capacity_exceeded_to_enospc);
 
 	allocate_threads(2);
 	set_thread(0);
