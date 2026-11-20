@@ -13,6 +13,18 @@ struct spdk_bdev_desc {
 
 typedef enum spdk_dif_type spdk_dif_type_t;
 
+/* NVMe status a failed child IO reports (raid_bdev_base_io_status reads it). */
+int g_ut_child_nvme_sct = SPDK_NVME_SCT_GENERIC;
+int g_ut_child_nvme_sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+
+void
+spdk_bdev_io_get_nvme_status(const struct spdk_bdev_io *bdev_io, uint32_t *cdw0, int *sct, int *sc)
+{
+	*cdw0 = 0;
+	*sct = g_ut_child_nvme_sct;
+	*sc = g_ut_child_nvme_sc;
+}
+
 spdk_dif_type_t
 spdk_bdev_get_dif_type(const struct spdk_bdev *bdev)
 {

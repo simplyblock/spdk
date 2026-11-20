@@ -160,6 +160,10 @@ struct raid_bdev_io {
 	enum spdk_bdev_io_status	base_bdev_io_status;
 	/* This will be the raid_io completion status unless any base io's status is different. */
 	enum spdk_bdev_io_status	base_bdev_io_status_default;
+	/* A base IO failed with NVMe "Capacity Exceeded" (the distrib could not place a
+	 * write for lack of space): the raid IO completes with that status, not a
+	 * generic failure. See raid_bdev_base_io_status(). */
+	bool				nospace;
 
 	/* Private data for the raid module */
 	void				*module_private;
@@ -422,6 +426,33 @@ raid_bdev_io_set_default_status(struct raid_bdev_io *raid_io, enum spdk_bdev_io_
 	assert(raid_io->base_bdev_io_submitted == 0);
 	raid_io->base_bdev_io_status = status;
 	raid_io->base_bdev_io_status_default = status;
+}
+
+/*
+ * The status a raid IO takes from one of its base IOs. A failed base IO that
+ * carries NVMe "Capacity Exceeded" also marks the raid IO nospace, so
+ * raid_bdev_io_complete() hands that status up instead of a generic failure.
+ *
+ * Without it the lvstore above the raid0 saw every out-of-space write as -EIO,
+ * took it for a lost leader, dropped leadership and blocked its client ports:
+ * bed bf29 2026-11-20 08:27, cluster at 99%, all five nodes fenced every
+ * lvstore in turn and the hosts lost every path. Call it before the base IO is
+ * freed.
+ */
+static inline enum spdk_bdev_io_status
+raid_bdev_base_io_status(struct raid_bdev_io *raid_io, struct spdk_bdev_io *base_io, bool success)
+{
+	uint32_t cdw0;
+	int sct, sc;
+
+	if (success) {
+		return SPDK_BDEV_IO_STATUS_SUCCESS;
+	}
+	spdk_bdev_io_get_nvme_status(base_io, &cdw0, &sct, &sc);
+	if (sct == SPDK_NVME_SCT_GENERIC && sc == SPDK_NVME_SC_CAPACITY_EXCEEDED) {
+		raid_io->nospace = true;
+	}
+	return SPDK_BDEV_IO_STATUS_FAILED;
 }
 
 int raid_bdev_remap_dix_reftag(void *md_buf, uint64_t num_blocks,

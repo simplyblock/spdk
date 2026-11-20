@@ -968,6 +968,59 @@ test_io_failure(void)
 	reset_globals();
 }
 
+/* A child IO that fails with NVMe "Capacity Exceeded" (the distrib could not place
+ * the write for lack of space) must leave the raid IO marked nospace, so the raid
+ * completes with that status and the lvstore above does not read it as a lost
+ * leader. Any other failure stays a plain failure. */
+static void
+test_io_failure_nospace(void)
+{
+	struct raid_bdev *raid_bdev;
+	struct raid_bdev_io *raid_io;
+	struct raid_bdev_io_channel *raid_ch;
+	int iotype, i;
+	const int iotypes[] = { SPDK_BDEV_IO_TYPE_WRITE, SPDK_BDEV_IO_TYPE_UNMAP };
+	const int scs[] = { SPDK_NVME_SC_CAPACITY_EXCEEDED, SPDK_NVME_SC_INTERNAL_DEVICE_ERROR };
+
+	set_globals();
+
+	raid_bdev = create_raid0();
+	raid_ch = raid_test_create_io_channel(raid_bdev);
+
+	g_child_io_status_flag = false;
+	for (iotype = 0; iotype < 2; iotype++) {
+		for (i = 0; i < 2; i++) {
+			g_ut_child_nvme_sct = SPDK_NVME_SCT_GENERIC;
+			g_ut_child_nvme_sc = scs[i];
+			raid_io = calloc(1, sizeof(*raid_io));
+			SPDK_CU_ASSERT_FATAL(raid_io != NULL);
+			/* the unmap spans two strips, so it takes the multi-child path */
+			raid_io_initialize(raid_io, raid_ch, raid_bdev, 0,
+					   iotypes[iotype] == SPDK_BDEV_IO_TYPE_UNMAP ? g_strip_size * 2 : g_strip_size / 2,
+					   iotypes[iotype]);
+			memset(g_io_output, 0, ((g_max_io_size / g_strip_size) + 1) * sizeof(struct io_output));
+			g_io_output_index = 0;
+			g_io_comp_status = true;
+			if (iotypes[iotype] == SPDK_BDEV_IO_TYPE_UNMAP) {
+				raid0_submit_null_payload_request(raid_io);
+			} else {
+				generate_dif(raid_io->iovs, raid_io->iovcnt, raid_io->md_buf,
+					     raid_io->offset_blocks, raid_io->num_blocks, &raid_bdev->bdev);
+				raid0_submit_rw_request(raid_io);
+			}
+			CU_ASSERT(g_io_comp_status == false);
+			CU_ASSERT(raid_io->nospace == (scs[i] == SPDK_NVME_SC_CAPACITY_EXCEEDED));
+			raid_io_cleanup(raid_io);
+		}
+	}
+	g_ut_child_nvme_sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+
+	raid_test_destroy_io_channel(raid_ch);
+	delete_raid0(raid_bdev);
+
+	reset_globals();
+}
+
 int
 main(int argc, char **argv)
 {
@@ -979,6 +1032,7 @@ main(int argc, char **argv)
 		{ "test_unmap_io", test_unmap_io },
 		{ "test_copy_io", test_copy_io },
 		{ "test_io_failure", test_io_failure },
+		{ "test_io_failure_nospace", test_io_failure_nospace },
 		CU_TEST_INFO_NULL,
 	};
 	CU_SuiteInfo suites[] = {
