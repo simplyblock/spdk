@@ -2691,6 +2691,15 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('-l', '--lvs-name', help='only lvols in lvol store name')
     p.set_defaults(func=bdev_lvol_get_lvols)
 
+    def bdev_lvol_get_cluster_runs(args):
+        print_dict(rpc.lvol.bdev_lvol_get_cluster_runs(args.client,
+                                                       name=args.name))
+
+    p = subparsers.add_parser('bdev_lvol_get_cluster_runs',
+                              help='List allocated lvol clusters as runs of lvstore clusters')
+    p.add_argument('name', help='lvol bdev name, alias or UUID')
+    p.set_defaults(func=bdev_lvol_get_cluster_runs)
+
     def bdev_raid_set_options(args):
         rpc.bdev.bdev_raid_set_options(args.client,
                                        process_window_size_kb=args.process_window_size_kb,

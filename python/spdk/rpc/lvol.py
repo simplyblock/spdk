@@ -1091,3 +1091,15 @@ def bdev_lvol_get_lvols(client, lvs_uuid=None, lvs_name=None):
     if lvs_name:
         params['lvs_name'] = lvs_name
     return client.call('bdev_lvol_get_lvols', params)
+
+
+def bdev_lvol_get_cluster_runs(client, name):
+    """List the allocated clusters of a logical volume as runs.
+
+    Args:
+        name: lvol bdev name, alias or UUID
+    """
+    params = {
+        'name': name,
+    }
+    return client.call('bdev_lvol_get_cluster_runs', params)

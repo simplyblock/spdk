@@ -53,6 +53,9 @@ DEFINE_STUB(spdk_bdev_copy_blocks, int,
 	     uint64_t src_offset_blocks, uint64_t num_blocks, spdk_bdev_io_completion_cb cb,
 	     void *cb_arg), 0);
 DEFINE_STUB(spdk_bdev_get_copy_domain, uint32_t, (struct spdk_bdev *bdev, uint64_t offset_blocks), 0);
+DEFINE_STUB(spdk_bdev_is_layer_bound, bool, (struct spdk_bdev *bdev, uint64_t offset_blocks),
+	    false);
+DEFINE_STUB(spdk_bdev_has_layer, bool, (struct spdk_bdev *bdev), false);
 
 static int g_io_sct, g_io_sc;
 

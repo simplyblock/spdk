@@ -1054,6 +1054,23 @@ uint32_t spdk_bdev_get_max_copy(const struct spdk_bdev *bdev);
 uint32_t spdk_bdev_get_copy_domain(struct spdk_bdev *bdev, uint64_t offset_blocks);
 
 /**
+ * Check whether a block is bound in the metadata of a layer bdev.
+ *
+ * \param bdev Block device to query.
+ * \param offset_blocks Block offset.
+ * \return true if bound, false if not or if the bdev is not a layer.
+ */
+bool spdk_bdev_is_layer_bound(struct spdk_bdev *bdev, uint64_t offset_blocks);
+
+/**
+ * Check whether a bdev implements is_layer_bound, i.e. it is a pack layer.
+ *
+ * \param bdev Block device to query.
+ * \return true if the bdev is a layer.
+ */
+bool spdk_bdev_has_layer(struct spdk_bdev *bdev);
+
+/**
  * Get the most recently measured queue depth from a bdev.
  *
  * The reported queue depth is the aggregate of outstanding I/O

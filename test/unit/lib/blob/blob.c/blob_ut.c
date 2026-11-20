@@ -4967,6 +4967,267 @@ blob_thin_prov_rw(void)
 	g_blobid = 0;
 }
 
+struct ut_cluster_run {
+	uint64_t blob_start;
+	uint64_t bs_start;
+	uint64_t count;
+};
+
+struct ut_cluster_runs {
+	struct ut_cluster_run runs[8];
+	int num_runs;
+	int stop_after;
+};
+
+static int
+ut_cluster_run_cb(void *cb_arg, uint64_t blob_cluster_start, uint64_t bs_cluster_start,
+		  uint64_t count)
+{
+	struct ut_cluster_runs *r = cb_arg;
+
+	SPDK_CU_ASSERT_FATAL(r->num_runs < (int)SPDK_COUNTOF(r->runs));
+	r->runs[r->num_runs].blob_start = blob_cluster_start;
+	r->runs[r->num_runs].bs_start = bs_cluster_start;
+	r->runs[r->num_runs].count = count;
+	r->num_runs++;
+
+	return r->num_runs == r->stop_after ? -ECANCELED : 0;
+}
+
+static void
+ut_check_cluster_run(struct ut_cluster_run *run, uint64_t blob_start, uint64_t bs_start,
+		     uint64_t count)
+{
+	CU_ASSERT(run->blob_start == blob_start);
+	CU_ASSERT(run->bs_start == bs_start);
+	CU_ASSERT(run->count == count);
+}
+
+static bool
+ut_layer_bound(struct spdk_bs_dev *dev, uint64_t lba)
+{
+	return false;
+}
+
+/* D8 G1: on a pack layer the clusters a shrink drops are cleared before the md without them is
+ * written. A power failure at that clear leaves them in the md; upstream order (md first) does
+ * not, and is kept when there is no layer. */
+static void
+blob_shrink_clear_order(bool on_layer)
+{
+	struct spdk_blob_store *bs;
+	struct spdk_bs_dev *dev;
+	struct spdk_blob *blob;
+	struct spdk_blob_opts opts;
+	struct spdk_bs_opts bs_opts;
+	struct spdk_power_failure_thresholds thresholds = {};
+	spdk_blob_id id;
+
+	dev = init_dev();
+	if (on_layer) {
+		dev->is_layer_bound = ut_layer_bound;
+	}
+	spdk_bs_opts_init(&bs_opts, sizeof(bs_opts));
+	spdk_bs_init(dev, &bs_opts, bs_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
+	bs = g_bs;
+
+	ut_spdk_blob_opts_init(&opts);
+	opts.num_clusters = 10;
+	blob = ut_blob_create_and_open(bs, &opts);
+	id = spdk_blob_get_id(blob);
+
+	spdk_blob_resize(blob, 5, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	thresholds.unmap_threshold = 1;
+	dev_set_power_failure_thresholds(thresholds);
+	spdk_blob_sync_md(blob, false, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -EIO);
+	dev_reset_power_failure_event();
+
+	ut_bs_dirty_load(&bs, &bs_opts);
+	spdk_bs_open_blob(bs, id, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	CU_ASSERT(spdk_blob_get_num_clusters(g_blob) == (on_layer ? 10 : 5));
+	spdk_blob_close(g_blob, blob_op_complete, NULL);
+	poll_threads();
+	spdk_bs_unload(bs, bs_op_complete, NULL);
+	poll_threads();
+	g_bs = NULL;
+}
+
+static void
+blob_shrink_clear_before_md_on_layer(void)
+{
+	blob_shrink_clear_order(true);
+	blob_shrink_clear_order(false);
+}
+
+/* D8 G2: two threads allocate the same thin cluster; the loser of the md insert clears its
+ * cluster and frees it. When that clear fails on a pack layer the cluster stays claimed;
+ * without a layer it is freed as upstream does. */
+static void
+blob_insert_race_clear_fail(bool on_layer)
+{
+	struct spdk_blob_store *bs;
+	struct spdk_bs_dev *dev;
+	struct spdk_blob *blob;
+	struct spdk_io_channel *ch0, *ch1;
+	struct spdk_blob_opts opts;
+	struct spdk_bs_opts bs_opts;
+	struct spdk_power_failure_thresholds thresholds = {};
+	uint8_t payload[BLOCKLEN];
+	uint64_t free_before;
+
+	dev = init_dev();
+	if (on_layer) {
+		dev->is_layer_bound = ut_layer_bound;
+	}
+	spdk_bs_opts_init(&bs_opts, sizeof(bs_opts));
+	spdk_bs_init(dev, &bs_opts, bs_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
+	bs = g_bs;
+
+	ut_spdk_blob_opts_init(&opts);
+	opts.thin_provision = true;
+	opts.num_clusters = 4;
+	blob = ut_blob_create_and_open(bs, &opts);
+	memset(payload, 0x5A, sizeof(payload));
+	ch0 = spdk_bs_alloc_io_channel(bs);
+	set_thread(1);
+	ch1 = spdk_bs_alloc_io_channel(bs);
+	set_thread(0);
+	SPDK_CU_ASSERT_FATAL(ch0 != NULL && ch1 != NULL);
+	free_before = spdk_bs_free_cluster_count(bs);
+
+	thresholds.unmap_threshold = 1;
+	dev_set_power_failure_thresholds(thresholds);
+	spdk_blob_io_write(blob, ch0, payload, 0, 1, blob_op_complete, NULL);
+	set_thread(1);
+	spdk_blob_io_write(blob, ch1, payload, 0, 1, blob_op_complete, NULL);
+	set_thread(0);
+	poll_threads();
+	dev_reset_power_failure_event();
+
+	CU_ASSERT(spdk_blob_get_num_allocated_clusters(blob) == 1);
+	CU_ASSERT(spdk_bs_free_cluster_count(bs) == free_before - (on_layer ? 2 : 1));
+
+	set_thread(1);
+	spdk_bs_free_io_channel(ch1);
+	set_thread(0);
+	spdk_bs_free_io_channel(ch0);
+	poll_threads();
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	spdk_bs_unload(bs, bs_op_complete, NULL);
+	poll_threads();
+	g_bs = NULL;
+}
+
+static void
+blob_insert_race_clear_fail_on_layer(void)
+{
+	blob_insert_race_clear_fail(true);
+	blob_insert_race_clear_fail(false);
+}
+
+static void
+blob_get_cluster_runs(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob *blob_a, *blob_b;
+	struct spdk_io_channel *channel;
+	struct spdk_blob_opts opts;
+	struct ut_cluster_runs r = {};
+	uint8_t payload[BLOCKLEN];
+	/* {blob (0 = A, 1 = B), blob cluster} */
+	const uint64_t alloc[][2] = { {0, 0}, {0, 1}, {1, 0}, {0, 2}, {0, 3}, {0, 5} };
+	uint64_t io_units_per_cluster, base;
+	size_t i;
+	int rc;
+
+	io_units_per_cluster = spdk_bs_get_cluster_size(bs) / spdk_bs_get_io_unit_size(bs);
+	memset(payload, 0xA5, sizeof(payload));
+
+	channel = spdk_bs_alloc_io_channel(bs);
+	CU_ASSERT(channel != NULL);
+
+	ut_spdk_blob_opts_init(&opts);
+	opts.thin_provision = true;
+	opts.num_clusters = 6;
+	blob_a = ut_blob_create_and_open(bs, &opts);
+	blob_b = ut_blob_create_and_open(bs, &opts);
+
+	/* No allocated clusters, no runs */
+	rc = spdk_blob_get_cluster_runs(blob_a, 0, ut_cluster_run_cb, &r);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(r.num_runs == 0);
+
+	/* Allocate A0, A1, B0, A2, A3, A5 in this order */
+	for (i = 0; i < SPDK_COUNTOF(alloc); i++) {
+		spdk_blob_io_write(alloc[i][0] == 0 ? blob_a : blob_b, channel, payload,
+				   alloc[i][1] * io_units_per_cluster, 1, blob_op_complete, NULL);
+		poll_threads();
+		CU_ASSERT(g_bserrno == 0);
+	}
+	CU_ASSERT(spdk_blob_get_num_allocated_clusters(blob_a) == 5);
+
+	base = bs_lba_to_cluster(bs, blob_a->active.clusters[0]);
+	CU_ASSERT(bs_lba_to_cluster(bs, blob_b->active.clusters[0]) == base + 2);
+
+	rc = spdk_blob_get_cluster_runs(blob_a, 0, ut_cluster_run_cb, &r);
+	CU_ASSERT(rc == 0);
+	SPDK_CU_ASSERT_FATAL(r.num_runs == 3);
+	ut_check_cluster_run(&r.runs[0], 0, base, 2);
+	ut_check_cluster_run(&r.runs[1], 2, base + 3, 2);
+	ut_check_cluster_run(&r.runs[2], 5, base + 5, 1);
+
+	/* Start in the middle of a run */
+	memset(&r, 0, sizeof(r));
+	rc = spdk_blob_get_cluster_runs(blob_a, 3, ut_cluster_run_cb, &r);
+	CU_ASSERT(rc == 0);
+	SPDK_CU_ASSERT_FATAL(r.num_runs == 2);
+	ut_check_cluster_run(&r.runs[0], 3, base + 4, 1);
+	ut_check_cluster_run(&r.runs[1], 5, base + 5, 1);
+
+	/* Callback stops the iteration */
+	memset(&r, 0, sizeof(r));
+	r.stop_after = 1;
+	rc = spdk_blob_get_cluster_runs(blob_a, 0, ut_cluster_run_cb, &r);
+	CU_ASSERT(rc == -ECANCELED);
+	CU_ASSERT(r.num_runs == 1);
+
+	/* Start past the end */
+	memset(&r, 0, sizeof(r));
+	rc = spdk_blob_get_cluster_runs(blob_a, 6, ut_cluster_run_cb, &r);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(r.num_runs == 0);
+
+	/* Not on the md thread */
+	set_thread(1);
+	memset(&r, 0, sizeof(r));
+	rc = spdk_blob_get_cluster_runs(blob_a, 0, ut_cluster_run_cb, &r);
+	CU_ASSERT(rc == -EINVAL);
+	CU_ASSERT(r.num_runs == 0);
+	set_thread(0);
+
+	ut_blob_close_and_delete(bs, blob_a);
+	ut_blob_close_and_delete(bs, blob_b);
+	spdk_bs_free_io_channel(channel);
+	poll_threads();
+	g_blob = NULL;
+	g_blobid = 0;
+}
+
 static void
 blob_thin_prov_write_count_io(void)
 {
@@ -12056,6 +12317,9 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite_bs, blob_thin_prov_alloc);
 		CU_ADD_TEST(suite_bs, blob_insert_cluster_msg_test);
 		CU_ADD_TEST(suite_bs, blob_thin_prov_rw);
+		CU_ADD_TEST(suite_bs, blob_get_cluster_runs);
+		CU_ADD_TEST(suite, blob_shrink_clear_before_md_on_layer);
+		CU_ADD_TEST(suite, blob_insert_race_clear_fail_on_layer);
 		CU_ADD_TEST(suite, blob_thin_prov_write_count_io);
 		CU_ADD_TEST(suite, blob_thin_prov_unmap_cluster);
 		CU_ADD_TEST(suite, blob_thin_write_zeroes_unallocated);

@@ -380,6 +380,9 @@ struct spdk_bdev_fn_table {
 	 * (e.g. the same raid0 leg).
 	 */
 	uint32_t (*get_copy_domain)(void *ctx, uint64_t offset_blocks);
+
+	/** Optional. Return true if the block is bound in the layer's own metadata. */
+	bool (*is_layer_bound)(void *ctx, uint64_t offset_blocks);
 };
 
 /** bdev I/O completion status */
