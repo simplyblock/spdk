@@ -2436,12 +2436,23 @@ struct spdk_blob_persist_ctx {
 	 * their HOME LBAs as well (first persist of a new blob); cleared as soon
 	 * as one page cannot be written through, see blob_persist_start(). */
 	bool			home_direct;
+	/* D8 G1 (pack layer only): truncated clusters were cleared before the md was written. */
+	bool			pre_cleared;
 
 	spdk_bs_sequence_t		*seq;
 	spdk_bs_sequence_cpl		cb_fn;
 	void				*cb_arg;
 	TAILQ_ENTRY(spdk_blob_persist_ctx) link;
 };
+
+/* The blobstore sits on a pack layer (dedup-pack-layer-architecture.md §10.1). Behaviour that
+ * the layer needs and that differs from upstream is gated on this, so lvstores without a layer
+ * are unchanged. */
+static inline bool
+bs_on_pack_layer(struct spdk_blob_store *bs)
+{
+	return bs->dev->is_layer_bound != NULL;
+}
 
 static void
 bs_batch_clear_dev(struct spdk_blob *blob, spdk_bs_batch_t *batch, uint64_t lba,
@@ -2817,10 +2828,11 @@ blob_persist_clear_clusters_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserr
 	blob_persist_clear_extents(seq, ctx);
 }
 
+/* Clears (unmaps) the clusters beyond active.num_clusters, then calls cpl. */
 static void
-blob_persist_clear_clusters(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+blob_persist_clear_truncated(spdk_bs_sequence_t *seq, struct spdk_blob_persist_ctx *ctx,
+			     spdk_bs_sequence_cpl cpl)
 {
-	struct spdk_blob_persist_ctx *ctx = cb_arg;
 	struct spdk_blob		*blob = ctx->blob;
 	struct spdk_blob_store		*bs = blob->bs;
 	spdk_bs_batch_t			*batch;
@@ -2833,13 +2845,8 @@ blob_persist_clear_clusters(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	 * at the end, but no changes ever occur in the middle of the list.
 	 */
 
-	if (bserrno != 0) {
-		blob_persist_complete(seq, ctx, bserrno);
-		return;
-	}
-
 	uint8_t special_io = blob->migration_flag ? 1 : 0;
-	batch = bs_sequence_to_batch_s(seq, blob->geometry, special_io, blob_persist_clear_clusters_cpl, ctx);
+	batch = bs_sequence_to_batch_s(seq, blob->geometry, special_io, cpl, ctx);
 
 	/* Clear all clusters that were truncated */
 	lba = 0;
@@ -2896,6 +2903,23 @@ blob_persist_clear_clusters(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	}
 
 	bs_batch_close(batch);
+}
+
+static void
+blob_persist_clear_clusters(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct spdk_blob_persist_ctx *ctx = cb_arg;
+
+	if (bserrno != 0) {
+		blob_persist_complete(seq, ctx, bserrno);
+		return;
+	}
+	if (ctx->pre_cleared) {
+		/* already cleared before the md was written: release only */
+		blob_persist_clear_clusters_cpl(seq, ctx, 0);
+		return;
+	}
+	blob_persist_clear_truncated(seq, ctx, blob_persist_clear_clusters_cpl);
 }
 
 static void persist_bs_write_used_blobids(spdk_bs_sequence_t *seq, void *arg, int bserrno);
@@ -3649,6 +3673,17 @@ blob_persist_start(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		return;
 	}
 
+	if (bs_on_pack_layer(blob->bs) && !ctx->pre_cleared &&
+	    blob->active.num_clusters < blob->active.cluster_array_size) {
+		/* D8 G1: clear the truncated clusters before the md without them is written, as async
+		 * delete does. A crash in between then leaves the clusters allocated in the md (the
+		 * delete or shrink is repeated) instead of free in used_clusters while their pages are
+		 * still bound in the pack layer. */
+		ctx->pre_cleared = true;
+		blob_persist_clear_truncated(seq, ctx, blob_persist_start);
+		return;
+	}
+
 	if (blob->active.num_pages == 0) {
 		/* This is the signal that the blob should be deleted.
 		 * Immediately jump to the clean up routine. */
@@ -4197,7 +4232,18 @@ blob_insert_cluster_clear_cpl(void *cb_arg, int bserrno)
 		SPDK_WARNLOG("Failed to clear cluster: %d\n", bserrno);
 	}
 
-	blob_insert_cluster_revert(ctx);
+	if (bserrno && bs_on_pack_layer(ctx->blob->bs)) {
+		/* D8 G2: the cluster received the COPY, so the pack layer binds its page. It stays
+		 * claimed (leaked until spdk_bs_cleanup or the promotion sweep) rather than being
+		 * handed out with that binding. */
+		if (ctx->new_extent_page != 0) {
+			spdk_spin_lock(&ctx->blob->bs->used_lock);
+			bs_release_md_page(ctx->blob->bs, ctx->new_extent_page);
+			spdk_spin_unlock(&ctx->blob->bs->used_lock);
+		}
+	} else {
+		blob_insert_cluster_revert(ctx);
+	}
 	/* Keep the insert error if there was one; -EEXIST continues without error. */
 	bs_sequence_finish(ctx->seq, ctx->insert_rc != 0 ? ctx->insert_rc : bserrno);
 }
@@ -9983,6 +10029,47 @@ uint64_t
 spdk_blob_get_next_unallocated_io_unit(struct spdk_blob *blob, uint64_t offset)
 {
 	return blob_find_io_unit(blob, offset, false);
+}
+
+int
+spdk_blob_get_cluster_runs(struct spdk_blob *blob, uint64_t start_cluster,
+			   spdk_blob_cluster_run_cb cb_fn, void *cb_arg)
+{
+	uint64_t i, blob_start = 0, bs_start = 0, count = 0, bs_cluster;
+	int rc;
+
+	assert(blob != NULL && cb_fn != NULL);
+
+	/* active.clusters is only modified on the md thread */
+	if (spdk_get_thread() != blob->bs->md_thread) {
+		return -EINVAL;
+	}
+
+	for (i = start_cluster; i < blob->active.num_clusters; i++) {
+		if (blob->active.clusters[i] == 0) {
+			continue;
+		}
+		bs_cluster = bs_lba_to_cluster(blob->bs, blob->active.clusters[i]);
+		if (count != 0 && i == blob_start + count && bs_cluster == bs_start + count) {
+			count++;
+			continue;
+		}
+		if (count != 0) {
+			rc = cb_fn(cb_arg, blob_start, bs_start, count);
+			if (rc != 0) {
+				return rc;
+			}
+		}
+		blob_start = i;
+		bs_start = bs_cluster;
+		count = 1;
+	}
+
+	if (count != 0) {
+		return cb_fn(cb_arg, blob_start, bs_start, count);
+	}
+
+	return 0;
 }
 
 /* START spdk_bs_create_blob */

@@ -2678,6 +2678,70 @@ cleanup:
 
 SPDK_RPC_REGISTER("bdev_lvol_get_lvols", rpc_bdev_lvol_get_lvols, SPDK_RPC_RUNTIME)
 
+static int
+rpc_dump_cluster_run(void *cb_arg, uint64_t blob_cluster_start, uint64_t bs_cluster_start,
+		     uint64_t count)
+{
+	struct spdk_json_write_ctx *w = cb_arg;
+
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_uint64(w, "blob_cluster_start", blob_cluster_start);
+	spdk_json_write_named_uint64(w, "lvs_cluster_start", bs_cluster_start);
+	spdk_json_write_named_uint64(w, "count", count);
+	spdk_json_write_object_end(w);
+
+	return 0;
+}
+
+static void
+rpc_bdev_lvol_get_cluster_runs(struct spdk_jsonrpc_request *request,
+			       const struct spdk_json_val *params)
+{
+	struct rpc_bdev_lvol_inflate req = {};
+	struct spdk_json_write_ctx *w;
+	struct spdk_bdev *bdev;
+	struct spdk_lvol *lvol;
+
+	if (spdk_json_decode_object(params, rpc_bdev_lvol_inflate_decoders,
+				    SPDK_COUNTOF(rpc_bdev_lvol_inflate_decoders),
+				    &req)) {
+		SPDK_INFOLOG(lvol_rpc, "spdk_json_decode_object failed\n");
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "spdk_json_decode_object failed");
+		goto cleanup;
+	}
+
+	bdev = spdk_bdev_get_by_name(req.name);
+	if (bdev == NULL) {
+		SPDK_ERRLOG("bdev '%s' does not exist\n", req.name);
+		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
+		goto cleanup;
+	}
+
+	lvol = vbdev_lvol_get_from_bdev(bdev);
+	if (lvol == NULL || lvol->blob == NULL) {
+		SPDK_ERRLOG("lvol does not exist\n");
+		spdk_jsonrpc_send_error_response(request, -ENODEV, spdk_strerror(ENODEV));
+		goto cleanup;
+	}
+
+	if (spdk_get_thread() != spdk_bs_get_md_thread(lvol->lvol_store->blobstore)) {
+		spdk_jsonrpc_send_error_response(request, -EINVAL, "not on the lvstore md thread");
+		goto cleanup;
+	}
+
+	w = spdk_jsonrpc_begin_result(request);
+	spdk_json_write_array_begin(w);
+	spdk_blob_get_cluster_runs(lvol->blob, 0, rpc_dump_cluster_run, w);
+	spdk_json_write_array_end(w);
+	spdk_jsonrpc_end_result(request, w);
+
+cleanup:
+	free_rpc_bdev_lvol_inflate(&req);
+}
+
+SPDK_RPC_REGISTER("bdev_lvol_get_cluster_runs", rpc_bdev_lvol_get_cluster_runs, SPDK_RPC_RUNTIME)
+
 struct rpc_bdev_lvol_get_lvol_delete_status {
 	char *name;
 };

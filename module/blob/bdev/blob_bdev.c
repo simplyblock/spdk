@@ -347,6 +347,12 @@ bdev_blob_get_copy_domain(struct spdk_bs_dev *dev, uint64_t lba)
 	return spdk_bdev_get_copy_domain(__get_bdev(dev), lba);
 }
 
+static bool
+bdev_blob_is_layer_bound(struct spdk_bs_dev *dev, uint64_t lba)
+{
+	return spdk_bdev_is_layer_bound(__get_bdev(dev), lba);
+}
+
 static void
 bdev_blob_copy(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	       uint64_t dst_lba, uint64_t src_lba, uint64_t lba_count,
@@ -602,6 +608,9 @@ blob_bdev_init(struct blob_bdev *b, struct spdk_bdev_desc *desc)
 	b->bs_dev.is_zeroes = bdev_blob_is_zeroes;
 	b->bs_dev.is_range_valid = bdev_blob_is_range_valid;
 	b->bs_dev.translate_lba = bdev_blob_translate_lba;
+	if (spdk_bdev_has_layer(bdev)) {
+		b->bs_dev.is_layer_bound = bdev_blob_is_layer_bound;
+	}
 }
 
 void

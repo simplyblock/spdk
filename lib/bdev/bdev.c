@@ -5422,6 +5422,22 @@ spdk_bdev_get_copy_domain(struct spdk_bdev *bdev, uint64_t offset_blocks)
 	return bdev->fn_table->get_copy_domain(bdev->ctxt, offset_blocks);
 }
 
+bool
+spdk_bdev_is_layer_bound(struct spdk_bdev *bdev, uint64_t offset_blocks)
+{
+	if (bdev->fn_table->is_layer_bound == NULL) {
+		return false;
+	}
+
+	return bdev->fn_table->is_layer_bound(bdev->ctxt, offset_blocks);
+}
+
+bool
+spdk_bdev_has_layer(struct spdk_bdev *bdev)
+{
+	return bdev->fn_table->is_layer_bound != NULL;
+}
+
 uint64_t
 spdk_bdev_get_qd(const struct spdk_bdev *bdev)
 {

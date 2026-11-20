@@ -357,6 +357,9 @@ struct spdk_bs_dev {
 
 	uint64_t	blockcnt;
 	uint32_t	blocklen; /* In bytes */
+
+	/* Optional. Set only when the bdev below is a pack layer; NULL means no layer. */
+	bool (*is_layer_bound)(struct spdk_bs_dev *dev, uint64_t lba);
 };
 
 struct spdk_bs_type {
@@ -920,6 +923,33 @@ uint64_t spdk_blob_get_next_allocated_io_unit(struct spdk_blob *blob, uint64_t o
  * \return offset in io_units or UINT64_MAX if only allocated io_unit found
  */
 uint64_t spdk_blob_get_next_unallocated_io_unit(struct spdk_blob *blob, uint64_t offset);
+
+/**
+ * Callback for spdk_blob_get_cluster_runs(). Return non-zero to stop the iteration.
+ *
+ * \param cb_arg Context passed to spdk_blob_get_cluster_runs().
+ * \param blob_cluster_start First cluster of the run, as a cluster index in the blob.
+ * \param bs_cluster_start First cluster of the run, as a cluster index in the blobstore.
+ * \param count Number of clusters in the run.
+ */
+typedef int (*spdk_blob_cluster_run_cb)(void *cb_arg, uint64_t blob_cluster_start,
+					uint64_t bs_cluster_start, uint64_t count);
+
+/**
+ * Report the clusters allocated to the blob as runs that are contiguous both in
+ * the blob and in the blobstore. Clusters not allocated to the blob itself (e.g.
+ * read from a parent) are skipped. Must be called on the blobstore md thread.
+ *
+ * \param blob Blob to query.
+ * \param start_cluster First blob cluster to look at.
+ * \param cb_fn Called synchronously once per run, in blob cluster order.
+ * \param cb_arg Argument passed to cb_fn.
+ *
+ * \return 0 on success, -EINVAL if not called on the md thread, or the first
+ * non-zero value returned by cb_fn.
+ */
+int spdk_blob_get_cluster_runs(struct spdk_blob *blob, uint64_t start_cluster,
+			       spdk_blob_cluster_run_cb cb_fn, void *cb_arg);
 
 struct spdk_blob_xattr_opts {
 	/* Number of attributes */
