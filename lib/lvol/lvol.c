@@ -2253,13 +2253,32 @@ spdk_lvol_resize_register(struct spdk_lvol *lvol, uint64_t sz,
 	cb_fn(cb_arg,  bserrno);
 }
 
+/*
+ * Another lvol of the lvstore on the blob id, other than skip. Opening a blob
+ * id that is already open returns the same spdk_blob (open_ref++), so two
+ * lvols on one id share one handle.
+ */
+static struct spdk_lvol *
+lvs_get_other_lvol_by_blob_id(struct spdk_lvol_store *lvs, spdk_blob_id blob_id,
+			      const struct spdk_lvol *skip)
+{
+	struct spdk_lvol *tmp;
+
+	TAILQ_FOREACH(tmp, &lvs->lvols, link) {
+		if (tmp != skip && tmp->blob_id == blob_id) {
+			return tmp;
+		}
+	}
+	return NULL;
+}
+
 int
 spdk_lvol_register_live(struct spdk_lvol_store *lvs, const char *name, const char *uuid_str, uint64_t blobid,
 		 bool thin_provision, enum lvol_clear_method clear_method, spdk_lvol_op_with_handle_complete cb_fn,
 		 void *cb_arg)
 {
 	struct spdk_lvol_with_handle_req *req;
-	struct spdk_lvol *lvol;
+	struct spdk_lvol *lvol, *owner;
 	int rc;
 
 	if (lvs == NULL) {
@@ -2270,6 +2289,27 @@ spdk_lvol_register_live(struct spdk_lvol_store *lvs, const char *name, const cha
 	rc = lvs_verify_lvol_name(lvs, name);
 	if (rc < 0) {
 		return rc;
+	}
+
+	/*
+	 * An lvol already registered on this blob id is a stale one: the leader
+	 * deleted it and reused the id, but it was never removed here. Opening
+	 * the id would hand the new lvol the stale lvol's open handle (with the
+	 * stale metadata); deleting either lvol then freed the handle under the
+	 * other (bf32 2026-11-21: SIGSEGV in vbdev_lvol_resv_refresh on the next
+	 * register). Refuse: nothing changes here and the control plane sees
+	 * EEXIST; it has to delete the stale lvol before registering this one.
+	 * Evicting the stale lvol here instead would mean unregistering a bdev
+	 * that may still be exposed through an NVMe-oF namespace, asynchronously,
+	 * from inside a register.
+	 */
+	owner = lvs_get_other_lvol_by_blob_id(lvs, blobid, NULL);
+	if (owner != NULL) {
+		SPDK_ERRLOG("lvolstore %s: cannot register lvol %s on blob 0x%" PRIx64 ": the blob is "
+			    "already registered as lvol %s (uuid %s), a stale lvol whose blob id the "
+			    "leader reused? Delete it first\n", lvs->name, name, blobid, owner->name,
+			    owner->uuid_str);
+		return -EEXIST;
 	}
 
 	req = calloc(1, sizeof(*req));
@@ -2452,10 +2492,30 @@ spdk_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_
 	if (lvol->lvol_store->leader) {
 		spdk_bs_delete_blob(bs, lvol->blob_id, lvol_delete_blob_cb, req);
 	} else {
+		struct spdk_lvol *other;
+
+		other = lvs_get_other_lvol_by_blob_id(lvol->lvol_store, lvol->blob_id, lvol);
+		if (other != NULL && other->blob != NULL) {
+			/*
+			 * Another lvol on the same blob id holds the open handle this lvol
+			 * shared (spdk_lvol_register_live refuses that now; an older
+			 * state may still have it). Deleting the blob frees that handle
+			 * under the other lvol (bf32). Leave the blob, and its metadata
+			 * pages, to the other lvol: its own delete releases them.
+			 */
+			SPDK_ERRLOG("Deleting tmpblob 0x%" PRIx64 " on failover: lvol %s still holds the "
+				    "same blob, leaving the blob to it\n", lvol->blob_id, other->name);
+			spdk_bs_free_blob_copy(lvol->tmp_blob);
+			lvol->tmp_blob = NULL;
+			lvol_delete_blob_cb(req, 0);
+			return;
+		}
+
 		SPDK_NOTICELOG("Deleting tmpblob 0x%" PRIx64 " on failover.\n", lvol->blob_id);
 		// TODO add check for snapshots and clons
 		pthread_mutex_lock(&g_lvol_stores_mutex);
 		spdk_bs_delete_blob_non_leader(bs, lvol->tmp_blob);
+		lvol->tmp_blob = NULL;
 		pthread_mutex_unlock(&g_lvol_stores_mutex);
 		lvol_delete_blob_cb(req , 0);
 	}
