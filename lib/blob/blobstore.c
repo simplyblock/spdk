@@ -10152,6 +10152,17 @@ blob_opts_copy(const struct spdk_blob_opts *src, struct spdk_blob_opts *dst)
 #undef SET_FIELD
 }
 
+void
+spdk_bs_free_blob_copy(struct spdk_blob *copy)
+{
+	if (copy == NULL) {
+		return;
+	}
+	/* the back_bs_dev is the open handle's (spdk_bs_copy_blob) */
+	copy->back_bs_dev = NULL;
+	blob_free(copy);
+}
+
 // added by sadegh
 
 struct spdk_blob *
@@ -13911,6 +13922,47 @@ out:
 	free(ctx);
 }
 
+/*
+ * Non-leader delete and the open handle of the blob.
+ *
+ * spdk_bs_delete_blob_non_leader deletes a copy of the blob
+ * (spdk_bs_copy_blob); the open handle -- the one in bs->open_blobs that
+ * blob_lookup returns and every spdk_bs_open_blob of the id shares, with
+ * open_ref++ -- is freed by the manual delete paths below. That handle can
+ * have holders this delete knows nothing about: a second lvol registered on
+ * the same blob id (a stale lvol the leader had deleted, whose blob id the
+ * leader reused), a clone's blob_bs_dev. Freeing it under them left their
+ * spdk_blob pointer dangling: bf32 2026-11-21, SIGSEGV in
+ * vbdev_lvol_resv_refresh -> blob_get_xattr_value on the next secondary
+ * register (lvs_update_live_cb walks every lvol). A handle with more
+ * references than the delete accounts for is therefore left in the tree for
+ * the remaining holders, who close it; at worst it leaks. The force delete
+ * frees at open_ref <= 1 as before: a lone remaining reference there is a
+ * leftover count of the snapshot bookkeeping as often as a holder, and the
+ * lvol layer does not delete a blob another lvol still holds
+ * (lvol_destroy_non_leader).
+ */
+static void
+bs_non_leader_handle_shared(struct spdk_blob *handle, const char *what)
+{
+	SPDK_ERRLOG("Non-leader %s of blob 0x%" PRIx64 ": its open handle is still held by others "
+		    "(open_ref %" PRIu32 "), not freeing it\n", what, handle->id, handle->open_ref);
+}
+
+/*
+ * The references a snapshot delete with a clone (delete_blob_manually, not
+ * single) accounts for on the open handle: the clone's -- the caller has
+ * re-parented the clone and freed its blob_bs_dev without closing the
+ * snapshot -- and the deleter's own while it still holds it. The deleting lvol
+ * closes its handle before the delete (spdk_lvol_close, after the copy), so
+ * the handle then has one reference less than the copy took from it.
+ */
+static uint32_t
+bs_non_leader_snapshot_refs(const struct spdk_blob *handle, const struct spdk_blob *copy)
+{
+	return 1 + (handle->open_ref >= copy->open_ref ? 1 : 0);
+}
+
 static void
 delete_blob_manually(struct spdk_blob_store *bs, struct spdk_blob *blob, bool single) {
 	struct spdk_blob_list *snapshot_entry = NULL;
@@ -13920,7 +13972,22 @@ delete_blob_manually(struct spdk_blob_store *bs, struct spdk_blob *blob, bool si
 
 	if (!single) {
 		tmp_blob = blob_lookup(blob->bs, blob->id);
-		if (tmp_blob) {
+		if (tmp_blob && tmp_blob != blob &&
+		    tmp_blob->open_ref > bs_non_leader_snapshot_refs(tmp_blob, blob)) {
+			/*
+			 * Someone else still holds this open handle -- another
+			 * lvol registered on the same blob id. Freeing it would
+			 * leave that holder dangling (see
+			 * bs_non_leader_handle_shared). Drop the clone's
+			 * reference only and leave the handle to the others.
+			 * Its back_bs_dev may have just been handed to the
+			 * clone: give it the zeroes dev, so the last close does
+			 * not destroy the clone's backing (a leak at worst).
+			 */
+			bs_non_leader_handle_shared(tmp_blob, "delete");
+			tmp_blob->open_ref--;
+			tmp_blob->back_bs_dev = bs_create_zeroes_dev();
+		} else if (tmp_blob) {
 			/*
 			* Remove the blob from the blob_store list now, to ensure it does not
 			*  get returned after this point by blob_lookup().
@@ -13964,7 +14031,15 @@ force_delete_blob_manually(struct spdk_blob *blob) {
 	struct spdk_blob_store *bs = blob->bs;
 
 	tmp_blob = blob_lookup(blob->bs, blob->id);
-	if (tmp_blob) {
+	if (tmp_blob && tmp_blob != blob && tmp_blob->open_ref > 1) {
+		/*
+		 * Others still hold the open handle (bs_non_leader_handle_shared):
+		 * leave it, its back_bs_dev and its references to them. No
+		 * reference is dropped: the deleting lvol closed its own before
+		 * the delete, so every one left belongs to a live holder.
+		 */
+		bs_non_leader_handle_shared(tmp_blob, "force delete");
+	} else if (tmp_blob) {
 		/*
 		* Remove the blob from the blob_store list now, to ensure it does not
 		*  get returned after this point by blob_lookup().
