@@ -1822,6 +1822,16 @@ test_io_complete_nospace(void)
 	CU_ASSERT(g_io_comp_status == false);
 	CU_ASSERT(g_io_comp_nvme_sct == -1);
 
+	/* out of space on one base IO and a device error on another: a plain
+	 * failure, the device error must not pass as "full" */
+	raid_io->nospace = true;
+	raid_io->failed_other = true;
+	g_io_comp_status = true;
+	raid_bdev_io_complete(raid_io, SPDK_BDEV_IO_STATUS_FAILED);
+	CU_ASSERT(g_io_comp_status == false);
+	CU_ASSERT(g_io_comp_nvme_sct == -1);
+	raid_io->failed_other = false;
+
 	/* nospace never turns a success into a failure */
 	raid_io->nospace = true;
 	raid_bdev_io_complete(raid_io, SPDK_BDEV_IO_STATUS_SUCCESS);

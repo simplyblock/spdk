@@ -3288,6 +3288,34 @@ _to_next_boundary(uint64_t offset, uint32_t boundary)
 
 static void bdev_io_split_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg);
 
+/*
+ * A failed child of a split IO fails the parent. An NVMe status of the child
+ * is kept when it is the only kind of failure the parent has seen, so the
+ * caller still tells "Capacity Exceeded" (device full) from a device error.
+ * Without it every write that crossed a raid0/concat strip boundary (those
+ * set split_on_optimal_io_boundary) reached the lvstore as a generic failure
+ * on a full cluster: -EIO, leadership dropped, ports blocked -- the very
+ * case spdk #95/#97 turn into a write error for the host. Two children with
+ * different failures make the parent a generic failure.
+ */
+static void
+bdev_io_split_child_failed(struct spdk_bdev_io *parent_io, const struct spdk_bdev_io *child)
+{
+	if (child->internal.status == SPDK_BDEV_IO_STATUS_NVME_ERROR) {
+		if (parent_io->internal.status == SPDK_BDEV_IO_STATUS_SUCCESS) {
+			parent_io->internal.status = SPDK_BDEV_IO_STATUS_NVME_ERROR;
+			parent_io->internal.error.nvme = child->internal.error.nvme;
+			return;
+		}
+		if (parent_io->internal.status == SPDK_BDEV_IO_STATUS_NVME_ERROR &&
+		    parent_io->internal.error.nvme.sct == child->internal.error.nvme.sct &&
+		    parent_io->internal.error.nvme.sc == child->internal.error.nvme.sc) {
+			return;
+		}
+	}
+	parent_io->internal.status = SPDK_BDEV_IO_STATUS_FAILED;
+}
+
 static void _bdev_rw_split(void *_bdev_io);
 
 static void bdev_unmap_split(struct spdk_bdev_io *bdev_io);
@@ -3681,12 +3709,14 @@ bdev_io_split_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
 	struct spdk_bdev_io *parent_io = cb_arg;
 
+	if (!success) {
+		bdev_io_split_child_failed(parent_io, bdev_io);
+	}
 	spdk_bdev_free_io(bdev_io);
 
 	assert(parent_io->internal.f.split);
 
 	if (!success) {
-		parent_io->internal.status = SPDK_BDEV_IO_STATUS_FAILED;
 		/* If any child I/O failed, stop further splitting process. */
 		parent_io->internal.split.current_offset_blocks += parent_io->internal.split.remaining_num_blocks;
 		parent_io->internal.split.remaining_num_blocks = 0;

@@ -1010,6 +1010,7 @@ test_io_failure_nospace(void)
 			}
 			CU_ASSERT(g_io_comp_status == false);
 			CU_ASSERT(raid_io->nospace == (scs[i] == SPDK_NVME_SC_CAPACITY_EXCEEDED));
+			CU_ASSERT(raid_io->failed_other == (scs[i] != SPDK_NVME_SC_CAPACITY_EXCEEDED));
 			raid_io_cleanup(raid_io);
 		}
 	}

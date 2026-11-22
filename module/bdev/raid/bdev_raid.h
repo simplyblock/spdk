@@ -164,6 +164,10 @@ struct raid_bdev_io {
 	 * write for lack of space): the raid IO completes with that status, not a
 	 * generic failure. See raid_bdev_base_io_status(). */
 	bool				nospace;
+	/* A base IO failed for another reason: the raid IO is a plain failure
+	 * even when another base IO ran out of space (a device error must not
+	 * pass as "full"). */
+	bool				failed_other;
 
 	/* Private data for the raid module */
 	void				*module_private;
@@ -451,6 +455,8 @@ raid_bdev_base_io_status(struct raid_bdev_io *raid_io, struct spdk_bdev_io *base
 	spdk_bdev_io_get_nvme_status(base_io, &cdw0, &sct, &sc);
 	if (sct == SPDK_NVME_SCT_GENERIC && sc == SPDK_NVME_SC_CAPACITY_EXCEEDED) {
 		raid_io->nospace = true;
+	} else {
+		raid_io->failed_other = true;
 	}
 	return SPDK_BDEV_IO_STATUS_FAILED;
 }

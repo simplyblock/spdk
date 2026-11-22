@@ -370,12 +370,24 @@ bs_sequence_copy_dev(spdk_bs_sequence_t *seq, uint64_t dst_lba, uint64_t src_lba
 	channel->dev->copy(channel->dev, channel->dev_channel, dst_lba, src_lba, lba_count, &set->cb_args, &bs_io_opts);
 }
 
+/*
+ * The error a request set reports when several of its ops failed. Any error
+ * other than -ENOSPC wins over -ENOSPC: the lvol layer fails a -ENOSPC write
+ * to the host and keeps leadership (spdk #95), so a device error must not be
+ * reported as "full" because an op that ran out of space completed after it.
+ */
+static inline void
+bs_request_set_error(struct spdk_bs_request_set *set, int bserrno)
+{
+	if (bserrno != 0 && (set->bserrno == 0 || set->bserrno == -ENOSPC)) {
+		set->bserrno = bserrno;
+	}
+}
+
 void
 bs_sequence_finish(spdk_bs_sequence_t *seq, int bserrno)
 {
-	if (bserrno != 0) {
-		seq->bserrno = bserrno;
-	}
+	bs_request_set_error((struct spdk_bs_request_set *)seq, bserrno);
 	bs_request_set_complete((struct spdk_bs_request_set *)seq);
 }
 
@@ -396,9 +408,7 @@ bs_batch_completion(struct spdk_io_channel *_channel,
 	struct spdk_bs_io_opts		bs_io_opts = {0};
 	struct limit *ctx;
 	set->u.batch.outstanding_ops--;
-	if (bserrno != 0) {
-		set->bserrno = bserrno;
-	}
+	bs_request_set_error(set, bserrno);
 
 	if (set->u.batch.is_unmap) {
 		if (!TAILQ_EMPTY(&set->u.batch.unmap_queue)) {
