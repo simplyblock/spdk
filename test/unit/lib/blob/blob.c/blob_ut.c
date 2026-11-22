@@ -10899,7 +10899,8 @@ blob_secondary_delete_snapshot_dangling_parent(void)
  * deletable (open_ref > 1), so the force delete runs. It freed the open
  * handle whatever its open_ref, leaving the other holders' spdk_blob dangling
  * (SIGSEGV in blob_get_xattr_value from vbdev_lvol_resv_refresh). Now the
- * handle stays, for its holders to close.
+ * handle stays valid for its holders to close, but leaves the open-blob tree:
+ * a reused blob id must not get the deleted blob's handle.
  */
 static void
 blob_secondary_force_delete_shared_handle(void)
@@ -10945,7 +10946,10 @@ blob_secondary_force_delete_shared_handle(void)
 	CU_ASSERT(rc == 0);
 	poll_threads();
 
-	CU_ASSERT(blob_lookup(bs, blobid) == blob);
+	/* the handle is valid for its holders, but no longer found by id */
+	CU_ASSERT(blob_lookup(bs, blobid) == NULL);
+	CU_ASSERT(spdk_bit_array_get(bs->open_blobids, blobid) == false);
+	CU_ASSERT(blob->orphaned == true);
 	CU_ASSERT(blob->open_ref == 2);
 	rc = spdk_blob_get_xattr_value(blob, "nvmf_resv", &value, &len);
 	CU_ASSERT(rc == 0);
@@ -10953,11 +10957,13 @@ blob_secondary_force_delete_shared_handle(void)
 	/* the blob itself is deleted on this node */
 	CU_ASSERT(spdk_bit_array_get(bs->used_blobids, bs_blobid_to_page(blobid)) == false);
 
-	/* the holders close it; the last close frees it */
+	/* the holders close it; the last close frees it without touching the
+	 * tree, and a dirty orphan writes no metadata (its id may be reused) */
 	spdk_blob_close(blob, blob_op_complete, NULL);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
-	CU_ASSERT(blob_lookup(bs, blobid) == blob);
+	CU_ASSERT(blob_lookup(bs, blobid) == NULL);
+	blob->state = SPDK_BLOB_STATE_DIRTY;
 	spdk_blob_close(blob, blob_op_complete, NULL);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
