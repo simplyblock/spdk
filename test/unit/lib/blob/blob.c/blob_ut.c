@@ -6175,6 +6175,106 @@ blob_snapshot_rw(void)
 
 /* A declined copy offload falls back to read and write, and the client write
  * succeeds: the fallback must not report the failed copy's error. */
+/*
+ * A snapshot delete that stopped in the middle (power failure, failover) left
+ * SNAPSHOT_PENDING_REMOVAL on the snapshot, and the clone's md was already
+ * updated (its parent is no longer the snapshot). The async delete does not
+ * update the clone again and, per cluster index of the snapshot:
+ *  - 1, 3: the clone holds the same cluster -> kept for the clone (no unmap,
+ *    no release);
+ *  - 0: the clone took it and gave it back since (already free) -> not
+ *    released again;
+ *  - 2: the clone has its own cluster -> the snapshot's, released.
+ */
+static void
+blob_delete_async_in_middle_keeps_clone_clusters(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob *snap, *clone;
+	struct spdk_io_channel *channel;
+	struct spdk_blob_opts opts;
+	spdk_blob_id cloneid;
+	uint64_t pages_per_cluster = spdk_bs_get_cluster_size(bs) / BLOCKLEN;
+	uint64_t free_before;
+	uint32_t cl[4];
+	uint8_t payload[BLOCKLEN], expected[BLOCKLEN];
+	const void *xval;
+	size_t xlen;
+	int i, rc;
+
+	channel = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(channel != NULL);
+
+	/* the snapshot: 4 allocated clusters, each with data */
+	ut_spdk_blob_opts_init(&opts);
+	opts.thin_provision = false;
+	opts.num_clusters = 4;
+	snap = ut_blob_create_and_open(bs, &opts);
+	memset(payload, 0x5A, sizeof(payload));
+	for (i = 0; i < 4; i++) {
+		spdk_blob_io_write(snap, channel, payload, i * pages_per_cluster, 1, blob_op_complete, NULL);
+		poll_threads();
+		CU_ASSERT(g_bserrno == 0);
+		cl[i] = bs_lba_to_cluster(bs, snap->active.clusters[i]);
+	}
+
+	/* the clone, already updated by the delete that stopped */
+	ut_spdk_blob_opts_init(&opts);
+	opts.thin_provision = true;
+	opts.num_clusters = 4;
+	clone = ut_blob_create_and_open(bs, &opts);
+	cloneid = spdk_blob_get_id(clone);
+	CU_ASSERT(clone->parent_id != spdk_blob_get_id(snap));
+	/* 2: the clone writes its own cluster */
+	memset(payload, 0xC3, sizeof(payload));
+	spdk_blob_io_write(clone, channel, payload, 2 * pages_per_cluster, 1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(clone->active.clusters[2] != 0 && clone->active.clusters[2] != snap->active.clusters[2]);
+	/* 1, 3: taken by the clone */
+	clone->active.clusters[1] = snap->active.clusters[1];
+	clone->active.clusters[3] = snap->active.clusters[3];
+	clone->active.num_allocated_clusters += 2;
+	/* 0: taken by the clone, then released by it (unmap) */
+	spdk_spin_lock(&bs->used_lock);
+	bs_release_cluster(bs, cl[0]);
+	spdk_spin_unlock(&bs->used_lock);
+
+	rc = blob_set_xattr(snap, SNAPSHOT_PENDING_REMOVAL, &cloneid, sizeof(cloneid), true);
+	CU_ASSERT(rc == 0);
+
+	free_before = bs->num_free_clusters;
+	g_bserrno = -1;
+	spdk_bs_delete_blob_async(bs, snap, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	/* only the snapshot's own cluster 2 is released; the clone untouched */
+	CU_ASSERT(bs->num_free_clusters == free_before + 1);
+	CU_ASSERT(!spdk_bit_pool_is_allocated(bs->used_clusters, cl[0]));
+	CU_ASSERT(spdk_bit_pool_is_allocated(bs->used_clusters, cl[1]));
+	CU_ASSERT(!spdk_bit_pool_is_allocated(bs->used_clusters, cl[2]));
+	CU_ASSERT(spdk_bit_pool_is_allocated(bs->used_clusters, cl[3]));
+	CU_ASSERT(clone->active.clusters[0] == 0);
+	CU_ASSERT(snap->active.num_allocated_clusters == 0);
+	CU_ASSERT(blob_get_xattr_value(snap, SNAPSHOT_PENDING_REMOVAL, &xval, &xlen, true) != 0);
+
+	/* the clone's data was not unmapped */
+	for (i = 1; i < 4; i++) {
+		memset(expected, i == 2 ? 0xC3 : 0x5A, sizeof(expected));
+		memset(payload, 0, sizeof(payload));
+		spdk_blob_io_read(clone, channel, payload, i * pages_per_cluster, 1, blob_op_complete, NULL);
+		poll_threads();
+		CU_ASSERT(g_bserrno == 0);
+		CU_ASSERT(memcmp(payload, expected, sizeof(payload)) == 0);
+	}
+
+	ut_blob_close_and_delete(bs, snap);
+	ut_blob_close_and_delete(bs, clone);
+	spdk_bs_free_io_channel(channel);
+	poll_threads();
+}
+
 static void
 blob_snapshot_rw_copy_declined(void)
 {
@@ -11960,6 +12060,7 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite, bs_load_iter_test);
 		CU_ADD_TEST(suite_bs, blob_snapshot_rw);
 		CU_ADD_TEST(suite_bs, blob_snapshot_rw_copy_declined);
+		CU_ADD_TEST(suite_bs, blob_delete_async_in_middle_keeps_clone_clusters);
 		CU_ADD_TEST(suite_bs, blob_merge_base_priority_class);
 		CU_ADD_TEST(suite_bs, blob_merge_base_64k_pieces);
 		CU_ADD_TEST(suite_bs, blob_merge_base_waits_for_buffers);

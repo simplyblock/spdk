@@ -14406,6 +14406,73 @@ blob_clear_clusters_async(spdk_bs_sequence_t *seq, struct bs_delete_async_releas
 	bs_batch_close(batch);
 }
 
+/*
+ * A snapshot whose earlier delete stopped in the middle (power failure,
+ * failover) still carries SNAPSHOT_PENDING_REMOVAL with its clone's id, and
+ * the clone's md already went to disk without it (clone->parent_id is no
+ * longer the snapshot): the clone took every cluster of the snapshot at an
+ * index where the clone had none. The delete does not update the clone
+ * again; before the snapshot is unmapped and its clusters are released, per
+ * index:
+ *  - clone has the same cluster: the clone's now, drop it from the snapshot;
+ *  - clone has none: the clone took it and gave it back since (unmap, or a
+ *    newer snapshot of the clone owns it), so it is not the snapshot's to
+ *    release either, drop it;
+ *  - clone has another cluster: the snapshot's own, release it as usual.
+ * clone == NULL: the clone is not open, so which clusters it took cannot be
+ * told; release none (leaked until the next load rebuilds the cluster map,
+ * never owned twice).
+ */
+static void
+bs_delete_async_drop_clone_clusters(struct spdk_blob *blob, struct spdk_blob *clone,
+				    spdk_blob_id clone_id)
+{
+	uint64_t i, kept = 0, given_back = 0;
+
+	if (clone == NULL) {
+		SPDK_ERRLOG("Blob 0x%" PRIx64 " was in delete before, its clone 0x%" PRIx64
+			    " is not open: none of its clusters is released\n", blob->id, clone_id);
+		for (i = 0; i < blob->active.num_clusters; i++) {
+			blob->active.clusters[i] = 0;
+		}
+		for (i = 0; i < blob->active.num_extent_pages; i++) {
+			blob->active.extent_pages[i] = 0;
+		}
+		blob->active.num_allocated_clusters = 0;
+		return;
+	}
+	assert(clone->parent_id != blob->id);
+
+	for (i = 0; i < blob->active.num_clusters && i < clone->active.num_clusters; i++) {
+		if (blob->active.clusters[i] == 0) {
+			continue;
+		}
+		if (blob->active.clusters[i] == clone->active.clusters[i]) {
+			kept++;
+		} else if (clone->active.clusters[i] == 0) {
+			given_back++;
+		} else {
+			continue;
+		}
+		blob->active.clusters[i] = 0;
+		if (blob->active.num_allocated_clusters > 0) {
+			blob->active.num_allocated_clusters--;
+		}
+	}
+	for (i = 0; i < blob->active.num_extent_pages && i < clone->active.num_extent_pages; i++) {
+		if (blob->active.extent_pages[i] != 0 &&
+		    blob->active.extent_pages[i] == clone->active.extent_pages[i]) {
+			blob->active.extent_pages[i] = 0;
+		}
+	}
+
+	if (kept != 0 || given_back != 0) {
+		SPDK_NOTICELOG("Blob 0x%" PRIx64 " was in delete before: %" PRIu64 " clusters are clone "
+			       "0x%" PRIx64 "'s, %" PRIu64 " the clone gave back; neither is released\n",
+			       blob->id, kept, clone->id, given_back);
+	}
+}
+
 static void
 bs_delete_blob_finish_async(void *cb_arg, struct spdk_blob *blob, int bserrno)
 {
@@ -14425,6 +14492,7 @@ bs_delete_blob_finish_async(void *cb_arg, struct spdk_blob *blob, int bserrno)
 		bs_delete_async_cpl(seq, blob, ERR_LEADERSHIP_CHANGED);
 		return;
 	}
+
 
 	/* Allocate the release list first, before anything changes: on failure
 	 * nothing is removed or unmapped yet. */
@@ -14468,6 +14536,8 @@ spdk_bs_delete_blob_async(struct spdk_blob_store *bs, struct spdk_blob *blob,
 	const void *value;
 	int rc;
 	size_t len;
+	bool in_middle = false;
+	spdk_blob_id in_middle_clone_id = SPDK_BLOBID_INVALID;
 
 	SPDK_NOTICELOG("Deleting clusters for blob 0x%" PRIx64 "\n", blob->id);
 
@@ -14500,10 +14570,15 @@ spdk_bs_delete_blob_async(struct spdk_blob_store *bs, struct spdk_blob *blob,
 	rc = blob_get_xattr_value(blob, SNAPSHOT_PENDING_REMOVAL, &value, &len, true);
 	if (rc == 0) {
 		SPDK_NOTICELOG("1- Deleting clusters for blob with clone 0x%" PRIx64 "\n", blob->id);
+		in_middle = true;
+		in_middle_clone_id = *(const spdk_blob_id *)value;
 		clone = blob_lookup(bs, *(spdk_blob_id *)value);
 		if (clone) {
 			if (clone->parent_id == blob->id) {
 				bool  md_ro = blob->md_ro;
+
+				/* stopped before the clone was updated: a normal delete */
+				in_middle = false;
 				blob->md_ro = false;
 				blob_remove_xattr(blob, SNAPSHOT_PENDING_REMOVAL, true);
 				blob->md_ro = md_ro;
@@ -14530,6 +14605,14 @@ spdk_bs_delete_blob_async(struct spdk_blob_store *bs, struct spdk_blob *blob,
 	}
 
 	blob->locked_operation_in_progress = true;
+
+	if (in_middle && !update_clone) {
+		/* stopped in the middle with the clone already updated: do not
+		 * update the clone again, keep what it took (see above) */
+		bs_delete_async_drop_clone_clusters(blob, ctx->corrupted_clone, in_middle_clone_id);
+		ctx->corrupted_clone = NULL;
+		ctx->corrupted_mode = false;
+	}
 
 	if (update_clone || ctx->corrupted_mode) {
 		SPDK_NOTICELOG("2- Deleting clusters for blob with clone 0x%" PRIx64 "\n", blob->id);
