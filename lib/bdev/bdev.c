@@ -5439,6 +5439,28 @@ spdk_bdev_has_layer(struct spdk_bdev *bdev)
 	return bdev->fn_table->is_layer_bound != NULL;
 }
 
+void
+spdk_bdev_set_layer_leader(struct spdk_bdev *bdev, bool leader,
+			   void (*cb)(void *cb_arg, int rc), void *cb_arg)
+{
+	if (bdev->fn_table->set_layer_leader == NULL) {
+		cb(cb_arg, 0);
+		return;
+	}
+
+	bdev->fn_table->set_layer_leader(bdev->ctxt, leader, cb, cb_arg);
+}
+
+uint64_t
+spdk_bdev_layer_next_bound(struct spdk_bdev *bdev, uint64_t offset_blocks)
+{
+	if (bdev->fn_table->layer_next_bound == NULL) {
+		return UINT64_MAX;
+	}
+
+	return bdev->fn_table->layer_next_bound(bdev->ctxt, offset_blocks);
+}
+
 uint64_t
 spdk_bdev_get_qd(const struct spdk_bdev *bdev)
 {

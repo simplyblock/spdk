@@ -1071,6 +1071,27 @@ bool spdk_bdev_is_layer_bound(struct spdk_bdev *bdev, uint64_t offset_blocks);
 bool spdk_bdev_has_layer(struct spdk_bdev *bdev);
 
 /**
+ * Tell a layer bdev that the lvstore above takes or gives up leadership. Completes at
+ * once with 0 if the bdev has no such op.
+ *
+ * \param bdev Block device.
+ * \param leader true on promotion, false on demotion.
+ * \param cb Called on the calling thread when the layer is done.
+ * \param cb_arg Argument passed to cb.
+ */
+void spdk_bdev_set_layer_leader(struct spdk_bdev *bdev, bool leader,
+				void (*cb)(void *cb_arg, int rc), void *cb_arg);
+
+/**
+ * First block at or after offset_blocks that is bound in a layer bdev's metadata.
+ *
+ * \param bdev Block device to query.
+ * \param offset_blocks Block offset to start at.
+ * \return the block offset, or UINT64_MAX if none or if the bdev is not a layer.
+ */
+uint64_t spdk_bdev_layer_next_bound(struct spdk_bdev *bdev, uint64_t offset_blocks);
+
+/**
  * Get the most recently measured queue depth from a bdev.
  *
  * The reported queue depth is the aggregate of outstanding I/O

@@ -363,6 +363,19 @@ bdev_blob_is_layer_bound(struct spdk_bs_dev *dev, uint64_t lba)
 }
 
 static void
+bdev_blob_set_layer_leader(struct spdk_bs_dev *dev, bool leader,
+			   void (*cb)(void *cb_arg, int rc), void *cb_arg)
+{
+	spdk_bdev_set_layer_leader(__get_bdev(dev), leader, cb, cb_arg);
+}
+
+static uint64_t
+bdev_blob_layer_next_bound(struct spdk_bs_dev *dev, uint64_t lba)
+{
+	return spdk_bdev_layer_next_bound(__get_bdev(dev), lba);
+}
+
+static void
 bdev_blob_copy(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	       uint64_t dst_lba, uint64_t src_lba, uint64_t lba_count,
 	       struct spdk_bs_dev_cb_args *cb_args, struct spdk_bs_io_opts *bs_io_opts)
@@ -619,6 +632,8 @@ blob_bdev_init(struct blob_bdev *b, struct spdk_bdev_desc *desc)
 	b->bs_dev.translate_lba = bdev_blob_translate_lba;
 	if (spdk_bdev_has_layer(bdev)) {
 		b->bs_dev.is_layer_bound = bdev_blob_is_layer_bound;
+		b->bs_dev.set_layer_leader = bdev_blob_set_layer_leader;
+		b->bs_dev.layer_next_bound = bdev_blob_layer_next_bound;
 	}
 }
 

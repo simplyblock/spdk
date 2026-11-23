@@ -5140,6 +5140,127 @@ blob_insert_race_clear_fail_on_layer(void)
 	blob_insert_race_clear_fail(false);
 }
 
+/* Fake pack layer: leadership calls in order, bound lbas, a completion code for promotion. */
+static int g_ut_layer_calls[4];
+static int g_ut_layer_ncalls;
+static int g_ut_layer_rc;
+static uint64_t g_ut_layer_bound[4];
+static int g_ut_layer_nbound;
+
+static void
+ut_layer_set_leader(struct spdk_bs_dev *dev, bool leader, void (*cb)(void *cb_arg, int rc),
+		    void *cb_arg)
+{
+	SPDK_CU_ASSERT_FATAL(g_ut_layer_ncalls < (int)SPDK_COUNTOF(g_ut_layer_calls));
+	g_ut_layer_calls[g_ut_layer_ncalls++] = leader;
+	cb(cb_arg, leader ? g_ut_layer_rc : 0);
+}
+
+static uint64_t
+ut_layer_next_bound(struct spdk_bs_dev *dev, uint64_t lba)
+{
+	uint64_t best = UINT64_MAX;
+	int i;
+
+	for (i = 0; i < g_ut_layer_nbound; i++) {
+		if (g_ut_layer_bound[i] >= lba && g_ut_layer_bound[i] < best) {
+			best = g_ut_layer_bound[i];
+		}
+	}
+	return best;
+}
+
+/* The layer takes leadership before the blobstore does and gives it up with it. On promotion
+ * free clusters it still binds are unmapped through it (D8 G3); clusters in use are not. */
+static void
+blob_layer_leader(void)
+{
+	struct spdk_blob_store *bs;
+	struct spdk_bs_dev *dev;
+	struct spdk_blob *blob;
+	struct spdk_io_channel *channel;
+	struct spdk_blob_opts opts;
+	struct spdk_bs_opts bs_opts;
+	uint8_t payload[BLOCKLEN];
+	uint64_t used_lba, free_cluster, free_lba, nfree;
+
+	dev = init_dev();
+	dev->is_layer_bound = ut_layer_bound;
+	dev->set_layer_leader = ut_layer_set_leader;
+	dev->layer_next_bound = ut_layer_next_bound;
+	spdk_bs_opts_init(&bs_opts, sizeof(bs_opts));
+	spdk_bs_init(dev, &bs_opts, bs_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
+	bs = g_bs;
+
+	ut_spdk_blob_opts_init(&opts);
+	opts.thin_provision = true;
+	opts.num_clusters = 4;
+	blob = ut_blob_create_and_open(bs, &opts);
+	channel = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(channel != NULL);
+	memset(payload, 0x5A, sizeof(payload));
+	spdk_blob_io_write(blob, channel, payload, 0, 1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	used_lba = blob->active.clusters[0];
+	free_cluster = spdk_bit_pool_find_free_bit(bs->used_clusters, 0);
+	free_lba = bs_cluster_to_lba(bs, free_cluster);
+	memset(&g_dev_buffer[free_lba * dev->blocklen], 0x77, BLOCKLEN);
+	g_ut_layer_bound[0] = used_lba;
+	g_ut_layer_bound[1] = free_lba;
+	g_ut_layer_nbound = 2;
+	nfree = spdk_bs_free_cluster_count(bs);
+
+	/* promotion refused by the layer: no leadership, no sweep */
+	g_ut_layer_ncalls = 0;
+	g_ut_layer_rc = -EIO;
+	spdk_bs_activate_md_journal(bs, false, true, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -EIO);
+	CU_ASSERT(g_ut_layer_ncalls == 1 && g_ut_layer_calls[0] == true);
+	CU_ASSERT(g_dev_buffer[free_lba * dev->blocklen] == 0x77);
+
+	/* promotion: the free bound cluster is unmapped and released, the used one kept */
+	g_ut_layer_ncalls = 0;
+	g_ut_layer_rc = 0;
+	spdk_bs_activate_md_journal(bs, false, true, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(g_ut_layer_ncalls == 1 && g_ut_layer_calls[0] == true);
+	CU_ASSERT(g_dev_buffer[free_lba * dev->blocklen] == 0);
+	CU_ASSERT(g_dev_buffer[used_lba * dev->blocklen] == 0x5A);
+	CU_ASSERT(spdk_bs_free_cluster_count(bs) == nfree);
+	CU_ASSERT(!spdk_bit_pool_is_allocated(bs->used_clusters, free_cluster));
+
+	/* demotion reaches the layer */
+	g_ut_layer_ncalls = 0;
+	spdk_bs_activate_md_journal(bs, true, false, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(g_ut_layer_ncalls == 1 && g_ut_layer_calls[0] == false);
+
+	/* failover update: the layer is promoted first, and its refusal stops the update */
+	g_ut_layer_ncalls = 0;
+	g_ut_layer_rc = -EIO;
+	spdk_bs_update_live(bs, true, 0, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -EIO);
+	CU_ASSERT(g_ut_layer_ncalls == 1 && g_ut_layer_calls[0] == true);
+	g_ut_layer_rc = 0;
+	g_ut_layer_nbound = 0;
+
+	spdk_bs_free_io_channel(channel);
+	poll_threads();
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	spdk_bs_unload(bs, bs_op_complete, NULL);
+	poll_threads();
+	g_bs = NULL;
+}
+
 static void
 blob_get_cluster_runs(void)
 {
@@ -12320,6 +12441,7 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite_bs, blob_get_cluster_runs);
 		CU_ADD_TEST(suite, blob_shrink_clear_before_md_on_layer);
 		CU_ADD_TEST(suite, blob_insert_race_clear_fail_on_layer);
+		CU_ADD_TEST(suite, blob_layer_leader);
 		CU_ADD_TEST(suite, blob_thin_prov_write_count_io);
 		CU_ADD_TEST(suite, blob_thin_prov_unmap_cluster);
 		CU_ADD_TEST(suite, blob_thin_write_zeroes_unallocated);

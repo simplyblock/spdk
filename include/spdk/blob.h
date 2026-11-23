@@ -360,6 +360,11 @@ struct spdk_bs_dev {
 
 	/* Optional. Set only when the bdev below is a pack layer; NULL means no layer. */
 	bool (*is_layer_bound)(struct spdk_bs_dev *dev, uint64_t lba);
+	/* Pack layer only: leadership change of the lvstore; cb runs on the calling thread. */
+	void (*set_layer_leader)(struct spdk_bs_dev *dev, bool leader,
+				 void (*cb)(void *cb_arg, int rc), void *cb_arg);
+	/* Pack layer only: first bound lba at or after lba, or UINT64_MAX. */
+	uint64_t (*layer_next_bound)(struct spdk_bs_dev *dev, uint64_t lba);
 };
 
 struct spdk_bs_type {

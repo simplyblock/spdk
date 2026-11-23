@@ -9744,8 +9744,8 @@ bs_clear_free_clusters_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
  * logged and the caller goes on. Runs on the md thread.
  */
 static void
-bs_clear_free_clusters(struct spdk_blob_store *bs, spdk_bs_sequence_t *seq,
-		       spdk_bs_sequence_cpl cb_fn, void *cb_arg)
+bs_clear_lowest_free_clusters(struct spdk_blob_store *bs, spdk_bs_sequence_t *seq,
+			      spdk_bs_sequence_cpl cb_fn, void *cb_arg)
 {
 	struct bs_clear_free_clusters_ctx *ctx;
 	spdk_bs_batch_t *batch;
@@ -9812,6 +9812,127 @@ bs_clear_free_clusters(struct spdk_blob_store *bs, spdk_bs_sequence_t *seq,
 	bs_batch_close(batch);
 }
 
+#define BS_LAYER_SWEEP_BATCH 256
+
+/* D8 G3: free clusters that the pack layer still binds (e.g. a COPY whose cluster insert never
+ * reached the md) are claimed, unmapped through the layer and released on promotion. */
+struct bs_layer_sweep_ctx {
+	struct spdk_blob_store	*bs;
+	spdk_bs_sequence_cpl	cb_fn;
+	void			*cb_arg;
+	uint64_t		next_lba;
+	uint32_t		clusters[BS_LAYER_SWEEP_BATCH];
+	uint32_t		num_clusters;
+	uint64_t		swept;
+};
+
+static void bs_layer_sweep_next(spdk_bs_sequence_t *seq, struct bs_layer_sweep_ctx *ctx);
+
+static void
+bs_layer_sweep_done(spdk_bs_sequence_t *seq, struct bs_layer_sweep_ctx *ctx)
+{
+	struct spdk_blob_store *bs = ctx->bs;
+	spdk_bs_sequence_cpl cb_fn = ctx->cb_fn;
+	void *cb_arg = ctx->cb_arg;
+
+	if (ctx->swept != 0) {
+		SPDK_NOTICELOG("Unmapped %" PRIu64 " free clusters still bound in the pack layer\n", ctx->swept);
+	}
+	free(ctx);
+	bs_clear_lowest_free_clusters(bs, seq, cb_fn, cb_arg);
+}
+
+static void
+bs_layer_sweep_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct bs_layer_sweep_ctx *ctx = cb_arg;
+	struct spdk_blob_store *bs = ctx->bs;
+	uint32_t i;
+
+	spdk_spin_lock(&bs->used_lock);
+	for (i = 0; i < ctx->num_clusters; i++) {
+		bs_release_cluster(bs, ctx->clusters[i]);
+	}
+	spdk_spin_unlock(&bs->used_lock);
+
+	if (bserrno != 0) {
+		/* the layer keeps them bound; the next promotion sweeps them again */
+		SPDK_ERRLOG("Unmap of %u free clusters bound in the pack layer failed, rc=%d\n",
+			    ctx->num_clusters, bserrno);
+		bs_layer_sweep_done(seq, ctx);
+		return;
+	}
+	ctx->swept += ctx->num_clusters;
+	bs_layer_sweep_next(seq, ctx);
+}
+
+static void
+bs_layer_sweep_next(spdk_bs_sequence_t *seq, struct bs_layer_sweep_ctx *ctx)
+{
+	struct spdk_blob_store *bs = ctx->bs;
+	spdk_bs_batch_t *batch;
+	uint64_t lba, cluster;
+	uint32_t i;
+
+	ctx->num_clusters = 0;
+	spdk_spin_lock(&bs->used_lock);
+	while (ctx->num_clusters < BS_LAYER_SWEEP_BATCH) {
+		lba = bs->dev->layer_next_bound(bs->dev, ctx->next_lba);
+		if (lba == UINT64_MAX) {
+			break;
+		}
+		cluster = bs_lba_to_cluster(bs, lba);
+		if (cluster >= bs->total_clusters) {
+			break;
+		}
+		ctx->next_lba = bs_cluster_to_lba(bs, cluster + 1);
+		if (spdk_bit_pool_is_allocated(bs->used_clusters, cluster)) {
+			continue;
+		}
+		spdk_bit_pool_allocate_specific_bit(bs->used_clusters, cluster);
+		bs->num_free_clusters--;
+		ctx->clusters[ctx->num_clusters++] = cluster;
+	}
+	spdk_spin_unlock(&bs->used_lock);
+
+	if (ctx->num_clusters == 0) {
+		bs_layer_sweep_done(seq, ctx);
+		return;
+	}
+
+	batch = bs_sequence_to_batch(seq, 0, bs_layer_sweep_cpl, ctx);
+	batch->u.batch.is_unmap = true;
+	for (i = 0; i < ctx->num_clusters; i++) {
+		bs->w_io++;
+		bs_batch_unmap_dev(batch, bs_cluster_to_lba(bs, ctx->clusters[i]), bs_cluster_to_lba(bs, 1));
+	}
+	bs_batch_close(batch);
+}
+
+static void
+bs_clear_free_clusters(struct spdk_blob_store *bs, spdk_bs_sequence_t *seq,
+		       spdk_bs_sequence_cpl cb_fn, void *cb_arg)
+{
+	struct bs_layer_sweep_ctx *ctx;
+
+	assert(spdk_get_thread() == bs->md_thread);
+
+	if (bs->dev->layer_next_bound == NULL) {
+		bs_clear_lowest_free_clusters(bs, seq, cb_fn, cb_arg);
+		return;
+	}
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL) {
+		SPDK_ERRLOG("Cannot allocate the pack layer sweep, skipping it\n");
+		bs_clear_lowest_free_clusters(bs, seq, cb_fn, cb_arg);
+		return;
+	}
+	ctx->bs = bs;
+	ctx->cb_fn = cb_fn;
+	ctx->cb_arg = cb_arg;
+	bs_layer_sweep_next(seq, ctx);
+}
+
 static void
 bs_activate_leader_cleared(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
@@ -9832,19 +9953,92 @@ spdk_bs_activate_md_journal_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserr
 	bs_clear_free_clusters(bs, seq, bs_activate_leader_cleared, NULL);
 }
 
+static void bs_activate_leader(struct spdk_blob_store *bs, bool old_state, bool new_state,
+			       spdk_blob_op_complete cb_fn, void *cb_arg);
+static void bs_update_live_start(struct spdk_blob_store *bs, bool failover, uint64_t id,
+				 spdk_bs_op_complete cb_fn, void *cb_arg);
+
+struct bs_layer_promote_ctx {
+	struct spdk_blob_store	*bs;
+	bool			old_state;
+	bool			update_live;
+	uint64_t		id;
+	spdk_blob_op_complete	cb_fn;
+	void			*cb_arg;
+};
+
+static void
+bs_layer_promoted(void *arg, int rc)
+{
+	struct bs_layer_promote_ctx ctx = *(struct bs_layer_promote_ctx *)arg;
+
+	free(arg);
+	if (rc != 0) {
+		/* without its layer the blobstore cannot take leadership */
+		SPDK_ERRLOG("Pack layer did not take leadership, rc=%d\n", rc);
+		ctx.cb_fn(ctx.cb_arg, rc);
+		return;
+	}
+	if (ctx.update_live) {
+		bs_update_live_start(ctx.bs, true, ctx.id, ctx.cb_fn, ctx.cb_arg);
+		return;
+	}
+	bs_activate_leader(ctx.bs, ctx.old_state, true, ctx.cb_fn, ctx.cb_arg);
+}
+
+/* The pack layer below loads (replay, LEADER) before the blobstore writes as leader. */
+static bool
+bs_layer_promote(struct spdk_blob_store *bs, bool old_state, bool update_live, uint64_t id,
+		 spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	struct bs_layer_promote_ctx *ctx;
+
+	if (bs->dev->set_layer_leader == NULL) {
+		return false;
+	}
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL) {
+		cb_fn(cb_arg, -ENOMEM);
+		return true;
+	}
+	ctx->bs = bs;
+	ctx->old_state = old_state;
+	ctx->update_live = update_live;
+	ctx->id = id;
+	ctx->cb_fn = cb_fn;
+	ctx->cb_arg = cb_arg;
+	bs->dev->set_layer_leader(bs->dev, true, bs_layer_promoted, ctx);
+	return true;
+}
+
 void
 spdk_bs_activate_md_journal(struct spdk_blob_store *bs, bool old_state, bool new_state, spdk_blob_op_complete cb_fn, void *cb_arg)
 {
-	struct spdk_bs_cpl		cpl;
-	spdk_bs_sequence_t		*seq = NULL;
-
 	if (!new_state) {
 		if (bs->md_journal != NULL) {
 			bs_md_journal_leadership_change(bs->md_journal, NULL, old_state, new_state, NULL, NULL);
 		}
+		if (bs->dev->set_layer_leader != NULL) {
+			/* completes once the layer's own IO has drained */
+			bs->dev->set_layer_leader(bs->dev, false, cb_fn, cb_arg);
+			return;
+		}
 		cb_fn(cb_arg, 0);
 		return;
 	}
+
+	if (bs_layer_promote(bs, old_state, false, 0, cb_fn, cb_arg)) {
+		return;
+	}
+	bs_activate_leader(bs, old_state, new_state, cb_fn, cb_arg);
+}
+
+static void
+bs_activate_leader(struct spdk_blob_store *bs, bool old_state, bool new_state,
+		   spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_bs_cpl		cpl;
+	spdk_bs_sequence_t		*seq = NULL;
 
 	if (old_state && bs->md_journal == NULL) {
 		/* Already leader (true -> true) and no journal: nothing to do. */
@@ -18437,6 +18631,18 @@ bs_update_super_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 void
 spdk_bs_update_live(struct spdk_blob_store *bs, bool failover, uint64_t id,
 		  spdk_bs_op_complete cb_fn, void *cb_arg)
+{
+	assert(spdk_get_thread() == bs->md_thread);
+
+	if (failover && bs_layer_promote(bs, false, true, id, cb_fn, cb_arg)) {
+		return;
+	}
+	bs_update_live_start(bs, failover, id, cb_fn, cb_arg);
+}
+
+static void
+bs_update_live_start(struct spdk_blob_store *bs, bool failover, uint64_t id,
+		     spdk_bs_op_complete cb_fn, void *cb_arg)
 {
 	struct spdk_bs_cpl	cpl;
 	struct spdk_bs_update_ctx *ctx;

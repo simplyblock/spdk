@@ -383,7 +383,19 @@ struct spdk_bdev_fn_table {
 
 	/** Optional. Return true if the block is bound in the layer's own metadata. */
 	bool (*is_layer_bound)(void *ctx, uint64_t offset_blocks);
+
+	/**
+	 * Optional, layer bdevs only. The lvstore above takes (true) or gives up (false)
+	 * leadership. cb runs on the calling thread.
+	 */
+	void (*set_layer_leader)(void *ctx, bool leader, void (*cb)(void *cb_arg, int rc), void *cb_arg);
+
+	/** Optional, layer bdevs only. First block at or after offset_blocks that is bound, or UINT64_MAX. */
+	uint64_t (*layer_next_bound)(void *ctx, uint64_t offset_blocks);
 };
+
+/* The fn_table has the layer ops above. */
+#define SPDK_BDEV_HAS_LAYER_OPS 1
 
 /** bdev I/O completion status */
 enum spdk_bdev_io_status {
