@@ -939,6 +939,17 @@ vbdev_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb
 			return;
 		}
 
+		/* A failover update of this blob is still running (started by
+		 * the delete of the snapshot below it): copying or freeing it
+		 * now would let the update write into freed memory. Answer
+		 * -EBUSY; the control plane retries. */
+		if (spdk_blob_locked_operation_in_progress(lvol->blob)) {
+			SPDK_ERRLOG("Deleting blob 0x%" PRIx64 " in secondary mode: its metadata update "
+				    "is still running, retry (-EBUSY)\n", lvol->blob_id);
+			cb_fn(cb_arg, -EBUSY);
+			return;
+		}
+
 		if (spdk_lvol_copy_blob(lvol)) {
 			SPDK_ERRLOG("Deleting blob 0x%" PRIx64 " in secondary mode failed not enough resources.\n", lvol->blob_id);
 			cb_fn(cb_arg, -ENOMEM);
