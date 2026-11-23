@@ -2884,9 +2884,8 @@ bs_load_pending_removal(void)
 
 	/*
 	 * new_md_journal: in "deletion mode" (SNAPSHOT_PENDING_REMOVAL, the clone no longer points
-	 * to the snapshot) the examine load does not delete the snapshot (56626a15e): it is left,
-	 * still marked, for its owner to delete, and only the clusters it shares with the clone
-	 * are dropped from it (none here: this clone has no clusters of its own).
+	 * to the snapshot) the examine load does not delete the snapshot (56626a15e): it is left
+	 * as it is, still marked, for its owner's async delete to finish.
 	 * Upstream expected it removed here.
 	 */
 	spdk_bs_open_blob(bs, snapshotid, blob_op_with_handle_complete, NULL);
@@ -7718,20 +7717,31 @@ blob_delete_snapshot_power_failure(void)
 			CU_ASSERT(spdk_blob_get_parent_snapshot(bs, blobid) == SPDK_BLOBID_INVALID);
 			CU_ASSERT(spdk_blob_get_num_allocated_clusters(blob) == 10);
 			/*
-			 * The examine load honours the pending removal: the snapshot keeps the
-			 * SNAPSHOT_PENDING_REMOVAL mark for its owner, but no longer maps the clusters the
-			 * clone took over (bs_examine_release_orphan_snapshot).
+			 * The examine load leaves the snapshot as it is, still marked
+			 * SNAPSHOT_PENDING_REMOVAL: it still maps the clusters the clone took over
+			 * (power failure before the snapshot's own md write) or nothing (after it).
 			 */
 			rc = blob_get_xattr_value(snapshot, SNAPSHOT_PENDING_REMOVAL, &value, &value_len, true);
 			CU_ASSERT(rc == 0);
+			CU_ASSERT(spdk_blob_get_num_allocated_clusters(snapshot) == 10 ||
+				  spdk_blob_get_num_allocated_clusters(snapshot) == 0);
+
+			/*
+			 * The owner deletes it as the lvol layer does: the leader's async delete, then
+			 * the sync delete. The async delete keeps the clusters the clone holds
+			 * (bs_delete_async_drop_clone_clusters): none is released.
+			 */
+			free_clusters = spdk_bs_free_cluster_count(bs);
+			g_bserrno = -1;
+			spdk_bs_delete_blob_async(bs, snapshot, blob_op_complete, NULL);
+			poll_threads();
+			CU_ASSERT(g_bserrno == 0);
 			CU_ASSERT(spdk_blob_get_num_allocated_clusters(snapshot) == 0);
 
 			spdk_blob_close(snapshot, blob_op_complete, NULL);
 			poll_threads();
 			CU_ASSERT(g_bserrno == 0);
 
-			/* The owner deletes the snapshot: the clone's clusters stay allocated. */
-			free_clusters = spdk_bs_free_cluster_count(bs);
 			spdk_bs_delete_blob(bs, snapshotid, blob_op_complete, NULL);
 			poll_threads();
 			CU_ASSERT(g_bserrno == 0);
