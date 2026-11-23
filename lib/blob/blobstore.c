@@ -9965,25 +9965,52 @@ struct bs_layer_promote_ctx {
 	uint64_t		id;
 	spdk_blob_op_complete	cb_fn;
 	void			*cb_arg;
+	int			rc;
 };
+
+static void
+bs_layer_promote_finish(void *arg, int rc)
+{
+	struct bs_layer_promote_ctx *ctx = arg;
+
+	if (rc != 0) {
+		SPDK_ERRLOG("Pack layer demotion after a failed promotion, rc=%d\n", rc);
+	}
+	ctx->cb_fn(ctx->cb_arg, ctx->rc);
+	free(ctx);
+}
+
+static void
+bs_layer_promote_done(void *arg, int rc)
+{
+	struct bs_layer_promote_ctx *ctx = arg;
+
+	ctx->rc = rc;
+	if (rc != 0 && !ctx->old_state) {
+		/* the blobstore did not take leadership: neither does its layer */
+		ctx->bs->dev->set_layer_leader(ctx->bs->dev, false, bs_layer_promote_finish, ctx);
+		return;
+	}
+	bs_layer_promote_finish(ctx, 0);
+}
 
 static void
 bs_layer_promoted(void *arg, int rc)
 {
-	struct bs_layer_promote_ctx ctx = *(struct bs_layer_promote_ctx *)arg;
+	struct bs_layer_promote_ctx *ctx = arg;
 
-	free(arg);
 	if (rc != 0) {
 		/* without its layer the blobstore cannot take leadership */
 		SPDK_ERRLOG("Pack layer did not take leadership, rc=%d\n", rc);
-		ctx.cb_fn(ctx.cb_arg, rc);
+		ctx->rc = rc;
+		bs_layer_promote_finish(ctx, 0);
 		return;
 	}
-	if (ctx.update_live) {
-		bs_update_live_start(ctx.bs, true, ctx.id, ctx.cb_fn, ctx.cb_arg);
+	if (ctx->update_live) {
+		bs_update_live_start(ctx->bs, true, ctx->id, bs_layer_promote_done, ctx);
 		return;
 	}
-	bs_activate_leader(ctx.bs, ctx.old_state, true, ctx.cb_fn, ctx.cb_arg);
+	bs_activate_leader(ctx->bs, ctx->old_state, true, bs_layer_promote_done, ctx);
 }
 
 /* The pack layer below loads (replay, LEADER) before the blobstore writes as leader. */

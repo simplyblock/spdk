@@ -5183,6 +5183,7 @@ blob_layer_leader(void)
 	struct spdk_bs_opts bs_opts;
 	uint8_t payload[BLOCKLEN];
 	uint64_t used_lba, free_cluster, free_lba, nfree;
+	struct spdk_power_failure_thresholds thresholds = {};
 
 	dev = init_dev();
 	dev->is_layer_bound = ut_layer_bound;
@@ -5249,7 +5250,18 @@ blob_layer_leader(void)
 	poll_threads();
 	CU_ASSERT(g_bserrno == -EIO);
 	CU_ASSERT(g_ut_layer_ncalls == 1 && g_ut_layer_calls[0] == true);
+
+	/* failover update failing after the layer took leadership: the layer is demoted again */
+	g_ut_layer_ncalls = 0;
 	g_ut_layer_rc = 0;
+	thresholds.read_threshold = 1;
+	dev_set_power_failure_thresholds(thresholds);
+	g_bserrno = 0;
+	spdk_bs_update_live(bs, true, 0, blob_op_complete, NULL);
+	poll_threads();
+	dev_reset_power_failure_event();
+	CU_ASSERT(g_bserrno != 0);
+	CU_ASSERT(g_ut_layer_ncalls == 2 && g_ut_layer_calls[0] == true && g_ut_layer_calls[1] == false);
 	g_ut_layer_nbound = 0;
 
 	spdk_bs_free_io_channel(channel);
