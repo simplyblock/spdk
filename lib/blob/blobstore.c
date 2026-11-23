@@ -6641,6 +6641,10 @@ bs_load_ctx_fail(struct spdk_bs_load_ctx *ctx, int bserrno)
 	assert(bserrno != 0);
 
 	spdk_free(ctx->super);
+	/* A mask read that failed (or any later step) leaves its buffer here;
+	 * every path that frees the mask itself sets ctx->mask to NULL. */
+	spdk_free(ctx->mask);
+	ctx->mask = NULL;
 	bs_sequence_finish(ctx->seq, bserrno);
 	if (!ctx->dump_type) {
 		bs_free(ctx->bs);
@@ -6957,6 +6961,7 @@ bs_load_iter(void *arg, struct spdk_blob *blob, int bserrno)
 	spdk_free(ctx->super);
 	if (ctx->mask) {
 		spdk_free(ctx->mask);
+		ctx->mask = NULL;
 	}
 	bs_sequence_finish(ctx->seq, bserrno);
 	free(ctx);
@@ -7346,6 +7351,7 @@ bs_load_used_blobids_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	rc = spdk_bit_array_resize(&ctx->bs->used_blobids, ctx->mask->length);
 	if (rc < 0) {
 		spdk_free(ctx->mask);
+		ctx->mask = NULL;
 		bs_load_ctx_fail(ctx, rc);
 		return;
 	}
@@ -7384,6 +7390,7 @@ bs_load_used_clusters_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	rc = spdk_bit_array_resize(&ctx->used_clusters, ctx->mask->length);
 	if (rc < 0) {
 		spdk_free(ctx->mask);
+		ctx->mask = NULL;
 		bs_load_ctx_fail(ctx, rc);
 		return;
 	}
@@ -7393,6 +7400,7 @@ bs_load_used_clusters_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	assert(ctx->bs->num_free_clusters <= ctx->bs->total_clusters);
 
 	spdk_free(ctx->mask);
+	ctx->mask = NULL;
 
 	/* Read the used blobids mask */
 	mask_size = ctx->super->used_blobid_mask_len * SPDK_BS_PAGE_SIZE;
@@ -7437,12 +7445,14 @@ bs_load_used_pages_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	rc = spdk_bit_array_resize(&ctx->bs->used_md_pages, ctx->mask->length);
 	if (rc < 0) {
 		spdk_free(ctx->mask);
+		ctx->mask = NULL;
 		bs_load_ctx_fail(ctx, rc);
 		return;
 	}
 
 	spdk_bit_array_load_mask(ctx->bs->used_md_pages, ctx->mask->mask);
 	spdk_free(ctx->mask);
+	ctx->mask = NULL;
 
 	/* Read the used clusters mask */
 	mask_size = ctx->super->used_cluster_mask_len * SPDK_BS_PAGE_SIZE;
@@ -7504,6 +7514,7 @@ bs_load_used_blobids_cpl_clean_mode(spdk_bs_sequence_t *seq, void *cb_arg, int b
 	rc = spdk_bit_array_resize(&ctx->bs->used_blobids, ctx->mask->length);
 	if (rc < 0) {
 		spdk_free(ctx->mask);
+		ctx->mask = NULL;
 		bs_load_ctx_fail(ctx, rc);
 		return;
 	}
@@ -7592,6 +7603,7 @@ bs_load_used_clusters_cpl_clean_mode(spdk_bs_sequence_t *seq, void *cb_arg, int 
 	rc = spdk_bit_array_resize(&ctx->used_clusters, ctx->mask->length);
 	if (rc < 0) {
 		spdk_free(ctx->mask);
+		ctx->mask = NULL;
 		bs_load_ctx_fail(ctx, rc);
 		return;
 	}
@@ -7601,6 +7613,7 @@ bs_load_used_clusters_cpl_clean_mode(spdk_bs_sequence_t *seq, void *cb_arg, int 
 	assert(ctx->bs->num_free_clusters <= ctx->bs->total_clusters);
 
 	spdk_free(ctx->mask);
+	ctx->mask = NULL;
 
 	/* Read the used blobids mask */
 	mask_size = ctx->super->used_blobid_mask_len * SPDK_BS_PAGE_SIZE;
@@ -7645,12 +7658,14 @@ bs_load_used_pages_cpl_clean_mode(spdk_bs_sequence_t *seq, void *cb_arg, int bse
 	rc = spdk_bit_array_resize(&ctx->bs->used_md_pages, ctx->mask->length);
 	if (rc < 0) {
 		spdk_free(ctx->mask);
+		ctx->mask = NULL;
 		bs_load_ctx_fail(ctx, rc);
 		return;
 	}
 
 	spdk_bit_array_load_mask(ctx->bs->used_md_pages, ctx->mask->mask);
 	spdk_free(ctx->mask);
+	ctx->mask = NULL;
 
 	/* Read the used clusters mask */
 	mask_size = ctx->super->used_cluster_mask_len * SPDK_BS_PAGE_SIZE;
@@ -7991,6 +8006,7 @@ bs_load_only_used_blobid_pages_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bs
 	rc = spdk_bit_array_resize(&ctx->used_blobid_pages, ctx->mask->length);
 	if (rc < 0) {
 		spdk_free(ctx->mask);
+		ctx->mask = NULL;
 		bs_load_ctx_fail(ctx, rc);
 		return;
 	}
@@ -8671,6 +8687,7 @@ bs_load_used_blobids_cpl_dump(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno
 		SPDK_NOTICELOG("Dumping blobid bitmap not match in the blobstore\n");
 	}
 	spdk_free(ctx->mask);
+	ctx->mask = NULL;
 	spdk_free(mask);
 
 	bs_load_complete(ctx);
@@ -17028,6 +17045,7 @@ bs_load_grow_used_clusters_write_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int 
 	}
 
 	spdk_free(ctx->mask);
+	ctx->mask = NULL;
 	ctx->bs->w_io++;
 	bs_sequence_write_dev(ctx->seq, ctx->super, bs_page_to_lba(ctx->bs, 0),
 			      bs_byte_to_lba(ctx->bs, sizeof(*ctx->super)),
@@ -17381,6 +17399,7 @@ bs_update_live_done(struct spdk_bs_update_ctx *ctx, int bserrno)
 
 	spdk_free(ctx->page);   /* NULL-safe */
 	spdk_free(ctx->mask);
+	ctx->mask = NULL;
 	free(ctx);
 }
 
