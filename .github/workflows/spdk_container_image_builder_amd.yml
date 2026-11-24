@@ -9,15 +9,22 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Pinned rather than ubuntu-latest: a runner image upgrade changes what
+    # `docker build` pushes, so moving to a new image should be a deliberate edit.
+    runs-on: ubuntu-26.04
     steps:
     - name: Checkout the triggered branch
       uses: actions/checkout@v3
       with:
         ref: ${{ github.event.workflow_run.head_branch }}
 
+    # Same sanitising as the TAG of build_image_spdk_core_arm ('/' -> '-'), so
+    # both workflows push <tag>-arm64 / <tag>-amd64 under one name and a branch
+    # such as fix/foo yields a valid image tag.
     - name: Set branch name from triggered workflow
-      run: echo "BRANCH_NAME=${{ github.event.workflow_run.head_branch }}" >> $GITHUB_ENV
+      env:
+        HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+      run: echo "BRANCH_NAME=$(echo "$HEAD_BRANCH" | sed 's/\//-/g')" >> $GITHUB_ENV
 
     - name: Configure AWS Credentials
       uses: aws-actions/configure-aws-credentials@v1
@@ -47,12 +54,21 @@ jobs:
 
     - name: Push the docker image
       run: docker image push 565979732541.dkr.ecr.us-east-1.amazonaws.com/spdk-core:$BRANCH_NAME-amd64
+
+    # `docker buildx imagetools create` rather than `docker manifest create`:
+    # the per-arch tags may themselves be manifest lists (a build with a
+    # provenance attestation pushes one), which `docker manifest create` refuses.
+    # imagetools assembles the multi-arch tag in the registry and pushes it.
+    # Only when the arm build succeeded: otherwise <tag>-arm64 is missing or left
+    # over from an older commit, and -latest would pair mismatched images.
     - name: Create the manifest
+      if: github.event.workflow_run.conclusion == 'success'
       run: |
-        docker manifest create simplyblock/spdk-core:$BRANCH_NAME-latest simplyblock/spdk-core:$BRANCH_NAME-arm64 simplyblock/spdk-core:$BRANCH_NAME-amd64
-        docker manifest create 565979732541.dkr.ecr.us-east-1.amazonaws.com/spdk-core:$BRANCH_NAME-latest 565979732541.dkr.ecr.us-east-1.amazonaws.com/spdk-core:$BRANCH_NAME-arm64 565979732541.dkr.ecr.us-east-1.amazonaws.com/spdk-core:$BRANCH_NAME-amd64
-        docker manifest annotate simplyblock/spdk-core:$BRANCH_NAME-latest simplyblock/spdk-core:$BRANCH_NAME-arm64 --arch arm64
-        docker manifest annotate simplyblock/spdk-core:$BRANCH_NAME-latest simplyblock/spdk-core:$BRANCH_NAME-amd64 --arch amd64
-        docker manifest annotate 565979732541.dkr.ecr.us-east-1.amazonaws.com/spdk-core:$BRANCH_NAME-latest 565979732541.dkr.ecr.us-east-1.amazonaws.com/spdk-core:$BRANCH_NAME-arm64 --arch arm64
-        docker manifest annotate 565979732541.dkr.ecr.us-east-1.amazonaws.com/spdk-core:$BRANCH_NAME-latest 565979732541.dkr.ecr.us-east-1.amazonaws.com/spdk-core:$BRANCH_NAME-amd64 --arch amd64
-        docker manifest push simplyblock/spdk-core:$BRANCH_NAME-latest
+        docker buildx imagetools create \
+          --tag simplyblock/spdk-core:$BRANCH_NAME-latest \
+          simplyblock/spdk-core:$BRANCH_NAME-arm64 \
+          simplyblock/spdk-core:$BRANCH_NAME-amd64
+        docker buildx imagetools create \
+          --tag 565979732541.dkr.ecr.us-east-1.amazonaws.com/spdk-core:$BRANCH_NAME-latest \
+          565979732541.dkr.ecr.us-east-1.amazonaws.com/spdk-core:$BRANCH_NAME-arm64 \
+          565979732541.dkr.ecr.us-east-1.amazonaws.com/spdk-core:$BRANCH_NAME-amd64
