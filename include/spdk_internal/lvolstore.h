@@ -219,7 +219,10 @@ struct spdk_lvs_poll_group {
 	/* Replication request buffers: iobuf small-pool chains taken on this
 	 * thread (lib/lvol/lvol.c, xfer_req_start). buf_readyq: requests that
 	 * got their buffers after waiting, submitted by a message
-	 * (buf_run_pending). */
+	 * (buf_run_pending). The iobuf channel exists only while replication
+	 * runs here (iobuf_ok): taken by the first request, released when the
+	 * last task's requests are gone -- a channel never released holds up
+	 * the iobuf shutdown. */
 	bool				iobuf_ok;
 	struct spdk_iobuf_channel	iobuf;
 	struct spdk_iobuf_chain_queue	bufq;
@@ -340,6 +343,11 @@ struct spdk_lvs_xfer {
 	 * (reads of a volume fall through to its snapshots). 0 keeps the blob's
 	 * own class. */
 	uint8_t priority_class;
+	/* Replication: the task's cap on iobuf small-pool buffers, for its
+	 * requests' chains on every poll group (limit 0: none). Its requests
+	 * also count against the cap all background users share, unless the
+	 * task is a priority one. */
+	struct spdk_iobuf_chain_budget buf_budget;
 
 	TAILQ_ENTRY(spdk_lvs_xfer)	entry;
 

@@ -5109,6 +5109,8 @@ spdk_lvs_set_opts(struct spdk_lvol_store *lvs, uint64_t groupid, uint64_t port, 
 	return;
 }
 
+static void lvs_poll_group_iobuf_release_idle(struct spdk_lvs_poll_group *lpg);
+
 static int
 spdk_wait_for_pg_io_cleanup_poller(void *arg) {
 	struct remote_lvol_info *rmt_lvol = arg;
@@ -5126,6 +5128,7 @@ spdk_wait_for_pg_io_cleanup_poller(void *arg) {
 	rmt_lvol->channel = NULL;
 	tdev->pg[lpg->id]--;
 	free(rmt_lvol);
+	lvs_poll_group_iobuf_release_idle(lpg);
 	return -1;
 }
 
@@ -5313,6 +5316,32 @@ spdk_change_rmt_lvol_state(struct spdk_lvol_store *lvs, struct spdk_transfer_dev
 #define LVS_XFER_IOBUF_MODULE	"lvol_xfer"
 /* small buffers each poll group thread keeps in its channel cache */
 #define LVS_XFER_IOBUF_CACHE	32
+/*
+ * The small pool is shared with client IO (nvmf has no kick: a pool that
+ * replication empties stalls it). A replication task holds at most this many
+ * buffers at once (8 MiB at 8 KiB; a full window of 256 x 64 KiB would be
+ * 2048), and every non-priority task together with the merges at most the
+ * shared background cap (spdk_iobuf_chain_bg_budget()). Set with
+ * spdk_lvol_set_xfer_iobuf_max_bufs().
+ */
+#define LVS_XFER_IOBUF_MAX_BUFS_DEFAULT	1024
+static uint32_t g_lvs_xfer_iobuf_max_bufs = LVS_XFER_IOBUF_MAX_BUFS_DEFAULT;
+
+int
+spdk_lvol_set_xfer_iobuf_max_bufs(uint32_t max_bufs)
+{
+	if (max_bufs == 0) {
+		return -EINVAL;
+	}
+	g_lvs_xfer_iobuf_max_bufs = max_bufs;
+	return 0;
+}
+
+uint32_t
+spdk_lvol_get_xfer_iobuf_max_bufs(void)
+{
+	return g_lvs_xfer_iobuf_max_bufs;
+}
 
 static void
 xfer_req_put_bufs(struct spdk_lvs_xfer_req *req)
@@ -5876,17 +5905,30 @@ xfer_req_submit_chain(struct spdk_lvs_xfer_req *req)
  * waiting (still in flight for the window, which therefore does not refill:
  * nothing spins). xfer_req_bufs_ready submits it once it has the buffers.
  */
+static void lvs_poll_group_iobuf_init(struct spdk_lvs_poll_group *lpg);
+
 static int
 xfer_req_start(struct spdk_lvs_xfer_req *req)
 {
 	struct spdk_lvs_poll_group *lpg = req->rmt_lvol ? req->rmt_lvol->group : NULL;
+	struct spdk_lvs_xfer *xfer = req->xfer;
 	int rc;
 
+	if (lpg != NULL) {
+		/* the channel exists while replication runs on this thread */
+		lvs_poll_group_iobuf_init(lpg);
+	}
 	if (lpg == NULL || !lpg->iobuf_ok) {
 		SPDK_ERRLOG("Replication request at offset %" PRIu64 ": no iobuf channel on this "
 			    "poll group\n", req->offset);
 		return -ENOMEM;
 	}
+	/* capped per task and, unless the task is the frozen final step, by the
+	 * cap all background users share; the final step goes ahead of the
+	 * background requests waiting on this thread */
+	spdk_iobuf_chain_set_budget(&req->chain, &xfer->buf_budget,
+				    xfer->priority ? NULL : spdk_iobuf_chain_bg_budget(),
+				    xfer->priority);
 	rc = spdk_iobuf_chain_get(&lpg->bufq, &req->chain, xfer_req_bytes(req));
 	if (rc < 0) {
 		SPDK_ERRLOG("Replication request at offset %" PRIu64 ": %" PRIu64 " bytes do not fit "
@@ -5988,12 +6030,16 @@ xfer_bufq_abort_rmt(struct spdk_lvs_poll_group *lpg, struct remote_lvol_info *rm
 	}
 }
 
+/* Take the poll group's iobuf channel, if it has none (on its thread). */
 static void
 lvs_poll_group_iobuf_init(struct spdk_lvs_poll_group *lpg)
 {
 	int rc;
 
-	TAILQ_INIT(&lpg->buf_readyq);
+	if (lpg->iobuf_ok) {
+		return;
+	}
+	assert(TAILQ_EMPTY(&lpg->buf_readyq));
 	rc = spdk_iobuf_channel_init(&lpg->iobuf, LVS_XFER_IOBUF_MODULE, LVS_XFER_IOBUF_CACHE, 0);
 	if (rc != 0) {
 		/* the pool cannot fill the cache now: take buffers as needed */
@@ -6006,6 +6052,25 @@ lvs_poll_group_iobuf_init(struct spdk_lvs_poll_group *lpg)
 	}
 	spdk_iobuf_chain_queue_init(&lpg->bufq, &lpg->iobuf, xfer_req_bufs_ready);
 	lpg->iobuf_ok = true;
+}
+
+/*
+ * A transfer task's requests left this poll group (task end, device removal):
+ * when no replication runs here any more -- no task, no request holding or
+ * waiting for buffers -- give the iobuf channel back. Its cache goes back to
+ * the pool, and the iobuf library's shutdown waits for every channel: one
+ * held for the app's life would hang it. The next request takes it again.
+ */
+static void
+lvs_poll_group_iobuf_release_idle(struct spdk_lvs_poll_group *lpg)
+{
+	if (!lpg->iobuf_ok || !TAILQ_EMPTY(&lpg->rmt_lvols) ||
+	    !spdk_iobuf_chain_queue_idle(&lpg->bufq) || lpg->bufq.held != 0 ||
+	    !TAILQ_EMPTY(&lpg->buf_readyq)) {
+		return;
+	}
+	spdk_iobuf_channel_fini(&lpg->iobuf);
+	lpg->iobuf_ok = false;
 }
 
 static int
@@ -6416,6 +6481,7 @@ spdk_wait_for_xfer_pg_io_cleanup_poller(void *arg)
 
 	free(rmt_lvol);
 	xfer->pg[lpg->id] = false;
+	lvs_poll_group_iobuf_release_idle(lpg);
 	return -1;
 }
 
@@ -6474,6 +6540,7 @@ spdk_delete_rmt_lvol_pg(void *arg) {
 		break;
 	}
 	xfer->pg[lpg->id] = false;
+	lvs_poll_group_iobuf_release_idle(lpg);
 }
 
 static int
@@ -8700,9 +8767,11 @@ spdk_lvs_create_poll_group(void *ctx)
 	lpg->thread_name = spdk_thread_get_name(lpg->thread);
 	TAILQ_INIT(&lpg->rmt_lvols);
 	TAILQ_INIT(&lpg->ch_tdev);
-	/* replication buffers: an iobuf channel of this thread (never released:
-	 * the poll group lives as long as the app) */
-	lvs_poll_group_iobuf_init(lpg);
+	/* replication buffers: an iobuf channel of this thread, taken by the
+	 * first replication request and released when replication stops here
+	 * (lvs_poll_group_iobuf_release_idle) -- held for the app's life it
+	 * would hang the iobuf shutdown */
+	TAILQ_INIT(&lpg->buf_readyq);
 	// lpg->md_thread = g_lvs_md_thread;
 	const char *suffix = strrchr(lpg->thread_name, '_'); // find last '_'
 	lpg->id =  atoi(suffix + 1);
@@ -9094,9 +9163,10 @@ spdk_lvol_create_backup_task(struct spdk_lvs_xfer *task, struct spdk_transfer_de
 	}
 	/* else no DMA payloads: every request's data is a chain of iobuf
 	 * small-pool buffers, taken per request on the poll group thread
-	 * (xfer_req_start) -- at most cluster_batch x 64 KiB in flight -- and a
-	 * command or the completion signal a small heap buffer
-	 * (xfer_req_ctrl_payload) */
+	 * (xfer_req_start) -- at most cluster_batch x 64 KiB in flight, and at
+	 * most the task's cap (buf_budget) -- and a command or the completion
+	 * signal a small heap buffer (xfer_req_ctrl_payload) */
+	spdk_iobuf_chain_budget_init(&task->buf_budget, g_lvs_xfer_iobuf_max_bufs);
 
 	for (int i = 0; i < task->cluster_batch; i++) {
         task->reqs[i].payload = task->pdus ? (uint8_t *)task->pdus + (i * s_elements_payload) : NULL;
