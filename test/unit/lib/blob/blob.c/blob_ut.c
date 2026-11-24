@@ -10892,6 +10892,122 @@ blob_secondary_delete_snapshot_dangling_parent(void)
 	CU_ASSERT(g_bserrno == 0);
 }
 
+/*
+ * bf32 2026-11-21: two lvols on one blob id share its open handle (open_ref
+ * 2); a third open is the deleting lvol's. The secondary delete of that lvol
+ * copies the blob, closes its handle and deletes the copy; the copy is not
+ * deletable (open_ref > 1), so the force delete runs. It freed the open
+ * handle whatever its open_ref, leaving the other holders' spdk_blob dangling
+ * (SIGSEGV in blob_get_xattr_value from vbdev_lvol_resv_refresh). Now the
+ * handle stays valid for its holders to close, but leaves the open-blob tree:
+ * a reused blob id must not get the deleted blob's handle.
+ */
+static void
+blob_secondary_force_delete_shared_handle(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob_opts opts;
+	struct spdk_blob *blob, *copy;
+	spdk_blob_id blobid;
+	const void *value;
+	size_t len;
+	int rc;
+
+	ut_spdk_blob_opts_init(&opts);
+	opts.num_clusters = 1;
+	blob = ut_blob_create_and_open(bs, &opts);
+	blobid = spdk_blob_get_id(blob);
+	rc = spdk_blob_set_xattr(blob, "nvmf_resv", "resv", 5);
+	CU_ASSERT(rc == 0);
+	spdk_blob_sync_md(blob, false, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	/* two more holders: the second lvol on the blob id, the deleting lvol */
+	spdk_bs_open_blob(bs, blobid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(g_blob == blob);
+	spdk_bs_open_blob(bs, blobid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(g_blob == blob);
+	CU_ASSERT(blob->open_ref == 3);
+
+	copy = spdk_bs_copy_blob(bs, blob);
+	SPDK_CU_ASSERT_FATAL(copy != NULL);
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(blob->open_ref == 2);
+
+	/* frees the copy, not the shared handle */
+	rc = spdk_bs_delete_blob_non_leader(bs, copy);
+	CU_ASSERT(rc == 0);
+	poll_threads();
+
+	/* the handle is valid for its holders, but no longer found by id */
+	CU_ASSERT(blob_lookup(bs, blobid) == NULL);
+	CU_ASSERT(spdk_bit_array_get(bs->open_blobids, blobid) == false);
+	CU_ASSERT(blob->orphaned == true);
+	CU_ASSERT(blob->open_ref == 2);
+	rc = spdk_blob_get_xattr_value(blob, "nvmf_resv", &value, &len);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(len == 5);
+	/* the blob itself is deleted on this node */
+	CU_ASSERT(spdk_bit_array_get(bs->used_blobids, bs_blobid_to_page(blobid)) == false);
+
+	/* the holders close it; the last close frees it without touching the
+	 * tree, and a dirty orphan writes no metadata (its id may be reused) */
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(blob_lookup(bs, blobid) == NULL);
+	blob->state = SPDK_BLOB_STATE_DIRTY;
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(blob_lookup(bs, blobid) == NULL);
+}
+
+/*
+ * open_ref 1 left on the handle at the force delete keeps the old behaviour:
+ * the handle is freed (a leftover count of the snapshot bookkeeping as often
+ * as a holder; an lvol holder is kept out by lvol_destroy_non_leader).
+ */
+static void
+blob_secondary_force_delete_last_ref(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob_opts opts;
+	struct spdk_blob *blob, *copy;
+	spdk_blob_id blobid;
+	int rc;
+
+	ut_spdk_blob_opts_init(&opts);
+	opts.num_clusters = 1;
+	blob = ut_blob_create_and_open(bs, &opts);
+	blobid = spdk_blob_get_id(blob);
+	spdk_bs_open_blob(bs, blobid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(blob->open_ref == 2);
+
+	copy = spdk_bs_copy_blob(bs, blob);
+	SPDK_CU_ASSERT_FATAL(copy != NULL);
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(blob->open_ref == 1);
+
+	/* frees the copy and the handle: do not use blob after this */
+	rc = spdk_bs_delete_blob_non_leader(bs, copy);
+	CU_ASSERT(rc == 0);
+	poll_threads();
+	CU_ASSERT(blob_lookup(bs, blobid) == NULL);
+	CU_ASSERT(spdk_bit_array_get(bs->used_blobids, bs_blobid_to_page(blobid)) == false);
+}
+
 static void
 blob_set_parent(void)
 {
@@ -12111,6 +12227,8 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite_bs, blob_shallow_copy);
 		CU_ADD_TEST(suite_bs, blob_secondary_delete_snapshot_reparented);
 		CU_ADD_TEST(suite_bs, blob_secondary_delete_snapshot_dangling_parent);
+		CU_ADD_TEST(suite_bs, blob_secondary_force_delete_shared_handle);
+		CU_ADD_TEST(suite_bs, blob_secondary_force_delete_last_ref);
 		CU_ADD_TEST(suite_esnap_bs, blob_set_parent);
 		CU_ADD_TEST(suite_esnap_bs, blob_set_external_parent);
 	}

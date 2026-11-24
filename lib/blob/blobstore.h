@@ -151,6 +151,11 @@ struct spdk_blob {
 	bool		invalid;
 	bool		data_ro;
 	bool		md_ro;
+	/* Deleted on this node (non-leader delete) while other holders still had
+	 * the open handle: unlinked from bs->open_blobs, so a reused blob id opens
+	 * a fresh handle from disk instead of this one. Its metadata is never
+	 * persisted again; the last close frees it. */
+	bool		orphaned;
 
 	uint64_t	invalid_flags;
 	uint64_t	data_ro_flags;
