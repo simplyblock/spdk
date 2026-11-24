@@ -288,8 +288,10 @@ ut_bs_dirty_load(struct spdk_blob_store **bs, struct spdk_bs_opts *opts)
 {
 	struct spdk_bs_dev *dev;
 
-	/* Dirty shutdown */
-	bs_free(*bs);
+	/* Dirty shutdown (none left after ut_bs_dirty_load_fails()) */
+	if (*bs != NULL) {
+		bs_free(*bs);
+	}
 
 	dev = init_dev();
 	/* Load an existing blob store */
@@ -302,6 +304,32 @@ ut_bs_dirty_load(struct spdk_blob_store **bs, struct spdk_bs_opts *opts)
 	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
 	*bs = g_bs;
 
+	g_bserrno = -1;
+}
+
+/* Dirty shutdown, then a load that must fail with bserrno and leave no blobstore. */
+static void
+ut_bs_dirty_load_fails(struct spdk_blob_store **bs, struct spdk_bs_opts *opts, int bserrno)
+{
+	struct spdk_bs_dev *dev;
+
+	if (*bs != NULL) {
+		bs_free(*bs);
+	}
+	*bs = NULL;
+
+	dev = init_dev();
+	g_bs = NULL;
+	g_bserrno = 0;
+	spdk_bs_load(dev, opts, bs_op_with_handle_complete, NULL);
+	poll_threads();
+	if (g_bserrno == 0) {
+		/* not expected: keep the handle so the test can go on and be torn down */
+		ut_bs_release_load_refs(g_bs);
+		*bs = g_bs;
+	}
+	CU_ASSERT(g_bserrno == bserrno);
+	CU_ASSERT(g_bs == NULL);
 	g_bserrno = -1;
 }
 
@@ -4401,18 +4429,28 @@ blob_dirty_shutdown(void)
 
 	free_clusters = spdk_bs_free_cluster_count(bs);
 
-	ut_bs_dirty_load(&bs, NULL);
-
 	/*
 	 * The recovery load takes the blobids from the persisted used blobid mask instead of
-	 * scanning all md pages for first pages, so blob 2 is opened: blob_parse() rejects its
-	 * first md page with the corrupted sequence number (-EINVAL), and the open still fails.
+	 * scanning all md pages for first pages, so blob 2 is examined: blob_parse() rejects its
+	 * first md page with the corrupted sequence number (-EINVAL) before claiming anything it
+	 * owns, and that fails the whole load (a skipped blob would leave its md pages and
+	 * clusters free for reuse).
 	 */
-	g_bserrno = 0;
+	ut_bs_dirty_load_fails(&bs, NULL, -EINVAL);
+
+	/* Repair the page: the blobstore loads again, nothing was changed by the failed load. */
+	page->sequence_num = 0;
+	page->crc = blob_md_page_calc_crc(page);
+	ut_bs_dirty_load(&bs, NULL);
+
 	spdk_bs_open_blob(bs, blobid2, blob_op_with_handle_complete, NULL);
 	poll_threads();
-	CU_ASSERT(g_bserrno == -EINVAL);
-	CU_ASSERT(g_blob == NULL);
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	spdk_blob_close(g_blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	g_blob = NULL;
 
 	spdk_bs_open_blob(bs, blobid3, blob_op_with_handle_complete, NULL);
 	poll_threads();
@@ -4425,7 +4463,8 @@ blob_dirty_shutdown(void)
 
 /*
  * A blob whose md page chain carries a wrong sequence number (on the first page or on a later
- * page of the chain) must fail to open after a load instead of being parsed.
+ * page of the chain) is rejected by blob_parse() instead of being parsed, and that fails the
+ * load: the rejection comes before the blob's md pages and clusters are claimed.
  */
 static void
 blob_md_chain_corrupted_sequence_num(void)
@@ -4433,7 +4472,7 @@ blob_md_chain_corrupted_sequence_num(void)
 	struct spdk_blob_store *bs = g_bs;
 	struct spdk_blob_opts opts;
 	struct spdk_blob *blob;
-	struct spdk_blob_md_page *page;
+	struct spdk_blob_md_page *page, *chain_page;
 	spdk_blob_id blobid, blobid2;
 	char xattr[2048];
 	char name[16];
@@ -4478,6 +4517,7 @@ blob_md_chain_corrupted_sequence_num(void)
 	SPDK_CU_ASSERT_FATAL(page->id == blobid && page->sequence_num == 1);
 	page->sequence_num = 7;
 	page->crc = blob_md_page_calc_crc(page);
+	chain_page = page;
 
 	/* First (only) page of the second blob: wrong sequence number, valid crc. */
 	page_num = bs_blobid_to_page(blobid2);
@@ -4487,20 +4527,323 @@ blob_md_chain_corrupted_sequence_num(void)
 	page->sequence_num = 1;
 	page->crc = blob_md_page_calc_crc(page);
 
-	/* The load skips both blobs; opening them fails. */
+	/* Both blobs are rejected: the load fails. */
+	ut_bs_dirty_load_fails(&bs, NULL, -EINVAL);
+
+	/* Only the later chain page of the first blob is still wrong: the load still fails. */
+	page->sequence_num = 0;
+	page->crc = blob_md_page_calc_crc(page);
+	ut_bs_dirty_load_fails(&bs, NULL, -EINVAL);
+
+	/* Both repaired: the load succeeds and both blobs open. */
+	chain_page->sequence_num = 1;
+	chain_page->crc = blob_md_page_calc_crc(chain_page);
 	ut_bs_dirty_load(&bs, NULL);
 
-	g_bserrno = 0;
 	spdk_bs_open_blob(bs, blobid, blob_op_with_handle_complete, NULL);
 	poll_threads();
-	CU_ASSERT(g_bserrno == -EINVAL);
-	CU_ASSERT(g_blob == NULL);
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	spdk_blob_close(g_blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
 
-	g_bserrno = 0;
 	spdk_bs_open_blob(bs, blobid2, blob_op_with_handle_complete, NULL);
 	poll_threads();
-	CU_ASSERT(g_bserrno == -EINVAL);
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	spdk_blob_close(g_blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	g_blob = NULL;
+}
+
+/*
+ * #93 A1 / #94: a snapshot with clusters and a clone, and the snapshot's md is corrupted
+ * (wrong sequence number with a valid crc, or a bad crc). The examine load must fail: before,
+ * the snapshot was skipped (its clusters and md pages never claimed, so free for reuse) and
+ * the clone's chain was cut (blob_load_snapshot_cpl), so the clone read zeroes.
+ */
+static void
+blob_load_corrupted_snapshot_with_clone(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_io_channel *channel;
+	struct spdk_blob_opts opts;
+	struct spdk_blob *blob, *snapshot;
+	struct spdk_blob_md_page *page, saved;
+	spdk_blob_id blobid, snapshotid;
+	uint64_t free_clusters, io_units_per_cluster, io_unit_size, i;
+	uint8_t *payload, *payload_read;
+
+	io_unit_size = spdk_bs_get_io_unit_size(bs);
+	io_units_per_cluster = spdk_bs_get_cluster_size(bs) / io_unit_size;
+	payload = calloc(1, io_unit_size);
+	payload_read = calloc(1, io_unit_size);
+	SPDK_CU_ASSERT_FATAL(payload != NULL && payload_read != NULL);
+	memset(payload, 0xA5, io_unit_size);
+
+	channel = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(channel != NULL);
+
+	/* A thick blob with data in all 4 clusters; the snapshot takes them, the blob is its clone. */
+	ut_spdk_blob_opts_init(&opts);
+	opts.num_clusters = 4;
+	opts.thin_provision = false;
+	blob = ut_blob_create_and_open(bs, &opts);
+	blobid = spdk_blob_get_id(blob);
+	for (i = 0; i < 4; i++) {
+		spdk_blob_io_write(blob, channel, payload, i * io_units_per_cluster, 1, blob_op_complete, NULL);
+		poll_threads();
+		CU_ASSERT(g_bserrno == 0);
+	}
+	spdk_bs_create_snapshot(bs, blobid, NULL, blob_op_with_id_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	snapshotid = g_blobid;
+	SPDK_CU_ASSERT_FATAL(snapshotid != SPDK_BLOBID_INVALID);
+	/* The clone gets a cluster of its own. */
+	memset(payload, 0x5A, io_unit_size);
+	spdk_blob_io_write(blob, channel, payload, 0, 1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	spdk_bs_free_io_channel(channel);
+	poll_threads();
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	g_blob = NULL;
+
+	ut_bs_reload(&bs, NULL);
+	free_clusters = spdk_bs_free_cluster_count(bs);
+
+	page = (struct spdk_blob_md_page *)&g_dev_buffer[SPDK_BS_PAGE_SIZE *
+			(bs->md_start + bs_blobid_to_page(snapshotid))];
+	SPDK_CU_ASSERT_FATAL(page->id == snapshotid && page->sequence_num == 0);
+	memcpy(&saved, page, sizeof(saved));
+
+	/* Wrong sequence number, valid crc: rejected by blob_parse(), the load fails. */
+	page->sequence_num = 3;
+	page->crc = blob_md_page_calc_crc(page);
+	ut_bs_dirty_load_fails(&bs, NULL, -EINVAL);
+
+	/* Corrupted page (crc mismatch): the load fails. */
+	memcpy(page, &saved, sizeof(saved));
+	page->descriptors[0] ^= 0xFF;
+	ut_bs_dirty_load_fails(&bs, NULL, -EINVAL);
+
+	/* Repaired: the load succeeds, nothing was changed or claimed twice. */
+	memcpy(page, &saved, sizeof(saved));
+	ut_bs_dirty_load(&bs, NULL);
+	CU_ASSERT(spdk_bs_free_cluster_count(bs) == free_clusters);
+
+	spdk_bs_open_blob(bs, snapshotid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	snapshot = g_blob;
+	CU_ASSERT(spdk_blob_get_num_allocated_clusters(snapshot) == 4);
+
+	spdk_bs_open_blob(bs, blobid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	blob = g_blob;
+	/* The chain is intact: the clone still reads the snapshot's data where it has none. */
+	CU_ASSERT(spdk_blob_get_parent_snapshot(bs, blobid) == snapshotid);
+	channel = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(channel != NULL);
+	spdk_blob_io_read(blob, channel, payload_read, 2 * io_units_per_cluster, 1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	memset(payload, 0xA5, io_unit_size);
+	CU_ASSERT(memcmp(payload, payload_read, io_unit_size) == 0);
+	spdk_blob_io_read(blob, channel, payload_read, 0, 1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	memset(payload, 0x5A, io_unit_size);
+	CU_ASSERT(memcmp(payload, payload_read, io_unit_size) == 0);
+	spdk_bs_free_io_channel(channel);
+	poll_threads();
+
+	ut_blob_close_and_delete(bs, blob);
+	ut_blob_close_and_delete(bs, snapshot);
+	free(payload);
+	free(payload_read);
+}
+
+/*
+ * A blob with unknown invalid flags is skipped by the examine load (it is from a newer
+ * blobstore version), but only after its md was parsed completely: its clusters and md pages
+ * stay claimed. Before, the parse stopped at the flags descriptor, before the extents.
+ */
+static void
+blob_load_invalid_flags_keeps_clusters(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob_opts opts;
+	struct spdk_blob *blob;
+	spdk_blob_id blobid;
+	uint64_t free_clusters;
+
+	ut_spdk_blob_opts_init(&opts);
+	opts.num_clusters = 5;
+	opts.thin_provision = false;
+	blob = ut_blob_create_and_open(bs, &opts);
+	blobid = spdk_blob_get_id(blob);
+	blob->invalid_flags = (1ULL << 63);
+	blob->state = SPDK_BLOB_STATE_DIRTY;
+	spdk_blob_sync_md(blob, false, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	g_blob = NULL;
+	free_clusters = spdk_bs_free_cluster_count(bs);
+
+	ut_bs_dirty_load(&bs, NULL);
+
+	/* Skipped: not loaded, cannot be opened, but everything it owns is still claimed. */
+	CU_ASSERT(blob_lookup(bs, blobid) == NULL);
+	CU_ASSERT(spdk_bs_free_cluster_count(bs) == free_clusters);
+	CU_ASSERT(spdk_bit_array_get(bs->used_md_pages, bs_blobid_to_page(blobid)) == true);
+	CU_ASSERT(spdk_bit_array_get(bs->used_blobids, bs_blobid_to_page(blobid)) == true);
+	g_blob = NULL;
+	spdk_bs_open_blob(bs, blobid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno != 0);
 	CU_ASSERT(g_blob == NULL);
+}
+
+/*
+ * A delete zeroes the blob's md pages and then persists the used blobid mask. If the mask write
+ * is lost (power failure), the mask names a blob whose first md page is all zeroes: the examine
+ * load drops it instead of failing on the crc of that page.
+ */
+static void
+blob_load_deleted_blob_stale_mask(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob_opts opts;
+	struct spdk_blob *blob;
+	spdk_blob_id blobid;
+	uint64_t free_clusters, mask_off, mask_bytes;
+	uint8_t *mask_before;
+
+	ut_spdk_blob_opts_init(&opts);
+	opts.num_clusters = 3;
+	opts.thin_provision = false;
+	blob = ut_blob_create_and_open(bs, &opts);
+	blobid = spdk_blob_get_id(blob);
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	g_blob = NULL;
+
+	mask_off = (uint64_t)bs->used_blobid_mask_start * SPDK_BS_PAGE_SIZE;
+	mask_bytes = (uint64_t)bs->used_blobid_mask_len * SPDK_BS_PAGE_SIZE;
+	mask_before = malloc(mask_bytes);
+	SPDK_CU_ASSERT_FATAL(mask_before != NULL);
+	memcpy(mask_before, &g_dev_buffer[mask_off], mask_bytes);
+
+	spdk_bs_delete_blob(bs, blobid, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	free_clusters = spdk_bs_free_cluster_count(bs);
+	CU_ASSERT(spdk_mem_all_zero(&g_dev_buffer[SPDK_BS_PAGE_SIZE * (bs->md_start + bs_blobid_to_page(
+			blobid))], SPDK_BS_PAGE_SIZE));
+
+	/* The mask write of the delete was lost. */
+	memcpy(&g_dev_buffer[mask_off], mask_before, mask_bytes);
+	free(mask_before);
+
+	ut_bs_dirty_load(&bs, NULL);
+	CU_ASSERT(spdk_bs_free_cluster_count(bs) == free_clusters);
+	CU_ASSERT(spdk_bit_array_get(bs->used_blobids, bs_blobid_to_page(blobid)) == false);
+	g_blob = NULL;
+	spdk_bs_open_blob(bs, blobid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno != 0);
+	CU_ASSERT(g_blob == NULL);
+}
+
+/*
+ * The examine load keeps skipping an external snapshot clone whose esnap device cannot be
+ * created (-ENOTSUP after a complete parse), and its clusters and md pages stay claimed.
+ */
+static void
+blob_esnap_load_unavailable_keeps_clusters(void)
+{
+	struct spdk_blob_store	*bs = g_bs;
+	struct spdk_bs_opts	bs_opts;
+	struct ut_esnap_opts	esnap_opts;
+	struct spdk_blob_opts	opts;
+	struct spdk_io_channel	*channel;
+	struct spdk_blob	*blob;
+	spdk_blob_id		blobid;
+	uint64_t		free_clusters, io_unit_size, io_units_per_cluster;
+	uint8_t			*payload, *payload_read;
+	const uint32_t		esnap_num_clusters = 4;
+
+	io_unit_size = spdk_bs_get_io_unit_size(bs);
+	io_units_per_cluster = spdk_bs_get_cluster_size(bs) / io_unit_size;
+	payload = calloc(1, io_unit_size);
+	payload_read = calloc(1, io_unit_size);
+	SPDK_CU_ASSERT_FATAL(payload != NULL && payload_read != NULL);
+	memset(payload, 0x3C, io_unit_size);
+
+	ut_spdk_blob_opts_init(&opts);
+	ut_esnap_opts_init(io_unit_size, esnap_num_clusters * io_units_per_cluster, __func__, NULL,
+			   &esnap_opts);
+	opts.esnap_id = &esnap_opts;
+	opts.esnap_id_len = sizeof(esnap_opts);
+	opts.num_clusters = esnap_num_clusters;
+	blob = ut_blob_create_and_open(bs, &opts);
+	SPDK_CU_ASSERT_FATAL(spdk_blob_is_esnap_clone(blob));
+	blobid = spdk_blob_get_id(blob);
+	channel = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(channel != NULL);
+	spdk_blob_io_write(blob, channel, payload, 2 * io_units_per_cluster, 1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(spdk_blob_get_num_allocated_clusters(blob) == 1);
+	spdk_bs_free_io_channel(channel);
+	poll_threads();
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	g_blob = NULL;
+	free_clusters = spdk_bs_free_cluster_count(bs);
+
+	/* Without esnap support: the load succeeds, the blob is skipped, its cluster stays claimed. */
+	spdk_bs_opts_init(&bs_opts, sizeof(bs_opts));
+	ut_bs_reload(&bs, &bs_opts);
+	CU_ASSERT(blob_lookup(bs, blobid) == NULL);
+	CU_ASSERT(spdk_bs_free_cluster_count(bs) == free_clusters);
+	CU_ASSERT(spdk_bit_array_get(bs->used_md_pages, bs_blobid_to_page(blobid)) == true);
+
+	/* With esnap support again: the blob and its data are back. */
+	spdk_bs_opts_init(&bs_opts, sizeof(bs_opts));
+	bs_opts.esnap_bs_dev_create = ut_esnap_create;
+	ut_bs_reload(&bs, &bs_opts);
+	CU_ASSERT(spdk_bs_free_cluster_count(bs) == free_clusters);
+	spdk_bs_open_blob(bs, blobid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	blob = g_blob;
+	channel = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(channel != NULL);
+	spdk_blob_io_read(blob, channel, payload_read, 2 * io_units_per_cluster, 1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(memcmp(payload, payload_read, io_unit_size) == 0);
+	spdk_bs_free_io_channel(channel);
+	poll_threads();
+	ut_blob_close_and_delete(bs, blob);
+	free(payload);
+	free(payload_read);
 }
 
 static void
@@ -12194,6 +12537,9 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite, bs_load);
 		CU_ADD_TEST(suite_bs, bs_load_pending_removal);
 		CU_ADD_TEST(suite_bs, blob_md_chain_corrupted_sequence_num);
+		CU_ADD_TEST(suite_bs, blob_load_corrupted_snapshot_with_clone);
+		CU_ADD_TEST(suite_bs, blob_load_invalid_flags_keeps_clusters);
+		CU_ADD_TEST(suite_bs, blob_load_deleted_blob_stale_mask);
 		CU_ADD_TEST(suite, bs_load_custom_cluster_size);
 		CU_ADD_TEST(suite, bs_load_after_failed_grow);
 		CU_ADD_TEST(suite, bs_load_error);
@@ -12266,6 +12612,7 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite_esnap_bs, blob_esnap_clone_inflate);
 		CU_ADD_TEST(suite_esnap_bs, blob_esnap_clone_decouple);
 		CU_ADD_TEST(suite_esnap_bs, blob_esnap_clone_reload);
+		CU_ADD_TEST(suite_esnap_bs, blob_esnap_load_unavailable_keeps_clusters);
 		CU_ADD_TEST(suite_esnap_bs, blob_esnap_hotplug);
 		CU_ADD_TEST(suite_blob, blob_is_degraded);
 		CU_ADD_TEST(suite_bs, blob_clone_resize);

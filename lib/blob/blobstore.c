@@ -1012,9 +1012,14 @@ blob_parse_page(const struct spdk_blob_md_page *page, struct spdk_blob *blob)
 			}
 
 			if ((desc_flags->invalid_flags | SPDK_BLOB_INVALID_FLAGS_MASK) !=
-			    SPDK_BLOB_INVALID_FLAGS_MASK) {
+			    SPDK_BLOB_INVALID_FLAGS_MASK && !blob->examine_flag) {
 				return -EINVAL;
 			}
+			/*
+			 * On examine, a blob with unknown invalid flags is parsed to the end so that its
+			 * clusters and md pages are claimed, and rejected (skipped) after that, in
+			 * blob_load_backing_dev().
+			 */
 
 			if ((desc_flags->data_ro_flags | SPDK_BLOB_DATA_RO_FLAGS_MASK) !=
 			    SPDK_BLOB_DATA_RO_FLAGS_MASK) {
@@ -1875,6 +1880,21 @@ blob_load_snapshot_cpl(void *cb_arg, struct spdk_blob *snapshot, int bserrno)
 		blob_load_final(ctx, bserrno);
 		return;
 	}
+	if (bserrno != 0 && bserrno != -ENOENT && ctx->status == SPDK_BLOB_LOAD_EXAMINE) {
+		/*
+		 * Examine load: the parent exists (its md page belongs to it) but failed to load.
+		 * Cutting the chain below would make this clone read zeroes where it inherits data,
+		 * and clearing the parent's used_blobids bit would keep the examine from ever
+		 * loading the parent itself, hiding its failure. Fail this clone with the parent's
+		 * error instead: a corrupted parent fails the whole load, an unusable but completely
+		 * parsed one (-ENOTSUP) gets this clone skipped with it (bs_load_iter_on_examine_cpl).
+		 */
+		SPDK_ERRLOG("blob 0x%" PRIx64 ": parent 0x%" PRIx64 " failed to load on examine (%d)\n",
+			    blob->id, blob->parent_id, bserrno);
+		blob->back_bs_dev = NULL;
+		blob_load_final(ctx, bserrno);
+		return;
+	}
 	if (bserrno != 0) {
 		// spdk_bit_array_clear(blob->bs->open_blobids, blob->parent_id);
 		// this line onlt for failover case
@@ -1974,6 +1994,19 @@ blob_load_backing_dev(spdk_bs_sequence_t *seq, void *cb_arg)
 	const void			*value;
 	size_t				len;
 	int				rc;
+
+	if (blob->examine_flag &&
+	    (blob->invalid_flags | SPDK_BLOB_INVALID_FLAGS_MASK) != SPDK_BLOB_INVALID_FLAGS_MASK) {
+		/*
+		 * Unknown invalid flags (blob_parse_page() let the examine parse finish so that its
+		 * clusters and md pages are claimed): the blob cannot be used; -ENOTSUP makes the
+		 * examine load skip it instead of failing (bs_load_iter_on_examine_cpl).
+		 */
+		SPDK_ERRLOG("blob 0x%" PRIx64 " has unsupported invalid flags 0x%" PRIx64 "\n",
+			    blob->id, blob->invalid_flags);
+		blob_load_final(ctx, -ENOTSUP);
+		return;
+	}
 
 	if (blob_is_esnap_clone(blob)) {
 		rc = blob_load_esnap(blob, seq->cpl.u.blob_handle.esnap_ctx);
@@ -2303,6 +2336,21 @@ blob_load_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 
 	page = &ctx->pages[ctx->num_pages - 1];
 	crc = blob_md_page_calc_crc(page);
+	if (crc != page->crc && ctx->num_pages == 1 && blob->examine_flag &&
+	    spdk_mem_all_zero(page, sizeof(*page))) {
+		/*
+		 * Examine: the blobid is in the persisted used blobid mask, but its first md page is
+		 * all zeroes. A delete zeroes the md pages first and then persists the mask
+		 * (blob_persist_zero_pages_cpl), so this is a delete whose mask write was lost: the
+		 * blob is gone and owns nothing. Not a corrupted page - drop the stale bit and let
+		 * the examine skip the blob (-ENOENT) instead of failing the load.
+		 */
+		SPDK_NOTICELOG("blobid 0x%" PRIx64 " is in the used blobid mask but its md page is "
+			       "zeroed (deleted): dropping it\n", blob->id);
+		spdk_bit_array_clear(blob->bs->used_blobids, current_page);
+		blob_load_final(ctx, -ENOENT);
+		return;
+	}
 	if (crc != page->crc) {
 		SPDK_ERRLOG("Metadata page %d crc mismatch for blobid 0x%" PRIx64 "\n",
 			    current_page, blob->id);
@@ -7014,8 +7062,9 @@ bs_load_examine_finish(struct spdk_bs_load_ctx *master)
 {
 	SPDK_NOTICELOG("Parallel examine blob loading done, rc=%d\n", master->rc);
 
-	/* A blobstore created without the md journal has none to start. */
-	if (master->bs->md_journal != NULL) {
+	/* A blobstore created without the md journal has none to start. A failed load does not
+	 * start it either: the blobstore is freed below, nothing may be drained HOME. */
+	if (master->bs->md_journal != NULL && master->rc == 0) {
 		bs_md_journal_examine_complete(master->bs->md_journal);
 		bs_md_journal_start(master->bs->md_journal);
 	}
@@ -7036,6 +7085,14 @@ bs_load_examine_finish(struct spdk_bs_load_ctx *master)
 	}
 
 	bs_sequence_finish(master->seq, master->rc);
+	if (master->rc != 0) {
+		/*
+		 * The caller gets no blobstore handle on failure (bs_call_cpl passes NULL): free it,
+		 * with the blobs the examine already opened, as bs_load_ctx_fail does for the earlier
+		 * load steps. Otherwise its pollers keep running and its memory leaks.
+		 */
+		bs_free(master->bs);
+	}
 	free(master);
 }
 
@@ -7049,14 +7106,21 @@ bs_load_iter_on_examine_cpl(void *cb_arg, int bserrno)
 
 	master->active_workers--;
 
-	if (bserrno == -EINVAL || bserrno == -ENOTSUP) {
+	if (bserrno == -ENOTSUP) {
 		/*
-		 * The blob cannot be used (unsupported flags, unparsable metadata, external snapshot
-		 * device not available): skip it, as the blob iteration of a regular load does,
-		 * instead of failing the load of the whole blobstore. Its owner sees it as present
-		 * in used_blobids but not loaded (spdk_bs_for_each_loaded_blob).
+		 * Only a blob that was parsed completely and is then unusable is skipped: an external
+		 * snapshot clone whose esnap device cannot be created, a blob with unknown invalid
+		 * flags (blob_load_backing_dev), or a clone of such a blob (blob_load_snapshot_cpl).
+		 * Clusters and md pages are claimed only while a blob's md is parsed on examine, and
+		 * these blobs got that far, so nothing they own can be handed out again. Its owner
+		 * sees it as present in used_blobids but not loaded (spdk_bs_for_each_loaded_blob).
+		 *
+		 * Any other error - in particular -EINVAL, a corrupted md page (crc, chain id or
+		 * sequence number, descriptors) - fails the load: the blob's clusters and md pages
+		 * were not (or only partly) claimed, and skipping it would let them be allocated
+		 * again (double ownership, md page reuse) and cut its clones' chains.
 		 */
-		SPDK_ERRLOG("Skipping blob that failed to load on examine: %d\n", bserrno);
+		SPDK_ERRLOG("Skipping blob that is unusable after a complete examine: %d\n", bserrno);
 		bserrno = 0;
 	}
 
