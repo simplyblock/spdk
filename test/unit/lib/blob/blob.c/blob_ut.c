@@ -6739,6 +6739,280 @@ blob_snapshot_rw_copy_declined(void)
 	g_blobid = 0;
 }
 
+/* Injected write errors (bs_dev_common.c): off. */
+static void
+ut_dev_write_fail_off(void)
+{
+	g_dev_write_fail_rc = 0;
+	g_dev_write_fail_lba = 0;
+	g_dev_write_fail_lba_count = 0;
+}
+
+static void
+ut_dev_write_fail_on(int rc, uint64_t lba, uint64_t lba_count)
+{
+	g_dev_write_fail_rc = rc;
+	g_dev_write_fail_lba = lba;
+	g_dev_write_fail_lba_count = lba_count;
+}
+
+/* First LBA after the metadata region (super block, masks, md journal, md pages). */
+static uint64_t
+ut_bs_md_end_lba(struct spdk_blob_store *bs)
+{
+	return bs_page_to_lba(bs, bs->md_start + bs->md_len);
+}
+
+static void
+ut_md_enospc_op_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	*(int *)cb_arg = bserrno;
+}
+
+enum ut_md_enospc_op {
+	UT_SEQ_WRITE,
+	UT_SEQ_WRITEV,
+	UT_SEQ_WRITE_ZEROES,
+	UT_BATCH_WRITE,
+	UT_BATCH_WRITEV,
+	UT_BATCH_WRITE_ZEROES,
+	UT_MD_ENOSPC_OP_COUNT
+};
+
+/* One write of the given kind at lba (and, for a batch, also a write at lba2
+ * when it is not UINT64_MAX); returns the error the op's callback saw. */
+static int
+ut_md_enospc_one_op(struct spdk_blob_store *bs, enum ut_md_enospc_op op, uint64_t lba,
+		    uint64_t lba2)
+{
+	static uint8_t buf[SPDK_BS_PAGE_SIZE];
+	struct iovec iov = { .iov_base = buf, .iov_len = BLOCKLEN };
+	struct spdk_bs_cpl cpl = {};
+	spdk_bs_sequence_t *seq;
+	spdk_bs_batch_t *batch;
+	int rc = 1;
+
+	cpl.type = SPDK_BS_CPL_TYPE_BS_BASIC;
+	cpl.u.bs_basic.cb_fn = bs_op_complete;
+	cpl.u.bs_basic.cb_arg = NULL;
+	seq = bs_sequence_start_bs(bs->md_channel, &cpl);
+	SPDK_CU_ASSERT_FATAL(seq != NULL);
+
+	switch (op) {
+	case UT_SEQ_WRITE:
+		bs_sequence_write_dev(seq, buf, lba, 1, ut_md_enospc_op_cpl, &rc);
+		break;
+	case UT_SEQ_WRITEV:
+		bs_sequence_writev_dev(seq, &iov, 1, lba, 1, ut_md_enospc_op_cpl, &rc);
+		break;
+	case UT_SEQ_WRITE_ZEROES:
+		bs_sequence_write_zeroes_dev(seq, lba, 1, ut_md_enospc_op_cpl, &rc);
+		break;
+	default:
+		batch = bs_sequence_to_batch(seq, 0, ut_md_enospc_op_cpl, &rc);
+		if (op == UT_BATCH_WRITE) {
+			bs_batch_write_dev(batch, buf, lba, 1);
+		} else if (op == UT_BATCH_WRITEV) {
+			bs_batch_writev_dev(batch, &iov, 1, lba, 1);
+		} else {
+			bs_batch_write_zeroes_dev(batch, lba, 1);
+		}
+		if (lba2 != UINT64_MAX) {
+			bs_batch_write_dev(batch, buf, lba2, 1);
+		}
+		bs_batch_close(batch);
+		break;
+	}
+	poll_threads();
+	CU_ASSERT(rc != 1);
+	bs_sequence_finish(seq, 0);
+	poll_threads();
+	return rc;
+}
+
+/*
+ * spdk #95 reports a full device (Capacity Exceeded) as -ENOSPC, and the lvol
+ * layer keeps leadership on it. For metadata that is wrong: a failed md
+ * journal append / HOME / ZERO write fails the journal until the next
+ * recovery, a failed md page, super block or used mask write leaves the disk
+ * behind memory. So -ENOSPC from a write to the metadata region reaches the
+ * blobstore as -EIO (the step-down path), for every kind of write a sequence
+ * or batch can issue; a blob data write keeps -ENOSPC.
+ */
+static void
+bs_md_write_enospc_is_eio(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	uint64_t md_lba, md_last_lba, data_lba;
+	int op;
+
+	md_lba = 0;					/* super block */
+	md_last_lba = ut_bs_md_end_lba(bs) - 1;		/* last md page */
+	data_lba = bs_cluster_to_lba(bs, bs->total_clusters - 1);
+	SPDK_CU_ASSERT_FATAL(data_lba >= ut_bs_md_end_lba(bs));
+
+	/* the whole device is full */
+	ut_dev_write_fail_on(-ENOSPC, 0, DEV_BUFFER_BLOCKCNT);
+	for (op = 0; op < UT_MD_ENOSPC_OP_COUNT; op++) {
+		CU_ASSERT(ut_md_enospc_one_op(bs, op, md_lba, UINT64_MAX) == -EIO);
+		CU_ASSERT(ut_md_enospc_one_op(bs, op, md_last_lba, UINT64_MAX) == -EIO);
+		CU_ASSERT(ut_md_enospc_one_op(bs, op, data_lba, UINT64_MAX) == -ENOSPC);
+	}
+	/* A batch with a metadata write in it reports -EIO, in either order. */
+	CU_ASSERT(ut_md_enospc_one_op(bs, UT_BATCH_WRITE, data_lba, md_lba) == -EIO);
+	CU_ASSERT(ut_md_enospc_one_op(bs, UT_BATCH_WRITE, md_lba, data_lba) == -EIO);
+
+	/* Other errors are left alone. */
+	ut_dev_write_fail_on(-EIO, 0, DEV_BUFFER_BLOCKCNT);
+	CU_ASSERT(ut_md_enospc_one_op(bs, UT_SEQ_WRITE, md_lba, UINT64_MAX) == -EIO);
+	CU_ASSERT(ut_md_enospc_one_op(bs, UT_SEQ_WRITE, data_lba, UINT64_MAX) == -EIO);
+	ut_dev_write_fail_off();
+	CU_ASSERT(ut_md_enospc_one_op(bs, UT_SEQ_WRITE_ZEROES, data_lba, UINT64_MAX) == 0);
+	CU_ASSERT(ut_md_enospc_one_op(bs, UT_BATCH_WRITE_ZEROES, data_lba, UINT64_MAX) == 0);
+}
+
+/*
+ * End to end: a thin blob's first write into a cluster needs a metadata write
+ * (the cluster insert). When that md write finds the device full, the user
+ * write fails with -EIO (the lvol layer then steps down, as before #95), not
+ * -ENOSPC. A plain data write to a full device stays -ENOSPC.
+ */
+static void
+blob_thin_alloc_md_enospc_is_eio(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob *blob;
+	struct spdk_io_channel *channel;
+	struct spdk_blob_opts opts;
+	uint64_t free_clusters;
+	uint64_t md_end = ut_bs_md_end_lba(bs);
+	uint8_t payload[BLOCKLEN];
+
+	channel = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(channel != NULL);
+
+	ut_spdk_blob_opts_init(&opts);
+	opts.thin_provision = true;
+	opts.num_clusters = 5;
+	blob = ut_blob_create_and_open(bs, &opts);
+	memset(payload, 0x5A, sizeof(payload));
+	free_clusters = spdk_bs_free_cluster_count(bs);
+
+	/* metadata region full: the allocating write fails with -EIO */
+	ut_dev_write_fail_on(-ENOSPC, 0, md_end);
+	g_dev_write_fail_count = 0;
+	spdk_blob_io_write(blob, channel, payload, 0, 1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_dev_write_fail_count > 0);
+	CU_ASSERT(g_bserrno == -EIO);
+	CU_ASSERT(spdk_bs_free_cluster_count(bs) == free_clusters);
+	ut_dev_write_fail_off();
+
+	/* space again: the write allocates the cluster */
+	spdk_blob_io_write(blob, channel, payload, 0, 1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(spdk_bs_free_cluster_count(bs) == free_clusters - 1);
+
+	/* data region full: a write to the allocated cluster keeps -ENOSPC */
+	ut_dev_write_fail_on(-ENOSPC, md_end, DEV_BUFFER_BLOCKCNT - md_end);
+	spdk_blob_io_write(blob, channel, payload, 0, 1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -ENOSPC);
+	ut_dev_write_fail_off();
+
+	ut_blob_close_and_delete(bs, blob);
+	spdk_bs_free_io_channel(channel);
+	poll_threads();
+}
+
+/*
+ * A CoW whose write to the newly allocated cluster fails (device full) must
+ * release that cluster, and the extent page it claimed: the leader keeps
+ * running on -ENOSPC (spdk #95), so a leaked cluster would stay out of the
+ * free count for good. The blob's map is unchanged and a retry succeeds.
+ */
+static void
+blob_cow_enospc_releases_cluster(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob *blob, *snapshot;
+	struct spdk_io_channel *channel;
+	struct spdk_blob_opts opts;
+	spdk_blob_id blobid, snapshotid;
+	uint64_t free_clusters, md_end = ut_bs_md_end_lba(bs);
+	uint32_t used_md_pages;
+	uint8_t payload_read[10 * BLOCKLEN];
+	uint8_t payload_write[10 * BLOCKLEN];
+	uint8_t expected[10 * BLOCKLEN];
+	int attempt;
+
+	channel = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(channel != NULL);
+
+	ut_spdk_blob_opts_init(&opts);
+	opts.thin_provision = true;
+	opts.num_clusters = 5;
+	blob = ut_blob_create_and_open(bs, &opts);
+	blobid = spdk_blob_get_id(blob);
+
+	memset(payload_write, 0xE5, sizeof(payload_write));
+	spdk_blob_io_write(blob, channel, payload_write, 4, 10, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	spdk_bs_create_snapshot(bs, blobid, NULL, blob_op_with_id_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	snapshotid = g_blobid;
+	spdk_bs_open_blob(bs, snapshotid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	snapshot = g_blob;
+	CU_ASSERT(blob->active.clusters[0] == 0);
+
+	free_clusters = spdk_bs_free_cluster_count(bs);
+	used_md_pages = spdk_bit_array_count_set(bs->used_md_pages);
+
+	/* Twice: a second failure must not double free anything. */
+	for (attempt = 0; attempt < 2; attempt++) {
+		/* The data region is full: the CoW copy / write of the new cluster fails. */
+		ut_dev_write_fail_on(-ENOSPC, md_end, DEV_BUFFER_BLOCKCNT - md_end);
+		g_dev_write_fail_count = 0;
+		memset(payload_write, 0xAA, 2 * BLOCKLEN);
+		spdk_blob_io_write(blob, channel, payload_write, 6, 2, blob_op_complete, NULL);
+		poll_threads();
+		ut_dev_write_fail_off();
+		CU_ASSERT(g_dev_write_fail_count > 0);
+		CU_ASSERT(g_bserrno == -ENOSPC);
+		CU_ASSERT(spdk_bs_free_cluster_count(bs) == free_clusters);
+		CU_ASSERT(spdk_bit_array_count_set(bs->used_md_pages) == used_md_pages);
+		CU_ASSERT(blob->active.clusters[0] == 0);
+	}
+
+	/* Space again: the retry allocates the cluster and copies it. */
+	spdk_blob_io_write(blob, channel, payload_write, 6, 2, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(spdk_bs_free_cluster_count(bs) == free_clusters - 1);
+	CU_ASSERT(blob->active.clusters[0] != 0);
+
+	spdk_blob_io_read(blob, channel, payload_read, 4, 10, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	memset(expected, 0xE5, sizeof(expected));
+	memset(expected + 2 * BLOCKLEN, 0xAA, 2 * BLOCKLEN);
+	CU_ASSERT(memcmp(payload_read, expected, 10 * BLOCKLEN) == 0);
+
+	ut_blob_close_and_delete(bs, blob);
+	ut_blob_close_and_delete(bs, snapshot);
+	spdk_bs_free_io_channel(channel);
+	poll_threads();
+	g_blob = NULL;
+	g_blobid = 0;
+}
+
 static void
 blob_snapshot_rw_iov(void)
 {
@@ -12578,6 +12852,9 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite, bs_load_iter_test);
 		CU_ADD_TEST(suite_bs, blob_snapshot_rw);
 		CU_ADD_TEST(suite_bs, blob_snapshot_rw_copy_declined);
+		CU_ADD_TEST(suite_bs, blob_cow_enospc_releases_cluster);
+		CU_ADD_TEST(suite_bs, blob_thin_alloc_md_enospc_is_eio);
+		CU_ADD_TEST(suite_bs, bs_md_write_enospc_is_eio);
 		CU_ADD_TEST(suite_bs, blob_delete_async_in_middle_keeps_clone_clusters);
 		CU_ADD_TEST(suite_bs, blob_merge_base_priority_class);
 		CU_ADD_TEST(suite_bs, blob_merge_base_64k_pieces);

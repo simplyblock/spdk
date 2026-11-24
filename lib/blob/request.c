@@ -32,6 +32,44 @@ check_geometry(struct spdk_blob_store *bs, uint8_t geometry, uint64_t lba)
 	return;
 }
 
+/*
+ * A write to the metadata region: the super block, the used masks, the md
+ * journal and the md pages all lie below the end of the md page region; blob
+ * data clusters start after it.
+ */
+static inline bool
+bs_lba_is_md(struct spdk_bs_channel *channel, uint64_t lba)
+{
+	struct spdk_blob_store *bs = channel->bs;
+
+	return lba < bs_page_to_lba(bs, bs->md_start + bs->md_len);
+}
+
+/*
+ * The error of an op of this set as its callbacks see it.
+ *
+ * A full device (-ENOSPC from blob_bdev, NVMe "Capacity Exceeded", spdk #95)
+ * is a write error for the host and the lvol layer keeps its leadership. That
+ * is right for blob data, but not for metadata: a failed md journal append,
+ * HOME drain or ZERO write puts the md journal into its failed state, which
+ * only a journal start/recovery clears, and a failed md page, super block or
+ * used mask write leaves the on-disk metadata behind the in-memory one. The
+ * node would keep leadership with metadata it can no longer write, and freeing
+ * space (a delete) needs md writes too. So a -ENOSPC from a metadata write is
+ * reported as -EIO, as every device error was before #95: the IO that needed
+ * the metadata fails with -EIO, the lvol layer drops leadership, and the next
+ * leader replays the journal.
+ */
+static inline int
+bs_request_set_md_errno(struct spdk_bs_request_set *set, int bserrno)
+{
+	if (spdk_unlikely(bserrno == -ENOSPC && set->md_io)) {
+		SPDK_ERRLOG("Metadata write failed with -ENOSPC (device full), reported as -EIO\n");
+		return -EIO;
+	}
+	return bserrno;
+}
+
 void
 bs_call_cpl(struct spdk_bs_cpl *cpl, int bserrno)
 {
@@ -86,6 +124,7 @@ bs_sequence_completion(struct spdk_io_channel *channel, void *cb_arg, int bserrn
 {
 	struct spdk_bs_request_set *set = cb_arg;
 
+	bserrno = bs_request_set_md_errno(set, bserrno);
 	set->bserrno = bserrno;
 	set->u.sequence.cb_fn((spdk_bs_sequence_t *)set, set->u.sequence.cb_arg, bserrno);
 }
@@ -111,6 +150,7 @@ bs_sequence_start(struct spdk_io_channel *_channel, struct spdk_bs_cpl *cpl,
 	set->back_channel = back_channel;
 
 	set->priority_class = channel->bs->priority_class;
+	set->md_io = false;
 	set->geometry = 0; // default geometry
 	set->special_io = 0; //default special io
 	set->cb_args.cb_fn = bs_sequence_completion;
@@ -200,6 +240,7 @@ bs_sequence_read_bs_dev(spdk_bs_sequence_t *seq, struct spdk_bs_dev *bs_dev,
 	SPDK_DEBUGLOG(blob_rw, "Reading %" PRIu32 " blocks from LBA %" PRIu64 "\n", lba_count,
 		      lba);
 
+	set->md_io = false;
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
 	bs_io_opts.priority = set->priority_class;
@@ -220,6 +261,7 @@ bs_sequence_read_dev(spdk_bs_sequence_t *seq, void *payload,
 	SPDK_DEBUGLOG(blob_rw, "Reading %" PRIu32 " blocks from LBA %" PRIu64 "\n", lba_count,
 		      lba);
 
+	set->md_io = false;
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
 	bs_io_opts.priority = set->priority_class;
@@ -240,6 +282,7 @@ bs_sequence_write_dev(spdk_bs_sequence_t *seq, void *payload,
 	SPDK_DEBUGLOG(blob_rw, "Writing %" PRIu32 " blocks from LBA %" PRIu64 "\n", lba_count,
 		      lba);
 
+	set->md_io = bs_lba_is_md(channel, lba);
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
 	bs_io_opts.priority = set->priority_class;
@@ -262,6 +305,7 @@ bs_sequence_readv_bs_dev(spdk_bs_sequence_t *seq, struct spdk_bs_dev *bs_dev,
 	SPDK_DEBUGLOG(blob_rw, "Reading %" PRIu32 " blocks from LBA %" PRIu64 "\n", lba_count,
 		      lba);
 
+	set->md_io = false;
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
 
@@ -288,6 +332,7 @@ bs_sequence_readv_dev(spdk_bs_sequence_t *seq, struct iovec *iov, int iovcnt,
 	SPDK_DEBUGLOG(blob_rw, "Reading %" PRIu32 " blocks from LBA %" PRIu64 "\n", lba_count,
 		      lba);
 
+	set->md_io = false;
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
 	bs_io_opts.priority = set->priority_class;
@@ -314,6 +359,7 @@ bs_sequence_writev_dev(spdk_bs_sequence_t *seq, struct iovec *iov, int iovcnt,
 	SPDK_DEBUGLOG(blob_rw, "Writing %" PRIu32 " blocks from LBA %" PRIu64 "\n", lba_count,
 		      lba);
 
+	set->md_io = bs_lba_is_md(channel, lba);
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
 	bs_io_opts.priority = set->priority_class;
@@ -342,6 +388,7 @@ bs_sequence_write_zeroes_dev(spdk_bs_sequence_t *seq,
 	SPDK_DEBUGLOG(blob_rw, "writing zeroes to %" PRIu64 " blocks at LBA %" PRIu64 "\n",
 		      lba_count, lba);
 
+	set->md_io = bs_lba_is_md(channel, lba);
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
 	bs_io_opts.priority = set->priority_class;
@@ -362,6 +409,7 @@ bs_sequence_copy_dev(spdk_bs_sequence_t *seq, uint64_t dst_lba, uint64_t src_lba
 	SPDK_DEBUGLOG(blob_rw, "Copying %" PRIu64 " blocks from LBA %" PRIu64 " to LBA %" PRIu64 "\n",
 		      lba_count, src_lba, dst_lba);
 
+	set->md_io = bs_lba_is_md(channel, dst_lba);
 	set->u.sequence.cb_fn = cb_fn;
 	set->u.sequence.cb_arg = cb_arg;
 	bs_io_opts.priority = set->priority_class;
@@ -395,6 +443,8 @@ bs_batch_completion(struct spdk_io_channel *_channel,
 	struct spdk_bs_channel		*channel = set->channel;
 	struct spdk_bs_io_opts		bs_io_opts = {0};
 	struct limit *ctx;
+
+	bserrno = bs_request_set_md_errno(set, bserrno);
 	set->u.batch.outstanding_ops--;
 	if (bserrno != 0) {
 		set->bserrno = bserrno;
@@ -472,6 +522,7 @@ bs_batch_open(struct spdk_io_channel *_channel, struct spdk_bs_cpl *cpl, struct 
 	set->u.batch.batch_closed = 0;
 	set->u.batch.geometry = blob->geometry;
 	set->u.batch.special_io = 0; // default special io
+	set->md_io = false;
 
 	set->priority_class = blob->priority_class;
 	set->geometry = blob->geometry;
@@ -515,6 +566,7 @@ bs_batch_open_s(struct spdk_io_channel *_channel, struct spdk_bs_cpl *cpl, uint8
 	set->u.batch.batch_closed = 0;
 	set->u.batch.geometry = blob->geometry;
 	set->u.batch.special_io = special_io;
+	set->md_io = false;
 
 	set->priority_class = blob->priority_class;
 	set->geometry = blob->geometry;
@@ -580,6 +632,7 @@ bs_batch_write_dev(spdk_bs_batch_t *batch, void *payload,
 	struct spdk_bs_request_set	*set = (struct spdk_bs_request_set *)batch;
 	struct spdk_bs_channel		*channel = set->channel;
 	struct spdk_bs_io_opts 		bs_io_opts = {0};
+	set->md_io |= bs_lba_is_md(channel, lba);
 	SPDK_DEBUGLOG(blob_rw, "Writing %" PRIu32 " blocks to LBA %" PRIu64 "\n", lba_count, lba);
 
 	set->u.batch.outstanding_ops++;
@@ -626,6 +679,7 @@ bs_batch_writev_dev(spdk_bs_batch_t *batch, struct iovec *iov, int iovcnt, uint6
 	struct spdk_bs_request_set	*set = (struct spdk_bs_request_set *)batch;
 	struct spdk_bs_channel		*channel = set->channel;
 	struct spdk_bs_io_opts 		bs_io_opts = {0};
+	set->md_io |= bs_lba_is_md(channel, lba);
 	SPDK_DEBUGLOG(blob_rw, "Writing %" PRIu32 " blocks to LBA %" PRIu64 "\n", lba_count, lba);
 
 	set->u.batch.outstanding_ops++;
@@ -651,6 +705,7 @@ bs_batch_unmap_dev(spdk_bs_batch_t *batch,
 	struct spdk_bs_io_opts		bs_io_opts = {0};
 	struct limit *ctx = NULL;
 
+	set->md_io |= bs_lba_is_md(channel, lba);
 	SPDK_DEBUGLOG(blob_rw, "Unmapping %" PRIu64 " blocks at LBA %" PRIu64 "\n", lba_count,
 		      lba);
 
@@ -693,6 +748,7 @@ bs_batch_write_zeroes_dev(spdk_bs_batch_t *batch,
 	struct spdk_bs_request_set	*set = (struct spdk_bs_request_set *)batch;
 	struct spdk_bs_channel		*channel = set->channel;
 	struct spdk_bs_io_opts		bs_io_opts = {0};
+	set->md_io |= bs_lba_is_md(channel, lba);
 	SPDK_DEBUGLOG(blob_rw, "Zeroing %" PRIu64 " blocks at LBA %" PRIu64 "\n", lba_count, lba);
 
 	set->u.batch.outstanding_ops++;
@@ -746,6 +802,7 @@ bs_sequence_to_batch(spdk_bs_sequence_t *seq, uint8_t geometry, spdk_bs_sequence
 	set->u.batch.batch_closed = 0;
 	set->u.batch.is_unmap = false;
 	TAILQ_INIT(&set->u.batch.unmap_queue);
+	set->md_io = false;
 
 	set->cb_args.cb_fn = bs_batch_completion;
 
@@ -765,6 +822,7 @@ bs_sequence_to_batch_s(spdk_bs_sequence_t *seq, uint8_t geometry, uint8_t specia
 	set->u.batch.batch_closed = 0;
 	set->u.batch.is_unmap = false;
 	TAILQ_INIT(&set->u.batch.unmap_queue);
+	set->md_io = false;
 
 	set->cb_args.cb_fn = bs_batch_completion;
 

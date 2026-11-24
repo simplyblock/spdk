@@ -3911,7 +3911,7 @@ struct spdk_blob_copy_cluster_ctx {
 	spdk_bs_sequence_t *seq;
 	struct spdk_blob_md_page *new_cluster_page;
 	struct spdk_bs_cluster_alloc *alloc;
-	bool data_written;	/* CoW data was written to new_cluster */
+	bool data_written;	/* CoW data was (or may have been) written to new_cluster */
 	int insert_rc;		/* insert error kept while the cluster is cleared */
 	/* Step times, for the allocation timing (see bs_cow_stat_add()). */
 	uint64_t slot_wait_us;	/* time the op waited for a free slot */
@@ -4303,6 +4303,33 @@ blob_insert_cluster_clear(struct spdk_blob_copy_cluster_ctx *ctx)
 	bs_batch_close(batch);
 }
 
+/*
+ * The CoW of a newly allocated cluster failed before the cluster was inserted
+ * into the blob (a read of the backing device, the copy, or a write of the new
+ * cluster failed). The cluster and a newly claimed extent page are still only
+ * claimed in the used maps: release them, or they leak. Before spdk #95 every
+ * such failure was -EIO and dropped leadership, and the next leader rebuilt
+ * the used maps from disk; now a full device (-ENOSPC) keeps the leader, and
+ * every failed CoW would take one cluster (and maybe an md page) out of the
+ * free count for good, until the lvstore looked full. When data may already be
+ * on the cluster (some chunk writes of the batch may have succeeded, or a
+ * partial copy), it is cleared first, as on a lost insert race: a new cluster
+ * must read as zeroes. The cluster is not in the blob's map yet, so nothing
+ * else releases it (no double free).
+ */
+static void
+blob_cow_failed(struct spdk_blob_copy_cluster_ctx *ctx, int bserrno)
+{
+	assert(bserrno != 0);
+	if (ctx->data_written) {
+		ctx->insert_rc = bserrno;
+		blob_insert_cluster_clear(ctx);
+		return;
+	}
+	blob_insert_cluster_revert(ctx);
+	bs_sequence_finish(ctx->seq, bserrno);
+}
+
 static void
 blob_insert_cluster_cpl(void *cb_arg, int bserrno)
 {
@@ -4342,8 +4369,9 @@ blob_write_copy_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	uint32_t cluster_number;
 
 	if (bserrno) {
-		/* The write failed, so jump to the final completion handler */
-		bs_sequence_finish(seq, bserrno);
+		/* The write failed: release the new cluster, then jump to the
+		 * final completion handler */
+		blob_cow_failed(ctx, bserrno);
 		return;
 	}
 
@@ -4435,13 +4463,15 @@ blob_write_copy(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	ctx->read_tsc = spdk_get_ticks();
 
 	if (bserrno != 0) {
-		/* A read failed, so jump to the final completion handler */
-		bs_sequence_finish(seq, bserrno);
+		/* A read failed: release the new cluster, then jump to the final
+		 * completion handler */
+		blob_cow_failed(ctx, bserrno);
 		return;
 	}
 
 	/* Write all chunks in one batch. With no data to write the batch
 	 * completes at close and the cluster is inserted without any data write. */
+	ctx->data_written = true;	/* from here on the cluster may hold data */
 	batch = bs_sequence_to_batch(seq, 0, blob_write_copy_cpl, ctx);
 	for (c = 0; c < ctx->nchunks; c++) {
 		chunk_lba = bs_cluster_to_lba(bs, ctx->new_cluster) +
@@ -4524,7 +4554,7 @@ blob_copy_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	 * IO fails (the lvol layer then drops leadership of the lvstore). */
 	((struct spdk_bs_request_set *)seq)->bserrno = 0;
 	if (blob_cow_bufs_alloc(ctx, blob->back_bs_dev->blocklen) != 0) {
-		bs_sequence_finish(seq, -ENOMEM);
+		blob_cow_failed(ctx, -ENOMEM);
 		return;
 	}
 
@@ -4538,6 +4568,7 @@ blob_copy(struct spdk_blob_copy_cluster_ctx *ctx, spdk_bs_user_op_t *op, uint64_
 	uint64_t lba_count = bs_dev_byte_to_lba(blob->back_bs_dev, blob->bs->cluster_sz);
 
 	ctx->read_tsc = ctx->start_tsc;	/* the copy has no separate read */
+	ctx->data_written = true;	/* a failed copy may have written part of the cluster */
 	bs_sequence_copy_dev(ctx->seq,
 			     bs_cluster_to_lba(blob->bs, ctx->new_cluster),
 			     src_lba,

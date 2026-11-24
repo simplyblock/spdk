@@ -28,6 +28,16 @@ bool g_dev_writev_ext_called;
 bool g_dev_readv_ext_called;
 bool g_dev_copy_enabled;
 int g_dev_copy_fail;
+/*
+ * Injected write error: a write, writev, write_zeroes or copy whose
+ * destination overlaps [g_dev_write_fail_lba, g_dev_write_fail_lba +
+ * g_dev_write_fail_lba_count) writes nothing and completes with
+ * g_dev_write_fail_rc (e.g. -ENOSPC, a full device). Off while the rc is 0.
+ */
+int g_dev_write_fail_rc;
+uint64_t g_dev_write_fail_lba;
+uint64_t g_dev_write_fail_lba_count;
+uint64_t g_dev_write_fail_count;	/* writes failed this way */
 struct spdk_blob_ext_io_opts g_blob_ext_io_opts;
 uint32_t g_phys_blocklen;
 
@@ -123,6 +133,39 @@ dev_complete(void *arg)
 	_bs_send_msg(dev_complete_cb, arg, NULL);
 }
 
+struct dev_write_fail_ctx {
+	struct spdk_bs_dev_cb_args *cb_args;
+	int rc;
+};
+
+static void
+dev_write_fail_complete(void *arg)
+{
+	struct dev_write_fail_ctx *ctx = arg;
+
+	ctx->cb_args->cb_fn(ctx->cb_args->channel, ctx->cb_args->cb_arg, ctx->rc);
+	free(ctx);
+}
+
+/* true: the write was failed by the injection (see g_dev_write_fail_rc) */
+static bool
+dev_write_inject_fail(uint64_t lba, uint64_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
+{
+	struct dev_write_fail_ctx *ctx;
+
+	if (g_dev_write_fail_rc == 0 || lba + lba_count <= g_dev_write_fail_lba ||
+	    lba >= g_dev_write_fail_lba + g_dev_write_fail_lba_count) {
+		return false;
+	}
+	ctx = calloc(1, sizeof(*ctx));
+	SPDK_CU_ASSERT_FATAL(ctx != NULL);
+	ctx->cb_args = cb_args;
+	ctx->rc = g_dev_write_fail_rc;
+	g_dev_write_fail_count++;
+	spdk_thread_send_msg(spdk_get_thread(), dev_write_fail_complete, ctx);
+	return true;
+}
+
 static void
 dev_read(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
 	 uint64_t lba, uint32_t lba_count,
@@ -168,6 +211,9 @@ dev_write(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payloa
 	uint64_t offset, length;
 
 	g_dev_last_write_priority = bs_io_opts ? bs_io_opts->priority : -1;
+	if (dev_write_inject_fail(lba, lba_count, cb_args)) {
+		return;
+	}
 	if (g_power_failure_thresholds.write_threshold != 0) {
 		g_power_failure_counters.write_counter++;
 	}
@@ -268,6 +314,9 @@ dev_writev(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	uint64_t offset, length;
 	int i;
 
+	if (dev_write_inject_fail(lba, lba_count, cb_args)) {
+		return;
+	}
 	if (g_power_failure_thresholds.write_threshold != 0) {
 		g_power_failure_counters.write_counter++;
 	}
@@ -371,6 +420,9 @@ dev_write_zeroes(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	uint64_t offset, length;
 
 	g_dev_last_write_priority = bs_io_opts ? bs_io_opts->priority : -1;
+	if (dev_write_inject_fail(lba, lba_count, cb_args)) {
+		return;
+	}
 	if (g_power_failure_thresholds.write_zero_threshold != 0) {
 		g_power_failure_counters.write_zero_counter++;
 	}
@@ -410,6 +462,9 @@ dev_copy(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, uint64_t dst_
 	const void *src = &g_dev_buffer[src_lba * dev->blocklen];
 	uint64_t size = lba_count * dev->blocklen;
 
+	if (dev_write_inject_fail(dst_lba, lba_count, cb_args)) {
+		return;
+	}
 	if (g_dev_copy_fail != 0) {
 		/* The base bdev declines the copy (e.g. a distrib page copy at max. chain depth). */
 		cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, g_dev_copy_fail);
