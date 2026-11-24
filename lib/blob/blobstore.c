@@ -5113,10 +5113,38 @@ blob_dirty_gen_reparent(struct spdk_blob *blob, spdk_blob_id new_parent)
  * fragments (bed bf18 2026-11-09: 64 x 512 KiB spdk_malloc failed there).
  */
 #define BLOB_MERGE_CHUNK	(64 * 1024)
-#define BLOB_MERGE_IOBUF_MODULE	"blob_merge"
 /* While a piece waits for buffers: look this often for buffers that other
  * threads returned to the pool (they wake only waiters of their own thread). */
 #define BLOB_MERGE_KICK_US	1000
+/*
+ * Limits of one merge's use of the iobuf small pool, which client IO shares:
+ * at most this many buffers at once (and, with every replication task, at most
+ * the shared background cap, spdk_iobuf_chain_bg_budget()), and a merge whose
+ * pieces get no buffers for this long fails with -ETIMEDOUT instead of waiting
+ * forever. Set with spdk_blob_set_merge_iobuf_limits().
+ */
+#define BLOB_MERGE_MAX_BUFS_DEFAULT	256
+#define BLOB_MERGE_TIMEOUT_MS_DEFAULT	60000
+static uint32_t g_blob_merge_max_bufs = BLOB_MERGE_MAX_BUFS_DEFAULT;
+static uint32_t g_blob_merge_timeout_ms = BLOB_MERGE_TIMEOUT_MS_DEFAULT;
+
+int
+spdk_blob_set_merge_iobuf_limits(uint32_t max_bufs, uint32_t timeout_ms)
+{
+	if (max_bufs == 0 || timeout_ms == 0) {
+		return -EINVAL;
+	}
+	g_blob_merge_max_bufs = max_bufs;
+	g_blob_merge_timeout_ms = timeout_ms;
+	return 0;
+}
+
+void
+spdk_blob_get_merge_iobuf_limits(uint32_t *max_bufs, uint32_t *timeout_ms)
+{
+	*max_bufs = g_blob_merge_max_bufs;
+	*timeout_ms = g_blob_merge_timeout_ms;
+}
 
 struct blob_merge_ctx;
 
@@ -5130,6 +5158,8 @@ struct blob_merge_op {
 };
 
 struct blob_merge_ctx {
+	struct spdk_blob_store		*bs;
+	TAILQ_ENTRY(blob_merge_ctx)	link;		/* bs->merges */
 	struct spdk_blob		*blob;
 	struct spdk_blob		*parent;	/* NULL: no parent, the base reads zeroes */
 	struct spdk_io_channel		*ch;
@@ -5159,6 +5189,18 @@ struct blob_merge_ctx {
 	TAILQ_HEAD(, blob_merge_op)	readyq;
 	bool				run_pending;
 	struct spdk_poller		*kick_poller;
+	/* the merge's own cap on small-pool buffers (g_blob_merge_max_bufs);
+	 * last_progress: a piece got buffers or completed (the timeout counts
+	 * from it while pieces wait); epoch: the blobstore's leadership epoch
+	 * at the start -- a change cancels the merge */
+	struct spdk_iobuf_chain_budget	budget;
+	uint64_t			last_progress;
+	uint64_t			epoch;
+	/* the last reference to the blob was closed while the merge ran: the
+	 * close was held back (and cancelled the merge) and runs at its end */
+	bool				close_deferred;
+	spdk_blob_op_complete		close_cb_fn;
+	void				*close_cb_arg;
 	struct blob_merge_op		ops[BLOB_MERGE_QD];
 	spdk_blob_merge_complete	cb_fn;
 	void				*cb_arg;
@@ -5167,7 +5209,11 @@ struct blob_merge_ctx {
 /*
  * The merges of a blobstore share one iobuf channel on the md thread (a thread
  * has at most IOBUF_MAX_CHANNELS). No cache: a merge takes the pool's buffers
- * as it goes and returns each piece's at once.
+ * as it goes and returns each piece's at once. The channel's iobuf module is
+ * the blobstore's own (registered while the channel exists): with one module
+ * for all, the channel of one blobstore going away while a merge of another on
+ * the same md thread waits for a buffer trips iobuf's assert that no waiting
+ * entry of the module is left on the thread.
  */
 static int
 bs_merge_iobuf_get(struct spdk_blob_store *bs)
@@ -5178,18 +5224,22 @@ bs_merge_iobuf_get(struct spdk_blob_store *bs)
 		bs->merge_iobuf_refs++;
 		return 0;
 	}
-	rc = spdk_iobuf_register_module(BLOB_MERGE_IOBUF_MODULE);
+	snprintf(bs->merge_iobuf_module, sizeof(bs->merge_iobuf_module), "blob_merge_%p",
+		 (void *)bs);
+	rc = spdk_iobuf_register_module(bs->merge_iobuf_module);
 	if (rc != 0 && rc != -EEXIST) {
 		return rc;
 	}
 	bs->merge_iobuf = calloc(1, sizeof(*bs->merge_iobuf));
 	if (bs->merge_iobuf == NULL) {
+		spdk_iobuf_unregister_module(bs->merge_iobuf_module);
 		return -ENOMEM;
 	}
-	rc = spdk_iobuf_channel_init(bs->merge_iobuf, BLOB_MERGE_IOBUF_MODULE, 0, 0);
+	rc = spdk_iobuf_channel_init(bs->merge_iobuf, bs->merge_iobuf_module, 0, 0);
 	if (rc != 0) {
 		free(bs->merge_iobuf);
 		bs->merge_iobuf = NULL;
+		spdk_iobuf_unregister_module(bs->merge_iobuf_module);
 		return rc;
 	}
 	bs->merge_iobuf_refs = 1;
@@ -5204,6 +5254,7 @@ bs_merge_iobuf_put(struct spdk_blob_store *bs)
 		spdk_iobuf_channel_fini(bs->merge_iobuf);
 		free(bs->merge_iobuf);
 		bs->merge_iobuf = NULL;
+		spdk_iobuf_unregister_module(bs->merge_iobuf_module);
 	}
 }
 
@@ -5266,6 +5317,101 @@ blob_merge_next_piece(struct blob_merge_ctx *ctx, uint64_t *offset, uint64_t *le
 static void blob_merge_pump(struct blob_merge_ctx *ctx);
 static void blob_merge_issue(struct blob_merge_ctx *ctx);
 
+/* The merge is gone: an unload that waited for the blobstore's merges goes on. */
+static void
+blob_merge_retire(struct blob_merge_ctx *ctx)
+{
+	struct spdk_blob_store *bs = ctx->bs;
+	spdk_bs_op_complete unload_cb_fn;
+	void *unload_cb_arg;
+
+	TAILQ_REMOVE(&bs->merges, ctx, link);
+	free(ctx);
+	if (TAILQ_EMPTY(&bs->merges) && !bs->merges_cancelling && bs->merge_unload_cb_fn != NULL) {
+		unload_cb_fn = bs->merge_unload_cb_fn;
+		unload_cb_arg = bs->merge_unload_cb_arg;
+		bs->merge_unload_cb_fn = NULL;
+		bs->merge_unload_cb_arg = NULL;
+		spdk_bs_unload(bs, unload_cb_fn, unload_cb_arg);
+	}
+}
+
+static void
+blob_merge_close_done(void *cb_arg, int bserrno)
+{
+	struct blob_merge_ctx *ctx = cb_arg;
+
+	ctx->close_cb_fn(ctx->close_cb_arg, bserrno);
+	blob_merge_retire(ctx);
+}
+
+/* A piece that waited for buffers leaves without IO (the merge failed). */
+static void
+blob_merge_op_withdrawn(struct blob_merge_op *op)
+{
+	op->busy = false;
+	op->ctx->inflight--;
+}
+
+/*
+ * The merge failed (or is cancelled or timed out): the pieces that wait for
+ * buffers, or got them and wait to be submitted, give them back now and leave
+ * -- a failed merge must not hold, or keep waiting for, buffers that client IO
+ * shares. The pieces in flight complete as usual. The caller pumps.
+ */
+static void
+blob_merge_fail(struct blob_merge_ctx *ctx, int rc)
+{
+	struct spdk_iobuf_chain *chain;
+	struct blob_merge_op *op;
+
+	if (ctx->rc == 0) {
+		SPDK_ERRLOG("blob 0x%" PRIx64 ": merge with the base stops: %d\n", ctx->blob->id, rc);
+		ctx->rc = rc;
+	}
+	if (!ctx->iobuf_ref) {
+		return;
+	}
+	while ((chain = spdk_iobuf_chain_withdraw_waiting(&ctx->bufq)) != NULL) {
+		blob_merge_op_withdrawn(SPDK_CONTAINEROF(chain, struct blob_merge_op, chain));
+	}
+	while ((op = TAILQ_FIRST(&ctx->readyq)) != NULL) {
+		TAILQ_REMOVE(&ctx->readyq, op, ready_link);
+		spdk_iobuf_chain_put(&op->chain);
+		blob_merge_op_withdrawn(op);
+	}
+}
+
+/* Stop the merge now (close of its blob, unload, leadership change). */
+static void
+blob_merge_cancel(struct blob_merge_ctx *ctx, int rc)
+{
+	blob_merge_fail(ctx, rc);
+	/* may finish the merge */
+	blob_merge_pump(ctx);
+}
+
+/*
+ * spdk_blob_close of the last reference while the blob merges: the blob must
+ * outlive the merge's IO, so the close waits for the merge, which it cancels.
+ */
+static void
+blob_merge_defer_close(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	struct blob_merge_ctx *ctx = blob->merge_ctx;
+
+	if (ctx->close_deferred) {
+		cb_fn(cb_arg, -EBUSY);
+		return;
+	}
+	SPDK_NOTICELOG("blob 0x%" PRIx64 ": closed while it merges with the base: the merge is "
+		       "cancelled, the close waits for it\n", blob->id);
+	ctx->close_deferred = true;
+	ctx->close_cb_fn = cb_fn;
+	ctx->close_cb_arg = cb_arg;
+	blob_merge_cancel(ctx, -ECANCELED);
+}
+
 static void
 blob_merge_finish(struct blob_merge_ctx *ctx)
 {
@@ -5274,20 +5420,23 @@ blob_merge_finish(struct blob_merge_ctx *ctx)
 	assert(TAILQ_EMPTY(&ctx->readyq));
 	blob->dirty_gen = ctx->gen;
 	blob->dirty_merging = false;
+	blob->merge_ctx = NULL;
 	if (ctx->rc == 0) {
 		ctx->gen->merge_pending = false;
 	}
 	SPDK_NOTICELOG("blob 0x%" PRIx64 ": merged with the base: %" PRIu64 " cluster(s), %" PRIu64
 		       " range(s), %" PRIu64 " bytes, rc %d\n", blob->id, ctx->stats.clusters,
 		       ctx->stats.ranges, ctx->stats.bytes, ctx->rc);
-	if (ctx->bufq.waits != 0) {
+	if (ctx->bufq.waits != 0 || ctx->budget.refused != 0) {
 		SPDK_NOTICELOG("blob 0x%" PRIx64 ": merge waited for iobuf small-pool buffers %" PRIu64
-			       " time(s)\n", blob->id, ctx->bufq.waits);
+			       " time(s) (%" PRIu64 " over a cap), held at most %" PRIu64 "\n", blob->id,
+			       ctx->bufq.waits, ctx->budget.refused, ctx->budget.max_used);
 	}
 	spdk_poller_unregister(&ctx->kick_poller);
 	for (int i = 0; i < BLOB_MERGE_QD; i++) {
 		spdk_iobuf_chain_put(&ctx->ops[i].chain);
 	}
+	assert(ctx->budget.used == 0);
 	if (ctx->iobuf_ref) {
 		bs_merge_iobuf_put(blob->bs);
 	}
@@ -5295,7 +5444,12 @@ blob_merge_finish(struct blob_merge_ctx *ctx)
 	free(ctx->ranges);
 	free(ctx->words);
 	ctx->cb_fn(ctx->cb_arg, &ctx->stats, ctx->rc);
-	free(ctx);
+	if (ctx->close_deferred) {
+		/* the held-back close of the last reference */
+		spdk_blob_close(blob, blob_merge_close_done, ctx);
+		return;
+	}
+	blob_merge_retire(ctx);
 }
 
 static void
@@ -5306,8 +5460,11 @@ blob_merge_op_done(struct blob_merge_op *op, int bserrno)
 	if (bserrno != 0 && ctx->rc == 0) {
 		SPDK_ERRLOG("blob 0x%" PRIx64 ": merge of [%" PRIu64 ", +%" PRIu64 ") failed: %d\n",
 			    ctx->blob->id, op->offset, op->length, bserrno);
-		ctx->rc = bserrno;
+		/* the pieces that wait for buffers leave now: they would only
+		 * give them back once they got them */
+		blob_merge_fail(ctx, bserrno);
 	}
+	ctx->last_progress = spdk_get_ticks();
 	/* the buffers go back at once: to a piece waiting for them, of this
 	 * merge or another user of the md thread, else to the pool */
 	spdk_iobuf_chain_put(&op->chain);
@@ -5348,6 +5505,7 @@ blob_merge_submit(struct blob_merge_op *op)
 		blob_merge_op_done(op, 0);
 		return;
 	}
+	ctx->last_progress = spdk_get_ticks();
 	spdk_blob_io_readv_with_priority(ctx->parent, ctx->ch, op->chain.iovs, (int)op->chain.needed,
 					 op->offset, op->length, ctx->priority_class,
 					 blob_merge_read_cpl, op);
@@ -5396,13 +5554,28 @@ blob_merge_kick(void *arg)
 {
 	struct blob_merge_ctx *ctx = arg;
 
+	uint64_t now = spdk_get_ticks();
+
 	if (!ctx->run_pending && !TAILQ_EMPTY(&ctx->readyq)) {
 		/* may finish the merge, and unregister this poller */
 		blob_merge_run_ready(ctx);
 		return SPDK_POLLER_BUSY;
 	}
+	if (ctx->rc == 0 && spdk_bs_get_dirty_epoch(ctx->bs) != ctx->epoch) {
+		/* leadership changed (failover): stop, may finish the merge */
+		blob_merge_cancel(ctx, -ECANCELED);
+		return SPDK_POLLER_BUSY;
+	}
 	if (spdk_iobuf_chain_queue_idle(&ctx->bufq)) {
+		ctx->last_progress = now;
 		return SPDK_POLLER_IDLE;
+	}
+	if (ctx->rc == 0 && now - ctx->last_progress >
+	    (uint64_t)g_blob_merge_timeout_ms * spdk_get_ticks_hz() / 1000) {
+		/* no buffers for that long: fail, instead of waiting forever with
+		 * the merge's pieces queued on the md thread (may finish it) */
+		blob_merge_cancel(ctx, -ETIMEDOUT);
+		return SPDK_POLLER_BUSY;
 	}
 	spdk_iobuf_chain_kick(&ctx->bufq);
 	return SPDK_POLLER_BUSY;
@@ -5431,6 +5604,11 @@ blob_merge_issue(struct blob_merge_ctx *ctx)
 {
 	int rc;
 
+	if (ctx->rc == 0 && spdk_bs_get_dirty_epoch(ctx->bs) != ctx->epoch) {
+		/* leadership changed since the merge started: no new pieces (the
+		 * caller, blob_merge_pump, finishes once the rest is back) */
+		blob_merge_fail(ctx, -ECANCELED);
+	}
 	for (uint32_t i = 0; i < BLOB_MERGE_QD && ctx->rc == 0; i++) {
 		struct blob_merge_op *op = &ctx->ops[i];
 
@@ -5515,6 +5693,7 @@ spdk_blob_merge_base_ext(struct spdk_blob *blob, int priority_class,
 		cb_fn(cb_arg, &none, -ENOMEM);
 		return;
 	}
+	ctx->bs = bs;
 	ctx->blob = blob;
 	ctx->parent = parent;
 	ctx->gen = gen;
@@ -5529,9 +5708,16 @@ spdk_blob_merge_base_ext(struct spdk_blob *blob, int priority_class,
 	ctx->ranges = calloc(ctx->nbits / 2 + 1, sizeof(*ctx->ranges));
 	ctx->ch = spdk_bs_alloc_io_channel(bs);
 	TAILQ_INIT(&ctx->readyq);
+	/* the merge's buffers count against its own cap and against the one it
+	 * shares with replication, which leaves the rest of the pool to client IO */
+	spdk_iobuf_chain_budget_init(&ctx->budget, g_blob_merge_max_bufs);
 	for (int i = 0; i < BLOB_MERGE_QD; i++) {
 		ctx->ops[i].ctx = ctx;
+		spdk_iobuf_chain_set_budget(&ctx->ops[i].chain, &ctx->budget,
+					    spdk_iobuf_chain_bg_budget(), false);
 	}
+	ctx->epoch = spdk_bs_get_dirty_epoch(bs);
+	ctx->last_progress = spdk_get_ticks();
 	if (ctx->words == NULL || ctx->ranges == NULL || ctx->ch == NULL) {
 		if (ctx->ch == NULL) {
 			SPDK_ERRLOG("blob 0x%" PRIx64 ": merge with the base: no I/O channel\n", blob->id);
@@ -5580,6 +5766,8 @@ spdk_blob_merge_base_ext(struct spdk_blob *blob, int priority_class,
 	 * Nothing else writes to a landing blob between its transfer and here. */
 	blob->dirty_gen = NULL;
 	blob->dirty_merging = true;
+	blob->merge_ctx = ctx;
+	TAILQ_INSERT_TAIL(&bs->merges, ctx, link);
 	blob_merge_pump(ctx);
 }
 
@@ -6718,6 +6906,7 @@ bs_alloc(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts, struct spdk_blob_st
 	}
 
 	RB_INIT(&bs->open_blobs);
+	TAILQ_INIT(&bs->merges);
 	TAILQ_INIT(&bs->snapshots);
 	bs->dev = dev;
 	bs->md_thread = spdk_get_thread();
@@ -9625,6 +9814,33 @@ spdk_bs_unload(struct spdk_blob_store *bs, spdk_bs_op_complete cb_fn, void *cb_a
 		assert(bs->esnap_unload_cb_arg == cb_arg);
 		bs->esnap_unload_cb_fn = NULL;
 		bs->esnap_unload_cb_arg = NULL;
+	}
+
+	if (!TAILQ_EMPTY(&bs->merges)) {
+		struct blob_merge_ctx *merge, *tmp;
+
+		/*
+		 * A merge with the base still uses the blobstore (its blobs, the md
+		 * thread's iobuf channel): cancel every merge and unload when the
+		 * last one is gone (blob_merge_retire). Blobs their owners did not
+		 * close still fail the unload below, once the merges are gone.
+		 */
+		if (bs->merge_unload_cb_fn != NULL) {
+			SPDK_ERRLOG("Blobstore unload in progress\n");
+			cb_fn(cb_arg, -EBUSY);
+			return;
+		}
+		SPDK_NOTICELOG("Blobstore unload: cancelling the merges with the base in progress\n");
+		bs->merges_cancelling = true;
+		TAILQ_FOREACH_SAFE(merge, &bs->merges, link, tmp) {
+			blob_merge_cancel(merge, -ECANCELED);
+		}
+		bs->merges_cancelling = false;
+		if (!TAILQ_EMPTY(&bs->merges)) {
+			bs->merge_unload_cb_fn = cb_fn;
+			bs->merge_unload_cb_arg = cb_arg;
+			return;
+		}
 	}
 
 	if (!RB_EMPTY(&bs->open_blobs)) {
@@ -14391,7 +14607,8 @@ bs_delete_open_cpl(void *cb_arg, struct spdk_blob *blob, int bserrno)
 		return;
 	}
 
-	if (blob->locked_operation_in_progress) {
+	if (blob->locked_operation_in_progress || blob->merge_ctx != NULL) {
+		/* (a merge with the base still writes into the blob) */
 		SPDK_DEBUGLOG(blob, "Cannot remove blob - another operation in progress\n");
 		ctx->bserrno = -EBUSY;
 		spdk_blob_close(blob, delete_blob_cleanup_finish, ctx);
@@ -14816,7 +15033,8 @@ spdk_bs_delete_blob_async(struct spdk_blob_store *bs, struct spdk_blob *blob,
 		return;
 	}
 
-	if (blob->locked_operation_in_progress) {
+	if (blob->locked_operation_in_progress || blob->merge_ctx != NULL) {
+		/* (a merge with the base still writes into the blob) */
 		SPDK_ERRLOG("Cannot remove blob - another operation in progress\n");
 		delete_blob_cleanup_finish(ctx, -EBUSY);
 		return;
@@ -16549,6 +16767,13 @@ spdk_blob_close(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_ar
 
 	if (blob->open_ref == 0) {
 		cb_fn(cb_arg, -EBADF);
+		return;
+	}
+
+	if (blob->open_ref == 1 && blob->merge_ctx != NULL) {
+		/* the merge's IO still uses the blob: cancel the merge, close
+		 * when it is done */
+		blob_merge_defer_close(blob, cb_fn, cb_arg);
 		return;
 	}
 

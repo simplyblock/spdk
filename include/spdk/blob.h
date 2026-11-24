@@ -600,6 +600,17 @@ void spdk_blob_merge_base(struct spdk_blob *blob, spdk_blob_merge_complete cb_fn
  * class, like the transfer it completes. */
 void spdk_blob_merge_base_ext(struct spdk_blob *blob, int priority_class,
 			      spdk_blob_merge_complete cb_fn, void *cb_arg);
+/*
+ * Limits of a merge's iobuf small-pool use (node-wide, for merges started
+ * from now on; the pool is shared with client IO): at most max_bufs buffers
+ * held by one merge, and -ETIMEDOUT when its pieces got no buffers for
+ * timeout_ms. A merge also stops with -ECANCELED when the last reference to
+ * the blob is closed (the close waits for it), the blobstore is unloaded (the
+ * unload waits for it) or the leadership changes; a delete of the blob fails
+ * with -EBUSY while it runs. -EINVAL for 0.
+ */
+int spdk_blob_set_merge_iobuf_limits(uint32_t max_bufs, uint32_t timeout_ms);
+void spdk_blob_get_merge_iobuf_limits(uint32_t *max_bufs, uint32_t *timeout_ms);
 
 bool spdk_blob_get_offset_allocate(struct spdk_blob *blob, uint64_t offset);
 bool spdk_blob_check_offset_valid(struct spdk_blob *blob, uint64_t offset, uint64_t length);

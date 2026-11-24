@@ -6460,6 +6460,257 @@ blob_merge_base_kick_takes_other_threads_buffers(void)
 	free(bufs);
 }
 
+/* A merge holds at most its cap of small buffers, although the pool has
+ * more (client IO shares it), and still completes. */
+static void
+blob_merge_base_cap_respected(void)
+{
+	struct ut_merge_env env;
+	uint32_t max_bufs, timeout_ms, held, rounds = 0;
+
+	ut_merge_env_setup(&env);
+	spdk_blob_get_merge_iobuf_limits(&max_bufs, &timeout_ms);
+	SPDK_CU_ASSERT_FATAL(spdk_blob_set_merge_iobuf_limits(16, timeout_ms) == 0);
+
+	g_merge_rc = 1;
+	spdk_blob_merge_base_ext(env.landing, -1, merge_complete, NULL);
+	/* the first pieces have their buffers, their reads are not done */
+	held = UT_IOBUF_SMALL_COUNT - ut_iobuf_small_free();
+	CU_ASSERT(held > 0);
+	CU_ASSERT(held <= 16);
+	while (g_merge_rc == 1 && rounds++ < 1000) {
+		poll_threads();
+		held = UT_IOBUF_SMALL_COUNT - ut_iobuf_small_free();
+		CU_ASSERT(held <= 16);
+		spdk_delay_us(1000);
+	}
+	CU_ASSERT(g_merge_rc == 0);
+	CU_ASSERT(ut_iobuf_small_free() == UT_IOBUF_SMALL_COUNT);
+	ut_merge_env_check(&env);
+
+	SPDK_CU_ASSERT_FATAL(spdk_blob_set_merge_iobuf_limits(max_bufs, timeout_ms) == 0);
+	ut_merge_env_teardown(&env);
+}
+
+/* A merge that gets no buffers for its timeout fails with -ETIMEDOUT instead
+ * of waiting forever, and holds nothing afterwards. */
+static void
+blob_merge_base_timeout(void)
+{
+	struct ut_merge_env env;
+	struct spdk_iobuf_channel ch;
+	void **bufs = calloc(UT_IOBUF_SMALL_COUNT, sizeof(void *));
+	uint32_t max_bufs, timeout_ms, n, rounds = 0;
+
+	SPDK_CU_ASSERT_FATAL(bufs != NULL);
+	ut_merge_env_setup(&env);
+	spdk_blob_get_merge_iobuf_limits(&max_bufs, &timeout_ms);
+	SPDK_CU_ASSERT_FATAL(spdk_blob_set_merge_iobuf_limits(max_bufs, 5) == 0);
+
+	n = ut_iobuf_drain(&ch, bufs, 0);
+	CU_ASSERT(n == UT_IOBUF_SMALL_COUNT);
+	g_merge_rc = 1;
+	spdk_blob_merge_base_ext(env.landing, -1, merge_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_merge_rc == 1);
+	while (g_merge_rc == 1 && rounds++ < 50) {
+		spdk_delay_us(1000);
+		poll_threads();
+	}
+	CU_ASSERT(g_merge_rc == -ETIMEDOUT);
+	CU_ASSERT(!env.landing->dirty_merging);
+
+	ut_iobuf_refill(&ch, bufs, n);
+	poll_threads();
+	CU_ASSERT(ut_iobuf_small_free() == UT_IOBUF_SMALL_COUNT);
+
+	SPDK_CU_ASSERT_FATAL(spdk_blob_set_merge_iobuf_limits(max_bufs, timeout_ms) == 0);
+	ut_merge_env_teardown(&env);
+	free(bufs);
+}
+
+static void *g_ut_client_buf;
+
+static void
+ut_client_buf_cb(struct spdk_iobuf_entry *entry, void *buf)
+{
+	g_ut_client_buf = buf;
+}
+
+/*
+ * A merge that failed stops waiting for buffers at once: its waiting pieces
+ * leave and give back what they got. Here the failing piece's 8 buffers are
+ * shared between the merge's next piece and a client that waits on the same
+ * thread: a merge that kept its piece waiting would end with 7 of 8 and wait
+ * forever (and the client would get 1).
+ */
+static void
+blob_merge_base_error_stops_waiting(void)
+{
+	struct ut_merge_env env;
+	struct spdk_iobuf_channel ch;
+	struct spdk_iobuf_entry client = {};
+	struct spdk_power_failure_thresholds thresholds = {};
+	void **bufs = calloc(UT_IOBUF_SMALL_COUNT, sizeof(void *));
+	uint32_t n, rounds = 0;
+
+	SPDK_CU_ASSERT_FATAL(bufs != NULL);
+	ut_merge_env_setup(&env);
+
+	/* one piece's worth: the first piece reads, the second waits */
+	n = ut_iobuf_drain(&ch, bufs, 8);
+	CU_ASSERT(n == UT_IOBUF_SMALL_COUNT - 8);
+	dev_reset_power_failure_event();
+	thresholds.read_threshold = 1;
+	dev_set_power_failure_thresholds(thresholds);
+
+	g_merge_rc = 1;
+	spdk_blob_merge_base_ext(env.landing, -1, merge_complete, NULL);
+	/* a client waits on the thread too, behind the merge */
+	g_ut_client_buf = NULL;
+	CU_ASSERT(spdk_iobuf_get(&ch, UT_IOBUF_SMALL_SIZE, &client, ut_client_buf_cb) == NULL);
+
+	while (g_merge_rc == 1 && rounds++ < 100) {
+		poll_threads();
+		spdk_delay_us(1000);
+	}
+	CU_ASSERT(g_merge_rc == -EIO);
+	/* the client got a buffer, the rest is back in the pool */
+	CU_ASSERT(g_ut_client_buf != NULL);
+	CU_ASSERT(ut_iobuf_small_free() == 7);
+	dev_reset_power_failure_event();
+
+	if (g_ut_client_buf != NULL) {
+		spdk_iobuf_put(&ch, g_ut_client_buf, UT_IOBUF_SMALL_SIZE);
+	} else {
+		spdk_iobuf_entry_abort(&ch, &client, UT_IOBUF_SMALL_SIZE);
+	}
+	ut_iobuf_refill(&ch, bufs, n);
+	rounds = 0;
+	while (g_merge_rc == 1 && rounds++ < 100) {
+		poll_threads();
+		spdk_delay_us(1000);
+	}
+	poll_threads();
+	CU_ASSERT(ut_iobuf_small_free() == UT_IOBUF_SMALL_COUNT);
+
+	ut_merge_env_teardown(&env);
+	free(bufs);
+}
+
+/* Closing the last reference while the blob merges cancels the merge, and the
+ * close waits for it (the merge's IO uses the blob). */
+static void
+blob_merge_base_cancelled_by_close(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct ut_merge_env env;
+	struct spdk_iobuf_channel ch;
+	void **bufs = calloc(UT_IOBUF_SMALL_COUNT, sizeof(void *));
+	spdk_blob_id landing_id;
+	uint32_t n;
+
+	SPDK_CU_ASSERT_FATAL(bufs != NULL);
+	ut_merge_env_setup(&env);
+	landing_id = spdk_blob_get_id(env.landing);
+
+	n = ut_iobuf_drain(&ch, bufs, 0);
+	g_merge_rc = 1;
+	spdk_blob_merge_base_ext(env.landing, -1, merge_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_merge_rc == 1);
+
+	/* a delete is refused while it merges */
+	spdk_bs_delete_blob(bs, landing_id, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -EBUSY);
+
+	g_bserrno = 1;
+	spdk_blob_close(env.landing, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_merge_rc == -ECANCELED);
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(blob_lookup(bs, landing_id) == NULL);
+
+	ut_iobuf_refill(&ch, bufs, n);
+	poll_threads();
+	CU_ASSERT(ut_iobuf_small_free() == UT_IOBUF_SMALL_COUNT);
+
+	spdk_bs_open_blob(bs, landing_id, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	env.landing = g_blob;
+	ut_merge_env_teardown(&env);
+	free(bufs);
+}
+
+/* An unload cancels the merges in progress and waits for them; here the
+ * blobs are still open, so the unload then fails as it always did. */
+static void
+blob_merge_base_cancelled_by_unload(void)
+{
+	struct ut_merge_env env;
+	struct spdk_iobuf_channel ch;
+	void **bufs = calloc(UT_IOBUF_SMALL_COUNT, sizeof(void *));
+	uint32_t n;
+
+	SPDK_CU_ASSERT_FATAL(bufs != NULL);
+	ut_merge_env_setup(&env);
+
+	n = ut_iobuf_drain(&ch, bufs, 0);
+	g_merge_rc = 1;
+	spdk_blob_merge_base_ext(env.landing, -1, merge_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_merge_rc == 1);
+
+	g_bserrno = 1;
+	spdk_bs_unload(g_bs, bs_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_merge_rc == -ECANCELED);
+	CU_ASSERT(g_bserrno == -EBUSY);
+	CU_ASSERT(TAILQ_EMPTY(&g_bs->merges));
+
+	ut_iobuf_refill(&ch, bufs, n);
+	poll_threads();
+	CU_ASSERT(ut_iobuf_small_free() == UT_IOBUF_SMALL_COUNT);
+
+	ut_merge_env_teardown(&env);
+	free(bufs);
+}
+
+/* A change of leadership (failover) cancels a merge in progress. */
+static void
+blob_merge_base_cancelled_by_leadership_change(void)
+{
+	struct ut_merge_env env;
+	struct spdk_iobuf_channel ch;
+	void **bufs = calloc(UT_IOBUF_SMALL_COUNT, sizeof(void *));
+	uint32_t n, rounds = 0;
+
+	SPDK_CU_ASSERT_FATAL(bufs != NULL);
+	ut_merge_env_setup(&env);
+
+	n = ut_iobuf_drain(&ch, bufs, 0);
+	g_merge_rc = 1;
+	spdk_blob_merge_base_ext(env.landing, -1, merge_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_merge_rc == 1);
+
+	spdk_bs_set_dirty_leader(g_bs, false);
+	while (g_merge_rc == 1 && rounds++ < 10) {
+		spdk_delay_us(1000);
+		poll_threads();
+	}
+	CU_ASSERT(g_merge_rc == -ECANCELED);
+
+	ut_iobuf_refill(&ch, bufs, n);
+	poll_threads();
+	CU_ASSERT(ut_iobuf_small_free() == UT_IOBUF_SMALL_COUNT);
+
+	ut_merge_env_teardown(&env);
+	free(bufs);
+}
+
 static void
 blob_snapshot_rw(void)
 {
@@ -13274,6 +13525,12 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite_bs, blob_merge_base_64k_pieces);
 		CU_ADD_TEST(suite_bs, blob_merge_base_waits_for_buffers);
 		CU_ADD_TEST(suite_bs, blob_merge_base_kick_takes_other_threads_buffers);
+		CU_ADD_TEST(suite_bs, blob_merge_base_cap_respected);
+		CU_ADD_TEST(suite_bs, blob_merge_base_timeout);
+		CU_ADD_TEST(suite_bs, blob_merge_base_error_stops_waiting);
+		CU_ADD_TEST(suite_bs, blob_merge_base_cancelled_by_close);
+		CU_ADD_TEST(suite_bs, blob_merge_base_cancelled_by_unload);
+		CU_ADD_TEST(suite_bs, blob_merge_base_cancelled_by_leadership_change);
 		CU_ADD_TEST(suite_bs, blob_snapshot_rw_iov);
 		CU_ADD_TEST(suite, blob_relations);
 		CU_ADD_TEST(suite, blob_relations2);
