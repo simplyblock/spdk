@@ -10779,6 +10779,79 @@ ut_snapshot_has_clone(struct spdk_blob_store *bs, spdk_blob_id snapshotid, spdk_
 }
 
 /*
+ * bf34 (2026-11-24): a secondary loaded a stale clone of the snapshot (the old
+ * instance of a replaced lvol) into the snapshot tree and never exposed it, so
+ * its entry stayed with no open blob. The replay of the snapshot's delete saw
+ * two clones: the delete was refused (vbdev) or forced (here) without
+ * re-parenting the live clone. Now the entry without an open blob is dropped
+ * first and the live clone is re-parented; open clones are never dropped.
+ */
+static void
+blob_secondary_delete_snapshot_phantom_clone(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob_opts opts;
+	struct spdk_blob *live, *snap, *stale, *tmp;
+	spdk_blob_id liveid, snapid, staleid;
+	size_t count;
+	int rc;
+
+	ut_spdk_blob_opts_init(&opts);
+	opts.num_clusters = 10;
+	live = ut_blob_create_and_open(bs, &opts);
+	liveid = spdk_blob_get_id(live);
+	spdk_bs_create_snapshot(bs, liveid, NULL, blob_op_with_id_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blobid != SPDK_BLOBID_INVALID);
+	snapid = g_blobid;
+	spdk_bs_open_blob(bs, snapid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	snap = g_blob;
+
+	/* the second clone, opened and closed again: its entry stays, no open blob */
+	spdk_bs_create_clone(bs, snapid, NULL, blob_op_with_id_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	staleid = g_blobid;
+	spdk_bs_open_blob(bs, staleid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	stale = g_blob;
+
+	/* while both clones are open nothing is dropped */
+	CU_ASSERT(spdk_bs_drop_unopened_clone_entries(bs, snapid) == 0);
+	spdk_blob_get_clones(bs, snapid, NULL, &count);
+	CU_ASSERT(count == 2);
+
+	spdk_blob_close(stale, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(blob_lookup(bs, staleid) == NULL);
+	CU_ASSERT(ut_snapshot_has_clone(bs, snapid, staleid));
+
+	/* the secondary replay of the snapshot's delete */
+	tmp = spdk_bs_copy_blob(bs, snap);
+	SPDK_CU_ASSERT_FATAL(tmp != NULL);
+	/* frees snap: do not use it after this */
+	rc = spdk_bs_delete_blob_non_leader(bs, tmp);
+	CU_ASSERT(rc == 0);
+	poll_threads();
+
+	/* the live clone was re-parented (the snapshot had no parent), the stale
+	 * entry is gone with the snapshot's */
+	CU_ASSERT(live->parent_id == SPDK_BLOBID_INVALID);
+	CU_ASSERT(spdk_blob_get_parent_snapshot(bs, liveid) == SPDK_BLOBID_INVALID);
+	CU_ASSERT(bs_get_snapshot_entry(bs, snapid) == NULL);
+	CU_ASSERT(spdk_bit_array_get(bs->used_blobids, bs_blobid_to_page(snapid)) == false);
+
+	spdk_blob_close(live, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+}
+
+/*
  * Secondary replay (spdk_bs_delete_blob_non_leader) of the delete of base,
  * after a leader that did its job: mid was re-parented on disk before base
  * was deleted. The replay re-reads mid and ends with the tree the leader has
@@ -12110,6 +12183,7 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite, blob_esnap_clone_resize);
 		CU_ADD_TEST(suite_bs, blob_shallow_copy);
 		CU_ADD_TEST(suite_bs, blob_secondary_delete_snapshot_reparented);
+		CU_ADD_TEST(suite_bs, blob_secondary_delete_snapshot_phantom_clone);
 		CU_ADD_TEST(suite_bs, blob_secondary_delete_snapshot_dangling_parent);
 		CU_ADD_TEST(suite_esnap_bs, blob_set_parent);
 		CU_ADD_TEST(suite_esnap_bs, blob_set_external_parent);

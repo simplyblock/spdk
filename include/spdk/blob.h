@@ -1037,6 +1037,23 @@ spdk_bs_copy_blob(struct spdk_blob_store *bs, struct spdk_blob	*blob);
 int spdk_bs_delete_blob_non_leader(struct spdk_blob_store *bs, struct spdk_blob	*blob);
 
 /**
+ * Non-leader only: drop the clone entries of a snapshot whose blob has no open
+ * handle on this node.
+ *
+ * On a non-leader every clone that exists for this node is an lvol, and an lvol
+ * keeps its blob open. A clone entry without an open blob is left over from a
+ * blob this node loaded but never exposed (e.g. the stale instance of a
+ * replaced lvol, dropped at examine because its name was taken) and that the
+ * leader has deleted since. Such an entry made the snapshot look like it had
+ * more clones than it has, and its delete fail on this node for good.
+ *
+ * \param bs Blobstore.
+ * \param snapshot_id The snapshot whose clone entries are checked.
+ * \return The number of entries dropped.
+ */
+int spdk_bs_drop_unopened_clone_entries(struct spdk_blob_store *bs, spdk_blob_id snapshot_id);
+
+/**
  * Create a read-only snapshot of specified blob with provided options.
  * This will automatically sync specified blob.
  *

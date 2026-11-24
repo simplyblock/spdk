@@ -907,7 +907,13 @@ vbdev_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb
 		return;
 	}
 
-	/* Check if it is possible to delete lvol */
+	/* Check if it is possible to delete lvol. On a non-leader every clone is an
+	 * open lvol: an entry without an open blob is a leftover of a blob this node
+	 * never exposed, and counting it refused the delete for good (bf34, see
+	 * spdk_bs_drop_unopened_clone_entries). */
+	if (!lvs->leader) {
+		spdk_bs_drop_unopened_clone_entries(lvs->blobstore, lvol->blob_id);
+	}
 	spdk_blob_get_clones(lvs->blobstore, lvol->blob_id, NULL, &count);
 	if (count > 1) {
 		/* throw an error */
@@ -2610,6 +2616,11 @@ _create_lvol_disk_unload_cb(void *cb_arg, int bdeverrno)
 		return;
 	}
 
+	/* The blob is closed (vbdev_lvol_unregister), but its entry in the snapshot
+	 * tree stays; on a non-leader it is dropped when its snapshot is deleted
+	 * (spdk_bs_drop_unopened_clone_entries). */
+	SPDK_NOTICELOG("lvol %s (blob 0x%" PRIx64 ") was not exposed: it stays in the snapshot tree "
+		       "without an open blob\n", lvol->unique_id, lvol->blob_id);
 	TAILQ_REMOVE(&lvol->lvol_store->lvols, lvol, link);
 	free(lvol);
 }
