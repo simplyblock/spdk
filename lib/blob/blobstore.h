@@ -385,6 +385,11 @@ struct spdk_bs_channel {
 	uint32_t			cow_stat_count;
 	uint64_t			cow_stat_tsc;	/* interval start */
 
+	/* COPY offload back-off (see bs_channel_copy_allowed()). Per channel,
+	 * so per thread: no locks. */
+	uint32_t			copy_declines;	/* consecutive declined/failed COPYs */
+	uint32_t			copy_skips;	/* CoWs that skipped COPY since the last try */
+
 	TAILQ_HEAD(, spdk_bs_request_set) queued_io;
 
 	RB_HEAD(blob_esnap_channel_tree, blob_esnap_channel) esnap_channels;

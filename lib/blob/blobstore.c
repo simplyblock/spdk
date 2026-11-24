@@ -3976,6 +3976,7 @@ struct spdk_blob_copy_cluster_ctx {
 	struct spdk_blob_md_page *new_cluster_page;
 	struct spdk_bs_cluster_alloc *alloc;
 	bool data_written;	/* CoW data was (or may have been) written to new_cluster */
+	bool copy_tried;	/* a COPY was sent for new_cluster (it may be partly done) */
 	int insert_rc;		/* insert error kept while the cluster is cleared */
 	/* Step times, for the allocation timing (see bs_cow_stat_add()). */
 	uint64_t slot_wait_us;	/* time the op waited for a free slot */
@@ -4457,7 +4458,11 @@ blob_write_copy_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 #define BLOB_COW_SCAN_UNIT	SPDK_BS_PAGE_SIZE	/* zero check granularity */
 #define BLOB_COW_MAX_WRITES	64		/* more ranges than this: write the whole chunk */
 
-/* Off for now (testing): CoW writes the whole cluster, zero parts included. */
+/* Off for now (testing): CoW writes the whole cluster, zero parts included.
+ * If this is turned on: zero-skip relies on the new cluster reading as zeroes.
+ * After a declined or failed COPY that is no longer true (the base may have
+ * done part of the copy), so blob_write_copy() never skips zero ranges for a
+ * cluster with ctx->copy_tried set. Keep that guard. */
 static bool g_blob_cow_skip_zero_ranges = false;
 
 static bool
@@ -4542,7 +4547,10 @@ blob_write_copy(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 			    bs_byte_to_lba(bs, (uint64_t)c * BLOB_COW_CHUNK_SIZE);
 		chunk_len = blob_cow_chunk_len(bs, c);
 
-		nranges = g_blob_cow_skip_zero_ranges ?
+		/* Fallback after a declined/failed COPY: the base may have copied
+		 * part of the cluster (or left anything there), so the cluster does
+		 * not read as zeroes. Rewrite the whole range, never skip zeroes. */
+		nranges = g_blob_cow_skip_zero_ranges && !ctx->copy_tried ?
 			  spdk_bs_find_data_ranges(ctx->bufs[c], chunk_len, BLOB_COW_SCAN_UNIT, 0,
 						   ranges, BLOB_COW_MAX_WRITES) : -1;
 		if (nranges < 0) {
@@ -4597,11 +4605,59 @@ blob_can_copy(struct spdk_blob *blob, uint64_t cluster_start_page, uint64_t *bas
 	       blob->back_bs_dev->translate_lba(blob->back_bs_dev, lba, base_lba);
 }
 
+/*
+ * COPY offload back-off. The base can decline a COPY (the distrib declines a
+ * page copy at max. copy chain depth or when the destination page is still
+ * mapped; on a loaded bed that is most of them), and then the CoW pays the
+ * COPY round trip before its read/write fallback. After
+ * g_blob_copy_decline_limit declines in a row on a channel, CoWs on that
+ * channel skip the COPY and read/write directly; every
+ * g_blob_copy_retry_every-th of them tries the COPY again, so a base that
+ * accepts again is used again. One success clears the back-off. The state is
+ * per bs channel, i.e. per thread, and needs no locks.
+ */
+#define BLOB_COPY_DECLINE_LIMIT	8
+#define BLOB_COPY_RETRY_EVERY	256
+static uint32_t g_blob_copy_decline_limit = BLOB_COPY_DECLINE_LIMIT;
+static uint32_t g_blob_copy_retry_every = BLOB_COPY_RETRY_EVERY;
+
+/* Called once per CoW that could be offloaded: true to send the COPY. */
+static bool
+bs_channel_copy_allowed(struct spdk_bs_channel *ch)
+{
+	if (ch->copy_declines < g_blob_copy_decline_limit) {
+		return true;
+	}
+	if (++ch->copy_skips >= g_blob_copy_retry_every) {
+		/* Probe: try the COPY once more. */
+		ch->copy_skips = 0;
+		return true;
+	}
+	return false;
+}
+
+static void
+bs_channel_copy_result(struct spdk_bs_channel *ch, int bserrno)
+{
+	if (bserrno == 0) {
+		ch->copy_declines = 0;
+		ch->copy_skips = 0;
+	} else if (ch->copy_declines < UINT32_MAX) {
+		if (++ch->copy_declines == g_blob_copy_decline_limit) {
+			SPDK_INFOLOG(blob, "%" PRIu32 " cluster copies declined in a row (last %d), "
+				     "reading and writing CoW clusters instead\n",
+				     ch->copy_declines, bserrno);
+		}
+	}
+}
+
 static void
 blob_copy_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
 	struct spdk_blob_copy_cluster_ctx *ctx = cb_arg;
 	struct spdk_blob *blob = ctx->blob;
+
+	bs_channel_copy_result(((struct spdk_bs_request_set *)seq)->channel, bserrno);
 
 	if (bserrno == 0) {
 		blob_write_copy_cpl(seq, cb_arg, 0);
@@ -4633,6 +4689,7 @@ blob_copy(struct spdk_blob_copy_cluster_ctx *ctx, spdk_bs_user_op_t *op, uint64_
 
 	ctx->read_tsc = ctx->start_tsc;	/* the copy has no separate read */
 	ctx->data_written = true;	/* a failed copy may have written part of the cluster */
+	ctx->copy_tried = true;
 	bs_sequence_copy_dev(ctx->seq,
 			     bs_cluster_to_lba(blob->bs, ctx->new_cluster),
 			     src_lba,
@@ -4712,6 +4769,11 @@ bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 	is_zeroes = is_valid_range && blob->back_bs_dev->is_zeroes(blob->back_bs_dev,
 			bs_dev_page_to_lba(blob->back_bs_dev, cluster_start_page),
 			bs_dev_byte_to_lba(blob->back_bs_dev, blob->bs->cluster_sz));
+	if (can_copy && blob->parent_id != SPDK_BLOBID_INVALID && !is_zeroes &&
+	    !bs_channel_copy_allowed(ch)) {
+		/* The base keeps declining COPYs: read and write directly. */
+		can_copy = false;
+	}
 	if (blob->parent_id != SPDK_BLOBID_INVALID && !is_zeroes && !can_copy) {
 		if (blob_cow_bufs_alloc(ctx, blob->back_bs_dev->blocklen) != 0) {
 			SPDK_ERRLOG("DMA allocation of %" PRIu32 " CoW chunks of size = %d failed.\n",
