@@ -945,9 +945,9 @@ blob_snapshot_freeze_io(void)
 	struct spdk_io_channel *channel;
 	struct spdk_bs_channel *bs_channel;
 	struct spdk_blob_store *bs = g_bs;
-	struct spdk_blob *blob;
+	struct spdk_blob *blob, *snapshot;
 	struct spdk_blob_opts opts;
-	spdk_blob_id blobid;
+	spdk_blob_id blobid, snapshotid;
 	uint32_t num_of_pages = 10;
 	uint8_t payload_read[num_of_pages * BLOCKLEN];
 	uint8_t payload_write[num_of_pages * BLOCKLEN];
@@ -1000,6 +1000,8 @@ blob_snapshot_freeze_io(void)
 	CU_ASSERT(g_bserrno == 0);
 	CU_ASSERT(g_blobid != SPDK_BLOBID_INVALID);
 
+	snapshotid = g_blobid;
+
 	/* Verify that blob has unset frozen_io */
 	CU_ASSERT(blob->frozen_refcnt == 0);
 
@@ -1008,6 +1010,31 @@ blob_snapshot_freeze_io(void)
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
 	CU_ASSERT(memcmp(payload_write, payload_read, num_of_pages * BLOCKLEN) == 0);
+
+	/*
+	 * The write queued while the blob was frozen ran after the swap: it went to the clone (the
+	 * blob, which allocated its own first cluster) and not to the snapshot, which still reads
+	 * the blob's content from before the snapshot (zeroes).
+	 */
+	CU_ASSERT(blob->parent_id == snapshotid);
+	g_blob = NULL;
+	spdk_bs_open_blob(bs, snapshotid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	snapshot = g_blob;
+	CU_ASSERT(spdk_blob_is_snapshot(snapshot));
+	CU_ASSERT(blob->active.clusters[0] != 0);
+	CU_ASSERT(blob->active.clusters[0] != snapshot->active.clusters[0]);
+	memset(payload_read, 0xFF, sizeof(payload_read));
+	spdk_blob_io_read(snapshot, channel, payload_read, 0, num_of_pages, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(memcmp(payload_zero, payload_read, num_of_pages * BLOCKLEN) == 0);
+	spdk_blob_close(snapshot, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	g_blob = NULL;
 
 	spdk_bs_free_io_channel(channel);
 	poll_threads();
@@ -3569,10 +3596,13 @@ bs_test_grow(void)
 	struct spdk_bs_super_block super_block;
 	struct spdk_bs_opts opts;
 	struct spdk_bs_md_mask mask;
-	uint64_t bdev_size;
+	uint64_t bdev_size, orig_size;
+	uint8_t *super_before;
+	size_t mask_region;
 
 	dev = init_dev();
 	bdev_size = dev->blockcnt * dev->blocklen;
+	orig_size = bdev_size;
 	spdk_bs_opts_init(&opts, sizeof(opts));
 	spdk_bs_init(dev, &opts, bs_op_with_handle_complete, NULL);
 	poll_threads();
@@ -3599,6 +3629,9 @@ bs_test_grow(void)
 	       sizeof(struct spdk_bs_md_mask));
 	/* new_md_journal: the used cluster mask is not written by unload/grow; was: CU_ASSERT(mask.type == SPDK_MD_MASK_TYPE_USED_CLUSTERS); */
 	/* new_md_journal: the used cluster mask is not written by unload/grow; was: CU_ASSERT(mask.length == bdev_size / (1 * 1024 * 1024)); */
+	/* super block up to the end of the used cluster mask (the used blobid mask follows it) */
+	mask_region = (size_t)super_block.used_blobid_mask_start * SPDK_BS_PAGE_SIZE;
+	SPDK_CU_ASSERT_FATAL(mask_region > (size_t)super_block.used_cluster_mask_start * SPDK_BS_PAGE_SIZE);
 
 	/*
 	 * The default dev size is 64M, here we set the dev size to 128M,
@@ -3615,15 +3648,28 @@ bs_test_grow(void)
 	/*
 	 * new_md_journal: spdk_bs_grow (grow while loading) refuses an unclean blobstore, and a
 	 * blobstore is never marked clean anymore (unload does not write the clean flag), so the
-	 * offline grow always fails. It has no user; lvstores grow with spdk_bs_grow_live
-	 * (bdev_lvol_grow_lvstore), covered by bs_grow_live.
+	 * offline grow always fails. lvstores grow with spdk_bs_grow_live (bdev_lvol_grow_lvstore),
+	 * covered by bs_grow_live.
+	 *
+	 * The refusal must come before anything is read or written beyond the super block: it used
+	 * to read the never-written used cluster mask (assert on its type in debug builds) and to
+	 * write a grown super block and mask to disk before failing with -EIO.
 	 */
+	super_before = calloc(1, mask_region);
+	SPDK_CU_ASSERT_FATAL(super_before != NULL);
+	memcpy(super_before, g_dev_buffer, mask_region);
 	g_bs = NULL;
+	g_bserrno = 0;
 	spdk_bs_grow(dev, &opts, bs_op_with_handle_complete, NULL);
 	poll_threads();
-	CU_ASSERT(g_bserrno != 0);
+	CU_ASSERT(g_bserrno == -EIO);
 	CU_ASSERT(g_bs == NULL);
 	g_bs = NULL;
+	/* Nothing was written: super block (size, mask lengths) and used cluster mask unchanged. */
+	CU_ASSERT(memcmp(super_before, g_dev_buffer, mask_region) == 0);
+	memcpy(&super_block, g_dev_buffer, sizeof(struct spdk_bs_super_block));
+	CU_ASSERT(super_block.size == orig_size);
+	free(super_before);
 	(void)bs;
 	(void)mask;
 }
@@ -4263,13 +4309,13 @@ blob_dirty_shutdown(void)
 
 	ut_bs_dirty_load(&bs, NULL);
 
-	/*
-	 * new_md_journal: the recovery load takes the blobids from the persisted used blobid mask
-	 * instead of scanning all md pages, and does not reject a first md page whose sequence
-	 * number is corrupted (upstream's scan skipped it, so the open failed). Blob 2 loads.
-	 */
+	/* A deleted blob stays deleted after a dirty load. */
+	g_blob = NULL;
+	g_bserrno = 0;
 	spdk_bs_open_blob(bs, blobid2, blob_op_with_handle_complete, NULL);
 	poll_threads();
+	CU_ASSERT(g_bserrno != 0);
+	CU_ASSERT(g_blob == NULL);
 	if (g_blob != NULL) {
 		spdk_blob_close(g_blob, blob_op_complete, NULL);
 		poll_threads();

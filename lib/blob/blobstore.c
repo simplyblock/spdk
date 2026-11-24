@@ -17210,6 +17210,19 @@ bs_grow_load_super_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		return;
 	}
 
+	/*
+	 * Refuse an unclean blobstore here, before bs_load_try_to_grow(): that step reads the used
+	 * cluster mask (which only a clean unload writes; this fork's unload never does, so it may
+	 * never have been written: assert on its type) and writes a grown mask and super block to
+	 * disk. The same check in bs_load_grow_continue() came only after those writes, so a
+	 * refused grow still changed the on-disk super block.
+	 */
+	if (ctx->super->used_blobid_mask_len == 0 || ctx->super->clean == 0) {
+		SPDK_ERRLOG("Can not grow an unclean blobstore, please load it normally to clean it.\n");
+		bs_load_ctx_fail(ctx, -EIO);
+		return;
+	}
+
 	bs_load_try_to_grow(ctx);
 }
 
