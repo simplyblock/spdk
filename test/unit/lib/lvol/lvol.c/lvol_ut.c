@@ -136,7 +136,25 @@ ut_lvol_snapshot_settle(void)
 	poll_threads();
 }
 DEFINE_STUB_V(spdk_blob_update_on_failover, (struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg));
-DEFINE_STUB(spdk_bs_delete_blob_non_leader, int ,(struct spdk_blob_store *bs, struct spdk_blob *blob), 0);
+static int g_delete_non_leader_calls;
+static struct spdk_blob *g_delete_non_leader_blob;
+static int g_free_blob_copy_calls;
+static struct spdk_blob *g_free_blob_copy_blob;
+
+int
+spdk_bs_delete_blob_non_leader(struct spdk_blob_store *bs, struct spdk_blob *blob)
+{
+	g_delete_non_leader_calls++;
+	g_delete_non_leader_blob = blob;
+	return 0;
+}
+
+void
+spdk_bs_free_blob_copy(struct spdk_blob *copy)
+{
+	g_free_blob_copy_calls++;
+	g_free_blob_copy_blob = copy;
+}
 DEFINE_STUB_V(spdk_bdev_free_io, (struct spdk_bdev_io *g_bdev_io));
 DEFINE_STUB_V(spdk_blob_io_read, (struct spdk_blob *blob, struct spdk_io_channel *channel,
 		   void *payload, uint64_t offset, uint64_t length,
@@ -1204,6 +1222,161 @@ lvol_create_destroy_success(void)
 	spdk_lvol_destroy(g_lvol, op_complete, NULL);
 	CU_ASSERT(g_lvserrno == 0);
 
+	g_lvserrno = -1;
+	rc = spdk_lvs_unload(g_lvol_store, op_complete, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_lvserrno == 0);
+	g_lvol_store = NULL;
+
+	free_dev(&dev);
+}
+
+/*
+ * bf32 2026-11-21: a stale lvol stayed registered on a secondary on blob id X
+ * after the leader deleted it; the leader reused X for a new lvol, whose
+ * register on the secondary opened X from the open-blob tree and so shared
+ * the stale lvol's spdk_blob. Registering a blob id another lvol of the
+ * lvstore already holds is refused now, with nothing changed.
+ */
+static void
+lvol_register_live_blob_id_owned(void)
+{
+	struct lvol_ut_bs_dev dev;
+	struct spdk_lvs_opts opts;
+	struct spdk_lvol *lvol;
+	spdk_blob_id blobid;
+	uint32_t ref;
+	int rc;
+
+	init_dev(&dev);
+	spdk_lvs_opts_init(&opts);
+	snprintf(opts.name, sizeof(opts.name), "lvs");
+
+	g_lvserrno = -1;
+	rc = spdk_lvs_init(&dev.bs_dev, &opts, lvol_store_op_with_handle_complete, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_lvserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_lvol_store != NULL);
+
+	spdk_lvol_create(g_lvol_store, "stale", 10, false, LVOL_CLEAR_WITH_DEFAULT, 0,
+			 lvol_op_with_handle_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_lvol != NULL);
+	lvol = g_lvol;
+	blobid = lvol->blob_id;
+	ref = lvol->blob->ref;
+
+	/* Refused synchronously: no callback, no open of the blob, no new lvol */
+	g_lvol = NULL;
+	g_lvserrno = 1;
+	rc = spdk_lvol_register_live(g_lvol_store, "new", NULL, blobid, false,
+				     LVOL_CLEAR_WITH_DEFAULT, lvol_op_with_handle_complete, NULL);
+	CU_ASSERT(rc == -EEXIST);
+	CU_ASSERT(g_lvserrno == 1);
+	CU_ASSERT(g_lvol == NULL);
+	CU_ASSERT(lvol->blob->ref == ref);
+	CU_ASSERT(TAILQ_FIRST(&g_lvol_store->lvols) == lvol);
+	CU_ASSERT(TAILQ_NEXT(lvol, link) == NULL);
+	CU_ASSERT(TAILQ_EMPTY(&g_lvol_store->pending_lvols));
+
+	/* Once the stale lvol is gone the blob id can be registered again: the
+	 * register goes on to open the blob (gone in this mock: -ENOENT) */
+	spdk_lvol_close(lvol, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+	spdk_lvol_destroy(lvol, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+
+	g_lvserrno = 1;
+	rc = spdk_lvol_register_live(g_lvol_store, "new", NULL, blobid, false,
+				     LVOL_CLEAR_WITH_DEFAULT, lvol_op_with_handle_complete, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_lvserrno == -ENOENT);
+	CU_ASSERT(TAILQ_EMPTY(&g_lvol_store->lvols));
+
+	g_lvserrno = -1;
+	rc = spdk_lvs_unload(g_lvol_store, op_complete, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_lvserrno == 0);
+	g_lvol_store = NULL;
+
+	free_dev(&dev);
+}
+
+/*
+ * A secondary-mode delete of an lvol that shares its blob with another lvol
+ * (a state from before the register check) leaves the blob to the other lvol:
+ * deleting it freed the shared open handle under the other lvol (bf32,
+ * SIGSEGV in vbdev_lvol_resv_refresh). Only the copy is freed. The other
+ * lvol's own delete then deletes the blob.
+ */
+static void
+lvol_destroy_non_leader_shared_blob(void)
+{
+	struct lvol_ut_bs_dev dev;
+	struct spdk_lvs_opts opts;
+	struct spdk_lvol *stale, *lvol;
+	struct spdk_blob *stale_blob;
+	struct spdk_blob copy1, copy2;
+	int rc;
+
+	init_dev(&dev);
+	spdk_lvs_opts_init(&opts);
+	snprintf(opts.name, sizeof(opts.name), "lvs");
+
+	g_lvserrno = -1;
+	rc = spdk_lvs_init(&dev.bs_dev, &opts, lvol_store_op_with_handle_complete, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_lvserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_lvol_store != NULL);
+
+	spdk_lvol_create(g_lvol_store, "stale", 10, false, LVOL_CLEAR_WITH_DEFAULT, 0,
+			 lvol_op_with_handle_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_lvol != NULL);
+	stale = g_lvol;
+	stale_blob = stale->blob;
+
+	spdk_lvol_create(g_lvol_store, "new", 10, false, LVOL_CLEAR_WITH_DEFAULT, 0,
+			 lvol_op_with_handle_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_lvol != NULL);
+	lvol = g_lvol;
+
+	/* the shared state: both lvols on one blob id, both opened it */
+	lvol->blob_id = stale->blob_id;
+	stale_blob->ref++;
+
+	/* vbdev_lvol_destroy in secondary mode: copy, close, delete */
+	g_lvol_store->leader = false;
+	lvol->tmp_blob = &copy1;
+	spdk_lvol_close(lvol, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+	g_delete_non_leader_calls = 0;
+	g_free_blob_copy_calls = 0;
+	g_lvserrno = 1;
+	spdk_lvol_destroy(lvol, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+	CU_ASSERT(g_delete_non_leader_calls == 0);
+	CU_ASSERT(g_free_blob_copy_calls == 1);
+	CU_ASSERT(g_free_blob_copy_blob == &copy1);
+	CU_ASSERT(TAILQ_FIRST(&g_lvol_store->lvols) == stale);
+	CU_ASSERT(TAILQ_NEXT(stale, link) == NULL);
+	CU_ASSERT(stale->blob == stale_blob);
+
+	/* the last lvol on the blob id deletes the blob */
+	stale_blob->ref--;
+	stale->tmp_blob = &copy2;
+	spdk_lvol_close(stale, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+	g_lvserrno = 1;
+	spdk_lvol_destroy(stale, op_complete, NULL);
+	CU_ASSERT(g_lvserrno == 0);
+	CU_ASSERT(g_delete_non_leader_calls == 1);
+	CU_ASSERT(g_delete_non_leader_blob == &copy2);
+	CU_ASSERT(g_free_blob_copy_calls == 1);
+	CU_ASSERT(TAILQ_EMPTY(&g_lvol_store->lvols));
+
+	g_lvol_store->leader = true;
 	g_lvserrno = -1;
 	rc = spdk_lvs_unload(g_lvol_store, op_complete, NULL);
 	CU_ASSERT(rc == 0);
@@ -5033,6 +5206,8 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, lvs_names);
 	CU_ADD_TEST(suite, lvol_create_destroy_success);
 	CU_ADD_TEST(suite, lvol_create_fail);
+	CU_ADD_TEST(suite, lvol_register_live_blob_id_owned);
+	CU_ADD_TEST(suite, lvol_destroy_non_leader_shared_blob);
 	CU_ADD_TEST(suite, lvol_destroy_fail);
 	CU_ADD_TEST(suite, lvol_close);
 	CU_ADD_TEST(suite, lvol_resize);

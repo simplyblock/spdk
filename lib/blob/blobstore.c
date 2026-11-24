@@ -3815,6 +3815,13 @@ blob_persist(spdk_bs_sequence_t *seq, struct spdk_blob *blob, bool md_drain,
 
 	blob_verify_md_op(blob);
 
+	if (spdk_unlikely(blob->orphaned)) {
+		/* deleted on this node; its id may already belong to another blob */
+		blob->state = SPDK_BLOB_STATE_CLEAN;
+		cb_fn(seq, cb_arg, 0);
+		return;
+	}
+
 	if (blob->state == SPDK_BLOB_STATE_CLEAN && TAILQ_EMPTY(&blob->persists_to_complete)) {
 		cb_fn(seq, cb_arg, 0);
 		return;
@@ -10083,6 +10090,17 @@ blob_opts_copy(const struct spdk_blob_opts *src, struct spdk_blob_opts *dst)
 #undef SET_FIELD
 }
 
+void
+spdk_bs_free_blob_copy(struct spdk_blob *copy)
+{
+	if (copy == NULL) {
+		return;
+	}
+	/* the back_bs_dev is the open handle's (spdk_bs_copy_blob) */
+	copy->back_bs_dev = NULL;
+	blob_free(copy);
+}
+
 // added by sadegh
 
 struct spdk_blob *
@@ -13825,13 +13843,14 @@ clone_update_delete_sync_cpl(void *cb_arg, int lvolerrno)
 		new_parent_entry->clone_count++;
 
 		parentblob = blob_lookup(clone->bs, new_parent_entry->id);
-		/* snapshot_entry (the OLD parent's) is NULL when the clone had no
-		 * parent before (ctx->parent_id invalid): do not dereference it.
-		 * Whether the old parent's count is the right one here at all is
-		 * left to the owner (the branch above uses the new parent's). */
-		if (parentblob && snapshot_entry &&
-		    parentblob->open_ref != snapshot_entry->clone_count + 1) {
-			parentblob->open_ref = snapshot_entry->clone_count + 1;
+		/* The new parent's references: its own plus one per clone, as in the
+		 * "already listed" branch above and spdk_bs_update_snapshot_clone.
+		 * This used the OLD parent's clone count, so a parent that gained a
+		 * clone here could be left with fewer references than holders: its
+		 * handle was then freed under a clone's blob_bs_dev on a later close
+		 * (use-after-free), or never freed. */
+		if (parentblob && parentblob->open_ref != new_parent_entry->clone_count + 1) {
+			parentblob->open_ref = new_parent_entry->clone_count + 1;
 		}
 
 		SPDK_NOTICELOG("Added clone 0x%" PRIx64" under new parent 0x%" PRIx64 "\n", clone->id, clone->parent_id);
@@ -13840,6 +13859,61 @@ clone_update_delete_sync_cpl(void *cb_arg, int lvolerrno)
 out:
 	// bs_print_snapshot_tree(clone->bs);
 	free(ctx);
+}
+
+/*
+ * Non-leader delete and the open handle of the blob.
+ *
+ * spdk_bs_delete_blob_non_leader deletes a copy of the blob
+ * (spdk_bs_copy_blob); the open handle -- the one in bs->open_blobs that
+ * blob_lookup returns and every spdk_bs_open_blob of the id shares, with
+ * open_ref++ -- is freed by the manual delete paths below. That handle can
+ * have holders this delete knows nothing about: a second lvol registered on
+ * the same blob id (a stale lvol the leader had deleted, whose blob id the
+ * leader reused), a clone's blob_bs_dev. Freeing it under them left their
+ * spdk_blob pointer dangling: bf32 2026-11-21, SIGSEGV in
+ * vbdev_lvol_resv_refresh -> blob_get_xattr_value on the next secondary
+ * register (lvs_update_live_cb walks every lvol). A handle with more
+ * references than the delete accounts for is therefore left to the remaining
+ * holders, who close it (unlinked from the open-blob tree, see
+ * bs_non_leader_handle_shared); at worst it leaks. The force delete
+ * frees at open_ref <= 1 as before: a lone remaining reference there is a
+ * leftover count of the snapshot bookkeeping as often as a holder, and the
+ * lvol layer does not delete a blob another lvol still holds
+ * (lvol_destroy_non_leader).
+ */
+static void
+bs_non_leader_handle_shared(struct spdk_blob *handle, const char *what)
+{
+	SPDK_ERRLOG("Non-leader %s of blob 0x%" PRIx64 ": its open handle is still held by others "
+		    "(open_ref %" PRIu32 "), not freeing it\n", what, handle->id, handle->open_ref);
+	/*
+	 * The blob is deleted on this node below, and the leader may reuse its
+	 * id. Left in bs->open_blobs, the handle -- with the deleted blob's
+	 * metadata -- would be what the next open of the reused id returns: two
+	 * different blobs on one spdk_blob again, the start of the bf32 chain.
+	 * Unlink it and never write its metadata; the holders keep valid memory
+	 * and the last close frees it.
+	 */
+	spdk_bit_array_clear(handle->bs->open_blobids, handle->id);
+	RB_REMOVE(spdk_blob_tree, &handle->bs->open_blobs, handle);
+	handle->orphaned = true;
+	handle->md_ro = true;
+	handle->state = SPDK_BLOB_STATE_CLEAN;
+}
+
+/*
+ * The references a snapshot delete with a clone (delete_blob_manually, not
+ * single) accounts for on the open handle: the clone's -- the caller has
+ * re-parented the clone and freed its blob_bs_dev without closing the
+ * snapshot -- and the deleter's own while it still holds it. The deleting lvol
+ * closes its handle before the delete (spdk_lvol_close, after the copy), so
+ * the handle then has one reference less than the copy took from it.
+ */
+static uint32_t
+bs_non_leader_snapshot_refs(const struct spdk_blob *handle, const struct spdk_blob *copy)
+{
+	return 1 + (handle->open_ref >= copy->open_ref ? 1 : 0);
 }
 
 static void
@@ -13851,7 +13925,22 @@ delete_blob_manually(struct spdk_blob_store *bs, struct spdk_blob *blob, bool si
 
 	if (!single) {
 		tmp_blob = blob_lookup(blob->bs, blob->id);
-		if (tmp_blob) {
+		if (tmp_blob && tmp_blob != blob &&
+		    tmp_blob->open_ref > bs_non_leader_snapshot_refs(tmp_blob, blob)) {
+			/*
+			 * Someone else still holds this open handle -- another
+			 * lvol registered on the same blob id. Freeing it would
+			 * leave that holder dangling (see
+			 * bs_non_leader_handle_shared). Drop the clone's
+			 * reference only and leave the handle to the others.
+			 * Its back_bs_dev may have just been handed to the
+			 * clone: give it the zeroes dev, so the last close does
+			 * not destroy the clone's backing (a leak at worst).
+			 */
+			bs_non_leader_handle_shared(tmp_blob, "delete");
+			tmp_blob->open_ref--;
+			tmp_blob->back_bs_dev = bs_create_zeroes_dev();
+		} else if (tmp_blob) {
 			/*
 			* Remove the blob from the blob_store list now, to ensure it does not
 			*  get returned after this point by blob_lookup().
@@ -13895,7 +13984,15 @@ force_delete_blob_manually(struct spdk_blob *blob) {
 	struct spdk_blob_store *bs = blob->bs;
 
 	tmp_blob = blob_lookup(blob->bs, blob->id);
-	if (tmp_blob) {
+	if (tmp_blob && tmp_blob != blob && tmp_blob->open_ref > 1) {
+		/*
+		 * Others still hold the open handle (bs_non_leader_handle_shared):
+		 * leave it, its back_bs_dev and its references to them. No
+		 * reference is dropped: the deleting lvol closed its own before
+		 * the delete, so every one left belongs to a live holder.
+		 */
+		bs_non_leader_handle_shared(tmp_blob, "force delete");
+	} else if (tmp_blob) {
 		/*
 		* Remove the blob from the blob_store list now, to ensure it does not
 		*  get returned after this point by blob_lookup().
@@ -16263,7 +16360,7 @@ blob_close_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 			 *  when the deletion process starts - so don't try to
 			 *  remove them again.
 			 */
-			if (blob->active.num_pages > 0 && blob->id != UINT64_MAX) {
+			if (blob->active.num_pages > 0 && blob->id != UINT64_MAX && !blob->orphaned) {
 				spdk_bit_array_clear(blob->bs->open_blobids, blob->id);
 				RB_REMOVE(spdk_blob_tree, &blob->bs->open_blobs, blob);
 			}

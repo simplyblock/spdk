@@ -1054,6 +1054,15 @@ int spdk_bs_delete_blob_non_leader(struct spdk_blob_store *bs, struct spdk_blob	
 int spdk_bs_drop_unopened_clone_entries(struct spdk_blob_store *bs, spdk_blob_id snapshot_id);
 
 /**
+ * Free a copy made by spdk_bs_copy_blob without deleting the blob, for a
+ * non-leader delete that leaves the blob to another holder of its open handle.
+ * The copy's back_bs_dev belongs to the open handle and is not destroyed.
+ *
+ * \param copy The copy, may be NULL.
+ */
+void spdk_bs_free_blob_copy(struct spdk_blob *copy);
+
+/**
  * Create a read-only snapshot of specified blob with provided options.
  * This will automatically sync specified blob.
  *
