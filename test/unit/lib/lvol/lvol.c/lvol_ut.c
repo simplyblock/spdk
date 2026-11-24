@@ -21,6 +21,9 @@
 #include "blob/blob_dirty.c"
 static struct blob_dirty_gen *g_ut_dirty_gen;
 static bool g_ut_dirty_usable;
+/* true: usable only against the generation's own base, as the blob layer
+ * answers (the bridged-delta tests); false: against any base. */
+static bool g_ut_dirty_usable_own_base;
 struct blob_dirty_gen *
 spdk_blob_get_dirty_gen(struct spdk_blob *blob)
 {
@@ -32,7 +35,12 @@ spdk_blob_dirty_gen_usable(struct spdk_blob *blob, const struct blob_dirty_gen *
 			   spdk_blob_id base, const char **why)
 {
 	(void)blob;
-	(void)base;
+	if (g_ut_dirty_usable_own_base && gen != NULL && base != gen->base) {
+		if (why != NULL) {
+			*why = "started at another base (unit test)";
+		}
+		return false;
+	}
 	if (why != NULL) {
 		*why = g_ut_dirty_usable ? NULL : "unusable (unit test)";
 	}
@@ -186,9 +194,44 @@ DEFINE_STUB_V(spdk_blob_io_read_with_priority, (struct spdk_blob *blob, struct s
 DEFINE_STUB_V(spdk_blob_io_write, (struct spdk_blob *blob, struct spdk_io_channel *channel,
 		   void *payload, uint64_t offset, uint64_t length,
 		   spdk_blob_op_complete cb_fn, void *cb_arg));
-DEFINE_STUB_V(spdk_blob_scan_used_clusters, (struct spdk_blob* blob, uint64_t *clusters, uint32_t num_clusters, int *count));
-DEFINE_STUB(spdk_blob_get_parent_snapshot, spdk_blob_id, (struct spdk_blob_store *bs, spdk_blob_id blobid),
-	    SPDK_BLOBID_INVALID);
+/* A small snapshot chain for the transfer tests: blob id -> parent id and
+ * the clusters (bit i: cluster i) the blob owns. Unlisted: no parent
+ * (SPDK_BLOBID_INVALID) and nothing owned. */
+#define UT_CHAIN_MAX 32
+static struct {
+	spdk_blob_id id;
+	spdk_blob_id parent;
+	uint64_t owned;
+} g_ut_chain[UT_CHAIN_MAX];
+static int g_ut_chain_cnt;
+
+static void
+ut_chain_set(spdk_blob_id id, spdk_blob_id parent, uint64_t owned)
+{
+	SPDK_CU_ASSERT_FATAL(g_ut_chain_cnt < UT_CHAIN_MAX);
+	g_ut_chain[g_ut_chain_cnt].id = id;
+	g_ut_chain[g_ut_chain_cnt].parent = parent;
+	g_ut_chain[g_ut_chain_cnt].owned = owned;
+	g_ut_chain_cnt++;
+}
+
+static void
+ut_chain_clear(void)
+{
+	g_ut_chain_cnt = 0;
+}
+
+spdk_blob_id
+spdk_blob_get_parent_snapshot(struct spdk_blob_store *bs, spdk_blob_id blobid)
+{
+	(void)bs;
+	for (int k = 0; k < g_ut_chain_cnt; k++) {
+		if (g_ut_chain[k].id == blobid) {
+			return g_ut_chain[k].parent;
+		}
+	}
+	return SPDK_BLOBID_INVALID;
+}
 
 DEFINE_STUB(spdk_blob_locked_operation_in_progress, bool, (const struct spdk_blob *blob), false);
 
@@ -306,6 +349,25 @@ struct spdk_blob {
 	struct spdk_bs_dev	*back_bs_dev;
 	uint64_t		num_clusters;
 };
+
+/* as the blob layer: fills only entries still 0 */
+void
+spdk_blob_scan_used_clusters(struct spdk_blob *blob, uint64_t *clusters, uint32_t num_clusters,
+			     int *count)
+{
+	for (int k = 0; blob != NULL && k < g_ut_chain_cnt; k++) {
+		if (g_ut_chain[k].id != blob->id) {
+			continue;
+		}
+		for (uint32_t i = 0; i < num_clusters && i < 64; i++) {
+			if ((g_ut_chain[k].owned & (1ULL << i)) && clusters[i] == 0) {
+				clusters[i] = 0x1000 + i;
+				(*count)++;
+			}
+		}
+	}
+}
+
 
 int g_lvserrno;
 int g_close_super_status;
