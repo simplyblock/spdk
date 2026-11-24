@@ -2634,13 +2634,18 @@ struct lvol_destroy_refresh_ctx {
 };
 
 /* Called with g_lvol_stores_mutex held. *busy: a stale lvol is being
- * refreshed by another path (IO-triggered update) right now. */
+ * refreshed by another path (IO-triggered update) right now. *failed: a stale
+ * lvol whose last refresh failed (failed_on_update, not being refreshed): its
+ * metadata, and so the snapshot tree, is not known; it is returned there and
+ * the search stops. */
 static struct spdk_lvol *
-lvs_find_stale_lvol(struct spdk_lvol_store *lvs, struct spdk_lvol *self, bool *busy)
+lvs_find_stale_lvol(struct spdk_lvol_store *lvs, struct spdk_lvol *self, bool *busy,
+		    struct spdk_lvol **failed)
 {
 	struct spdk_lvol *l;
 
 	*busy = false;
+	*failed = NULL;
 	TAILQ_FOREACH(l, &lvs->lvols, link) {
 		if (l == self || l->leader || l->blob == NULL || l->hublvol ||
 		    strcmp(l->name, "hublvol") == 0) {
@@ -2651,6 +2656,14 @@ lvs_find_stale_lvol(struct spdk_lvol_store *lvs, struct spdk_lvol *self, bool *b
 			*busy = true;
 			continue;
 		}
+		if (l->failed_on_update) {
+			/* Review B4.2 #3: a failed refresh is not "busy"; waiting the full
+			 * 30 s for it and answering -EBUSY blocked every snapshot delete of
+			 * the lvstore. Answer at once; the delete can run again once the
+			 * lvol was refreshed (IO-triggered retry) or the leadership was set. */
+			*failed = l;
+			return NULL;
+		}
 		return l;
 	}
 	return NULL;
@@ -2659,13 +2672,13 @@ lvs_find_stale_lvol(struct spdk_lvol_store *lvs, struct spdk_lvol *self, bool *b
 static bool
 lvs_has_stale_lvol(struct spdk_lvol_store *lvs, struct spdk_lvol *self)
 {
-	struct spdk_lvol *stale;
+	struct spdk_lvol *stale, *failed;
 	bool busy;
 
 	pthread_mutex_lock(&g_lvol_stores_mutex);
-	stale = lvs_find_stale_lvol(lvs, self, &busy);
+	stale = lvs_find_stale_lvol(lvs, self, &busy, &failed);
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
-	return stale != NULL || busy;
+	return stale != NULL || busy || failed != NULL;
 }
 
 static void lvol_destroy_refresh_next(struct lvol_destroy_refresh_ctx *ctx);
@@ -2676,6 +2689,9 @@ lvol_destroy_refresh_finish(struct lvol_destroy_refresh_ctx *ctx, int rc)
 	spdk_lvol_op_complete cb_fn = ctx->cb_fn;
 	void *cb_arg = ctx->cb_arg;
 
+	assert(ctx->poller == NULL);
+	/* set by lvol_destroy_refresh_start() for the whole refresh + wait phase */
+	ctx->lvol->action_in_progress = false;
 	free(ctx);
 	cb_fn(cb_arg, rc);
 }
@@ -2695,6 +2711,19 @@ lvol_destroy_refresh_cpl(void *cb_arg, int lvolerrno)
 		lvol_destroy_refresh_finish(ctx, ERR_UPDATE_FAILED);
 		return;
 	}
+	/* Review B4.2 #5: the leadership may have been lost while the metadata was
+	 * read. Then the lvol must not be marked leader (it would serve IO as one);
+	 * only its refresh is over. The delete is aborted. */
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+	if (!ctx->lvol->lvol_store->leader) {
+		stale->update_in_progress = false;
+		pthread_mutex_unlock(&g_lvol_stores_mutex);
+		SPDK_ERRLOG("lvol %s: cannot delete it: leadership lost while refreshing lvol %s\n",
+			    ctx->lvol->unique_id, stale->unique_id);
+		lvol_destroy_refresh_finish(ctx, ERR_LEADERSHIP_CHANGED);
+		return;
+	}
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
 	spdk_lvol_set_leader(stale);
 	lvol_destroy_refresh_next(ctx);
 }
@@ -2716,7 +2745,7 @@ lvol_destroy_refresh_next(struct lvol_destroy_refresh_ctx *ctx)
 	struct spdk_lvol *lvol = ctx->lvol;
 	spdk_lvol_op_complete cb_fn = ctx->cb_fn;
 	void *cb_arg = ctx->cb_arg;
-	struct spdk_lvol *stale;
+	struct spdk_lvol *stale, *failed;
 	bool busy;
 
 	if (!lvs->leader) {
@@ -2726,7 +2755,7 @@ lvol_destroy_refresh_next(struct lvol_destroy_refresh_ctx *ctx)
 	}
 
 	pthread_mutex_lock(&g_lvol_stores_mutex);
-	stale = lvs_find_stale_lvol(lvs, lvol, &busy);
+	stale = lvs_find_stale_lvol(lvs, lvol, &busy, &failed);
 	if (stale != NULL) {
 		/* as lvol_update_async_delete() */
 		stale->update_in_progress = true;
@@ -2734,6 +2763,14 @@ lvol_destroy_refresh_next(struct lvol_destroy_refresh_ctx *ctx)
 		blob_freeze_on_failover(stale->blob);
 	}
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
+
+	if (failed != NULL) {
+		SPDK_ERRLOG("lvol %s: cannot delete it: refreshing lvol %s (blob 0x%" PRIx64 ") "
+			    "failed before, the snapshot tree is not known\n",
+			    lvol->unique_id, failed->unique_id, failed->blob_id);
+		lvol_destroy_refresh_finish(ctx, ERR_UPDATE_FAILED);
+		return;
+	}
 
 	if (stale != NULL) {
 		ctx->stale = stale;
@@ -2758,7 +2795,9 @@ lvol_destroy_refresh_next(struct lvol_destroy_refresh_ctx *ctx)
 		return;
 	}
 
-	/* The tree is current now: delete again, with the clone if there is one. */
+	/* The tree is current now: delete again, with the clone if there is one.
+	 * spdk_lvol_destroy_async() sets action_in_progress again for the delete. */
+	lvol->action_in_progress = false;
 	free(ctx);
 	spdk_lvol_destroy_async(lvol, cb_fn, cb_arg);
 }
@@ -2776,6 +2815,13 @@ lvol_destroy_refresh_start(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, 
 	ctx->lvol = lvol;
 	ctx->cb_fn = cb_fn;
 	ctx->cb_arg = cb_arg;
+	/* Review B4.2 #4: hold the lvol for the whole refresh + wait phase (up to 30 s
+	 * on a poller that keeps ctx->lvol): another delete (vbdev_lvol_destroy), open
+	 * and lvstore unload / destroy (spdk_lvs_unload, spdk_lvs_destroy) refuse an
+	 * lvol with an action in progress, so none of them frees it under the poller.
+	 * Cleared on every exit (lvol_destroy_refresh_finish, or right before the
+	 * delete runs again). */
+	lvol->action_in_progress = true;
 	SPDK_NOTICELOG("lvol %s: snapshot delete on a leader with lvols not refreshed since the "
 		       "takeover: refreshing them first\n", lvol->unique_id);
 	lvol_destroy_refresh_next(ctx);
@@ -3145,9 +3191,13 @@ lvol_update_on_failover_cpl(void *cb_arg, int lvolerrno)
 	struct spdk_lvol *lvol = req->lvol;	
 	if (lvolerrno < 0) {
 		SPDK_ERRLOG("Cannot update lvol on failover blob 0x%" PRIx64 "\n", lvol->blob_id);
-		//remember call function to drop the IO for this lvol
-		//change the state to drop;
-		lvol->failed_on_update = true;
+		/* IO is dropped on failed_on_update (vbdev and blob layer), not on
+		 * update_in_progress. Review B4.2 #3: update_in_progress has to end here
+		 * too, else the lvol counted as "being refreshed" for good: no IO retried
+		 * the refresh and every snapshot delete of the lvstore waited 30 s for it
+		 * and failed -EBUSY. The blob layer unfroze the blob, with
+		 * blob->failed_on_update set first (bs_update_blob_on_failover_cpl). */
+		spdk_lvol_set_leader_failed_on_update(lvol);
 		free(req);
 		return;		
 	}
@@ -3169,6 +3219,14 @@ lvol_update_failed_cpl(void *cb_arg, int lvolerrno)
 	SPDK_NOTICELOG("Unfreezed on filed update on failover blob 0x%" PRIx64 "\n", lvol->blob_id);
 }
 
+static void
+lvol_update_failed_cleanup_msg(void *arg)
+{
+	struct spdk_lvol *lvol = arg;
+
+	spdk_blob_update_failed_cleanup(lvol->blob, lvol_update_failed_cpl, lvol);
+}
+
 void
 lvol_update_on_failover(struct spdk_lvol_store *lvs, struct spdk_lvol *lvol, bool send_msg)
 {
@@ -3178,9 +3236,17 @@ lvol_update_on_failover(struct spdk_lvol_store *lvs, struct spdk_lvol *lvol, boo
 	req = calloc(1, sizeof(*req));
 	if (req == NULL) {
 		SPDK_ERRLOG("Cannot alloc memory for request structure.\n");
-		// change the state to drop incoming IO;
-		// we should call the cleanup
+		/* Drop incoming IO at once. The caller froze the blob: unfreeze it (IO
+		 * queued meanwhile fails on blob->failed_on_update) and end the update
+		 * (lvol_update_failed_cpl clears update_in_progress, review B4.2 #3),
+		 * on the md thread, as the lvstore-level failure does. */
 		lvol->failed_on_update = true;
+		if (!send_msg) {
+			spdk_blob_update_failed_cleanup(lvol->blob, lvol_update_failed_cpl, lvol);
+		} else if (spdk_thread_send_msg(spdk_bs_get_md_thread(lvs->blobstore),
+						lvol_update_failed_cleanup_msg, lvol) != 0) {
+			SPDK_ERRLOG("Cannot end failed update of blob 0x%" PRIx64 "\n", lvol->blob_id);
+		}
 		return;
 	}
 
@@ -3268,8 +3334,14 @@ spdk_lvol_update_on_failover(struct spdk_lvol_store *lvs, struct spdk_lvol *lvol
 		assert(lvol->leader == false);
 		lvol->update_in_progress = true;
 		if (lvs->retry_on_update > 3) {
-			SPDK_ERRLOG("Update lvolstore reached its limite.\n");
+			/* Nothing started (no freeze), so no update is in progress either
+			 * (review B4.2 #3); IO is dropped on failed_on_update. Every IO
+			 * comes here again now: log only the first one. */
+			if (!lvol->failed_on_update) {
+				SPDK_ERRLOG("Update lvolstore reached its limite.\n");
+			}
 			lvol->failed_on_update = true;
+			lvol->update_in_progress = false;
 			pthread_mutex_unlock(&g_lvol_stores_mutex);
 			return;
 		}
