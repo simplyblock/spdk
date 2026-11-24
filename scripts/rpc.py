@@ -2331,6 +2331,15 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p = subparsers.add_parser('bdev_lvol_transfer_stat', help='Get a snapshot transfer stat')
     p.add_argument('lvol_name', help='lvol bdev name')
     p.set_defaults(func=bdev_lvol_transfer_stat)
+
+    def bdev_lvol_set_xfer_whole_cluster_pct(args):
+        print_json(rpc.lvol.bdev_lvol_set_xfer_whole_cluster_pct(args.client, pct=args.pct))
+
+    p = subparsers.add_parser('bdev_lvol_set_xfer_whole_cluster_pct',
+                              help='Set the partial-transfer threshold: a cluster at least PCT %% dirty '
+                              'is sent whole instead of as its dirty ranges (default 100: only fully dirty)')
+    p.add_argument('pct', help='0..100', type=int)
+    p.set_defaults(func=bdev_lvol_set_xfer_whole_cluster_pct)
     
     def bdev_lvol_add_clone(args):
         print_json(rpc.lvol.bdev_lvol_add_clone(args.client,

@@ -504,6 +504,20 @@ def bdev_lvol_transfer_stat(client, lvol_name=None):
     params = { 'lvol_name': lvol_name }
     return client.call('bdev_lvol_transfer_stat', params)
 
+
+def bdev_lvol_set_xfer_whole_cluster_pct(client, pct):
+    """Set the node-wide partial-transfer threshold: a cluster at least pct %
+    dirty is sent whole instead of as its dirty ranges.
+
+    Args:
+        pct: 0..100 (100, the default: only fully dirty clusters whole;
+             0: every cluster whole)
+
+    Returns:
+        {"whole_cluster_pct": the value now in effect}
+    """
+    return client.call('bdev_lvol_set_xfer_whole_cluster_pct', {'pct': pct})
+
 def bdev_lvol_convert(client, lvol_name=None):
     """convert lvol to snapshot.
 

@@ -5586,13 +5586,20 @@ fragment_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 #define XFER_FINAL_PARTIAL_WINDOW	256
 
 /* A cluster of a partial transfer whose dirty share is at least this many
- * percent is sent as one whole-cluster request instead of its dirty ranges
- * (each range is a request of at most XFER_PARTIAL_MAX_BYTES through a
- * window of cluster_batch requests; a mostly-dirty cluster costs more that
- * way than its 2 MiB in one request). 100: only fully dirty clusters;
- * 0: every cluster whole. Set with spdk_lvol_set_xfer_whole_cluster_pct()
- * (RPC bdev_lvol_set_xfer_whole_cluster_pct). */
-#define XFER_WHOLE_CLUSTER_PCT_DEFAULT	50
+ * percent is sent whole instead of as its dirty ranges. 100: only fully dirty
+ * clusters (off); 0: every cluster whole. Set with
+ * spdk_lvol_set_xfer_whole_cluster_pct() (RPC
+ * bdev_lvol_set_xfer_whole_cluster_pct, kept in the lvol module's
+ * save_config output when not the default).
+ *
+ * Default off. The threshold was added when a whole cluster was one 2 MiB
+ * request; since every replication request is at most XFER_PARTIAL_MAX_BYTES,
+ * a whole cluster is 32 requests of 64 KiB too. Its dirty ranges take at
+ * most 32 + (number of ranges) requests -- one more per range, only for
+ * fragmented clusters -- but carry only the dirty bytes, while the whole
+ * cluster carries all 2 MiB: up to 2x the bytes at 50 %, which a WAN link
+ * pays for. Dirty ranges it is, unless the control plane sets a threshold. */
+#define XFER_WHOLE_CLUSTER_PCT_DEFAULT	100
 static uint32_t g_lvs_xfer_whole_cluster_pct = XFER_WHOLE_CLUSTER_PCT_DEFAULT;
 
 int
