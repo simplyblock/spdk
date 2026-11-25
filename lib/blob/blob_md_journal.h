@@ -18,9 +18,14 @@
  * with three lvstores, and no free block above ~0.5 MiB (bed bf19 2026-11-09).
  * Chunks, not one 64 MiB block: a journal can be created on a heap that is
  * already fragmented (lvstore load, takeover).
+ *
+ * 2 MiB is the preferred size, not a requirement: when a chunk cannot be
+ * allocated (no contiguous 2 MiB block left), md_journal_init_elements()
+ * halves the chunk down to a single element (8 KiB) instead of failing the
+ * lvstore load with -ENOMEM. Hence up to one chunk per element.
  */
 #define BS_MD_JOURNAL_ELEMS_PER_CHUNK     256u
-#define BS_MD_JOURNAL_NUM_CHUNKS          (BS_MD_JOURNAL_NUM_ELEMS / BS_MD_JOURNAL_ELEMS_PER_CHUNK)
+#define BS_MD_JOURNAL_MAX_CHUNKS          BS_MD_JOURNAL_NUM_ELEMS
 
 /*
  * Maximum number of ordered journal elements handled by one home drain batch.
@@ -28,6 +33,13 @@
  * Only one drain batch is active at a time.
  */
 #define BS_MD_JOURNAL_DRAIN_BATCH_SIZE	1000u
+/*
+ * Largest HOME drain batch when it runs at PREMIUM priority (blobstore with
+ * priority classes): 1024 x 4 KiB = 4 MiB, so one batch cannot hold client IO
+ * back for a 32 MiB backlog. Without priority classes a batch takes the whole
+ * backlog (BS_MD_JOURNAL_NUM_ELEMS).
+ */
+#define BS_MD_JOURNAL_PREMIUM_BATCH_MAX	1024u
 
 
 #define BS_MD_JOURNAL_MAGIC               0x4D444A32u
@@ -262,8 +274,11 @@ TAILQ_HEAD(md_journal_home_wait_queue, md_journal_home_waiter);
 
 struct spdk_bs_md_journal {
 	struct spdk_blob_store *bs;
-	/* DMA chunks the elements' hdr/page buffers point into */
-	void *elem_dma_chunks[BS_MD_JOURNAL_NUM_CHUNKS];
+	/* DMA chunks the elements' hdr/page buffers point into (array of
+	 * BS_MD_JOURNAL_MAX_CHUNKS, elem_dma_chunk_count used; chunks may be
+	 * smaller than BS_MD_JOURNAL_ELEMS_PER_CHUNK on a fragmented heap) */
+	void **elem_dma_chunks;
+	uint32_t elem_dma_chunk_count;
 	spdk_bs_sequence_t *home_seq;
 	spdk_bs_sequence_t *zero_seq;
 	/*

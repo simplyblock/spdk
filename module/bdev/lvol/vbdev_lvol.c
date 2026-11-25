@@ -48,6 +48,7 @@ static TAILQ_HEAD(, lvol_store_bdev) g_spdk_lvol_pairs = TAILQ_HEAD_INITIALIZER(
 static int vbdev_lvs_init(void);
 static void vbdev_lvs_fini_start(void);
 static int vbdev_lvs_get_ctx_size(void);
+static int vbdev_lvs_config_json(struct spdk_json_write_ctx *w);
 static void vbdev_lvs_examine_config(struct spdk_bdev *bdev);
 static void vbdev_lvs_examine_disk(struct spdk_bdev *bdev);
 static bool g_shutdown_started = false;
@@ -60,7 +61,7 @@ static struct spdk_bdev_module g_lvol_if = {
 	.examine_config = vbdev_lvs_examine_config,
 	.examine_disk = vbdev_lvs_examine_disk,
 	.get_ctx_size = vbdev_lvs_get_ctx_size,
-
+	.config_json = vbdev_lvs_config_json,
 };
 
 SPDK_BDEV_MODULE_REGISTER(lvol, &g_lvol_if)
@@ -894,87 +895,6 @@ _vbdev_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *c
 	cb_fn(cb_arg, 0);
 }
 
-/*
- * A secondary-mode delete of a blob whose failover update is still in flight.
- * Deleting a snapshot in secondary mode re-parents its clone and starts an
- * async spdk_blob_update_on_failover of that clone
- * (spdk_bs_delete_blob_non_leader); the control plane's next sync delete is
- * often that very clone (a chain torn down top to bottom). Copying and
- * freeing the blob then (spdk_lvol_copy_blob, delete_blob_manually) left the
- * update's completion chain -- bs_update_blob_cpl, blob_unfreeze_io,
- * clone_update_delete_sync_cpl -- writing into freed memory: heap corruption,
- * SIGSEGV in the bdev name tree seconds later (bf14, 2026-11-06). Wait for
- * the update instead, bounded; the RPC answers when the delete is done.
- */
-#define VBDEV_LVOL_DESTROY_DEFER_US		(10 * 1000)
-#define VBDEV_LVOL_DESTROY_DEFER_MAX_US		(30 * 1000 * 1000)
-
-struct vbdev_lvol_destroy_defer {
-	struct spdk_lvol	*lvol;
-	spdk_lvol_op_complete	cb_fn;
-	void			*cb_arg;
-	bool			is_sync;
-	uint64_t		deadline;
-	struct spdk_poller	*poller;
-};
-
-static int
-vbdev_lvol_destroy_defer_poll(void *arg)
-{
-	struct vbdev_lvol_destroy_defer *d = arg;
-	struct spdk_lvol *lvol = d->lvol;
-
-	if (spdk_blob_locked_operation_in_progress(lvol->blob)) {
-		if (spdk_get_ticks() < d->deadline) {
-			return SPDK_POLLER_IDLE;
-		}
-		SPDK_ERRLOG("Deleting blob 0x%" PRIx64 " in secondary mode: its metadata update "
-			    "is still in flight after %u s, giving up (-EBUSY)\n", lvol->blob_id,
-			    VBDEV_LVOL_DESTROY_DEFER_MAX_US / (1000 * 1000));
-		spdk_poller_unregister(&d->poller);
-		lvol->action_in_progress = false;
-		d->cb_fn(d->cb_arg, -EBUSY);
-		free(d);
-		return SPDK_POLLER_BUSY;
-	}
-	spdk_poller_unregister(&d->poller);
-	lvol->action_in_progress = false;
-	SPDK_NOTICELOG("Deleting blob 0x%" PRIx64 " in secondary mode: metadata update done, "
-		       "deleting now\n", lvol->blob_id);
-	vbdev_lvol_destroy(lvol, d->cb_fn, d->cb_arg, d->is_sync);
-	free(d);
-	return SPDK_POLLER_BUSY;
-}
-
-static bool
-vbdev_lvol_destroy_defer(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg,
-			 bool is_sync)
-{
-	struct vbdev_lvol_destroy_defer *d = calloc(1, sizeof(*d));
-
-	if (d == NULL) {
-		return false;
-	}
-	d->lvol = lvol;
-	d->cb_fn = cb_fn;
-	d->cb_arg = cb_arg;
-	d->is_sync = is_sync;
-	d->deadline = spdk_get_ticks() +
-		      spdk_get_ticks_hz() / (1000 * 1000) * VBDEV_LVOL_DESTROY_DEFER_MAX_US;
-	d->poller = SPDK_POLLER_REGISTER(vbdev_lvol_destroy_defer_poll, d,
-					 VBDEV_LVOL_DESTROY_DEFER_US);
-	if (d->poller == NULL) {
-		free(d);
-		return false;
-	}
-	/* a repeated delete RPC (the control plane retries on its timeout)
-	 * answers -EBUSY instead of deferring a second delete of this lvol */
-	lvol->action_in_progress = true;
-	SPDK_NOTICELOG("Deleting blob 0x%" PRIx64 " in secondary mode: deferred, its metadata "
-		       "update is in flight\n", lvol->blob_id);
-	return true;
-}
-
 void
 vbdev_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg, bool is_sync)
 {
@@ -1020,12 +940,14 @@ vbdev_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb
 			return;
 		}
 
+		/* A failover update of this blob is still running (started by
+		 * the delete of the snapshot below it): copying or freeing it
+		 * now would let the update write into freed memory. Answer
+		 * -EBUSY; the control plane retries. */
 		if (spdk_blob_locked_operation_in_progress(lvol->blob)) {
-			/* a failover update holds the blob: copying or freeing
-			 * it now corrupts the heap (vbdev_lvol_destroy_defer) */
-			if (!vbdev_lvol_destroy_defer(lvol, cb_fn, cb_arg, is_sync)) {
-				cb_fn(cb_arg, -EBUSY);
-			}
+			SPDK_ERRLOG("Deleting blob 0x%" PRIx64 " in secondary mode: its metadata update "
+				    "is still running, retry (-EBUSY)\n", lvol->blob_id);
+			cb_fn(cb_arg, -EBUSY);
 			return;
 		}
 
@@ -2992,11 +2914,33 @@ vbdev_lvol_create_snapshot(struct spdk_lvol *lvol, const char *snapshot_name,
  * never stay parked because a snapshot failed -- and THEN garbage-collects
  * the snapshots already taken, newest first.
  */
+/*
+ * Members are re-looked up before every use (group_snap_lookup): a member can be
+ * deleted or closed while the group waits for a freeze, a snapshot or an unfreeze, and
+ * the caller's lvol pointer is then dangling. A member that is gone fails the group
+ * before its snapshot (-ENODEV); after it, its freeze went with its blob handle and the
+ * unfreeze skips it.
+ *
+ * A member snapshot that is still running GROUP_SNAP_TIMEOUT_US after the snapshots
+ * were submitted no longer holds the other members: every member is group-unfrozen, the
+ * caller gets -ETIMEDOUT, and the snapshots that complete later are garbage-collected
+ * (they were not taken inside one frozen window). The stuck member itself stays frozen
+ * by its own snapshot's freeze until that snapshot completes; only the group's hold is
+ * released. The freeze and unfreeze phases have no timeout: they are local
+ * for_each_channel passes that only stall when an SPDK thread is wedged, and nothing
+ * here could recover that.
+ */
+#define GROUP_SNAP_TIMEOUT_US		(10ULL * 1000 * 1000)
+/* A group unfreeze fails only on -ENOMEM, with the freeze still held: retry it. */
+#define GROUP_SNAP_UNFREEZE_RETRY_US	1000
+#define GROUP_SNAP_UNFREEZE_RETRIES	1000
+
 enum group_snap_phase {
 	GRP_SNAP_FREEZE = 0,
 	GRP_SNAP_CREATE,
 	GRP_SNAP_INPROCESS,
 	GRP_SNAP_UNFREEZE,
+	GRP_SNAP_DRAIN,		/* timed out and answered: waiting for late snapshot completions */
 	GRP_SNAP_GC,
 	GRP_SNAP_GC_INPROCESS
 };
@@ -3005,13 +2949,18 @@ struct spdk_lvol_group_snap_entry;
 
 struct vbdev_lvol_group_snap_ctx {
 	struct spdk_lvol_group_snap_entry *entry;
-	struct vbdev_lvol_group_snap_entry	*entries;
+	struct vbdev_lvol_group_snap_entry	*entries;	/* the caller's; NULL once answered */
 	uint32_t		count;
 	uint32_t		completed;	/* async completions plus submission reference */
 	uint32_t		idx;		/* cursor of the freeze / unfreeze phases; GC: destroys submitted */
-	uint32_t		frozen;		/* members group-frozen so far */
 	enum group_snap_phase			phase;
 	int				rc;		/* first error, sticky */
+	struct spdk_lvol_store	*lvs;		/* compared, never dereferenced unless still registered */
+	bool			submitted;	/* member snapshots were submitted */
+	bool			answered;	/* cb_fn was called */
+	uint32_t		unfreeze_retries;
+	struct spdk_poller	*timeout_poller;
+	struct spdk_poller	*retry_poller;
 	vbdev_lvol_group_snapshot_complete	cb_fn;
 	void			*cb_arg;
 };
@@ -3019,14 +2968,70 @@ struct vbdev_lvol_group_snap_ctx {
 struct spdk_lvol_group_snap_entry {
 	struct vbdev_lvol_group_snap_ctx	*ctx;
 	uint32_t	idx;
+	/* Only dereferenced after group_snap_lookup() found them still in the lvstore. */
+	struct spdk_lvol	*lvol;
+	struct spdk_uuid	lvol_uuid;
+	struct spdk_blob	*frozen_blob;	/* blob this group froze; NULL = not frozen */
+	struct spdk_lvol	*snap;		/* created snapshot */
+	struct spdk_uuid	snap_uuid;
 };
 
 static void group_snap_advance(struct vbdev_lvol_group_snap_ctx *ctx);
 
+/*
+ * Return lvol if it is still a live lvol of the group's lvstore, else NULL. The cached
+ * pointer is only compared until it is found in the lvstore's list; the uuid check
+ * guards against a new lvol allocated at a freed one's address.
+ */
+static struct spdk_lvol *
+group_snap_lookup(struct vbdev_lvol_group_snap_ctx *ctx, struct spdk_lvol *cached,
+		  const struct spdk_uuid *uuid)
+{
+	struct lvol_store_bdev *lvs_bdev;
+	struct spdk_lvol *lvol;
+
+	if (cached == NULL) {
+		return NULL;
+	}
+	for (lvs_bdev = vbdev_lvol_store_first(); lvs_bdev != NULL;
+	     lvs_bdev = vbdev_lvol_store_next(lvs_bdev)) {
+		if (lvs_bdev->lvs != ctx->lvs) {
+			continue;
+		}
+		TAILQ_FOREACH(lvol, &ctx->lvs->lvols, link) {
+			if (lvol == cached && spdk_uuid_compare(&lvol->uuid, uuid) == 0) {
+				return lvol;
+			}
+		}
+		return NULL;
+	}
+	return NULL;
+}
+
+/* report_snaps: false when answering early (timeout): every snapshot is still to be GC'd. */
+static void
+group_snap_answer(struct vbdev_lvol_group_snap_ctx *ctx, bool report_snaps)
+{
+	uint32_t i;
+
+	if (ctx->answered) {
+		return;
+	}
+	for (i = 0; i < ctx->count; i++) {
+		ctx->entries[i].snap = report_snaps ? ctx->entry[i].snap : NULL;
+	}
+	ctx->answered = true;
+	ctx->cb_fn(ctx->cb_arg, ctx->entries, ctx->count, ctx->rc);
+	/* The caller may free its entries now. */
+	ctx->entries = NULL;
+}
+
 static void
 group_snap_complete(struct vbdev_lvol_group_snap_ctx *ctx)
 {
-	ctx->cb_fn(ctx->cb_arg, ctx->entries, ctx->count, ctx->rc);
+	spdk_poller_unregister(&ctx->timeout_poller);
+	spdk_poller_unregister(&ctx->retry_poller);
+	group_snap_answer(ctx, true);
 	free(ctx->entry);
 	free(ctx);
 }
@@ -3037,8 +3042,10 @@ group_snap_freeze_cb(void *cb_arg, int lvolerrno)
 	struct vbdev_lvol_group_snap_ctx *ctx = cb_arg;
 
 	if (lvolerrno != 0) {
-		SPDK_ERRLOG("group snapshot: freeze of member %u (%s) failed: %d\n",
-			    ctx->idx, ctx->entries[ctx->idx].lvol->name, lvolerrno);
+		SPDK_ERRLOG("group snapshot: freeze of member %u failed: %d\n",
+			    ctx->idx, lvolerrno);
+		/* A failed group freeze moves no counter: this member holds nothing. */
+		ctx->entry[ctx->idx].frozen_blob = NULL;
 		ctx->rc = lvolerrno;
 		/* Nothing created yet; unwind the freezes taken so far. */
 		ctx->phase = GRP_SNAP_UNFREEZE;
@@ -3046,7 +3053,6 @@ group_snap_freeze_cb(void *cb_arg, int lvolerrno)
 		group_snap_advance(ctx);
 		return;
 	}
-	ctx->frozen++;
 	ctx->idx++;
 	group_snap_advance(ctx);
 }
@@ -3054,23 +3060,34 @@ group_snap_freeze_cb(void *cb_arg, int lvolerrno)
 static void
 group_snap_create_cb(void *cb_arg, struct spdk_lvol *snap, int lvolerrno)
 {
-	struct spdk_lvol_group_snap_entry *entries = cb_arg;
-	struct vbdev_lvol_group_snap_ctx *ctx = entries->ctx;
+	struct spdk_lvol_group_snap_entry *e = cb_arg;
+	struct vbdev_lvol_group_snap_ctx *ctx = e->ctx;
+
 	ctx->completed++;
 	if (lvolerrno != 0 || snap == NULL) {
-		SPDK_ERRLOG("group snapshot: snapshot %s of member %s failed: %d\n",
-				ctx->entries[entries->idx].snapshot_name,
-				ctx->entries[entries->idx].lvol->name, lvolerrno);
-
+		SPDK_ERRLOG("group snapshot: snapshot of member %u failed: %d\n",
+			    e->idx, lvolerrno);
 		if (ctx->rc == 0) {
 			ctx->rc = lvolerrno != 0 ? lvolerrno : -EIO;
-
 		}
-		group_snap_advance(ctx);
-		return;
+	} else {
+		e->snap = snap;
+		e->snap_uuid = snap->uuid;
 	}
-	ctx->entries[entries->idx].snap = snap;
+	/* After a timeout the unfreeze runs first; it looks at completed when it is done. */
+	if (ctx->phase == GRP_SNAP_INPROCESS || ctx->phase == GRP_SNAP_DRAIN) {
+		group_snap_advance(ctx);
+	}
+}
+
+static int
+group_snap_unfreeze_retry(void *cb_arg)
+{
+	struct vbdev_lvol_group_snap_ctx *ctx = cb_arg;
+
+	spdk_poller_unregister(&ctx->retry_poller);
 	group_snap_advance(ctx);
+	return SPDK_POLLER_BUSY;
 }
 
 static void
@@ -3079,28 +3096,65 @@ group_snap_unfreeze_cb(void *cb_arg, int lvolerrno)
 	struct vbdev_lvol_group_snap_ctx *ctx = cb_arg;
 
 	if (lvolerrno != 0) {
+		/*
+		 * The group unfreeze fails only before it drops the counts (-ENOMEM): the member
+		 * is still frozen. Moving on would leave its host IO parked for good, so retry
+		 * the same member a bounded number of times.
+		 */
+		if (ctx->unfreeze_retries < GROUP_SNAP_UNFREEZE_RETRIES) {
+			ctx->unfreeze_retries++;
+			ctx->retry_poller = spdk_poller_register(group_snap_unfreeze_retry, ctx,
+					    GROUP_SNAP_UNFREEZE_RETRY_US);
+			if (ctx->retry_poller != NULL) {
+				return;
+			}
+		}
 		/* Keep going: the remaining members must still be unfrozen. */
-		SPDK_ERRLOG("group snapshot: unfreeze of member %u (%s) failed: %d\n",
-			    ctx->idx, ctx->entries[ctx->idx].lvol->name, lvolerrno);
+		SPDK_ERRLOG("group snapshot: unfreeze of member %u failed: %d, giving up after %u "
+			    "retries (member stays frozen)\n", ctx->idx, lvolerrno, ctx->unfreeze_retries);
 		if (ctx->rc == 0) {
 			ctx->rc = lvolerrno;
 		}
 	}
+	ctx->entry[ctx->idx].frozen_blob = NULL;
+	ctx->unfreeze_retries = 0;
 	ctx->idx++;
 	group_snap_advance(ctx);
+}
+
+static int
+group_snap_timeout(void *cb_arg)
+{
+	struct vbdev_lvol_group_snap_ctx *ctx = cb_arg;
+
+	spdk_poller_unregister(&ctx->timeout_poller);
+	if (ctx->phase != GRP_SNAP_INPROCESS) {
+		return SPDK_POLLER_BUSY;
+	}
+	SPDK_ERRLOG("group snapshot: %u of %u member snapshots still running after %" PRIu64
+		    " us; unfreezing the group and failing it\n",
+		    ctx->count + 1 - ctx->completed, ctx->count, (uint64_t)GROUP_SNAP_TIMEOUT_US);
+	if (ctx->rc == 0) {
+		ctx->rc = -ETIMEDOUT;
+	}
+	ctx->phase = GRP_SNAP_UNFREEZE;
+	ctx->idx = 0;
+	group_snap_advance(ctx);
+	return SPDK_POLLER_BUSY;
 }
 
 static void
 group_snap_gc_cb(void *cb_arg, int lvolerrno)
 {
-	struct spdk_lvol_group_snap_entry *entries = cb_arg;
-	struct vbdev_lvol_group_snap_ctx *ctx = entries->ctx;
+	struct spdk_lvol_group_snap_entry *e = cb_arg;
+	struct vbdev_lvol_group_snap_ctx *ctx = e->ctx;
+
 	ctx->completed++;
 	if (lvolerrno != 0) {
 		SPDK_ERRLOG("group snapshot: GC of partial snapshot %u failed: %d "
-					"(snapshot left behind)\n", entries->idx, lvolerrno);
+			    "(snapshot left behind)\n", e->idx, lvolerrno);
 	} else {
-		ctx->entries[entries->idx].snap = NULL;
+		e->snap = NULL;
 	}
 	group_snap_advance(ctx);
 }
@@ -3108,14 +3162,28 @@ group_snap_gc_cb(void *cb_arg, int lvolerrno)
 static void
 group_snap_advance(struct vbdev_lvol_group_snap_ctx *ctx)
 {
+	struct spdk_lvol_group_snap_entry *e;
+	struct spdk_lvol *lvol;
 	uint32_t i = 0;
+
 	switch (ctx->phase) {
 
 	case GRP_SNAP_FREEZE:
 		/* Park IO on EVERY member before the first snapshot is taken. */
 		if (ctx->idx < ctx->count) {
-			spdk_blob_group_freeze_io(ctx->entries[ctx->idx].lvol->blob,
-						  group_snap_freeze_cb, ctx);
+			e = &ctx->entry[ctx->idx];
+			lvol = group_snap_lookup(ctx, e->lvol, &e->lvol_uuid);
+			if (lvol == NULL || lvol->blob == NULL) {
+				SPDK_ERRLOG("group snapshot: member %u was deleted or closed before "
+					    "it was frozen\n", ctx->idx);
+				ctx->rc = -ENODEV;
+				ctx->phase = GRP_SNAP_UNFREEZE;
+				ctx->idx = 0;
+				group_snap_advance(ctx);
+				return;
+			}
+			e->frozen_blob = lvol->blob;
+			spdk_blob_group_freeze_io(lvol->blob, group_snap_freeze_cb, ctx);
 			return;
 		}
 		ctx->phase = GRP_SNAP_CREATE;
@@ -3124,12 +3192,29 @@ group_snap_advance(struct vbdev_lvol_group_snap_ctx *ctx)
 		return;
 	case GRP_SNAP_CREATE:
 		ctx->phase = GRP_SNAP_INPROCESS;
+		ctx->submitted = true;
+		ctx->timeout_poller = spdk_poller_register(group_snap_timeout, ctx,
+				      GROUP_SNAP_TIMEOUT_US);
+		if (ctx->timeout_poller == NULL) {
+			SPDK_WARNLOG("group snapshot: cannot arm the %" PRIu64 " us timeout\n",
+				     (uint64_t)GROUP_SNAP_TIMEOUT_US);
+		}
 
 		/* All members are frozen: the snapshots are taken in parallel (95ac0d3b5). */
 		for (i = 0; i < ctx->count; i++) {
-			vbdev_lvol_create_snapshot(ctx->entries[i].lvol,
-						   ctx->entries[i].snapshot_name,
-						   group_snap_create_cb, &ctx->entry[i]);
+			e = &ctx->entry[i];
+			lvol = group_snap_lookup(ctx, e->lvol, &e->lvol_uuid);
+			if (lvol == NULL) {
+				SPDK_ERRLOG("group snapshot: member %u was deleted or closed while "
+					    "frozen\n", i);
+				ctx->completed++;
+				if (ctx->rc == 0) {
+					ctx->rc = -ENODEV;
+				}
+				continue;
+			}
+			vbdev_lvol_create_snapshot(lvol, ctx->entries[i].snapshot_name,
+						   group_snap_create_cb, e);
 		}
 		/*
 		* Account for the submission loop with one extra completion. A snapshot
@@ -3149,6 +3234,7 @@ group_snap_advance(struct vbdev_lvol_group_snap_ctx *ctx)
 			SPDK_NOTICELOG("GRP_SNAP_INPROCESS: completed=%d, count=%d\n", ctx->completed, ctx->count);
 			return;
 		}
+		spdk_poller_unregister(&ctx->timeout_poller);
 
 		if (ctx->rc != 0) {
 			SPDK_ERRLOG("group snapshot creation failed: rc=%d\n", ctx->rc);
@@ -3160,9 +3246,28 @@ group_snap_advance(struct vbdev_lvol_group_snap_ctx *ctx)
 		return;
 	case GRP_SNAP_UNFREEZE:
 		/* Unfreeze exactly the members that were frozen. */
-		if (ctx->idx < ctx->frozen) {
-			spdk_blob_group_unfreeze_io(ctx->entries[ctx->idx].lvol->blob,
-						    group_snap_unfreeze_cb, ctx);
+		while (ctx->idx < ctx->count && ctx->entry[ctx->idx].frozen_blob == NULL) {
+			ctx->idx++;
+		}
+		if (ctx->idx < ctx->count) {
+			e = &ctx->entry[ctx->idx];
+			lvol = group_snap_lookup(ctx, e->lvol, &e->lvol_uuid);
+			if (lvol == NULL || lvol->blob != e->frozen_blob) {
+				/* Its blob handle was closed with it, and the freeze with the handle. */
+				SPDK_WARNLOG("group snapshot: member %u was deleted or closed while "
+					     "frozen; nothing left to unfreeze\n", ctx->idx);
+				e->frozen_blob = NULL;
+				ctx->idx++;
+				group_snap_advance(ctx);
+				return;
+			}
+			spdk_blob_group_unfreeze_io(e->frozen_blob, group_snap_unfreeze_cb, ctx);
+			return;
+		}
+		if (ctx->submitted && ctx->completed != ctx->count + 1) {
+			/* Timed out: the members are released, answer now, GC what comes late. */
+			group_snap_answer(ctx, false);
+			ctx->phase = GRP_SNAP_DRAIN;
 			return;
 		}
 		if (ctx->rc != 0) {
@@ -3172,16 +3277,30 @@ group_snap_advance(struct vbdev_lvol_group_snap_ctx *ctx)
 		}
 		group_snap_complete(ctx);
 		return;
+	case GRP_SNAP_DRAIN:
+		if (ctx->completed != ctx->count + 1) {
+			return;
+		}
+		ctx->phase = GRP_SNAP_GC;
+		group_snap_advance(ctx);
+		return;
 	case GRP_SNAP_GC:
 		ctx->completed = 0;
 		ctx->idx = 0;
 		ctx->phase = GRP_SNAP_GC_INPROCESS;
 		for (i = 0; i < ctx->count; i++) {
-			if (ctx->entries[i].snap != NULL) {
-				ctx->idx++;
-				vbdev_lvol_destroy(ctx->entries[i].snap,
-						   group_snap_gc_cb, &ctx->entry[i], true);
+			e = &ctx->entry[i];
+			if (e->snap == NULL) {
+				continue;
 			}
+			lvol = group_snap_lookup(ctx, e->snap, &e->snap_uuid);
+			if (lvol == NULL) {
+				SPDK_WARNLOG("group snapshot: partial snapshot %u is already gone\n", i);
+				e->snap = NULL;
+				continue;
+			}
+			ctx->idx++;
+			vbdev_lvol_destroy(lvol, group_snap_gc_cb, e, true);
 		}
 
 		/*
@@ -3260,9 +3379,12 @@ vbdev_lvol_create_snapshot_group(struct vbdev_lvol_group_snap_entry *entries,
 	for (i = 0; i < count; i++) {
 		ctx->entry[i].ctx = ctx;
 		ctx->entry[i].idx = i;
+		ctx->entry[i].lvol = entries[i].lvol;
+		ctx->entry[i].lvol_uuid = entries[i].lvol->uuid;
 	}
 	ctx->entries = entries;
 	ctx->count = count;
+	ctx->lvs = lvs;
 	ctx->cb_fn = cb_fn;
 	ctx->cb_arg = cb_arg;
 	ctx->phase = GRP_SNAP_FREEZE;
@@ -4848,6 +4970,22 @@ vbdev_lvs_fini_start(void)
 	spdk_poller_unregister(&g_resv_sync_poller);
 
 	vbdev_lvs_fini_start_iter(vbdev_lvol_store_first());
+}
+
+/* Module-wide settings for save_config, so a restart from the saved config
+ * keeps them: the partial-transfer whole-cluster threshold (a node-wide
+ * tunable; every other replication setting is a parameter of each transfer
+ * RPC). */
+static int
+vbdev_lvs_config_json(struct spdk_json_write_ctx *w)
+{
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_string(w, "method", "bdev_lvol_set_xfer_whole_cluster_pct");
+	spdk_json_write_named_object_begin(w, "params");
+	spdk_json_write_named_uint32(w, "pct", spdk_lvol_get_xfer_whole_cluster_pct());
+	spdk_json_write_object_end(w);
+	spdk_json_write_object_end(w);
+	return 0;
 }
 
 static int

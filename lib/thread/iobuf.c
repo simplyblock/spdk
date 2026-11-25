@@ -8,6 +8,7 @@
 #include "spdk/likely.h"
 #include "spdk/log.h"
 #include "spdk/thread.h"
+#include "spdk_internal/iobuf_chain.h"
 
 #define IOBUF_MIN_SMALL_POOL_SIZE	64
 #define IOBUF_MIN_LARGE_POOL_SIZE	8
@@ -74,6 +75,43 @@ static struct iobuf g_iobuf = {
 		.large_bufsize = IOBUF_DEFAULT_LARGE_BUFSIZE,
 	},
 };
+
+/*
+ * The cap every background chain user (replication, blob merge) shares, as a
+ * percentage of the small pool: the rest of the pool stays for client IO
+ * (nvmf), which waits for buffers without a kick and would stall if a
+ * background user emptied the pool. See spdk_internal/iobuf_chain.h.
+ */
+static struct spdk_iobuf_chain_budget g_iobuf_bg_budget;
+static uint32_t g_iobuf_bg_pct = SPDK_IOBUF_CHAIN_BG_PCT_DEFAULT;
+
+struct spdk_iobuf_chain_budget *
+spdk_iobuf_chain_bg_budget(void)
+{
+	uint64_t limit = g_iobuf.opts.small_pool_count *
+			 __atomic_load_n(&g_iobuf_bg_pct, __ATOMIC_RELAXED) / 100;
+
+	/* follows the pool size and the percentage as they are set */
+	__atomic_store_n(&g_iobuf_bg_budget.limit, spdk_max(limit, 1), __ATOMIC_RELAXED);
+	return &g_iobuf_bg_budget;
+}
+
+int
+spdk_iobuf_chain_set_bg_pct(uint32_t pct)
+{
+	if (pct == 0 || pct > 100) {
+		return -EINVAL;
+	}
+	__atomic_store_n(&g_iobuf_bg_pct, pct, __ATOMIC_RELAXED);
+	spdk_iobuf_chain_bg_budget();
+	return 0;
+}
+
+uint32_t
+spdk_iobuf_chain_get_bg_pct(void)
+{
+	return __atomic_load_n(&g_iobuf_bg_pct, __ATOMIC_RELAXED);
+}
 
 struct iobuf_get_stats_ctx {
 	struct spdk_iobuf_module_stats	*modules;

@@ -2253,13 +2253,32 @@ spdk_lvol_resize_register(struct spdk_lvol *lvol, uint64_t sz,
 	cb_fn(cb_arg,  bserrno);
 }
 
+/*
+ * Another lvol of the lvstore on the blob id, other than skip. Opening a blob
+ * id that is already open returns the same spdk_blob (open_ref++), so two
+ * lvols on one id share one handle.
+ */
+static struct spdk_lvol *
+lvs_get_other_lvol_by_blob_id(struct spdk_lvol_store *lvs, spdk_blob_id blob_id,
+			      const struct spdk_lvol *skip)
+{
+	struct spdk_lvol *tmp;
+
+	TAILQ_FOREACH(tmp, &lvs->lvols, link) {
+		if (tmp != skip && tmp->blob_id == blob_id) {
+			return tmp;
+		}
+	}
+	return NULL;
+}
+
 int
 spdk_lvol_register_live(struct spdk_lvol_store *lvs, const char *name, const char *uuid_str, uint64_t blobid,
 		 bool thin_provision, enum lvol_clear_method clear_method, spdk_lvol_op_with_handle_complete cb_fn,
 		 void *cb_arg)
 {
 	struct spdk_lvol_with_handle_req *req;
-	struct spdk_lvol *lvol;
+	struct spdk_lvol *lvol, *owner;
 	int rc;
 
 	if (lvs == NULL) {
@@ -2270,6 +2289,27 @@ spdk_lvol_register_live(struct spdk_lvol_store *lvs, const char *name, const cha
 	rc = lvs_verify_lvol_name(lvs, name);
 	if (rc < 0) {
 		return rc;
+	}
+
+	/*
+	 * An lvol already registered on this blob id is a stale one: the leader
+	 * deleted it and reused the id, but it was never removed here. Opening
+	 * the id would hand the new lvol the stale lvol's open handle (with the
+	 * stale metadata); deleting either lvol then freed the handle under the
+	 * other (bf32 2026-11-21: SIGSEGV in vbdev_lvol_resv_refresh on the next
+	 * register). Refuse: nothing changes here and the control plane sees
+	 * EEXIST; it has to delete the stale lvol before registering this one.
+	 * Evicting the stale lvol here instead would mean unregistering a bdev
+	 * that may still be exposed through an NVMe-oF namespace, asynchronously,
+	 * from inside a register.
+	 */
+	owner = lvs_get_other_lvol_by_blob_id(lvs, blobid, NULL);
+	if (owner != NULL) {
+		SPDK_ERRLOG("lvolstore %s: cannot register lvol %s on blob 0x%" PRIx64 ": the blob is "
+			    "already registered as lvol %s (uuid %s), a stale lvol whose blob id the "
+			    "leader reused? Delete it first\n", lvs->name, name, blobid, owner->name,
+			    owner->uuid_str);
+		return -EEXIST;
 	}
 
 	req = calloc(1, sizeof(*req));
@@ -2390,72 +2430,6 @@ spdk_lvol_rename(struct spdk_lvol *lvol, const char *new_name,
 	}
 }
 
-/* Waiting for a failover update of the blob, at most 3000 polls of 10 ms
- * (see lvol_destroy_non_leader). */
-#define LVOL_DESTROY_NON_LEADER_WAIT_US		(10 * 1000)
-#define LVOL_DESTROY_NON_LEADER_WAIT_MAX	3000
-
-static int lvol_destroy_non_leader_poll(void *arg);
-
-/*
- * Non-leader delete of the lvol's blob. delete_blob_manually frees the open
- * blob (blob_lookup of the id); if a failover update of it is in flight --
- * started when the snapshot below it was deleted in secondary mode -- its
- * completion chain then writes into freed memory. vbdev_lvol_destroy already
- * waits for that before it copies the blob; this covers an update that began
- * between that check and here (the bdev unregister in between is async).
- */
-static void
-lvol_destroy_non_leader(struct spdk_lvol_req *req)
-{
-	struct spdk_lvol *lvol = req->lvol;
-	struct spdk_blob_store *bs = lvol->lvol_store->blobstore;
-
-	if (spdk_blob_locked_operation_in_progress(lvol->blob) &&
-	    req->rc < LVOL_DESTROY_NON_LEADER_WAIT_MAX) {
-		if (req->poller == NULL) {
-			SPDK_NOTICELOG("Deleting tmpblob 0x%" PRIx64 " on failover: waiting for its "
-				       "metadata update\n", lvol->blob_id);
-			req->poller = SPDK_POLLER_REGISTER(lvol_destroy_non_leader_poll, req,
-							   LVOL_DESTROY_NON_LEADER_WAIT_US);
-		}
-		if (req->poller != NULL) {
-			return;
-		}
-		/* no poller: go on, as before this check */
-	}
-	if (req->poller != NULL) {
-		spdk_poller_unregister(&req->poller);
-	}
-	if (spdk_blob_locked_operation_in_progress(lvol->blob)) {
-		SPDK_ERRLOG("Deleting tmpblob 0x%" PRIx64 " on failover while its metadata update "
-			    "is still in flight\n", lvol->blob_id);
-	}
-
-	SPDK_NOTICELOG("Deleting tmpblob 0x%" PRIx64 " on failover.\n", lvol->blob_id);
-	// TODO add check for snapshots and clons
-	pthread_mutex_lock(&g_lvol_stores_mutex);
-	spdk_bs_delete_blob_non_leader(bs, lvol->tmp_blob);
-	pthread_mutex_unlock(&g_lvol_stores_mutex);
-	req->rc = 0;
-	lvol_delete_blob_cb(req, 0);
-}
-
-static int
-lvol_destroy_non_leader_poll(void *arg)
-{
-	struct spdk_lvol_req *req = arg;
-
-	/* rc counts the polls while the delete waits */
-	req->rc++;
-	if (spdk_blob_locked_operation_in_progress(req->lvol->blob) &&
-	    req->rc < LVOL_DESTROY_NON_LEADER_WAIT_MAX) {
-		return SPDK_POLLER_IDLE;
-	}
-	lvol_destroy_non_leader(req);
-	return SPDK_POLLER_BUSY;
-}
-
 void
 spdk_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_arg)
 {
@@ -2518,7 +2492,32 @@ spdk_lvol_destroy(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, void *cb_
 	if (lvol->lvol_store->leader) {
 		spdk_bs_delete_blob(bs, lvol->blob_id, lvol_delete_blob_cb, req);
 	} else {
-		lvol_destroy_non_leader(req);
+		struct spdk_lvol *other;
+
+		other = lvs_get_other_lvol_by_blob_id(lvol->lvol_store, lvol->blob_id, lvol);
+		if (other != NULL && other->blob != NULL) {
+			/*
+			 * Another lvol on the same blob id holds the open handle this lvol
+			 * shared (spdk_lvol_register_live refuses that now; an older
+			 * state may still have it). Deleting the blob frees that handle
+			 * under the other lvol (bf32). Leave the blob, and its metadata
+			 * pages, to the other lvol: its own delete releases them.
+			 */
+			SPDK_ERRLOG("Deleting tmpblob 0x%" PRIx64 " on failover: lvol %s still holds the "
+				    "same blob, leaving the blob to it\n", lvol->blob_id, other->name);
+			spdk_bs_free_blob_copy(lvol->tmp_blob);
+			lvol->tmp_blob = NULL;
+			lvol_delete_blob_cb(req, 0);
+			return;
+		}
+
+		SPDK_NOTICELOG("Deleting tmpblob 0x%" PRIx64 " on failover.\n", lvol->blob_id);
+		// TODO add check for snapshots and clons
+		pthread_mutex_lock(&g_lvol_stores_mutex);
+		spdk_bs_delete_blob_non_leader(bs, lvol->tmp_blob);
+		lvol->tmp_blob = NULL;
+		pthread_mutex_unlock(&g_lvol_stores_mutex);
+		lvol_delete_blob_cb(req , 0);
 	}
 }
 
@@ -2635,13 +2634,18 @@ struct lvol_destroy_refresh_ctx {
 };
 
 /* Called with g_lvol_stores_mutex held. *busy: a stale lvol is being
- * refreshed by another path (IO-triggered update) right now. */
+ * refreshed by another path (IO-triggered update) right now. *failed: a stale
+ * lvol whose last refresh failed (failed_on_update, not being refreshed): its
+ * metadata, and so the snapshot tree, is not known; it is returned there and
+ * the search stops. */
 static struct spdk_lvol *
-lvs_find_stale_lvol(struct spdk_lvol_store *lvs, struct spdk_lvol *self, bool *busy)
+lvs_find_stale_lvol(struct spdk_lvol_store *lvs, struct spdk_lvol *self, bool *busy,
+		    struct spdk_lvol **failed)
 {
 	struct spdk_lvol *l;
 
 	*busy = false;
+	*failed = NULL;
 	TAILQ_FOREACH(l, &lvs->lvols, link) {
 		if (l == self || l->leader || l->blob == NULL || l->hublvol ||
 		    strcmp(l->name, "hublvol") == 0) {
@@ -2652,6 +2656,14 @@ lvs_find_stale_lvol(struct spdk_lvol_store *lvs, struct spdk_lvol *self, bool *b
 			*busy = true;
 			continue;
 		}
+		if (l->failed_on_update) {
+			/* Review B4.2 #3: a failed refresh is not "busy"; waiting the full
+			 * 30 s for it and answering -EBUSY blocked every snapshot delete of
+			 * the lvstore. Answer at once; the delete can run again once the
+			 * lvol was refreshed (IO-triggered retry) or the leadership was set. */
+			*failed = l;
+			return NULL;
+		}
 		return l;
 	}
 	return NULL;
@@ -2660,13 +2672,13 @@ lvs_find_stale_lvol(struct spdk_lvol_store *lvs, struct spdk_lvol *self, bool *b
 static bool
 lvs_has_stale_lvol(struct spdk_lvol_store *lvs, struct spdk_lvol *self)
 {
-	struct spdk_lvol *stale;
+	struct spdk_lvol *stale, *failed;
 	bool busy;
 
 	pthread_mutex_lock(&g_lvol_stores_mutex);
-	stale = lvs_find_stale_lvol(lvs, self, &busy);
+	stale = lvs_find_stale_lvol(lvs, self, &busy, &failed);
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
-	return stale != NULL || busy;
+	return stale != NULL || busy || failed != NULL;
 }
 
 static void lvol_destroy_refresh_next(struct lvol_destroy_refresh_ctx *ctx);
@@ -2677,6 +2689,9 @@ lvol_destroy_refresh_finish(struct lvol_destroy_refresh_ctx *ctx, int rc)
 	spdk_lvol_op_complete cb_fn = ctx->cb_fn;
 	void *cb_arg = ctx->cb_arg;
 
+	assert(ctx->poller == NULL);
+	/* set by lvol_destroy_refresh_start() for the whole refresh + wait phase */
+	ctx->lvol->action_in_progress = false;
 	free(ctx);
 	cb_fn(cb_arg, rc);
 }
@@ -2696,6 +2711,19 @@ lvol_destroy_refresh_cpl(void *cb_arg, int lvolerrno)
 		lvol_destroy_refresh_finish(ctx, ERR_UPDATE_FAILED);
 		return;
 	}
+	/* Review B4.2 #5: the leadership may have been lost while the metadata was
+	 * read. Then the lvol must not be marked leader (it would serve IO as one);
+	 * only its refresh is over. The delete is aborted. */
+	pthread_mutex_lock(&g_lvol_stores_mutex);
+	if (!ctx->lvol->lvol_store->leader) {
+		stale->update_in_progress = false;
+		pthread_mutex_unlock(&g_lvol_stores_mutex);
+		SPDK_ERRLOG("lvol %s: cannot delete it: leadership lost while refreshing lvol %s\n",
+			    ctx->lvol->unique_id, stale->unique_id);
+		lvol_destroy_refresh_finish(ctx, ERR_LEADERSHIP_CHANGED);
+		return;
+	}
+	pthread_mutex_unlock(&g_lvol_stores_mutex);
 	spdk_lvol_set_leader(stale);
 	lvol_destroy_refresh_next(ctx);
 }
@@ -2717,7 +2745,7 @@ lvol_destroy_refresh_next(struct lvol_destroy_refresh_ctx *ctx)
 	struct spdk_lvol *lvol = ctx->lvol;
 	spdk_lvol_op_complete cb_fn = ctx->cb_fn;
 	void *cb_arg = ctx->cb_arg;
-	struct spdk_lvol *stale;
+	struct spdk_lvol *stale, *failed;
 	bool busy;
 
 	if (!lvs->leader) {
@@ -2727,7 +2755,7 @@ lvol_destroy_refresh_next(struct lvol_destroy_refresh_ctx *ctx)
 	}
 
 	pthread_mutex_lock(&g_lvol_stores_mutex);
-	stale = lvs_find_stale_lvol(lvs, lvol, &busy);
+	stale = lvs_find_stale_lvol(lvs, lvol, &busy, &failed);
 	if (stale != NULL) {
 		/* as lvol_update_async_delete() */
 		stale->update_in_progress = true;
@@ -2735,6 +2763,14 @@ lvol_destroy_refresh_next(struct lvol_destroy_refresh_ctx *ctx)
 		blob_freeze_on_failover(stale->blob);
 	}
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
+
+	if (failed != NULL) {
+		SPDK_ERRLOG("lvol %s: cannot delete it: refreshing lvol %s (blob 0x%" PRIx64 ") "
+			    "failed before, the snapshot tree is not known\n",
+			    lvol->unique_id, failed->unique_id, failed->blob_id);
+		lvol_destroy_refresh_finish(ctx, ERR_UPDATE_FAILED);
+		return;
+	}
 
 	if (stale != NULL) {
 		ctx->stale = stale;
@@ -2759,7 +2795,9 @@ lvol_destroy_refresh_next(struct lvol_destroy_refresh_ctx *ctx)
 		return;
 	}
 
-	/* The tree is current now: delete again, with the clone if there is one. */
+	/* The tree is current now: delete again, with the clone if there is one.
+	 * spdk_lvol_destroy_async() sets action_in_progress again for the delete. */
+	lvol->action_in_progress = false;
 	free(ctx);
 	spdk_lvol_destroy_async(lvol, cb_fn, cb_arg);
 }
@@ -2777,6 +2815,13 @@ lvol_destroy_refresh_start(struct spdk_lvol *lvol, spdk_lvol_op_complete cb_fn, 
 	ctx->lvol = lvol;
 	ctx->cb_fn = cb_fn;
 	ctx->cb_arg = cb_arg;
+	/* Review B4.2 #4: hold the lvol for the whole refresh + wait phase (up to 30 s
+	 * on a poller that keeps ctx->lvol): another delete (vbdev_lvol_destroy), open
+	 * and lvstore unload / destroy (spdk_lvs_unload, spdk_lvs_destroy) refuse an
+	 * lvol with an action in progress, so none of them frees it under the poller.
+	 * Cleared on every exit (lvol_destroy_refresh_finish, or right before the
+	 * delete runs again). */
+	lvol->action_in_progress = true;
 	SPDK_NOTICELOG("lvol %s: snapshot delete on a leader with lvols not refreshed since the "
 		       "takeover: refreshing them first\n", lvol->unique_id);
 	lvol_destroy_refresh_next(ctx);
@@ -3146,9 +3191,13 @@ lvol_update_on_failover_cpl(void *cb_arg, int lvolerrno)
 	struct spdk_lvol *lvol = req->lvol;	
 	if (lvolerrno < 0) {
 		SPDK_ERRLOG("Cannot update lvol on failover blob 0x%" PRIx64 "\n", lvol->blob_id);
-		//remember call function to drop the IO for this lvol
-		//change the state to drop;
-		lvol->failed_on_update = true;
+		/* IO is dropped on failed_on_update (vbdev and blob layer), not on
+		 * update_in_progress. Review B4.2 #3: update_in_progress has to end here
+		 * too, else the lvol counted as "being refreshed" for good: no IO retried
+		 * the refresh and every snapshot delete of the lvstore waited 30 s for it
+		 * and failed -EBUSY. The blob layer unfroze the blob, with
+		 * blob->failed_on_update set first (bs_update_blob_on_failover_cpl). */
+		spdk_lvol_set_leader_failed_on_update(lvol);
 		free(req);
 		return;		
 	}
@@ -3170,6 +3219,14 @@ lvol_update_failed_cpl(void *cb_arg, int lvolerrno)
 	SPDK_NOTICELOG("Unfreezed on filed update on failover blob 0x%" PRIx64 "\n", lvol->blob_id);
 }
 
+static void
+lvol_update_failed_cleanup_msg(void *arg)
+{
+	struct spdk_lvol *lvol = arg;
+
+	spdk_blob_update_failed_cleanup(lvol->blob, lvol_update_failed_cpl, lvol);
+}
+
 void
 lvol_update_on_failover(struct spdk_lvol_store *lvs, struct spdk_lvol *lvol, bool send_msg)
 {
@@ -3179,9 +3236,17 @@ lvol_update_on_failover(struct spdk_lvol_store *lvs, struct spdk_lvol *lvol, boo
 	req = calloc(1, sizeof(*req));
 	if (req == NULL) {
 		SPDK_ERRLOG("Cannot alloc memory for request structure.\n");
-		// change the state to drop incoming IO;
-		// we should call the cleanup
+		/* Drop incoming IO at once. The caller froze the blob: unfreeze it (IO
+		 * queued meanwhile fails on blob->failed_on_update) and end the update
+		 * (lvol_update_failed_cpl clears update_in_progress, review B4.2 #3),
+		 * on the md thread, as the lvstore-level failure does. */
 		lvol->failed_on_update = true;
+		if (!send_msg) {
+			spdk_blob_update_failed_cleanup(lvol->blob, lvol_update_failed_cpl, lvol);
+		} else if (spdk_thread_send_msg(spdk_bs_get_md_thread(lvs->blobstore),
+						lvol_update_failed_cleanup_msg, lvol) != 0) {
+			SPDK_ERRLOG("Cannot end failed update of blob 0x%" PRIx64 "\n", lvol->blob_id);
+		}
 		return;
 	}
 
@@ -3269,8 +3334,14 @@ spdk_lvol_update_on_failover(struct spdk_lvol_store *lvs, struct spdk_lvol *lvol
 		assert(lvol->leader == false);
 		lvol->update_in_progress = true;
 		if (lvs->retry_on_update > 3) {
-			SPDK_ERRLOG("Update lvolstore reached its limite.\n");
+			/* Nothing started (no freeze), so no update is in progress either
+			 * (review B4.2 #3); IO is dropped on failed_on_update. Every IO
+			 * comes here again now: log only the first one. */
+			if (!lvol->failed_on_update) {
+				SPDK_ERRLOG("Update lvolstore reached its limite.\n");
+			}
 			lvol->failed_on_update = true;
+			lvol->update_in_progress = false;
 			pthread_mutex_unlock(&g_lvol_stores_mutex);
 			return;
 		}
@@ -5038,6 +5109,8 @@ spdk_lvs_set_opts(struct spdk_lvol_store *lvs, uint64_t groupid, uint64_t port, 
 	return;
 }
 
+static void lvs_poll_group_iobuf_release_idle(struct spdk_lvs_poll_group *lpg);
+
 static int
 spdk_wait_for_pg_io_cleanup_poller(void *arg) {
 	struct remote_lvol_info *rmt_lvol = arg;
@@ -5055,6 +5128,7 @@ spdk_wait_for_pg_io_cleanup_poller(void *arg) {
 	rmt_lvol->channel = NULL;
 	tdev->pg[lpg->id]--;
 	free(rmt_lvol);
+	lvs_poll_group_iobuf_release_idle(lpg);
 	return -1;
 }
 
@@ -5242,6 +5316,32 @@ spdk_change_rmt_lvol_state(struct spdk_lvol_store *lvs, struct spdk_transfer_dev
 #define LVS_XFER_IOBUF_MODULE	"lvol_xfer"
 /* small buffers each poll group thread keeps in its channel cache */
 #define LVS_XFER_IOBUF_CACHE	32
+/*
+ * The small pool is shared with client IO (nvmf has no kick: a pool that
+ * replication empties stalls it). A replication task holds at most this many
+ * buffers at once (8 MiB at 8 KiB; a full window of 256 x 64 KiB would be
+ * 2048), and every non-priority task together with the merges at most the
+ * shared background cap (spdk_iobuf_chain_bg_budget()). Set with
+ * spdk_lvol_set_xfer_iobuf_max_bufs().
+ */
+#define LVS_XFER_IOBUF_MAX_BUFS_DEFAULT	1024
+static uint32_t g_lvs_xfer_iobuf_max_bufs = LVS_XFER_IOBUF_MAX_BUFS_DEFAULT;
+
+int
+spdk_lvol_set_xfer_iobuf_max_bufs(uint32_t max_bufs)
+{
+	if (max_bufs == 0) {
+		return -EINVAL;
+	}
+	g_lvs_xfer_iobuf_max_bufs = max_bufs;
+	return 0;
+}
+
+uint32_t
+spdk_lvol_get_xfer_iobuf_max_bufs(void)
+{
+	return g_lvs_xfer_iobuf_max_bufs;
+}
 
 static void
 xfer_req_put_bufs(struct spdk_lvs_xfer_req *req)
@@ -5486,13 +5586,20 @@ fragment_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 #define XFER_FINAL_PARTIAL_WINDOW	256
 
 /* A cluster of a partial transfer whose dirty share is at least this many
- * percent is sent as one whole-cluster request instead of its dirty ranges
- * (each range is a request of at most XFER_PARTIAL_MAX_BYTES through a
- * window of cluster_batch requests; a mostly-dirty cluster costs more that
- * way than its 2 MiB in one request). 100: only fully dirty clusters;
- * 0: every cluster whole. Set with spdk_lvol_set_xfer_whole_cluster_pct()
- * (RPC bdev_lvol_set_xfer_whole_cluster_pct). */
-#define XFER_WHOLE_CLUSTER_PCT_DEFAULT	50
+ * percent is sent whole instead of as its dirty ranges. 100: only fully dirty
+ * clusters (off); 0: every cluster whole. Set with
+ * spdk_lvol_set_xfer_whole_cluster_pct() (RPC
+ * bdev_lvol_set_xfer_whole_cluster_pct, kept in the lvol module's
+ * save_config output when not the default).
+ *
+ * Default off. The threshold was added when a whole cluster was one 2 MiB
+ * request; since every replication request is at most XFER_PARTIAL_MAX_BYTES,
+ * a whole cluster is 32 requests of 64 KiB too. Its dirty ranges take at
+ * most 32 + (number of ranges) requests -- one more per range, only for
+ * fragmented clusters -- but carry only the dirty bytes, while the whole
+ * cluster carries all 2 MiB: up to 2x the bytes at 50 %, which a WAN link
+ * pays for. Dirty ranges it is, unless the control plane sets a threshold. */
+#define XFER_WHOLE_CLUSTER_PCT_DEFAULT	100
 static uint32_t g_lvs_xfer_whole_cluster_pct = XFER_WHOLE_CLUSTER_PCT_DEFAULT;
 
 int
@@ -5805,17 +5912,30 @@ xfer_req_submit_chain(struct spdk_lvs_xfer_req *req)
  * waiting (still in flight for the window, which therefore does not refill:
  * nothing spins). xfer_req_bufs_ready submits it once it has the buffers.
  */
+static void lvs_poll_group_iobuf_init(struct spdk_lvs_poll_group *lpg);
+
 static int
 xfer_req_start(struct spdk_lvs_xfer_req *req)
 {
 	struct spdk_lvs_poll_group *lpg = req->rmt_lvol ? req->rmt_lvol->group : NULL;
+	struct spdk_lvs_xfer *xfer = req->xfer;
 	int rc;
 
+	if (lpg != NULL) {
+		/* the channel exists while replication runs on this thread */
+		lvs_poll_group_iobuf_init(lpg);
+	}
 	if (lpg == NULL || !lpg->iobuf_ok) {
 		SPDK_ERRLOG("Replication request at offset %" PRIu64 ": no iobuf channel on this "
 			    "poll group\n", req->offset);
 		return -ENOMEM;
 	}
+	/* capped per task and, unless the task is the frozen final step, by the
+	 * cap all background users share; the final step goes ahead of the
+	 * background requests waiting on this thread */
+	spdk_iobuf_chain_set_budget(&req->chain, &xfer->buf_budget,
+				    xfer->priority ? NULL : spdk_iobuf_chain_bg_budget(),
+				    xfer->priority);
 	rc = spdk_iobuf_chain_get(&lpg->bufq, &req->chain, xfer_req_bytes(req));
 	if (rc < 0) {
 		SPDK_ERRLOG("Replication request at offset %" PRIu64 ": %" PRIu64 " bytes do not fit "
@@ -5917,12 +6037,16 @@ xfer_bufq_abort_rmt(struct spdk_lvs_poll_group *lpg, struct remote_lvol_info *rm
 	}
 }
 
+/* Take the poll group's iobuf channel, if it has none (on its thread). */
 static void
 lvs_poll_group_iobuf_init(struct spdk_lvs_poll_group *lpg)
 {
 	int rc;
 
-	TAILQ_INIT(&lpg->buf_readyq);
+	if (lpg->iobuf_ok) {
+		return;
+	}
+	assert(TAILQ_EMPTY(&lpg->buf_readyq));
 	rc = spdk_iobuf_channel_init(&lpg->iobuf, LVS_XFER_IOBUF_MODULE, LVS_XFER_IOBUF_CACHE, 0);
 	if (rc != 0) {
 		/* the pool cannot fill the cache now: take buffers as needed */
@@ -5935,6 +6059,25 @@ lvs_poll_group_iobuf_init(struct spdk_lvs_poll_group *lpg)
 	}
 	spdk_iobuf_chain_queue_init(&lpg->bufq, &lpg->iobuf, xfer_req_bufs_ready);
 	lpg->iobuf_ok = true;
+}
+
+/*
+ * A transfer task's requests left this poll group (task end, device removal):
+ * when no replication runs here any more -- no task, no request holding or
+ * waiting for buffers -- give the iobuf channel back. Its cache goes back to
+ * the pool, and the iobuf library's shutdown waits for every channel: one
+ * held for the app's life would hang it. The next request takes it again.
+ */
+static void
+lvs_poll_group_iobuf_release_idle(struct spdk_lvs_poll_group *lpg)
+{
+	if (!lpg->iobuf_ok || !TAILQ_EMPTY(&lpg->rmt_lvols) ||
+	    !spdk_iobuf_chain_queue_idle(&lpg->bufq) || lpg->bufq.held != 0 ||
+	    !TAILQ_EMPTY(&lpg->buf_readyq)) {
+		return;
+	}
+	spdk_iobuf_channel_fini(&lpg->iobuf);
+	lpg->iobuf_ok = false;
 }
 
 static int
@@ -6229,6 +6372,19 @@ spdk_lvol_unfreeze_io(void *arg)
 	return;
 }
 
+/* A final step that fails before its task starts undoes the freeze it took
+ * through the unfreeze path, which resubmits the client IO queued meanwhile
+ * (only clearing lvol->freezed would strand it). A freeze that was already in
+ * place when the step started belongs to someone else and stays. */
+static void
+xfer_undo_final_freeze(struct spdk_lvol *lvol, bool final_step, bool was_frozen)
+{
+	if (!final_step || was_frozen) {
+		return;
+	}
+	spdk_lvol_unfreeze_io(lvol);
+}
+
 static void
 spdk_xfer_sync_mode(struct spdk_lvs_xfer *xfer)
 {
@@ -6345,6 +6501,7 @@ spdk_wait_for_xfer_pg_io_cleanup_poller(void *arg)
 
 	free(rmt_lvol);
 	xfer->pg[lpg->id] = false;
+	lvs_poll_group_iobuf_release_idle(lpg);
 	return -1;
 }
 
@@ -6403,6 +6560,7 @@ spdk_delete_rmt_lvol_pg(void *arg) {
 		break;
 	}
 	xfer->pg[lpg->id] = false;
+	lvs_poll_group_iobuf_release_idle(lpg);
 }
 
 static int
@@ -7002,7 +7160,52 @@ xfer_add_bridged_clusters(struct spdk_lvs_xfer *xfer)
 	return added;
 }
 
-static void
+/*
+ * A replication that asked for a delta against partial_base but sends full
+ * clusters: the destination holds a copy of partial_base (it is a clone of it,
+ * or merges from it), and the full send carries only the clusters the source
+ * owns itself. When the source's parent is not partial_base, the snapshots in
+ * between were never sent and their clusters would be missing on the
+ * destination. Send them too, whole (bridged, as the delta does), or refuse:
+ * the control plane must then do a real full send of the chain.
+ * 0, or a negative errno: the transfer must not start.
+ */
+static int
+xfer_full_bridge(struct spdk_lvs_xfer *xfer, uint64_t partial_base)
+{
+	struct spdk_lvol *lvol = xfer->lvol;
+	spdk_blob_id parent;
+
+	if (xfer->type != XFER_REPLICATE_SNAPSHOT || partial_base == 0 ||
+	    (spdk_blob_id)partial_base == lvol->blob_id) {
+		/* no destination base known (or the destination is the source) */
+		return 0;
+	}
+	parent = spdk_blob_get_parent_snapshot(lvol->lvol_store->blobstore, lvol->blob_id);
+	if (parent == (spdk_blob_id)partial_base) {
+		/* the source's own clusters are the whole difference */
+		return 0;
+	}
+	/* a delta setup that failed after bridging left its own array */
+	free(xfer->bridged);
+	xfer->bridged = NULL;
+	if (parent == SPDK_BLOBID_INVALID ||
+	    !xfer_bridge_partial_base(xfer, parent, partial_base)) {
+		SPDK_ERRLOG("Transfer lvol %s%s: full send against base 0x%" PRIx64 ": the base is "
+			    "not reachable from the source's parent 0x%" PRIx64 " within %u open "
+			    "snapshots; the clusters in between cannot be sent, refusing\n",
+			    lvol->name, xfer->final_step ? " final step" : "", partial_base,
+			    parent, XFER_BRIDGE_MAX_HOPS);
+		return -ENOENT;
+	}
+	SPDK_NOTICELOG("Transfer lvol %s%s: full send bridged over %" PRIu32 " snapshot(s) to "
+		       "base 0x%" PRIx64 ": %" PRIu64 " cluster(s) they own are sent whole too\n",
+		       lvol->name, xfer->final_step ? " final step" : "", xfer->bridge_hops,
+		       partial_base, xfer->bridge_clusters);
+	return 0;
+}
+
+static int
 xfer_setup_partial(struct spdk_lvs_xfer *xfer, uint64_t offset, uint64_t partial_base)
 {
 	struct spdk_lvol *lvol = xfer->lvol;
@@ -7026,6 +7229,14 @@ xfer_setup_partial(struct spdk_lvs_xfer *xfer, uint64_t offset, uint64_t partial
 		why = "the source is not a read-only snapshot";
 	} else if (offset != 0) {
 		why = "a resumed transfer sends full clusters";
+	} else if (xfer->dest_is_clone && lvol->xfer_clone_round_incomplete) {
+		/* An earlier transfer of this source into the clone did not
+		 * complete: its alloc step may have left zero-filled clusters
+		 * there that no data reached. A dirty range written into such a
+		 * cluster would leave zeroes where the base's content belongs
+		 * (no CoW: the clone owns it). Full clusters overwrite them
+		 * (no_zero_skip). */
+		why = "an earlier transfer into the clone did not complete";
 	} else if (xfer->page_size == 0 || SPDK_BLOB_DIRTY_BLOCK_SZ % xfer->page_size != 0) {
 		why = "dirty block is not a whole number of pages";
 	} else {
@@ -7071,12 +7282,13 @@ xfer_setup_partial(struct spdk_lvs_xfer *xfer, uint64_t offset, uint64_t partial
 					       lvol->name, spdk_blob_dirty_gen_base(gen), xfer->bridge_hops,
 					       partial_base, xfer->bridge_clusters);
 			}
-			return;
+			return 0;
 		}
 	}
 	SPDK_NOTICELOG("Transfer lvol %s%s: partial requested (base 0x%" PRIx64 "), sending full "
 		       "clusters: %s\n", lvol->name, xfer->final_step ? " final step" : "",
 		       partial_base, why);
+	return xfer_full_bridge(xfer, partial_base);
 }
 
 /* Fill ranges with cluster idx's dirty ranges. False: no usable bitmap for it
@@ -7163,7 +7375,12 @@ xfer_fill_range_req(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req *req)
 	if (xfer->lvol->redirect_map_id != 0) {
 		req->dst_offset = ((uint64_t)(xfer->lvol->redirect_map_id) << 48) | req->offset;
 	}
-	req->partial = true;
+	/* Only a dirty range is partial: its destination cluster holds the
+	 * base's content (or will, by CoW/merge), so its zero blocks must be
+	 * written. A piece of a whole cluster lands in a cluster the alloc step
+	 * just allocated (reads as zeroes): it keeps zero detection unless the
+	 * task says otherwise (no_zero_skip). */
+	req->partial = !xfer->range_whole;
 	req->action = REQ_ACTION_COPY_BACKUP;
 	req->status = XFER_REQ_STATUS_READY;
 
@@ -7204,6 +7421,7 @@ xfer_repl_next(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req *req)
 
 		if (xfer->partial != NULL && xfer->partial[i] && xfer_load_ranges(xfer, i)) {
 			/* bitmap-driven: only the dirty ranges travel */
+			xfer->range_whole = false;
 			xfer->hold_idx = i + 1;
 			xfer_fill_range_req(xfer, req);
 			return true;
@@ -7219,6 +7437,7 @@ xfer_repl_next(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req *req)
 			xfer->range_pos = 0;
 			xfer->range_done = 0;
 			xfer->range_cluster = i;
+			xfer->range_whole = true;
 			xfer->lvol->xfer_full_clusters++;
 			xfer->hold_idx = i + 1;
 			xfer_fill_range_req(xfer, req);
@@ -7464,6 +7683,10 @@ xfer_replication(struct spdk_lvs_xfer *xfer) {
 			break;
 		case XFER_STATE_DONE:
 			xfer->lvol->transfer_status = XFER_DONE;
+			if (xfer->dest_is_clone) {
+				/* every cluster reached the clone */
+				xfer->lvol->xfer_clone_round_incomplete = false;
+			}
 			destroy_xfer_task(xfer);
 			return 0;
 
@@ -8629,9 +8852,11 @@ spdk_lvs_create_poll_group(void *ctx)
 	lpg->thread_name = spdk_thread_get_name(lpg->thread);
 	TAILQ_INIT(&lpg->rmt_lvols);
 	TAILQ_INIT(&lpg->ch_tdev);
-	/* replication buffers: an iobuf channel of this thread (never released:
-	 * the poll group lives as long as the app) */
-	lvs_poll_group_iobuf_init(lpg);
+	/* replication buffers: an iobuf channel of this thread, taken by the
+	 * first replication request and released when replication stops here
+	 * (lvs_poll_group_iobuf_release_idle) -- held for the app's life it
+	 * would hang the iobuf shutdown */
+	TAILQ_INIT(&lpg->buf_readyq);
 	// lpg->md_thread = g_lvs_md_thread;
 	const char *suffix = strrchr(lpg->thread_name, '_'); // find last '_'
 	lpg->id =  atoi(suffix + 1);
@@ -9023,9 +9248,10 @@ spdk_lvol_create_backup_task(struct spdk_lvs_xfer *task, struct spdk_transfer_de
 	}
 	/* else no DMA payloads: every request's data is a chain of iobuf
 	 * small-pool buffers, taken per request on the poll group thread
-	 * (xfer_req_start) -- at most cluster_batch x 64 KiB in flight -- and a
-	 * command or the completion signal a small heap buffer
-	 * (xfer_req_ctrl_payload) */
+	 * (xfer_req_start) -- at most cluster_batch x 64 KiB in flight, and at
+	 * most the task's cap (buf_budget) -- and a command or the completion
+	 * signal a small heap buffer (xfer_req_ctrl_payload) */
+	spdk_iobuf_chain_budget_init(&task->buf_budget, g_lvs_xfer_iobuf_max_bufs);
 
 	for (int i = 0; i < task->cluster_batch; i++) {
         task->reqs[i].payload = task->pdus ? (uint8_t *)task->pdus + (i * s_elements_payload) : NULL;
@@ -9139,7 +9365,7 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
 	struct spdk_lvs_xfer *xfer, *task;	
 	struct spdk_lvol_store *lvs = lvol->lvol_store;	
 	int rc;
-	bool final_step;
+	bool final_step, was_frozen;
 	// if (!lvs->leader) {
 	// 	SPDK_ERRLOG("Lvolstore %s: is not leader.\n", lvs->name);
 	// 	return -EINVAL;
@@ -9244,17 +9470,41 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
 	 * landing) is not a clone: it is chained by the signal as before. */
 	task->dest_is_clone = type == XFER_REPLICATE_SNAPSHOT && cow_landing &&
 			      (task->final_step || dest_clone);
+	/* A clone destination is not new: it owns the clusters earlier rounds
+	 * (endgame dest_clone rounds, an earlier attempt) wrote, and the alloc
+	 * step skips clusters it already owns (spdk_blob_alloc_clusters), so a
+	 * zero block of a whole cluster may land on old data: write it. */
+	if (task->dest_is_clone) {
+		task->no_zero_skip = true;
+	}
 	/* Freeze the final step's volume before the partial decision: its
 	 * generation must not move under the setup (xfer_setup_partial). The
-	 * drain of IO already in flight follows (spdk_lvol_transfer_delay). */
+	 * drain of IO already in flight follows (spdk_lvol_transfer_delay).
+	 * A freeze already in place is someone else's: an early error below
+	 * leaves it (was_frozen). */
+	was_frozen = lvol->freezed;
 	if (task->final_step) {
 		lvol->freezed = true;
 	}
+	final_step = task->final_step;
 	/* Decided before the request buffers are sized: a partial task sends
 	 * every cluster in requests of at most XFER_PARTIAL_MAX_BYTES. */
 	if (allow_partial) {
 		task->cow_landing = cow_landing;
-		xfer_setup_partial(task, offset, partial_base);
+		rc = xfer_setup_partial(task, offset, partial_base);
+		if (rc != 0) {
+			/* nothing was sent: the control plane must do a real full send */
+			if (task->dirty_gen != NULL) {
+				spdk_blob_dirty_gen_unref(task->dirty_gen);
+			}
+			free(task->partial);
+			free(task->ranges);
+			free(task->bridged);
+			free(task->clusters);
+			free(task);
+			xfer_undo_final_freeze(lvol, final_step, was_frozen);
+			return rc;
+		}
 	}
 	/* A partial final step sends 64 KiB requests, not 2 MiB clusters: a
 	 * window of 2 (the control plane's final-step batch, sized for whole
@@ -9268,14 +9518,16 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
 		task->cluster_batch = XFER_FINAL_PARTIAL_WINDOW;
 	}
 
-	final_step = task->final_step;
 	rc = spdk_lvol_create_backup_task(task, tdev);
 	if (rc != 0) {
 		/* the task is freed; the freeze set above is ours to undo */
-		if (final_step) {
-			lvol->freezed = false;
-		}
+		xfer_undo_final_freeze(lvol, final_step, was_frozen);
 		return rc;
+	}
+	if (task->dest_is_clone) {
+		/* until this task reaches XFER_STATE_DONE the clone may hold
+		 * zero-filled clusters of it (see xfer_clone_round_incomplete) */
+		lvol->xfer_clone_round_incomplete = true;
 	}
 
 	if (task->priority && !task->priority_counted) {

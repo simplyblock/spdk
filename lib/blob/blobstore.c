@@ -642,8 +642,13 @@ blob_io_cpl(struct spdk_io_channel_iter *i, int status)
 	free(ctx);
 }
 
+/*
+ * group: also count the freeze in group_frozen_refcnt (consistency-group freeze). Both
+ * counters move together, and only once nothing can fail any more: on -ENOMEM neither
+ * moves, so group_frozen_refcnt never claims a freeze that frozen_refcnt does not hold.
+ */
 static void
-blob_freeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+blob_freeze_io_ext(struct spdk_blob *blob, bool group, spdk_blob_op_complete cb_fn, void *cb_arg)
 {
 	struct freeze_io_ctx *ctx;
 
@@ -661,9 +666,18 @@ blob_freeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg
 	ctx->blob = blob;
 
 	/* Freeze I/O on blob */
+	if (group) {
+		blob->group_frozen_refcnt++;
+	}
 	blob->frozen_refcnt++;
 
 	spdk_for_each_channel(blob->bs, blob_io_sync, ctx, blob_io_cpl);
+}
+
+static void
+blob_freeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	blob_freeze_io_ext(blob, false, cb_fn, cb_arg);
 }
 
 static void
@@ -854,8 +868,10 @@ spdk_bs_drain_channel_queued(struct spdk_blob_store *bs,
 	spdk_for_each_channel(bs, spdk_bs_drain_queued_io, ctx, spdk_bs_drain_cpl);
 }
 
+/* Counterpart of blob_freeze_io_ext: on -ENOMEM neither counter moves (the freeze is
+ * still held and the caller can retry); otherwise both drop together. */
 static void
-blob_unfreeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+blob_unfreeze_io_ext(struct spdk_blob *blob, bool group, spdk_blob_op_complete cb_fn, void *cb_arg)
 {
 	struct freeze_io_ctx *ctx;
 
@@ -873,10 +889,20 @@ blob_unfreeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_a
 	ctx->blob = blob;
 
 	assert(blob->frozen_refcnt > 0);
+	if (group) {
+		assert(blob->group_frozen_refcnt > 0);
+		blob->group_frozen_refcnt--;
+	}
 
 	blob->frozen_refcnt--;
 
 	spdk_for_each_channel(blob->bs, blob_execute_queued_io, ctx, blob_io_cpl);
+}
+
+static void
+blob_unfreeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	blob_unfreeze_io_ext(blob, false, cb_fn, cb_arg);
 }
 
 static int
@@ -1012,9 +1038,14 @@ blob_parse_page(const struct spdk_blob_md_page *page, struct spdk_blob *blob)
 			}
 
 			if ((desc_flags->invalid_flags | SPDK_BLOB_INVALID_FLAGS_MASK) !=
-			    SPDK_BLOB_INVALID_FLAGS_MASK) {
+			    SPDK_BLOB_INVALID_FLAGS_MASK && !blob->examine_flag) {
 				return -EINVAL;
 			}
+			/*
+			 * On examine, a blob with unknown invalid flags is parsed to the end so that its
+			 * clusters and md pages are claimed, and rejected (skipped) after that, in
+			 * blob_load_backing_dev().
+			 */
 
 			if ((desc_flags->data_ro_flags | SPDK_BLOB_DATA_RO_FLAGS_MASK) !=
 			    SPDK_BLOB_DATA_RO_FLAGS_MASK) {
@@ -1875,6 +1906,21 @@ blob_load_snapshot_cpl(void *cb_arg, struct spdk_blob *snapshot, int bserrno)
 		blob_load_final(ctx, bserrno);
 		return;
 	}
+	if (bserrno != 0 && bserrno != -ENOENT && ctx->status == SPDK_BLOB_LOAD_EXAMINE) {
+		/*
+		 * Examine load: the parent exists (its md page belongs to it) but failed to load.
+		 * Cutting the chain below would make this clone read zeroes where it inherits data,
+		 * and clearing the parent's used_blobids bit would keep the examine from ever
+		 * loading the parent itself, hiding its failure. Fail this clone with the parent's
+		 * error instead: a corrupted parent fails the whole load, an unusable but completely
+		 * parsed one (-ENOTSUP) gets this clone skipped with it (bs_load_iter_on_examine_cpl).
+		 */
+		SPDK_ERRLOG("blob 0x%" PRIx64 ": parent 0x%" PRIx64 " failed to load on examine (%d)\n",
+			    blob->id, blob->parent_id, bserrno);
+		blob->back_bs_dev = NULL;
+		blob_load_final(ctx, bserrno);
+		return;
+	}
 	if (bserrno != 0) {
 		// spdk_bit_array_clear(blob->bs->open_blobids, blob->parent_id);
 		// this line onlt for failover case
@@ -1974,6 +2020,19 @@ blob_load_backing_dev(spdk_bs_sequence_t *seq, void *cb_arg)
 	const void			*value;
 	size_t				len;
 	int				rc;
+
+	if (blob->examine_flag &&
+	    (blob->invalid_flags | SPDK_BLOB_INVALID_FLAGS_MASK) != SPDK_BLOB_INVALID_FLAGS_MASK) {
+		/*
+		 * Unknown invalid flags (blob_parse_page() let the examine parse finish so that its
+		 * clusters and md pages are claimed): the blob cannot be used; -ENOTSUP makes the
+		 * examine load skip it instead of failing (bs_load_iter_on_examine_cpl).
+		 */
+		SPDK_ERRLOG("blob 0x%" PRIx64 " has unsupported invalid flags 0x%" PRIx64 "\n",
+			    blob->id, blob->invalid_flags);
+		blob_load_final(ctx, -ENOTSUP);
+		return;
+	}
 
 	if (blob_is_esnap_clone(blob)) {
 		rc = blob_load_esnap(blob, seq->cpl.u.blob_handle.esnap_ctx);
@@ -2303,6 +2362,19 @@ blob_load_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 
 	page = &ctx->pages[ctx->num_pages - 1];
 	crc = blob_md_page_calc_crc(page);
+	if (crc != page->crc && spdk_mem_all_zero(page, sizeof(*page))) {
+		/*
+		 * The blobid is in the persisted used blobid mask, but its md page is all
+		 * zeroes. A delete persists the mask (bit cleared) before it zeroes the md
+		 * pages (blob_persist_start), and a create writes the md pages
+		 * before it sets the bit, so a set bit always names valid pages: this is
+		 * corruption, and the load fails.
+		 */
+		SPDK_ERRLOG("Metadata page %d of blobid 0x%" PRIx64 " is all zeroes, but the blobid "
+			    "is in the used blobid mask: metadata corrupted\n", current_page, blob->id);
+		blob_load_final(ctx, -EINVAL);
+		return;
+	}
 	if (crc != page->crc) {
 		SPDK_ERRLOG("Metadata page %d crc mismatch for blobid 0x%" PRIx64 "\n",
 			    current_page, blob->id);
@@ -2924,8 +2996,6 @@ blob_persist_zero_pages_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	struct spdk_blob_store		*bs = blob->bs;
 	size_t				i;
 
-	bool delete_blob = false;
-
 	if (bserrno != 0) {
 		blob_persist_complete(seq, ctx, bserrno);
 		return;
@@ -2947,18 +3017,12 @@ blob_persist_zero_pages_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		page_num = bs_blobid_to_page(blob->id);
 		ctx->idx_blobids = bs_blobid_to_page(blob->id);
 		bs_release_md_page(bs, page_num);
-		delete_blob = true;
 	}
 
 	spdk_spin_unlock(&bs->used_lock);
-	if (delete_blob) {
-		//sync md and blobids bit array
-		ctx->bit_cb_fn_persist = blob_persist_clear_clusters;
-		persist_bs_write_used_blobids(seq, ctx, 0);
-	} else {
-		/* Move on to clearing clusters */
-		blob_persist_clear_clusters(seq, ctx, 0);
-	}
+	/* A delete persisted the used blobid mask before zeroing the pages
+	 * (blob_persist_start). Move on to clearing clusters. */
+	blob_persist_clear_clusters(seq, ctx, 0);
 }
 
 static void
@@ -3115,6 +3179,32 @@ persist_bs_write_used_blobids(spdk_bs_sequence_t *seq, void *arg, int bserrno)
 	bs_sequence_write_dev(seq, ctx->bit_page, lba, bs_byte_to_lba(bs, SPDK_BS_PAGE_SIZE), cb_fn, arg);
 }
 
+/*
+ * Re-check, right before each direct HOME write of a write-through persist
+ * (blob_persist_start()), that this node may still write HOME. The journal
+ * write before it can complete after a demotion (it is not failed by the
+ * pause); a HOME write issued then would land on pages that the new leader
+ * may already have reused, and the create would "succeed" on a node that is
+ * no longer leader. is_leader is checked too: the journal pause is sent to
+ * the md thread and may not have run yet when leadership is already gone.
+ * On failure the persist fails with -EIO, like a journal write rejected by a
+ * paused journal (bs_md_journal_write()).
+ */
+static int
+blob_persist_home_direct_check(struct spdk_blob_persist_ctx *ctx)
+{
+	struct spdk_blob_store *bs = ctx->blob->bs;
+
+	if (bs->is_leader && bs_md_journal_home_direct_ok(bs->md_journal)) {
+		return 0;
+	}
+
+	SPDK_ERRLOG("blob 0x%" PRIx64 ": HOME write-through dropped: is_leader=%d, journal not "
+		    "writable (paused/failed/stopping) - failing the persist\n",
+		    ctx->blob->id, bs->is_leader);
+	return -EIO;
+}
+
 /* Journal write of the root page done: write the same buffer to its HOME LBA
  * when this persist writes through (see blob_persist_start()). */
 static void
@@ -3123,6 +3213,10 @@ blob_persist_page_root_home(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	struct spdk_blob_persist_ctx	*ctx = cb_arg;
 	struct spdk_blob		*blob = ctx->blob;
 	struct spdk_blob_store		*bs = blob->bs;
+
+	if (bserrno == 0 && ctx->home_direct) {
+		bserrno = blob_persist_home_direct_check(ctx);
+	}
 
 	if (bserrno != 0 || !ctx->home_direct) {
 		persist_bs_write_used_blobids(seq, ctx, bserrno);
@@ -3190,6 +3284,10 @@ blob_persist_page_chain_home(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	struct spdk_blob_store		*bs = blob->bs;
 	spdk_bs_batch_t			*batch;
 	size_t				i;
+
+	if (bserrno == 0 && ctx->home_direct) {
+		bserrno = blob_persist_home_direct_check(ctx);
+	}
 
 	if (bserrno != 0 || !ctx->home_direct) {
 		blob_persist_write_page_root(seq, ctx, bserrno);
@@ -3575,6 +3673,10 @@ blob_persist_extent_page_home(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno
 	struct spdk_blob		*blob = ctx->blob;
 	uint32_t			extent_page_id;
 
+	if (bserrno == 0 && ctx->home_direct) {
+		bserrno = blob_persist_home_direct_check(ctx);
+	}
+
 	if (bserrno != 0 || !ctx->home_direct) {
 		blob_persist_write_extent_pages(seq, ctx, bserrno);
 		return;
@@ -3670,7 +3772,16 @@ blob_persist_start(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		 * Immediately jump to the clean up routine. */
 		assert(blob->clean.num_pages > 0);
 		blob->state = SPDK_BLOB_STATE_CLEAN;
-		blob_persist_zero_pages(seq, ctx, 0);
+		/*
+		 * Persist the used blobid mask (the delete cleared the bit in memory,
+		 * bs_delete_blob_finish) BEFORE zeroing the md pages. A crash in between
+		 * then leaves a cleared bit over intact pages (a harmless leftover), never
+		 * a set bit over zeroed pages: a set bit always names valid metadata, and
+		 * the load treats an all-zero page under a set bit as corruption.
+		 */
+		ctx->idx_blobids = bs_blobid_to_page(blob->id);
+		ctx->bit_cb_fn_persist = blob_persist_zero_pages;
+		persist_bs_write_used_blobids(seq, ctx, 0);
 		return;
 
 	}
@@ -3815,6 +3926,13 @@ blob_persist(spdk_bs_sequence_t *seq, struct spdk_blob *blob, bool md_drain,
 
 	blob_verify_md_op(blob);
 
+	if (spdk_unlikely(blob->orphaned)) {
+		/* deleted on this node; its id may already belong to another blob */
+		blob->state = SPDK_BLOB_STATE_CLEAN;
+		cb_fn(seq, cb_arg, 0);
+		return;
+	}
+
 	if (blob->state == SPDK_BLOB_STATE_CLEAN && TAILQ_EMPTY(&blob->persists_to_complete)) {
 		cb_fn(seq, cb_arg, 0);
 		return;
@@ -3856,7 +3974,8 @@ struct spdk_blob_copy_cluster_ctx {
 	spdk_bs_sequence_t *seq;
 	struct spdk_blob_md_page *new_cluster_page;
 	struct spdk_bs_cluster_alloc *alloc;
-	bool data_written;	/* CoW data was written to new_cluster */
+	bool data_written;	/* CoW data was (or may have been) written to new_cluster */
+	bool copy_tried;	/* a COPY was sent for new_cluster (it may be partly done) */
 	int insert_rc;		/* insert error kept while the cluster is cleared */
 	/* Step times, for the allocation timing (see bs_cow_stat_add()). */
 	uint64_t slot_wait_us;	/* time the op waited for a free slot */
@@ -4248,6 +4367,33 @@ blob_insert_cluster_clear(struct spdk_blob_copy_cluster_ctx *ctx)
 	bs_batch_close(batch);
 }
 
+/*
+ * The CoW of a newly allocated cluster failed before the cluster was inserted
+ * into the blob (a read of the backing device, the copy, or a write of the new
+ * cluster failed). The cluster and a newly claimed extent page are still only
+ * claimed in the used maps: release them, or they leak. Before spdk #95 every
+ * such failure was -EIO and dropped leadership, and the next leader rebuilt
+ * the used maps from disk; now a full device (-ENOSPC) keeps the leader, and
+ * every failed CoW would take one cluster (and maybe an md page) out of the
+ * free count for good, until the lvstore looked full. When data may already be
+ * on the cluster (some chunk writes of the batch may have succeeded, or a
+ * partial copy), it is cleared first, as on a lost insert race: a new cluster
+ * must read as zeroes. The cluster is not in the blob's map yet, so nothing
+ * else releases it (no double free).
+ */
+static void
+blob_cow_failed(struct spdk_blob_copy_cluster_ctx *ctx, int bserrno)
+{
+	assert(bserrno != 0);
+	if (ctx->data_written) {
+		ctx->insert_rc = bserrno;
+		blob_insert_cluster_clear(ctx);
+		return;
+	}
+	blob_insert_cluster_revert(ctx);
+	bs_sequence_finish(ctx->seq, bserrno);
+}
+
 static void
 blob_insert_cluster_cpl(void *cb_arg, int bserrno)
 {
@@ -4287,8 +4433,9 @@ blob_write_copy_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	uint32_t cluster_number;
 
 	if (bserrno) {
-		/* The write failed, so jump to the final completion handler */
-		bs_sequence_finish(seq, bserrno);
+		/* The write failed: release the new cluster, then jump to the
+		 * final completion handler */
+		blob_cow_failed(ctx, bserrno);
 		return;
 	}
 
@@ -4310,7 +4457,11 @@ blob_write_copy_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 #define BLOB_COW_SCAN_UNIT	SPDK_BS_PAGE_SIZE	/* zero check granularity */
 #define BLOB_COW_MAX_WRITES	64		/* more ranges than this: write the whole chunk */
 
-/* Off for now (testing): CoW writes the whole cluster, zero parts included. */
+/* Off for now (testing): CoW writes the whole cluster, zero parts included.
+ * If this is turned on: zero-skip relies on the new cluster reading as zeroes.
+ * After a declined or failed COPY that is no longer true (the base may have
+ * done part of the copy), so blob_write_copy() never skips zero ranges for a
+ * cluster with ctx->copy_tried set. Keep that guard. */
 static bool g_blob_cow_skip_zero_ranges = false;
 
 static bool
@@ -4380,20 +4531,25 @@ blob_write_copy(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	ctx->read_tsc = spdk_get_ticks();
 
 	if (bserrno != 0) {
-		/* A read failed, so jump to the final completion handler */
-		bs_sequence_finish(seq, bserrno);
+		/* A read failed: release the new cluster, then jump to the final
+		 * completion handler */
+		blob_cow_failed(ctx, bserrno);
 		return;
 	}
 
 	/* Write all chunks in one batch. With no data to write the batch
 	 * completes at close and the cluster is inserted without any data write. */
+	ctx->data_written = true;	/* from here on the cluster may hold data */
 	batch = bs_sequence_to_batch(seq, 0, blob_write_copy_cpl, ctx);
 	for (c = 0; c < ctx->nchunks; c++) {
 		chunk_lba = bs_cluster_to_lba(bs, ctx->new_cluster) +
 			    bs_byte_to_lba(bs, (uint64_t)c * BLOB_COW_CHUNK_SIZE);
 		chunk_len = blob_cow_chunk_len(bs, c);
 
-		nranges = g_blob_cow_skip_zero_ranges ?
+		/* Fallback after a declined/failed COPY: the base may have copied
+		 * part of the cluster (or left anything there), so the cluster does
+		 * not read as zeroes. Rewrite the whole range, never skip zeroes. */
+		nranges = g_blob_cow_skip_zero_ranges && !ctx->copy_tried ?
 			  spdk_bs_find_data_ranges(ctx->bufs[c], chunk_len, BLOB_COW_SCAN_UNIT, 0,
 						   ranges, BLOB_COW_MAX_WRITES) : -1;
 		if (nranges < 0) {
@@ -4448,11 +4604,59 @@ blob_can_copy(struct spdk_blob *blob, uint64_t cluster_start_page, uint64_t *bas
 	       blob->back_bs_dev->translate_lba(blob->back_bs_dev, lba, base_lba);
 }
 
+/*
+ * COPY offload back-off. The base can decline a COPY (the distrib declines a
+ * page copy at max. copy chain depth or when the destination page is still
+ * mapped; on a loaded bed that is most of them), and then the CoW pays the
+ * COPY round trip before its read/write fallback. After
+ * g_blob_copy_decline_limit declines in a row on a channel, CoWs on that
+ * channel skip the COPY and read/write directly; every
+ * g_blob_copy_retry_every-th of them tries the COPY again, so a base that
+ * accepts again is used again. One success clears the back-off. The state is
+ * per bs channel, i.e. per thread, and needs no locks.
+ */
+#define BLOB_COPY_DECLINE_LIMIT	8
+#define BLOB_COPY_RETRY_EVERY	256
+static uint32_t g_blob_copy_decline_limit = BLOB_COPY_DECLINE_LIMIT;
+static uint32_t g_blob_copy_retry_every = BLOB_COPY_RETRY_EVERY;
+
+/* Called once per CoW that could be offloaded: true to send the COPY. */
+static bool
+bs_channel_copy_allowed(struct spdk_bs_channel *ch)
+{
+	if (ch->copy_declines < g_blob_copy_decline_limit) {
+		return true;
+	}
+	if (++ch->copy_skips >= g_blob_copy_retry_every) {
+		/* Probe: try the COPY once more. */
+		ch->copy_skips = 0;
+		return true;
+	}
+	return false;
+}
+
+static void
+bs_channel_copy_result(struct spdk_bs_channel *ch, int bserrno)
+{
+	if (bserrno == 0) {
+		ch->copy_declines = 0;
+		ch->copy_skips = 0;
+	} else if (ch->copy_declines < UINT32_MAX) {
+		if (++ch->copy_declines == g_blob_copy_decline_limit) {
+			SPDK_INFOLOG(blob, "%" PRIu32 " cluster copies declined in a row (last %d), "
+				     "reading and writing CoW clusters instead\n",
+				     ch->copy_declines, bserrno);
+		}
+	}
+}
+
 static void
 blob_copy_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
 	struct spdk_blob_copy_cluster_ctx *ctx = cb_arg;
 	struct spdk_blob *blob = ctx->blob;
+
+	bs_channel_copy_result(((struct spdk_bs_request_set *)seq)->channel, bserrno);
 
 	if (bserrno == 0) {
 		blob_write_copy_cpl(seq, cb_arg, 0);
@@ -4469,7 +4673,7 @@ blob_copy_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	 * IO fails (the lvol layer then drops leadership of the lvstore). */
 	((struct spdk_bs_request_set *)seq)->bserrno = 0;
 	if (blob_cow_bufs_alloc(ctx, blob->back_bs_dev->blocklen) != 0) {
-		bs_sequence_finish(seq, -ENOMEM);
+		blob_cow_failed(ctx, -ENOMEM);
 		return;
 	}
 
@@ -4483,6 +4687,8 @@ blob_copy(struct spdk_blob_copy_cluster_ctx *ctx, spdk_bs_user_op_t *op, uint64_
 	uint64_t lba_count = bs_dev_byte_to_lba(blob->back_bs_dev, blob->bs->cluster_sz);
 
 	ctx->read_tsc = ctx->start_tsc;	/* the copy has no separate read */
+	ctx->data_written = true;	/* a failed copy may have written part of the cluster */
+	ctx->copy_tried = true;
 	bs_sequence_copy_dev(ctx->seq,
 			     bs_cluster_to_lba(blob->bs, ctx->new_cluster),
 			     src_lba,
@@ -4562,6 +4768,11 @@ bs_allocate_and_copy_cluster(struct spdk_blob *blob,
 	is_zeroes = is_valid_range && blob->back_bs_dev->is_zeroes(blob->back_bs_dev,
 			bs_dev_page_to_lba(blob->back_bs_dev, cluster_start_page),
 			bs_dev_byte_to_lba(blob->back_bs_dev, blob->bs->cluster_sz));
+	if (can_copy && blob->parent_id != SPDK_BLOBID_INVALID && !is_zeroes &&
+	    !bs_channel_copy_allowed(ch)) {
+		/* The base keeps declining COPYs: read and write directly. */
+		can_copy = false;
+	}
 	if (blob->parent_id != SPDK_BLOBID_INVALID && !is_zeroes && !can_copy) {
 		if (blob_cow_bufs_alloc(ctx, blob->back_bs_dev->blocklen) != 0) {
 			SPDK_ERRLOG("DMA allocation of %" PRIu32 " CoW chunks of size = %d failed.\n",
@@ -4963,10 +5174,38 @@ blob_dirty_gen_reparent(struct spdk_blob *blob, spdk_blob_id new_parent)
  * fragments (bed bf18 2026-11-09: 64 x 512 KiB spdk_malloc failed there).
  */
 #define BLOB_MERGE_CHUNK	(64 * 1024)
-#define BLOB_MERGE_IOBUF_MODULE	"blob_merge"
 /* While a piece waits for buffers: look this often for buffers that other
  * threads returned to the pool (they wake only waiters of their own thread). */
 #define BLOB_MERGE_KICK_US	1000
+/*
+ * Limits of one merge's use of the iobuf small pool, which client IO shares:
+ * at most this many buffers at once (and, with every replication task, at most
+ * the shared background cap, spdk_iobuf_chain_bg_budget()), and a merge whose
+ * pieces get no buffers for this long fails with -ETIMEDOUT instead of waiting
+ * forever. Set with spdk_blob_set_merge_iobuf_limits().
+ */
+#define BLOB_MERGE_MAX_BUFS_DEFAULT	256
+#define BLOB_MERGE_TIMEOUT_MS_DEFAULT	60000
+static uint32_t g_blob_merge_max_bufs = BLOB_MERGE_MAX_BUFS_DEFAULT;
+static uint32_t g_blob_merge_timeout_ms = BLOB_MERGE_TIMEOUT_MS_DEFAULT;
+
+int
+spdk_blob_set_merge_iobuf_limits(uint32_t max_bufs, uint32_t timeout_ms)
+{
+	if (max_bufs == 0 || timeout_ms == 0) {
+		return -EINVAL;
+	}
+	g_blob_merge_max_bufs = max_bufs;
+	g_blob_merge_timeout_ms = timeout_ms;
+	return 0;
+}
+
+void
+spdk_blob_get_merge_iobuf_limits(uint32_t *max_bufs, uint32_t *timeout_ms)
+{
+	*max_bufs = g_blob_merge_max_bufs;
+	*timeout_ms = g_blob_merge_timeout_ms;
+}
 
 struct blob_merge_ctx;
 
@@ -4980,6 +5219,8 @@ struct blob_merge_op {
 };
 
 struct blob_merge_ctx {
+	struct spdk_blob_store		*bs;
+	TAILQ_ENTRY(blob_merge_ctx)	link;		/* bs->merges */
 	struct spdk_blob		*blob;
 	struct spdk_blob		*parent;	/* NULL: no parent, the base reads zeroes */
 	struct spdk_io_channel		*ch;
@@ -5009,6 +5250,18 @@ struct blob_merge_ctx {
 	TAILQ_HEAD(, blob_merge_op)	readyq;
 	bool				run_pending;
 	struct spdk_poller		*kick_poller;
+	/* the merge's own cap on small-pool buffers (g_blob_merge_max_bufs);
+	 * last_progress: a piece got buffers or completed (the timeout counts
+	 * from it while pieces wait); epoch: the blobstore's leadership epoch
+	 * at the start -- a change cancels the merge */
+	struct spdk_iobuf_chain_budget	budget;
+	uint64_t			last_progress;
+	uint64_t			epoch;
+	/* the last reference to the blob was closed while the merge ran: the
+	 * close was held back (and cancelled the merge) and runs at its end */
+	bool				close_deferred;
+	spdk_blob_op_complete		close_cb_fn;
+	void				*close_cb_arg;
 	struct blob_merge_op		ops[BLOB_MERGE_QD];
 	spdk_blob_merge_complete	cb_fn;
 	void				*cb_arg;
@@ -5017,7 +5270,11 @@ struct blob_merge_ctx {
 /*
  * The merges of a blobstore share one iobuf channel on the md thread (a thread
  * has at most IOBUF_MAX_CHANNELS). No cache: a merge takes the pool's buffers
- * as it goes and returns each piece's at once.
+ * as it goes and returns each piece's at once. The channel's iobuf module is
+ * the blobstore's own (registered while the channel exists): with one module
+ * for all, the channel of one blobstore going away while a merge of another on
+ * the same md thread waits for a buffer trips iobuf's assert that no waiting
+ * entry of the module is left on the thread.
  */
 static int
 bs_merge_iobuf_get(struct spdk_blob_store *bs)
@@ -5028,18 +5285,22 @@ bs_merge_iobuf_get(struct spdk_blob_store *bs)
 		bs->merge_iobuf_refs++;
 		return 0;
 	}
-	rc = spdk_iobuf_register_module(BLOB_MERGE_IOBUF_MODULE);
+	snprintf(bs->merge_iobuf_module, sizeof(bs->merge_iobuf_module), "blob_merge_%p",
+		 (void *)bs);
+	rc = spdk_iobuf_register_module(bs->merge_iobuf_module);
 	if (rc != 0 && rc != -EEXIST) {
 		return rc;
 	}
 	bs->merge_iobuf = calloc(1, sizeof(*bs->merge_iobuf));
 	if (bs->merge_iobuf == NULL) {
+		spdk_iobuf_unregister_module(bs->merge_iobuf_module);
 		return -ENOMEM;
 	}
-	rc = spdk_iobuf_channel_init(bs->merge_iobuf, BLOB_MERGE_IOBUF_MODULE, 0, 0);
+	rc = spdk_iobuf_channel_init(bs->merge_iobuf, bs->merge_iobuf_module, 0, 0);
 	if (rc != 0) {
 		free(bs->merge_iobuf);
 		bs->merge_iobuf = NULL;
+		spdk_iobuf_unregister_module(bs->merge_iobuf_module);
 		return rc;
 	}
 	bs->merge_iobuf_refs = 1;
@@ -5054,6 +5315,7 @@ bs_merge_iobuf_put(struct spdk_blob_store *bs)
 		spdk_iobuf_channel_fini(bs->merge_iobuf);
 		free(bs->merge_iobuf);
 		bs->merge_iobuf = NULL;
+		spdk_iobuf_unregister_module(bs->merge_iobuf_module);
 	}
 }
 
@@ -5116,6 +5378,101 @@ blob_merge_next_piece(struct blob_merge_ctx *ctx, uint64_t *offset, uint64_t *le
 static void blob_merge_pump(struct blob_merge_ctx *ctx);
 static void blob_merge_issue(struct blob_merge_ctx *ctx);
 
+/* The merge is gone: an unload that waited for the blobstore's merges goes on. */
+static void
+blob_merge_retire(struct blob_merge_ctx *ctx)
+{
+	struct spdk_blob_store *bs = ctx->bs;
+	spdk_bs_op_complete unload_cb_fn;
+	void *unload_cb_arg;
+
+	TAILQ_REMOVE(&bs->merges, ctx, link);
+	free(ctx);
+	if (TAILQ_EMPTY(&bs->merges) && !bs->merges_cancelling && bs->merge_unload_cb_fn != NULL) {
+		unload_cb_fn = bs->merge_unload_cb_fn;
+		unload_cb_arg = bs->merge_unload_cb_arg;
+		bs->merge_unload_cb_fn = NULL;
+		bs->merge_unload_cb_arg = NULL;
+		spdk_bs_unload(bs, unload_cb_fn, unload_cb_arg);
+	}
+}
+
+static void
+blob_merge_close_done(void *cb_arg, int bserrno)
+{
+	struct blob_merge_ctx *ctx = cb_arg;
+
+	ctx->close_cb_fn(ctx->close_cb_arg, bserrno);
+	blob_merge_retire(ctx);
+}
+
+/* A piece that waited for buffers leaves without IO (the merge failed). */
+static void
+blob_merge_op_withdrawn(struct blob_merge_op *op)
+{
+	op->busy = false;
+	op->ctx->inflight--;
+}
+
+/*
+ * The merge failed (or is cancelled or timed out): the pieces that wait for
+ * buffers, or got them and wait to be submitted, give them back now and leave
+ * -- a failed merge must not hold, or keep waiting for, buffers that client IO
+ * shares. The pieces in flight complete as usual. The caller pumps.
+ */
+static void
+blob_merge_fail(struct blob_merge_ctx *ctx, int rc)
+{
+	struct spdk_iobuf_chain *chain;
+	struct blob_merge_op *op;
+
+	if (ctx->rc == 0) {
+		SPDK_ERRLOG("blob 0x%" PRIx64 ": merge with the base stops: %d\n", ctx->blob->id, rc);
+		ctx->rc = rc;
+	}
+	if (!ctx->iobuf_ref) {
+		return;
+	}
+	while ((chain = spdk_iobuf_chain_withdraw_waiting(&ctx->bufq)) != NULL) {
+		blob_merge_op_withdrawn(SPDK_CONTAINEROF(chain, struct blob_merge_op, chain));
+	}
+	while ((op = TAILQ_FIRST(&ctx->readyq)) != NULL) {
+		TAILQ_REMOVE(&ctx->readyq, op, ready_link);
+		spdk_iobuf_chain_put(&op->chain);
+		blob_merge_op_withdrawn(op);
+	}
+}
+
+/* Stop the merge now (close of its blob, unload, leadership change). */
+static void
+blob_merge_cancel(struct blob_merge_ctx *ctx, int rc)
+{
+	blob_merge_fail(ctx, rc);
+	/* may finish the merge */
+	blob_merge_pump(ctx);
+}
+
+/*
+ * spdk_blob_close of the last reference while the blob merges: the blob must
+ * outlive the merge's IO, so the close waits for the merge, which it cancels.
+ */
+static void
+blob_merge_defer_close(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	struct blob_merge_ctx *ctx = blob->merge_ctx;
+
+	if (ctx->close_deferred) {
+		cb_fn(cb_arg, -EBUSY);
+		return;
+	}
+	SPDK_NOTICELOG("blob 0x%" PRIx64 ": closed while it merges with the base: the merge is "
+		       "cancelled, the close waits for it\n", blob->id);
+	ctx->close_deferred = true;
+	ctx->close_cb_fn = cb_fn;
+	ctx->close_cb_arg = cb_arg;
+	blob_merge_cancel(ctx, -ECANCELED);
+}
+
 static void
 blob_merge_finish(struct blob_merge_ctx *ctx)
 {
@@ -5124,20 +5481,23 @@ blob_merge_finish(struct blob_merge_ctx *ctx)
 	assert(TAILQ_EMPTY(&ctx->readyq));
 	blob->dirty_gen = ctx->gen;
 	blob->dirty_merging = false;
+	blob->merge_ctx = NULL;
 	if (ctx->rc == 0) {
 		ctx->gen->merge_pending = false;
 	}
 	SPDK_NOTICELOG("blob 0x%" PRIx64 ": merged with the base: %" PRIu64 " cluster(s), %" PRIu64
 		       " range(s), %" PRIu64 " bytes, rc %d\n", blob->id, ctx->stats.clusters,
 		       ctx->stats.ranges, ctx->stats.bytes, ctx->rc);
-	if (ctx->bufq.waits != 0) {
+	if (ctx->bufq.waits != 0 || ctx->budget.refused != 0) {
 		SPDK_NOTICELOG("blob 0x%" PRIx64 ": merge waited for iobuf small-pool buffers %" PRIu64
-			       " time(s)\n", blob->id, ctx->bufq.waits);
+			       " time(s) (%" PRIu64 " over a cap), held at most %" PRIu64 "\n", blob->id,
+			       ctx->bufq.waits, ctx->budget.refused, ctx->budget.max_used);
 	}
 	spdk_poller_unregister(&ctx->kick_poller);
 	for (int i = 0; i < BLOB_MERGE_QD; i++) {
 		spdk_iobuf_chain_put(&ctx->ops[i].chain);
 	}
+	assert(ctx->budget.used == 0);
 	if (ctx->iobuf_ref) {
 		bs_merge_iobuf_put(blob->bs);
 	}
@@ -5145,7 +5505,12 @@ blob_merge_finish(struct blob_merge_ctx *ctx)
 	free(ctx->ranges);
 	free(ctx->words);
 	ctx->cb_fn(ctx->cb_arg, &ctx->stats, ctx->rc);
-	free(ctx);
+	if (ctx->close_deferred) {
+		/* the held-back close of the last reference */
+		spdk_blob_close(blob, blob_merge_close_done, ctx);
+		return;
+	}
+	blob_merge_retire(ctx);
 }
 
 static void
@@ -5156,8 +5521,11 @@ blob_merge_op_done(struct blob_merge_op *op, int bserrno)
 	if (bserrno != 0 && ctx->rc == 0) {
 		SPDK_ERRLOG("blob 0x%" PRIx64 ": merge of [%" PRIu64 ", +%" PRIu64 ") failed: %d\n",
 			    ctx->blob->id, op->offset, op->length, bserrno);
-		ctx->rc = bserrno;
+		/* the pieces that wait for buffers leave now: they would only
+		 * give them back once they got them */
+		blob_merge_fail(ctx, bserrno);
 	}
+	ctx->last_progress = spdk_get_ticks();
 	/* the buffers go back at once: to a piece waiting for them, of this
 	 * merge or another user of the md thread, else to the pool */
 	spdk_iobuf_chain_put(&op->chain);
@@ -5198,6 +5566,7 @@ blob_merge_submit(struct blob_merge_op *op)
 		blob_merge_op_done(op, 0);
 		return;
 	}
+	ctx->last_progress = spdk_get_ticks();
 	spdk_blob_io_readv_with_priority(ctx->parent, ctx->ch, op->chain.iovs, (int)op->chain.needed,
 					 op->offset, op->length, ctx->priority_class,
 					 blob_merge_read_cpl, op);
@@ -5246,13 +5615,28 @@ blob_merge_kick(void *arg)
 {
 	struct blob_merge_ctx *ctx = arg;
 
+	uint64_t now = spdk_get_ticks();
+
 	if (!ctx->run_pending && !TAILQ_EMPTY(&ctx->readyq)) {
 		/* may finish the merge, and unregister this poller */
 		blob_merge_run_ready(ctx);
 		return SPDK_POLLER_BUSY;
 	}
+	if (ctx->rc == 0 && spdk_bs_get_dirty_epoch(ctx->bs) != ctx->epoch) {
+		/* leadership changed (failover): stop, may finish the merge */
+		blob_merge_cancel(ctx, -ECANCELED);
+		return SPDK_POLLER_BUSY;
+	}
 	if (spdk_iobuf_chain_queue_idle(&ctx->bufq)) {
+		ctx->last_progress = now;
 		return SPDK_POLLER_IDLE;
+	}
+	if (ctx->rc == 0 && now - ctx->last_progress >
+	    (uint64_t)g_blob_merge_timeout_ms * spdk_get_ticks_hz() / 1000) {
+		/* no buffers for that long: fail, instead of waiting forever with
+		 * the merge's pieces queued on the md thread (may finish it) */
+		blob_merge_cancel(ctx, -ETIMEDOUT);
+		return SPDK_POLLER_BUSY;
 	}
 	spdk_iobuf_chain_kick(&ctx->bufq);
 	return SPDK_POLLER_BUSY;
@@ -5281,6 +5665,11 @@ blob_merge_issue(struct blob_merge_ctx *ctx)
 {
 	int rc;
 
+	if (ctx->rc == 0 && spdk_bs_get_dirty_epoch(ctx->bs) != ctx->epoch) {
+		/* leadership changed since the merge started: no new pieces (the
+		 * caller, blob_merge_pump, finishes once the rest is back) */
+		blob_merge_fail(ctx, -ECANCELED);
+	}
 	for (uint32_t i = 0; i < BLOB_MERGE_QD && ctx->rc == 0; i++) {
 		struct blob_merge_op *op = &ctx->ops[i];
 
@@ -5365,6 +5754,7 @@ spdk_blob_merge_base_ext(struct spdk_blob *blob, int priority_class,
 		cb_fn(cb_arg, &none, -ENOMEM);
 		return;
 	}
+	ctx->bs = bs;
 	ctx->blob = blob;
 	ctx->parent = parent;
 	ctx->gen = gen;
@@ -5379,9 +5769,16 @@ spdk_blob_merge_base_ext(struct spdk_blob *blob, int priority_class,
 	ctx->ranges = calloc(ctx->nbits / 2 + 1, sizeof(*ctx->ranges));
 	ctx->ch = spdk_bs_alloc_io_channel(bs);
 	TAILQ_INIT(&ctx->readyq);
+	/* the merge's buffers count against its own cap and against the one it
+	 * shares with replication, which leaves the rest of the pool to client IO */
+	spdk_iobuf_chain_budget_init(&ctx->budget, g_blob_merge_max_bufs);
 	for (int i = 0; i < BLOB_MERGE_QD; i++) {
 		ctx->ops[i].ctx = ctx;
+		spdk_iobuf_chain_set_budget(&ctx->ops[i].chain, &ctx->budget,
+					    spdk_iobuf_chain_bg_budget(), false);
 	}
+	ctx->epoch = spdk_bs_get_dirty_epoch(bs);
+	ctx->last_progress = spdk_get_ticks();
 	if (ctx->words == NULL || ctx->ranges == NULL || ctx->ch == NULL) {
 		if (ctx->ch == NULL) {
 			SPDK_ERRLOG("blob 0x%" PRIx64 ": merge with the base: no I/O channel\n", blob->id);
@@ -5430,6 +5827,8 @@ spdk_blob_merge_base_ext(struct spdk_blob *blob, int priority_class,
 	 * Nothing else writes to a landing blob between its transfer and here. */
 	blob->dirty_gen = NULL;
 	blob->dirty_merging = true;
+	blob->merge_ctx = ctx;
+	TAILQ_INSERT_TAIL(&bs->merges, ctx, link);
 	blob_merge_pump(ctx);
 }
 
@@ -6417,7 +6816,6 @@ struct spdk_bs_load_ctx {
 	bool					dumping;
 	bool              		snapshot_create_mode;
 	bool              		snapshot_md_flag;
-	bool				orphan_released;
 	uint32_t				page_counter;
 	bool 					dump_type;
 	FILE					*fp;
@@ -6569,6 +6967,7 @@ bs_alloc(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts, struct spdk_blob_st
 	}
 
 	RB_INIT(&bs->open_blobs);
+	TAILQ_INIT(&bs->merges);
 	TAILQ_INIT(&bs->snapshots);
 	bs->dev = dev;
 	bs->md_thread = spdk_get_thread();
@@ -6642,6 +7041,10 @@ bs_load_ctx_fail(struct spdk_bs_load_ctx *ctx, int bserrno)
 	assert(bserrno != 0);
 
 	spdk_free(ctx->super);
+	/* A mask read that failed (or any later step) leaves its buffer here;
+	 * every path that frees the mask itself sets ctx->mask to NULL. */
+	spdk_free(ctx->mask);
+	ctx->mask = NULL;
 	bs_sequence_finish(ctx->seq, bserrno);
 	if (!ctx->dump_type) {
 		bs_free(ctx->bs);
@@ -6958,6 +7361,7 @@ bs_load_iter(void *arg, struct spdk_blob *blob, int bserrno)
 	spdk_free(ctx->super);
 	if (ctx->mask) {
 		spdk_free(ctx->mask);
+		ctx->mask = NULL;
 	}
 	bs_sequence_finish(ctx->seq, bserrno);
 	free(ctx);
@@ -7003,8 +7407,9 @@ bs_load_examine_finish(struct spdk_bs_load_ctx *master)
 {
 	SPDK_NOTICELOG("Parallel examine blob loading done, rc=%d\n", master->rc);
 
-	/* A blobstore created without the md journal has none to start. */
-	if (master->bs->md_journal != NULL) {
+	/* A blobstore created without the md journal has none to start. A failed load does not
+	 * start it either: the blobstore is freed below, nothing may be drained HOME. */
+	if (master->bs->md_journal != NULL && master->rc == 0) {
 		bs_md_journal_examine_complete(master->bs->md_journal);
 		bs_md_journal_start(master->bs->md_journal);
 	}
@@ -7025,6 +7430,14 @@ bs_load_examine_finish(struct spdk_bs_load_ctx *master)
 	}
 
 	bs_sequence_finish(master->seq, master->rc);
+	if (master->rc != 0) {
+		/*
+		 * The caller gets no blobstore handle on failure (bs_call_cpl passes NULL): free it,
+		 * with the blobs the examine already opened, as bs_load_ctx_fail does for the earlier
+		 * load steps. Otherwise its pollers keep running and its memory leaks.
+		 */
+		bs_free(master->bs);
+	}
 	free(master);
 }
 
@@ -7038,14 +7451,21 @@ bs_load_iter_on_examine_cpl(void *cb_arg, int bserrno)
 
 	master->active_workers--;
 
-	if (bserrno == -EINVAL || bserrno == -ENOTSUP) {
+	if (bserrno == -ENOTSUP) {
 		/*
-		 * The blob cannot be used (unsupported flags, unparsable metadata, external snapshot
-		 * device not available): skip it, as the blob iteration of a regular load does,
-		 * instead of failing the load of the whole blobstore. Its owner sees it as present
-		 * in used_blobids but not loaded (spdk_bs_for_each_loaded_blob).
+		 * Only a blob that was parsed completely and is then unusable is skipped: an external
+		 * snapshot clone whose esnap device cannot be created, a blob with unknown invalid
+		 * flags (blob_load_backing_dev), or a clone of such a blob (blob_load_snapshot_cpl).
+		 * Clusters and md pages are claimed only while a blob's md is parsed on examine, and
+		 * these blobs got that far, so nothing they own can be handed out again. Its owner
+		 * sees it as present in used_blobids but not loaded (spdk_bs_for_each_loaded_blob).
+		 *
+		 * Any other error - in particular -EINVAL, a corrupted md page (crc, chain id or
+		 * sequence number, descriptors) - fails the load: the blob's clusters and md pages
+		 * were not (or only partly) claimed, and skipping it would let them be allocated
+		 * again (double ownership, md page reuse) and cut its clones' chains.
 		 */
-		SPDK_ERRLOG("Skipping blob that failed to load on examine: %d\n", bserrno);
+		SPDK_ERRLOG("Skipping blob that is unusable after a complete examine: %d\n", bserrno);
 		bserrno = 0;
 	}
 
@@ -7207,72 +7627,6 @@ bs_update_corrupted_blob_without_close(void *cb_arg, int bserrno)
 	spdk_blob_sync_md(ctx->blob, false, blob_op_update_corrupted_cb, ctx);
 }
 
-/*
- * Snapshot deletion interrupted after the clone was updated ("deletion mode"): the clone already
- * took over the snapshot's clusters (and extent pages), while the snapshot's metadata still
- * maps them. The examine load leaves such a snapshot (still marked SNAPSHOT_PENDING_REMOVAL) for
- * its owner to delete, but it must not keep those mappings: whichever way it is deleted later
- * (spdk_bs_delete_blob has no clone to update, it just releases every cluster the snapshot
- * maps), it would release clusters the clone is using - and a cluster the clone releases in
- * the meantime would still be mapped by the snapshot. Drop the shared entries from the
- * snapshot, as delete_snapshot_sync_clone_cpl() does before the snapshot is deleted. Returns
- * whether anything was dropped.
- */
-static bool
-bs_examine_release_orphan_snapshot(struct spdk_blob *snapshot, struct spdk_blob *clone)
-{
-	bool changed = false;
-	uint64_t i;
-
-	for (i = 0; i < snapshot->active.num_clusters && i < clone->active.num_clusters; i++) {
-		if (snapshot->active.clusters[i] != 0 &&
-		    snapshot->active.clusters[i] == clone->active.clusters[i]) {
-			snapshot->active.clusters[i] = 0;
-			snapshot->active.num_allocated_clusters--;
-			changed = true;
-		}
-	}
-	for (i = 0; i < snapshot->active.num_extent_pages && i < clone->active.num_extent_pages; i++) {
-		if (snapshot->active.extent_pages[i] != 0 &&
-		    snapshot->active.extent_pages[i] == clone->active.extent_pages[i]) {
-			snapshot->active.extent_pages[i] = 0;
-			changed = true;
-		}
-	}
-
-	return changed;
-}
-
-static void
-bs_examine_release_orphan_snapshot_close_cpl(void *cb_arg, int bserrno)
-{
-	struct spdk_bs_load_ctx *ctx = cb_arg;
-	struct spdk_blob *snapshot = ctx->blob;
-
-	if (bserrno != 0) {
-		SPDK_ERRLOG("Failed to close clone of a corrupted blob\n");
-	}
-
-	if (!ctx->orphan_released) {
-		bs_load_iter_on_examine_cpl(ctx, 0);
-		return;
-	}
-	ctx->orphan_released = false;
-
-	SPDK_NOTICELOG("Snapshot 0x%" PRIx64 " pending removal: its clusters belong to the clone, "
-		       "dropping them from the snapshot\n", snapshot->id);
-
-	/* The snapshot now has unallocated clusters: thin provisioned, reading zeroes there
-	 * unless it has a parent of its own. */
-	ctx->snapshot_md_flag = snapshot->md_ro;
-	snapshot->md_ro = false;
-	blob_set_thin_provision(snapshot);
-	if (snapshot->back_bs_dev == NULL) {
-		snapshot->back_bs_dev = bs_create_zeroes_dev();
-	}
-	spdk_blob_sync_md(snapshot, false, blob_op_update_corrupted_cb, ctx);
-}
-
 static void
 bs_examine_clone_without_close(void *cb_arg, struct spdk_blob *blob, int bserrno)
 {
@@ -7297,12 +7651,12 @@ bs_examine_clone_without_close(void *cb_arg, struct spdk_blob *blob, int bserrno
 		}
 		ctx->blobid = ctx->blob->id;
 		SPDK_INFOLOG(blob, "Cannot examine corrupted snapblob in deletion mode 0x%" PRIx64 ".\n", blob->id);
-		/* Power failure occurred after updating clone (snapshot delete case). The snapshot is
-		 * left for its owner to delete, but its clusters already belong to the clone: release
-		 * them from the snapshot now (bs_examine_release_orphan_snapshot) */
+		/* Power failure occurred after updating clone (snapshot delete case). The snapshot
+		 * is left as it is, still marked SNAPSHOT_PENDING_REMOVAL: the leader's async delete
+		 * finishes it and keeps the clusters the clone already holds
+		 * (bs_delete_async_drop_clone_clusters). */
 		// bs_swap_corrupted_blob_start(ctx->blob, blob, bs_examine_swap_corrupted_blob_cleanup, ctx);
-		ctx->orphan_released = bs_examine_release_orphan_snapshot(ctx->blob, blob);
-		spdk_blob_close(blob, bs_examine_release_orphan_snapshot_close_cpl, ctx);
+		spdk_blob_close(blob, bs_delete_corrupted_blob_examine_cpl, ctx);
 		// only for failover recovery case, we just delete the corrupted snapblob
 		// spdk_blob_close(blob, bs_delete_corrupted_blob_without_close, ctx);
 		return;
@@ -7413,6 +7767,7 @@ bs_load_used_blobids_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	rc = spdk_bit_array_resize(&ctx->bs->used_blobids, ctx->mask->length);
 	if (rc < 0) {
 		spdk_free(ctx->mask);
+		ctx->mask = NULL;
 		bs_load_ctx_fail(ctx, rc);
 		return;
 	}
@@ -7451,6 +7806,7 @@ bs_load_used_clusters_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	rc = spdk_bit_array_resize(&ctx->used_clusters, ctx->mask->length);
 	if (rc < 0) {
 		spdk_free(ctx->mask);
+		ctx->mask = NULL;
 		bs_load_ctx_fail(ctx, rc);
 		return;
 	}
@@ -7460,6 +7816,7 @@ bs_load_used_clusters_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	assert(ctx->bs->num_free_clusters <= ctx->bs->total_clusters);
 
 	spdk_free(ctx->mask);
+	ctx->mask = NULL;
 
 	/* Read the used blobids mask */
 	mask_size = ctx->super->used_blobid_mask_len * SPDK_BS_PAGE_SIZE;
@@ -7504,12 +7861,14 @@ bs_load_used_pages_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	rc = spdk_bit_array_resize(&ctx->bs->used_md_pages, ctx->mask->length);
 	if (rc < 0) {
 		spdk_free(ctx->mask);
+		ctx->mask = NULL;
 		bs_load_ctx_fail(ctx, rc);
 		return;
 	}
 
 	spdk_bit_array_load_mask(ctx->bs->used_md_pages, ctx->mask->mask);
 	spdk_free(ctx->mask);
+	ctx->mask = NULL;
 
 	/* Read the used clusters mask */
 	mask_size = ctx->super->used_cluster_mask_len * SPDK_BS_PAGE_SIZE;
@@ -7571,6 +7930,7 @@ bs_load_used_blobids_cpl_clean_mode(spdk_bs_sequence_t *seq, void *cb_arg, int b
 	rc = spdk_bit_array_resize(&ctx->bs->used_blobids, ctx->mask->length);
 	if (rc < 0) {
 		spdk_free(ctx->mask);
+		ctx->mask = NULL;
 		bs_load_ctx_fail(ctx, rc);
 		return;
 	}
@@ -7659,6 +8019,7 @@ bs_load_used_clusters_cpl_clean_mode(spdk_bs_sequence_t *seq, void *cb_arg, int 
 	rc = spdk_bit_array_resize(&ctx->used_clusters, ctx->mask->length);
 	if (rc < 0) {
 		spdk_free(ctx->mask);
+		ctx->mask = NULL;
 		bs_load_ctx_fail(ctx, rc);
 		return;
 	}
@@ -7668,6 +8029,7 @@ bs_load_used_clusters_cpl_clean_mode(spdk_bs_sequence_t *seq, void *cb_arg, int 
 	assert(ctx->bs->num_free_clusters <= ctx->bs->total_clusters);
 
 	spdk_free(ctx->mask);
+	ctx->mask = NULL;
 
 	/* Read the used blobids mask */
 	mask_size = ctx->super->used_blobid_mask_len * SPDK_BS_PAGE_SIZE;
@@ -7712,12 +8074,14 @@ bs_load_used_pages_cpl_clean_mode(spdk_bs_sequence_t *seq, void *cb_arg, int bse
 	rc = spdk_bit_array_resize(&ctx->bs->used_md_pages, ctx->mask->length);
 	if (rc < 0) {
 		spdk_free(ctx->mask);
+		ctx->mask = NULL;
 		bs_load_ctx_fail(ctx, rc);
 		return;
 	}
 
 	spdk_bit_array_load_mask(ctx->bs->used_md_pages, ctx->mask->mask);
 	spdk_free(ctx->mask);
+	ctx->mask = NULL;
 
 	/* Read the used clusters mask */
 	mask_size = ctx->super->used_cluster_mask_len * SPDK_BS_PAGE_SIZE;
@@ -8058,6 +8422,7 @@ bs_load_only_used_blobid_pages_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bs
 	rc = spdk_bit_array_resize(&ctx->used_blobid_pages, ctx->mask->length);
 	if (rc < 0) {
 		spdk_free(ctx->mask);
+		ctx->mask = NULL;
 		bs_load_ctx_fail(ctx, rc);
 		return;
 	}
@@ -8738,6 +9103,7 @@ bs_load_used_blobids_cpl_dump(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno
 		SPDK_NOTICELOG("Dumping blobid bitmap not match in the blobstore\n");
 	}
 	spdk_free(ctx->mask);
+	ctx->mask = NULL;
 	spdk_free(mask);
 
 	bs_load_complete(ctx);
@@ -9511,6 +9877,33 @@ spdk_bs_unload(struct spdk_blob_store *bs, spdk_bs_op_complete cb_fn, void *cb_a
 		bs->esnap_unload_cb_arg = NULL;
 	}
 
+	if (!TAILQ_EMPTY(&bs->merges)) {
+		struct blob_merge_ctx *merge, *tmp;
+
+		/*
+		 * A merge with the base still uses the blobstore (its blobs, the md
+		 * thread's iobuf channel): cancel every merge and unload when the
+		 * last one is gone (blob_merge_retire). Blobs their owners did not
+		 * close still fail the unload below, once the merges are gone.
+		 */
+		if (bs->merge_unload_cb_fn != NULL) {
+			SPDK_ERRLOG("Blobstore unload in progress\n");
+			cb_fn(cb_arg, -EBUSY);
+			return;
+		}
+		SPDK_NOTICELOG("Blobstore unload: cancelling the merges with the base in progress\n");
+		bs->merges_cancelling = true;
+		TAILQ_FOREACH_SAFE(merge, &bs->merges, link, tmp) {
+			blob_merge_cancel(merge, -ECANCELED);
+		}
+		bs->merges_cancelling = false;
+		if (!TAILQ_EMPTY(&bs->merges)) {
+			bs->merge_unload_cb_fn = cb_fn;
+			bs->merge_unload_cb_arg = cb_arg;
+			return;
+		}
+	}
+
 	if (!RB_EMPTY(&bs->open_blobs)) {
 		SPDK_ERRLOG("Blobstore still has open blobs\n");
 		cb_fn(cb_arg, -EBUSY);
@@ -9923,26 +10316,7 @@ spdk_bs_get_io_unit_size(struct spdk_blob_store *bs)
 uint64_t
 spdk_bs_free_cluster_count(struct spdk_blob_store *bs)
 {
-	struct spdk_blob *blob;
-	uint64_t used = 0;
-
-	if (bs->is_leader || spdk_get_thread() != bs->md_thread) {
-		return bs->num_free_clusters;
-	}
-
-	/*
-	 * Not the leader: num_free_clusters only shrinks here. Every re-read of a blob's metadata
-	 * claims its clusters, while the leader's deletes and shrinks never release them on this
-	 * node (the bitmap is rebuilt from disk on promotion). Report the clusters of the open
-	 * blobs instead: each cluster belongs to exactly one blob, and a snapshot deleted with a
-	 * clone hands its clusters to the clone. used_clusters itself stays a superset, which the
-	 * free-cluster clear on promotion relies on.
-	 */
-	RB_FOREACH(blob, spdk_blob_tree, &bs->open_blobs) {
-		used += blob->active.num_allocated_clusters;
-	}
-
-	return used < bs->total_data_clusters ? bs->total_data_clusters - used : 0;
+	return bs->num_free_clusters;
 }
 
 uint64_t
@@ -10150,6 +10524,17 @@ blob_opts_copy(const struct spdk_blob_opts *src, struct spdk_blob_opts *dst)
 
 #undef FIELD_OK
 #undef SET_FIELD
+}
+
+void
+spdk_bs_free_blob_copy(struct spdk_blob *copy)
+{
+	if (copy == NULL) {
+		return;
+	}
+	/* the back_bs_dev is the open handle's (spdk_bs_copy_blob) */
+	copy->back_bs_dev = NULL;
+	blob_free(copy);
 }
 
 // added by sadegh
@@ -11011,19 +11396,20 @@ spdk_blob_group_freeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, v
 	 * locked_operation_in_progress - the group holds its freeze across the per-member
 	 * snapshot creations, and each of those takes its own spdk_snapshot_freeze_blob, which
 	 * refuses when that flag is set. The group window relies on frozen_refcnt staying >= 1
-	 * from before the first member snapshot until after the last. */
-	blob_verify_md_op(blob);
-	blob->group_frozen_refcnt++;
-	blob_freeze_io(blob, cb_fn, cb_arg);
+	 * from before the first member snapshot until after the last.
+	 * group_frozen_refcnt moves together with frozen_refcnt inside blob_freeze_io_ext:
+	 * bumping it here up front left it one above frozen_refcnt when the freeze failed
+	 * with -ENOMEM. */
+	blob_freeze_io_ext(blob, true, cb_fn, cb_arg);
 }
 
 void
 spdk_blob_group_unfreeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
 {
-	blob_verify_md_op(blob);
-	assert(blob->group_frozen_refcnt > 0);
-	blob->group_frozen_refcnt--;
-	blob_unfreeze_io(blob, cb_fn, cb_arg);
+	/* On -ENOMEM nothing moves and the blob is still frozen, so the caller can retry.
+	 * Dropping group_frozen_refcnt up front left frozen_refcnt one above it: a freeze
+	 * nobody owned any more, the member stayed frozen. */
+	blob_unfreeze_io_ext(blob, true, cb_fn, cb_arg);
 }
 /* END spdk_bs_create_snapshot */
 
@@ -13304,6 +13690,9 @@ struct delete_snapshot_ctx {
 	bool snapshot_md_ro;
 	struct spdk_blob *clone;
 	bool clone_md_ro;
+	/* This delete holds its one freeze on the clone (blob_freeze_io succeeded and the
+	 * matching unfreeze has not). */
+	bool clone_frozen;
 	bool is_async;
 	spdk_blob_op_with_handle_complete cb_fn;
 	void *cb_arg;
@@ -13358,13 +13747,36 @@ delete_snapshot_cleanup_snapshot(void *cb_arg, int bserrno)
 	spdk_blob_close(ctx->snapshot, delete_blob_cleanup_finish, ctx);
 }
 
+static void delete_snapshot_cleanup_clone(void *cb_arg, int bserrno);
+
+static void
+delete_snapshot_cleanup_clone_unfrozen(void *cb_arg, int bserrno)
+{
+	struct delete_snapshot_ctx *ctx = cb_arg;
+
+	if (bserrno != 0) {
+		/* blob_unfreeze_io only fails before it drops the count (-ENOMEM). */
+		SPDK_ERRLOG("blob 0x%" PRIx64 ": failed to release the snapshot delete's freeze on "
+			    "the clone: %d (clone stays frozen)\n", ctx->clone->id, bserrno);
+	}
+	ctx->clone_frozen = false;
+	delete_snapshot_cleanup_clone(ctx, 0);
+}
+
 static void
 delete_snapshot_cleanup_clone(void *cb_arg, int bserrno)
 {
 	struct delete_snapshot_ctx *ctx = cb_arg;
 
-	if (ctx->clone->frozen_refcnt > 0) {
-		blob_unfreeze_io(ctx->clone, delete_snapshot_cleanup_clone, ctx);
+	/*
+	 * Undo only this delete's own freeze, exactly once, like the success path
+	 * (delete_snapshot_sync_snapshot_cpl). Unfreezing "until frozen_refcnt is 0" also
+	 * dropped freezes other owners hold: a consistency-group freeze of the clone
+	 * (spdk_blob_group_freeze_io) was drained, host IO ran inside the group window and
+	 * the group's own unfreeze later underflowed the count.
+	 */
+	if (ctx->clone_frozen) {
+		blob_unfreeze_io(ctx->clone, delete_snapshot_cleanup_clone_unfrozen, ctx);
 		return;
 	}
 	ctx->clone->md_ro = ctx->clone_md_ro;
@@ -13378,10 +13790,13 @@ delete_snapshot_unfreeze_cpl(void *cb_arg, int bserrno)
 	struct delete_snapshot_ctx *ctx = cb_arg;
 
 	if (bserrno) {
+		/* The unfreeze failed before dropping the count: the freeze is still ours
+		 * (clone_frozen), the cleanup retries it once. */
 		ctx->bserrno = bserrno;
 		delete_snapshot_cleanup_clone(ctx, 0);
 		return;
 	}
+	ctx->clone_frozen = false;
 
 	ctx->clone->locked_operation_in_progress = false;
 	spdk_blob_close(ctx->clone, delete_blob_cleanup_finish, ctx);
@@ -13645,6 +14060,7 @@ delete_snapshot_freeze_io_cb(void *cb_arg, int bserrno)
 		delete_snapshot_cleanup_clone(ctx, 0);
 		return;
 	}
+	ctx->clone_frozen = true;
 
 	/* Temporarily override md_ro flag for snapshot for MD modification */
 	ctx->snapshot_md_ro = ctx->snapshot->md_ro;
@@ -13894,13 +14310,14 @@ clone_update_delete_sync_cpl(void *cb_arg, int lvolerrno)
 		new_parent_entry->clone_count++;
 
 		parentblob = blob_lookup(clone->bs, new_parent_entry->id);
-		/* snapshot_entry (the OLD parent's) is NULL when the clone had no
-		 * parent before (ctx->parent_id invalid): do not dereference it.
-		 * Whether the old parent's count is the right one here at all is
-		 * left to the owner (the branch above uses the new parent's). */
-		if (parentblob && snapshot_entry &&
-		    parentblob->open_ref != snapshot_entry->clone_count + 1) {
-			parentblob->open_ref = snapshot_entry->clone_count + 1;
+		/* The new parent's references: its own plus one per clone, as in the
+		 * "already listed" branch above and spdk_bs_update_snapshot_clone.
+		 * This used the OLD parent's clone count, so a parent that gained a
+		 * clone here could be left with fewer references than holders: its
+		 * handle was then freed under a clone's blob_bs_dev on a later close
+		 * (use-after-free), or never freed. */
+		if (parentblob && parentblob->open_ref != new_parent_entry->clone_count + 1) {
+			parentblob->open_ref = new_parent_entry->clone_count + 1;
 		}
 
 		SPDK_NOTICELOG("Added clone 0x%" PRIx64" under new parent 0x%" PRIx64 "\n", clone->id, clone->parent_id);
@@ -13909,6 +14326,61 @@ clone_update_delete_sync_cpl(void *cb_arg, int lvolerrno)
 out:
 	// bs_print_snapshot_tree(clone->bs);
 	free(ctx);
+}
+
+/*
+ * Non-leader delete and the open handle of the blob.
+ *
+ * spdk_bs_delete_blob_non_leader deletes a copy of the blob
+ * (spdk_bs_copy_blob); the open handle -- the one in bs->open_blobs that
+ * blob_lookup returns and every spdk_bs_open_blob of the id shares, with
+ * open_ref++ -- is freed by the manual delete paths below. That handle can
+ * have holders this delete knows nothing about: a second lvol registered on
+ * the same blob id (a stale lvol the leader had deleted, whose blob id the
+ * leader reused), a clone's blob_bs_dev. Freeing it under them left their
+ * spdk_blob pointer dangling: bf32 2026-11-21, SIGSEGV in
+ * vbdev_lvol_resv_refresh -> blob_get_xattr_value on the next secondary
+ * register (lvs_update_live_cb walks every lvol). A handle with more
+ * references than the delete accounts for is therefore left to the remaining
+ * holders, who close it (unlinked from the open-blob tree, see
+ * bs_non_leader_handle_shared); at worst it leaks. The force delete
+ * frees at open_ref <= 1 as before: a lone remaining reference there is a
+ * leftover count of the snapshot bookkeeping as often as a holder, and the
+ * lvol layer does not delete a blob another lvol still holds
+ * (lvol_destroy_non_leader).
+ */
+static void
+bs_non_leader_handle_shared(struct spdk_blob *handle, const char *what)
+{
+	SPDK_ERRLOG("Non-leader %s of blob 0x%" PRIx64 ": its open handle is still held by others "
+		    "(open_ref %" PRIu32 "), not freeing it\n", what, handle->id, handle->open_ref);
+	/*
+	 * The blob is deleted on this node below, and the leader may reuse its
+	 * id. Left in bs->open_blobs, the handle -- with the deleted blob's
+	 * metadata -- would be what the next open of the reused id returns: two
+	 * different blobs on one spdk_blob again, the start of the bf32 chain.
+	 * Unlink it and never write its metadata; the holders keep valid memory
+	 * and the last close frees it.
+	 */
+	spdk_bit_array_clear(handle->bs->open_blobids, handle->id);
+	RB_REMOVE(spdk_blob_tree, &handle->bs->open_blobs, handle);
+	handle->orphaned = true;
+	handle->md_ro = true;
+	handle->state = SPDK_BLOB_STATE_CLEAN;
+}
+
+/*
+ * The references a snapshot delete with a clone (delete_blob_manually, not
+ * single) accounts for on the open handle: the clone's -- the caller has
+ * re-parented the clone and freed its blob_bs_dev without closing the
+ * snapshot -- and the deleter's own while it still holds it. The deleting lvol
+ * closes its handle before the delete (spdk_lvol_close, after the copy), so
+ * the handle then has one reference less than the copy took from it.
+ */
+static uint32_t
+bs_non_leader_snapshot_refs(const struct spdk_blob *handle, const struct spdk_blob *copy)
+{
+	return 1 + (handle->open_ref >= copy->open_ref ? 1 : 0);
 }
 
 static void
@@ -13920,7 +14392,22 @@ delete_blob_manually(struct spdk_blob_store *bs, struct spdk_blob *blob, bool si
 
 	if (!single) {
 		tmp_blob = blob_lookup(blob->bs, blob->id);
-		if (tmp_blob) {
+		if (tmp_blob && tmp_blob != blob &&
+		    tmp_blob->open_ref > bs_non_leader_snapshot_refs(tmp_blob, blob)) {
+			/*
+			 * Someone else still holds this open handle -- another
+			 * lvol registered on the same blob id. Freeing it would
+			 * leave that holder dangling (see
+			 * bs_non_leader_handle_shared). Drop the clone's
+			 * reference only and leave the handle to the others.
+			 * Its back_bs_dev may have just been handed to the
+			 * clone: give it the zeroes dev, so the last close does
+			 * not destroy the clone's backing (a leak at worst).
+			 */
+			bs_non_leader_handle_shared(tmp_blob, "delete");
+			tmp_blob->open_ref--;
+			tmp_blob->back_bs_dev = bs_create_zeroes_dev();
+		} else if (tmp_blob) {
 			/*
 			* Remove the blob from the blob_store list now, to ensure it does not
 			*  get returned after this point by blob_lookup().
@@ -13964,7 +14451,15 @@ force_delete_blob_manually(struct spdk_blob *blob) {
 	struct spdk_blob_store *bs = blob->bs;
 
 	tmp_blob = blob_lookup(blob->bs, blob->id);
-	if (tmp_blob) {
+	if (tmp_blob && tmp_blob != blob && tmp_blob->open_ref > 1) {
+		/*
+		 * Others still hold the open handle (bs_non_leader_handle_shared):
+		 * leave it, its back_bs_dev and its references to them. No
+		 * reference is dropped: the deleting lvol closed its own before
+		 * the delete, so every one left belongs to a live holder.
+		 */
+		bs_non_leader_handle_shared(tmp_blob, "force delete");
+	} else if (tmp_blob) {
 		/*
 		* Remove the blob from the blob_store list now, to ensure it does not
 		*  get returned after this point by blob_lookup().
@@ -14197,7 +14692,8 @@ bs_delete_open_cpl(void *cb_arg, struct spdk_blob *blob, int bserrno)
 		return;
 	}
 
-	if (blob->locked_operation_in_progress) {
+	if (blob->locked_operation_in_progress || blob->merge_ctx != NULL) {
+		/* (a merge with the base still writes into the blob) */
 		SPDK_DEBUGLOG(blob, "Cannot remove blob - another operation in progress\n");
 		ctx->bserrno = -EBUSY;
 		spdk_blob_close(blob, delete_blob_cleanup_finish, ctx);
@@ -14430,6 +14926,73 @@ blob_clear_clusters_async(spdk_bs_sequence_t *seq, struct bs_delete_async_releas
 	bs_batch_close(batch);
 }
 
+/*
+ * A snapshot whose earlier delete stopped in the middle (power failure,
+ * failover) still carries SNAPSHOT_PENDING_REMOVAL with its clone's id, and
+ * the clone's md already went to disk without it (clone->parent_id is no
+ * longer the snapshot): the clone took every cluster of the snapshot at an
+ * index where the clone had none. The delete does not update the clone
+ * again; before the snapshot is unmapped and its clusters are released, per
+ * index:
+ *  - clone has the same cluster: the clone's now, drop it from the snapshot;
+ *  - clone has none: the clone took it and gave it back since (unmap, or a
+ *    newer snapshot of the clone owns it), so it is not the snapshot's to
+ *    release either, drop it;
+ *  - clone has another cluster: the snapshot's own, release it as usual.
+ * clone == NULL: the clone is not open, so which clusters it took cannot be
+ * told; release none (leaked until the next load rebuilds the cluster map,
+ * never owned twice).
+ */
+static void
+bs_delete_async_drop_clone_clusters(struct spdk_blob *blob, struct spdk_blob *clone,
+				    spdk_blob_id clone_id)
+{
+	uint64_t i, kept = 0, given_back = 0;
+
+	if (clone == NULL) {
+		SPDK_ERRLOG("Blob 0x%" PRIx64 " was in delete before, its clone 0x%" PRIx64
+			    " is not open: none of its clusters is released\n", blob->id, clone_id);
+		for (i = 0; i < blob->active.num_clusters; i++) {
+			blob->active.clusters[i] = 0;
+		}
+		for (i = 0; i < blob->active.num_extent_pages; i++) {
+			blob->active.extent_pages[i] = 0;
+		}
+		blob->active.num_allocated_clusters = 0;
+		return;
+	}
+	assert(clone->parent_id != blob->id);
+
+	for (i = 0; i < blob->active.num_clusters && i < clone->active.num_clusters; i++) {
+		if (blob->active.clusters[i] == 0) {
+			continue;
+		}
+		if (blob->active.clusters[i] == clone->active.clusters[i]) {
+			kept++;
+		} else if (clone->active.clusters[i] == 0) {
+			given_back++;
+		} else {
+			continue;
+		}
+		blob->active.clusters[i] = 0;
+		if (blob->active.num_allocated_clusters > 0) {
+			blob->active.num_allocated_clusters--;
+		}
+	}
+	for (i = 0; i < blob->active.num_extent_pages && i < clone->active.num_extent_pages; i++) {
+		if (blob->active.extent_pages[i] != 0 &&
+		    blob->active.extent_pages[i] == clone->active.extent_pages[i]) {
+			blob->active.extent_pages[i] = 0;
+		}
+	}
+
+	if (kept != 0 || given_back != 0) {
+		SPDK_NOTICELOG("Blob 0x%" PRIx64 " was in delete before: %" PRIu64 " clusters are clone "
+			       "0x%" PRIx64 "'s, %" PRIu64 " the clone gave back; neither is released\n",
+			       blob->id, kept, clone->id, given_back);
+	}
+}
+
 static void
 bs_delete_blob_finish_async(void *cb_arg, struct spdk_blob *blob, int bserrno)
 {
@@ -14449,6 +15012,7 @@ bs_delete_blob_finish_async(void *cb_arg, struct spdk_blob *blob, int bserrno)
 		bs_delete_async_cpl(seq, blob, ERR_LEADERSHIP_CHANGED);
 		return;
 	}
+
 
 	/* Allocate the release list first, before anything changes: on failure
 	 * nothing is removed or unmapped yet. */
@@ -14492,6 +15056,8 @@ spdk_bs_delete_blob_async(struct spdk_blob_store *bs, struct spdk_blob *blob,
 	const void *value;
 	int rc;
 	size_t len;
+	bool in_middle = false;
+	spdk_blob_id in_middle_clone_id = SPDK_BLOBID_INVALID;
 
 	SPDK_NOTICELOG("Deleting clusters for blob 0x%" PRIx64 "\n", blob->id);
 
@@ -14524,10 +15090,15 @@ spdk_bs_delete_blob_async(struct spdk_blob_store *bs, struct spdk_blob *blob,
 	rc = blob_get_xattr_value(blob, SNAPSHOT_PENDING_REMOVAL, &value, &len, true);
 	if (rc == 0) {
 		SPDK_NOTICELOG("1- Deleting clusters for blob with clone 0x%" PRIx64 "\n", blob->id);
+		in_middle = true;
+		in_middle_clone_id = *(const spdk_blob_id *)value;
 		clone = blob_lookup(bs, *(spdk_blob_id *)value);
 		if (clone) {
 			if (clone->parent_id == blob->id) {
 				bool  md_ro = blob->md_ro;
+
+				/* stopped before the clone was updated: a normal delete */
+				in_middle = false;
 				blob->md_ro = false;
 				blob_remove_xattr(blob, SNAPSHOT_PENDING_REMOVAL, true);
 				blob->md_ro = md_ro;
@@ -14547,13 +15118,22 @@ spdk_bs_delete_blob_async(struct spdk_blob_store *bs, struct spdk_blob *blob,
 		return;
 	}
 
-	if (blob->locked_operation_in_progress) {
+	if (blob->locked_operation_in_progress || blob->merge_ctx != NULL) {
+		/* (a merge with the base still writes into the blob) */
 		SPDK_ERRLOG("Cannot remove blob - another operation in progress\n");
 		delete_blob_cleanup_finish(ctx, -EBUSY);
 		return;
 	}
 
 	blob->locked_operation_in_progress = true;
+
+	if (in_middle && !update_clone) {
+		/* stopped in the middle with the clone already updated: do not
+		 * update the clone again, keep what it took (see above) */
+		bs_delete_async_drop_clone_clusters(blob, ctx->corrupted_clone, in_middle_clone_id);
+		ctx->corrupted_clone = NULL;
+		ctx->corrupted_mode = false;
+	}
 
 	if (update_clone || ctx->corrupted_mode) {
 		SPDK_NOTICELOG("2- Deleting clusters for blob with clone 0x%" PRIx64 "\n", blob->id);
@@ -16230,7 +16810,7 @@ blob_close_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 			 *  when the deletion process starts - so don't try to
 			 *  remove them again.
 			 */
-			if (blob->active.num_pages > 0 && blob->id != UINT64_MAX) {
+			if (blob->active.num_pages > 0 && blob->id != UINT64_MAX && !blob->orphaned) {
 				spdk_bit_array_clear(blob->bs->open_blobids, blob->id);
 				RB_REMOVE(spdk_blob_tree, &blob->bs->open_blobs, blob);
 			}
@@ -16272,6 +16852,13 @@ spdk_blob_close(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_ar
 
 	if (blob->open_ref == 0) {
 		cb_fn(cb_arg, -EBADF);
+		return;
+	}
+
+	if (blob->open_ref == 1 && blob->merge_ctx != NULL) {
+		/* the merge's IO still uses the blob: cancel the merge, close
+		 * when it is done */
+		blob_merge_defer_close(blob, cb_fn, cb_arg);
 		return;
 	}
 
@@ -17036,6 +17623,7 @@ bs_load_grow_used_clusters_write_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int 
 	}
 
 	spdk_free(ctx->mask);
+	ctx->mask = NULL;
 	ctx->bs->w_io++;
 	bs_sequence_write_dev(ctx->seq, ctx->super, bs_page_to_lba(ctx->bs, 0),
 			      bs_byte_to_lba(ctx->bs, sizeof(*ctx->super)),
@@ -17119,6 +17707,19 @@ bs_grow_load_super_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	rc = bs_super_validate(ctx->super, ctx->bs);
 	if (rc != 0) {
 		bs_load_ctx_fail(ctx, rc);
+		return;
+	}
+
+	/*
+	 * Refuse an unclean blobstore here, before bs_load_try_to_grow(): that step reads the used
+	 * cluster mask (which only a clean unload writes; this fork's unload never does, so it may
+	 * never have been written: assert on its type) and writes a grown mask and super block to
+	 * disk. The same check in bs_load_grow_continue() came only after those writes, so a
+	 * refused grow still changed the on-disk super block.
+	 */
+	if (ctx->super->used_blobid_mask_len == 0 || ctx->super->clean == 0) {
+		SPDK_ERRLOG("Can not grow an unclean blobstore, please load it normally to clean it.\n");
+		bs_load_ctx_fail(ctx, -EIO);
 		return;
 	}
 
@@ -17389,6 +17990,7 @@ bs_update_live_done(struct spdk_bs_update_ctx *ctx, int bserrno)
 
 	spdk_free(ctx->page);   /* NULL-safe */
 	spdk_free(ctx->mask);
+	ctx->mask = NULL;
 	free(ctx);
 }
 

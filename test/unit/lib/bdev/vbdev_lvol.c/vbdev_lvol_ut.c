@@ -61,7 +61,15 @@ DEFINE_STUB_V(spdk_lvol_chain, (struct spdk_lvol *origlvol, struct spdk_lvol *cl
 DEFINE_STUB(spdk_tdev_get_hub_channel, struct spdk_io_channel *, (struct spdk_transfer_dev *tdev, struct spdk_thread *thread), NULL);
 DEFINE_STUB_V(spdk_lvs_rmt_bdev_remove, (struct spdk_transfer_dev *tdev));
 DEFINE_STUB(spdk_unload_lvs_poll_group, bool, (struct spdk_lvol_store *lvs), false);
-DEFINE_STUB(spdk_lvs_queued_failed_IO, int, (struct spdk_lvol_store *lvs), 0);
+/* Counted: lvol_op_comp calls it to freeze the lvstore, block its ports and drop
+ * leadership; tests assert when it must (not) be called. */
+static int g_lvs_queued_failed_io_calls;
+int
+spdk_lvs_queued_failed_IO(struct spdk_lvol_store *lvs)
+{
+	g_lvs_queued_failed_io_calls++;
+	return 0;
+}
 DEFINE_STUB(spdk_lvol_freeze_io, enum freeze_io_result, (struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io, spdk_lvol_op_migrate_complete cb_fn), FREEZE_IO_QUEUED);
 DEFINE_STUB_V(spdk_add_stat_ext, (struct spdk_io_channel *ch));
 DEFINE_STUB(spdk_bdev_get_memory_domains, int, (struct spdk_bdev *bdev,
@@ -102,6 +110,7 @@ DEFINE_STUB(spdk_bdev_readv_blocks_ext, int,
 	    (struct spdk_bdev_desc *desc, struct spdk_io_channel *ch, struct iovec *iov, int iovcnt,
 	     uint64_t offset_blocks, uint64_t num_blocks, spdk_bdev_io_completion_cb cb,
 	     void *cb_arg, struct spdk_bdev_ext_io_opts *opts), 0);
+DEFINE_STUB(spdk_lvol_get_xfer_whole_cluster_pct, uint32_t, (void), 100);
 struct spdk_blob {
 	uint64_t	id;
 	char		name[32];
@@ -1017,10 +1026,28 @@ static int g_grp_snapshot_calls;
 static int g_grp_freeze_fail_at;       /* 1-based freeze call to fail; 0 = never */
 static int g_grp_freeze_calls;
 static int g_grp_snap_taken_while_frozen;
+static int g_grp_unfreeze_fail_at;     /* 1-based unfreeze call to fail with -ENOMEM; 0 = never */
+static int g_grp_unfreeze_calls;
+/* Called after the n-th successful freeze / the n-th snapshot submission. */
+static void (*g_grp_freeze_hook)(int call);
+static void (*g_grp_snapshot_hook)(int call);
+/* 1-based snapshot call whose completion is held back (a stuck member); 0 = never. */
+static int g_grp_snapshot_defer_at;
+static spdk_lvol_op_with_handle_complete g_grp_deferred_cb;
+static void *g_grp_deferred_arg;
+static struct spdk_lvol *g_grp_deferred_lvol;
 
 static void
 grp_reset(void)
 {
+	g_grp_unfreeze_fail_at = 0;
+	g_grp_unfreeze_calls = 0;
+	g_grp_freeze_hook = NULL;
+	g_grp_snapshot_hook = NULL;
+	g_grp_snapshot_defer_at = 0;
+	g_grp_deferred_cb = NULL;
+	g_grp_deferred_arg = NULL;
+	g_grp_deferred_lvol = NULL;
 	memset(g_grp_events, 0, sizeof(g_grp_events));
 	memset(g_grp_blobs, 0, sizeof(g_grp_blobs));
 	memset(g_grp_freeze_cnt, 0, sizeof(g_grp_freeze_cnt));
@@ -1104,6 +1131,9 @@ spdk_blob_group_freeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, v
 	}
 	(*grp_freeze_slot(blob))++;
 	grp_event('F', grp_blob_index(blob));
+	if (g_grp_freeze_hook) {
+		g_grp_freeze_hook(g_grp_freeze_calls);
+	}
 	cb_fn(cb_arg, 0);
 }
 
@@ -1112,6 +1142,13 @@ spdk_blob_group_unfreeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn,
 {
 	int *slot = grp_freeze_slot(blob);
 
+	g_grp_unfreeze_calls++;
+	if (g_grp_unfreeze_fail_at && g_grp_unfreeze_calls == g_grp_unfreeze_fail_at) {
+		/* Like the real one: -ENOMEM before anything moves, the blob stays frozen. */
+		grp_event('u', grp_blob_index(blob));
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
 	if (*slot > 0) {
 		(*slot)--;
 	}
@@ -1133,8 +1170,17 @@ spdk_lvol_create_snapshot(struct spdk_lvol *lvol, const char *snapshot_name,
 			g_grp_snap_taken_while_frozen++;
 		}
 	}
+	if (g_grp_snapshot_hook) {
+		g_grp_snapshot_hook(g_grp_snapshot_calls);
+	}
 	if (g_grp_snapshot_fail_at && g_grp_snapshot_calls == g_grp_snapshot_fail_at) {
 		cb_fn(cb_arg, NULL, -EIO);
+		return;
+	}
+	if (g_grp_snapshot_defer_at && g_grp_snapshot_calls == g_grp_snapshot_defer_at) {
+		g_grp_deferred_cb = cb_fn;
+		g_grp_deferred_arg = cb_arg;
+		g_grp_deferred_lvol = lvol;
 		return;
 	}
 
@@ -1506,6 +1552,183 @@ ut_lvol_group_snapshot_freeze_fail_unwinds(void)
 	CU_ASSERT(strchr(ev, 'D') == NULL);
 	CU_ASSERT(g_grp_freeze_cnt[0] == 0);
 
+	vbdev_lvs_destruct(lvs, lvol_store_op_complete, NULL);
+	ut_vbdev_lvs_settle();
+	grp_reset();
+}
+
+/*
+ * A group unfreeze that fails with -ENOMEM leaves the member frozen (nothing moved). The
+ * group retries it: the member is unfrozen and the group snapshot still succeeds. Before,
+ * the member was skipped and stayed frozen for good, and the whole set was GC'd.
+ */
+static void
+ut_lvol_group_snapshot_unfreeze_nomem_retries(void)
+{
+	struct spdk_lvol *lvols[3];
+	struct spdk_lvol_store *lvs;
+
+	lvs = grp_setup(lvols);
+	g_grp_unfreeze_fail_at = 2;      /* second member's unfreeze fails once */
+
+	g_grp_entries[0] = (struct vbdev_lvol_group_snap_entry){lvols[0], (char *)"s0", NULL};
+	g_grp_entries[1] = (struct vbdev_lvol_group_snap_entry){lvols[1], (char *)"s1", NULL};
+	g_grp_entries[2] = (struct vbdev_lvol_group_snap_entry){lvols[2], (char *)"s2", NULL};
+	g_grp_done_called = 0;
+	vbdev_lvol_create_snapshot_group(g_grp_entries, 3, grp_snapshot_done, NULL);
+	spdk_delay_us(GROUP_SNAP_UNFREEZE_RETRY_US);
+	poll_threads();
+
+	CU_ASSERT(g_grp_done_called == 1);
+	CU_ASSERT(g_grp_done_rc == 0);
+	CU_ASSERT(strcmp(grp_events_joined(), "F0 F1 F2 S0 S1 S2 U0 u1 U1 U2 ") == 0);
+	CU_ASSERT(g_grp_freeze_cnt[0] == 0 && g_grp_freeze_cnt[1] == 0 && g_grp_freeze_cnt[2] == 0);
+	CU_ASSERT(g_grp_entries[0].snap != NULL);
+	CU_ASSERT(g_grp_entries[1].snap != NULL);
+	CU_ASSERT(g_grp_entries[2].snap != NULL);
+
+	vbdev_lvs_destruct(lvs, lvol_store_op_complete, NULL);
+	ut_vbdev_lvs_settle();
+	grp_reset();
+}
+
+static struct spdk_lvol *g_grp_removed_lvol;
+static struct spdk_lvol *g_grp_remove_target;
+static int g_grp_remove_at;
+
+/* Simulates a delete/close of a member: it leaves the lvstore's list. */
+static void
+grp_remove_member(int call)
+{
+	if (call == g_grp_remove_at && g_grp_remove_target != NULL) {
+		TAILQ_REMOVE(&g_grp_remove_target->lvol_store->lvols, g_grp_remove_target, link);
+		g_grp_removed_lvol = g_grp_remove_target;
+		g_grp_remove_target = NULL;
+	}
+}
+
+static void
+grp_restore_member(void)
+{
+	if (g_grp_removed_lvol != NULL) {
+		TAILQ_INSERT_TAIL(&g_grp_removed_lvol->lvol_store->lvols, g_grp_removed_lvol, link);
+		g_grp_removed_lvol = NULL;
+	}
+}
+
+/* A member deleted before it is frozen fails the group (-ENODEV) and is never touched. */
+static void
+ut_lvol_group_snapshot_member_gone_before_freeze(void)
+{
+	struct spdk_lvol *lvols[3];
+	struct spdk_lvol_store *lvs;
+	const char *ev;
+
+	lvs = grp_setup(lvols);
+	g_grp_remove_target = lvols[2];
+	g_grp_remove_at = 1;             /* member 2 goes away right after member 0 froze */
+	g_grp_freeze_hook = grp_remove_member;
+
+	g_grp_entries[0] = (struct vbdev_lvol_group_snap_entry){lvols[0], (char *)"s0", NULL};
+	g_grp_entries[1] = (struct vbdev_lvol_group_snap_entry){lvols[1], (char *)"s1", NULL};
+	g_grp_entries[2] = (struct vbdev_lvol_group_snap_entry){lvols[2], (char *)"s2", NULL};
+	g_grp_done_called = 0;
+	vbdev_lvol_create_snapshot_group(g_grp_entries, 3, grp_snapshot_done, NULL);
+
+	CU_ASSERT(g_grp_done_called == 1);
+	CU_ASSERT(g_grp_done_rc == -ENODEV);
+	ev = grp_events_joined();
+	CU_ASSERT(strcmp(ev, "F0 F1 U0 U1 ") == 0);
+	CU_ASSERT(g_grp_freeze_cnt[0] == 0 && g_grp_freeze_cnt[1] == 0 && g_grp_freeze_cnt[2] == 0);
+	CU_ASSERT(g_grp_entries[0].snap == NULL);
+	CU_ASSERT(g_grp_entries[1].snap == NULL);
+	CU_ASSERT(g_grp_entries[2].snap == NULL);
+
+	grp_restore_member();
+	vbdev_lvs_destruct(lvs, lvol_store_op_complete, NULL);
+	ut_vbdev_lvs_settle();
+	grp_reset();
+}
+
+/* A member deleted while frozen is not unfrozen through its dangling pointer. */
+static void
+ut_lvol_group_snapshot_member_gone_while_frozen(void)
+{
+	struct spdk_lvol *lvols[3];
+	struct spdk_lvol_store *lvs;
+
+	lvs = grp_setup(lvols);
+	g_grp_remove_target = lvols[1];
+	g_grp_remove_at = 3;             /* member 1 goes away during the snapshots */
+	g_grp_snapshot_hook = grp_remove_member;
+
+	g_grp_entries[0] = (struct vbdev_lvol_group_snap_entry){lvols[0], (char *)"s0", NULL};
+	g_grp_entries[1] = (struct vbdev_lvol_group_snap_entry){lvols[1], (char *)"s1", NULL};
+	g_grp_entries[2] = (struct vbdev_lvol_group_snap_entry){lvols[2], (char *)"s2", NULL};
+	g_grp_done_called = 0;
+	vbdev_lvol_create_snapshot_group(g_grp_entries, 3, grp_snapshot_done, NULL);
+
+	CU_ASSERT(g_grp_done_called == 1);
+	CU_ASSERT(g_grp_done_rc == 0);
+	CU_ASSERT(strcmp(grp_events_joined(), "F0 F1 F2 S0 S1 S2 U0 U2 ") == 0);
+
+	grp_restore_member();
+	vbdev_lvs_destruct(lvs, lvol_store_op_complete, NULL);
+	ut_vbdev_lvs_settle();
+	grp_reset();
+}
+
+/*
+ * One member's snapshot never completes: after GROUP_SNAP_TIMEOUT_US the group lets go of
+ * every member and fails with -ETIMEDOUT; the snapshots, including the late one, are
+ * garbage-collected once the late one completes.
+ */
+static void
+ut_lvol_group_snapshot_stuck_member_times_out(void)
+{
+	struct spdk_lvol *lvols[3];
+	struct spdk_lvol_store *lvs;
+	struct spdk_lvol *snap;
+	const char *ev;
+
+	lvs = grp_setup(lvols);
+	g_grp_snapshot_defer_at = 2;     /* member 1's snapshot is stuck */
+
+	g_grp_entries[0] = (struct vbdev_lvol_group_snap_entry){lvols[0], (char *)"s0", NULL};
+	g_grp_entries[1] = (struct vbdev_lvol_group_snap_entry){lvols[1], (char *)"s1", NULL};
+	g_grp_entries[2] = (struct vbdev_lvol_group_snap_entry){lvols[2], (char *)"s2", NULL};
+	g_grp_done_called = 0;
+	vbdev_lvol_create_snapshot_group(g_grp_entries, 3, grp_snapshot_done, NULL);
+	poll_threads();
+	CU_ASSERT(g_grp_done_called == 0);
+	CU_ASSERT(g_grp_freeze_cnt[0] == 1 && g_grp_freeze_cnt[1] == 1 && g_grp_freeze_cnt[2] == 1);
+
+	spdk_delay_us(GROUP_SNAP_TIMEOUT_US);
+	poll_threads();
+
+	CU_ASSERT(g_grp_done_called == 1);
+	CU_ASSERT(g_grp_done_rc == -ETIMEDOUT);
+	CU_ASSERT(strcmp(grp_events_joined(), "F0 F1 F2 S0 S1 S2 U0 U1 U2 ") == 0);
+	CU_ASSERT(g_grp_freeze_cnt[0] == 0 && g_grp_freeze_cnt[1] == 0 && g_grp_freeze_cnt[2] == 0);
+	CU_ASSERT(g_grp_entries[0].snap == NULL);
+	CU_ASSERT(g_grp_entries[1].snap == NULL);
+	CU_ASSERT(g_grp_entries[2].snap == NULL);
+
+	/* The caller has its answer; scribble over its entries as an RPC would free them. */
+	memset(g_grp_entries, 0xa5, sizeof(g_grp_entries));
+
+	/* The stuck snapshot completes late: everything taken is garbage-collected. */
+	SPDK_CU_ASSERT_FATAL(g_grp_deferred_cb != NULL);
+	snap = _lvol_create(g_grp_deferred_lvol->lvol_store);
+	snprintf(snap->name, sizeof(snap->name), "%s", "s1");
+	g_grp_deferred_cb(g_grp_deferred_arg, snap, 0);
+	poll_threads();
+
+	CU_ASSERT(g_grp_done_called == 1);
+	ev = grp_events_joined();
+	CU_ASSERT(strcmp(ev, "F0 F1 F2 S0 S1 S2 U0 U1 U2 D0 D0 D0 ") == 0);
+
+	memset(g_grp_entries, 0, sizeof(g_grp_entries));
 	vbdev_lvs_destruct(lvs, lvol_store_op_complete, NULL);
 	ut_vbdev_lvs_settle();
 	grp_reset();
@@ -2258,6 +2481,7 @@ ut_lvol_nospace_is_a_write_error_not_a_failover(void)
 	g_io->u.bdev.offset_blocks = 20;
 	g_io->u.bdev.num_blocks = 8;
 	g_io->internal.status = SPDK_BDEV_IO_STATUS_PENDING;
+	g_lvs_queued_failed_io_calls = 0;
 
 	lvol_op_comp(g_io, -ENOSPC);
 	ut_capture_nvme_status();
@@ -2266,10 +2490,14 @@ ut_lvol_nospace_is_a_write_error_not_a_failover(void)
 	CU_ASSERT(g_io->internal.status == SPDK_BDEV_IO_STATUS_PENDING);
 	CU_ASSERT(ns_lvs.queue_failed_rsp == false);
 	CU_ASSERT(ns_lvs.leader == true);
+	/* no freeze, no port block, no leadership drop */
+	CU_ASSERT(g_lvs_queued_failed_io_calls == 0);
 
-	/* Any other error keeps today's behaviour: a generic failure. */
+	/* Any other error keeps today's behaviour: a generic failure, and the
+	 * failed-IO path (freeze, port block, step-down) runs. */
 	lvol_op_comp(g_io, -EIO);
 	CU_ASSERT(g_io->internal.status == SPDK_BDEV_IO_STATUS_FAILED);
+	CU_ASSERT(g_lvs_queued_failed_io_calls == 1);
 
 	free(g_io);
 	free(g_lvol);
@@ -3667,6 +3895,42 @@ ut_lvol_resv_hub_detached_before_unload(void)
  * sync poller nor a sync it queued just before may follow lvs_bdev->lvs, nor make a
  * new hub (test_replication exec_sync_lvs_mga_source_degraded: ASan
  * heap-use-after-free in vbdev_lvol_resv_sync_poll during bdev_lvol_delete_lvstore). */
+/* On a secondary, the delete of a snapshot starts a failover update of the
+ * snapshot above it. A delete of that blob while the update runs answers
+ * -EBUSY at once (the control plane retries) and touches nothing. */
+static int g_ut_destroy_rc;
+static int g_ut_destroy_calls;
+
+static void
+ut_destroy_done(void *cb_arg, int rc)
+{
+	g_ut_destroy_rc = rc;
+	g_ut_destroy_calls++;
+}
+
+static void
+ut_lvol_destroy_secondary_busy_while_updating(void)
+{
+	struct ut_resv_node n;
+
+	ut_resv_node_init(&n, false);
+	g_ut_destroy_calls = 0;
+	g_ut_destroy_rc = 0;
+
+	MOCK_SET(spdk_blob_locked_operation_in_progress, true);
+	vbdev_lvol_destroy(&n.lvol, ut_destroy_done, NULL, true);
+	poll_threads();
+	MOCK_SET(spdk_blob_locked_operation_in_progress, false);
+
+	CU_ASSERT(g_ut_destroy_calls == 1);
+	CU_ASSERT(g_ut_destroy_rc == -EBUSY);
+	CU_ASSERT(n.lvol.action_in_progress == false);
+	CU_ASSERT(n.lvol.blob == (struct spdk_blob *)0x1);
+	CU_ASSERT(TAILQ_FIRST(&n.lvs.lvols) == &n.lvol);
+
+	ut_resv_node_fini(&n);
+}
+
 static void
 ut_lvol_resv_sync_skips_detached_lvs(void)
 {
@@ -3913,6 +4177,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, ut_lvol_hub_resv_plain_io_ignores_stale_iovs);
 	CU_ADD_TEST(suite, ut_lvol_resv_hub_detached_before_unload);
 	CU_ADD_TEST(suite, ut_lvol_resv_sync_skips_detached_lvs);
+	CU_ADD_TEST(suite, ut_lvol_destroy_secondary_busy_while_updating);
 	CU_ADD_TEST(suite, ut_lvol_resv_follower_keeps_fetched_state);
 	CU_ADD_TEST(suite, ut_lvol_resv_store_failure_restores_xattr);
 	CU_ADD_TEST(suite, ut_lvol_resv_sync_backoff);
@@ -3930,6 +4195,10 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, ut_lvol_group_snapshot_midfail_unfreezes_then_gcs);
 	CU_ADD_TEST(suite, ut_lvol_group_snapshot_freeze_fail_unwinds);
 	CU_ADD_TEST(suite, ut_lvol_group_snapshot_rejects_empty_and_null);
+	CU_ADD_TEST(suite, ut_lvol_group_snapshot_unfreeze_nomem_retries);
+	CU_ADD_TEST(suite, ut_lvol_group_snapshot_member_gone_before_freeze);
+	CU_ADD_TEST(suite, ut_lvol_group_snapshot_member_gone_while_frozen);
+	CU_ADD_TEST(suite, ut_lvol_group_snapshot_stuck_member_times_out);
 	CU_ADD_TEST(suite, ut_lvol_clone);
 	CU_ADD_TEST(suite, ut_lvs_destroy);
 	CU_ADD_TEST(suite, ut_lvs_unload);

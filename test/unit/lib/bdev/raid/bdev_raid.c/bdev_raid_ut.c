@@ -37,6 +37,9 @@ struct io_output {
 struct io_output *g_io_output = NULL;
 uint32_t g_io_output_index;
 uint32_t g_io_comp_status;
+/* NVMe status of the last completion; -1 when it completed with a plain bdev status */
+int g_io_comp_nvme_sct;
+int g_io_comp_nvme_sc;
 bool g_child_io_status_flag;
 void *g_rpc_req;
 uint32_t g_rpc_req_size;
@@ -338,6 +341,16 @@ void
 spdk_bdev_io_complete(struct spdk_bdev_io *bdev_io, enum spdk_bdev_io_status status)
 {
 	g_io_comp_status = ((status == SPDK_BDEV_IO_STATUS_SUCCESS) ? true : false);
+	g_io_comp_nvme_sct = -1;
+	g_io_comp_nvme_sc = -1;
+}
+
+void
+spdk_bdev_io_complete_nvme_status(struct spdk_bdev_io *bdev_io, uint32_t cdw0, int sct, int sc)
+{
+	g_io_comp_status = (sct == SPDK_NVME_SCT_GENERIC && sc == SPDK_NVME_SC_SUCCESS);
+	g_io_comp_nvme_sct = sct;
+	g_io_comp_nvme_sc = sc;
 }
 
 static void
@@ -1776,6 +1789,58 @@ test_bdev_ioch_destroy(void *io_device, void *ctx_buf)
 {
 }
 
+/* A raid IO whose base IO failed with NVMe "Capacity Exceeded" completes with
+ * that NVMe status (blob_bdev maps it to -ENOSPC, the lvol layer then fails the
+ * host IO without touching leadership). Without nospace a failure stays a plain
+ * SPDK_BDEV_IO_STATUS_FAILED. */
+static void
+test_io_complete_nospace(void)
+{
+	struct raid_bdev raid_bdev = { .level = RAID0 };
+	struct spdk_bdev_io *bdev_io;
+	struct raid_bdev_io *raid_io;
+
+	bdev_io = calloc(1, sizeof(struct spdk_bdev_io) + sizeof(struct raid_bdev_io));
+	SPDK_CU_ASSERT_FATAL(bdev_io != NULL);
+	bdev_io->bdev = &raid_bdev.bdev;
+	bdev_io->type = SPDK_BDEV_IO_TYPE_WRITE;
+	raid_io = (struct raid_bdev_io *)bdev_io->driver_ctx;
+	raid_io->raid_bdev = &raid_bdev;
+	raid_io->type = SPDK_BDEV_IO_TYPE_WRITE;
+	raid_io->split.offset = RAID_OFFSET_BLOCKS_INVALID;
+
+	raid_io->nospace = true;
+	g_io_comp_status = true;
+	raid_bdev_io_complete(raid_io, SPDK_BDEV_IO_STATUS_FAILED);
+	CU_ASSERT(g_io_comp_status == false);
+	CU_ASSERT(g_io_comp_nvme_sct == SPDK_NVME_SCT_GENERIC);
+	CU_ASSERT(g_io_comp_nvme_sc == SPDK_NVME_SC_CAPACITY_EXCEEDED);
+
+	raid_io->nospace = false;
+	g_io_comp_status = true;
+	raid_bdev_io_complete(raid_io, SPDK_BDEV_IO_STATUS_FAILED);
+	CU_ASSERT(g_io_comp_status == false);
+	CU_ASSERT(g_io_comp_nvme_sct == -1);
+
+	/* out of space on one base IO and a device error on another: a plain
+	 * failure, the device error must not pass as "full" */
+	raid_io->nospace = true;
+	raid_io->failed_other = true;
+	g_io_comp_status = true;
+	raid_bdev_io_complete(raid_io, SPDK_BDEV_IO_STATUS_FAILED);
+	CU_ASSERT(g_io_comp_status == false);
+	CU_ASSERT(g_io_comp_nvme_sct == -1);
+	raid_io->failed_other = false;
+
+	/* nospace never turns a success into a failure */
+	raid_io->nospace = true;
+	raid_bdev_io_complete(raid_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+	CU_ASSERT(g_io_comp_status == true);
+	CU_ASSERT(g_io_comp_nvme_sct == -1);
+
+	free(bdev_io);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1794,6 +1859,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_reset_io);
 	CU_ADD_TEST(suite, test_multi_raid);
 	CU_ADD_TEST(suite, test_io_type_supported);
+	CU_ADD_TEST(suite, test_io_complete_nospace);
 	CU_ADD_TEST(suite, test_raid_json_dump_info);
 	CU_ADD_TEST(suite, test_context_size);
 	CU_ADD_TEST(suite, test_raid_level_conversions);

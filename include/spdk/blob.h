@@ -357,6 +357,12 @@ struct spdk_bs_dev {
 
 	uint64_t	blockcnt;
 	uint32_t	blocklen; /* In bytes */
+
+	/* The device takes an IO priority class in the top LBA bits
+	 * (spdk/priority_class.h) and strips it before the address is used, as the
+	 * raid module does. Without it, the bits would make the LBA out of range,
+	 * so the blobstore must send class 0. */
+	bool		priority_lba_bits;
 };
 
 struct spdk_bs_type {
@@ -600,6 +606,17 @@ void spdk_blob_merge_base(struct spdk_blob *blob, spdk_blob_merge_complete cb_fn
  * class, like the transfer it completes. */
 void spdk_blob_merge_base_ext(struct spdk_blob *blob, int priority_class,
 			      spdk_blob_merge_complete cb_fn, void *cb_arg);
+/*
+ * Limits of a merge's iobuf small-pool use (node-wide, for merges started
+ * from now on; the pool is shared with client IO): at most max_bufs buffers
+ * held by one merge, and -ETIMEDOUT when its pieces got no buffers for
+ * timeout_ms. A merge also stops with -ECANCELED when the last reference to
+ * the blob is closed (the close waits for it), the blobstore is unloaded (the
+ * unload waits for it) or the leadership changes; a delete of the blob fails
+ * with -EBUSY while it runs. -EINVAL for 0.
+ */
+int spdk_blob_set_merge_iobuf_limits(uint32_t max_bufs, uint32_t timeout_ms);
+void spdk_blob_get_merge_iobuf_limits(uint32_t *max_bufs, uint32_t *timeout_ms);
 
 bool spdk_blob_get_offset_allocate(struct spdk_blob *blob, uint64_t offset);
 bool spdk_blob_check_offset_valid(struct spdk_blob *blob, uint64_t offset, uint64_t length);
@@ -1035,6 +1052,15 @@ struct spdk_blob *
 spdk_bs_copy_blob(struct spdk_blob_store *bs, struct spdk_blob	*blob);
 
 int spdk_bs_delete_blob_non_leader(struct spdk_blob_store *bs, struct spdk_blob	*blob);
+
+/**
+ * Free a copy made by spdk_bs_copy_blob without deleting the blob, for a
+ * non-leader delete that leaves the blob to another holder of its open handle.
+ * The copy's back_bs_dev belongs to the open handle and is not destroyed.
+ *
+ * \param copy The copy, may be NULL.
+ */
+void spdk_bs_free_blob_copy(struct spdk_blob *copy);
 
 /**
  * Create a read-only snapshot of specified blob with provided options.

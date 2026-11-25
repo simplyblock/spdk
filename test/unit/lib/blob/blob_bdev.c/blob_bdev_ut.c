@@ -106,6 +106,7 @@ struct spdk_bdev {
 	enum spdk_bdev_claim_type claim_type;
 	struct spdk_bdev_module *claim_module;
 	struct spdk_bdev_desc *claim_desc;
+	const char *module_name;
 };
 
 struct spdk_bdev_desc {
@@ -214,6 +215,12 @@ spdk_bdev_get_physical_block_size(const struct spdk_bdev *bdev)
 	return bdev->phys_blocklen;
 }
 
+const char *
+spdk_bdev_get_module_name(const struct spdk_bdev *bdev)
+{
+	return bdev->module_name != NULL ? bdev->module_name : "malloc";
+}
+
 /* This is a simple approximation: it does not support shared claims */
 int
 spdk_bdev_module_claim_bdev_desc(struct spdk_bdev_desc *desc, enum spdk_bdev_claim_type type,
@@ -267,6 +274,36 @@ create_bs_dev(void)
 	CU_ASSERT(bdev.claim_type == SPDK_BDEV_CLAIM_NONE);
 
 	bs_dev->destroy(bs_dev);
+	CU_ASSERT(bdev.open_cnt == 0);
+	g_bdev = NULL;
+}
+
+/* Only a raid bdev strips the IO priority class from the top LBA bits; the
+ * blobstore may send a class (e.g. PREMIUM metadata IO) only to such a device. */
+static void
+create_bs_dev_priority_lba_bits(void)
+{
+	struct spdk_bdev bdev;
+	struct spdk_bs_dev *bs_dev = NULL;
+	int rc;
+
+	init_bdev(&bdev, "bdev0", 16);
+	g_bdev = &bdev;
+
+	rc = spdk_bdev_create_bs_dev_ext("bdev0", NULL, NULL, &bs_dev);
+	CU_ASSERT(rc == 0);
+	SPDK_CU_ASSERT_FATAL(bs_dev != NULL);
+	CU_ASSERT(!bs_dev->priority_lba_bits);
+	bs_dev->destroy(bs_dev);
+
+	bdev.module_name = "raid";
+	bs_dev = NULL;
+	rc = spdk_bdev_create_bs_dev_ext("bdev0", NULL, NULL, &bs_dev);
+	CU_ASSERT(rc == 0);
+	SPDK_CU_ASSERT_FATAL(bs_dev != NULL);
+	CU_ASSERT(bs_dev->priority_lba_bits);
+	bs_dev->destroy(bs_dev);
+
 	CU_ASSERT(bdev.open_cnt == 0);
 	g_bdev = NULL;
 }
@@ -598,6 +635,7 @@ main(int argc, char **argv)
 
 	CU_ADD_TEST(suite, create_bs_dev);
 	CU_ADD_TEST(suite, create_bs_dev_ro);
+	CU_ADD_TEST(suite, create_bs_dev_priority_lba_bits);
 	CU_ADD_TEST(suite, create_bs_dev_rw);
 	CU_ADD_TEST(suite, claim_bs_dev);
 	CU_ADD_TEST(suite, claim_bs_dev_ro);

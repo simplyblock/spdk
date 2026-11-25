@@ -113,6 +113,8 @@ struct spdk_blob_list {
 	TAILQ_ENTRY(spdk_blob_list) link;
 };
 
+struct blob_merge_ctx;
+
 struct spdk_blob {
 	struct spdk_blob_store *bs;
 
@@ -137,6 +139,9 @@ struct spdk_blob {
 	struct blob_dirty_gen *dirty_gen;
 	/* spdk_blob_merge_base is running (dirty_gen is detached meanwhile) */
 	bool dirty_merging;
+	/* that merge: a close of the last reference waits for it (and cancels
+	 * it), a delete is refused while it runs */
+	struct blob_merge_ctx *merge_ctx;
 
 	enum spdk_blob_state		state;
 
@@ -151,6 +156,11 @@ struct spdk_blob {
 	bool		invalid;
 	bool		data_ro;
 	bool		md_ro;
+	/* Deleted on this node (non-leader delete) while other holders still had
+	 * the open handle: unlinked from bs->open_blobs, so a reused blob id opens
+	 * a fresh handle from disk instead of this one. Its metadata is never
+	 * persisted again; the last close frees it. */
+	bool		orphaned;
 
 	uint64_t	invalid_flags;
 	uint64_t	data_ro_flags;
@@ -258,9 +268,19 @@ struct spdk_blob_store {
 	 * over the snapshot's window. In memory: restarts at 0 with the process. */
 	uint64_t			dirty_local_writes;
 	/* spdk_blob_merge_base: one iobuf channel on the md thread, shared by
-	 * the merges in progress (merge_iobuf_refs) */
+	 * the merges in progress (merge_iobuf_refs), of an iobuf module of this
+	 * blobstore's own: iobuf asserts that a channel going away leaves no
+	 * waiting entry of its module on the thread, and several blobstores
+	 * share the md thread */
 	struct spdk_iobuf_channel	*merge_iobuf;
 	uint32_t			merge_iobuf_refs;
+	char				merge_iobuf_module[48];
+	/* the merges in progress; an unload cancels them and waits for them
+	 * (merge_unload_cb_fn), merges_cancelling while it cancels them */
+	TAILQ_HEAD(, blob_merge_ctx)	merges;
+	bool				merges_cancelling;
+	spdk_bs_op_complete		merge_unload_cb_fn;
+	void				*merge_unload_cb_arg;
 	/* Two-node arbitration: held IO is returned as a path error (-ENOTCONN), not EIO. */
 	bool				ha_fenced;
 	/* Two-node arbitration: desired hold state, written by the lvol layer, applied on
@@ -364,6 +384,11 @@ struct spdk_bs_channel {
 	struct spdk_bs_cow_stat		cow_stat_max;
 	uint32_t			cow_stat_count;
 	uint64_t			cow_stat_tsc;	/* interval start */
+
+	/* COPY offload back-off (see bs_channel_copy_allowed()). Per channel,
+	 * so per thread: no locks. */
+	uint32_t			copy_declines;	/* consecutive declined/failed COPYs */
+	uint32_t			copy_skips;	/* CoWs that skipped COPY since the last try */
 
 	TAILQ_HEAD(, spdk_bs_request_set) queued_io;
 

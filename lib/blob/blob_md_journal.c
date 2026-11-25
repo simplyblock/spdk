@@ -74,10 +74,17 @@ md_journal_free_elem_chunks(struct spdk_bs_md_journal *jr)
 {
 	uint32_t c;
 
-	for (c = 0; c < BS_MD_JOURNAL_NUM_CHUNKS; c++) {
+	if (jr->elem_dma_chunks == NULL) {
+		return;
+	}
+
+	for (c = 0; c < jr->elem_dma_chunk_count; c++) {
 		spdk_free(jr->elem_dma_chunks[c]);
 		jr->elem_dma_chunks[c] = NULL;
 	}
+	jr->elem_dma_chunk_count = 0;
+	free(jr->elem_dma_chunks);
+	jr->elem_dma_chunks = NULL;
 }
 
 static void
@@ -1431,6 +1438,34 @@ spdk_md_journal_batch_drain_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserr
 	}
 }
 
+/*
+ * HOME and ZERO writes carry the metadata priority class (PREMIUM) whenever
+ * the base device understands priority classes. At class 0 the drain queued
+ * behind client IO and the CoW backlog in the distrib and every md_drain
+ * persist waited on it (add_clone/create 5-47 s, dbfbb2322); ZERO batches
+ * return journal slots, so a starved ZERO path stalls admission too.
+ *
+ * Keyed on the device, not on the lvols' classes (bs->priority_class): that
+ * is 0 on most production lvstores (no QoS classes, no replication landing
+ * volume, and after every restart until a classed lvol is created again),
+ * which brought the slow drain back. The class rides in the top LBA bits
+ * (blob_bdev.c); only a device that strips them (raid, see
+ * spdk_bs_dev.priority_lba_bits) may get it, any other (malloc, aio, plain
+ * NVMe) would see out-of-range LBAs. bs_sequence_to_batch() keeps the
+ * sequence's class for the batch.
+ */
+static bool
+md_journal_premium(const struct spdk_bs_md_journal *jr)
+{
+	return jr->bs->dev->priority_lba_bits;
+}
+
+static void
+md_journal_seq_set_priority(struct spdk_bs_md_journal *jr, spdk_bs_sequence_t *seq)
+{
+	seq->priority_class = md_journal_premium(jr) ? PREMIUM_PRIORITY_CLASS : 0;
+}
+
 static int
 spdk_md_journal_write_batch_drain(struct spdk_bs_md_journal *jr)
 {
@@ -1449,6 +1484,7 @@ spdk_md_journal_write_batch_drain(struct spdk_bs_md_journal *jr)
 
 	drain_batch = jr->drain_batch;
 
+	md_journal_seq_set_priority(jr, jr->home_seq);
 	batch = bs_sequence_to_batch(jr->home_seq, 0, spdk_md_journal_batch_drain_cpl, jr);
 
 	for (i = 0; i < drain_batch->elem_count; i++) {
@@ -1527,24 +1563,33 @@ md_journal_start_drain_batch(struct spdk_bs_md_journal *jr, bool force)
 
 	batch->journal = jr;
 
-	uint32_t max_drain = force ?  BS_MD_JOURNAL_NUM_ELEMS : BS_MD_JOURNAL_DRAIN_BATCH_SIZE;
+	/*
+	 * A PREMIUM batch (md_journal_seq_set_priority()) is scheduled ahead of
+	 * client IO; the whole backlog (up to 8192 x 4 KiB = 32 MiB) in one such
+	 * batch can hold client IO back for its full duration. Cap it: the next
+	 * batch starts as soon as this one completes, so client IO gets a turn
+	 * between batches while the backlog still drains back to back.
+	 */
+	uint32_t max_batch = md_journal_premium(jr) ?
+			     BS_MD_JOURNAL_PREMIUM_BATCH_MAX : BS_MD_JOURNAL_NUM_ELEMS;
+	uint32_t max_drain = force ? max_batch : spdk_min(BS_MD_JOURNAL_DRAIN_BATCH_SIZE, max_batch);
 	/*
 	 * Consume the next consecutive elements from the ordered
 	 * HOME queue.
 	 *
 	 * The small batch bounds the work of an idle-ish journal. When more
 	 * than that is already pending, the queue is behind: take everything
-	 * (the large size) so one batch, not several back-to-back ones, drains
+	 * (up to max_batch) so one batch, not several back-to-back ones, drains
 	 * the backlog. Per-LBA ordering is unaffected: elements stay in
 	 * sequence order and md_journal_mark_latest() still homes only the
 	 * newest entry of an LBA within the batch.
 	 */
 	while ((elem = TAILQ_FIRST(&jr->home_queue)) != NULL) {
 		if (batch->elem_count >= max_drain) {
-			if (max_drain >= BS_MD_JOURNAL_NUM_ELEMS) {
+			if (max_drain >= max_batch) {
 				break;
 			}
-			max_drain = BS_MD_JOURNAL_NUM_ELEMS;
+			max_drain = max_batch;
 		}
 
 		TAILQ_REMOVE(&jr->home_queue, elem, link);
@@ -1704,6 +1749,7 @@ spdk_md_journal_submit_zeroes_v1_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int 
 		return;
 	}
 
+	md_journal_seq_set_priority(jr, jr->zero_seq);
 	batch = bs_sequence_to_batch(jr->zero_seq, 0, spdk_md_journal_submit_zeroes_v2_cpl, zero_batch);
 	
 	for (uint32_t i = 0; i < zero_batch->elem_count; i++) {
@@ -1783,6 +1829,7 @@ spdk_md_journal_submit_zeroes(struct spdk_bs_md_journal *jr)
 
 	md_journal_mark_latest(zero_batch);
 
+	md_journal_seq_set_priority(jr, jr->zero_seq);
 	batch = bs_sequence_to_batch(jr->zero_seq, 0, spdk_md_journal_submit_zeroes_v1_cpl, zero_batch);
 	for (uint32_t i = 0; i < zero_batch->elem_count; i++) {
 		elem = zero_batch->items[i];
@@ -2096,11 +2143,23 @@ bs_md_journal_start(struct spdk_bs_md_journal *jr)
 	return 0;
 }
 
+/*
+ * Allocator of the element DMA chunks. A macro so that the unit test can
+ * fail the 2 MiB requests of a fragmented heap (see md_journal_init_elements).
+ */
+#ifndef MD_JOURNAL_ELEM_ZMALLOC
+#define MD_JOURNAL_ELEM_ZMALLOC spdk_zmalloc
+#endif
+
 static int
 md_journal_init_elements(struct spdk_bs_md_journal *jr)
 {
 	struct md_journal_elem *elem;
 	uint32_t i;
+	/* elements per chunk; halved for good once a chunk cannot be allocated */
+	uint32_t chunk_elems = BS_MD_JOURNAL_ELEMS_PER_CHUNK;
+	uint8_t *chunk_cur = NULL;
+	uint32_t chunk_left = 0;
 
 	jr->elems = calloc(BS_MD_JOURNAL_NUM_ELEMS, sizeof(*jr->elems));
 	if (jr->elems == NULL) {
@@ -2108,8 +2167,16 @@ md_journal_init_elements(struct spdk_bs_md_journal *jr)
 		return -ENOMEM;
 	}
 
+	jr->elem_dma_chunks = calloc(BS_MD_JOURNAL_MAX_CHUNKS, sizeof(*jr->elem_dma_chunks));
+	jr->elem_dma_chunk_count = 0;
+	if (jr->elem_dma_chunks == NULL) {
+		SPDK_ERRLOG("md_journal: cannot allocate the DMA chunk table\n");
+		free(jr->elems);
+		jr->elems = NULL;
+		return -ENOMEM;
+	}
+
 	for (i = 0; i < BS_MD_JOURNAL_NUM_ELEMS; i++) {
-		uint32_t c = i / BS_MD_JOURNAL_ELEMS_PER_CHUNK;
 		uint8_t *slot_buf;
 
 		elem = &jr->elems[i];
@@ -2117,18 +2184,45 @@ md_journal_init_elements(struct spdk_bs_md_journal *jr)
 		elem->journal = jr;
 		elem->slot = i;
 
-		if (jr->elem_dma_chunks[c] == NULL) {
-			jr->elem_dma_chunks[c] = spdk_zmalloc((size_t)BS_MD_JOURNAL_ELEMS_PER_CHUNK *
-							      BS_MD_JOURNAL_ENTRY_SIZE,
-							      BS_MD_JOURNAL_PAGE_SIZE, NULL,
-							      SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
-			if (jr->elem_dma_chunks[c] == NULL) {
+		if (chunk_left == 0) {
+			uint32_t want = spdk_min(chunk_elems, BS_MD_JOURNAL_NUM_ELEMS - i);
+			void *chunk;
+
+			/*
+			 * 2 MiB chunks need 2 MiB contiguous free blocks. On a
+			 * fragmented heap (lvstore load or takeover late in the
+			 * process lifetime) there may be none: halve the chunk
+			 * down to one element (8 KiB) before failing the journal,
+			 * and therefore the lvstore load, with -ENOMEM.
+			 */
+			for (;;) {
+				chunk = MD_JOURNAL_ELEM_ZMALLOC((size_t)want * BS_MD_JOURNAL_ENTRY_SIZE,
+								BS_MD_JOURNAL_PAGE_SIZE, NULL,
+								SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+				if (chunk != NULL || want == 1) {
+					break;
+				}
+				want /= 2;
+				if (want < chunk_elems) {
+					SPDK_NOTICELOG("md_journal: no %u KiB DMA block for element %u, "
+						       "falling back to %u KiB chunks\n",
+						       chunk_elems * BS_MD_JOURNAL_ENTRY_SIZE / 1024, i,
+						       want * BS_MD_JOURNAL_ENTRY_SIZE / 1024);
+					chunk_elems = want;
+				}
+			}
+			if (chunk == NULL) {
 				goto error;
 			}
+			assert(jr->elem_dma_chunk_count < BS_MD_JOURNAL_MAX_CHUNKS);
+			jr->elem_dma_chunks[jr->elem_dma_chunk_count++] = chunk;
+			chunk_cur = chunk;
+			chunk_left = want;
 		}
 		/* header page then metadata page, adjacent (8 KiB per element) */
-		slot_buf = (uint8_t *)jr->elem_dma_chunks[c] +
-			   (size_t)(i % BS_MD_JOURNAL_ELEMS_PER_CHUNK) * BS_MD_JOURNAL_ENTRY_SIZE;
+		slot_buf = chunk_cur;
+		chunk_cur += BS_MD_JOURNAL_ENTRY_SIZE;
+		chunk_left--;
 		elem->hdr = (struct md_journal_entry_hdr *)slot_buf;
 		elem->page = slot_buf + BS_MD_JOURNAL_PAGE_SIZE;
 
@@ -2144,9 +2238,10 @@ md_journal_init_elements(struct spdk_bs_md_journal *jr)
 		jr->free_count++;
 	}
 
-	SPDK_NOTICELOG("md_journal: %u elements initialized (%u KiB DMA buffers)\n",
+	SPDK_NOTICELOG("md_journal: %u elements initialized (%u KiB DMA buffers in %u chunks)\n",
 		       BS_MD_JOURNAL_NUM_ELEMS,
-		       (uint32_t)((uint64_t)BS_MD_JOURNAL_NUM_ELEMS * BS_MD_JOURNAL_ENTRY_SIZE / 1024));
+		       (uint32_t)((uint64_t)BS_MD_JOURNAL_NUM_ELEMS * BS_MD_JOURNAL_ENTRY_SIZE / 1024),
+		       jr->elem_dma_chunk_count);
 
 	return 0;
 
@@ -2894,16 +2989,7 @@ bs_md_journal_create(struct spdk_blob_store *bs, uint64_t md_journal_mask_start,
 		md_journal_free(jr);
 		return NULL;
 	}
-	/*
-	 * HOME (and ZERO) writes carry the metadata priority class, not the
-	 * blobstore's default: bs_sequence_start_bs() copies bs->priority_class,
-	 * which is 0 until some blob gets a class (spdk_blob_set_io_priority_class
-	 * then raises it to PREMIUM for "metadata I/O"). The class rides in the
-	 * top LBA bits (blob_bdev.c) and the distrib schedules by it; at class 0
-	 * the drain queued behind client IO and every md_drain persist waited on
-	 * it. bs_sequence_to_batch() keeps the sequence's class for the batch.
-	 */
-	jr->home_seq->priority_class = PREMIUM_PRIORITY_CLASS;
+	/* class of HOME (and ZERO) IO: see md_journal_seq_set_priority() */
 
 	struct spdk_bs_cpl zero_cpl;
 	zero_cpl.type = SPDK_BS_CPL_TYPE_BLOB_BASIC;
@@ -2916,8 +3002,6 @@ bs_md_journal_create(struct spdk_blob_store *bs, uint64_t md_journal_mask_start,
 		md_journal_free(jr);
 		return NULL;
 	}
-	/* ZERO batches return journal slots; a starved ZERO path stalls admission too. */
-	jr->zero_seq->priority_class = PREMIUM_PRIORITY_CLASS;
 	/*
 	 * For a fresh journal.
 	 *
