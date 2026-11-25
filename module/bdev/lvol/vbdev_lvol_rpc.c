@@ -4489,8 +4489,10 @@ rpc_bdev_lvol_set_xfer_whole_cluster_pct(struct spdk_jsonrpc_request *request,
 	spdk_jsonrpc_end_result(request, w);
 }
 
+/* STARTUP too: a saved config (vbdev_lvs_config_json) sets it before any
+ * lvol store loads. */
 SPDK_RPC_REGISTER("bdev_lvol_set_xfer_whole_cluster_pct", rpc_bdev_lvol_set_xfer_whole_cluster_pct,
-		  SPDK_RPC_RUNTIME)
+		  SPDK_RPC_STARTUP | SPDK_RPC_RUNTIME)
 
 struct rpc_bdev_lvol_set_iobuf_limits {
 	uint32_t bg_pct;

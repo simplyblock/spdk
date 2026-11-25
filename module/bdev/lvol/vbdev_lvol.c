@@ -48,6 +48,7 @@ static TAILQ_HEAD(, lvol_store_bdev) g_spdk_lvol_pairs = TAILQ_HEAD_INITIALIZER(
 static int vbdev_lvs_init(void);
 static void vbdev_lvs_fini_start(void);
 static int vbdev_lvs_get_ctx_size(void);
+static int vbdev_lvs_config_json(struct spdk_json_write_ctx *w);
 static void vbdev_lvs_examine_config(struct spdk_bdev *bdev);
 static void vbdev_lvs_examine_disk(struct spdk_bdev *bdev);
 static bool g_shutdown_started = false;
@@ -60,7 +61,7 @@ static struct spdk_bdev_module g_lvol_if = {
 	.examine_config = vbdev_lvs_examine_config,
 	.examine_disk = vbdev_lvs_examine_disk,
 	.get_ctx_size = vbdev_lvs_get_ctx_size,
-
+	.config_json = vbdev_lvs_config_json,
 };
 
 SPDK_BDEV_MODULE_REGISTER(lvol, &g_lvol_if)
@@ -4969,6 +4970,22 @@ vbdev_lvs_fini_start(void)
 	spdk_poller_unregister(&g_resv_sync_poller);
 
 	vbdev_lvs_fini_start_iter(vbdev_lvol_store_first());
+}
+
+/* Module-wide settings for save_config, so a restart from the saved config
+ * keeps them: the partial-transfer whole-cluster threshold (a node-wide
+ * tunable; every other replication setting is a parameter of each transfer
+ * RPC). */
+static int
+vbdev_lvs_config_json(struct spdk_json_write_ctx *w)
+{
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_string(w, "method", "bdev_lvol_set_xfer_whole_cluster_pct");
+	spdk_json_write_named_object_begin(w, "params");
+	spdk_json_write_named_uint32(w, "pct", spdk_lvol_get_xfer_whole_cluster_pct());
+	spdk_json_write_object_end(w);
+	spdk_json_write_object_end(w);
+	return 0;
 }
 
 static int

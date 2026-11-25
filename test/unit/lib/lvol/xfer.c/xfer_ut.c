@@ -17,6 +17,8 @@
 /* blob_dirty.c and the dirty-gen / freeze-probe stubs now come from
  * lvol_ut.c, which this file includes wholesale. */
 
+#define UT_SRC_ID	0x43
+
 static struct spdk_lvol g_xfer_lvol;
 static struct spdk_lvol_store g_xfer_lvs;
 /* the poll group the requests run on: its iobuf channel is set up in main() */
@@ -31,7 +33,13 @@ make_xfer(int cluster_batch, uint32_t num_clusters, const int *allocated)
 	memset(&g_xfer_lvol, 0, sizeof(g_xfer_lvol));
 	memset(&g_xfer_lvs, 0, sizeof(g_xfer_lvs));
 	g_xfer_lvol.lvol_store = &g_xfer_lvs;
+	TAILQ_INIT(&g_xfer_lvs.lvols);
 	snprintf(g_xfer_lvol.name, sizeof(g_xfer_lvol.name), "xfer_ut_lvol");
+	/* the source snapshot's parent is the destination's base (0x42, the
+	 * partial_base the tests pass), as in a chain sent snapshot by snapshot */
+	ut_chain_clear();
+	g_xfer_lvol.blob_id = UT_SRC_ID;
+	ut_chain_set(UT_SRC_ID, 0x42, 0);
 
 	xfer->lvol = &g_xfer_lvol;
 	xfer->type = XFER_REPLICATE_SNAPSHOT;
@@ -88,6 +96,7 @@ free_xfer(struct spdk_lvs_xfer *xfer)
 	spdk_ring_free(xfer->ready_ring);
 	free(xfer->clusters);
 	free(xfer->ranges);
+	free(xfer->bridged);
 	free(xfer);
 }
 
@@ -505,12 +514,27 @@ ut_zero_chain(struct spdk_lvs_xfer_req *req)
 }
 
 /* One request, submitted: it holds its chain (zeroed: the source read zeroes)
- * and its read is out. */
+ * and its read is out. The request is made by the dispatcher
+ * (xfer_repl_next), as in production: the first 64 KiB piece of a whole
+ * cluster of a task without a dirty generation. */
 static struct spdk_lvs_xfer_req *
 make_cluster_req(struct spdk_lvs_xfer **xferp, struct remote_lvol_info *rmt)
 {
 	struct spdk_lvs_xfer *xfer = make_cluster_xfer(1, rmt);
-	struct spdk_lvs_xfer_req *req = ut_prep_req(xfer, 0, rmt);
+	struct spdk_lvs_xfer_req *req;
+
+	xfer->hold_idx = 0;
+	xfer->idx = 0;
+	xfer->outstanding_io = 0;
+	SPDK_CU_ASSERT_FATAL(xfer_repl_next(xfer, &xfer->reqs[0]));
+	CU_ASSERT(xfer->reqs[0].offset == 0);
+	CU_ASSERT(xfer->reqs[0].len == UT_REQ_BLOCKS);
+	/* a piece of a whole cluster is not partial: zero detection is on */
+	CU_ASSERT(!xfer->reqs[0].partial);
+	/* the cluster's other pieces are not part of these tests: the request
+	 * is the task's last one, and is done when its writes are */
+	xfer->range_pos = xfer->num_ranges;
+	req = ut_prep_req(xfer, 0, rmt);
 
 	CU_ASSERT(submit_rw_reqs_local(req) == 0);
 	SPDK_CU_ASSERT_FATAL(req->chain.nbufs == UT_REQ_BLOCKS * 4096 / UT_XFER_SMALL_SIZE);
@@ -1265,10 +1289,11 @@ xfer_cow_landing_still_sends_partial_ranges(void)
 	blob_dirty_gen_free(gen);
 }
 
-/* In a partial task every request is at most 64 KiB (16 pages), marked
- * partial: a partial cluster's coalesced dirty ranges, and whole clusters as
- * one range over all of them -- so a deep window costs no more buffer memory
- * than a shallow one of whole clusters. */
+/* In a partial task every request is at most 64 KiB (16 pages): a partial
+ * cluster's coalesced dirty ranges (marked partial), and whole clusters as
+ * one range over all of them (not partial: zero detection stays with the
+ * task's no_zero_skip) -- so a deep window costs no more buffer memory than
+ * a shallow one of whole clusters. */
 static void
 xfer_partial_dispatch_splits_ranges(void)
 {
@@ -1278,21 +1303,27 @@ xfer_partial_dispatch_splits_ranges(void)
 	struct spdk_lvs_xfer_req *req;
 	struct {
 		uint64_t offset, len;
+		bool partial;
 	} want[80];
 	uint32_t nw = 0, n = 0;
 
 	for (uint32_t p = 0; p < UT_PPC; p += 16) {		/* cluster 0, whole */
 		want[nw].offset = p;
+		want[nw].partial = false;
 		want[nw++].len = 16;
 	}
 	want[nw].offset = UT_PPC + 2;				/* 8 KiB at 8 KiB */
+	want[nw].partial = true;
 	want[nw++].len = 2;
 	want[nw].offset = UT_PPC + 256;				/* 1 MiB: 64 KiB ... */
+	want[nw].partial = true;
 	want[nw++].len = 16;
 	want[nw].offset = UT_PPC + 272;				/* ... + 40 KiB */
+	want[nw].partial = true;
 	want[nw++].len = 10;
 	for (uint32_t p = 0; p < UT_PPC; p += 16) {		/* cluster 2, whole */
 		want[nw].offset = 2 * UT_PPC + p;
+		want[nw].partial = false;
 		want[nw++].len = 16;
 	}
 
@@ -1304,7 +1335,7 @@ xfer_partial_dispatch_splits_ranges(void)
 		SPDK_CU_ASSERT_FATAL(n < nw);
 		CU_ASSERT(req->offset == want[n].offset);
 		CU_ASSERT(req->len == want[n].len);
-		CU_ASSERT(req->partial);
+		CU_ASSERT(req->partial == want[n].partial);
 		CU_ASSERT(req->len * 4096 <= 64 * 1024);
 		n++;
 	}
@@ -1316,9 +1347,9 @@ xfer_partial_dispatch_splits_ranges(void)
 	blob_dirty_gen_free(gen);
 }
 
-/* A cluster whose dirty share reaches the whole-cluster threshold (default
- * 50 %) is classified whole, not as ranges; at 100 % only a fully dirty
- * cluster is; at 0 % every cluster is. */
+/* A cluster whose dirty share reaches the whole-cluster threshold is
+ * classified whole, not as ranges. Default 100 % (off): only a fully dirty
+ * cluster is; at 50 % a mostly dirty one is; at 0 % every cluster is. */
 static void
 xfer_partial_mostly_dirty_cluster_goes_whole(void)
 {
@@ -1331,22 +1362,23 @@ xfer_partial_mostly_dirty_cluster_goes_whole(void)
 	blob_dirty_mark(gen, 0, 8192);
 	blob_dirty_mark(gen, (uint64_t)UT_CLUSTER_SZ + 256 * 1024, 1024 * 1024 + 64 * 1024);
 
-	CU_ASSERT(spdk_lvol_get_xfer_whole_cluster_pct() == 50);
+	/* default: only dirty ranges travel */
+	CU_ASSERT(spdk_lvol_get_xfer_whole_cluster_pct() == 100);
 	xfer = make_partial_xfer(1, 2, alloc, gen);
 	SPDK_CU_ASSERT_FATAL(xfer->allow_partial);
 	xfer_classify_partial(xfer);
 	CU_ASSERT(xfer->partial[0] == 1);
-	CU_ASSERT(xfer->partial[1] == 0);
-	CU_ASSERT(xfer->partial_clusters == 1);
+	CU_ASSERT(xfer->partial[1] == 1);
+	CU_ASSERT(xfer->partial_clusters == 2);
 	free_partial_xfer(xfer);
 
 	CU_ASSERT(spdk_lvol_set_xfer_whole_cluster_pct(101) == -EINVAL);
-	CU_ASSERT(spdk_lvol_set_xfer_whole_cluster_pct(100) == 0);
+	CU_ASSERT(spdk_lvol_set_xfer_whole_cluster_pct(50) == 0);
 	xfer = make_partial_xfer(1, 2, alloc, gen);
 	xfer_classify_partial(xfer);
 	CU_ASSERT(xfer->partial[0] == 1);
-	CU_ASSERT(xfer->partial[1] == 1);
-	CU_ASSERT(xfer->partial_clusters == 2);
+	CU_ASSERT(xfer->partial[1] == 0);
+	CU_ASSERT(xfer->partial_clusters == 1);
 	free_partial_xfer(xfer);
 
 	CU_ASSERT(spdk_lvol_set_xfer_whole_cluster_pct(0) == 0);
@@ -1357,7 +1389,7 @@ xfer_partial_mostly_dirty_cluster_goes_whole(void)
 	CU_ASSERT(xfer->partial_clusters == 0);
 	free_partial_xfer(xfer);
 
-	CU_ASSERT(spdk_lvol_set_xfer_whole_cluster_pct(50) == 0);
+	CU_ASSERT(spdk_lvol_set_xfer_whole_cluster_pct(100) == 0);
 	blob_dirty_gen_free(gen);
 }
 
@@ -1676,6 +1708,465 @@ xfer_poll_group_releases_iobuf_channel(void)
 	free_xfer(xfer);
 }
 
+/*
+ * Snapshot chains on the source for the bridge tests. Blob ids:
+ * 0x40 <- 0x41 <- 0x42 <- UT_SRC_ID (0x43): the destination holds 0x40;
+ * 0x41 owns cluster 1, 0x42 owns cluster 2, the source owns cluster 3.
+ */
+static struct spdk_lvol g_ut_chain_lvols[4];
+static struct spdk_blob g_ut_chain_blobs[4];
+
+static void
+ut_chain_open(spdk_blob_id id, int slot)
+{
+	struct spdk_lvol *lvol = &g_ut_chain_lvols[slot];
+
+	memset(lvol, 0, sizeof(*lvol));
+	memset(&g_ut_chain_blobs[slot], 0, sizeof(g_ut_chain_blobs[slot]));
+	g_ut_chain_blobs[slot].id = id;
+	lvol->blob = &g_ut_chain_blobs[slot];
+	lvol->blob_id = id;
+	lvol->lvol_store = &g_xfer_lvs;
+	TAILQ_INSERT_TAIL(&g_xfer_lvs.lvols, lvol, link);
+}
+
+/* after make_xfer (which resets g_xfer_lvs and the chain) */
+static void
+ut_chain_4(void)
+{
+	ut_chain_clear();
+	ut_chain_set(0x41, 0x40, 1u << 1);
+	ut_chain_set(0x42, 0x41, 1u << 2);
+	ut_chain_set(UT_SRC_ID, 0x42, 1u << 3);
+	ut_chain_open(0x41, 0);
+	ut_chain_open(0x42, 1);
+}
+
+/* The full fallback of a delta request (the generation is unusable) against
+ * a base older than the source's parent: the clusters the snapshots in
+ * between own are sent too, whole -- not only the source's own. */
+static void
+xfer_full_fallback_bridges_skipped_snapshots(void)
+{
+	const int alloc[5] = {0, 0, 0, 0, 0};
+	struct spdk_lvs_xfer *xfer = make_xfer(1, 5, alloc);
+	int count = 0;
+
+	ut_chain_4();
+	g_blob_read_only = true;
+	g_ut_dirty_gen = NULL;		/* no generation: full clusters */
+	xfer->page_size = 4096;
+	CU_ASSERT(xfer_setup_partial(xfer, 0, 0x40) == 0);
+	CU_ASSERT(!xfer->allow_partial);
+	SPDK_CU_ASSERT_FATAL(xfer->bridged != NULL);
+	CU_ASSERT(xfer->bridge_hops == 2);
+	CU_ASSERT(xfer->bridge_clusters == 2);
+	CU_ASSERT(!xfer->bridged[0] && xfer->bridged[1] && xfer->bridged[2]);
+	CU_ASSERT(!xfer->bridged[3] && !xfer->bridged[4]);
+
+	/* XFER_STATE_NONE: the source's own clusters, then the bridged ones */
+	xfer->clusters[3] = 1;
+	count = 1;
+	count += xfer_add_bridged_clusters(xfer);
+	CU_ASSERT(count == 3);
+	CU_ASSERT(xfer->clusters[0] == 0 && xfer->clusters[1] != 0 && xfer->clusters[2] != 0);
+	CU_ASSERT(xfer->clusters[3] != 0 && xfer->clusters[4] == 0);
+	free(xfer->bridged);
+	xfer->bridged = NULL;
+
+	/* the base is the source's parent: its own clusters are the difference */
+	CU_ASSERT(xfer_setup_partial(xfer, 0, 0x42) == 0);
+	CU_ASSERT(xfer->bridged == NULL);
+	/* a resumed task falls back too, and bridges the same way */
+	CU_ASSERT(xfer_setup_partial(xfer, 512, 0x40) == 0);
+	CU_ASSERT(xfer->bridged != NULL && xfer->bridge_clusters == 2);
+
+	g_blob_read_only = false;
+	free_xfer(xfer);
+	ut_chain_clear();
+}
+
+/* A full fallback that cannot reach the destination's base refuses to start
+ * (the clusters in between would be missing): the base is not an ancestor,
+ * an in-between snapshot is not open here, or too many hops. */
+static void
+xfer_full_fallback_refuses_unreachable_base(void)
+{
+	const int alloc[5] = {0, 0, 0, 0, 0};
+	struct spdk_lvs_xfer *xfer = make_xfer(1, 5, alloc);
+	int i;
+
+	ut_chain_4();
+	g_blob_read_only = true;
+	g_ut_dirty_gen = NULL;
+	xfer->page_size = 4096;
+
+	/* not an ancestor */
+	CU_ASSERT(xfer_setup_partial(xfer, 0, 0x99) == -ENOENT);
+	CU_ASSERT(xfer->bridged == NULL);
+
+	/* 0x41 is not open on this node */
+	TAILQ_REMOVE(&g_xfer_lvs.lvols, &g_ut_chain_lvols[0], link);
+	CU_ASSERT(xfer_setup_partial(xfer, 0, 0x40) == -ENOENT);
+	CU_ASSERT(xfer->bridged == NULL);
+	TAILQ_INSERT_HEAD(&g_xfer_lvs.lvols, &g_ut_chain_lvols[0], link);
+
+	/* a migration's partial_base is not a replication base: as before */
+	xfer->type = XFER_MIGRATE_SNAPSHOT;
+	CU_ASSERT(xfer_setup_partial(xfer, 0, 0x99) == 0);
+	xfer->type = XFER_REPLICATE_SNAPSHOT;
+	/* nor is 0 (no base given) */
+	CU_ASSERT(xfer_setup_partial(xfer, 0, 0) == 0);
+
+	/* a long chain: more than XFER_BRIDGE_MAX_HOPS snapshots in between */
+	ut_chain_clear();
+	ut_chain_set(UT_SRC_ID, 0x200, 0);
+	for (i = 0; i <= XFER_BRIDGE_MAX_HOPS; i++) {
+		ut_chain_set(0x200 + i, 0x200 + i + 1, 0);
+	}
+	CU_ASSERT(xfer_setup_partial(xfer, 0, 0x200 + XFER_BRIDGE_MAX_HOPS + 1) == -ENOENT);
+
+	g_blob_read_only = false;
+	free_xfer(xfer);
+	ut_chain_clear();
+}
+
+/* The bridged delta (34c538289): the generation started at the source's
+ * parent, the destination holds an older snapshot. The delta goes on against
+ * it: the clusters the in-between snapshots own (the generation's base
+ * included, the destination's base not) are sent whole, the dirty clusters
+ * as ranges. */
+static void
+xfer_bridged_delta_sends_in_between_clusters_whole(void)
+{
+	const int alloc[5] = {0, 0, 0, 1, 0};
+	struct blob_dirty_gen *gen = blob_dirty_gen_create(UT_CLUSTER_SZ);
+	struct spdk_lvs_xfer *xfer;
+	int count = 1;
+
+	SPDK_CU_ASSERT_FATAL(gen != NULL);
+	gen->base = 0x42;
+	/* 8 KiB dirty in clusters 2 (bridged too) and 3 (the source's own) */
+	blob_dirty_mark(gen, 2ULL * UT_CLUSTER_SZ, 8192);
+	blob_dirty_mark(gen, 3ULL * UT_CLUSTER_SZ, 8192);
+
+	xfer = make_xfer(1, 5, alloc);
+	ut_chain_4();
+	xfer->page_size = 4096;
+	xfer->page_per_cluster = UT_PPC;
+	g_ut_dirty_usable_own_base = true;
+	g_ut_dirty_gen = gen;
+	g_ut_dirty_usable = true;
+	g_blob_read_only = true;
+	free(xfer->ranges);
+	xfer->ranges = NULL;
+	CU_ASSERT(xfer_setup_partial(xfer, 0, 0x40) == 0);
+	g_blob_read_only = false;
+	SPDK_CU_ASSERT_FATAL(xfer->allow_partial);
+	SPDK_CU_ASSERT_FATAL(xfer->bridged != NULL);
+	CU_ASSERT(xfer->dirty_gen == gen);
+	CU_ASSERT(xfer->bridge_hops == 2);	/* 0x42 and 0x41 */
+	CU_ASSERT(!xfer->bridged[0] && xfer->bridged[1] && xfer->bridged[2] && !xfer->bridged[3]);
+
+	count += xfer_add_bridged_clusters(xfer);
+	CU_ASSERT(count == 3);
+	xfer_classify_partial(xfer);
+	CU_ASSERT(xfer->partial[1] == 0);	/* bridged: whole */
+	CU_ASSERT(xfer->partial[2] == 0);	/* bridged, though dirty: whole */
+	CU_ASSERT(xfer->partial[3] == 1);	/* the source's own dirty cluster */
+	CU_ASSERT(xfer->partial_clusters == 1);
+
+	/* against the generation's own base no bridge is needed */
+	free(xfer->partial);
+	free(xfer->ranges);
+	free(xfer->bridged);
+	xfer->partial = NULL;
+	xfer->ranges = NULL;
+	xfer->bridged = NULL;
+	spdk_blob_dirty_gen_unref(xfer->dirty_gen);
+	xfer->dirty_gen = NULL;
+	xfer->allow_partial = false;
+	g_blob_read_only = true;
+	CU_ASSERT(xfer_setup_partial(xfer, 0, 0x42) == 0);
+	g_blob_read_only = false;
+	CU_ASSERT(xfer->allow_partial && xfer->bridged == NULL);
+
+	g_ut_dirty_usable_own_base = false;
+	free_partial_xfer(xfer);
+	blob_dirty_gen_free(gen);
+	ut_chain_clear();
+}
+
+/* A bridge the delta cannot build (an in-between snapshot is not open) is no
+ * delta; the full fallback cannot reach the base either: refused. */
+static void
+xfer_bridged_delta_unbridgeable_is_refused(void)
+{
+	const int alloc[5] = {0, 0, 0, 1, 0};
+	struct blob_dirty_gen *gen = blob_dirty_gen_create(UT_CLUSTER_SZ);
+	struct spdk_lvs_xfer *xfer = make_xfer(1, 5, alloc);
+
+	SPDK_CU_ASSERT_FATAL(gen != NULL);
+	gen->base = 0x42;
+	ut_chain_4();
+	TAILQ_REMOVE(&g_xfer_lvs.lvols, &g_ut_chain_lvols[0], link);	/* 0x41 */
+	g_ut_dirty_usable_own_base = true;
+	g_ut_dirty_gen = gen;
+	g_ut_dirty_usable = true;
+	g_blob_read_only = true;
+	xfer->page_size = 4096;
+	CU_ASSERT(xfer_setup_partial(xfer, 0, 0x40) == -ENOENT);
+	CU_ASSERT(!xfer->allow_partial && xfer->dirty_gen == NULL && xfer->bridged == NULL);
+	CU_ASSERT(gen->refcnt == 1);
+
+	g_blob_read_only = false;
+	g_ut_dirty_usable_own_base = false;
+	g_ut_dirty_gen = NULL;
+	free_xfer(xfer);
+	blob_dirty_gen_free(gen);
+	ut_chain_clear();
+}
+
+/* A transfer into a clone (dest_clone / a cow_landing final step) after one
+ * that did not complete sends full clusters, not dirty ranges: the clone may
+ * hold clusters the earlier alloc step zero-filled that no data reached, and
+ * a range written into one would leave zeroes where the base belongs. */
+static void
+xfer_dest_clone_after_incomplete_round_sends_full(void)
+{
+	const int alloc[3] = {1, 1, 1};
+	struct blob_dirty_gen *gen = make_gen_012();
+	struct spdk_lvs_xfer *xfer;
+
+	/* the round before completed: a delta */
+	xfer = make_xfer(1, 3, alloc);
+	xfer->dest_is_clone = true;
+	g_xfer_lvol.xfer_clone_round_incomplete = false;
+	g_ut_dirty_gen = gen;
+	g_ut_dirty_usable = true;
+	g_blob_read_only = true;
+	xfer->page_size = 4096;
+	free(xfer->ranges);
+	xfer->ranges = NULL;
+	CU_ASSERT(xfer_setup_partial(xfer, 0, 0x42) == 0);
+	CU_ASSERT(xfer->allow_partial);
+	free(xfer->partial);
+	free(xfer->ranges);
+	xfer->partial = NULL;
+	xfer->ranges = NULL;
+	spdk_blob_dirty_gen_unref(xfer->dirty_gen);
+	xfer->dirty_gen = NULL;
+	xfer->allow_partial = false;
+
+	/* it did not: full clusters */
+	g_xfer_lvol.xfer_clone_round_incomplete = true;
+	CU_ASSERT(xfer_setup_partial(xfer, 0, 0x42) == 0);
+	CU_ASSERT(!xfer->allow_partial && xfer->dirty_gen == NULL);
+	/* a landing volume (not a clone) is new: the flag does not matter */
+	xfer->dest_is_clone = false;
+	CU_ASSERT(xfer_setup_partial(xfer, 0, 0x42) == 0);
+	CU_ASSERT(xfer->allow_partial);
+	CU_ASSERT(gen->refcnt == 2);
+
+	g_blob_read_only = false;
+	g_xfer_lvol.xfer_clone_round_incomplete = false;
+	free_partial_xfer(xfer);
+	blob_dirty_gen_free(gen);
+}
+
+/*
+ * spdk_lvol_transfer end to end, for the task setup: a source lvol on a fake
+ * lvol store and transfer device. No poll groups are registered, so no
+ * request is ever sent; the md poller runs the task's state machine.
+ */
+static struct spdk_lvol g_ut_tx_lvol;
+static struct spdk_lvol_store g_ut_tx_lvs;
+static struct spdk_blob g_ut_tx_blob;
+static struct spdk_transfer_dev g_ut_tx_tdev;
+static int g_ut_requeued;
+
+static void
+ut_tx_setup(void)
+{
+	memset(&g_ut_tx_lvol, 0, sizeof(g_ut_tx_lvol));
+	memset(&g_ut_tx_lvs, 0, sizeof(g_ut_tx_lvs));
+	memset(&g_ut_tx_blob, 0, sizeof(g_ut_tx_blob));
+	memset(&g_ut_tx_tdev, 0, sizeof(g_ut_tx_tdev));
+	TAILQ_INIT(&g_ut_tx_lvs.lvols);
+	g_ut_tx_lvs.blobstore = (struct spdk_blob_store *)0x1;	/* only passed to stubs */
+	g_ut_tx_blob.id = 0x77;
+	g_ut_tx_blob.num_clusters = 4;
+	g_ut_tx_lvol.blob = &g_ut_tx_blob;
+	g_ut_tx_lvol.blob_id = 0x77;
+	g_ut_tx_lvol.lvol_store = &g_ut_tx_lvs;
+	TAILQ_INIT(&g_ut_tx_lvol.redirect_migrate_io);
+	snprintf(g_ut_tx_lvol.name, sizeof(g_ut_tx_lvol.name), "ut_tx_lvol");
+	g_ut_tx_tdev.desc = (struct spdk_bdev_desc *)0x1;	/* only null-checked */
+	g_ut_tx_tdev.lvs = &g_ut_tx_lvs;
+	g_ut_requeued = 0;
+	g_ut_dirty_gen = NULL;
+	ut_chain_clear();
+	ut_chain_set(0x77, 0x76, 0);		/* the destination holds 0x76 */
+	MOCK_SET(spdk_bs_get_page_size, 4096);
+}
+
+static void
+ut_tx_teardown(void)
+{
+	MOCK_CLEAR(spdk_bs_get_page_size);
+	MOCK_CLEAR(spdk_ring_create);
+	ut_chain_clear();
+}
+
+static void
+ut_tx_cb(void *cb_arg, struct spdk_lvol *lvol, int rc)
+{
+}
+
+/* the client IO's resubmission (vbdev_lvol_dequeue_io in production) */
+static void
+ut_requeue_cb(void *arg)
+{
+	g_ut_requeued++;
+	free(arg);
+}
+
+/* Client IO queued on the frozen volume, as spdk_lvol_freeze_io does. */
+static void
+ut_queue_frozen_io(struct spdk_lvol *lvol)
+{
+	struct spdk_migrate_io *mio = calloc(1, sizeof(*mio));
+
+	SPDK_CU_ASSERT_FATAL(mio != NULL);
+	mio->thread = spdk_get_thread();
+	mio->cb_fn = ut_requeue_cb;
+	TAILQ_INSERT_TAIL(&lvol->redirect_migrate_io, mio, entry);
+}
+
+/* The final step freezes the volume before its task is built. If the task
+ * cannot be built, the freeze is undone through the unfreeze path: the client
+ * IO queued in the meantime is resubmitted, not stranded. A freeze that was
+ * in place before the step is someone else's and stays, with its IO. */
+static void
+xfer_final_step_setup_failure_unfreezes(void)
+{
+	struct spdk_lvol *lvol = &g_ut_tx_lvol;
+	int rc;
+
+	ut_tx_setup();
+	MOCK_SET(spdk_ring_create, NULL);	/* spdk_lvol_create_backup_task fails */
+
+	/* the IO a poll group queued between the freeze and the failure */
+	ut_queue_frozen_io(lvol);
+	rc = spdk_lvol_transfer(lvol, 0, 2, XFER_REPLICATE_SNAPSHOT, &g_ut_tx_tdev, "snap", 1, 0,
+				false, 0, true, false, ut_tx_cb, NULL);
+	CU_ASSERT(rc == -ENOMEM);
+	poll_threads();
+	CU_ASSERT(!lvol->freezed);
+	CU_ASSERT(g_ut_requeued == 1);
+	CU_ASSERT(TAILQ_EMPTY(&lvol->redirect_migrate_io));
+	CU_ASSERT(TAILQ_EMPTY(&g_lvs_xfer_tasks));
+
+	/* frozen by someone else before the step: stays frozen, IO stays queued */
+	lvol->freezed = true;
+	ut_queue_frozen_io(lvol);
+	rc = spdk_lvol_transfer(lvol, 0, 2, XFER_REPLICATE_SNAPSHOT, &g_ut_tx_tdev, "snap", 1, 0,
+				false, 0, true, false, ut_tx_cb, NULL);
+	CU_ASSERT(rc == -ENOMEM);
+	poll_threads();
+	CU_ASSERT(lvol->freezed);
+	CU_ASSERT(g_ut_requeued == 1);
+	CU_ASSERT(!TAILQ_EMPTY(&lvol->redirect_migrate_io));
+	spdk_lvol_unfreeze_io(lvol);		/* the owner's unfreeze */
+	poll_threads();
+	CU_ASSERT(g_ut_requeued == 2);
+
+	ut_tx_teardown();
+}
+
+/* A final step whose delta falls back to full clusters against a base it
+ * cannot reach is refused before its task starts: same freeze undo. */
+static void
+xfer_final_step_refused_base_unfreezes(void)
+{
+	struct spdk_lvol *lvol = &g_ut_tx_lvol;
+	int rc;
+
+	ut_tx_setup();
+	ut_queue_frozen_io(lvol);
+	rc = spdk_lvol_transfer(lvol, 0, 2, XFER_REPLICATE_SNAPSHOT, &g_ut_tx_tdev, "snap", 1, 0,
+				true, 0x99, true, false, ut_tx_cb, NULL);
+	CU_ASSERT(rc == -ENOENT);
+	poll_threads();
+	CU_ASSERT(!lvol->freezed);
+	CU_ASSERT(g_ut_requeued == 1);
+	CU_ASSERT(TAILQ_EMPTY(&g_lvs_xfer_tasks));
+
+	ut_tx_teardown();
+}
+
+/* Run the md poller until the task list is empty, then let the delayed
+ * teardown (destroy_xfer_task_tmo, 200 ms) free the task. */
+static void
+ut_tx_run_to_done(void)
+{
+	for (int i = 0; i < 10 && !TAILQ_EMPTY(&g_lvs_xfer_tasks); i++) {
+		spdk_delay_us(1000);
+		poll_threads();
+	}
+	CU_ASSERT(TAILQ_EMPTY(&g_lvs_xfer_tasks));
+	spdk_delay_us(300 * 1000);
+	poll_threads();
+}
+
+/* A dest_clone round: its zero blocks are written (the clone owns clusters
+ * from earlier rounds, which the alloc step skips), and the source remembers
+ * the round as incomplete until its task is done. */
+static void
+xfer_dest_clone_round_lifecycle(void)
+{
+	struct spdk_lvol *lvol = &g_ut_tx_lvol;
+	struct spdk_lvs_xfer *task;
+	int rc;
+
+	ut_tx_setup();
+	rc = spdk_lvol_transfer(lvol, 0, 2, XFER_REPLICATE_SNAPSHOT, &g_ut_tx_tdev, NULL, 1, 0,
+				false, 0, true, true, ut_tx_cb, NULL);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+	CU_ASSERT(lvol->xfer_clone_round_incomplete);
+
+	/* the drain delay (50 ms) puts the task on the md poller's list */
+	spdk_delay_us(60 * 1000);
+	poll_threads();
+	task = TAILQ_FIRST(&g_lvs_xfer_tasks);
+	SPDK_CU_ASSERT_FATAL(task != NULL && task->lvol == lvol);
+	CU_ASSERT(task->dest_is_clone);
+	CU_ASSERT(task->no_zero_skip);
+
+	/* nothing to send (the source owns no cluster here): the task is done
+	 * and the round complete */
+	ut_tx_run_to_done();
+	CU_ASSERT(lvol->transfer_status == XFER_DONE);
+	CU_ASSERT(!lvol->xfer_clone_round_incomplete);
+
+	/* a plain landing-volume round keeps zero detection */
+	rc = spdk_lvol_transfer(lvol, 0, 2, XFER_REPLICATE_SNAPSHOT, &g_ut_tx_tdev, NULL, 1, 0,
+				false, 0, false, false, ut_tx_cb, NULL);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+	CU_ASSERT(!lvol->xfer_clone_round_incomplete);
+	spdk_delay_us(60 * 1000);
+	poll_threads();
+	task = TAILQ_FIRST(&g_lvs_xfer_tasks);
+	SPDK_CU_ASSERT_FATAL(task != NULL);
+	CU_ASSERT(!task->dest_is_clone);
+	CU_ASSERT(!task->no_zero_skip);
+	ut_tx_run_to_done();
+
+	spdk_poller_unregister(&g_xfer_md_poller);
+	poll_threads();
+	ut_tx_teardown();
+}
+
 static void
 ut_xfer_iobuf_finish_cb(void *ctx)
 {
@@ -1728,6 +2219,14 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, xfer_replicate_leaves_client_reserve);
 	CU_ADD_TEST(suite, xfer_final_step_goes_ahead_of_background);
 	CU_ADD_TEST(suite, xfer_poll_group_releases_iobuf_channel);
+	CU_ADD_TEST(suite, xfer_full_fallback_bridges_skipped_snapshots);
+	CU_ADD_TEST(suite, xfer_full_fallback_refuses_unreachable_base);
+	CU_ADD_TEST(suite, xfer_bridged_delta_sends_in_between_clusters_whole);
+	CU_ADD_TEST(suite, xfer_bridged_delta_unbridgeable_is_refused);
+	CU_ADD_TEST(suite, xfer_dest_clone_after_incomplete_round_sends_full);
+	CU_ADD_TEST(suite, xfer_final_step_setup_failure_unfreezes);
+	CU_ADD_TEST(suite, xfer_final_step_refused_base_unfreezes);
+	CU_ADD_TEST(suite, xfer_dest_clone_round_lifecycle);
 
 	allocate_threads(2);
 	set_thread(0);

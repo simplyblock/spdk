@@ -5586,13 +5586,20 @@ fragment_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 #define XFER_FINAL_PARTIAL_WINDOW	256
 
 /* A cluster of a partial transfer whose dirty share is at least this many
- * percent is sent as one whole-cluster request instead of its dirty ranges
- * (each range is a request of at most XFER_PARTIAL_MAX_BYTES through a
- * window of cluster_batch requests; a mostly-dirty cluster costs more that
- * way than its 2 MiB in one request). 100: only fully dirty clusters;
- * 0: every cluster whole. Set with spdk_lvol_set_xfer_whole_cluster_pct()
- * (RPC bdev_lvol_set_xfer_whole_cluster_pct). */
-#define XFER_WHOLE_CLUSTER_PCT_DEFAULT	50
+ * percent is sent whole instead of as its dirty ranges. 100: only fully dirty
+ * clusters (off); 0: every cluster whole. Set with
+ * spdk_lvol_set_xfer_whole_cluster_pct() (RPC
+ * bdev_lvol_set_xfer_whole_cluster_pct, kept in the lvol module's
+ * save_config output when not the default).
+ *
+ * Default off. The threshold was added when a whole cluster was one 2 MiB
+ * request; since every replication request is at most XFER_PARTIAL_MAX_BYTES,
+ * a whole cluster is 32 requests of 64 KiB too. Its dirty ranges take at
+ * most 32 + (number of ranges) requests -- one more per range, only for
+ * fragmented clusters -- but carry only the dirty bytes, while the whole
+ * cluster carries all 2 MiB: up to 2x the bytes at 50 %, which a WAN link
+ * pays for. Dirty ranges it is, unless the control plane sets a threshold. */
+#define XFER_WHOLE_CLUSTER_PCT_DEFAULT	100
 static uint32_t g_lvs_xfer_whole_cluster_pct = XFER_WHOLE_CLUSTER_PCT_DEFAULT;
 
 int
@@ -6363,6 +6370,19 @@ spdk_lvol_unfreeze_io(void *arg)
 		spdk_thread_send_msg(migrate_io->thread, migrate_io->cb_fn, migrate_io);
 	}
 	return;
+}
+
+/* A final step that fails before its task starts undoes the freeze it took
+ * through the unfreeze path, which resubmits the client IO queued meanwhile
+ * (only clearing lvol->freezed would strand it). A freeze that was already in
+ * place when the step started belongs to someone else and stays. */
+static void
+xfer_undo_final_freeze(struct spdk_lvol *lvol, bool final_step, bool was_frozen)
+{
+	if (!final_step || was_frozen) {
+		return;
+	}
+	spdk_lvol_unfreeze_io(lvol);
 }
 
 static void
@@ -7140,7 +7160,52 @@ xfer_add_bridged_clusters(struct spdk_lvs_xfer *xfer)
 	return added;
 }
 
-static void
+/*
+ * A replication that asked for a delta against partial_base but sends full
+ * clusters: the destination holds a copy of partial_base (it is a clone of it,
+ * or merges from it), and the full send carries only the clusters the source
+ * owns itself. When the source's parent is not partial_base, the snapshots in
+ * between were never sent and their clusters would be missing on the
+ * destination. Send them too, whole (bridged, as the delta does), or refuse:
+ * the control plane must then do a real full send of the chain.
+ * 0, or a negative errno: the transfer must not start.
+ */
+static int
+xfer_full_bridge(struct spdk_lvs_xfer *xfer, uint64_t partial_base)
+{
+	struct spdk_lvol *lvol = xfer->lvol;
+	spdk_blob_id parent;
+
+	if (xfer->type != XFER_REPLICATE_SNAPSHOT || partial_base == 0 ||
+	    (spdk_blob_id)partial_base == lvol->blob_id) {
+		/* no destination base known (or the destination is the source) */
+		return 0;
+	}
+	parent = spdk_blob_get_parent_snapshot(lvol->lvol_store->blobstore, lvol->blob_id);
+	if (parent == (spdk_blob_id)partial_base) {
+		/* the source's own clusters are the whole difference */
+		return 0;
+	}
+	/* a delta setup that failed after bridging left its own array */
+	free(xfer->bridged);
+	xfer->bridged = NULL;
+	if (parent == SPDK_BLOBID_INVALID ||
+	    !xfer_bridge_partial_base(xfer, parent, partial_base)) {
+		SPDK_ERRLOG("Transfer lvol %s%s: full send against base 0x%" PRIx64 ": the base is "
+			    "not reachable from the source's parent 0x%" PRIx64 " within %u open "
+			    "snapshots; the clusters in between cannot be sent, refusing\n",
+			    lvol->name, xfer->final_step ? " final step" : "", partial_base,
+			    parent, XFER_BRIDGE_MAX_HOPS);
+		return -ENOENT;
+	}
+	SPDK_NOTICELOG("Transfer lvol %s%s: full send bridged over %" PRIu32 " snapshot(s) to "
+		       "base 0x%" PRIx64 ": %" PRIu64 " cluster(s) they own are sent whole too\n",
+		       lvol->name, xfer->final_step ? " final step" : "", xfer->bridge_hops,
+		       partial_base, xfer->bridge_clusters);
+	return 0;
+}
+
+static int
 xfer_setup_partial(struct spdk_lvs_xfer *xfer, uint64_t offset, uint64_t partial_base)
 {
 	struct spdk_lvol *lvol = xfer->lvol;
@@ -7164,6 +7229,14 @@ xfer_setup_partial(struct spdk_lvs_xfer *xfer, uint64_t offset, uint64_t partial
 		why = "the source is not a read-only snapshot";
 	} else if (offset != 0) {
 		why = "a resumed transfer sends full clusters";
+	} else if (xfer->dest_is_clone && lvol->xfer_clone_round_incomplete) {
+		/* An earlier transfer of this source into the clone did not
+		 * complete: its alloc step may have left zero-filled clusters
+		 * there that no data reached. A dirty range written into such a
+		 * cluster would leave zeroes where the base's content belongs
+		 * (no CoW: the clone owns it). Full clusters overwrite them
+		 * (no_zero_skip). */
+		why = "an earlier transfer into the clone did not complete";
 	} else if (xfer->page_size == 0 || SPDK_BLOB_DIRTY_BLOCK_SZ % xfer->page_size != 0) {
 		why = "dirty block is not a whole number of pages";
 	} else {
@@ -7209,12 +7282,13 @@ xfer_setup_partial(struct spdk_lvs_xfer *xfer, uint64_t offset, uint64_t partial
 					       lvol->name, spdk_blob_dirty_gen_base(gen), xfer->bridge_hops,
 					       partial_base, xfer->bridge_clusters);
 			}
-			return;
+			return 0;
 		}
 	}
 	SPDK_NOTICELOG("Transfer lvol %s%s: partial requested (base 0x%" PRIx64 "), sending full "
 		       "clusters: %s\n", lvol->name, xfer->final_step ? " final step" : "",
 		       partial_base, why);
+	return xfer_full_bridge(xfer, partial_base);
 }
 
 /* Fill ranges with cluster idx's dirty ranges. False: no usable bitmap for it
@@ -7301,7 +7375,12 @@ xfer_fill_range_req(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req *req)
 	if (xfer->lvol->redirect_map_id != 0) {
 		req->dst_offset = ((uint64_t)(xfer->lvol->redirect_map_id) << 48) | req->offset;
 	}
-	req->partial = true;
+	/* Only a dirty range is partial: its destination cluster holds the
+	 * base's content (or will, by CoW/merge), so its zero blocks must be
+	 * written. A piece of a whole cluster lands in a cluster the alloc step
+	 * just allocated (reads as zeroes): it keeps zero detection unless the
+	 * task says otherwise (no_zero_skip). */
+	req->partial = !xfer->range_whole;
 	req->action = REQ_ACTION_COPY_BACKUP;
 	req->status = XFER_REQ_STATUS_READY;
 
@@ -7342,6 +7421,7 @@ xfer_repl_next(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req *req)
 
 		if (xfer->partial != NULL && xfer->partial[i] && xfer_load_ranges(xfer, i)) {
 			/* bitmap-driven: only the dirty ranges travel */
+			xfer->range_whole = false;
 			xfer->hold_idx = i + 1;
 			xfer_fill_range_req(xfer, req);
 			return true;
@@ -7357,6 +7437,7 @@ xfer_repl_next(struct spdk_lvs_xfer *xfer, struct spdk_lvs_xfer_req *req)
 			xfer->range_pos = 0;
 			xfer->range_done = 0;
 			xfer->range_cluster = i;
+			xfer->range_whole = true;
 			xfer->lvol->xfer_full_clusters++;
 			xfer->hold_idx = i + 1;
 			xfer_fill_range_req(xfer, req);
@@ -7602,6 +7683,10 @@ xfer_replication(struct spdk_lvs_xfer *xfer) {
 			break;
 		case XFER_STATE_DONE:
 			xfer->lvol->transfer_status = XFER_DONE;
+			if (xfer->dest_is_clone) {
+				/* every cluster reached the clone */
+				xfer->lvol->xfer_clone_round_incomplete = false;
+			}
 			destroy_xfer_task(xfer);
 			return 0;
 
@@ -9280,7 +9365,7 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
 	struct spdk_lvs_xfer *xfer, *task;	
 	struct spdk_lvol_store *lvs = lvol->lvol_store;	
 	int rc;
-	bool final_step;
+	bool final_step, was_frozen;
 	// if (!lvs->leader) {
 	// 	SPDK_ERRLOG("Lvolstore %s: is not leader.\n", lvs->name);
 	// 	return -EINVAL;
@@ -9385,17 +9470,41 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
 	 * landing) is not a clone: it is chained by the signal as before. */
 	task->dest_is_clone = type == XFER_REPLICATE_SNAPSHOT && cow_landing &&
 			      (task->final_step || dest_clone);
+	/* A clone destination is not new: it owns the clusters earlier rounds
+	 * (endgame dest_clone rounds, an earlier attempt) wrote, and the alloc
+	 * step skips clusters it already owns (spdk_blob_alloc_clusters), so a
+	 * zero block of a whole cluster may land on old data: write it. */
+	if (task->dest_is_clone) {
+		task->no_zero_skip = true;
+	}
 	/* Freeze the final step's volume before the partial decision: its
 	 * generation must not move under the setup (xfer_setup_partial). The
-	 * drain of IO already in flight follows (spdk_lvol_transfer_delay). */
+	 * drain of IO already in flight follows (spdk_lvol_transfer_delay).
+	 * A freeze already in place is someone else's: an early error below
+	 * leaves it (was_frozen). */
+	was_frozen = lvol->freezed;
 	if (task->final_step) {
 		lvol->freezed = true;
 	}
+	final_step = task->final_step;
 	/* Decided before the request buffers are sized: a partial task sends
 	 * every cluster in requests of at most XFER_PARTIAL_MAX_BYTES. */
 	if (allow_partial) {
 		task->cow_landing = cow_landing;
-		xfer_setup_partial(task, offset, partial_base);
+		rc = xfer_setup_partial(task, offset, partial_base);
+		if (rc != 0) {
+			/* nothing was sent: the control plane must do a real full send */
+			if (task->dirty_gen != NULL) {
+				spdk_blob_dirty_gen_unref(task->dirty_gen);
+			}
+			free(task->partial);
+			free(task->ranges);
+			free(task->bridged);
+			free(task->clusters);
+			free(task);
+			xfer_undo_final_freeze(lvol, final_step, was_frozen);
+			return rc;
+		}
 	}
 	/* A partial final step sends 64 KiB requests, not 2 MiB clusters: a
 	 * window of 2 (the control plane's final-step batch, sized for whole
@@ -9409,14 +9518,16 @@ spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster_bat
 		task->cluster_batch = XFER_FINAL_PARTIAL_WINDOW;
 	}
 
-	final_step = task->final_step;
 	rc = spdk_lvol_create_backup_task(task, tdev);
 	if (rc != 0) {
 		/* the task is freed; the freeze set above is ours to undo */
-		if (final_step) {
-			lvol->freezed = false;
-		}
+		xfer_undo_final_freeze(lvol, final_step, was_frozen);
 		return rc;
+	}
+	if (task->dest_is_clone) {
+		/* until this task reaches XFER_STATE_DONE the clone may hold
+		 * zero-filled clusters of it (see xfer_clone_round_incomplete) */
+		lvol->xfer_clone_round_incomplete = true;
 	}
 
 	if (task->priority && !task->priority_counted) {

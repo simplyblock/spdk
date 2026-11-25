@@ -6191,6 +6191,114 @@ blob_merge_base_priority_class(void)
 }
 
 /*
+ * Repeated transfer rounds into the same clone (dest_clone): the alloc
+ * command of a later round names clusters the clone already owns from an
+ * earlier round. They are skipped -- not allocated a second time, their data
+ * kept -- and only the clusters the clone does not own yet are claimed.
+ */
+static void
+blob_alloc_clusters_skips_owned_clusters(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob *blob, *snapshot, *clone;
+	struct spdk_io_channel *channel;
+	struct spdk_blob_opts opts;
+	spdk_blob_id blobid, snapshotid, cloneid;
+	uint64_t io_unit = spdk_bs_get_io_unit_size(bs);
+	uint64_t io_units_per_cluster = spdk_bs_get_cluster_size(bs) / io_unit;
+	uint64_t len = io_units_per_cluster * io_unit;
+	uint64_t free_before, lba0;
+	uint32_t round1[1] = {0};
+	uint32_t round2[2] = {0, 1};
+	uint8_t *buf, *expected;
+
+	buf = calloc(1, len);
+	expected = calloc(1, len);
+	SPDK_CU_ASSERT_FATAL(buf != NULL && expected != NULL);
+	channel = spdk_bs_alloc_io_channel(bs);
+	CU_ASSERT(channel != NULL);
+
+	/* the base: 4 clusters, cluster 0 and 1 hold 0x11 */
+	ut_spdk_blob_opts_init(&opts);
+	opts.thin_provision = true;
+	opts.num_clusters = 4;
+	blob = ut_blob_create_and_open(bs, &opts);
+	blobid = spdk_blob_get_id(blob);
+	memset(buf, 0x11, len);
+	spdk_blob_io_write(blob, channel, buf, 0, io_units_per_cluster, blob_op_complete, NULL);
+	poll_threads();
+	spdk_blob_io_write(blob, channel, buf, io_units_per_cluster, io_units_per_cluster,
+			   blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	spdk_bs_create_snapshot(bs, blobid, NULL, blob_op_with_id_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	snapshotid = g_blobid;
+	spdk_bs_open_blob(bs, snapshotid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	snapshot = g_blob;
+
+	/* the destination clone */
+	spdk_bs_create_clone(bs, snapshotid, NULL, blob_op_with_id_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	cloneid = g_blobid;
+	spdk_bs_open_blob(bs, cloneid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	clone = g_blob;
+
+	/* round 1: cluster 0 allocated and written */
+	free_before = spdk_bs_free_cluster_count(bs);
+	spdk_blob_alloc_clusters(clone, round1, 1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(spdk_bs_free_cluster_count(bs) == free_before - 1);
+	lba0 = clone->active.clusters[0];
+	CU_ASSERT(lba0 != 0);
+	memset(buf, 0x22, len);
+	spdk_blob_io_write(clone, channel, buf, 0, io_units_per_cluster, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	/* round 2 names cluster 0 again: only cluster 1 is claimed */
+	free_before = spdk_bs_free_cluster_count(bs);
+	spdk_blob_alloc_clusters(clone, round2, 2, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(spdk_bs_free_cluster_count(bs) == free_before - 1);
+	CU_ASSERT(clone->active.clusters[0] == lba0);
+	CU_ASSERT(clone->active.clusters[1] != 0 && clone->active.clusters[1] != lba0);
+	CU_ASSERT(clone->active.clusters[2] == 0);
+
+	/* cluster 0 keeps round 1's data; cluster 1 is fresh (zeroes: the
+	 * transfer writes all of it, see no_zero_skip) */
+	spdk_blob_io_read(clone, channel, buf, 0, io_units_per_cluster, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	memset(expected, 0x22, len);
+	CU_ASSERT(memcmp(buf, expected, len) == 0);
+	spdk_blob_io_read(clone, channel, buf, io_units_per_cluster, io_units_per_cluster,
+			  blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	memset(expected, 0, len);
+	CU_ASSERT(memcmp(buf, expected, len) == 0);
+
+	ut_blob_close_and_delete(bs, clone);
+	ut_blob_close_and_delete(bs, blob);
+	ut_blob_close_and_delete(bs, snapshot);
+	spdk_bs_free_io_channel(channel);
+	poll_threads();
+	free(buf);
+	free(expected);
+	g_blob = NULL;
+	g_blobid = 0;
+}
+
+/*
  * The merge takes its buffers from the iobuf small pool (main() sets it up
  * with UT_IOBUF_SMALL_COUNT buffers of UT_IOBUF_SMALL_SIZE), as chains of
  * 64 KiB pieces, and waits when the pool is empty.
@@ -13708,6 +13816,7 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite_bs, blob_md_journal_home_direct_demoted);
 		CU_ADD_TEST(suite_bs, blob_md_journal_home_priority);
 		CU_ADD_TEST(suite_bs, blob_md_journal_elem_chunk_fallback);
+		CU_ADD_TEST(suite_bs, blob_alloc_clusters_skips_owned_clusters);
 		CU_ADD_TEST(suite_bs, blob_merge_base_64k_pieces);
 		CU_ADD_TEST(suite_bs, blob_merge_base_waits_for_buffers);
 		CU_ADD_TEST(suite_bs, blob_merge_base_kick_takes_other_threads_buffers);
