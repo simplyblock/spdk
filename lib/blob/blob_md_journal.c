@@ -1439,24 +1439,31 @@ spdk_md_journal_batch_drain_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserr
 }
 
 /*
- * HOME and ZERO writes carry the metadata priority class (PREMIUM) when the
- * blobstore uses priority classes at all, i.e. bs->priority_class, which
- * spdk_blob_set_io_priority_class() raises to PREMIUM as soon as some blob
- * gets a class. At class 0 the drain queued behind client IO in the distrib
- * and every md_drain persist waited on it; ZERO batches return journal slots,
- * so a starved ZERO path stalls admission too.
+ * HOME and ZERO writes carry the metadata priority class (PREMIUM) whenever
+ * the base device understands priority classes. At class 0 the drain queued
+ * behind client IO and the CoW backlog in the distrib and every md_drain
+ * persist waited on it (add_clone/create 5-47 s, dbfbb2322); ZERO batches
+ * return journal slots, so a starved ZERO path stalls admission too.
  *
- * Not unconditionally PREMIUM: the class rides in the top LBA bits
- * (blob_bdev.c) and only raid strips them, so a base bdev without priority
- * support (malloc, aio, plain NVMe) would get out-of-range LBAs. The class
- * is read per batch, not at journal creation: the journal is created at load,
- * before the lvols set their classes. bs_sequence_to_batch() keeps the
+ * Keyed on the device, not on the lvols' classes (bs->priority_class): that
+ * is 0 on most production lvstores (no QoS classes, no replication landing
+ * volume, and after every restart until a classed lvol is created again),
+ * which brought the slow drain back. The class rides in the top LBA bits
+ * (blob_bdev.c); only a device that strips them (raid, see
+ * spdk_bs_dev.priority_lba_bits) may get it, any other (malloc, aio, plain
+ * NVMe) would see out-of-range LBAs. bs_sequence_to_batch() keeps the
  * sequence's class for the batch.
  */
+static bool
+md_journal_premium(const struct spdk_bs_md_journal *jr)
+{
+	return jr->bs->dev->priority_lba_bits;
+}
+
 static void
 md_journal_seq_set_priority(struct spdk_bs_md_journal *jr, spdk_bs_sequence_t *seq)
 {
-	seq->priority_class = jr->bs->priority_class;
+	seq->priority_class = md_journal_premium(jr) ? PREMIUM_PRIORITY_CLASS : 0;
 }
 
 static int
@@ -1563,7 +1570,7 @@ md_journal_start_drain_batch(struct spdk_bs_md_journal *jr, bool force)
 	 * batch starts as soon as this one completes, so client IO gets a turn
 	 * between batches while the backlog still drains back to back.
 	 */
-	uint32_t max_batch = jr->bs->priority_class != 0 ?
+	uint32_t max_batch = md_journal_premium(jr) ?
 			     BS_MD_JOURNAL_PREMIUM_BATCH_MAX : BS_MD_JOURNAL_NUM_ELEMS;
 	uint32_t max_drain = force ? max_batch : spdk_min(BS_MD_JOURNAL_DRAIN_BATCH_SIZE, max_batch);
 	/*

@@ -357,6 +357,12 @@ struct spdk_bs_dev {
 
 	uint64_t	blockcnt;
 	uint32_t	blocklen; /* In bytes */
+
+	/* The device takes an IO priority class in the top LBA bits
+	 * (spdk/priority_class.h) and strips it before the address is used, as the
+	 * raid module does. Without it, the bits would make the LBA out of range,
+	 * so the blobstore must send class 0. */
+	bool		priority_lba_bits;
 };
 
 struct spdk_bs_type {
