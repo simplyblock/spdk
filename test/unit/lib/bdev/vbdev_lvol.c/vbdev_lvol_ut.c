@@ -61,7 +61,15 @@ DEFINE_STUB_V(spdk_lvol_chain, (struct spdk_lvol *origlvol, struct spdk_lvol *cl
 DEFINE_STUB(spdk_tdev_get_hub_channel, struct spdk_io_channel *, (struct spdk_transfer_dev *tdev, struct spdk_thread *thread), NULL);
 DEFINE_STUB_V(spdk_lvs_rmt_bdev_remove, (struct spdk_transfer_dev *tdev));
 DEFINE_STUB(spdk_unload_lvs_poll_group, bool, (struct spdk_lvol_store *lvs), false);
-DEFINE_STUB(spdk_lvs_queued_failed_IO, int, (struct spdk_lvol_store *lvs), 0);
+/* Counted: lvol_op_comp calls it to freeze the lvstore, block its ports and drop
+ * leadership; tests assert when it must (not) be called. */
+static int g_lvs_queued_failed_io_calls;
+int
+spdk_lvs_queued_failed_IO(struct spdk_lvol_store *lvs)
+{
+	g_lvs_queued_failed_io_calls++;
+	return 0;
+}
 DEFINE_STUB(spdk_lvol_freeze_io, enum freeze_io_result, (struct spdk_lvol *lvol, struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io, spdk_lvol_op_migrate_complete cb_fn), FREEZE_IO_QUEUED);
 DEFINE_STUB_V(spdk_add_stat_ext, (struct spdk_io_channel *ch));
 DEFINE_STUB(spdk_bdev_get_memory_domains, int, (struct spdk_bdev *bdev,
@@ -2258,6 +2266,7 @@ ut_lvol_nospace_is_a_write_error_not_a_failover(void)
 	g_io->u.bdev.offset_blocks = 20;
 	g_io->u.bdev.num_blocks = 8;
 	g_io->internal.status = SPDK_BDEV_IO_STATUS_PENDING;
+	g_lvs_queued_failed_io_calls = 0;
 
 	lvol_op_comp(g_io, -ENOSPC);
 	ut_capture_nvme_status();
@@ -2266,10 +2275,14 @@ ut_lvol_nospace_is_a_write_error_not_a_failover(void)
 	CU_ASSERT(g_io->internal.status == SPDK_BDEV_IO_STATUS_PENDING);
 	CU_ASSERT(ns_lvs.queue_failed_rsp == false);
 	CU_ASSERT(ns_lvs.leader == true);
+	/* no freeze, no port block, no leadership drop */
+	CU_ASSERT(g_lvs_queued_failed_io_calls == 0);
 
-	/* Any other error keeps today's behaviour: a generic failure. */
+	/* Any other error keeps today's behaviour: a generic failure, and the
+	 * failed-IO path (freeze, port block, step-down) runs. */
 	lvol_op_comp(g_io, -EIO);
 	CU_ASSERT(g_io->internal.status == SPDK_BDEV_IO_STATUS_FAILED);
+	CU_ASSERT(g_lvs_queued_failed_io_calls == 1);
 
 	free(g_io);
 	free(g_lvol);
