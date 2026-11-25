@@ -2064,6 +2064,126 @@ bdev_io_boundary_split_test(void)
 	ut_fini_bdev();
 }
 
+/* Complete the outstanding child IOs with an NVMe status. */
+static void
+stub_complete_io_nvme(uint32_t num, int sct, int sc)
+{
+	struct bdev_ut_channel *ch = g_bdev_ut_channel;
+	struct bdev_ut_io *bio;
+
+	while (num-- > 0 && !TAILQ_EMPTY(&ch->outstanding_io)) {
+		bio = TAILQ_FIRST(&ch->outstanding_io);
+		TAILQ_REMOVE(&ch->outstanding_io, bio, link);
+		ch->outstanding_io_count--;
+		spdk_bdev_io_complete_nvme_status(spdk_bdev_io_from_ctx(bio), 0, sct, sc);
+	}
+}
+
+static int g_split_nvme_sct, g_split_nvme_sc;
+
+static void
+io_done_nvme(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	uint32_t cdw0;
+
+	g_io_done = true;
+	g_io_status = bdev_io->internal.status;
+	spdk_bdev_io_get_nvme_status(bdev_io, &cdw0, &g_split_nvme_sct, &g_split_nvme_sc);
+	spdk_bdev_free_io(bdev_io);
+}
+
+/*
+ * A split IO keeps the NVMe status of its failed children, so a write that
+ * crossed a raid0 strip boundary on a full cluster still reads as "Capacity
+ * Exceeded" above (the lvstore fails it to the host and keeps leadership)
+ * rather than a generic failure (-EIO: leadership dropped, ports blocked).
+ * Children failing in different ways make the parent a generic failure.
+ */
+static void
+bdev_io_split_nvme_status_test(void)
+{
+	struct spdk_bdev *bdev;
+	struct spdk_bdev_desc *desc = NULL;
+	struct spdk_io_channel *io_ch;
+	struct spdk_bdev_opts bdev_opts = {};
+	struct iovec iov = { .iov_base = (void *)0x10000, .iov_len = 512 * 64 };
+	int rc;
+
+	spdk_bdev_get_opts(&bdev_opts, sizeof(bdev_opts));
+	bdev_opts.bdev_io_pool_size = 512;
+	bdev_opts.bdev_io_cache_size = 64;
+	ut_init_bdev(&bdev_opts);
+	bdev = allocate_bdev("bdev0");
+	rc = spdk_bdev_open_ext("bdev0", true, bdev_ut_event_cb, NULL, &desc);
+	CU_ASSERT(rc == 0);
+	SPDK_CU_ASSERT_FATAL(desc != NULL);
+	io_ch = spdk_bdev_get_io_channel(desc);
+	CU_ASSERT(io_ch != NULL);
+	bdev->optimal_io_boundary = 16;
+	bdev->split_on_optimal_io_boundary = true;
+
+	/* 64 blocks from offset 1 at boundary 16: 5 children.
+	 * One child out of space, the others fine: Capacity Exceeded. */
+	g_io_done = false;
+	rc = spdk_bdev_writev_blocks(desc, io_ch, &iov, 1, 1, 64, io_done_nvme, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_bdev_ut_channel->outstanding_io_count == 5);
+	stub_complete_io(2);
+	stub_complete_io_nvme(1, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_CAPACITY_EXCEEDED);
+	stub_complete_io(2);
+	CU_ASSERT(g_io_done == true);
+	CU_ASSERT(g_io_status == SPDK_BDEV_IO_STATUS_NVME_ERROR);
+	CU_ASSERT(g_split_nvme_sct == SPDK_NVME_SCT_GENERIC);
+	CU_ASSERT(g_split_nvme_sc == SPDK_NVME_SC_CAPACITY_EXCEEDED);
+
+	/* every child out of space: still Capacity Exceeded */
+	g_io_done = false;
+	rc = spdk_bdev_writev_blocks(desc, io_ch, &iov, 1, 1, 64, io_done_nvme, NULL);
+	CU_ASSERT(rc == 0);
+	stub_complete_io_nvme(5, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_CAPACITY_EXCEEDED);
+	CU_ASSERT(g_io_done == true);
+	CU_ASSERT(g_io_status == SPDK_BDEV_IO_STATUS_NVME_ERROR);
+	CU_ASSERT(g_split_nvme_sc == SPDK_NVME_SC_CAPACITY_EXCEEDED);
+
+	/* out of space and a plain failure after it: a generic failure */
+	g_io_done = false;
+	rc = spdk_bdev_writev_blocks(desc, io_ch, &iov, 1, 1, 64, io_done_nvme, NULL);
+	CU_ASSERT(rc == 0);
+	stub_complete_io_nvme(1, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_CAPACITY_EXCEEDED);
+	g_io_exp_status = SPDK_BDEV_IO_STATUS_FAILED;
+	stub_complete_io(4);
+	g_io_exp_status = SPDK_BDEV_IO_STATUS_SUCCESS;
+	CU_ASSERT(g_io_done == true);
+	CU_ASSERT(g_io_status == SPDK_BDEV_IO_STATUS_FAILED);
+	CU_ASSERT(g_split_nvme_sc == SPDK_NVME_SC_INTERNAL_DEVICE_ERROR);
+
+	/* a plain failure first, out of space after it: still a generic failure */
+	g_io_done = false;
+	rc = spdk_bdev_writev_blocks(desc, io_ch, &iov, 1, 1, 64, io_done_nvme, NULL);
+	CU_ASSERT(rc == 0);
+	g_io_exp_status = SPDK_BDEV_IO_STATUS_FAILED;
+	stub_complete_io(1);
+	g_io_exp_status = SPDK_BDEV_IO_STATUS_SUCCESS;
+	stub_complete_io_nvme(4, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_CAPACITY_EXCEEDED);
+	CU_ASSERT(g_io_done == true);
+	CU_ASSERT(g_io_status == SPDK_BDEV_IO_STATUS_FAILED);
+
+	/* two different NVMe errors: a generic failure */
+	g_io_done = false;
+	rc = spdk_bdev_writev_blocks(desc, io_ch, &iov, 1, 1, 64, io_done_nvme, NULL);
+	CU_ASSERT(rc == 0);
+	stub_complete_io_nvme(1, SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_CAPACITY_EXCEEDED);
+	stub_complete_io_nvme(4, SPDK_NVME_SCT_MEDIA_ERROR, SPDK_NVME_SC_UNRECOVERED_READ_ERROR);
+	CU_ASSERT(g_io_done == true);
+	CU_ASSERT(g_io_status == SPDK_BDEV_IO_STATUS_FAILED);
+	CU_ASSERT(g_bdev_ut_channel->outstanding_io_count == 0);
+
+	spdk_put_io_channel(io_ch);
+	spdk_bdev_close(desc);
+	free_bdev(bdev);
+	ut_fini_bdev();
+}
+
 static void
 bdev_io_max_size_and_segment_split_test(void)
 {
@@ -7818,6 +7938,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, bdev_io_wait_test);
 	CU_ADD_TEST(suite, bdev_io_spans_split_test);
 	CU_ADD_TEST(suite, bdev_io_boundary_split_test);
+	CU_ADD_TEST(suite, bdev_io_split_nvme_status_test);
 	CU_ADD_TEST(suite, bdev_io_max_size_and_segment_split_test);
 	CU_ADD_TEST(suite, bdev_io_mix_split_test);
 	CU_ADD_TEST(suite, bdev_io_split_with_io_wait);
