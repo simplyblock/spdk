@@ -642,8 +642,13 @@ blob_io_cpl(struct spdk_io_channel_iter *i, int status)
 	free(ctx);
 }
 
+/*
+ * group: also count the freeze in group_frozen_refcnt (consistency-group freeze). Both
+ * counters move together, and only once nothing can fail any more: on -ENOMEM neither
+ * moves, so group_frozen_refcnt never claims a freeze that frozen_refcnt does not hold.
+ */
 static void
-blob_freeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+blob_freeze_io_ext(struct spdk_blob *blob, bool group, spdk_blob_op_complete cb_fn, void *cb_arg)
 {
 	struct freeze_io_ctx *ctx;
 
@@ -661,9 +666,18 @@ blob_freeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg
 	ctx->blob = blob;
 
 	/* Freeze I/O on blob */
+	if (group) {
+		blob->group_frozen_refcnt++;
+	}
 	blob->frozen_refcnt++;
 
 	spdk_for_each_channel(blob->bs, blob_io_sync, ctx, blob_io_cpl);
+}
+
+static void
+blob_freeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	blob_freeze_io_ext(blob, false, cb_fn, cb_arg);
 }
 
 static void
@@ -854,8 +868,10 @@ spdk_bs_drain_channel_queued(struct spdk_blob_store *bs,
 	spdk_for_each_channel(bs, spdk_bs_drain_queued_io, ctx, spdk_bs_drain_cpl);
 }
 
+/* Counterpart of blob_freeze_io_ext: on -ENOMEM neither counter moves (the freeze is
+ * still held and the caller can retry); otherwise both drop together. */
 static void
-blob_unfreeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+blob_unfreeze_io_ext(struct spdk_blob *blob, bool group, spdk_blob_op_complete cb_fn, void *cb_arg)
 {
 	struct freeze_io_ctx *ctx;
 
@@ -873,10 +889,20 @@ blob_unfreeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_a
 	ctx->blob = blob;
 
 	assert(blob->frozen_refcnt > 0);
+	if (group) {
+		assert(blob->group_frozen_refcnt > 0);
+		blob->group_frozen_refcnt--;
+	}
 
 	blob->frozen_refcnt--;
 
 	spdk_for_each_channel(blob->bs, blob_execute_queued_io, ctx, blob_io_cpl);
+}
+
+static void
+blob_unfreeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	blob_unfreeze_io_ext(blob, false, cb_fn, cb_arg);
 }
 
 static int
@@ -11055,19 +11081,20 @@ spdk_blob_group_freeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, v
 	 * locked_operation_in_progress - the group holds its freeze across the per-member
 	 * snapshot creations, and each of those takes its own spdk_snapshot_freeze_blob, which
 	 * refuses when that flag is set. The group window relies on frozen_refcnt staying >= 1
-	 * from before the first member snapshot until after the last. */
-	blob_verify_md_op(blob);
-	blob->group_frozen_refcnt++;
-	blob_freeze_io(blob, cb_fn, cb_arg);
+	 * from before the first member snapshot until after the last.
+	 * group_frozen_refcnt moves together with frozen_refcnt inside blob_freeze_io_ext:
+	 * bumping it here up front left it one above frozen_refcnt when the freeze failed
+	 * with -ENOMEM. */
+	blob_freeze_io_ext(blob, true, cb_fn, cb_arg);
 }
 
 void
 spdk_blob_group_unfreeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
 {
-	blob_verify_md_op(blob);
-	assert(blob->group_frozen_refcnt > 0);
-	blob->group_frozen_refcnt--;
-	blob_unfreeze_io(blob, cb_fn, cb_arg);
+	/* On -ENOMEM nothing moves and the blob is still frozen, so the caller can retry.
+	 * Dropping group_frozen_refcnt up front left frozen_refcnt one above it: a freeze
+	 * nobody owned any more, the member stayed frozen. */
+	blob_unfreeze_io_ext(blob, true, cb_fn, cb_arg);
 }
 /* END spdk_bs_create_snapshot */
 
@@ -13348,6 +13375,9 @@ struct delete_snapshot_ctx {
 	bool snapshot_md_ro;
 	struct spdk_blob *clone;
 	bool clone_md_ro;
+	/* This delete holds its one freeze on the clone (blob_freeze_io succeeded and the
+	 * matching unfreeze has not). */
+	bool clone_frozen;
 	bool is_async;
 	spdk_blob_op_with_handle_complete cb_fn;
 	void *cb_arg;
@@ -13402,13 +13432,36 @@ delete_snapshot_cleanup_snapshot(void *cb_arg, int bserrno)
 	spdk_blob_close(ctx->snapshot, delete_blob_cleanup_finish, ctx);
 }
 
+static void delete_snapshot_cleanup_clone(void *cb_arg, int bserrno);
+
+static void
+delete_snapshot_cleanup_clone_unfrozen(void *cb_arg, int bserrno)
+{
+	struct delete_snapshot_ctx *ctx = cb_arg;
+
+	if (bserrno != 0) {
+		/* blob_unfreeze_io only fails before it drops the count (-ENOMEM). */
+		SPDK_ERRLOG("blob 0x%" PRIx64 ": failed to release the snapshot delete's freeze on "
+			    "the clone: %d (clone stays frozen)\n", ctx->clone->id, bserrno);
+	}
+	ctx->clone_frozen = false;
+	delete_snapshot_cleanup_clone(ctx, 0);
+}
+
 static void
 delete_snapshot_cleanup_clone(void *cb_arg, int bserrno)
 {
 	struct delete_snapshot_ctx *ctx = cb_arg;
 
-	if (ctx->clone->frozen_refcnt > 0) {
-		blob_unfreeze_io(ctx->clone, delete_snapshot_cleanup_clone, ctx);
+	/*
+	 * Undo only this delete's own freeze, exactly once, like the success path
+	 * (delete_snapshot_sync_snapshot_cpl). Unfreezing "until frozen_refcnt is 0" also
+	 * dropped freezes other owners hold: a consistency-group freeze of the clone
+	 * (spdk_blob_group_freeze_io) was drained, host IO ran inside the group window and
+	 * the group's own unfreeze later underflowed the count.
+	 */
+	if (ctx->clone_frozen) {
+		blob_unfreeze_io(ctx->clone, delete_snapshot_cleanup_clone_unfrozen, ctx);
 		return;
 	}
 	ctx->clone->md_ro = ctx->clone_md_ro;
@@ -13422,10 +13475,13 @@ delete_snapshot_unfreeze_cpl(void *cb_arg, int bserrno)
 	struct delete_snapshot_ctx *ctx = cb_arg;
 
 	if (bserrno) {
+		/* The unfreeze failed before dropping the count: the freeze is still ours
+		 * (clone_frozen), the cleanup retries it once. */
 		ctx->bserrno = bserrno;
 		delete_snapshot_cleanup_clone(ctx, 0);
 		return;
 	}
+	ctx->clone_frozen = false;
 
 	ctx->clone->locked_operation_in_progress = false;
 	spdk_blob_close(ctx->clone, delete_blob_cleanup_finish, ctx);
@@ -13689,6 +13745,7 @@ delete_snapshot_freeze_io_cb(void *cb_arg, int bserrno)
 		delete_snapshot_cleanup_clone(ctx, 0);
 		return;
 	}
+	ctx->clone_frozen = true;
 
 	/* Temporarily override md_ro flag for snapshot for MD modification */
 	ctx->snapshot_md_ro = ctx->snapshot->md_ro;

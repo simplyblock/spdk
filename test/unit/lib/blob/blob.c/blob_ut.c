@@ -10522,6 +10522,122 @@ blob_nested_freezes(void)
 	g_blobid = 0;
 }
 
+/*
+ * A consistency-group freeze that fails with -ENOMEM moves neither counter, and a group
+ * unfreeze that fails with -ENOMEM moves neither: group_frozen_refcnt never gets out of
+ * step with frozen_refcnt (it used to be bumped/dropped before the allocation).
+ */
+static void
+blob_group_freeze_nomem_keeps_counts_in_step(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob *blob;
+	struct spdk_blob_opts opts;
+
+	ut_spdk_blob_opts_init(&opts);
+	blob = ut_blob_create_and_open(bs, &opts);
+
+	g_bserrno = 0;
+	MOCK_SET(calloc, NULL);
+	spdk_blob_group_freeze_io(blob, blob_op_complete, NULL);
+	MOCK_CLEAR(calloc);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -ENOMEM);
+	CU_ASSERT(blob->frozen_refcnt == 0);
+	CU_ASSERT(blob->group_frozen_refcnt == 0);
+
+	g_bserrno = -1;
+	spdk_blob_group_freeze_io(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(blob->frozen_refcnt == 1);
+	CU_ASSERT(blob->group_frozen_refcnt == 1);
+
+	/* A failed unfreeze leaves the freeze held, in step, for the caller to retry. */
+	g_bserrno = 0;
+	MOCK_SET(calloc, NULL);
+	spdk_blob_group_unfreeze_io(blob, blob_op_complete, NULL);
+	MOCK_CLEAR(calloc);
+	poll_threads();
+	CU_ASSERT(g_bserrno == -ENOMEM);
+	CU_ASSERT(blob->frozen_refcnt == 1);
+	CU_ASSERT(blob->group_frozen_refcnt == 1);
+
+	g_bserrno = -1;
+	spdk_blob_group_unfreeze_io(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(blob->frozen_refcnt == 0);
+	CU_ASSERT(blob->group_frozen_refcnt == 0);
+
+	ut_blob_close_and_delete(bs, blob);
+	poll_threads();
+	g_blob = NULL;
+	g_blobid = 0;
+}
+
+/*
+ * A snapshot delete that fails after freezing the clone undoes only its own freeze. The
+ * clone is also held by a consistency-group freeze: that freeze must survive the failed
+ * delete, and the group's own unfreeze must find it (it used to be drained by an
+ * "unfreeze until 0" loop, then the group unfreeze underflowed the count).
+ */
+static void
+blob_group_freeze_survives_failed_snapshot_delete(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob *clone;
+	struct spdk_blob_opts opts;
+	struct spdk_power_failure_thresholds thresholds = {};
+	spdk_blob_id snapshotid;
+
+	ut_spdk_blob_opts_init(&opts);
+	opts.num_clusters = 4;
+	clone = ut_blob_create_and_open(bs, &opts);
+
+	spdk_bs_create_snapshot(bs, spdk_blob_get_id(clone), NULL, blob_op_with_id_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blobid != SPDK_BLOBID_INVALID);
+	snapshotid = g_blobid;
+	CU_ASSERT(spdk_blob_get_parent_snapshot(bs, spdk_blob_get_id(clone)) == snapshotid);
+
+	g_bserrno = -1;
+	spdk_blob_group_freeze_io(clone, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(clone->frozen_refcnt == 1);
+	CU_ASSERT(clone->group_frozen_refcnt == 1);
+
+	/* Every md write fails: the delete freezes the clone, then fails and cleans up. */
+	thresholds.write_threshold = 1;
+	dev_set_power_failure_thresholds(thresholds);
+	g_bserrno = 0;
+	spdk_bs_delete_blob(bs, snapshotid, blob_op_complete, NULL);
+	poll_threads();
+	dev_reset_power_failure_event();
+	CU_ASSERT(g_bserrno != 0);
+	CU_ASSERT(spdk_blob_get_parent_snapshot(bs, spdk_blob_get_id(clone)) == snapshotid);
+
+	/* The group freeze is still there, and only it. */
+	CU_ASSERT(clone->group_frozen_refcnt == 1);
+	SPDK_CU_ASSERT_FATAL(clone->frozen_refcnt == 1);
+
+	g_bserrno = -1;
+	spdk_blob_group_unfreeze_io(clone, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(clone->frozen_refcnt == 0);
+	CU_ASSERT(clone->group_frozen_refcnt == 0);
+
+	ut_blob_close_and_delete(bs, clone);
+	spdk_bs_delete_blob(bs, snapshotid, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	g_blob = NULL;
+	g_blobid = 0;
+}
+
 static void
 blob_ext_md_pages(void)
 {
@@ -12879,6 +12995,8 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite_bs, blob_seek_io_unit);
 		CU_ADD_TEST(suite_esnap_bs, blob_esnap_create);
 		CU_ADD_TEST(suite_bs, blob_nested_freezes);
+		CU_ADD_TEST(suite_bs, blob_group_freeze_nomem_keeps_counts_in_step);
+		CU_ADD_TEST(suite_bs, blob_group_freeze_survives_failed_snapshot_delete);
 		CU_ADD_TEST(suite, blob_ext_md_pages);
 		CU_ADD_TEST(suite, blob_esnap_io_4096_4096);
 		CU_ADD_TEST(suite, blob_esnap_io_512_512);
