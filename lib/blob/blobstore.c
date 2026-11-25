@@ -3189,6 +3189,32 @@ persist_bs_write_used_blobids(spdk_bs_sequence_t *seq, void *arg, int bserrno)
 	bs_sequence_write_dev(seq, ctx->bit_page, lba, bs_byte_to_lba(bs, SPDK_BS_PAGE_SIZE), cb_fn, arg);
 }
 
+/*
+ * Re-check, right before each direct HOME write of a write-through persist
+ * (blob_persist_start()), that this node may still write HOME. The journal
+ * write before it can complete after a demotion (it is not failed by the
+ * pause); a HOME write issued then would land on pages that the new leader
+ * may already have reused, and the create would "succeed" on a node that is
+ * no longer leader. is_leader is checked too: the journal pause is sent to
+ * the md thread and may not have run yet when leadership is already gone.
+ * On failure the persist fails with -EIO, like a journal write rejected by a
+ * paused journal (bs_md_journal_write()).
+ */
+static int
+blob_persist_home_direct_check(struct spdk_blob_persist_ctx *ctx)
+{
+	struct spdk_blob_store *bs = ctx->blob->bs;
+
+	if (bs->is_leader && bs_md_journal_home_direct_ok(bs->md_journal)) {
+		return 0;
+	}
+
+	SPDK_ERRLOG("blob 0x%" PRIx64 ": HOME write-through dropped: is_leader=%d, journal not "
+		    "writable (paused/failed/stopping) - failing the persist\n",
+		    ctx->blob->id, bs->is_leader);
+	return -EIO;
+}
+
 /* Journal write of the root page done: write the same buffer to its HOME LBA
  * when this persist writes through (see blob_persist_start()). */
 static void
@@ -3197,6 +3223,10 @@ blob_persist_page_root_home(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	struct spdk_blob_persist_ctx	*ctx = cb_arg;
 	struct spdk_blob		*blob = ctx->blob;
 	struct spdk_blob_store		*bs = blob->bs;
+
+	if (bserrno == 0 && ctx->home_direct) {
+		bserrno = blob_persist_home_direct_check(ctx);
+	}
 
 	if (bserrno != 0 || !ctx->home_direct) {
 		persist_bs_write_used_blobids(seq, ctx, bserrno);
@@ -3264,6 +3294,10 @@ blob_persist_page_chain_home(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	struct spdk_blob_store		*bs = blob->bs;
 	spdk_bs_batch_t			*batch;
 	size_t				i;
+
+	if (bserrno == 0 && ctx->home_direct) {
+		bserrno = blob_persist_home_direct_check(ctx);
+	}
 
 	if (bserrno != 0 || !ctx->home_direct) {
 		blob_persist_write_page_root(seq, ctx, bserrno);
@@ -3648,6 +3682,10 @@ blob_persist_extent_page_home(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno
 	struct spdk_blob_persist_ctx	*ctx = cb_arg;
 	struct spdk_blob		*blob = ctx->blob;
 	uint32_t			extent_page_id;
+
+	if (bserrno == 0 && ctx->home_direct) {
+		bserrno = blob_persist_home_direct_check(ctx);
+	}
 
 	if (bserrno != 0 || !ctx->home_direct) {
 		blob_persist_write_extent_pages(seq, ctx, bserrno);

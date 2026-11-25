@@ -15,6 +15,26 @@
 #include "thread/thread.c"
 #include "ext_dev.c"
 #include "blob/blobstore.c"
+
+/*
+ * Allocator of the md journal's element DMA chunks: fails every request larger
+ * than g_ut_mdj_alloc_max (0: no limit), like a fragmented heap without a free
+ * block of that size.
+ */
+static size_t g_ut_mdj_alloc_max;
+static uint32_t g_ut_mdj_alloc_failed;
+
+static void *
+ut_md_journal_elem_zmalloc(size_t size, size_t align, uint64_t *phys_addr, int numa_id,
+			   uint32_t flags)
+{
+	if (g_ut_mdj_alloc_max != 0 && size > g_ut_mdj_alloc_max) {
+		g_ut_mdj_alloc_failed++;
+		return NULL;
+	}
+	return spdk_zmalloc(size, align, phys_addr, numa_id, flags);
+}
+#define MD_JOURNAL_ELEM_ZMALLOC ut_md_journal_elem_zmalloc
 #include "blob/blob_md_journal.c"
 #include "blob/request.c"
 #include "blob/zeroes.c"
@@ -12350,6 +12370,281 @@ blob_thick_write_zeroes_writes(void)
 	wz_teardown(&f);
 }
 
+/*
+ * md journal tests. The 64 MiB test device has no room for an on-disk journal
+ * created by spdk_bs_init (md_journal option), so a journal is attached to
+ * g_bs by hand: its slots live in the last 16 MiB of the device, which these
+ * tests never allocate as clusters. The drain poller is not started; the
+ * tests drive the HOME drain directly.
+ */
+#define UT_MDJ_START_PAGE	((DEV_BUFFER_SIZE / SPDK_BS_PAGE_SIZE) - 4096)
+#define UT_MDJ_LEN_PAGES	4096
+
+static struct spdk_bs_md_journal *
+ut_mdj_attach(struct spdk_blob_store *bs)
+{
+	struct spdk_bs_md_journal *jr;
+
+	jr = bs_md_journal_create(bs, UT_MDJ_START_PAGE, UT_MDJ_LEN_PAGES);
+	SPDK_CU_ASSERT_FATAL(jr != NULL);
+	bs->md_journal = jr;
+	return jr;
+}
+
+static void
+ut_mdj_destroy_cpl(void *cb_arg, int bserrno)
+{
+}
+
+static void
+ut_mdj_detach(struct spdk_blob_store *bs)
+{
+	struct spdk_bs_md_journal *jr = bs->md_journal;
+
+	bs->md_journal = NULL;
+	bs_md_journal_destroy(jr, ut_mdj_destroy_cpl);
+	poll_threads();
+}
+
+static bool
+ut_md_page_is_zero(struct spdk_blob_store *bs, uint32_t page_idx)
+{
+	uint8_t *page = &g_dev_buffer[bs_md_page_to_lba(bs, page_idx) * bs->dev->blocklen];
+	uint32_t i;
+
+	for (i = 0; i < SPDK_BS_PAGE_SIZE; i++) {
+		if (page[i] != 0) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/*
+ * Create a thin blob with no clusters (one md page, written through to HOME
+ * after its journal write). With demote set, leadership is lost while the
+ * journal write is in flight: demote == 1 pauses the journal, demote == 2 only
+ * clears is_leader (the pause message has not reached the md thread yet).
+ */
+static void
+ut_mdj_create_blob(struct spdk_blob_store *bs, int demote, uint32_t *page_idx)
+{
+	struct spdk_bs_md_journal *jr = bs->md_journal;
+	struct spdk_blob_opts opts;
+	int i;
+
+	*page_idx = spdk_bit_array_find_first_clear(bs->used_md_pages, 0);
+	memset(&g_dev_buffer[bs_md_page_to_lba(bs, *page_idx) * bs->dev->blocklen], 0,
+	       SPDK_BS_PAGE_SIZE);
+
+	ut_spdk_blob_opts_init(&opts);
+	opts.thin_provision = true;
+	opts.num_clusters = 0;
+	g_bserrno = 1;
+	g_blobid = SPDK_BLOBID_INVALID;
+	spdk_bs_create_blob_ext(bs, &opts, blob_op_with_id_complete, NULL);
+
+	if (demote != 0) {
+		for (i = 0; i < 1000 && jr->journal_inflight == 0 && g_bserrno == 1; i++) {
+			poll_thread_times(0, 1);
+		}
+		SPDK_CU_ASSERT_FATAL(jr->journal_inflight > 0);
+		if (demote == 1) {
+			md_journal_pause_msg(bs);
+			CU_ASSERT(jr->paused);
+		} else {
+			spdk_bs_set_leader(bs, false);
+		}
+	}
+	poll_threads();
+}
+
+/*
+ * 81272df94: the first persist of a new blob writes its pages to HOME right
+ * after their journal writes, without the HOME barrier. A node demoted while
+ * the journal write was in flight must not write HOME (the new leader may
+ * have reused those pages) and the create must fail.
+ */
+static void
+blob_md_journal_home_direct_demoted(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob_md_page *page;
+	uint32_t page_idx;
+
+	/* Leader, journal running: the page reaches HOME and the create succeeds. */
+	ut_mdj_attach(bs);
+	ut_mdj_create_blob(bs, 0, &page_idx);
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(g_blobid == bs_page_to_blobid(page_idx));
+	page = (struct spdk_blob_md_page *)&g_dev_buffer[bs_md_page_to_lba(bs, page_idx) *
+			bs->dev->blocklen];
+	CU_ASSERT(page->id == bs_page_to_blobid(page_idx));
+	ut_mdj_detach(bs);
+
+	/* Journal paused (demoted) between journal write and HOME write. */
+	ut_mdj_attach(bs);
+	ut_mdj_create_blob(bs, 1, &page_idx);
+	CU_ASSERT(g_bserrno == -EIO);
+	CU_ASSERT(ut_md_page_is_zero(bs, page_idx));
+	CU_ASSERT(!spdk_bit_array_get(bs->used_md_pages, page_idx));
+	ut_mdj_detach(bs);
+
+	/* is_leader cleared, journal pause not processed yet. */
+	ut_mdj_attach(bs);
+	ut_mdj_create_blob(bs, 2, &page_idx);
+	CU_ASSERT(g_bserrno == -EIO);
+	CU_ASSERT(ut_md_page_is_zero(bs, page_idx));
+	CU_ASSERT(!spdk_bit_array_get(bs->used_md_pages, page_idx));
+	spdk_bs_set_leader(bs, true);
+	ut_mdj_detach(bs);
+}
+
+static void
+ut_mdj_batch_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	*(int *)cb_arg = bserrno;
+	bs_sequence_finish(seq, bserrno);
+}
+
+static void
+ut_mdj_seq_cpl(void *cb_arg, int bserrno)
+{
+}
+
+/* Journal count entries (distinct target pages from page 8192 on). */
+static void
+ut_mdj_write_entries(struct spdk_blob_store *bs, uint32_t count)
+{
+	struct spdk_bs_md_journal *jr = bs->md_journal;
+	struct md_journal_batch *jr_batch;
+	struct spdk_bs_cpl cpl;
+	spdk_bs_sequence_t *seq;
+	uint8_t *buf;
+	int rc = 1;
+	uint32_t i;
+
+	buf = calloc(1, SPDK_BS_PAGE_SIZE);
+	SPDK_CU_ASSERT_FATAL(buf != NULL);
+	memset(buf, 0x5a, SPDK_BS_PAGE_SIZE);
+
+	cpl.type = SPDK_BS_CPL_TYPE_BLOB_BASIC;
+	cpl.u.blob_basic.cb_fn = ut_mdj_seq_cpl;
+	cpl.u.blob_basic.cb_arg = NULL;
+	seq = bs_sequence_start_bs(bs->md_channel, &cpl);
+	SPDK_CU_ASSERT_FATAL(seq != NULL);
+
+	jr_batch = bs_md_journal_sequence_to_batch(jr, seq, count, ut_mdj_batch_cpl, &rc);
+	SPDK_CU_ASSERT_FATAL(jr_batch != NULL);
+	for (i = 0; i < count; i++) {
+		bs_md_journal_batch_write(jr_batch, buf, bs_page_to_lba(bs, 8192 + i),
+					  bs_byte_to_lba(bs, SPDK_BS_PAGE_SIZE), MD_JOURNAL_WRITE);
+	}
+	bs_md_journal_batch_close(jr_batch);
+	poll_threads();
+	CU_ASSERT(rc == 0);
+	free(buf);
+}
+
+/*
+ * dbfbb2322: HOME/ZERO IO went out at PREMIUM priority always. The class is
+ * encoded in the high LBA bits, which only raid strips, so on a blobstore
+ * without priority classes it must stay 0. With priority classes it is
+ * PREMIUM, and a PREMIUM HOME batch is capped at
+ * BS_MD_JOURNAL_PREMIUM_BATCH_MAX entries.
+ */
+static void
+blob_md_journal_home_priority(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_bs_md_journal *jr;
+	uint32_t count = BS_MD_JOURNAL_PREMIUM_BATCH_MAX + 76;
+
+	/* No priority class configured: HOME writes carry class 0, one batch. */
+	CU_ASSERT(bs->priority_class == 0);
+	jr = ut_mdj_attach(bs);
+	ut_mdj_write_entries(bs, count);
+	g_dev_last_write_priority = -2;
+	md_journal_start_drain_batch(jr, true);
+	CU_ASSERT(jr->drain_batch->elem_count == count);
+	poll_threads();
+	CU_ASSERT(g_dev_last_write_priority == 0);
+	CU_ASSERT(!jr->active_drain_batch);
+	CU_ASSERT(TAILQ_EMPTY(&jr->home_queue));
+	ut_mdj_detach(bs);
+
+	/* Priority classes in use (a blob got one): PREMIUM, capped batches. */
+	bs->priority_class = PREMIUM_PRIORITY_CLASS;
+	jr = ut_mdj_attach(bs);
+	ut_mdj_write_entries(bs, count);
+	g_dev_last_write_priority = -2;
+	md_journal_start_drain_batch(jr, true);
+	CU_ASSERT(jr->drain_batch->elem_count == BS_MD_JOURNAL_PREMIUM_BATCH_MAX);
+	poll_threads();
+	CU_ASSERT(g_dev_last_write_priority == PREMIUM_PRIORITY_CLASS);
+	/* the next batch started right away and took the rest */
+	CU_ASSERT(TAILQ_EMPTY(&jr->home_queue));
+	CU_ASSERT(!jr->active_drain_batch);
+	CU_ASSERT(jr->home_durable_seq == count);
+	bs->priority_class = 0;
+	ut_mdj_detach(bs);
+}
+
+/*
+ * 16ac34329: element buffers come from 2 MiB chunks. On a heap without a free
+ * 2 MiB block the journal (and so the lvstore load) must still come up, with
+ * smaller chunks; only when not even one 8 KiB element fits does it fail.
+ */
+static void
+blob_md_journal_elem_chunk_fallback(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_bs_md_journal *jr;
+	uint32_t i;
+
+	/* default: 2 MiB chunks */
+	g_ut_mdj_alloc_max = 0;
+	jr = bs_md_journal_create(bs, UT_MDJ_START_PAGE, UT_MDJ_LEN_PAGES);
+	SPDK_CU_ASSERT_FATAL(jr != NULL);
+	CU_ASSERT(jr->elem_dma_chunk_count == BS_MD_JOURNAL_NUM_ELEMS / BS_MD_JOURNAL_ELEMS_PER_CHUNK);
+	bs_md_journal_destroy(jr, ut_mdj_destroy_cpl);
+
+	/* no 2 MiB block: 512 KiB chunks */
+	g_ut_mdj_alloc_max = 512 * 1024;
+	g_ut_mdj_alloc_failed = 0;
+	jr = bs_md_journal_create(bs, UT_MDJ_START_PAGE, UT_MDJ_LEN_PAGES);
+	SPDK_CU_ASSERT_FATAL(jr != NULL);
+	/* 2 MiB and 1 MiB fail once, then 512 KiB chunks for good */
+	CU_ASSERT(g_ut_mdj_alloc_failed == 2);
+	CU_ASSERT(jr->elem_dma_chunk_count == BS_MD_JOURNAL_NUM_ELEMS / 64);
+	CU_ASSERT(jr->free_count == BS_MD_JOURNAL_NUM_ELEMS);
+	for (i = 0; i < BS_MD_JOURNAL_NUM_ELEMS; i++) {
+		CU_ASSERT((uint8_t *)jr->elems[i].page ==
+			  (uint8_t *)jr->elems[i].hdr + BS_MD_JOURNAL_PAGE_SIZE);
+		if (i % 64 != 0) {
+			CU_ASSERT((uint8_t *)jr->elems[i].hdr ==
+				  (uint8_t *)jr->elems[i - 1].hdr + BS_MD_JOURNAL_ENTRY_SIZE);
+		}
+	}
+	bs_md_journal_destroy(jr, ut_mdj_destroy_cpl);
+
+	/* only single elements fit: one 8 KiB allocation per element */
+	g_ut_mdj_alloc_max = BS_MD_JOURNAL_ENTRY_SIZE;
+	jr = bs_md_journal_create(bs, UT_MDJ_START_PAGE, UT_MDJ_LEN_PAGES);
+	SPDK_CU_ASSERT_FATAL(jr != NULL);
+	CU_ASSERT(jr->elem_dma_chunk_count == BS_MD_JOURNAL_NUM_ELEMS);
+	CU_ASSERT(jr->free_count == BS_MD_JOURNAL_NUM_ELEMS);
+	bs_md_journal_destroy(jr, ut_mdj_destroy_cpl);
+
+	/* not even one element fits: the create fails (and frees what it had) */
+	g_ut_mdj_alloc_max = BS_MD_JOURNAL_PAGE_SIZE;
+	jr = bs_md_journal_create(bs, UT_MDJ_START_PAGE, UT_MDJ_LEN_PAGES);
+	CU_ASSERT(jr == NULL);
+
+	g_ut_mdj_alloc_max = 0;
+	poll_threads();
+}
+
 static void
 suite_bs_setup(void)
 {
@@ -12973,6 +13268,9 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite_bs, bs_md_write_enospc_is_eio);
 		CU_ADD_TEST(suite_bs, blob_delete_async_in_middle_keeps_clone_clusters);
 		CU_ADD_TEST(suite_bs, blob_merge_base_priority_class);
+		CU_ADD_TEST(suite_bs, blob_md_journal_home_direct_demoted);
+		CU_ADD_TEST(suite_bs, blob_md_journal_home_priority);
+		CU_ADD_TEST(suite_bs, blob_md_journal_elem_chunk_fallback);
 		CU_ADD_TEST(suite_bs, blob_merge_base_64k_pieces);
 		CU_ADD_TEST(suite_bs, blob_merge_base_waits_for_buffers);
 		CU_ADD_TEST(suite_bs, blob_merge_base_kick_takes_other_threads_buffers);
