@@ -38,6 +38,8 @@ int g_dev_write_fail_rc;
 uint64_t g_dev_write_fail_lba;
 uint64_t g_dev_write_fail_lba_count;
 uint64_t g_dev_write_fail_count;	/* writes failed this way */
+uint64_t g_dev_copy_calls;	/* COPYs sent to the dev, declined ones included */
+bool g_dev_copy_partial;	/* a declined COPY leaves junk in the destination */
 struct spdk_blob_ext_io_opts g_blob_ext_io_opts;
 uint32_t g_phys_blocklen;
 
@@ -465,7 +467,14 @@ dev_copy(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, uint64_t dst_
 	if (dev_write_inject_fail(dst_lba, lba_count, cb_args)) {
 		return;
 	}
+	g_dev_copy_calls++;
 	if (g_dev_copy_fail != 0) {
+		if (g_dev_copy_partial) {
+			/* Part of the copy was done (or the destination was touched)
+			 * before it failed: the destination holds neither zeroes nor
+			 * the source. */
+			memset(dst, 0xFF, size);
+		}
 		/* The base bdev declines the copy (e.g. a distrib page copy at max. chain depth). */
 		cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, g_dev_copy_fail);
 		return;
