@@ -14557,6 +14557,30 @@ spdk_bs_delete_blob_non_leader(struct spdk_blob_store *bs, struct spdk_blob *blo
 	rc = blob_get_xattr_value(blob, SNAPSHOT_PENDING_REMOVAL, &value, &len, true);
 	if (rc == 0) {
 		removal_clone = blob_lookup(bs, *(spdk_blob_id *)value);
+		if (removal_clone && removal_clone->parent_id != blob->id) {
+			/*
+			 * The mark names the clone the leader was re-parenting when it
+			 * started deleting this snapshot. It is only a hint: by the
+			 * time this node replays the delete, the clone may no longer
+			 * be a child of this snapshot here. bf28 (2026-11-19): the
+			 * leader re-parented LVOL_33 from SNAP_615 to SNAP_477 and a
+			 * new snapshot SNAP_619 (parent SNAP_477) was then taken of
+			 * LVOL_33 and registered on this node before SNAP_615's sync
+			 * delete reached it. Its registration moved LVOL_33 under
+			 * SNAP_619, leaving SNAP_615 a snapshot without clones. Taking
+			 * the mark at its word re-parented LVOL_33 to SNAP_477 and
+			 * gave it SNAP_615's back device, while SNAP_619 still listed
+			 * it: LVOL_33 sat under two snapshots, read past SNAP_619's
+			 * data, and SNAP_477 had two clones, so its own delete failed
+			 * with EPERM for good. A clone that does not point at this
+			 * snapshot is left alone: the snapshot goes as a leaf, or with
+			 * the clone its tree does list.
+			 */
+			SPDK_NOTICELOG("Snapshot 0x%" PRIx64 " is marked pending removal for clone 0x%" PRIx64
+				       ", but that clone's parent here is 0x%" PRIx64 ": not re-parenting it\n",
+				       blob->id, removal_clone->id, removal_clone->parent_id);
+			removal_clone = NULL;
+		}
 		if (removal_clone) {
 			corrupted_mode = true;
 			SPDK_NOTICELOG("Blob is a snapshot and was in delete before - corrupted snapblob in secondary mode 0x%" PRIx64 ".\n", blob->id);
