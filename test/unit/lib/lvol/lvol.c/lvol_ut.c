@@ -135,7 +135,28 @@ ut_lvol_snapshot_settle(void)
 	spdk_delay_us(50 * 1000);
 	poll_threads();
 }
-DEFINE_STUB_V(spdk_blob_update_on_failover, (struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg));
+/* The blob refresh of a failover update: kept pending, the test completes it
+ * (g_ut_upd_cb) with the result it wants. */
+static int g_ut_upd_calls;
+static struct spdk_blob *g_ut_upd_blob;
+static spdk_blob_op_complete g_ut_upd_cb;
+static void *g_ut_upd_arg;
+void
+spdk_blob_update_on_failover(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	g_ut_upd_calls++;
+	g_ut_upd_blob = blob;
+	g_ut_upd_cb = cb_fn;
+	g_ut_upd_arg = cb_arg;
+}
+static int g_ut_del_async_calls;
+void
+spdk_bs_delete_blob_async(struct spdk_blob_store *bs, struct spdk_blob *blob,
+			  spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	g_ut_del_async_calls++;
+	cb_fn(cb_arg, 0);
+}
 static int g_delete_non_leader_calls;
 static struct spdk_blob *g_delete_non_leader_blob;
 static int g_free_blob_copy_calls;
@@ -4195,8 +4216,16 @@ DEFINE_STUB_V(spdk_bs_update_on_failover, (struct spdk_blob_store *bs, spdk_bs_o
 		void *cb_arg));
 DEFINE_STUB_V(spdk_blob_update_on_failover_send_msg, (struct spdk_blob *blob,
 		spdk_blob_op_complete cb_fn, void *cb_arg));
-DEFINE_STUB_V(spdk_blob_update_failed_cleanup, (struct spdk_blob *blob,
-		spdk_blob_op_complete cb_fn, void *cb_arg));
+/* Unfreezes the blob and completes (the md-thread cleanup of a failed update). */
+static int g_ut_upd_cleanup_calls;
+void
+spdk_blob_update_failed_cleanup(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	g_ut_upd_cleanup_calls++;
+	cb_fn(cb_arg, 0);
+}
+DEFINE_STUB(spdk_bs_get_md_thread, struct spdk_thread *, (struct spdk_blob_store *bs), NULL);
+DEFINE_STUB(bs_get_xattr_removal, spdk_blob_id, (struct spdk_blob *blob), SPDK_BLOBID_INVALID);
 DEFINE_STUB_V(spdk_bs_drain_channel_queued, (struct spdk_blob_store *bs,
 		struct spdk_hublvol_channels *ch_list, int count, spdk_drain_op_cpl cb_fn, void *cb_arg));
 
@@ -5163,6 +5192,255 @@ lvs_refresh_notification(void)
 	spdk_lvs_set_refresh_cb(NULL, NULL);
 }
 
+/*
+ * #91 stale-refresh before a leader's snapshot delete (review B4).
+ * lvs 9x: leader, primary. snap: the snapshot being deleted (refreshed). stale:
+ * an lvol not refreshed since the takeover (leader == false).
+ */
+static void
+ut_rc_cb(void *cb_arg, int rc)
+{
+	*(int *)cb_arg = rc;
+}
+
+static void
+ut_refresh_lvol_init(struct spdk_lvol_store *lvs, struct spdk_lvol *lvol, struct spdk_blob *blob,
+		     spdk_blob_id id, bool leader, const char *name)
+{
+	memset(lvol, 0, sizeof(*lvol));
+	memset(blob, 0, sizeof(*blob));
+	blob->id = id;
+	lvol->blob = blob;
+	lvol->blob_id = id;
+	lvol->leader = leader;
+	lvol->lvol_store = lvs;
+	snprintf(lvol->unique_id, sizeof(lvol->unique_id), "%s", name);
+	TAILQ_INSERT_TAIL(&lvs->lvols, lvol, link);
+}
+
+/* Without the fixes a delete waits on a poller (up to 3000 x 10 ms): let it end
+ * so no pending poller outlives the test's stack. */
+static void
+ut_refresh_settle(int *rc)
+{
+	int i;
+
+	for (i = 0; i < 3002 && *rc == 99; i++) {
+		spdk_delay_us(10 * 1000);
+		poll_threads();
+	}
+}
+
+static void
+ut_refresh_reset(void)
+{
+	g_ut_upd_calls = 0;
+	g_ut_upd_blob = NULL;
+	g_ut_upd_cb = NULL;
+	g_ut_upd_arg = NULL;
+	g_ut_del_async_calls = 0;
+	g_ut_upd_cleanup_calls = 0;
+	g_blob_read_only = true;
+}
+
+/* Review B4.2 #3: an IO-triggered refresh that fails ends the update
+ * (update_in_progress false), a snapshot delete then fails at once with
+ * ERR_UPDATE_FAILED (not 30 s and -EBUSY), and once the lvol is refreshed by
+ * the next IO the delete succeeds. */
+static void
+lvol_destroy_refresh_failed_update(void)
+{
+	struct spdk_lvol_store *lvs = ha_alloc_lvs(91, true, NODE_PRIMARY);
+	struct spdk_blob snap_blob, stale_blob;
+	struct spdk_lvol snap, stale;
+	int rc;
+
+	ut_refresh_reset();
+	ut_refresh_lvol_init(lvs, &snap, &snap_blob, 0x910, true, "snap");
+	ut_refresh_lvol_init(lvs, &stale, &stale_blob, 0x911, false, "stale");
+
+	/* IO on the stale lvol refreshes it; the refresh fails */
+	spdk_lvol_update_on_failover(lvs, &stale, false);
+	CU_ASSERT(stale.update_in_progress == true);
+	SPDK_CU_ASSERT_FATAL(g_ut_upd_calls == 1);
+	CU_ASSERT(g_ut_upd_blob == &stale_blob);
+	g_ut_upd_cb(g_ut_upd_arg, -EIO);
+	CU_ASSERT(stale.failed_on_update == true);
+	CU_ASSERT(stale.leader == false);
+	CU_ASSERT(stale.update_in_progress == false);
+
+	/* the snapshot delete fails at once, nothing refreshed or deleted */
+	rc = 99;
+	spdk_lvol_destroy_async(&snap, ut_rc_cb, &rc);
+	CU_ASSERT(rc == ERR_UPDATE_FAILED);
+	ut_refresh_settle(&rc);
+	CU_ASSERT(g_ut_upd_calls == 1);
+	CU_ASSERT(g_ut_del_async_calls == 0);
+	CU_ASSERT(snap.action_in_progress == false);
+
+	/* the next IO retries the refresh, which works now */
+	spdk_lvol_update_on_failover(lvs, &stale, false);
+	CU_ASSERT(g_ut_upd_calls == 2);
+	if (g_ut_upd_calls == 2) {
+		CU_ASSERT(stale.failed_on_update == false);
+		g_ut_upd_cb(g_ut_upd_arg, 0);
+	}
+	CU_ASSERT(stale.leader == true);
+	CU_ASSERT(stale.update_in_progress == false);
+
+	/* and the snapshot delete runs */
+	rc = 99;
+	spdk_lvol_destroy_async(&snap, ut_rc_cb, &rc);
+	CU_ASSERT(rc == 0);
+	ut_refresh_settle(&rc);
+	CU_ASSERT(g_ut_del_async_calls == 1);
+	CU_ASSERT(snap.action_in_progress == false);
+
+	g_blob_read_only = false;
+	TAILQ_REMOVE(&lvs->lvols, &snap, link);
+	TAILQ_REMOVE(&lvs->lvols, &stale, link);
+	ha_free_lvs(lvs);
+}
+
+/* Review B4.2 #3, the other exits of an IO-triggered update: the lvstore retry
+ * limit and an allocation failure end the update too (IO still dropped). */
+static void
+lvol_update_failover_error_exits(void)
+{
+	struct spdk_lvol_store *lvs = ha_alloc_lvs(92, true, NODE_PRIMARY);
+	struct spdk_blob blob;
+	struct spdk_lvol lvol;
+
+	ut_refresh_reset();
+	ut_refresh_lvol_init(lvs, &lvol, &blob, 0x920, false, "lvol");
+
+	/* retry limit: nothing started */
+	lvs->retry_on_update = 4;
+	spdk_lvol_update_on_failover(lvs, &lvol, false);
+	CU_ASSERT(g_ut_upd_calls == 0);
+	CU_ASSERT(lvol.failed_on_update == true);
+	CU_ASSERT(lvol.update_in_progress == false);
+	lvs->retry_on_update = 0;
+
+	/* allocation failure: the frozen blob is cleaned up (unfrozen), update ended */
+	lvol.failed_on_update = false;
+	lvol.update_in_progress = false;
+	MOCK_SET(calloc, NULL);
+	spdk_lvol_update_on_failover(lvs, &lvol, false);
+	MOCK_CLEAR(calloc);
+	CU_ASSERT(g_ut_upd_calls == 0);
+	CU_ASSERT(g_ut_upd_cleanup_calls == 1);
+	CU_ASSERT(lvol.failed_on_update == true);
+	CU_ASSERT(lvol.update_in_progress == false);
+
+	g_blob_read_only = false;
+	TAILQ_REMOVE(&lvs->lvols, &lvol, link);
+	ha_free_lvs(lvs);
+}
+
+/* Review B4.2 #4: the lvol being deleted has action_in_progress for the whole
+ * refresh + wait phase (an lvstore unload is refused meanwhile), and it is
+ * cleared on success and on an abort during the wait. */
+static void
+lvol_destroy_refresh_holds_lvol(void)
+{
+	struct spdk_lvol_store *lvs = ha_alloc_lvs(93, true, NODE_PRIMARY);
+	struct spdk_blob snap_blob, stale_blob, busy_blob;
+	struct spdk_lvol snap, stale, busy;
+	int rc, urc;
+
+	ut_refresh_reset();
+	ut_refresh_lvol_init(lvs, &snap, &snap_blob, 0x930, true, "snap");
+	ut_refresh_lvol_init(lvs, &stale, &stale_blob, 0x931, false, "stale");
+	ut_refresh_lvol_init(lvs, &busy, &busy_blob, 0x932, false, "busy");
+	busy.update_in_progress = true;		/* an IO-triggered refresh runs */
+
+	rc = 99;
+	spdk_lvol_destroy_async(&snap, ut_rc_cb, &rc);
+	SPDK_CU_ASSERT_FATAL(g_ut_upd_calls == 1);
+	CU_ASSERT(g_ut_upd_blob == &stale_blob);
+	CU_ASSERT(rc == 99);
+	CU_ASSERT(snap.action_in_progress == true);
+	if (snap.action_in_progress) {
+		/* (unguarded, without the fix the unload would free the stack lvols) */
+		urc = 99;
+		CU_ASSERT(spdk_lvs_unload(lvs, ut_rc_cb, &urc) == -EBUSY);
+		CU_ASSERT(urc == -EBUSY);
+	}
+
+	/* stale refreshed; the busy lvol is waited for */
+	g_ut_upd_cb(g_ut_upd_arg, 0);
+	CU_ASSERT(stale.leader == true);
+	spdk_delay_us(10 * 1000);
+	poll_threads();
+	CU_ASSERT(rc == 99);
+	CU_ASSERT(snap.action_in_progress == true);
+
+	/* the busy lvol's refresh is done: the delete runs */
+	spdk_lvol_set_leader(&busy);
+	spdk_delay_us(10 * 1000);
+	poll_threads();
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_ut_del_async_calls == 1);
+	CU_ASSERT(snap.action_in_progress == false);
+
+	/* again, and the leadership goes during the wait: aborted, lvol released */
+	busy.leader = false;
+	busy.update_in_progress = true;
+	rc = 99;
+	spdk_lvol_destroy_async(&snap, ut_rc_cb, &rc);
+	CU_ASSERT(rc == 99);
+	CU_ASSERT(snap.action_in_progress == true);
+	lvs->leader = false;
+	spdk_delay_us(10 * 1000);
+	poll_threads();
+	CU_ASSERT(rc == ERR_LEADERSHIP_CHANGED);
+	CU_ASSERT(g_ut_del_async_calls == 1);
+	CU_ASSERT(snap.action_in_progress == false);
+	ut_refresh_settle(&rc);
+
+	g_blob_read_only = false;
+	TAILQ_REMOVE(&lvs->lvols, &snap, link);
+	TAILQ_REMOVE(&lvs->lvols, &stale, link);
+	TAILQ_REMOVE(&lvs->lvols, &busy, link);
+	ha_free_lvs(lvs);
+}
+
+/* Review B4.2 #5: leadership lost while a stale lvol is refreshed: the lvol is
+ * not made leader, its update ends, the delete is aborted. */
+static void
+lvol_destroy_refresh_leadership_lost(void)
+{
+	struct spdk_lvol_store *lvs = ha_alloc_lvs(94, true, NODE_PRIMARY);
+	struct spdk_blob snap_blob, stale_blob;
+	struct spdk_lvol snap, stale;
+	int rc;
+
+	ut_refresh_reset();
+	ut_refresh_lvol_init(lvs, &snap, &snap_blob, 0x940, true, "snap");
+	ut_refresh_lvol_init(lvs, &stale, &stale_blob, 0x941, false, "stale");
+
+	rc = 99;
+	spdk_lvol_destroy_async(&snap, ut_rc_cb, &rc);
+	SPDK_CU_ASSERT_FATAL(g_ut_upd_calls == 1);
+	CU_ASSERT(stale.update_in_progress == true);
+
+	lvs->leader = false;
+	g_ut_upd_cb(g_ut_upd_arg, 0);
+	CU_ASSERT(stale.leader == false);
+	CU_ASSERT(stale.update_in_progress == false);
+	CU_ASSERT(stale.failed_on_update == false);
+	CU_ASSERT(rc == ERR_LEADERSHIP_CHANGED);
+	CU_ASSERT(g_ut_del_async_calls == 0);
+	CU_ASSERT(snap.action_in_progress == false);
+	ut_refresh_settle(&rc);
+
+	g_blob_read_only = false;
+	TAILQ_REMOVE(&lvs->lvols, &snap, link);
+	TAILQ_REMOVE(&lvs->lvols, &stale, link);
+	ha_free_lvs(lvs);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -5198,6 +5476,10 @@ main(int argc, char **argv)
 	suite = CU_add_suite("lvol", NULL, NULL);
 
 	CU_ADD_TEST(suite, lvs_refresh_notification);
+	CU_ADD_TEST(suite, lvol_destroy_refresh_failed_update);
+	CU_ADD_TEST(suite, lvol_update_failover_error_exits);
+	CU_ADD_TEST(suite, lvol_destroy_refresh_holds_lvol);
+	CU_ADD_TEST(suite, lvol_destroy_refresh_leadership_lost);
 	CU_ADD_TEST(suite, lvs_hub_close_notification);
 	CU_ADD_TEST(suite, lvs_init_unload_success);
 	CU_ADD_TEST(suite, lvs_init_destroy_success);
