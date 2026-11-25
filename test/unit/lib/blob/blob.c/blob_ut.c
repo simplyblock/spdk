@@ -12270,6 +12270,104 @@ blob_secondary_delete_snapshot_dangling_parent(void)
 }
 
 /*
+ * bf28 (2026-11-19, LVS_1 on cef37452 and LVS_10 on a8ae2460): the leader
+ * deletes mid (SNAP_615), the only snapshot under the clone (LVOL_33): it marks
+ * mid pending removal for the clone and re-parents the clone to base
+ * (SNAP_477). Before mid's sync delete reaches this secondary, a new snapshot
+ * of the clone (SNAP_619, parent base on the leader) is registered here: the
+ * registration moves the clone from mid to the new snapshot, so mid is left
+ * without clones. The replay of mid's delete must then drop mid as a leaf. It
+ * used to follow the pending-removal mark to the clone and re-parent it to
+ * base, leaving it listed under both base and the new snapshot (base with two
+ * clones: its own delete failed with EPERM) and reading through mid's old
+ * back device.
+ */
+static void
+blob_secondary_delete_snapshot_clone_moved_by_register(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob *base, *mid, *clone, *newsnap, *tmp;
+	spdk_blob_id baseid, midid, cloneid, newsnapid;
+	spdk_blob_id ids[4];
+	size_t count;
+	int rc;
+
+	ut_secondary_delete_chain(bs, &base, &mid, &clone);
+	baseid = spdk_blob_get_id(base);
+	midid = spdk_blob_get_id(mid);
+	cloneid = spdk_blob_get_id(clone);
+
+	/* The leader's new snapshot of the clone, loaded here with parent base */
+	spdk_bs_create_clone(bs, baseid, NULL, blob_op_with_id_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blobid != SPDK_BLOBID_INVALID);
+	newsnapid = g_blobid;
+	spdk_bs_open_blob(bs, newsnapid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	newsnap = g_blob;
+	CU_ASSERT(newsnap->parent_id == baseid);
+
+	/* Its registration on this secondary (rpc_bdev_lvol_snapshot_register) */
+	spdk_bs_update_snapshot_clone(bs, clone, newsnap, false, false);
+	spdk_bs_update_snapshot_clone_live(clone, newsnap);
+	/* the clone's old back device (on mid) is closed */
+	poll_threads();
+	CU_ASSERT(mid->open_ref == 1);
+	CU_ASSERT(clone->parent_id == newsnapid);
+	CU_ASSERT(ut_snapshot_has_clone(bs, newsnapid, cloneid));
+	CU_ASSERT(!ut_snapshot_has_clone(bs, midid, cloneid));
+	CU_ASSERT(ut_snapshot_has_clone(bs, baseid, midid));
+	CU_ASSERT(ut_snapshot_has_clone(bs, baseid, newsnapid));
+
+	/* mid as this node re-read it while the leader was deleting it */
+	mid->md_ro = false;
+	rc = blob_set_xattr(mid, SNAPSHOT_PENDING_REMOVAL, &cloneid, sizeof(cloneid), true);
+	CU_ASSERT(rc == 0);
+	mid->state = SPDK_BLOB_STATE_CLEAN;
+	mid->md_ro = true;
+
+	tmp = spdk_bs_copy_blob(bs, mid);
+	SPDK_CU_ASSERT_FATAL(tmp != NULL);
+	rc = spdk_bs_delete_blob_non_leader(bs, tmp);
+	CU_ASSERT(rc == 0);
+	poll_threads();
+
+	/* mid is gone on this node */
+	CU_ASSERT(spdk_bit_array_get(bs->used_blobids, bs_blobid_to_page(midid)) == false);
+	CU_ASSERT(bs_get_snapshot_entry(bs, midid) == NULL);
+	/* the clone stays under the new snapshot, and only there */
+	CU_ASSERT(clone->parent_id == newsnapid);
+	CU_ASSERT(spdk_blob_get_parent_snapshot(bs, cloneid) == newsnapid);
+	CU_ASSERT(ut_snapshot_has_clone(bs, newsnapid, cloneid));
+	CU_ASSERT(!ut_snapshot_has_clone(bs, baseid, cloneid));
+	/* base keeps exactly one clone, the new snapshot: its delete can merge */
+	count = SPDK_COUNTOF(ids);
+	rc = spdk_blob_get_clones(bs, baseid, ids, &count);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(count == 1);
+	CU_ASSERT(ids[0] == newsnapid);
+
+	spdk_blob_close(clone, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	spdk_blob_close(newsnap, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	/* a leaf delete leaves the open handle to its owner (the lvol's close) */
+	if (blob_lookup(bs, midid) == mid) {
+		spdk_blob_close(mid, blob_op_complete, NULL);
+		poll_threads();
+		CU_ASSERT(g_bserrno == 0);
+	}
+	spdk_blob_close(base, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+}
+
+/*
  * bf32 2026-11-21: two lvols on one blob id share its open handle (open_ref
  * 2); a third open is the deleting lvol's. The secondary delete of that lvol
  * copies the blob, closes its handle and deletes the copy; the copy is not
@@ -13905,6 +14003,7 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite_bs, blob_shallow_copy);
 		CU_ADD_TEST(suite_bs, blob_secondary_delete_snapshot_reparented);
 		CU_ADD_TEST(suite_bs, blob_secondary_delete_snapshot_dangling_parent);
+		CU_ADD_TEST(suite_bs, blob_secondary_delete_snapshot_clone_moved_by_register);
 		CU_ADD_TEST(suite_bs, blob_secondary_force_delete_shared_handle);
 		CU_ADD_TEST(suite_bs, blob_secondary_force_delete_last_ref);
 		CU_ADD_TEST(suite_esnap_bs, blob_set_parent);
