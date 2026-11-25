@@ -2362,19 +2362,17 @@ blob_load_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 
 	page = &ctx->pages[ctx->num_pages - 1];
 	crc = blob_md_page_calc_crc(page);
-	if (crc != page->crc && ctx->num_pages == 1 && blob->examine_flag &&
-	    spdk_mem_all_zero(page, sizeof(*page))) {
+	if (crc != page->crc && spdk_mem_all_zero(page, sizeof(*page))) {
 		/*
-		 * Examine: the blobid is in the persisted used blobid mask, but its first md page is
-		 * all zeroes. A delete zeroes the md pages first and then persists the mask
-		 * (blob_persist_zero_pages_cpl), so this is a delete whose mask write was lost: the
-		 * blob is gone and owns nothing. Not a corrupted page - drop the stale bit and let
-		 * the examine skip the blob (-ENOENT) instead of failing the load.
+		 * The blobid is in the persisted used blobid mask, but its md page is all
+		 * zeroes. A delete persists the mask (bit cleared) before it zeroes the md
+		 * pages (blob_persist_start), and a create writes the md pages
+		 * before it sets the bit, so a set bit always names valid pages: this is
+		 * corruption, and the load fails.
 		 */
-		SPDK_NOTICELOG("blobid 0x%" PRIx64 " is in the used blobid mask but its md page is "
-			       "zeroed (deleted): dropping it\n", blob->id);
-		spdk_bit_array_clear(blob->bs->used_blobids, current_page);
-		blob_load_final(ctx, -ENOENT);
+		SPDK_ERRLOG("Metadata page %d of blobid 0x%" PRIx64 " is all zeroes, but the blobid "
+			    "is in the used blobid mask: metadata corrupted\n", current_page, blob->id);
+		blob_load_final(ctx, -EINVAL);
 		return;
 	}
 	if (crc != page->crc) {
@@ -2998,8 +2996,6 @@ blob_persist_zero_pages_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	struct spdk_blob_store		*bs = blob->bs;
 	size_t				i;
 
-	bool delete_blob = false;
-
 	if (bserrno != 0) {
 		blob_persist_complete(seq, ctx, bserrno);
 		return;
@@ -3021,18 +3017,12 @@ blob_persist_zero_pages_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		page_num = bs_blobid_to_page(blob->id);
 		ctx->idx_blobids = bs_blobid_to_page(blob->id);
 		bs_release_md_page(bs, page_num);
-		delete_blob = true;
 	}
 
 	spdk_spin_unlock(&bs->used_lock);
-	if (delete_blob) {
-		//sync md and blobids bit array
-		ctx->bit_cb_fn_persist = blob_persist_clear_clusters;
-		persist_bs_write_used_blobids(seq, ctx, 0);
-	} else {
-		/* Move on to clearing clusters */
-		blob_persist_clear_clusters(seq, ctx, 0);
-	}
+	/* A delete persisted the used blobid mask before zeroing the pages
+	 * (blob_persist_start). Move on to clearing clusters. */
+	blob_persist_clear_clusters(seq, ctx, 0);
 }
 
 static void
@@ -3782,7 +3772,16 @@ blob_persist_start(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		 * Immediately jump to the clean up routine. */
 		assert(blob->clean.num_pages > 0);
 		blob->state = SPDK_BLOB_STATE_CLEAN;
-		blob_persist_zero_pages(seq, ctx, 0);
+		/*
+		 * Persist the used blobid mask (the delete cleared the bit in memory,
+		 * bs_delete_blob_finish) BEFORE zeroing the md pages. A crash in between
+		 * then leaves a cleared bit over intact pages (a harmless leftover), never
+		 * a set bit over zeroed pages: a set bit always names valid metadata, and
+		 * the load treats an all-zero page under a set bit as corruption.
+		 */
+		ctx->idx_blobids = bs_blobid_to_page(blob->id);
+		ctx->bit_cb_fn_persist = blob_persist_zero_pages;
+		persist_bs_write_used_blobids(seq, ctx, 0);
 		return;
 
 	}
