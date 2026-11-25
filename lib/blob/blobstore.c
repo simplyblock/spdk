@@ -14486,6 +14486,43 @@ force_delete_blob_manually(struct spdk_blob *blob) {
 	delete_blob_manually(bs, blob, true);
 }
 
+/*
+ * bf34 (2026-11-24, LVS_4 on the two secondaries R5 restarted): the leader had
+ * replaced LVOL_37 (blob 0x0e -> 0x02) and was deleting the old blob while the
+ * secondaries were down. On restart they loaded both from disk; 0x0e, a clone
+ * of SNAP_2195 (0x34), entered the snapshot tree at load, then its lvol was
+ * dropped at examine ("Bdev name LVS_4/LVOL_37 already exists": the bdev was
+ * unregistered, the lvol freed, the blob closed). The clone entry stayed. When
+ * the leader deleted SNAP_2195, every sync delete of it on the secondaries
+ * failed with "cannot destroy: has 2 clones" (EPERM), the sync-delete tasks
+ * retried for good and the del-sync gate held every snapshot create of the
+ * lvstore: replication stopped.
+ */
+int
+spdk_bs_drop_unopened_clone_entries(struct spdk_blob_store *bs, spdk_blob_id snapshot_id)
+{
+	struct spdk_blob_list *snapshot_entry, *clone_entry, *tmp;
+	int dropped = 0;
+
+	snapshot_entry = bs_get_snapshot_entry(bs, snapshot_id);
+	if (snapshot_entry == NULL) {
+		return 0;
+	}
+	TAILQ_FOREACH_SAFE(clone_entry, &snapshot_entry->clones, link, tmp) {
+		if (blob_lookup(bs, clone_entry->id) != NULL) {
+			continue;
+		}
+		SPDK_NOTICELOG("Snapshot 0x%" PRIx64 ": dropping clone entry 0x%" PRIx64 ", no blob of "
+			       "that id is open on this non-leader (left over from a blob it never "
+			       "exposed)\n", snapshot_id, clone_entry->id);
+		TAILQ_REMOVE(&snapshot_entry->clones, clone_entry, link);
+		snapshot_entry->clone_count--;
+		free(clone_entry);
+		dropped++;
+	}
+	return dropped;
+}
+
 int
 spdk_bs_delete_blob_non_leader(struct spdk_blob_store *bs, struct spdk_blob *blob) 
 {
@@ -14502,9 +14539,15 @@ spdk_bs_delete_blob_non_leader(struct spdk_blob_store *bs, struct spdk_blob *blo
 	struct spdk_blob_list *clone_entry = NULL;
 	struct spdk_blob_list *snapshot_clone_entry = NULL;
 	struct spdk_blob *clone = NULL;
+	int bserrno;
+
+	/* A phantom clone entry makes a snapshot with one live clone look like one
+	 * with two: bs_is_blob_deletable() then refuses, and the force delete below
+	 * drops the snapshot without re-parenting its live clone. */
+	spdk_bs_drop_unopened_clone_entries(bs, blob->id);
 
 	/* Check if blob can be removed and if it is a snapshot with clone on top of it */
-	int bserrno = bs_is_blob_deletable(blob, &update_clone);
+	bserrno = bs_is_blob_deletable(blob, &update_clone);
 	if (bserrno) {
 		SPDK_ERRLOG("Cannot remove blob in state nonleader. force remove it.\n");
 		force_delete_blob_manually(blob);

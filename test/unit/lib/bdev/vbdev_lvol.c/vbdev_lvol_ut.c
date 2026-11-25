@@ -406,12 +406,30 @@ spdk_blob_get_next_unallocated_io_unit(struct spdk_blob *blob, uint64_t offset)
 	}
 }
 
+/* Clone entries of the destroyed lvol's blob: g_ut_clone_count in total, of
+ * which g_ut_phantom_clones have no open blob (spdk_bs_drop_unopened_clone_entries
+ * drops those). */
+static size_t g_ut_clone_count;
+static size_t g_ut_phantom_clones;
+static int g_ut_drop_calls;
+
 int
 spdk_blob_get_clones(struct spdk_blob_store *bs, spdk_blob_id blobid, spdk_blob_id *ids,
 		     size_t *count)
 {
-	*count = 0;
+	*count = g_ut_clone_count;
 	return 0;
+}
+
+int
+spdk_bs_drop_unopened_clone_entries(struct spdk_blob_store *bs, spdk_blob_id snapshot_id)
+{
+	int dropped = (int)g_ut_phantom_clones;
+
+	g_ut_drop_calls++;
+	g_ut_clone_count -= g_ut_phantom_clones;
+	g_ut_phantom_clones = 0;
+	return dropped;
 }
 
 spdk_blob_id
@@ -3931,6 +3949,63 @@ ut_lvol_destroy_secondary_busy_while_updating(void)
 	ut_resv_node_fini(&n);
 }
 
+/*
+ * bf34 (2026-11-24): on a secondary, SNAP_2195 kept a clone entry for a blob
+ * the node never exposed (a replaced lvol's stale instance, dropped at
+ * examine). Every sync delete of the snapshot counted it and failed with
+ * -EPERM for good. A non-leader drops clone entries without an open blob
+ * before counting; a leader counts as before, and two live clones still
+ * refuse the delete.
+ */
+static void
+ut_lvol_destroy_secondary_phantom_clone(void)
+{
+	struct ut_resv_node n;
+
+	/* non-leader, one live clone + one phantom: the count passes; the busy
+	 * mock stops the delete right after it */
+	ut_resv_node_init(&n, false);
+	g_ut_destroy_calls = 0;
+	g_ut_drop_calls = 0;
+	g_ut_clone_count = 2;
+	g_ut_phantom_clones = 1;
+	MOCK_SET(spdk_blob_locked_operation_in_progress, true);
+	vbdev_lvol_destroy(&n.lvol, ut_destroy_done, NULL, true);
+	poll_threads();
+	CU_ASSERT(g_ut_drop_calls == 1);
+	CU_ASSERT(g_ut_destroy_calls == 1);
+	CU_ASSERT(g_ut_destroy_rc == -EBUSY);
+
+	/* non-leader, two live clones: still refused */
+	g_ut_destroy_calls = 0;
+	g_ut_drop_calls = 0;
+	g_ut_clone_count = 2;
+	g_ut_phantom_clones = 0;
+	vbdev_lvol_destroy(&n.lvol, ut_destroy_done, NULL, true);
+	poll_threads();
+	CU_ASSERT(g_ut_drop_calls == 1);
+	CU_ASSERT(g_ut_destroy_calls == 1);
+	CU_ASSERT(g_ut_destroy_rc == -EPERM);
+	MOCK_SET(spdk_blob_locked_operation_in_progress, false);
+	ut_resv_node_fini(&n);
+
+	/* leader: nothing is dropped, the entry counts as before */
+	ut_resv_node_init(&n, true);
+	g_ut_destroy_calls = 0;
+	g_ut_drop_calls = 0;
+	g_ut_clone_count = 2;
+	g_ut_phantom_clones = 1;
+	vbdev_lvol_destroy(&n.lvol, ut_destroy_done, NULL, true);
+	poll_threads();
+	CU_ASSERT(g_ut_drop_calls == 0);
+	CU_ASSERT(g_ut_destroy_calls == 1);
+	CU_ASSERT(g_ut_destroy_rc == -EPERM);
+	ut_resv_node_fini(&n);
+
+	g_ut_clone_count = 0;
+	g_ut_phantom_clones = 0;
+}
+
 static void
 ut_lvol_resv_sync_skips_detached_lvs(void)
 {
@@ -4178,6 +4253,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, ut_lvol_resv_hub_detached_before_unload);
 	CU_ADD_TEST(suite, ut_lvol_resv_sync_skips_detached_lvs);
 	CU_ADD_TEST(suite, ut_lvol_destroy_secondary_busy_while_updating);
+	CU_ADD_TEST(suite, ut_lvol_destroy_secondary_phantom_clone);
 	CU_ADD_TEST(suite, ut_lvol_resv_follower_keeps_fetched_state);
 	CU_ADD_TEST(suite, ut_lvol_resv_store_failure_restores_xattr);
 	CU_ADD_TEST(suite, ut_lvol_resv_sync_backoff);
