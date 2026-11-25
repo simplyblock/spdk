@@ -4737,19 +4737,19 @@ blob_load_invalid_flags_keeps_clusters(void)
 }
 
 /*
- * A delete zeroes the blob's md pages and then persists the used blobid mask. If the mask write
- * is lost (power failure), the mask names a blob whose first md page is all zeroes: the examine
- * load drops it instead of failing on the crc of that page.
+ * A set bit in the used blobid mask always names valid metadata: a delete
+ * persists the mask before it zeroes the md pages. So a blob whose bit is set
+ * but whose md page is all zeroes is corruption, and the load fails (it is not
+ * silently dropped).
  */
 static void
-blob_load_deleted_blob_stale_mask(void)
+blob_load_zeroed_md_page_is_corruption(void)
 {
 	struct spdk_blob_store *bs = g_bs;
 	struct spdk_blob_opts opts;
 	struct spdk_blob *blob;
 	spdk_blob_id blobid;
-	uint64_t free_clusters, mask_off, mask_bytes;
-	uint8_t *mask_before;
+	uint64_t page_off;
 
 	ut_spdk_blob_opts_init(&opts);
 	opts.num_clusters = 3;
@@ -4761,25 +4761,60 @@ blob_load_deleted_blob_stale_mask(void)
 	CU_ASSERT(g_bserrno == 0);
 	g_blob = NULL;
 
-	mask_off = (uint64_t)bs->used_blobid_mask_start * SPDK_BS_PAGE_SIZE;
-	mask_bytes = (uint64_t)bs->used_blobid_mask_len * SPDK_BS_PAGE_SIZE;
-	mask_before = malloc(mask_bytes);
-	SPDK_CU_ASSERT_FATAL(mask_before != NULL);
-	memcpy(mask_before, &g_dev_buffer[mask_off], mask_bytes);
+	/* The blob's md page reads as zeroes; its bit is still set. */
+	page_off = (uint64_t)SPDK_BS_PAGE_SIZE * (bs->md_start + bs_blobid_to_page(blobid));
+	memset(&g_dev_buffer[page_off], 0, SPDK_BS_PAGE_SIZE);
 
-	spdk_bs_delete_blob(bs, blobid, blob_op_complete, NULL);
+	ut_bs_dirty_load_fails(&bs, NULL, -EINVAL);
+	CU_ASSERT(bs == NULL);
+}
+
+/*
+ * A delete persists the used blobid mask (bit cleared) before it zeroes the md
+ * pages. If it stops in between (here: the md page zeroing fails, as a crash
+ * would leave it), the reload sees a cleared bit over intact pages: the blob is
+ * gone and the load succeeds. The other order would leave a set bit over zeroed
+ * pages, which the load must treat as corruption.
+ */
+static void
+blob_delete_persists_mask_before_zeroing(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob_opts opts;
+	struct spdk_blob *blob;
+	spdk_blob_id blobid;
+	uint64_t page_lba;
+
+	ut_spdk_blob_opts_init(&opts);
+	opts.num_clusters = 3;
+	opts.thin_provision = false;
+	blob = ut_blob_create_and_open(bs, &opts);
+	blobid = spdk_blob_get_id(blob);
+	spdk_blob_close(blob, blob_op_complete, NULL);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
-	free_clusters = spdk_bs_free_cluster_count(bs);
-	CU_ASSERT(spdk_mem_all_zero(&g_dev_buffer[SPDK_BS_PAGE_SIZE * (bs->md_start + bs_blobid_to_page(
-			blobid))], SPDK_BS_PAGE_SIZE));
+	g_blob = NULL;
 
-	/* The mask write of the delete was lost. */
-	memcpy(&g_dev_buffer[mask_off], mask_before, mask_bytes);
-	free(mask_before);
+	/* The zeroing of the blob's md page fails. */
+	page_lba = bs_md_page_to_lba(bs, bs_blobid_to_page(blobid));
+	g_dev_write_fail_rc = -EIO;
+	g_dev_write_fail_lba = page_lba;
+	g_dev_write_fail_lba_count = bs_byte_to_lba(bs, SPDK_BS_PAGE_SIZE);
+	g_dev_write_fail_count = 0;
+	spdk_bs_delete_blob(bs, blobid, blob_op_complete, NULL);
+	poll_threads();
+	g_dev_write_fail_rc = 0;
+	g_dev_write_fail_lba = 0;
+	g_dev_write_fail_lba_count = 0;
+	CU_ASSERT(g_dev_write_fail_count >= 1);
+	CU_ASSERT(g_bserrno != 0);
+	/* the md page was not zeroed */
+	CU_ASSERT(!spdk_mem_all_zero(&g_dev_buffer[(uint64_t)SPDK_BS_PAGE_SIZE *
+				     (bs->md_start + bs_blobid_to_page(blobid))], SPDK_BS_PAGE_SIZE));
 
+	/* Power loss: the persisted mask already has the bit cleared. */
 	ut_bs_dirty_load(&bs, NULL);
-	CU_ASSERT(spdk_bs_free_cluster_count(bs) == free_clusters);
+	SPDK_CU_ASSERT_FATAL(bs != NULL);
 	CU_ASSERT(spdk_bit_array_get(bs->used_blobids, bs_blobid_to_page(blobid)) == false);
 	g_blob = NULL;
 	spdk_bs_open_blob(bs, blobid, blob_op_with_handle_complete, NULL);
@@ -13771,7 +13806,8 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite_bs, blob_md_chain_corrupted_sequence_num);
 		CU_ADD_TEST(suite_bs, blob_load_corrupted_snapshot_with_clone);
 		CU_ADD_TEST(suite_bs, blob_load_invalid_flags_keeps_clusters);
-		CU_ADD_TEST(suite_bs, blob_load_deleted_blob_stale_mask);
+		CU_ADD_TEST(suite_bs, blob_load_zeroed_md_page_is_corruption);
+		CU_ADD_TEST(suite_bs, blob_delete_persists_mask_before_zeroing);
 		CU_ADD_TEST(suite, bs_load_custom_cluster_size);
 		CU_ADD_TEST(suite, bs_load_after_failed_grow);
 		CU_ADD_TEST(suite, bs_load_error);
