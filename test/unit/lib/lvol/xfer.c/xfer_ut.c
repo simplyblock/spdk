@@ -1505,6 +1505,177 @@ xfer_resume_offset_is_lowest_not_done(void)
 	free_xfer(xfer);
 }
 
+/* Complete (as all-zero reads) every request that has its buffers and was
+ * submitted, until all n are done. */
+static uint32_t
+ut_complete_submitted(struct spdk_lvs_xfer_req **r, uint32_t n)
+{
+	uint32_t done = 0, round, i;
+
+	for (round = 0; round < 20 && done < n; round++) {
+		poll_threads();
+		for (i = 0; i < n; i++) {
+			if (r[i]->status == XFER_REQ_STATUS_IN_FLIGHT && !r[i]->chain.waiting &&
+			    !r[i]->buf_ready && r[i]->chain.nbufs != 0) {
+				ut_zero_chain(r[i]);
+				local_op_comp(r[i], 0);
+				done++;
+			}
+		}
+	}
+	return done;
+}
+
+/* A task holds at most its cap of buffers although the pool has more: the
+ * third request waits, and goes as soon as one of the first two is done. */
+static void
+xfer_replicate_task_cap_respected(void)
+{
+	struct spdk_lvs_xfer *xfer;
+	struct remote_lvol_info rmt;
+	struct spdk_lvs_xfer_req *r[3];
+
+	xfer = make_cluster_xfer(3, &rmt);
+	spdk_iobuf_chain_budget_init(&xfer->buf_budget, 16);	/* two requests' worth */
+	for (int i = 0; i < 3; i++) {
+		r[i] = ut_prep_req(xfer, i, &rmt);
+		CU_ASSERT(submit_rw_reqs_local(r[i]) == 0);
+	}
+	CU_ASSERT(g_ut_blob_readv_cnt == 2);
+	CU_ASSERT(r[2]->chain.waiting && r[2]->chain.nbufs == 0);
+	CU_ASSERT(xfer->buf_budget.used == 16);
+	CU_ASSERT(ut_xfer_bufs_free() == UT_XFER_SMALL_COUNT - 16);
+	helper_xfer_poller(&g_ut_lpg);		/* a kick finds the cap still full */
+	CU_ASSERT(r[2]->chain.waiting);
+
+	ut_zero_chain(r[0]);
+	local_op_comp(r[0], 0);
+	CU_ASSERT(r[2]->buf_ready);
+	poll_threads();
+	CU_ASSERT(g_ut_blob_readv_cnt == 3 && g_ut_blob_readv_arg == r[2]);
+	CU_ASSERT(xfer->buf_budget.max_used == 16);
+
+	CU_ASSERT(ut_complete_submitted(&r[1], 2) == 2);
+	CU_ASSERT(xfer->buf_budget.used == 0);
+	CU_ASSERT(ut_xfer_bufs_free() == UT_XFER_SMALL_COUNT);
+	free_xfer(xfer);
+}
+
+/* All background replication together holds at most the shared cap
+ * (SPDK_IOBUF_CHAIN_BG_PCT_DEFAULT % of the pool): the rest of the pool stays
+ * for client IO, even with no per-task cap. */
+static void
+xfer_replicate_leaves_client_reserve(void)
+{
+	struct spdk_iobuf_chain_budget *bg = spdk_iobuf_chain_bg_budget();
+	const uint32_t cap = UT_XFER_SMALL_COUNT * SPDK_IOBUF_CHAIN_BG_PCT_DEFAULT / 100;
+	struct spdk_lvs_xfer *xfer;
+	struct remote_lvol_info rmt;
+	struct spdk_lvs_xfer_req *r[24];
+
+	xfer = make_cluster_xfer(24, &rmt);
+	for (int i = 0; i < 24; i++) {
+		r[i] = ut_prep_req(xfer, i, &rmt);
+		CU_ASSERT(submit_rw_reqs_local(r[i]) == 0);
+	}
+	CU_ASSERT(g_ut_blob_readv_cnt == cap / 8);
+	CU_ASSERT(bg->used == cap);
+	CU_ASSERT(ut_xfer_bufs_free() >= UT_XFER_SMALL_COUNT - cap);
+
+	CU_ASSERT(ut_complete_submitted(r, 24) == 24);
+	CU_ASSERT(g_ut_blob_readv_cnt == 24);
+	CU_ASSERT(bg->max_used <= cap);
+	CU_ASSERT(bg->used == 0);
+	CU_ASSERT(ut_xfer_bufs_free() == UT_XFER_SMALL_COUNT);
+	free_xfer(xfer);
+}
+
+/* The frozen final step does not wait behind background replication: its
+ * request goes ahead of the waiting background ones (the first gives back
+ * the 3 buffers it held) and gets the next buffers. */
+static void
+xfer_final_step_goes_ahead_of_background(void)
+{
+	struct spdk_lvs_xfer *bg, *fin;
+	struct remote_lvol_info rmt, rmt_fin;
+	struct spdk_lvs_xfer_req *a, *b, *p;
+	struct spdk_lvs_xfer_req *r[3];
+	void **bufs = calloc(UT_XFER_SMALL_COUNT, sizeof(void *));
+	uint32_t n, i;
+
+	SPDK_CU_ASSERT_FATAL(bufs != NULL);
+	bg = make_cluster_xfer(2, &rmt);
+	fin = make_cluster_xfer(1, &rmt_fin);
+	fin->priority = true;
+	a = ut_prep_req(bg, 0, &rmt);
+	b = ut_prep_req(bg, 1, &rmt);
+	p = ut_prep_req(fin, 0, &rmt_fin);
+
+	n = ut_xfer_drain(bufs, 3);
+	CU_ASSERT(submit_rw_reqs_local(a) == 0);
+	CU_ASSERT(submit_rw_reqs_local(b) == 0);
+	CU_ASSERT(a->chain.waiting && a->chain.nbufs == 3);
+	CU_ASSERT(submit_rw_reqs_local(p) == 0);
+	CU_ASSERT(TAILQ_FIRST(&g_ut_lpg.bufq.waitq) == &p->chain);
+	CU_ASSERT(p->chain.nbufs == 3);
+	CU_ASSERT(a->chain.waiting && a->chain.nbufs == 0);
+
+	for (i = 0; i < 5; i++) {
+		spdk_iobuf_put(&g_ut_lpg.iobuf, bufs[--n], UT_XFER_SMALL_SIZE);
+	}
+	CU_ASSERT(p->buf_ready && a->chain.waiting);
+	poll_threads();
+	CU_ASSERT(g_ut_blob_readv_cnt == 1 && g_ut_blob_readv_arg == p);
+
+	while (n > 0) {
+		spdk_iobuf_put(&g_ut_lpg.iobuf, bufs[--n], UT_XFER_SMALL_SIZE);
+	}
+	r[0] = p;
+	r[1] = a;
+	r[2] = b;
+	CU_ASSERT(ut_complete_submitted(r, 3) == 3);
+	CU_ASSERT(ut_xfer_bufs_free() == UT_XFER_SMALL_COUNT);
+	free(bufs);
+	free_xfer(fin);
+	free_xfer(bg);
+}
+
+/* When a task's last requests leave the poll group the iobuf channel goes back
+ * (a channel held for the app's life hangs the iobuf shutdown); the next
+ * replication request takes it again. */
+static void
+xfer_poll_group_releases_iobuf_channel(void)
+{
+	struct spdk_lvs_xfer *xfer;
+	struct remote_lvol_info rmt, *gone;
+	struct spdk_lvs_xfer_req *a;
+
+	CU_ASSERT(g_ut_lpg.iobuf_ok);
+	xfer = make_cluster_xfer(1, &rmt);
+	a = ut_prep_req(xfer, 0, &rmt);
+	CU_ASSERT(submit_rw_reqs_local(a) == 0);
+	CU_ASSERT(ut_complete_submitted(&a, 1) == 1);
+	CU_ASSERT(rmt.outstanding_io == 0);
+
+	/* the task's teardown on this poll group, once its IO drained */
+	gone = calloc(1, sizeof(*gone));
+	SPDK_CU_ASSERT_FATAL(gone != NULL);
+	gone->group = &g_ut_lpg;
+	gone->xfer_task = xfer;
+	CU_ASSERT(spdk_wait_for_xfer_pg_io_cleanup_poller(gone) == -1);
+	CU_ASSERT(!g_ut_lpg.iobuf_ok);
+	CU_ASSERT(g_ut_lpg.iobuf.parent == NULL);
+	CU_ASSERT(ut_xfer_bufs_free() == UT_XFER_SMALL_COUNT);
+
+	a = ut_prep_req(xfer, 0, &rmt);
+	CU_ASSERT(submit_rw_reqs_local(a) == 0);
+	CU_ASSERT(g_ut_lpg.iobuf_ok);
+	CU_ASSERT(a->chain.nbufs == 8);
+	CU_ASSERT(ut_complete_submitted(&a, 1) == 1);
+	CU_ASSERT(ut_xfer_bufs_free() == UT_XFER_SMALL_COUNT);
+	free_xfer(xfer);
+}
+
 static void
 ut_xfer_iobuf_finish_cb(void *ctx)
 {
@@ -1553,6 +1724,10 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, xfer_resume_offset_is_lowest_not_done);
 	CU_ADD_TEST(suite, xfer_completion_refills_in_place);
 	CU_ADD_TEST(suite, xfer_completion_hands_back_while_paused);
+	CU_ADD_TEST(suite, xfer_replicate_task_cap_respected);
+	CU_ADD_TEST(suite, xfer_replicate_leaves_client_reserve);
+	CU_ADD_TEST(suite, xfer_final_step_goes_ahead_of_background);
+	CU_ADD_TEST(suite, xfer_poll_group_releases_iobuf_channel);
 
 	allocate_threads(2);
 	set_thread(0);
@@ -1569,6 +1744,7 @@ main(int argc, char **argv)
 	}
 	TAILQ_INIT(&g_ut_lpg.rmt_lvols);
 	TAILQ_INIT(&g_ut_lpg.ch_tdev);
+	TAILQ_INIT(&g_ut_lpg.buf_readyq);
 	g_ut_lpg.thread = spdk_get_thread();
 	g_ut_lpg.thread_name = "ut_lpg";
 	lvs_poll_group_iobuf_init(&g_ut_lpg);
@@ -1579,7 +1755,9 @@ main(int argc, char **argv)
 
 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
 
-	spdk_iobuf_channel_fini(&g_ut_lpg.iobuf);
+	if (g_ut_lpg.iobuf_ok) {
+		spdk_iobuf_channel_fini(&g_ut_lpg.iobuf);
+	}
 	spdk_iobuf_finish(ut_xfer_iobuf_finish_cb, NULL);
 	poll_threads();
 	free_threads();

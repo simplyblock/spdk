@@ -397,6 +397,10 @@ int spdk_lvol_transfer(struct spdk_lvol *lvol, uint64_t offset, uint32_t cluster
  */
 int spdk_lvol_set_xfer_whole_cluster_pct(uint32_t pct);
 uint32_t spdk_lvol_get_xfer_whole_cluster_pct(void);
+/* Node-wide cap on the iobuf small-pool buffers one replication task holds at
+ * once (tasks started from now on); -EINVAL for 0. */
+int spdk_lvol_set_xfer_iobuf_max_bufs(uint32_t max_bufs);
+uint32_t spdk_lvol_get_xfer_iobuf_max_bufs(void);
 typedef void (*spdk_lvol_merge_complete)(void *cb_arg, const struct spdk_blob_merge_stats *stats,
 		int lvolerrno);
 /* Fill a partially replicated landing lvol from its base (spdk_blob_merge_base). */
