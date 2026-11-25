@@ -219,7 +219,10 @@ struct spdk_lvs_poll_group {
 	/* Replication request buffers: iobuf small-pool chains taken on this
 	 * thread (lib/lvol/lvol.c, xfer_req_start). buf_readyq: requests that
 	 * got their buffers after waiting, submitted by a message
-	 * (buf_run_pending). */
+	 * (buf_run_pending). The iobuf channel exists only while replication
+	 * runs here (iobuf_ok): taken by the first request, released when the
+	 * last task's requests are gone -- a channel never released holds up
+	 * the iobuf shutdown. */
 	bool				iobuf_ok;
 	struct spdk_iobuf_channel	iobuf;
 	struct spdk_iobuf_chain_queue	bufq;
@@ -340,6 +343,11 @@ struct spdk_lvs_xfer {
 	 * (reads of a volume fall through to its snapshots). 0 keeps the blob's
 	 * own class. */
 	uint8_t priority_class;
+	/* Replication: the task's cap on iobuf small-pool buffers, for its
+	 * requests' chains on every poll group (limit 0: none). Its requests
+	 * also count against the cap all background users share, unless the
+	 * task is a priority one. */
+	struct spdk_iobuf_chain_budget buf_budget;
 
 	TAILQ_ENTRY(spdk_lvs_xfer)	entry;
 
@@ -418,6 +426,10 @@ struct spdk_lvs_xfer {
 	uint32_t range_pos;
 	uint32_t range_done;
 	uint64_t range_cluster;
+	/* The current ranges are one range over the whole cluster (a cluster
+	 * sent whole, in pieces), not dirty ranges: its pieces keep zero
+	 * detection (req->partial false), see xfer_repl_next. */
+	bool range_whole;
 	uint64_t partial_clusters;
 	/* Guards the request generator (hold_idx, the ranges, idx, success_cnt,
 	 * outstanding_io, timeout) of a replication task: the app thread's
@@ -425,8 +437,9 @@ struct spdk_lvs_xfer {
 	 * in place (xfer_refill_inline) both take the next request from it. */
 	pthread_spinlock_t gen_lock;
 	/* The destination may hold non-zero content in clusters this task did
-	 * not just allocate (a resumed transfer skips the allocation step), so
-	 * zero ranges must be written too. */
+	 * not just allocate (a resumed transfer skips the allocation step; a
+	 * clone destination owns clusters from earlier rounds, which the
+	 * allocation step skips), so zero ranges must be written too. */
 	bool no_zero_skip;
 };
 
@@ -591,6 +604,11 @@ struct spdk_lvol {
 	uint64_t xfer_partial_reqs;
 	uint64_t xfer_full_clusters;
 	uint64_t xfer_pages_sent;
+	/* A transfer of this lvol into a clone destination (dest_is_clone) was
+	 * started and has not completed: the destination may hold clusters the
+	 * allocation step zero-filled and no data reached. The next such
+	 * transfer sends full clusters, not dirty ranges (xfer_setup_partial). */
+	bool xfer_clone_round_incomplete;
 	uint64_t current_offset;
 };
 

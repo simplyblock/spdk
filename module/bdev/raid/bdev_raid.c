@@ -789,6 +789,14 @@ raid_bdev_io_complete(struct raid_bdev_io *raid_io, enum spdk_bdev_io_status sta
 			}
 		}
 
+		if (status == SPDK_BDEV_IO_STATUS_FAILED && raid_io->nospace && !raid_io->failed_other) {
+			/* Out of space below: keep the NVMe status, the lvstore maps it to
+			 * -ENOSPC and fails the host IO without touching leadership. */
+			spdk_bdev_io_complete_nvme_status(bdev_io, 0, SPDK_NVME_SCT_GENERIC,
+							  SPDK_NVME_SC_CAPACITY_EXCEEDED);
+			return;
+		}
+
 		/* A failed COPY is the base bdev declining the offload (the distrib
 		 * answers FAILED by design when it cannot copy the range); the
 		 * blobstore then falls back to read + write. Not worth a line per
@@ -1055,6 +1063,8 @@ raid_bdev_io_init(struct raid_bdev_io *raid_io, struct raid_bdev_io_channel *rai
 	raid_io->base_bdev_io_submitted = 0;
 	raid_io->used_bits = (struct raid_io_used_bits){0};
 	raid_io->completion_cb = NULL;
+	raid_io->nospace = false;
+	raid_io->failed_other = false;
 	raid_io->split.offset = RAID_OFFSET_BLOCKS_INVALID;
 
 	raid_bdev_io_set_default_status(raid_io, SPDK_BDEV_IO_STATUS_SUCCESS);

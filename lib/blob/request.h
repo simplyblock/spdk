@@ -108,6 +108,13 @@ struct spdk_bs_request_set {
 	int 	priority_class;
 	uint8_t geometry;
 	uint8_t special_io;
+	/*
+	 * Set when a write of this set (the current op of a sequence, any op of a
+	 * batch) went to the metadata region: super block, used masks, md journal,
+	 * md pages. A -ENOSPC from such a write is reported as -EIO, see
+	 * bs_request_set_md_errno() in request.c.
+	 */
+	bool	md_io;
 	struct spdk_blob_store	*bs;
 
 	union {

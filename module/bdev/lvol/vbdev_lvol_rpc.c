@@ -12,6 +12,8 @@
 #include "spdk/string.h"
 #include "spdk/log.h"
 #include "spdk/json.h"
+#include "spdk/blob.h"
+#include "spdk_internal/iobuf_chain.h"
 
 SPDK_LOG_REGISTER_COMPONENT(lvol_rpc)
 #define RPC_MAX_LVOL_VBDEV 255
@@ -4487,8 +4489,78 @@ rpc_bdev_lvol_set_xfer_whole_cluster_pct(struct spdk_jsonrpc_request *request,
 	spdk_jsonrpc_end_result(request, w);
 }
 
+/* STARTUP too: a saved config (vbdev_lvs_config_json) sets it before any
+ * lvol store loads. */
 SPDK_RPC_REGISTER("bdev_lvol_set_xfer_whole_cluster_pct", rpc_bdev_lvol_set_xfer_whole_cluster_pct,
-		  SPDK_RPC_RUNTIME)
+		  SPDK_RPC_STARTUP | SPDK_RPC_RUNTIME)
+
+struct rpc_bdev_lvol_set_iobuf_limits {
+	uint32_t bg_pct;
+	uint32_t xfer_task_max_bufs;
+	uint32_t merge_max_bufs;
+	uint32_t merge_timeout_ms;
+};
+
+static const struct spdk_json_object_decoder rpc_bdev_lvol_set_iobuf_limits_decoders[] = {
+	{"bg_pct", offsetof(struct rpc_bdev_lvol_set_iobuf_limits, bg_pct), spdk_json_decode_uint32, true},
+	{"xfer_task_max_bufs", offsetof(struct rpc_bdev_lvol_set_iobuf_limits, xfer_task_max_bufs), spdk_json_decode_uint32, true},
+	{"merge_max_bufs", offsetof(struct rpc_bdev_lvol_set_iobuf_limits, merge_max_bufs), spdk_json_decode_uint32, true},
+	{"merge_timeout_ms", offsetof(struct rpc_bdev_lvol_set_iobuf_limits, merge_timeout_ms), spdk_json_decode_uint32, true},
+};
+
+/*
+ * Node-wide limits of replication's and the landing merge's use of the iobuf
+ * small pool, which client IO shares: bg_pct % of the pool for all of them
+ * together (the rest is reserved for client IO), at most xfer_task_max_bufs
+ * per replication task and merge_max_bufs per merge, and a merge that gets no
+ * buffers for merge_timeout_ms fails. Every parameter is optional; the reply
+ * has the values in force.
+ */
+static void
+rpc_bdev_lvol_set_iobuf_limits(struct spdk_jsonrpc_request *request,
+			       const struct spdk_json_val *params)
+{
+	struct rpc_bdev_lvol_set_iobuf_limits req = {};
+	struct spdk_json_write_ctx *w;
+	uint32_t merge_max_bufs, merge_timeout_ms;
+
+	spdk_blob_get_merge_iobuf_limits(&merge_max_bufs, &merge_timeout_ms);
+	req.bg_pct = spdk_iobuf_chain_get_bg_pct();
+	req.xfer_task_max_bufs = spdk_lvol_get_xfer_iobuf_max_bufs();
+	req.merge_max_bufs = merge_max_bufs;
+	req.merge_timeout_ms = merge_timeout_ms;
+	if (params != NULL &&
+	    spdk_json_decode_object(params, rpc_bdev_lvol_set_iobuf_limits_decoders,
+				    SPDK_COUNTOF(rpc_bdev_lvol_set_iobuf_limits_decoders), &req)) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "spdk_json_decode_object failed");
+		return;
+	}
+	if (req.bg_pct == 0 || req.bg_pct > 100 || req.xfer_task_max_bufs == 0 ||
+	    req.merge_max_bufs == 0 || req.merge_timeout_ms == 0) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "bg_pct must be 1..100, the others > 0");
+		return;
+	}
+	spdk_iobuf_chain_set_bg_pct(req.bg_pct);
+	spdk_lvol_set_xfer_iobuf_max_bufs(req.xfer_task_max_bufs);
+	spdk_blob_set_merge_iobuf_limits(req.merge_max_bufs, req.merge_timeout_ms);
+	SPDK_NOTICELOG("iobuf limits: background %u%% of the small pool, %u buffers per "
+		       "replication task, %u per merge, merge timeout %u ms\n", req.bg_pct,
+		       req.xfer_task_max_bufs, req.merge_max_bufs, req.merge_timeout_ms);
+
+	w = spdk_jsonrpc_begin_result(request);
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_uint32(w, "bg_pct", spdk_iobuf_chain_get_bg_pct());
+	spdk_json_write_named_uint32(w, "xfer_task_max_bufs", spdk_lvol_get_xfer_iobuf_max_bufs());
+	spdk_blob_get_merge_iobuf_limits(&merge_max_bufs, &merge_timeout_ms);
+	spdk_json_write_named_uint32(w, "merge_max_bufs", merge_max_bufs);
+	spdk_json_write_named_uint32(w, "merge_timeout_ms", merge_timeout_ms);
+	spdk_json_write_object_end(w);
+	spdk_jsonrpc_end_result(request, w);
+}
+
+SPDK_RPC_REGISTER("bdev_lvol_set_iobuf_limits", rpc_bdev_lvol_set_iobuf_limits, SPDK_RPC_RUNTIME)
 
 struct rpc_bdev_lvol_dirty_bitmap_info {
 	char *lvol_name;
