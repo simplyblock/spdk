@@ -13091,10 +13091,11 @@ ut_mdj_write_entries(struct spdk_blob_store *bs, uint32_t count)
 
 /*
  * dbfbb2322: HOME/ZERO IO went out at PREMIUM priority always. The class is
- * encoded in the high LBA bits, which only raid strips, so on a blobstore
- * without priority classes it must stay 0. With priority classes it is
- * PREMIUM, and a PREMIUM HOME batch is capped at
- * BS_MD_JOURNAL_PREMIUM_BATCH_MAX entries.
+ * encoded in the high LBA bits, which only raid strips, so on a device that
+ * does not strip them (spdk_bs_dev.priority_lba_bits false) it must be 0, even
+ * when blobs use priority classes. On a device that strips them it is PREMIUM,
+ * even when no blob has a class (the usual production lvstore), and a PREMIUM
+ * HOME batch is capped at BS_MD_JOURNAL_PREMIUM_BATCH_MAX entries.
  */
 static void
 blob_md_journal_home_priority(void)
@@ -13103,8 +13104,9 @@ blob_md_journal_home_priority(void)
 	struct spdk_bs_md_journal *jr;
 	uint32_t count = BS_MD_JOURNAL_PREMIUM_BATCH_MAX + 76;
 
-	/* No priority class configured: HOME writes carry class 0, one batch. */
-	CU_ASSERT(bs->priority_class == 0);
+	/* Device without priority bits, blobs with classes: class 0, one batch. */
+	CU_ASSERT(!bs->dev->priority_lba_bits);
+	bs->priority_class = PREMIUM_PRIORITY_CLASS;
 	jr = ut_mdj_attach(bs);
 	ut_mdj_write_entries(bs, count);
 	g_dev_last_write_priority = -2;
@@ -13114,10 +13116,12 @@ blob_md_journal_home_priority(void)
 	CU_ASSERT(g_dev_last_write_priority == 0);
 	CU_ASSERT(!jr->active_drain_batch);
 	CU_ASSERT(TAILQ_EMPTY(&jr->home_queue));
+	bs->priority_class = 0;
 	ut_mdj_detach(bs);
 
-	/* Priority classes in use (a blob got one): PREMIUM, capped batches. */
-	bs->priority_class = PREMIUM_PRIORITY_CLASS;
+	/* Device with priority bits (raid), no blob has a class: PREMIUM, capped batches. */
+	bs->dev->priority_lba_bits = true;
+	CU_ASSERT(bs->priority_class == 0);
 	jr = ut_mdj_attach(bs);
 	ut_mdj_write_entries(bs, count);
 	g_dev_last_write_priority = -2;
@@ -13129,7 +13133,7 @@ blob_md_journal_home_priority(void)
 	CU_ASSERT(TAILQ_EMPTY(&jr->home_queue));
 	CU_ASSERT(!jr->active_drain_batch);
 	CU_ASSERT(jr->home_durable_seq == count);
-	bs->priority_class = 0;
+	bs->dev->priority_lba_bits = false;
 	ut_mdj_detach(bs);
 }
 

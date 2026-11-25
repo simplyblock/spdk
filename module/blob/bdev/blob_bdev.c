@@ -611,6 +611,10 @@ blob_bdev_init(struct blob_bdev *b, struct spdk_bdev_desc *desc)
 	b->bs_dev.is_zeroes = bdev_blob_is_zeroes;
 	b->bs_dev.is_range_valid = bdev_blob_is_range_valid;
 	b->bs_dev.translate_lba = bdev_blob_translate_lba;
+	/* raid (raid0, concat, ...) takes the priority class out of the LBA's top
+	 * bits and passes it on to its base bdevs (bdev_raid.c); other bdevs would
+	 * read the bits as part of the address. */
+	b->bs_dev.priority_lba_bits = strcmp(spdk_bdev_get_module_name(bdev), "raid") == 0;
 }
 
 void
