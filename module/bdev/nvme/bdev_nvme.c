@@ -728,6 +728,81 @@ nvme_ctrlr_unregister(void *ctx)
 	spdk_io_device_unregister(nvme_ctrlr, nvme_ctrlr_unregister_cb);
 }
 
+static uint32_t
+nvme_ctrlr_count_namespaces(struct nvme_ctrlr *nvme_ctrlr)
+{
+	struct nvme_ns *ns;
+	uint32_t n = 0;
+
+	RB_FOREACH(ns, nvme_ns_tree, &nvme_ctrlr->namespaces) {
+		n++;
+	}
+	return n;
+}
+
+static uint64_t
+nvme_ctrlr_destruct_age_sec(const struct nvme_ctrlr *nvme_ctrlr)
+{
+	if (!nvme_ctrlr->destruct || nvme_ctrlr->destruct_start_tsc == 0) {
+		return 0;
+	}
+	return (spdk_get_ticks() - nvme_ctrlr->destruct_start_tsc) / spdk_get_ticks_hz();
+}
+
+/* What still keeps a controller that is being deleted from being unregistered
+ * (nvme_ctrlr_can_be_unregistered). A delete that never completes leaves the
+ * controller "deleting" for good, and every new attach under that name fails;
+ * these say which condition never cleared. */
+static void
+nvme_ctrlr_dump_destruct_json(struct spdk_json_write_ctx *w, struct nvme_ctrlr *nvme_ctrlr)
+{
+	spdk_json_write_named_object_begin(w, "destruct_blockers");
+	spdk_json_write_named_uint64(w, "seconds", nvme_ctrlr_destruct_age_sec(nvme_ctrlr));
+	spdk_json_write_named_int32(w, "ref", nvme_ctrlr->ref);
+	spdk_json_write_named_bool(w, "resetting", nvme_ctrlr->resetting);
+	spdk_json_write_named_bool(w, "ana_log_page_updating", nvme_ctrlr->ana_log_page_updating);
+	spdk_json_write_named_bool(w, "io_path_cache_clearing", nvme_ctrlr->io_path_cache_clearing);
+	spdk_json_write_named_bool(w, "qpair_abort_pending", nvme_ctrlr->destruct_fanout_pending);
+	spdk_json_write_named_uint32(w, "namespaces", nvme_ctrlr_count_namespaces(nvme_ctrlr));
+	spdk_json_write_named_bool(w, "reconnect_is_delayed", nvme_ctrlr->reconnect_is_delayed);
+	spdk_json_write_named_bool(w, "ctrlr_failed", spdk_nvme_ctrlr_is_failed(nvme_ctrlr->ctrlr));
+	spdk_json_write_object_end(w);
+}
+
+/* Logged by the admin queue poller, which runs until the controller is
+ * unregistered: first after BDEV_NVME_DESTRUCT_STALL_SEC, then every
+ * BDEV_NVME_DESTRUCT_STALL_LOG_SEC. */
+#define BDEV_NVME_DESTRUCT_STALL_SEC		30
+#define BDEV_NVME_DESTRUCT_STALL_LOG_SEC	60
+
+static void
+nvme_ctrlr_log_stalled_destruct(struct nvme_ctrlr *nvme_ctrlr)
+{
+	uint64_t now, age;
+
+	if (spdk_likely(!nvme_ctrlr->destruct)) {
+		return;
+	}
+	age = nvme_ctrlr_destruct_age_sec(nvme_ctrlr);
+	if (age < BDEV_NVME_DESTRUCT_STALL_SEC) {
+		return;
+	}
+	now = spdk_get_ticks();
+	if (nvme_ctrlr->destruct_log_tsc != 0 &&
+	    (now - nvme_ctrlr->destruct_log_tsc) / spdk_get_ticks_hz() < BDEV_NVME_DESTRUCT_STALL_LOG_SEC) {
+		return;
+	}
+	nvme_ctrlr->destruct_log_tsc = now;
+	NVME_CTRLR_ERRLOG(nvme_ctrlr,
+			  "delete has not completed after %" PRIu64 " s: ref=%d resetting=%d "
+			  "ana_log_page_updating=%d io_path_cache_clearing=%d qpair_abort_pending=%d "
+			  "namespaces=%u reconnect_is_delayed=%d failed=%d\n",
+			  age, nvme_ctrlr->ref, nvme_ctrlr->resetting, nvme_ctrlr->ana_log_page_updating,
+			  nvme_ctrlr->io_path_cache_clearing, nvme_ctrlr->destruct_fanout_pending,
+			  nvme_ctrlr_count_namespaces(nvme_ctrlr), nvme_ctrlr->reconnect_is_delayed,
+			  spdk_nvme_ctrlr_is_failed(nvme_ctrlr->ctrlr));
+}
+
 static bool
 nvme_ctrlr_can_be_unregistered(struct nvme_ctrlr *nvme_ctrlr)
 {
@@ -1976,6 +2051,8 @@ bdev_nvme_poll_adminq(void *arg)
 	nvme_ctrlr_disconnected_cb disconnected_cb;
 
 	assert(nvme_ctrlr != NULL);
+
+	nvme_ctrlr_log_stalled_destruct(nvme_ctrlr);
 
 	/* The disconnect edge can be missed entirely (see nvme_ctrlr_disconnect):
 	 * once the controller is parked in NVME_CTRLR_STATE_DISCONNECTED,
@@ -4165,6 +4242,9 @@ nvme_ctrlr_info_json(struct spdk_json_write_ctx *w, struct nvme_ctrlr *nvme_ctrl
 	spdk_json_write_object_begin(w);
 
 	spdk_json_write_named_string(w, "state", nvme_ctrlr_get_state_str(nvme_ctrlr));
+	if (nvme_ctrlr->destruct) {
+		nvme_ctrlr_dump_destruct_json(w, nvme_ctrlr);
+	}
 
 #ifdef SPDK_CONFIG_NVME_CUSE
 	size_t cuse_name_size = 128;
@@ -6316,6 +6396,10 @@ bdev_nvme_destruct_abort_qpairs_done(struct nvme_ctrlr *nvme_ctrlr, void *ctx, i
 {
 	NVME_CTRLR_INFOLOG(nvme_ctrlr, "qpairs were disconnected for destruct.\n");
 
+	pthread_mutex_lock(&nvme_ctrlr->mutex);
+	nvme_ctrlr->destruct_fanout_pending = false;
+	pthread_mutex_unlock(&nvme_ctrlr->mutex);
+
 	/* Drop the reference taken in bdev_nvme_destruct_abort_qpairs() that kept
 	 * the controller alive across the asynchronous channel iteration.
 	 */
@@ -6348,6 +6432,7 @@ bdev_nvme_destruct_abort_qpairs(struct nvme_ctrlr *nvme_ctrlr)
 
 	/* The controller is going away; fail aborted I/O instead of retrying it. */
 	nvme_ctrlr->dont_retry = true;
+	nvme_ctrlr->destruct_fanout_pending = true;
 	pthread_mutex_unlock(&nvme_ctrlr->mutex);
 
 	/* Keep the controller alive while the per-channel iteration runs;
@@ -6392,6 +6477,7 @@ bdev_nvme_delete_ctrlr_unsafe(struct nvme_ctrlr *nvme_ctrlr, bool hotplug)
 	}
 
 	nvme_ctrlr->destruct = true;
+	nvme_ctrlr->destruct_start_tsc = spdk_get_ticks();
 	return 0;
 }
 
@@ -8109,6 +8195,7 @@ bdev_nvme_fini_destruct_ctrlrs(void)
 				continue;
 			}
 			nvme_ctrlr->destruct = true;
+			nvme_ctrlr->destruct_start_tsc = spdk_get_ticks();
 			pthread_mutex_unlock(&nvme_ctrlr->mutex);
 
 			spdk_thread_send_msg(nvme_ctrlr->thread, _nvme_ctrlr_destruct,

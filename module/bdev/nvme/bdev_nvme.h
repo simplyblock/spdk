@@ -105,6 +105,9 @@ struct nvme_ctrlr {
 	uint32_t				io_path_cache_clearing : 1;
 	uint32_t				dont_retry : 1;
 	uint32_t				disabled : 1;
+	/* bdev_nvme_destruct_abort_qpairs() is still walking the channels (it
+	 * holds a reference until it finishes). */
+	uint32_t				destruct_fanout_pending : 1;
 
 	struct spdk_bdev_nvme_ctrlr_opts	opts;
 
@@ -123,6 +126,9 @@ struct nvme_ctrlr {
 	struct spdk_nvme_detach_ctx		*detach_ctx;
 
 	uint64_t				reset_start_tsc;
+	/* When the destruct started, and when a stalled destruct was last logged. */
+	uint64_t				destruct_start_tsc;
+	uint64_t				destruct_log_tsc;
 	struct spdk_poller			*reconnect_delay_timer;
 
 	nvme_ctrlr_disconnected_cb		disconnected_cb;
