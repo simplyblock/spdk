@@ -200,6 +200,8 @@ struct spdk_blob {
 	bool 		examine_flag;
 };
 
+struct bs_blobid_mask_wr;
+
 struct spdk_blob_store {
 	uint64_t			md_start; /* Offset from beginning of disk, in pages */
 	uint32_t			md_len; /* Count, in pages */
@@ -228,6 +230,11 @@ struct spdk_blob_store {
 	struct spdk_bit_array		*open_blobids;
 	struct spdk_bit_array		*map_blobids;
 	uint32_t 	blob_counter;
+
+	/* Direct writes of the used blobid mask pages (persist_bs_write_used_blobids):
+	 * at most one write per mask page in flight, indexed by mask page. */
+	struct bs_blobid_mask_wr	**blobid_mask_wr;
+	uint32_t			blobid_mask_wr_len;
 
 	struct spdk_spinlock		used_lock;
 

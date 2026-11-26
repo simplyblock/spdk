@@ -205,6 +205,68 @@ dev_read(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload
 	spdk_thread_send_msg(spdk_get_thread(), dev_complete, cb_args);
 }
 
+/*
+ * Write hold (test hook): the next g_dev_write_hold_count writes that overlap
+ * [g_dev_write_hold_lba, g_dev_write_hold_lba + g_dev_write_hold_lba_count) are kept
+ * in flight - nothing written, not completed - until ut_dev_release_held_writes(),
+ * which writes their payload then and completes them. A later write to the same
+ * blocks that is not held lands first: the held one lands last, as a device may
+ * complete two writes in either order.
+ */
+uint64_t g_dev_write_hold_lba;
+uint64_t g_dev_write_hold_lba_count;
+uint32_t g_dev_write_hold_count;
+
+struct dev_held_write {
+	struct spdk_bs_dev		*dev;
+	void				*payload;
+	uint64_t			lba;
+	uint32_t			lba_count;
+	struct spdk_bs_dev_cb_args	*cb_args;
+	TAILQ_ENTRY(dev_held_write)	link;
+};
+static TAILQ_HEAD(, dev_held_write) g_dev_held_writes = TAILQ_HEAD_INITIALIZER(g_dev_held_writes);
+
+static bool
+dev_write_hold(struct spdk_bs_dev *dev, void *payload, uint64_t lba, uint32_t lba_count,
+	       struct spdk_bs_dev_cb_args *cb_args)
+{
+	struct dev_held_write *hw;
+
+	if (g_dev_write_hold_count == 0 || lba + lba_count <= g_dev_write_hold_lba ||
+	    lba >= g_dev_write_hold_lba + g_dev_write_hold_lba_count) {
+		return false;
+	}
+	hw = calloc(1, sizeof(*hw));
+	SPDK_CU_ASSERT_FATAL(hw != NULL);
+	hw->dev = dev;
+	hw->payload = payload;
+	hw->lba = lba;
+	hw->lba_count = lba_count;
+	hw->cb_args = cb_args;
+	TAILQ_INSERT_TAIL(&g_dev_held_writes, hw, link);
+	g_dev_write_hold_count--;
+	return true;
+}
+
+/* Writes and completes the held writes; returns how many there were. */
+static int
+ut_dev_release_held_writes(void)
+{
+	struct dev_held_write *hw;
+	int n = 0;
+
+	while ((hw = TAILQ_FIRST(&g_dev_held_writes)) != NULL) {
+		TAILQ_REMOVE(&g_dev_held_writes, hw, link);
+		memcpy(&g_dev_buffer[hw->lba * hw->dev->blocklen], hw->payload,
+		       (uint64_t)hw->lba_count * hw->dev->blocklen);
+		spdk_thread_send_msg(spdk_get_thread(), dev_complete, hw->cb_args);
+		free(hw);
+		n++;
+	}
+	return n;
+}
+
 static void
 dev_write(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
 	  uint64_t lba, uint32_t lba_count,
@@ -214,6 +276,9 @@ dev_write(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payloa
 
 	g_dev_last_write_priority = bs_io_opts ? bs_io_opts->priority : -1;
 	if (dev_write_inject_fail(lba, lba_count, cb_args)) {
+		return;
+	}
+	if (dev_write_hold(dev, payload, lba, lba_count, cb_args)) {
 		return;
 	}
 	if (g_power_failure_thresholds.write_threshold != 0) {
