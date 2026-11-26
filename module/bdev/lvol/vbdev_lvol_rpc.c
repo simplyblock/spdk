@@ -2290,6 +2290,7 @@ rpc_dump_lvol_store_info(struct spdk_json_write_ctx *w, struct lvol_store_bdev *
 	spdk_json_write_named_string(w, "base_bdev", spdk_bdev_get_name(lvs_bdev->bdev));
 	spdk_json_write_named_uint64(w, "total_data_clusters", spdk_bs_total_data_cluster_count(bs));
 	spdk_json_write_named_uint64(w, "free_clusters", spdk_bs_free_cluster_count(bs));
+	spdk_json_write_named_uint32(w, "quarantined_blobs", spdk_bs_quarantined_blob_count(bs));
 	spdk_json_write_named_uint64(w, "block_size", spdk_bs_get_io_unit_size(bs));
 	spdk_json_write_named_uint64(w, "cluster_size", cluster_size);
 

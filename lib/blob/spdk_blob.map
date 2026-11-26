@@ -14,6 +14,7 @@
 	spdk_bs_get_page_size;
 	spdk_bs_get_io_unit_size;
 	spdk_bs_free_cluster_count;
+	spdk_bs_quarantined_blob_count;
 	spdk_bs_total_data_cluster_count;
 	spdk_bs_grow;
 	spdk_bs_grow_live;

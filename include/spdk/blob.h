@@ -847,6 +847,17 @@ uint64_t spdk_bs_get_io_unit_size(struct spdk_blob_store *bs);
 uint64_t spdk_bs_free_cluster_count(struct spdk_blob_store *bs);
 
 /**
+ * Get the number of quarantined blobs: blobs whose metadata could not be parsed
+ * when the blobstore was loaded. They are not loaded and not iterated; their blob
+ * ids and root metadata pages stay reserved so that nothing reuses them.
+ *
+ * \param bs blobstore to query.
+ *
+ * \return the number of quarantined blobs.
+ */
+uint32_t spdk_bs_quarantined_blob_count(struct spdk_blob_store *bs);
+
+/**
  * Get the total number of clusters accessible by user.
  *
  * \param bs blobstore to query.
