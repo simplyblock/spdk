@@ -87,6 +87,27 @@ md_journal_free_elem_chunks(struct spdk_bs_md_journal *jr)
 	jr->elem_dma_chunks = NULL;
 }
 
+/* An examine write that patched a kept overlay page (md_journal_promote_from_examine). */
+struct md_journal_examine_carry {
+	uint32_t	slot;
+	uint64_t	seq;
+	uint64_t	lba;
+	void		*page;
+};
+
+static void
+md_journal_examine_carry_free(struct spdk_bs_md_journal *jr)
+{
+	uint32_t i;
+
+	for (i = 0; i < jr->examine_carry_count; i++) {
+		free(jr->examine_carry[i].page);
+	}
+	free(jr->examine_carry);
+	jr->examine_carry = NULL;
+	jr->examine_carry_count = 0;
+}
+
 static void
 md_journal_free(struct spdk_bs_md_journal *jr)
 {
@@ -107,6 +128,7 @@ md_journal_free(struct spdk_bs_md_journal *jr)
 	if (!TAILQ_EMPTY(&jr->home_wait_queue)) {
 		SPDK_ERRLOG("md_journal: freeing journal with pending HOME waiters\n");
 	}
+	md_journal_examine_carry_free(jr);
 
 	if (jr->home_seq != NULL) {
 		bs_sequence_finish(jr->home_seq, 0);
@@ -912,6 +934,7 @@ bs_md_journal_write(struct spdk_bs_md_journal *jr, spdk_bs_sequence_t *seq, void
 			} else {
 				memset(elem->page, 0, BS_MD_JOURNAL_PAGE_SIZE);
 			}
+			elem->examine_patched = true;
 		}
 
 		req = calloc(1, sizeof(*req));
@@ -1091,6 +1114,7 @@ bs_md_journal_batch_write(struct md_journal_batch *batch, void *payload, uint64_
 			} else {
 				memset(elmnt->page, 0, BS_MD_JOURNAL_PAGE_SIZE);
 			}
+			elmnt->examine_patched = true;
 			
 		}
 	}
@@ -2261,15 +2285,16 @@ error:
 /*
  * The examine result: after the examine read, until the set-leader call.
  *
- * Examine is always followed by the set-leader RPC (0 -> 1 or 0 -> 0), and the
- * old leader is demoted before the examine starts, so nothing writes the
- * journal slots in between. The examine result is kept until that call:
+ * The examine result is kept until the set-leader call (0 -> 1 or 0 -> 0):
  *  - the valid slots (drain_batch->items), already read into elem->{hdr,page};
  *  - the newest entry per LBA (the hash), also the read overlay;
  *  - writes keep going directly HOME and patch the overlay page (examine).
- * On 0 -> 1 the promotion uses it: HOME the newest per LBA, ZERO the valid
- * slots, reset, without reading the 8192 slots again. On 0 -> 0 it is dropped.
- * A failover recovery started any other way reads the slots again.
+ * On 0 -> 0 it is dropped. On 0 -> 1 the promotion reads the slots again and
+ * carries the patched overlay pages over (md_journal_promote_from_examine): it
+ * cannot know that nothing wrote the journal since the examine. An examine of
+ * a node that is not taking over (a restarted secondary) runs while another
+ * node leads and writes the journal, and the set-leader call may come hours
+ * later (bf36 LVS_22, 2026-11-26: examine 13:42, promotion 16:55).
  */
 static bool
 md_journal_examine_kept(struct spdk_bs_md_journal *jr)
@@ -2572,6 +2597,42 @@ md_journal_recovery_apply(spdk_bs_sequence_t *seq, struct spdk_bs_md_journal *jr
 	bs_batch_close(batch);
 }
 
+/*
+ * After the slot re-read of a promotion that followed an examine: the examine
+ * writes (md_journal_promote_from_examine) replace the page of the newest entry
+ * for their LBA if it is still the entry they patched (same slot and sequence).
+ */
+static void
+md_journal_apply_examine_carry(struct spdk_bs_md_journal *jr)
+{
+	struct md_journal_examine_carry *c;
+	struct md_journal_elem *elem;
+	uint32_t applied = 0, i;
+
+	if (jr->examine_carry_count == 0) {
+		md_journal_examine_carry_free(jr);
+		return;
+	}
+
+	for (i = 0; i < jr->examine_carry_count; i++) {
+		c = &jr->examine_carry[i];
+		elem = md_journal_hash_get(jr, c->lba);
+		if (elem != NULL && elem->slot == c->slot && elem->seq == c->seq) {
+			memcpy(elem->page, c->page, BS_MD_JOURNAL_PAGE_SIZE);
+			applied++;
+			continue;
+		}
+		SPDK_NOTICELOG("md_journal: examine write of lba=%" PRIu64 " (slot=%u seq=%" PRIu64
+			       ") not carried over: %s\n", c->lba, c->slot, c->seq,
+			       elem == NULL ? "its entry was drained since the examine" :
+			       "a newer entry was written since the examine");
+	}
+
+	SPDK_NOTICELOG("md_journal: promotion: %u of %u examine writes carried over\n",
+		       applied, jr->examine_carry_count);
+	md_journal_examine_carry_free(jr);
+}
+
 static void
 spdk_md_journal_update_read_finished(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
@@ -2609,6 +2670,7 @@ spdk_md_journal_update_read_finished(spdk_bs_sequence_t *seq, void *cb_arg, int 
 	jr->drain_batch->elem_count = 0;
 	for (i = 0; i < BS_MD_JOURNAL_NUM_ELEMS; i++) {
 		elem = &jr->elems[i];
+		elem->examine_patched = false;
 
 		/*
 		 * Empty, partially written or incompatible entries are
@@ -2677,12 +2739,14 @@ spdk_md_journal_update_read_finished(spdk_bs_sequence_t *seq, void *cb_arg, int 
 		return;
 	}
 
+	md_journal_apply_examine_carry(jr);
 	md_journal_recovery_apply(seq, jr);
 	return;
 
 error:
 	SPDK_ERRLOG("md_journal: recovery aborted: rc=%d examine=%d - journal stays paused\n",
 		    bserrno, jr->examine);
+	md_journal_examine_carry_free(jr);
 	jr->recovering = false;
 
 	jr->update_cb_fn(seq, jr->update_cb_arg, bserrno);
@@ -2723,8 +2787,9 @@ bs_md_journal_recovery_on_failover(struct spdk_bs_md_journal *jr, spdk_bs_sequen
 	}
 
 	if (md_journal_examine_kept(jr)) {
-		/* Not the set-leader promotion: the slots may have changed since
-		 * the examine, read them again (the read rebuilds everything). */
+		/* The slots may have changed since the examine: read them again
+		 * (the read rebuilds everything; md_journal_promote_from_examine
+		 * carries the examine writes over). */
 		SPDK_NOTICELOG("md_journal: recovery start: examine result (%u valid entries) "
 			       "not used, reading the slots again\n", jr->drain_batch->elem_count);
 	}
@@ -3097,13 +3162,34 @@ md_journal_pause_msg(void *arg)
 }
 
 /*
- * Set-leader promotion right after an examine: recover from the examine result
- * (md_journal_examine_kept()) instead of reading the 8192 slots again.
+ * Set-leader promotion after an examine (md_journal_examine_kept()).
+ *
+ * The examine result cannot be HOMEd as it is: since the examine another
+ * leader may have written entries (not in it), HOMEd and zeroed entries (in it,
+ * stale now) or reset the journal. bf36 LVS_22 (2026-11-26): a promotion 3 h
+ * after the examine HOMEd the examine's entries without reading the journal,
+ * zeroed it, and lost the leader's newer metadata (a deleted blob came back
+ * with a stale root page). So the promotion reads the slots again, as every
+ * other failover recovery does (8192 x 8 KiB, ~70 ms in bf36).
+ *
+ * What the examine result alone has are the examine writes: they went
+ * directly HOME and patched the overlay page of a valid entry, which is
+ * still in its slot unless a leader drained it since. Those pages are carried
+ * over the re-read: where the newest entry for the LBA is still the same slot
+ * and sequence, it is HOMEd with the examine's content
+ * (md_journal_apply_examine_carry). A newer entry written since wins, and an
+ * entry drained since is not HOMEd again.
  */
 static int
 md_journal_promote_from_examine(struct spdk_bs_md_journal *jr, spdk_bs_sequence_t *seq,
 				spdk_bs_sequence_cpl cb_fn, void *cb_arg)
 {
+	struct md_journal_examine_carry *carry = NULL;
+	struct md_journal_elem *elem;
+	uint32_t kept = jr->drain_batch->elem_count;
+	uint32_t n = 0, k = 0, i;
+	int rc;
+
 	if (jr->journal_inflight != 0 || jr->active_drain_batch || jr->active_zero_batch) {
 		SPDK_ERRLOG("md_journal: cannot promote from examine: journal_inflight=%u "
 			    "home_active=%d zero_active=%d\n", jr->journal_inflight,
@@ -3111,18 +3197,48 @@ md_journal_promote_from_examine(struct spdk_bs_md_journal *jr, spdk_bs_sequence_
 		return -EBUSY;
 	}
 
-	SPDK_NOTICELOG("md_journal: promotion from the examine result: %u valid entries, "
-		       "no journal read\n", jr->drain_batch->elem_count);
+	for (i = 0; i < kept; i++) {
+		if (jr->drain_batch->items[i]->examine_patched) {
+			n++;
+		}
+	}
+	if (n > 0) {
+		carry = calloc(n, sizeof(*carry));
+		if (carry == NULL) {
+			return -ENOMEM;
+		}
+		for (i = 0; i < kept; i++) {
+			elem = jr->drain_batch->items[i];
+			if (!elem->examine_patched) {
+				continue;
+			}
+			carry[k].page = malloc(BS_MD_JOURNAL_PAGE_SIZE);
+			if (carry[k].page == NULL) {
+				jr->examine_carry = carry;
+				jr->examine_carry_count = k;
+				md_journal_examine_carry_free(jr);
+				return -ENOMEM;
+			}
+			memcpy(carry[k].page, elem->page, BS_MD_JOURNAL_PAGE_SIZE);
+			carry[k].slot = elem->slot;
+			carry[k].seq = elem->seq;
+			carry[k].lba = elem->hdr->target_lba;
+			k++;
+		}
+	}
 
-	jr->update_cb_fn = cb_fn;
-	jr->update_cb_arg = cb_arg;
-	jr->recovering = true;
-	jr->paused = true;
-	/* From here writes are rejected until the reset unpauses the journal. */
-	jr->examine = false;
+	SPDK_NOTICELOG("md_journal: promotion after an examine: reading the journal slots again "
+		       "(the examine kept %u valid entries; %u examine writes carried over)\n", kept, n);
 
-	md_journal_recovery_apply(seq, jr);
-	return 0;
+	md_journal_examine_carry_free(jr);
+	jr->examine_carry = carry;
+	jr->examine_carry_count = n;
+
+	rc = bs_md_journal_recovery_on_failover(jr, seq, cb_fn, cb_arg, false);
+	if (rc != 0) {
+		md_journal_examine_carry_free(jr);
+	}
+	return rc;
 }
 
 static void

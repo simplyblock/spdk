@@ -13385,6 +13385,260 @@ ut_mdj_write_entries(struct spdk_blob_store *bs, uint32_t count)
 }
 
 /*
+ * Full journal tests: the journal's 8192 slots live behind the device
+ * (DEV_JOURNAL_AREA_SIZE), so recovery and examine can read all of them. The
+ * slot geometry needs 4 KiB device blocks and io units.
+ */
+#define UT_MDJ_FULL_START_PAGE	(DEV_BUFFER_SIZE / SPDK_BS_PAGE_SIZE)
+#define UT_MDJ_FULL_LEN_PAGES	(DEV_JOURNAL_AREA_SIZE / SPDK_BS_PAGE_SIZE)
+#define UT_MDJ_FULL_PAGE0	9000
+
+static bool
+ut_mdj_full_supported(struct spdk_blob_store *bs)
+{
+	return bs->dev->blocklen == SPDK_BS_PAGE_SIZE && bs->io_unit_size == bs->dev->blocklen;
+}
+
+static struct spdk_bs_md_journal *
+ut_mdj_full_create(struct spdk_blob_store *bs)
+{
+	struct spdk_bs_md_journal *jr;
+
+	jr = bs_md_journal_create(bs, UT_MDJ_FULL_START_PAGE, UT_MDJ_FULL_LEN_PAGES);
+	SPDK_CU_ASSERT_FATAL(jr != NULL);
+	return jr;
+}
+
+static uint8_t *
+ut_mdj_home(struct spdk_blob_store *bs, uint32_t page)
+{
+	return &g_dev_buffer[bs_page_to_lba(bs, page) * bs->dev->blocklen];
+}
+
+static bool
+ut_mdj_home_is(struct spdk_blob_store *bs, uint32_t page, uint8_t val)
+{
+	uint8_t *p = ut_mdj_home(bs, page);
+	uint32_t i;
+
+	for (i = 0; i < SPDK_BS_PAGE_SIZE; i++) {
+		if (p[i] != val) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static void
+ut_mdj_set_home(struct spdk_blob_store *bs, uint32_t page, uint8_t val)
+{
+	memset(ut_mdj_home(bs, page), val, SPDK_BS_PAGE_SIZE);
+}
+
+static spdk_bs_sequence_t *
+ut_mdj_seq(struct spdk_blob_store *bs)
+{
+	struct spdk_bs_cpl cpl;
+	spdk_bs_sequence_t *seq;
+
+	cpl.type = SPDK_BS_CPL_TYPE_BLOB_BASIC;
+	cpl.u.blob_basic.cb_fn = ut_mdj_seq_cpl;
+	cpl.u.blob_basic.cb_arg = NULL;
+	seq = bs_sequence_start_bs(bs->md_channel, &cpl);
+	SPDK_CU_ASSERT_FATAL(seq != NULL);
+	return seq;
+}
+
+/* Journal count entries filled with val for pages page0.. through jr. */
+static void
+ut_mdj_journal_pages(struct spdk_bs_md_journal *jr, uint32_t page0, uint32_t count, uint8_t val)
+{
+	struct spdk_blob_store *bs = jr->bs;
+	struct md_journal_batch *jr_batch;
+	uint8_t *buf;
+	int rc = 1;
+	uint32_t i;
+
+	buf = calloc(1, SPDK_BS_PAGE_SIZE);
+	SPDK_CU_ASSERT_FATAL(buf != NULL);
+	memset(buf, val, SPDK_BS_PAGE_SIZE);
+
+	jr_batch = bs_md_journal_sequence_to_batch(jr, ut_mdj_seq(bs), count, ut_mdj_batch_cpl, &rc);
+	SPDK_CU_ASSERT_FATAL(jr_batch != NULL);
+	for (i = 0; i < count; i++) {
+		bs_md_journal_batch_write(jr_batch, buf, bs_page_to_lba(bs, page0 + i),
+					  bs_byte_to_lba(bs, SPDK_BS_PAGE_SIZE), MD_JOURNAL_WRITE);
+	}
+	bs_md_journal_batch_close(jr_batch);
+	poll_threads();
+	CU_ASSERT(rc == 0);
+	free(buf);
+}
+
+/* Examine of this node's journal, kept until the set-leader call. */
+static void
+ut_mdj_examine(struct spdk_bs_md_journal *jr)
+{
+	int rc = 1;
+
+	CU_ASSERT(bs_md_journal_recovery_on_failover(jr, ut_mdj_seq(jr->bs), ut_mdj_batch_cpl,
+			&rc, true) == 0);
+	poll_threads();
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(bs_md_journal_examine_complete(jr) == 0);
+	CU_ASSERT(md_journal_examine_kept(jr));
+}
+
+/* The set-leader call 0 -> 1. */
+static void
+ut_mdj_promote(struct spdk_bs_md_journal *jr)
+{
+	int rc = 1;
+
+	bs_md_journal_leadership_change(jr, ut_mdj_seq(jr->bs), false, true, ut_mdj_batch_cpl, &rc);
+	poll_threads();
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(!jr->paused);
+	CU_ASSERT(!jr->examine);
+}
+
+static void
+ut_mdj_full_free(struct spdk_bs_md_journal *jr)
+{
+	bs_md_journal_destroy(jr, ut_mdj_destroy_cpl);
+	poll_threads();
+}
+
+/*
+ * bf36 LVS_22 (2026-11-26): node B examined the lvstore while node A led it
+ * (13:42), and was promoted 3 h later (16:55). The promotion HOMEd B's kept
+ * examine result without reading the journal and zeroed the journal: A's
+ * entries written since were lost, and entries A had HOMEd and zeroed since
+ * were HOMEd again in their old version (a deleted blob came back).
+ *
+ * Here: four pages are journaled (0x5a), B examines and keeps them. Then A
+ * becomes leader: its recovery HOMEs and zeroes the journal (all four pages
+ * 0x5a at HOME), A writes the first two pages again (0xa5) and HOMEs them
+ * (slots zeroed), and journals the last two (0xb6) without HOMEing them yet.
+ * B's promotion must leave 0xa5, 0xa5, 0xb6, 0xb6 at HOME.
+ */
+static void
+blob_md_journal_stale_examine_promotion(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_bs_md_journal *jr_b, *jr_a;
+	const uint32_t p = UT_MDJ_FULL_PAGE0;
+	uint32_t i;
+
+	if (!ut_mdj_full_supported(bs)) {
+		return;
+	}
+	memset(&g_dev_buffer[DEV_BUFFER_SIZE], 0, DEV_JOURNAL_AREA_SIZE);
+	for (i = 0; i < 4; i++) {
+		ut_mdj_set_home(bs, p + i, 0x11);
+	}
+
+	/* the old leader journals four pages, not HOMEd */
+	jr_a = ut_mdj_full_create(bs);
+	ut_mdj_journal_pages(jr_a, p, 4, 0x5a);
+	ut_mdj_full_free(jr_a);
+
+	/* B examines: four valid entries kept */
+	jr_b = ut_mdj_full_create(bs);
+	ut_mdj_examine(jr_b);
+	CU_ASSERT(jr_b->drain_batch->elem_count == 4);
+
+	/* A takes over: its recovery HOMEs and zeroes the journal */
+	jr_a = ut_mdj_full_create(bs);
+	{
+		int rc = 1;
+
+		CU_ASSERT(bs_md_journal_recovery_on_failover(jr_a, ut_mdj_seq(bs), ut_mdj_batch_cpl,
+				&rc, false) == 0);
+		poll_threads();
+		CU_ASSERT(rc == 0);
+	}
+	for (i = 0; i < 4; i++) {
+		CU_ASSERT(ut_mdj_home_is(bs, p + i, 0x5a));
+	}
+	/* A rewrites the first two pages and HOMEs them (as its drain does: HOME, then zero the slots) */
+	ut_mdj_journal_pages(jr_a, p, 2, 0xa5);
+	ut_mdj_full_free(jr_a);
+	memset(&g_dev_buffer[DEV_BUFFER_SIZE], 0, DEV_JOURNAL_AREA_SIZE);
+	ut_mdj_set_home(bs, p, 0xa5);
+	ut_mdj_set_home(bs, p + 1, 0xa5);
+	/* and journals the last two, not HOMEd yet */
+	jr_a = ut_mdj_full_create(bs);
+	ut_mdj_journal_pages(jr_a, p + 2, 2, 0xb6);
+	ut_mdj_full_free(jr_a);
+
+	/* B is promoted, 3 h later */
+	spdk_delay_us(3ULL * 3600 * SPDK_SEC_TO_USEC);
+	ut_mdj_promote(jr_b);
+
+	CU_ASSERT(ut_mdj_home_is(bs, p, 0xa5));
+	CU_ASSERT(ut_mdj_home_is(bs, p + 1, 0xa5));
+	CU_ASSERT(ut_mdj_home_is(bs, p + 2, 0xb6));
+	CU_ASSERT(ut_mdj_home_is(bs, p + 3, 0xb6));
+
+	ut_mdj_full_free(jr_b);
+}
+
+/*
+ * The promotion after an examine with nothing written in between: every kept
+ * entry is HOMEd, and an examine write that patched a kept overlay page (it
+ * went directly HOME, the journal entry is older) is carried over the re-read
+ * of the slots instead of being overwritten by that older entry.
+ */
+static void
+blob_md_journal_fresh_examine_promotion(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_bs_md_journal *jr_b, *jr_a;
+	const uint32_t p = UT_MDJ_FULL_PAGE0;
+	uint8_t *buf;
+	int rc = 1;
+	uint32_t i;
+
+	if (!ut_mdj_full_supported(bs)) {
+		return;
+	}
+	memset(&g_dev_buffer[DEV_BUFFER_SIZE], 0, DEV_JOURNAL_AREA_SIZE);
+	for (i = 0; i < 4; i++) {
+		ut_mdj_set_home(bs, p + i, 0x11);
+	}
+
+	jr_a = ut_mdj_full_create(bs);
+	ut_mdj_journal_pages(jr_a, p, 4, 0x5a);
+	ut_mdj_full_free(jr_a);
+
+	jr_b = ut_mdj_full_create(bs);
+	ut_mdj_examine(jr_b);
+	CU_ASSERT(jr_b->drain_batch->elem_count == 4);
+
+	/* an examine write of the second page: directly HOME, patches the overlay */
+	buf = calloc(1, SPDK_BS_PAGE_SIZE);
+	SPDK_CU_ASSERT_FATAL(buf != NULL);
+	memset(buf, 0x77, SPDK_BS_PAGE_SIZE);
+	bs_md_journal_write(jr_b, ut_mdj_seq(bs), buf, bs_page_to_lba(bs, p + 1),
+			    bs_byte_to_lba(bs, SPDK_BS_PAGE_SIZE), ut_mdj_batch_cpl, &rc, MD_JOURNAL_WRITE);
+	poll_threads();
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(ut_mdj_home_is(bs, p + 1, 0x77));
+	free(buf);
+
+	ut_mdj_promote(jr_b);
+
+	CU_ASSERT(ut_mdj_home_is(bs, p, 0x5a));
+	CU_ASSERT(ut_mdj_home_is(bs, p + 1, 0x77));
+	CU_ASSERT(ut_mdj_home_is(bs, p + 2, 0x5a));
+	CU_ASSERT(ut_mdj_home_is(bs, p + 3, 0x5a));
+	CU_ASSERT(jr_b->examine_carry == NULL && jr_b->examine_carry_count == 0);
+
+	ut_mdj_full_free(jr_b);
+}
+
+/*
  * dbfbb2322: HOME/ZERO IO went out at PREMIUM priority always. The class is
  * encoded in the high LBA bits, which only raid strips, so on a device that
  * does not strip them (spdk_bs_dev.priority_lba_bits false) it must be 0, even
@@ -14115,6 +14369,8 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite_bs, blob_delete_async_in_middle_keeps_clone_clusters);
 		CU_ADD_TEST(suite_bs, blob_merge_base_priority_class);
 		CU_ADD_TEST(suite_bs, blob_md_journal_home_direct_demoted);
+		CU_ADD_TEST(suite_bs, blob_md_journal_stale_examine_promotion);
+		CU_ADD_TEST(suite_bs, blob_md_journal_fresh_examine_promotion);
 		CU_ADD_TEST(suite_bs, blob_md_journal_home_priority);
 		CU_ADD_TEST(suite_bs, blob_md_journal_elem_chunk_fallback);
 		CU_ADD_TEST(suite_bs, blob_alloc_clusters_skips_owned_clusters);
@@ -14187,7 +14443,7 @@ main(int argc, char **argv)
 		return 1;
 	}
 
-	g_dev_buffer = calloc(1, DEV_BUFFER_SIZE);
+	g_dev_buffer = calloc(1, DEV_BUFFER_SIZE + DEV_JOURNAL_AREA_SIZE);
 
 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
 

@@ -12,10 +12,26 @@
 #define DEV_BUFFER_BLOCKLEN (4096)
 #define DEV_BUFFER_BLOCKCNT (DEV_BUFFER_SIZE / DEV_BUFFER_BLOCKLEN)
 #define DEV_MAX_PHYS_BLOCKLEN (16384)
+/*
+ * Behind the device: room for a full md journal (8192 slots x 8 KiB) for the
+ * tests that read all of its slots (recovery, examine). The blobstore never
+ * addresses it; an IO is valid entirely inside the device or entirely inside
+ * this area.
+ */
+#define DEV_JOURNAL_AREA_SIZE (64 * 1024 * 1024)
 #define FIRST_DATA_CLUSTER(bs) \
 	((DEV_BUFFER_SIZE / spdk_bs_get_cluster_size(bs)) - spdk_bs_total_data_cluster_count(bs))
 
 uint8_t *g_dev_buffer;
+
+static bool
+dev_range_ok(uint64_t offset, uint64_t length)
+{
+	if (offset + length <= DEV_BUFFER_SIZE) {
+		return true;
+	}
+	return offset >= DEV_BUFFER_SIZE && offset + length <= DEV_BUFFER_SIZE + DEV_JOURNAL_AREA_SIZE;
+}
 uint64_t g_dev_write_bytes;
 uint64_t g_dev_read_bytes;
 /* largest single read the device saw (reset by the tests that check it) */
@@ -191,7 +207,7 @@ dev_read(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload
 	     g_power_failure_counters.general_counter < g_power_failure_thresholds.general_threshold)) {
 		offset = lba * dev->blocklen;
 		length = lba_count * dev->blocklen;
-		SPDK_CU_ASSERT_FATAL(offset + length <= DEV_BUFFER_SIZE);
+		SPDK_CU_ASSERT_FATAL(dev_range_ok(offset, length));
 
 		if (length > 0) {
 			memcpy(payload, &g_dev_buffer[offset], length);
@@ -295,7 +311,7 @@ dev_write(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payloa
 	     g_power_failure_counters.general_counter < g_power_failure_thresholds.general_threshold)) {
 		offset = lba * dev->blocklen;
 		length = lba_count * dev->blocklen;
-		SPDK_CU_ASSERT_FATAL(offset + length <= DEV_BUFFER_SIZE);
+		SPDK_CU_ASSERT_FATAL(dev_range_ok(offset, length));
 
 		memcpy(&g_dev_buffer[offset], payload, length);
 		g_dev_write_bytes += length;
@@ -341,7 +357,7 @@ dev_readv(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	     g_power_failure_counters.general_counter < g_power_failure_thresholds.general_threshold)) {
 		offset = lba * dev->blocklen;
 		length = lba_count * dev->blocklen;
-		SPDK_CU_ASSERT_FATAL(offset + length <= DEV_BUFFER_SIZE);
+		SPDK_CU_ASSERT_FATAL(dev_range_ok(offset, length));
 		__check_iov(iov, iovcnt, length);
 		g_dev_last_read_priority = bs_io_opts ? bs_io_opts->priority : -1;
 
@@ -398,7 +414,7 @@ dev_writev(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	     g_power_failure_counters.general_counter < g_power_failure_thresholds.general_threshold)) {
 		offset = lba * dev->blocklen;
 		length = lba_count * dev->blocklen;
-		SPDK_CU_ASSERT_FATAL(offset + length <= DEV_BUFFER_SIZE);
+		SPDK_CU_ASSERT_FATAL(dev_range_ok(offset, length));
 		__check_iov(iov, iovcnt, length);
 		g_dev_last_write_priority = bs_io_opts ? bs_io_opts->priority : -1;
 
@@ -470,7 +486,7 @@ dev_unmap(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	     g_power_failure_counters.general_counter < g_power_failure_thresholds.general_threshold)) {
 		offset = lba * dev->blocklen;
 		length = lba_count * dev->blocklen;
-		SPDK_CU_ASSERT_FATAL(offset + length <= DEV_BUFFER_SIZE);
+		SPDK_CU_ASSERT_FATAL(dev_range_ok(offset, length));
 		memset(&g_dev_buffer[offset], 0, length);
 	} else {
 		g_power_failure_rc = -EIO;
@@ -504,7 +520,7 @@ dev_write_zeroes(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 	     g_power_failure_counters.general_counter < g_power_failure_thresholds.general_threshold)) {
 		offset = lba * dev->blocklen;
 		length = lba_count * dev->blocklen;
-		SPDK_CU_ASSERT_FATAL(offset + length <= DEV_BUFFER_SIZE);
+		SPDK_CU_ASSERT_FATAL(dev_range_ok(offset, length));
 		memset(&g_dev_buffer[offset], 0, length);
 		g_dev_write_bytes += length;
 	} else {
