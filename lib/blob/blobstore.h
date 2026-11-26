@@ -236,6 +236,13 @@ struct spdk_blob_store {
 	struct bs_blobid_mask_wr	**blobid_mask_wr;
 	uint32_t			blobid_mask_wr_len;
 
+	/* Blobs whose metadata could not be parsed at load: their used_blobids bit and
+	 * root md page stay reserved, but they are not loaded (bs_load_quarantine). */
+	struct spdk_bit_array		*quarantined_blobids;
+	uint32_t			num_quarantined_blobs;
+	/* examine load: a clone's parent failed to load (blob_load_snapshot_cpl) */
+	bool				examine_parent_failed;
+
 	struct spdk_spinlock		used_lock;
 
 	uint32_t			cluster_sz;

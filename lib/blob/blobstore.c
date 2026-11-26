@@ -1936,6 +1936,10 @@ blob_load_snapshot_cpl(void *cb_arg, struct spdk_blob *snapshot, int bserrno)
 		 */
 		SPDK_ERRLOG("blob 0x%" PRIx64 ": parent 0x%" PRIx64 " failed to load on examine (%d)\n",
 			    blob->id, blob->parent_id, bserrno);
+		if (bserrno != -ENOTSUP) {
+			/* a parent a clone reads through is never quarantined (bs_load_quarantine) */
+			blob->bs->examine_parent_failed = true;
+		}
 		blob->back_bs_dev = NULL;
 		blob_load_final(ctx, bserrno);
 		return;
@@ -6734,6 +6738,7 @@ bs_dev_destroy(void *io_device)
 	spdk_bit_array_free(&bs->used_blobids);
 	spdk_bit_array_free(&bs->used_md_pages);
 	spdk_bit_array_free(&bs->map_blobids);
+	spdk_bit_array_free(&bs->quarantined_blobids);
 	spdk_bit_pool_free(&bs->used_clusters);
 	bs_blobid_mask_wr_free(bs);
 	/*
@@ -7531,6 +7536,84 @@ bs_get_xattr_removal(struct spdk_blob *blob)
 	return *(spdk_blob_id *)value;
 }
 
+/*
+ * Quarantine (examine load): a blob whose metadata cannot be parsed - a corrupted md
+ * page (crc, chain id or sequence number, descriptors), an all-zero page under a set
+ * used_blobids bit (#111), an invalid extent page - no longer fails the whole
+ * lvstore. It is not loaded and not iterated (spdk_bs_for_each_loaded_blob), its
+ * used_blobids bit stays set and its root md page stays claimed, so that neither its
+ * blob id nor that page is ever handed out again; spdk_bs_quarantined_blob_count()
+ * reports it, and the bit stays on disk for a repair.
+ *
+ * Still strict (#105), the load fails as before when:
+ * - the blob is the parent of a clone (blob_load_snapshot_cpl sets
+ *   examine_parent_failed): the clone reads through it, and the parent's clusters,
+ *   not all claimed, could be handed out and overwritten under the clone;
+ * - the error is not a parse error (-EIO, -ENOMEM, ...): nothing says the metadata
+ *   is bad.
+ *
+ * What a quarantined blob owns beyond its root page (chain pages, clusters) is known
+ * only as far as its md was parsed: the rest is free and may be reused. Its data is
+ * unreachable without a repair either way, and nothing else reads it.
+ */
+static bool
+bs_load_quarantine_candidate(struct spdk_bs_load_ctx *worker, int bserrno)
+{
+	struct spdk_blob_store *bs = worker->bs;
+	uint32_t page = worker->page_index;
+
+	if (!spdk_bit_array_get(bs->used_blobids, page)) {
+		/* -ENOENT for a blob that is really gone (its bit was dropped) */
+		return false;
+	}
+	if (bs->quarantined_blobids == NULL) {
+		bs->quarantined_blobids = spdk_bit_array_create(spdk_bit_array_capacity(bs->used_blobids));
+		if (bs->quarantined_blobids == NULL) {
+			return false;	/* fails the load, as before */
+		}
+	}
+	SPDK_ERRLOG("Blob 0x%" PRIx64 " is in used_blobids but its metadata cannot be parsed (%d): "
+		    "quarantine candidate\n", bs_page_to_blobid(page), bserrno);
+	spdk_bit_array_set(bs->quarantined_blobids, page);
+	return true;
+}
+
+static int
+bs_load_quarantine(struct spdk_blob_store *bs)
+{
+	uint32_t page;
+
+	if (bs->quarantined_blobids == NULL) {
+		return 0;
+	}
+	if (bs->examine_parent_failed) {
+		SPDK_ERRLOG("A blob whose metadata cannot be parsed is the parent of a clone: "
+			    "failing the load (the clone reads through it)\n");
+		return -EINVAL;
+	}
+
+	bs->num_quarantined_blobs = 0;
+	page = spdk_bit_array_find_first_set(bs->quarantined_blobids, 0);
+	while (page < spdk_bit_array_capacity(bs->quarantined_blobids)) {
+		spdk_blob_id id = bs_page_to_blobid(page);
+
+		if (!spdk_bit_array_get(bs->used_blobids, page) || blob_lookup(bs, id) != NULL) {
+			/* dropped meanwhile, or loaded after all (by a clone's open) */
+			spdk_bit_array_clear(bs->quarantined_blobids, page);
+		} else {
+			spdk_bit_array_set(bs->used_md_pages, page);
+			bs->num_quarantined_blobs++;
+			SPDK_ERRLOG("Blob 0x%" PRIx64 " QUARANTINED: not loaded; its blob id and root md "
+				    "page %u stay reserved\n", id, page);
+		}
+		page = spdk_bit_array_find_first_set(bs->quarantined_blobids, page + 1);
+	}
+	if (bs->num_quarantined_blobs > 0) {
+		SPDK_ERRLOG("%u blob(s) quarantined at load\n", bs->num_quarantined_blobs);
+	}
+	return 0;
+}
+
 static bool
 bs_load_examine_assign_next(struct spdk_bs_load_ctx *worker)
 {
@@ -7556,6 +7639,10 @@ bs_load_blob_iter_on_examine(struct spdk_bs_load_ctx *ctx);
 static void
 bs_load_examine_finish(struct spdk_bs_load_ctx *master)
 {
+	if (master->rc == 0) {
+		master->rc = bs_load_quarantine(master->bs);
+	}
+
 	SPDK_NOTICELOG("Parallel examine blob loading done, rc=%d\n", master->rc);
 
 	/* A blobstore created without the md journal has none to start. A failed load does not
@@ -7601,6 +7688,11 @@ bs_load_iter_on_examine_cpl(void *cb_arg, int bserrno)
 	assert(master->active_workers > 0);
 
 	master->active_workers--;
+
+	if ((bserrno == -EINVAL || bserrno == -ENOENT) && bs_load_quarantine_candidate(worker, bserrno)) {
+		/* decided once every blob is examined: bs_load_quarantine() */
+		bserrno = 0;
+	}
 
 	if (bserrno == -ENOTSUP) {
 		/*
@@ -10468,6 +10560,12 @@ uint64_t
 spdk_bs_free_cluster_count(struct spdk_blob_store *bs)
 {
 	return bs->num_free_clusters;
+}
+
+uint32_t
+spdk_bs_quarantined_blob_count(struct spdk_blob_store *bs)
+{
+	return bs->num_quarantined_blobs;
 }
 
 uint64_t
@@ -17322,6 +17420,13 @@ spdk_bs_for_each_loaded_blob(struct spdk_blob_store *bs,
 		}
 
 		blob = blob_lookup(bs, blobid);
+		if (blob == NULL && bs->quarantined_blobids != NULL &&
+		    spdk_bit_array_get(bs->quarantined_blobids, page)) {
+			/* not loaded on purpose (bs_load_quarantine) */
+			SPDK_NOTICELOG("Blob 0x%" PRIx64 " is quarantined: skipped\n", blobid);
+			page = spdk_bit_array_find_first_set(bs->used_blobids, page + 1);
+			continue;
+		}
 		if (blob == NULL) {
 			SPDK_ERRLOG("Blob 0x%" PRIx64" is present in used_blobids but not loaded\n", blobid);
 

@@ -339,6 +339,24 @@ ut_disk_blobid_bit(struct spdk_blob_store *bs, uint32_t page)
 	return (mask->mask[page / 8] >> (page % 8)) & 1;
 }
 
+/* A blob of a loaded blobstore that must be quarantined: not openable, id and page kept. */
+static void
+ut_blob_is_quarantined(struct spdk_blob_store *bs, spdk_blob_id blobid)
+{
+	uint32_t page = bs_blobid_to_page(blobid);
+
+	SPDK_CU_ASSERT_FATAL(bs->quarantined_blobids != NULL);
+	CU_ASSERT(spdk_bit_array_get(bs->quarantined_blobids, page));
+	CU_ASSERT(spdk_bit_array_get(bs->used_blobids, page));
+	CU_ASSERT(spdk_bit_array_get(bs->used_md_pages, page));
+	CU_ASSERT(ut_disk_blobid_bit(bs, page));
+	g_blob = NULL;
+	spdk_bs_open_blob(bs, blobid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno != 0);
+	CU_ASSERT(g_blob == NULL);
+}
+
 /* Dirty shutdown, then a load that must fail with bserrno and leave no blobstore. */
 static void
 ut_bs_dirty_load_fails(struct spdk_blob_store **bs, struct spdk_bs_opts *opts, int bserrno)
@@ -4464,16 +4482,27 @@ blob_dirty_shutdown(void)
 	/*
 	 * The recovery load takes the blobids from the persisted used blobid mask instead of
 	 * scanning all md pages for first pages, so blob 2 is examined: blob_parse() rejects its
-	 * first md page with the corrupted sequence number (-EINVAL) before claiming anything it
-	 * owns, and that fails the whole load (a skipped blob would leave its md pages and
-	 * clusters free for reuse).
+	 * first md page with the corrupted sequence number (-EINVAL). Blob 2 is no clone's
+	 * parent: it is quarantined (not loaded, its blob id and md page kept) and the
+	 * blobstore loads with blob 3.
 	 */
-	ut_bs_dirty_load_fails(&bs, NULL, -EINVAL);
+	ut_bs_dirty_load(&bs, NULL);
+	CU_ASSERT(spdk_bs_quarantined_blob_count(bs) == 1);
+	ut_blob_is_quarantined(bs, blobid2);
+	spdk_bs_open_blob(bs, blobid3, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	spdk_blob_close(g_blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	g_blob = NULL;
 
-	/* Repair the page: the blobstore loads again, nothing was changed by the failed load. */
+	/* Repair the page: blob 2 loads again. */
 	page->sequence_num = 0;
 	page->crc = blob_md_page_calc_crc(page);
 	ut_bs_dirty_load(&bs, NULL);
+	CU_ASSERT(spdk_bs_quarantined_blob_count(bs) == 0);
 
 	spdk_bs_open_blob(bs, blobid2, blob_op_with_handle_complete, NULL);
 	poll_threads();
@@ -4559,18 +4588,24 @@ blob_md_chain_corrupted_sequence_num(void)
 	page->sequence_num = 1;
 	page->crc = blob_md_page_calc_crc(page);
 
-	/* Both blobs are rejected: the load fails. */
-	ut_bs_dirty_load_fails(&bs, NULL, -EINVAL);
+	/* Both blobs are rejected: both are quarantined, the load succeeds. */
+	ut_bs_dirty_load(&bs, NULL);
+	CU_ASSERT(spdk_bs_quarantined_blob_count(bs) == 2);
+	ut_blob_is_quarantined(bs, blobid);
+	ut_blob_is_quarantined(bs, blobid2);
 
-	/* Only the later chain page of the first blob is still wrong: the load still fails. */
+	/* Only the later chain page of the first blob is still wrong: only it is quarantined. */
 	page->sequence_num = 0;
 	page->crc = blob_md_page_calc_crc(page);
-	ut_bs_dirty_load_fails(&bs, NULL, -EINVAL);
+	ut_bs_dirty_load(&bs, NULL);
+	CU_ASSERT(spdk_bs_quarantined_blob_count(bs) == 1);
+	ut_blob_is_quarantined(bs, blobid);
 
 	/* Both repaired: the load succeeds and both blobs open. */
 	chain_page->sequence_num = 1;
 	chain_page->crc = blob_md_page_calc_crc(chain_page);
 	ut_bs_dirty_load(&bs, NULL);
+	CU_ASSERT(spdk_bs_quarantined_blob_count(bs) == 0);
 
 	spdk_bs_open_blob(bs, blobid, blob_op_with_handle_complete, NULL);
 	poll_threads();
@@ -4754,14 +4789,41 @@ blob_load_invalid_flags_keeps_clusters(void)
  * but whose md page is all zeroes is corruption, and the load fails (it is not
  * silently dropped).
  */
+struct ut_loaded_iter {
+	int	blobs;
+	int	errors;
+};
+
 static void
-blob_load_zeroed_md_page_is_corruption(void)
+ut_loaded_iter_fn(void *cb_arg, struct spdk_blob *blob, int bserrno)
+{
+	struct ut_loaded_iter *it = cb_arg;
+
+	if (bserrno == 0 && blob != NULL) {
+		it->blobs++;
+	} else if (bserrno != -ENOENT) {
+		it->errors++;
+	}
+}
+
+/*
+ * bf36 R3b (2026-11-26, LVS_22): one blob whose md cannot be parsed failed the load of the
+ * whole lvstore (#105 strict load), and the node never came back. #111: an all-zero md page
+ * under a set used_blobids bit is corruption. Such a blob (no clone reads through it) is now
+ * quarantined: the load succeeds and reports it, the blob is neither loaded nor iterated,
+ * and its blob id and md page stay reserved - on disk too - so that no new blob reuses them.
+ */
+static void
+blob_load_zeroed_md_page_is_quarantined(void)
 {
 	struct spdk_blob_store *bs = g_bs;
 	struct spdk_blob_opts opts;
 	struct spdk_blob *blob;
-	spdk_blob_id blobid;
+	struct ut_loaded_iter it = {};
+	struct spdk_bs_dev *dev;
+	spdk_blob_id blobid, other, ids[8];
 	uint64_t page_off;
+	int i;
 
 	ut_spdk_blob_opts_init(&opts);
 	opts.num_clusters = 3;
@@ -4771,14 +4833,67 @@ blob_load_zeroed_md_page_is_corruption(void)
 	spdk_blob_close(blob, blob_op_complete, NULL);
 	poll_threads();
 	CU_ASSERT(g_bserrno == 0);
+	blob = ut_blob_create_and_open(bs, &opts);
+	other = spdk_blob_get_id(blob);
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
 	g_blob = NULL;
 
 	/* The blob's md page reads as zeroes; its bit is still set. */
 	page_off = (uint64_t)SPDK_BS_PAGE_SIZE * (bs->md_start + bs_blobid_to_page(blobid));
 	memset(&g_dev_buffer[page_off], 0, SPDK_BS_PAGE_SIZE);
 
-	ut_bs_dirty_load_fails(&bs, NULL, -EINVAL);
-	CU_ASSERT(bs == NULL);
+	/* Dirty load. The owner (the lvol layer) adopts what the examine left open:
+	 * the quarantined blob is skipped, not reported as missing. */
+	bs_free(bs);
+	dev = init_dev();
+	g_bserrno = -1;
+	spdk_bs_load(dev, NULL, bs_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
+	bs = g_bs;
+	CU_ASSERT(spdk_bs_for_each_loaded_blob(bs, ut_loaded_iter_fn, &it) == 0);
+	CU_ASSERT(it.errors == 0);
+	CU_ASSERT(it.blobs == 1);
+	ut_bs_release_load_refs(bs);
+	CU_ASSERT(spdk_bs_quarantined_blob_count(bs) == 1);
+	ut_blob_is_quarantined(bs, blobid);
+
+	/* the other blob is there */
+	spdk_bs_open_blob(bs, other, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	spdk_blob_close(g_blob, blob_op_complete, NULL);
+	poll_threads();
+	g_blob = NULL;
+
+	/* new blobs never get its id (its md page) */
+	for (i = 0; i < 8; i++) {
+		blob = ut_blob_create_and_open(bs, &opts);
+		ids[i] = spdk_blob_get_id(blob);
+		CU_ASSERT(ids[i] != blobid);
+		spdk_blob_close(blob, blob_op_complete, NULL);
+		poll_threads();
+		CU_ASSERT(g_bserrno == 0);
+	}
+	g_blob = NULL;
+
+	/* the creates rewrote the mask page: the bit is still on disk, the next load agrees */
+	ut_bs_dirty_load(&bs, NULL);
+	CU_ASSERT(spdk_bs_quarantined_blob_count(bs) == 1);
+	ut_blob_is_quarantined(bs, blobid);
+	for (i = 0; i < 8; i++) {
+		spdk_bs_open_blob(bs, ids[i], blob_op_with_handle_complete, NULL);
+		poll_threads();
+		CU_ASSERT(g_bserrno == 0);
+		SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+		spdk_blob_close(g_blob, blob_op_complete, NULL);
+		poll_threads();
+	}
+	g_blob = NULL;
 }
 
 /*
@@ -7162,6 +7277,106 @@ blob_delete_async_in_middle_keeps_clone_clusters(void)
 
 	ut_blob_close_and_delete(bs, snap);
 	ut_blob_close_and_delete(bs, clone);
+	spdk_bs_free_io_channel(channel);
+	poll_threads();
+}
+
+/*
+ * bf36 (2026-11-26, LVS_22): a snapshot with one clone (blob 0x18) was deleted on the
+ * leader, async then sync, both reporting success. After a restart the load still found
+ * its used_blobids bit set and its root page valid, pointing at an extent page reused
+ * since, and the load (#105) refused the whole lvstore. A deleted snapshot must stay
+ * deleted across a dirty reload, and its clone keep its data.
+ */
+static void
+blob_delete_snapshot_with_clone_stays_deleted_after_dirty_load(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob *blob, *snap;
+	struct spdk_io_channel *channel;
+	struct spdk_blob_opts opts;
+	spdk_blob_id blobid, snapid;
+	uint64_t pages_per_cluster = spdk_bs_get_cluster_size(bs) / BLOCKLEN;
+	uint8_t payload[BLOCKLEN], expected[BLOCKLEN];
+	int i;
+
+	channel = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(channel != NULL);
+
+	ut_spdk_blob_opts_init(&opts);
+	opts.thin_provision = true;
+	opts.num_clusters = 4;
+	blob = ut_blob_create_and_open(bs, &opts);
+	blobid = spdk_blob_get_id(blob);
+	memset(payload, 0x5A, sizeof(payload));
+	for (i = 0; i < 4; i++) {
+		spdk_blob_io_write(blob, channel, payload, i * pages_per_cluster, 1, blob_op_complete, NULL);
+		poll_threads();
+		CU_ASSERT(g_bserrno == 0);
+	}
+
+	/* the snapshot; the blob becomes its only clone */
+	spdk_bs_create_snapshot(bs, blobid, NULL, blob_op_with_id_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blobid != SPDK_BLOBID_INVALID);
+	snapid = g_blobid;
+
+	/* the clone overwrites cluster 1 */
+	memset(payload, 0xC3, sizeof(payload));
+	spdk_blob_io_write(blob, channel, payload, 1 * pages_per_cluster, 1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	/* phase 1 on the leader: the async delete of the open snapshot */
+	spdk_bs_open_blob(bs, snapid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	snap = g_blob;
+	g_bserrno = -1;
+	spdk_bs_delete_blob_async(bs, snap, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	spdk_blob_close(snap, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	/* phase 2: the leader's sync delete */
+	g_bserrno = -1;
+	spdk_bs_delete_blob(bs, snapid, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(!spdk_bit_array_get(bs->used_blobids, bs_blobid_to_page(snapid)));
+
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	spdk_bs_free_io_channel(channel);
+	poll_threads();
+
+	/* the restart: a dirty load of what is on the device */
+	ut_bs_dirty_load(&bs, NULL);
+	CU_ASSERT(!spdk_bit_array_get(bs->used_blobids, bs_blobid_to_page(snapid)));
+	CU_ASSERT(blob_lookup(bs, snapid) == NULL);
+
+	/* the clone kept its data */
+	channel = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(channel != NULL);
+	spdk_bs_open_blob(bs, blobid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	blob = g_blob;
+	for (i = 0; i < 4; i++) {
+		memset(expected, i == 1 ? 0xC3 : 0x5A, sizeof(expected));
+		memset(payload, 0, sizeof(payload));
+		spdk_blob_io_read(blob, channel, payload, i * pages_per_cluster, 1, blob_op_complete, NULL);
+		poll_threads();
+		CU_ASSERT(g_bserrno == 0);
+		CU_ASSERT(memcmp(payload, expected, sizeof(payload)) == 0);
+	}
+	ut_blob_close_and_delete(bs, blob);
 	spdk_bs_free_io_channel(channel);
 	poll_threads();
 }
@@ -14066,7 +14281,7 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite_bs, blob_md_chain_corrupted_sequence_num);
 		CU_ADD_TEST(suite_bs, blob_load_corrupted_snapshot_with_clone);
 		CU_ADD_TEST(suite_bs, blob_load_invalid_flags_keeps_clusters);
-		CU_ADD_TEST(suite_bs, blob_load_zeroed_md_page_is_corruption);
+		CU_ADD_TEST(suite_bs, blob_load_zeroed_md_page_is_quarantined);
 		CU_ADD_TEST(suite_bs, blob_used_blobid_mask_writes_do_not_reorder);
 		CU_ADD_TEST(suite_bs, blob_delete_persists_mask_before_zeroing);
 		CU_ADD_TEST(suite, bs_load_custom_cluster_size);
@@ -14113,6 +14328,7 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite_bs, blob_snapshot_rw_copy_decline_backoff);
 		CU_ADD_TEST(suite_bs, blob_snapshot_rw_copy_partial_decline_no_zero_skip);
 		CU_ADD_TEST(suite_bs, blob_delete_async_in_middle_keeps_clone_clusters);
+		CU_ADD_TEST(suite_bs, blob_delete_snapshot_with_clone_stays_deleted_after_dirty_load);
 		CU_ADD_TEST(suite_bs, blob_merge_base_priority_class);
 		CU_ADD_TEST(suite_bs, blob_md_journal_home_direct_demoted);
 		CU_ADD_TEST(suite_bs, blob_md_journal_home_priority);
