@@ -2634,18 +2634,20 @@ struct lvol_destroy_refresh_ctx {
 };
 
 /* Called with g_lvol_stores_mutex held. *busy: a stale lvol is being
- * refreshed by another path (IO-triggered update) right now. *failed: a stale
- * lvol whose last refresh failed (failed_on_update, not being refreshed): its
- * metadata, and so the snapshot tree, is not known; it is returned there and
- * the search stops. */
+ * refreshed by another path (IO-triggered update) right now.
+ *
+ * A lvol whose last refresh failed (failed_on_update) is stale too and is
+ * returned: the delete refreshes it again, once per delete
+ * (lvol_destroy_refresh_cpl fails the delete with ERR_UPDATE_FAILED if that
+ * attempt fails as well). Refusing it without a retry blocked every snapshot
+ * delete of the lvstore for good: only host IO or a leadership change retried
+ * the refresh, and a snapshot never gets host IO. */
 static struct spdk_lvol *
-lvs_find_stale_lvol(struct spdk_lvol_store *lvs, struct spdk_lvol *self, bool *busy,
-		    struct spdk_lvol **failed)
+lvs_find_stale_lvol(struct spdk_lvol_store *lvs, struct spdk_lvol *self, bool *busy)
 {
 	struct spdk_lvol *l;
 
 	*busy = false;
-	*failed = NULL;
 	TAILQ_FOREACH(l, &lvs->lvols, link) {
 		if (l == self || l->leader || l->blob == NULL || l->hublvol ||
 		    strcmp(l->name, "hublvol") == 0) {
@@ -2656,14 +2658,6 @@ lvs_find_stale_lvol(struct spdk_lvol_store *lvs, struct spdk_lvol *self, bool *b
 			*busy = true;
 			continue;
 		}
-		if (l->failed_on_update) {
-			/* Review B4.2 #3: a failed refresh is not "busy"; waiting the full
-			 * 30 s for it and answering -EBUSY blocked every snapshot delete of
-			 * the lvstore. Answer at once; the delete can run again once the
-			 * lvol was refreshed (IO-triggered retry) or the leadership was set. */
-			*failed = l;
-			return NULL;
-		}
 		return l;
 	}
 	return NULL;
@@ -2672,13 +2666,13 @@ lvs_find_stale_lvol(struct spdk_lvol_store *lvs, struct spdk_lvol *self, bool *b
 static bool
 lvs_has_stale_lvol(struct spdk_lvol_store *lvs, struct spdk_lvol *self)
 {
-	struct spdk_lvol *stale, *failed;
+	struct spdk_lvol *stale;
 	bool busy;
 
 	pthread_mutex_lock(&g_lvol_stores_mutex);
-	stale = lvs_find_stale_lvol(lvs, self, &busy, &failed);
+	stale = lvs_find_stale_lvol(lvs, self, &busy);
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
-	return stale != NULL || busy || failed != NULL;
+	return stale != NULL || busy;
 }
 
 static void lvol_destroy_refresh_next(struct lvol_destroy_refresh_ctx *ctx);
@@ -2745,7 +2739,7 @@ lvol_destroy_refresh_next(struct lvol_destroy_refresh_ctx *ctx)
 	struct spdk_lvol *lvol = ctx->lvol;
 	spdk_lvol_op_complete cb_fn = ctx->cb_fn;
 	void *cb_arg = ctx->cb_arg;
-	struct spdk_lvol *stale, *failed;
+	struct spdk_lvol *stale;
 	bool busy;
 
 	if (!lvs->leader) {
@@ -2755,7 +2749,7 @@ lvol_destroy_refresh_next(struct lvol_destroy_refresh_ctx *ctx)
 	}
 
 	pthread_mutex_lock(&g_lvol_stores_mutex);
-	stale = lvs_find_stale_lvol(lvs, lvol, &busy, &failed);
+	stale = lvs_find_stale_lvol(lvs, lvol, &busy);
 	if (stale != NULL) {
 		/* as lvol_update_async_delete() */
 		stale->update_in_progress = true;
@@ -2763,14 +2757,6 @@ lvol_destroy_refresh_next(struct lvol_destroy_refresh_ctx *ctx)
 		blob_freeze_on_failover(stale->blob);
 	}
 	pthread_mutex_unlock(&g_lvol_stores_mutex);
-
-	if (failed != NULL) {
-		SPDK_ERRLOG("lvol %s: cannot delete it: refreshing lvol %s (blob 0x%" PRIx64 ") "
-			    "failed before, the snapshot tree is not known\n",
-			    lvol->unique_id, failed->unique_id, failed->blob_id);
-		lvol_destroy_refresh_finish(ctx, ERR_UPDATE_FAILED);
-		return;
-	}
 
 	if (stale != NULL) {
 		ctx->stale = stale;

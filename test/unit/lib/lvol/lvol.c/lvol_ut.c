@@ -5306,9 +5306,11 @@ ut_refresh_reset(void)
 }
 
 /* Review B4.2 #3: an IO-triggered refresh that fails ends the update
- * (update_in_progress false), a snapshot delete then fails at once with
- * ERR_UPDATE_FAILED (not 30 s and -EBUSY), and once the lvol is refreshed by
- * the next IO the delete succeeds. */
+ * (update_in_progress false). A snapshot delete then refreshes that lvol
+ * itself, once: if that attempt fails too, the delete fails at once with
+ * ERR_UPDATE_FAILED (not 30 s and -EBUSY); if it works, the delete runs. A
+ * failed lvol must not block snapshot deletes until it gets host IO (a
+ * snapshot never does). */
 static void
 lvol_destroy_refresh_failed_update(void)
 {
@@ -5331,30 +5333,38 @@ lvol_destroy_refresh_failed_update(void)
 	CU_ASSERT(stale.leader == false);
 	CU_ASSERT(stale.update_in_progress == false);
 
-	/* the snapshot delete fails at once, nothing refreshed or deleted */
+	/* a snapshot delete refreshes the failed lvol again ... */
 	rc = 99;
 	spdk_lvol_destroy_async(&snap, ut_rc_cb, &rc);
+	SPDK_CU_ASSERT_FATAL(g_ut_upd_calls == 2);
+	CU_ASSERT(g_ut_upd_blob == &stale_blob);
+	CU_ASSERT(stale.update_in_progress == true);
+	CU_ASSERT(stale.failed_on_update == false);
+	CU_ASSERT(rc == 99);
+	CU_ASSERT(snap.action_in_progress == true);
+
+	/* ... once: that attempt fails too, the delete fails at once, nothing deleted */
+	g_ut_upd_cb(g_ut_upd_arg, -EIO);
 	CU_ASSERT(rc == ERR_UPDATE_FAILED);
 	ut_refresh_settle(&rc);
-	CU_ASSERT(g_ut_upd_calls == 1);
+	CU_ASSERT(g_ut_upd_calls == 2);
 	CU_ASSERT(g_ut_del_async_calls == 0);
 	CU_ASSERT(snap.action_in_progress == false);
-
-	/* the next IO retries the refresh, which works now */
-	spdk_lvol_update_on_failover(lvs, &stale, false);
-	CU_ASSERT(g_ut_upd_calls == 2);
-	if (g_ut_upd_calls == 2) {
-		CU_ASSERT(stale.failed_on_update == false);
-		g_ut_upd_cb(g_ut_upd_arg, 0);
-	}
-	CU_ASSERT(stale.leader == true);
+	CU_ASSERT(stale.failed_on_update == true);
 	CU_ASSERT(stale.update_in_progress == false);
 
-	/* and the snapshot delete runs */
+	/* the next snapshot delete retries it again; it works now and the delete runs,
+	 * without any host IO on the failed lvol */
 	rc = 99;
 	spdk_lvol_destroy_async(&snap, ut_rc_cb, &rc);
-	CU_ASSERT(rc == 0);
+	SPDK_CU_ASSERT_FATAL(g_ut_upd_calls == 3);
+	CU_ASSERT(g_ut_upd_blob == &stale_blob);
+	g_ut_upd_cb(g_ut_upd_arg, 0);
+	CU_ASSERT(stale.leader == true);
+	CU_ASSERT(stale.failed_on_update == false);
+	CU_ASSERT(stale.update_in_progress == false);
 	ut_refresh_settle(&rc);
+	CU_ASSERT(rc == 0);
 	CU_ASSERT(g_ut_del_async_calls == 1);
 	CU_ASSERT(snap.action_in_progress == false);
 
