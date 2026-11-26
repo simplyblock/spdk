@@ -1770,6 +1770,84 @@ test_destruct_abort_inflight_io(void)
 	CU_ASSERT(nvme_ctrlr_get_by_name("nvme0") == NULL);
 }
 
+/* A delete that does not complete says why: bf36 (2026-11-25), the JM controller
+ * of a node that had been shut down stayed "deleting" on all three peers for 2 h
+ * and every new attach under its name failed; nothing showed which condition of
+ * nvme_ctrlr_can_be_unregistered() never cleared. */
+static void
+test_destruct_stall_reports_blockers(void)
+{
+	struct spdk_nvme_transport_id trid = {};
+	struct spdk_nvme_ctrlr ctrlr = {};
+	struct nvme_ctrlr *nvme_ctrlr;
+	struct spdk_io_channel *ch;
+	uint64_t first_log;
+	int rc;
+
+	ut_init_trid(&trid);
+	TAILQ_INIT(&ctrlr.active_io_qpairs);
+
+	set_thread(0);
+
+	rc = nvme_ctrlr_create(&ctrlr, "nvme0", &trid, NULL);
+	CU_ASSERT(rc == 0);
+	nvme_ctrlr = nvme_ctrlr_get_by_name("nvme0");
+	SPDK_CU_ASSERT_FATAL(nvme_ctrlr != NULL);
+
+	/* not being deleted: nothing to report */
+	CU_ASSERT(nvme_ctrlr_destruct_age_sec(nvme_ctrlr) == 0);
+	nvme_ctrlr_log_stalled_destruct(nvme_ctrlr);
+	CU_ASSERT(nvme_ctrlr->destruct_log_tsc == 0);
+
+	/* a consumer keeps its channel: the delete cannot complete */
+	ch = spdk_get_io_channel(nvme_ctrlr);
+	SPDK_CU_ASSERT_FATAL(ch != NULL);
+
+	rc = bdev_nvme_delete("nvme0", &g_any_path, NULL, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(nvme_ctrlr->destruct == true);
+	CU_ASSERT(nvme_ctrlr->destruct_start_tsc != 0);
+	poll_threads();
+
+	/* the qpair abort of the destruct has finished and dropped its reference;
+	 * what remains is the channel's */
+	CU_ASSERT(nvme_ctrlr->destruct_fanout_pending == false);
+	CU_ASSERT(nvme_ctrlr->ref == 1);
+	CU_ASSERT(nvme_ctrlr_get_by_name("nvme0") == nvme_ctrlr);
+	CU_ASSERT(nvme_ctrlr_count_namespaces(nvme_ctrlr) == 0);
+
+	/* not logged before BDEV_NVME_DESTRUCT_STALL_SEC */
+	spdk_delay_us((BDEV_NVME_DESTRUCT_STALL_SEC - 1) * SPDK_SEC_TO_USEC);
+	nvme_ctrlr_log_stalled_destruct(nvme_ctrlr);
+	CU_ASSERT(nvme_ctrlr->destruct_log_tsc == 0);
+
+	/* then once, and again only after BDEV_NVME_DESTRUCT_STALL_LOG_SEC */
+	spdk_delay_us(SPDK_SEC_TO_USEC);
+	CU_ASSERT(nvme_ctrlr_destruct_age_sec(nvme_ctrlr) == BDEV_NVME_DESTRUCT_STALL_SEC);
+	nvme_ctrlr_log_stalled_destruct(nvme_ctrlr);
+	first_log = nvme_ctrlr->destruct_log_tsc;
+	CU_ASSERT(first_log != 0);
+	spdk_delay_us((BDEV_NVME_DESTRUCT_STALL_LOG_SEC - 1) * SPDK_SEC_TO_USEC);
+	nvme_ctrlr_log_stalled_destruct(nvme_ctrlr);
+	CU_ASSERT(nvme_ctrlr->destruct_log_tsc == first_log);
+	spdk_delay_us(SPDK_SEC_TO_USEC);
+	nvme_ctrlr_log_stalled_destruct(nvme_ctrlr);
+	CU_ASSERT(nvme_ctrlr->destruct_log_tsc > first_log);
+
+	/* the admin queue poller does it on its own */
+	nvme_ctrlr->destruct_log_tsc = 0;
+	spdk_delay_us(g_opts.nvme_adminq_poll_period_us);
+	poll_threads();
+	CU_ASSERT(nvme_ctrlr->destruct_log_tsc != 0);
+
+	/* the channel goes: the delete completes */
+	spdk_put_io_channel(ch);
+	poll_threads();
+	spdk_delay_us(1000);
+	poll_threads();
+	CU_ASSERT(nvme_ctrlr_get_by_name("nvme0") == NULL);
+}
+
 static void
 test_failover_ctrlr(void)
 {
@@ -8374,6 +8452,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_reset_ctrlr);
 	CU_ADD_TEST(suite, test_race_between_reset_and_destruct_ctrlr);
 	CU_ADD_TEST(suite, test_destruct_abort_inflight_io);
+	CU_ADD_TEST(suite, test_destruct_stall_reports_blockers);
 	CU_ADD_TEST(suite, test_failover_ctrlr);
 	CU_ADD_TEST(suite, test_race_between_failover_and_add_secondary_trid);
 	CU_ADD_TEST(suite, test_pending_reset);
