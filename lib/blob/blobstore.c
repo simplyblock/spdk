@@ -2548,6 +2548,32 @@ struct spdk_blob_persist_ctx {
 	spdk_bs_sequence_cpl		cb_fn;
 	void				*cb_arg;
 	TAILQ_ENTRY(spdk_blob_persist_ctx) link;
+
+	/* Waiting for a used blobid mask page write (persist_bs_write_used_blobids) */
+	TAILQ_ENTRY(spdk_blob_persist_ctx) mask_link;
+	spdk_bs_sequence_t		*mask_seq;
+};
+
+/*
+ * One page of the used blobid mask, written straight to the device (not through the
+ * md journal) from the in-memory bits. Each write carries the whole page as it is when
+ * the write is built. Two persists that write the same page concurrently could
+ * complete out of order and leave the OLDER image on disk: a lost update of the other
+ * blob's bit (a deleted blob's bit set again, or a new blob's bit missing). So at most
+ * one write per page is in flight. A persist that arrives meanwhile waits; when the
+ * write completes, the page is written again with the newest bits, which covers every
+ * waiter, and only then do the waiters complete. An error completes every persist the
+ * failed write covered.
+ */
+struct bs_blobid_mask_wr {
+	struct spdk_blob_store				*bs;
+	uint64_t					pageidx;
+	void						*buf;
+	bool						in_flight;
+	/* persists covered by the write in flight */
+	TAILQ_HEAD(, spdk_blob_persist_ctx)		writing;
+	/* persists that arrived after it was built: covered by the next write */
+	TAILQ_HEAD(, spdk_blob_persist_ctx)		waiting;
 };
 
 static void
@@ -3110,20 +3136,153 @@ blob_persist_zero_pages(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	}
 }
 
+/* The bits of mask page pageidx, as they are now in memory, into buf (one md page). */
+static void
+bs_blobid_mask_build(struct spdk_blob_store *bs, uint64_t pageidx, void *buf)
+{
+	struct spdk_bs_md_mask *mask;
+	uint64_t first_page_bits = SPDK_BS_PAGE_SIZE_INBIT - SPDK_BS_MD_STRUCT_INBIT;
+	uint64_t first_bit_inpage, last_bit_inpage;
+
+	memset(buf, 0, SPDK_BS_PAGE_SIZE);
+	if (pageidx == 0) {
+		first_bit_inpage = 0;
+		last_bit_inpage = spdk_min(first_page_bits, (uint64_t)bs->md_len);
+		mask = (struct spdk_bs_md_mask *)buf;
+		mask->type = SPDK_MD_MASK_TYPE_USED_BLOBIDS;
+		mask->length = bs->md_len;
+		assert(mask->length == spdk_bit_array_capacity(bs->used_blobids));
+		spdk_bit_array_store_mask_one_page(bs->used_blobids, mask->mask,
+						   first_bit_inpage, last_bit_inpage);
+	} else {
+		first_bit_inpage = first_page_bits + ((pageidx - 1) * SPDK_BS_PAGE_SIZE_INBIT);
+		last_bit_inpage = spdk_min(first_bit_inpage + SPDK_BS_PAGE_SIZE_INBIT, (uint64_t)bs->md_len);
+		spdk_bit_array_store_mask_one_page(bs->used_blobids, buf,
+						   first_bit_inpage, last_bit_inpage);
+	}
+}
+
+static struct bs_blobid_mask_wr *
+bs_blobid_mask_wr_get(struct spdk_blob_store *bs, uint64_t pageidx)
+{
+	struct bs_blobid_mask_wr *wr;
+
+	if (pageidx >= bs->blobid_mask_wr_len) {
+		/* entries are separate allocations: growing the index moves no state */
+		uint32_t len = bs->used_blobid_mask_len;
+		struct bs_blobid_mask_wr **tmp;
+
+		if (pageidx >= len) {
+			return NULL;
+		}
+		tmp = realloc(bs->blobid_mask_wr, len * sizeof(*tmp));
+		if (tmp == NULL) {
+			return NULL;
+		}
+		memset(&tmp[bs->blobid_mask_wr_len], 0, (len - bs->blobid_mask_wr_len) * sizeof(*tmp));
+		bs->blobid_mask_wr = tmp;
+		bs->blobid_mask_wr_len = len;
+	}
+
+	wr = bs->blobid_mask_wr[pageidx];
+	if (wr == NULL) {
+		wr = calloc(1, sizeof(*wr));
+		if (wr == NULL) {
+			return NULL;
+		}
+		wr->buf = spdk_zmalloc(SPDK_BS_PAGE_SIZE, 0, NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+		if (wr->buf == NULL) {
+			free(wr);
+			return NULL;
+		}
+		wr->bs = bs;
+		wr->pageidx = pageidx;
+		TAILQ_INIT(&wr->writing);
+		TAILQ_INIT(&wr->waiting);
+		bs->blobid_mask_wr[pageidx] = wr;
+	}
+	return wr;
+}
+
+static void bs_blobid_mask_wr_done(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno);
+
+/* Write the page with the bits as they are now, for every persist waiting on it. */
+static void
+bs_blobid_mask_wr_issue(struct bs_blobid_mask_wr *wr)
+{
+	struct spdk_blob_store *bs = wr->bs;
+	struct spdk_blob_persist_ctx *first;
+
+	assert(!wr->in_flight);
+	assert(TAILQ_EMPTY(&wr->writing));
+	TAILQ_CONCAT(&wr->writing, &wr->waiting, mask_link);
+	first = TAILQ_FIRST(&wr->writing);
+	assert(first != NULL);
+
+	bs_blobid_mask_build(bs, wr->pageidx, wr->buf);
+	wr->in_flight = true;
+	bs->w_io++;
+	/* on the sequence of one of the persists it covers: that one waits for it anyway */
+	bs_sequence_write_dev(first->mask_seq, wr->buf,
+			      bs_page_to_lba(bs, bs->used_blobid_mask_start + wr->pageidx),
+			      bs_byte_to_lba(bs, SPDK_BS_PAGE_SIZE), bs_blobid_mask_wr_done, wr);
+}
+
+static void
+bs_blobid_mask_wr_done(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct bs_blobid_mask_wr *wr = cb_arg;
+	TAILQ_HEAD(, spdk_blob_persist_ctx) done = TAILQ_HEAD_INITIALIZER(done);
+	struct spdk_blob_persist_ctx *ctx;
+
+	(void)seq;
+	wr->in_flight = false;
+	TAILQ_CONCAT(&done, &wr->writing, mask_link);
+	if (bserrno != 0) {
+		SPDK_ERRLOG("Used blobid mask page %" PRIu64 " write failed: %d\n", wr->pageidx, bserrno);
+	}
+
+	/* Bits changed while it was in flight: write the page again, with them. */
+	if (!TAILQ_EMPTY(&wr->waiting)) {
+		bs_blobid_mask_wr_issue(wr);
+	}
+
+	while ((ctx = TAILQ_FIRST(&done)) != NULL) {
+		TAILQ_REMOVE(&done, ctx, mask_link);
+		ctx->bit_cb_fn_persist(ctx->mask_seq, ctx, bserrno);
+	}
+}
+
+static void
+bs_blobid_mask_wr_free(struct spdk_blob_store *bs)
+{
+	uint32_t i;
+
+	for (i = 0; i < bs->blobid_mask_wr_len; i++) {
+		struct bs_blobid_mask_wr *wr = bs->blobid_mask_wr[i];
+
+		if (wr == NULL) {
+			continue;
+		}
+		assert(!wr->in_flight && TAILQ_EMPTY(&wr->waiting));
+		spdk_free(wr->buf);
+		free(wr);
+	}
+	free(bs->blobid_mask_wr);
+	bs->blobid_mask_wr = NULL;
+	bs->blobid_mask_wr_len = 0;
+}
+
 static void
 persist_bs_write_used_blobids(spdk_bs_sequence_t *seq, void *arg, int bserrno)
 {
 	struct spdk_blob_persist_ctx *ctx = arg;
 	struct spdk_blob *blob = ctx->blob;
 	struct spdk_blob_store *bs = blob->bs;
-	struct spdk_bs_md_mask *mask;
 	spdk_bs_sequence_cpl cb_fn = ctx->bit_cb_fn_persist;
-
+	struct bs_blobid_mask_wr *wr;
 	uint64_t first_page_bits;
-	uint64_t first_bit_inpage;
-	uint64_t last_bit_inpage;
 	uint64_t pageidx;
-	uint64_t lba;
 
 	if (bserrno != 0) {
 		cb_fn(seq, ctx, bserrno);
@@ -3142,47 +3301,11 @@ persist_bs_write_used_blobids(spdk_bs_sequence_t *seq, void *arg, int bserrno)
 		return;
 	}
 
-	if (!ctx->bit_page) {
-		ctx->bit_page = spdk_zmalloc(SPDK_BS_PAGE_SIZE, 0, NULL,
-				SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
-		if (!ctx->bit_page) {
-			cb_fn(seq, ctx, -ENOMEM);
-			return;
-		}
-	}
-
 	first_page_bits = SPDK_BS_PAGE_SIZE_INBIT - SPDK_BS_MD_STRUCT_INBIT;
-	memset(ctx->bit_page, 0, SPDK_BS_PAGE_SIZE);
-
 	if (ctx->idx_blobids < first_page_bits) {
 		pageidx = 0;
-		first_bit_inpage = 0;
-		last_bit_inpage = first_page_bits;
-		if (last_bit_inpage > bs->md_len) {
-			last_bit_inpage = bs->md_len;
-		}
-
-		mask = (struct spdk_bs_md_mask *)ctx->bit_page;
-		mask->type = SPDK_MD_MASK_TYPE_USED_BLOBIDS;
-		mask->length = bs->md_len;
-
-		assert(mask->length == spdk_bit_array_capacity(bs->used_blobids));
-		// spdk_spin_lock(&bs->used_lock);
-		spdk_bit_array_store_mask_one_page(bs->used_blobids,
-					mask->mask, first_bit_inpage, last_bit_inpage);
-		// spdk_spin_unlock(&bs->used_lock);
 	} else {
 		pageidx = 1 + ((ctx->idx_blobids - first_page_bits) / SPDK_BS_PAGE_SIZE_INBIT);
-		first_bit_inpage = first_page_bits + ((pageidx - 1) * SPDK_BS_PAGE_SIZE_INBIT);
-		last_bit_inpage = first_bit_inpage + SPDK_BS_PAGE_SIZE_INBIT;
-
-		if (last_bit_inpage > bs->md_len) {
-			last_bit_inpage = bs->md_len;
-		}
-		// spdk_spin_lock(&bs->used_lock);//not sure we need this tbh
-		spdk_bit_array_store_mask_one_page(bs->used_blobids,
-					ctx->bit_page, first_bit_inpage, last_bit_inpage);
-		// spdk_spin_unlock(&bs->used_lock);
 	}
 
 	if (pageidx >= bs->used_blobid_mask_len) {
@@ -3192,10 +3315,18 @@ persist_bs_write_used_blobids(spdk_bs_sequence_t *seq, void *arg, int bserrno)
 		return;
 	}
 
-	lba = bs_page_to_lba(bs, bs->used_blobid_mask_start + pageidx);
+	wr = bs_blobid_mask_wr_get(bs, pageidx);
+	if (wr == NULL) {
+		cb_fn(seq, ctx, -ENOMEM);
+		return;
+	}
 
-	bs->w_io++;
-	bs_sequence_write_dev(seq, ctx->bit_page, lba, bs_byte_to_lba(bs, SPDK_BS_PAGE_SIZE), cb_fn, arg);
+	ctx->mask_seq = seq;
+	TAILQ_INSERT_TAIL(&wr->waiting, ctx, mask_link);
+	if (!wr->in_flight) {
+		bs_blobid_mask_wr_issue(wr);
+	}
+	/* else: bs_blobid_mask_wr_done() writes the page again, with this persist's bit */
 }
 
 /*
@@ -6604,6 +6735,7 @@ bs_dev_destroy(void *io_device)
 	spdk_bit_array_free(&bs->used_md_pages);
 	spdk_bit_array_free(&bs->map_blobids);
 	spdk_bit_pool_free(&bs->used_clusters);
+	bs_blobid_mask_wr_free(bs);
 	/*
 	 * If this function is called for any reason except a successful unload,
 	 * the unload_cpl type will be NONE and this will be a nop.

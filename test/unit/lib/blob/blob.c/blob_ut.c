@@ -327,6 +327,18 @@ ut_bs_dirty_load(struct spdk_blob_store **bs, struct spdk_bs_opts *opts)
 	g_bserrno = -1;
 }
 
+/* The used blobid mask bit of md page *page* as it is on disk (mask page 0 only). */
+static bool
+ut_disk_blobid_bit(struct spdk_blob_store *bs, uint32_t page)
+{
+	struct spdk_bs_md_mask *mask = (struct spdk_bs_md_mask *)
+				       &g_dev_buffer[(uint64_t)bs->used_blobid_mask_start * SPDK_BS_PAGE_SIZE];
+
+	SPDK_CU_ASSERT_FATAL(mask->type == SPDK_MD_MASK_TYPE_USED_BLOBIDS);
+	SPDK_CU_ASSERT_FATAL(page < SPDK_BS_PAGE_SIZE_INBIT - SPDK_BS_MD_STRUCT_INBIT);
+	return (mask->mask[page / 8] >> (page % 8)) & 1;
+}
+
 /* Dirty shutdown, then a load that must fail with bserrno and leave no blobstore. */
 static void
 ut_bs_dirty_load_fails(struct spdk_blob_store **bs, struct spdk_bs_opts *opts, int bserrno)
@@ -4767,6 +4779,83 @@ blob_load_zeroed_md_page_is_corruption(void)
 
 	ut_bs_dirty_load_fails(&bs, NULL, -EINVAL);
 	CU_ASSERT(bs == NULL);
+}
+
+/*
+ * The used blobid mask page is written straight to the device with the bits as they are
+ * when the write is built. Two persists of the same mask page that complete out of order
+ * left the older image on disk: blob A's mask write is held in the device, blob B's
+ * (A and B set) lands, then A's (only A set) lands over it - B's bit is lost, and a
+ * reload does not know B. Now B's persist waits for A's write and the page is written
+ * again with both bits.
+ */
+struct ut_create_res {
+	spdk_blob_id	id;
+	int		rc;
+	bool		done;
+};
+
+static void
+ut_create_res_cb(void *cb_arg, spdk_blob_id blobid, int bserrno)
+{
+	struct ut_create_res *r = cb_arg;
+
+	r->id = blobid;
+	r->rc = bserrno;
+	r->done = true;
+}
+
+static void
+blob_used_blobid_mask_writes_do_not_reorder(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob_opts opts;
+	struct ut_create_res a = {}, b = {};
+
+	ut_spdk_blob_opts_init(&opts);
+
+	g_dev_write_hold_lba = bs_page_to_lba(bs, bs->used_blobid_mask_start);
+	g_dev_write_hold_lba_count = bs_byte_to_lba(bs, SPDK_BS_PAGE_SIZE);
+	g_dev_write_hold_count = 1;
+
+	spdk_bs_create_blob_ext(bs, &opts, ut_create_res_cb, &a);
+	poll_threads();
+	/* A's mask write is held: its create has not completed */
+	CU_ASSERT(g_dev_write_hold_count == 0);
+	CU_ASSERT(!a.done);
+
+	spdk_bs_create_blob_ext(bs, &opts, ut_create_res_cb, &b);
+	poll_threads();
+
+	CU_ASSERT(ut_dev_release_held_writes() == 1);
+	poll_threads();
+	g_dev_write_hold_count = 0;
+	g_dev_write_hold_lba = 0;
+	g_dev_write_hold_lba_count = 0;
+
+	SPDK_CU_ASSERT_FATAL(a.done && b.done);
+	CU_ASSERT(a.rc == 0 && b.rc == 0);
+	CU_ASSERT(a.id != b.id);
+
+	/* on disk: both bits */
+	CU_ASSERT(ut_disk_blobid_bit(bs, bs_blobid_to_page(a.id)));
+	CU_ASSERT(ut_disk_blobid_bit(bs, bs_blobid_to_page(b.id)));
+
+	/* and the reload has both blobs */
+	ut_bs_dirty_load(&bs, NULL);
+	spdk_bs_open_blob(bs, a.id, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	spdk_blob_close(g_blob, blob_op_complete, NULL);
+	poll_threads();
+	spdk_bs_open_blob(bs, b.id, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_blob != NULL);
+	spdk_blob_close(g_blob, blob_op_complete, NULL);
+	poll_threads();
+	g_blob = NULL;
 }
 
 /*
@@ -13978,6 +14067,7 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite_bs, blob_load_corrupted_snapshot_with_clone);
 		CU_ADD_TEST(suite_bs, blob_load_invalid_flags_keeps_clusters);
 		CU_ADD_TEST(suite_bs, blob_load_zeroed_md_page_is_corruption);
+		CU_ADD_TEST(suite_bs, blob_used_blobid_mask_writes_do_not_reorder);
 		CU_ADD_TEST(suite_bs, blob_delete_persists_mask_before_zeroing);
 		CU_ADD_TEST(suite, bs_load_custom_cluster_size);
 		CU_ADD_TEST(suite, bs_load_after_failed_grow);
