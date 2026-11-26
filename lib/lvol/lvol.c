@@ -7053,8 +7053,13 @@ xfer_resume_offset(struct spdk_lvs_xfer *xfer, const struct spdk_lvs_xfer_req *d
  * (the control plane) must guarantee before passing allow_partial.
  */
 /* Snapshots between the destination's base and the generation's base that a
- * bridged delta tolerates (each adds its owned clusters, sent whole). */
-#define XFER_BRIDGE_MAX_HOPS	16
+ * bridged delta tolerates (each adds its owned clusters, sent whole). The
+ * chain walked is the volume's own snapshot chain: local snapshots taken
+ * between two replication rounds sit in it too, and a volume may keep long
+ * local chains. 16 refused those transfers (-ENOENT), which left the control
+ * plane only a full image send. The walk costs one pass over the cluster
+ * map per hop, on the reactor, once per transfer setup. */
+#define XFER_BRIDGE_MAX_HOPS	250
 
 /*
  * The generation started on gen_base, a LATER snapshot of the same lvol than

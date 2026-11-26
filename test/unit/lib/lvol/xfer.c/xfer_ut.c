@@ -1831,6 +1831,77 @@ xfer_full_fallback_refuses_unreachable_base(void)
 	ut_chain_clear();
 }
 
+/* A long local snapshot chain between two replicated snapshots: every
+ * snapshot in between open on this node. XFER_BRIDGE_MAX_HOPS of them still
+ * bridge (the clusters they own are sent whole); one more refuses. */
+static void
+ut_long_chain(struct spdk_lvol *lvols, struct spdk_blob *blobs, int n)
+{
+	int i;
+
+	ut_chain_clear();
+	ut_chain_set(UT_SRC_ID, 0x300, 0);
+	for (i = 0; i < n; i++) {
+		/* each snapshot owns one of clusters 0..2 */
+		ut_chain_set(0x300 + i, 0x300 + i + 1, 1u << (i % 3));
+		lvols[i].blob = &blobs[i];
+		blobs[i].id = 0x300 + i;
+		lvols[i].blob_id = 0x300 + i;
+		lvols[i].lvol_store = &g_xfer_lvs;
+		TAILQ_INSERT_TAIL(&g_xfer_lvs.lvols, &lvols[i], link);
+	}
+}
+
+static void
+ut_long_chain_close(struct spdk_lvol *lvols, int n)
+{
+	int i;
+
+	for (i = 0; i < n; i++) {
+		TAILQ_REMOVE(&g_xfer_lvs.lvols, &lvols[i], link);
+	}
+	ut_chain_clear();
+}
+
+static void
+xfer_full_fallback_bridges_a_long_local_chain(void)
+{
+	const int alloc[5] = {0, 0, 0, 0, 0};
+	struct spdk_lvs_xfer *xfer = make_xfer(1, 5, alloc);
+	const int n = XFER_BRIDGE_MAX_HOPS + 1;
+	struct spdk_lvol *lvols = calloc(n, sizeof(*lvols));
+	struct spdk_blob *blobs = calloc(n, sizeof(*blobs));
+
+	SPDK_CU_ASSERT_FATAL(lvols != NULL && blobs != NULL);
+	CU_ASSERT(XFER_BRIDGE_MAX_HOPS >= 250);
+	g_blob_read_only = true;
+	g_ut_dirty_gen = NULL;		/* no generation: full clusters */
+	xfer->page_size = 4096;
+
+	/* exactly XFER_BRIDGE_MAX_HOPS snapshots in between: bridged */
+	ut_long_chain(lvols, blobs, XFER_BRIDGE_MAX_HOPS);
+	CU_ASSERT(xfer_setup_partial(xfer, 0, 0x300 + XFER_BRIDGE_MAX_HOPS) == 0);
+	SPDK_CU_ASSERT_FATAL(xfer->bridged != NULL);
+	CU_ASSERT(xfer->bridge_hops == XFER_BRIDGE_MAX_HOPS);
+	CU_ASSERT(xfer->bridge_clusters == 3);
+	CU_ASSERT(xfer->bridged[0] && xfer->bridged[1] && xfer->bridged[2]);
+	CU_ASSERT(!xfer->bridged[3] && !xfer->bridged[4]);
+	free(xfer->bridged);
+	xfer->bridged = NULL;
+	ut_long_chain_close(lvols, XFER_BRIDGE_MAX_HOPS);
+
+	/* one more: refused, nothing left behind */
+	ut_long_chain(lvols, blobs, n);
+	CU_ASSERT(xfer_setup_partial(xfer, 0, 0x300 + n) == -ENOENT);
+	CU_ASSERT(xfer->bridged == NULL);
+	ut_long_chain_close(lvols, n);
+
+	g_blob_read_only = false;
+	free(lvols);
+	free(blobs);
+	free_xfer(xfer);
+}
+
 /* The bridged delta (34c538289): the generation started at the source's
  * parent, the destination holds an older snapshot. The delta goes on against
  * it: the clusters the in-between snapshots own (the generation's base
@@ -2221,6 +2292,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, xfer_poll_group_releases_iobuf_channel);
 	CU_ADD_TEST(suite, xfer_full_fallback_bridges_skipped_snapshots);
 	CU_ADD_TEST(suite, xfer_full_fallback_refuses_unreachable_base);
+	CU_ADD_TEST(suite, xfer_full_fallback_bridges_a_long_local_chain);
 	CU_ADD_TEST(suite, xfer_bridged_delta_sends_in_between_clusters_whole);
 	CU_ADD_TEST(suite, xfer_bridged_delta_unbridgeable_is_refused);
 	CU_ADD_TEST(suite, xfer_dest_clone_after_incomplete_round_sends_full);

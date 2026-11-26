@@ -197,7 +197,7 @@ DEFINE_STUB_V(spdk_blob_io_write, (struct spdk_blob *blob, struct spdk_io_channe
 /* A small snapshot chain for the transfer tests: blob id -> parent id and
  * the clusters (bit i: cluster i) the blob owns. Unlisted: no parent
  * (SPDK_BLOBID_INVALID) and nothing owned. */
-#define UT_CHAIN_MAX 32
+#define UT_CHAIN_MAX 256
 static struct {
 	spdk_blob_id id;
 	spdk_blob_id parent;
