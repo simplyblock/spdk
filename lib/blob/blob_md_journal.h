@@ -194,6 +194,12 @@ struct md_journal_elem {
 	 */
 	bool skip_home;
 
+	/*
+	 * An examine write patched this kept overlay page (md_journal_examine_kept):
+	 * the promotion carries it over its re-read of the slots.
+	 */
+	bool examine_patched;
+
     TAILQ_ENTRY(md_journal_elem) link;
 };
 
@@ -362,6 +368,12 @@ struct spdk_bs_md_journal {
 
 	bool recovering;
 	bool examine;
+	/*
+	 * Examine writes carried over the slot re-read of a promotion
+	 * (md_journal_promote_from_examine), applied when the re-read is scanned.
+	 */
+	struct md_journal_examine_carry *examine_carry;
+	uint32_t examine_carry_count;
 	bool stopping;
 	bool paused;
 	/*
