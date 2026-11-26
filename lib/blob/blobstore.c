@@ -868,20 +868,12 @@ spdk_bs_drain_channel_queued(struct spdk_blob_store *bs,
 	spdk_for_each_channel(bs, spdk_bs_drain_queued_io, ctx, spdk_bs_drain_cpl);
 }
 
-/* Counterpart of blob_freeze_io_ext: on -ENOMEM neither counter moves (the freeze is
- * still held and the caller can retry); otherwise both drop together. */
+/* The unfreeze itself, with a ctx the caller has already allocated: it cannot fail. */
 static void
-blob_unfreeze_io_ext(struct spdk_blob *blob, bool group, spdk_blob_op_complete cb_fn, void *cb_arg)
+blob_unfreeze_io_start(struct spdk_blob *blob, bool group, struct freeze_io_ctx *ctx,
+		       spdk_blob_op_complete cb_fn, void *cb_arg)
 {
-	struct freeze_io_ctx *ctx;
-
 	blob_verify_md_op(blob);
-
-	ctx = calloc(1, sizeof(*ctx));
-	if (!ctx) {
-		cb_fn(cb_arg, -ENOMEM);
-		return;
-	}
 
 	ctx->cpl.type = SPDK_BS_CPL_TYPE_BS_BASIC;
 	ctx->cpl.u.blob_basic.cb_fn = cb_fn;
@@ -899,10 +891,37 @@ blob_unfreeze_io_ext(struct spdk_blob *blob, bool group, spdk_blob_op_complete c
 	spdk_for_each_channel(blob->bs, blob_execute_queued_io, ctx, blob_io_cpl);
 }
 
+/* Counterpart of blob_freeze_io_ext: on -ENOMEM neither counter moves (the freeze is
+ * still held and the caller can retry); otherwise both drop together. */
+static void
+blob_unfreeze_io_ext(struct spdk_blob *blob, bool group, spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	struct freeze_io_ctx *ctx;
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+	blob_unfreeze_io_start(blob, group, ctx, cb_fn, cb_arg);
+}
+
 static void
 blob_unfreeze_io(struct spdk_blob *blob, spdk_blob_op_complete cb_fn, void *cb_arg)
 {
 	blob_unfreeze_io_ext(blob, false, cb_fn, cb_arg);
+}
+
+/*
+ * Unfreeze with a ctx allocated when the freeze was taken (a freeze that an operation
+ * must be able to undo on every path, e.g. a snapshot delete's freeze on the clone).
+ * It cannot fail; the ctx is freed when the unfreeze completes.
+ */
+static void
+blob_unfreeze_io_prealloc(struct spdk_blob *blob, struct freeze_io_ctx *ctx,
+			  spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	blob_unfreeze_io_start(blob, false, ctx, cb_fn, cb_arg);
 }
 
 static int
@@ -13693,6 +13712,9 @@ struct delete_snapshot_ctx {
 	/* This delete holds its one freeze on the clone (blob_freeze_io succeeded and the
 	 * matching unfreeze has not). */
 	bool clone_frozen;
+	/* Allocated before the clone is frozen and used by the one unfreeze of that
+	 * freeze (success or cleanup), so undoing the freeze cannot fail with -ENOMEM. */
+	struct freeze_io_ctx *clone_unfreeze_ctx;
 	bool is_async;
 	spdk_blob_op_with_handle_complete cb_fn;
 	void *cb_arg;
@@ -13717,6 +13739,8 @@ delete_blob_cleanup_finish(void *cb_arg, int bserrno)
 
 	ctx->cb_fn(ctx->cb_arg, ctx->snapshot, ctx->bserrno);
 	spdk_free(ctx->page);
+	/* left over when the clone freeze itself failed */
+	free(ctx->clone_unfreeze_ctx);
 	free(ctx);
 }
 
@@ -13749,16 +13773,25 @@ delete_snapshot_cleanup_snapshot(void *cb_arg, int bserrno)
 
 static void delete_snapshot_cleanup_clone(void *cb_arg, int bserrno);
 
+/* Undo this delete's freeze on the clone with the ctx allocated before the freeze
+ * (delete_snapshot_open_clone_cb): it cannot fail. */
+static void
+delete_snapshot_unfreeze_clone(struct delete_snapshot_ctx *ctx, spdk_blob_op_complete cb_fn)
+{
+	struct freeze_io_ctx *uctx = ctx->clone_unfreeze_ctx;
+
+	assert(ctx->clone_frozen);
+	assert(uctx != NULL);
+	ctx->clone_unfreeze_ctx = NULL;
+	blob_unfreeze_io_prealloc(ctx->clone, uctx, cb_fn, ctx);
+}
+
 static void
 delete_snapshot_cleanup_clone_unfrozen(void *cb_arg, int bserrno)
 {
 	struct delete_snapshot_ctx *ctx = cb_arg;
 
-	if (bserrno != 0) {
-		/* blob_unfreeze_io only fails before it drops the count (-ENOMEM). */
-		SPDK_ERRLOG("blob 0x%" PRIx64 ": failed to release the snapshot delete's freeze on "
-			    "the clone: %d (clone stays frozen)\n", ctx->clone->id, bserrno);
-	}
+	assert(bserrno == 0);
 	ctx->clone_frozen = false;
 	delete_snapshot_cleanup_clone(ctx, 0);
 }
@@ -13776,7 +13809,7 @@ delete_snapshot_cleanup_clone(void *cb_arg, int bserrno)
 	 * the group's own unfreeze later underflowed the count.
 	 */
 	if (ctx->clone_frozen) {
-		blob_unfreeze_io(ctx->clone, delete_snapshot_cleanup_clone_unfrozen, ctx);
+		delete_snapshot_unfreeze_clone(ctx, delete_snapshot_cleanup_clone_unfrozen);
 		return;
 	}
 	ctx->clone->md_ro = ctx->clone_md_ro;
@@ -13789,13 +13822,8 @@ delete_snapshot_unfreeze_cpl(void *cb_arg, int bserrno)
 {
 	struct delete_snapshot_ctx *ctx = cb_arg;
 
-	if (bserrno) {
-		/* The unfreeze failed before dropping the count: the freeze is still ours
-		 * (clone_frozen), the cleanup retries it once. */
-		ctx->bserrno = bserrno;
-		delete_snapshot_cleanup_clone(ctx, 0);
-		return;
-	}
+	/* blob_unfreeze_io_prealloc cannot fail */
+	assert(bserrno == 0);
 	ctx->clone_frozen = false;
 
 	ctx->clone->locked_operation_in_progress = false;
@@ -13871,7 +13899,7 @@ delete_snapshot_sync_snapshot_cpl(void *cb_arg, int bserrno)
 	ctx->clone->md_ro = ctx->clone_md_ro;
 	ctx->snapshot->md_ro = ctx->snapshot_md_ro;
 
-	blob_unfreeze_io(ctx->clone, delete_snapshot_unfreeze_cpl, ctx);
+	delete_snapshot_unfreeze_clone(ctx, delete_snapshot_unfreeze_cpl);
 }
 
 static void
@@ -14103,6 +14131,15 @@ delete_snapshot_open_clone_cb(void *cb_arg, struct spdk_blob *clone, int bserrno
 	if (clone->locked_operation_in_progress) {
 		SPDK_DEBUGLOG(blob, "Cannot remove blob - another operation in progress on its clone\n");
 		ctx->bserrno = -EBUSY;
+		spdk_blob_close(ctx->clone, delete_snapshot_cleanup_snapshot, ctx);
+		return;
+	}
+
+	/* Allocate the unfreeze's ctx now, so this delete can always undo its freeze
+	 * (review E-3: an unfreeze that failed with -ENOMEM left the clone frozen). */
+	ctx->clone_unfreeze_ctx = calloc(1, sizeof(*ctx->clone_unfreeze_ctx));
+	if (ctx->clone_unfreeze_ctx == NULL) {
+		ctx->bserrno = -ENOMEM;
 		spdk_blob_close(ctx->clone, delete_snapshot_cleanup_snapshot, ctx);
 		return;
 	}
