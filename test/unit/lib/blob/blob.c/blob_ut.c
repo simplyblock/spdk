@@ -2989,6 +2989,75 @@ bs_load_pending_removal(void)
 	g_blob = NULL;
 }
 
+/*
+ * spdk_bs_init must clear the metadata region. A blobstore created on a device that held
+ * another one with the same geometry otherwise loads the old used blobid mask and md
+ * pages: the old blobs come back as blobs of the new blobstore. (With another md_len, the
+ * stale mask fails the load: bs_load_custom_cluster_size aborted when run after bs_load.)
+ */
+static void
+bs_init_clears_previous_metadata(void)
+{
+	struct spdk_blob_store *bs;
+	struct spdk_bs_dev *dev;
+	struct spdk_blob_opts opts;
+	struct spdk_blob *blob;
+	spdk_blob_id blobid;
+
+	/* A blobstore with one blob on the device */
+	dev = init_dev();
+	spdk_bs_init(dev, NULL, bs_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
+	bs = g_bs;
+	ut_spdk_blob_opts_init(&opts);
+	opts.num_clusters = 2;
+	blob = ut_blob_create_and_open(bs, &opts);
+	blobid = spdk_blob_get_id(blob);
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	spdk_bs_unload(bs, bs_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	g_bs = NULL;
+	g_blob = NULL;
+
+	/* A new blobstore on the same device, same geometry */
+	dev = init_dev();
+	spdk_bs_init(dev, NULL, bs_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
+	bs = g_bs;
+	spdk_bs_unload(bs, bs_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	g_bs = NULL;
+
+	/* Its first load has no blobs: the old one is gone */
+	dev = init_dev();
+	spdk_bs_load(dev, NULL, bs_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	SPDK_CU_ASSERT_FATAL(g_bs != NULL);
+	bs = g_bs;
+	ut_bs_release_load_refs(bs);
+	CU_ASSERT(spdk_bit_array_count_set(bs->used_blobids) == 0);
+	g_blob = NULL;
+	spdk_bs_open_blob(bs, blobid, blob_op_with_handle_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno != 0);
+	CU_ASSERT(g_blob == NULL);
+	CU_ASSERT(spdk_bs_free_cluster_count(bs) == spdk_bs_total_data_cluster_count(bs));
+
+	spdk_bs_unload(bs, bs_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	g_bs = NULL;
+}
+
 static void
 bs_load_custom_cluster_size(void)
 {
@@ -14070,6 +14139,7 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite_bs, blob_used_blobid_mask_writes_do_not_reorder);
 		CU_ADD_TEST(suite_bs, blob_delete_persists_mask_before_zeroing);
 		CU_ADD_TEST(suite, bs_load_custom_cluster_size);
+		CU_ADD_TEST(suite, bs_init_clears_previous_metadata);
 		CU_ADD_TEST(suite, bs_load_after_failed_grow);
 		CU_ADD_TEST(suite, bs_load_error);
 		CU_ADD_TEST(suite_bs, bs_unload);

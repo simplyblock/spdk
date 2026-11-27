@@ -9801,9 +9801,18 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 
 	batch = bs_sequence_to_batch(seq, 0, bs_init_trim_cpl, ctx);
 
-	/* Clear metadata space */
-	// bs->w_io++;
-	// bs_batch_write_zeroes_dev(batch, 0, num_md_lba);
+	/*
+	 * Clear metadata space. Neither the used page/cluster/blobid masks nor the md pages
+	 * are written at init (masks are persisted page by page with blob metadata, and
+	 * unload no longer writes them), so whatever an earlier blobstore left on this
+	 * device would be read back by the first load: its used blobid mask (a mask of
+	 * another md_len fails the load, one of the same md_len names the old blobs) and
+	 * their md pages, which the examine load would then open as this blobstore's blobs.
+	 * Zeroing was commented out in f0c898b9a ("add bind to device - dump tree") without
+	 * a stated reason; it is the upstream behaviour.
+	 */
+	bs->w_io++;
+	bs_batch_write_zeroes_dev(batch, 0, num_md_lba);
 
 	lba = num_md_lba;
 	lba_count = ctx->bs->dev->blockcnt - lba;
